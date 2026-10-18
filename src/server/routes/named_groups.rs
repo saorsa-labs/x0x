@@ -11680,22 +11680,27 @@ async fn request_treekem_catchup_page(
 /// Most other active members one epoch-ahead round asks (#1427).
 const TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS: usize = 3;
 
-/// Most rounds one epoch-ahead observation runs, one throttle window apart
-/// (#1427).
+/// Fewest rounds one epoch-ahead target runs, one throttle window apart
+/// (#1427). A target runs more rounds until it has asked every candidate.
 const TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS: usize = 6;
 
 /// #1427: traffic at a later TreeKEM epoch than the local live group shows
 /// that this member missed a membership commit. The metadata topic stops
 /// redelivery after its schedule, and a member with no later membership
-/// event never reaches the gap catch-up. Ask a few other active members for
-/// a catch-up page on the existing request path. The response handler
-/// applies the served commits with all its usual checks. The shared
-/// per-peer throttle bounds repeats while the gap stays open. One
-/// observation asks again after each throttle window, at most
-/// [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`] times, and each round asks the
-/// members asked least recently (see [`epoch_ahead_catchup_peers`]). So a
-/// single later-epoch record reaches a signer that ranks after offline
-/// members, with no further traffic.
+/// event never reaches the gap catch-up. Ask other active members for a
+/// catch-up page on the existing request path. The response handler
+/// applies the served commits with all its usual checks.
+///
+/// One task runs per group. It holds the highest epoch observed for the
+/// group in `AppState::treekem_epoch_ahead_targets`. A later observation
+/// while the task runs raises that target and starts the task's round
+/// count again, so a late answer for an older epoch does not end the
+/// recovery of a newer one. Each round asks the members asked least
+/// recently (see [`epoch_ahead_catchup_peers`]), one throttle window
+/// apart. The task runs at least [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`]
+/// rounds, and continues until every candidate was asked once (ADR 0088
+/// L1: any one reachable holder is enough). Each such round asks at least
+/// one candidate not yet asked, so the round count is bounded.
 pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
     state: &Arc<AppState>,
     group_id: &str,
@@ -11713,38 +11718,85 @@ async fn request_treekem_catchup_for_epoch_ahead(
     group_id: &str,
     observed_epoch: u64,
 ) {
-    for round in 0..TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS {
+    let key = {
+        let groups = state.named_groups.read().await;
+        let Some(key) = groups
+            .get_key_value(group_id)
+            .map(|(key, _)| key)
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(key, _)| key)
+            })
+        else {
+            return;
+        };
+        key.clone()
+    };
+    {
+        let mut targets = state.treekem_epoch_ahead_targets.lock().await;
+        if let Some(target) = targets.get_mut(&key) {
+            // The running task picks up the higher target.
+            *target = (*target).max(observed_epoch);
+            return;
+        }
+        targets.insert(key.clone(), observed_epoch);
+    }
+    let mut target = observed_epoch;
+    let mut asked = HashSet::new();
+    let mut round = 0;
+    loop {
         if round > 0 {
             tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
         }
-        if !request_treekem_catchup_round(state, group_id, observed_epoch, round).await {
-            return;
+        let latest = state
+            .treekem_epoch_ahead_targets
+            .lock()
+            .await
+            .get(&key)
+            .copied()
+            .unwrap_or(target);
+        if latest > target {
+            target = latest;
+            asked.clear();
+            round = 0;
         }
+        let outcome = request_treekem_catchup_round(state, &key, target, round, &mut asked).await;
+        round += 1;
+        let more = outcome
+            .is_some_and(|all_asked| round < TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS || !all_asked);
+        if more {
+            continue;
+        }
+        let mut targets = state.treekem_epoch_ahead_targets.lock().await;
+        if targets.get(&key).is_some_and(|latest| *latest > target) {
+            // A later observation arrived during this round.
+            continue;
+        }
+        targets.remove(&key);
+        return;
     }
 }
 
 /// One round of [`request_treekem_catchup_for_epoch_ahead`]. Returns
-/// `false` when no later round is needed: this member left the group,
-/// reached `observed_epoch`, or every candidate is inside the throttle
-/// window (another task asks them).
+/// `None` when no later round is needed: this member left the group or
+/// reached `target_epoch`. Otherwise returns whether every candidate is in
+/// `asked`. A candidate goes into `asked` when this round asks it, or when
+/// another request asked it inside the throttle window.
 async fn request_treekem_catchup_round(
     state: &Arc<AppState>,
     group_id: &str,
-    observed_epoch: u64,
+    target_epoch: u64,
     round: usize,
-) -> bool {
+    asked: &mut HashSet<AgentId>,
+) -> Option<bool> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let (key, from_revision, from_epoch, peers) = {
         let groups = state.named_groups.read().await;
-        let Some((key, info)) = groups.get_key_value(group_id).or_else(|| {
-            groups
-                .iter()
-                .find(|(_, info)| info.stable_group_id() == group_id)
-        }) else {
-            return false;
-        };
+        let (key, info) = groups.get_key_value(group_id)?;
         if info.withdrawn || !info.has_active_member(&local_agent_hex) {
-            return false;
+            return None;
         }
         // Owner and admins first: they sign membership commits, and only
         // the signer can deliver a removal whose binding is the legacy
@@ -11765,38 +11817,47 @@ async fn request_treekem_catchup_round(
         let peers: Vec<AgentId> = candidates.into_iter().map(|(_, peer)| peer).collect();
         (key.clone(), info.state_revision, info.secret_epoch, peers)
     };
-    let Some(local_epoch) = current_treekem_epoch(state, &key).await else {
-        return false;
-    };
-    if observed_epoch <= local_epoch {
-        return false;
+    let local_epoch = current_treekem_epoch(state, &key).await?;
+    if target_epoch <= local_epoch {
+        return None;
     }
     tracing::info!(
         round,
         group_id = %LogHexId::group(&key),
         local_epoch,
-        observed_epoch,
+        target_epoch,
         "TreeKEM traffic is ahead of the local epoch; requesting catch-up"
     );
     let throttle_key =
         |peer: &AgentId| format!("{key}:{}:{from_revision}:{from_epoch}", hex::encode(peer.0));
     let chosen = {
         let mut throttle = state.treekem_catchup_throttle.write().await;
-        let chosen =
-            epoch_ahead_catchup_peers(peers, |peer| throttle.get(&throttle_key(peer)).copied());
+        // Peers this task has not asked go first. A new local revision or
+        // epoch changes every throttle key, and without this the rotation
+        // would start again from the first peers.
+        let (fresh, repeat): (Vec<AgentId>, Vec<AgentId>) = peers
+            .iter()
+            .copied()
+            .partition(|peer| !asked.contains(peer));
+        let chosen = epoch_ahead_catchup_peers([fresh, repeat].concat(), |peer| {
+            throttle.get(&throttle_key(peer)).copied()
+        });
         let now = Instant::now();
         for peer in &chosen {
             throttle.insert(throttle_key(peer), now);
         }
+        // Chosen peers are now inside the window too.
+        asked.extend(peers.iter().copied().filter(|peer| {
+            throttle
+                .get(&throttle_key(peer))
+                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+        }));
         chosen
     };
-    if chosen.is_empty() {
-        return false;
-    }
     for peer in chosen {
         let _sent = request_treekem_catchup_page(state, &key, &peer).await;
     }
-    true
+    Some(peers.iter().all(|peer| asked.contains(peer)))
 }
 
 /// #1427: the peers one epoch-ahead round asks. `candidates` is in
@@ -45187,6 +45248,7 @@ pub(in crate::server) mod tests {
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
+            treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,

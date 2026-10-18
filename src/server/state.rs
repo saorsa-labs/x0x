@@ -1204,6 +1204,10 @@ pub(super) struct AppState {
     pub(super) treekem_member_key_packages: super::routes::TreeKemMemberKeyPackageCache,
     /// Anti-spam throttle for outbound catch-up requests.
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
+    /// #1427: per group key, the highest TreeKEM epoch seen in traffic
+    /// while an epoch-ahead catch-up task runs for that group. An entry
+    /// means one task runs; a later observation raises the entry.
+    pub(super) treekem_epoch_ahead_targets: Mutex<HashMap<String, u64>>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
