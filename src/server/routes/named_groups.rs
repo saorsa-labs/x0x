@@ -11701,11 +11701,13 @@ const TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS: usize = 6;
 /// runs at least [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`] rounds, and
 /// continues until every candidate was asked once (ADR 0088 L1: any one
 /// reachable holder is enough). Each such round asks at least one
-/// candidate not yet asked, so the round count is bounded. When the rounds
-/// end without the target, an observation of the same epoch after the
-/// start of the last round starts a new cycle of rounds. That observation
-/// can come from a holder that was offline when the last round asked it.
-/// Without new traffic, the task stops after one cycle.
+/// candidate not yet asked, so the round count is bounded. An observation
+/// can come from a holder that was offline when an earlier round asked
+/// it. So a round that finds a new observation starts a new pass: the
+/// task then continues until it has asked every candidate again. When the
+/// rounds end without the target, an observation after the start of the
+/// last round starts a new cycle of rounds. Without new traffic, the task
+/// stops after one cycle.
 pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
     state: &Arc<AppState>,
     group_id: &str,
@@ -11752,6 +11754,8 @@ async fn request_treekem_catchup_for_epoch_ahead(
     let mut covered = 0;
     let mut renew = false;
     let mut asked = HashSet::new();
+    // When the current pass over the candidates started.
+    let mut since = Instant::now();
     let mut round = 0;
     loop {
         if round > 0 {
@@ -11767,13 +11771,18 @@ async fn request_treekem_catchup_for_epoch_ahead(
                 epoch: target,
                 observations: covered,
             });
-        if std::mem::take(&mut renew) || latest.epoch > target {
+        let renewed = std::mem::take(&mut renew) || latest.epoch > target;
+        if renewed {
             target = target.max(latest.epoch);
-            asked.clear();
             round = 0;
         }
+        if renewed || latest.observations > covered {
+            asked.clear();
+            since = Instant::now();
+        }
         covered = latest.observations;
-        let outcome = request_treekem_catchup_round(state, &key, target, round, &mut asked).await;
+        let outcome =
+            request_treekem_catchup_round(state, &key, target, round, since, &mut asked).await;
         round += 1;
         let more = outcome
             .is_some_and(|all_asked| round < TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS || !all_asked);
@@ -11831,12 +11840,13 @@ fn note_epoch_ahead_observation(
 /// `None` when no later round is needed: this member left the group or
 /// reached `target_epoch`. Otherwise returns whether every candidate is in
 /// `asked`. A candidate goes into `asked` when this round asks it, or when
-/// another request asked it inside the throttle window.
+/// another request asked it at or after `since`.
 async fn request_treekem_catchup_round(
     state: &Arc<AppState>,
     group_id: &str,
     target_epoch: u64,
     round: usize,
+    since: Instant,
     asked: &mut HashSet<AgentId>,
 ) -> Option<bool> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -11894,17 +11904,23 @@ async fn request_treekem_catchup_round(
         for peer in &chosen {
             throttle.insert(throttle_key(peer), now);
         }
-        // Chosen peers are now inside the window too.
+        // Chosen peers were stamped now, so they pass the `since` filter.
         asked.extend(peers.iter().copied().filter(|peer| {
             throttle
                 .get(&throttle_key(peer))
-                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+                .is_some_and(|last| *last >= since)
         }));
         chosen
     };
-    for peer in chosen {
-        let _sent = request_treekem_catchup_page(state, &key, &peer).await;
-    }
+    // Send to the chosen peers together. A send to an offline peer runs
+    // until its DM timeouts end, and in series it would hold back the
+    // next round, which asks the peers that can answer.
+    let _sent = futures::future::join_all(
+        chosen
+            .iter()
+            .map(|peer| request_treekem_catchup_page(state, &key, peer)),
+    )
+    .await;
     Some(peers.iter().all(|peer| asked.contains(peer)))
 }
 

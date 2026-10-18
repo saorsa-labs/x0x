@@ -4130,6 +4130,111 @@ async fn same_epoch_observation_in_the_last_round_asks_again() -> Result<()> {
     Ok(())
 }
 
+/// #1427 (Codex RC5): six candidates, three per round. The penultimate
+/// round asks the signer, which is offline. The signer then comes back
+/// and sends one record at the same missed epoch. The last round asks
+/// only other members. The observation must not be lost: the recovery
+/// must ask the signer again, with no further traffic.
+#[tokio::test]
+async fn same_epoch_observation_in_the_penultimate_round_asks_the_holder_again() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let signer = cast.fixture.state.agent.agent_id();
+    let signer_hex = hex::encode(signer.as_bytes());
+    let missed = cast.epoch_before + 1;
+    // Admins rank first by agent id, so these three rank before the signer.
+    let silent: Vec<AgentId> = (1..=3u8)
+        .map(|last| {
+            let mut id = [0u8; 32];
+            id[31] = last;
+            AgentId(id)
+        })
+        .collect();
+    {
+        let mut groups = victim.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group on the victim");
+        for peer in &silent {
+            info.add_member(
+                hex::encode(peer.as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(signer_hex.clone()),
+                None,
+            );
+        }
+    }
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let sent = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .filter(|recorded| *recorded == group_id.as_bytes())
+            .count()
+    };
+    let prefix = |peer: &AgentId| format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
+    // The throttle uses the wall clock, which paused time does not move.
+    // Removing a peer's entry stands for its throttle window passing.
+    let expire = |peers: &[AgentId]| {
+        let mut throttle = victim
+            .treekem_catchup_throttle
+            .try_write()
+            .expect("no round holds the throttle");
+        throttle.retain(|key, _| !peers.iter().any(|peer| key.starts_with(&prefix(peer))));
+    };
+    let asked = |peer: &AgentId| {
+        let throttle = victim.treekem_catchup_throttle.try_read();
+        throttle.is_ok_and(|throttle| throttle.keys().any(|key| key.starts_with(&prefix(peer))))
+    };
+    let others: Vec<AgentId> = silent
+        .iter()
+        .copied()
+        .chain([cast.fixture.member_id, cast.member_b])
+        .collect();
+    tokio::time::pause();
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, missed);
+    wait_until(|| sent() >= 6).await;
+    assert_eq!(sent(), 6, "the first two rounds ask all six members");
+    assert!(asked(&signer), "the second round asks the signer");
+
+    // Between the third and fourth rounds after the first ask.
+    let rounds = u32::try_from(TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS)?;
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (rounds - 4) + TREEKEM_CATCHUP_THROTTLE / 2)
+        .await;
+    assert_eq!(sent(), 6, "the middle rounds find every member throttled");
+    expire(&[signer]);
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+    assert_eq!(sent(), 7, "the penultimate round asks the offline signer");
+
+    // The signer is back and sends one record at the same epoch.
+    assert!(
+        !note_epoch_ahead_observation(
+            &mut *victim.treekem_epoch_ahead_targets.lock().await,
+            group_id,
+            missed,
+        ),
+        "the running recovery takes the observation"
+    );
+    // The last round finds the signer still inside its window.
+    expire(&others);
+    wait_until(|| sent() >= 10).await;
+    assert_eq!(sent(), 10, "the last round asks three other members");
+
+    expire(&[signer]);
+    wait_until(|| asked(&signer)).await;
+    assert!(
+        asked(&signer),
+        "the recovery must ask the signer again after its observation"
+    );
+    Ok(())
+}
+
 /// #1427 (Codex RC3): the signer ranks after twenty silent admins, so
 /// past six rounds of three. One observation must still reach it.
 #[tokio::test]
