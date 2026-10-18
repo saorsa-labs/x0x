@@ -3880,3 +3880,62 @@ fn epoch_ahead_catchup_rotates_past_unanswered_peers() {
         "the least recently asked peers are asked first"
     );
 }
+
+/// #1427 (Codex RC2): one later-epoch record, then silence. The three
+/// members asked first never answer and the signer ranks fourth. The
+/// single observation must still go on to the signer, with no further
+/// traffic to start a new request.
+#[tokio::test]
+async fn single_epoch_ahead_observation_reaches_the_fourth_ranked_signer() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let signer = cast.fixture.state.agent.agent_id();
+    let signer_hex = hex::encode(signer.as_bytes());
+    // Admins rank first by agent id, so these three rank before the signer.
+    let silent: Vec<AgentId> = (1..=3u8)
+        .map(|last| {
+            let mut id = [0u8; 32];
+            id[31] = last;
+            AgentId(id)
+        })
+        .collect();
+    {
+        let mut groups = victim.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group on the victim");
+        for peer in &silent {
+            info.add_member(
+                hex::encode(peer.as_bytes()),
+                x0x::groups::GroupRole::Admin,
+                Some(signer_hex.clone()),
+                None,
+            );
+        }
+    }
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::pause();
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, cast.epoch_before + 1);
+
+    let asked = |peer: &AgentId| {
+        let prefix = format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
+        let throttle = victim.treekem_catchup_throttle.try_read();
+        throttle.is_ok_and(|throttle| throttle.keys().any(|key| key.starts_with(&prefix)))
+    };
+    wait_until(|| asked(&signer)).await;
+    for peer in &silent {
+        assert!(asked(peer), "the first round asks the three silent admins");
+    }
+    assert!(
+        asked(&signer),
+        "one observation must go on to the fourth-ranked signer"
+    );
+    assert!(
+        asked(&cast.fixture.member_id) && asked(&cast.member_b),
+        "the later round asks the remaining members too"
+    );
+    Ok(())
+}

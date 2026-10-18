@@ -11677,8 +11677,12 @@ async fn request_treekem_catchup_page(
     true
 }
 
-/// Most other active members one epoch-ahead observation asks (#1427).
+/// Most other active members one epoch-ahead round asks (#1427).
 const TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS: usize = 3;
+
+/// Most rounds one epoch-ahead observation runs, one throttle window apart
+/// (#1427).
+const TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS: usize = 6;
 
 /// #1427: traffic at a later TreeKEM epoch than the local live group shows
 /// that this member missed a membership commit. The metadata topic stops
@@ -11686,9 +11690,12 @@ const TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS: usize = 3;
 /// event never reaches the gap catch-up. Ask a few other active members for
 /// a catch-up page on the existing request path. The response handler
 /// applies the served commits with all its usual checks. The shared
-/// per-peer throttle bounds repeats while the gap stays open, and each
-/// later observation asks the members asked least recently, so every
-/// active member is tried in turn (see [`epoch_ahead_catchup_peers`]).
+/// per-peer throttle bounds repeats while the gap stays open. One
+/// observation asks again after each throttle window, at most
+/// [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`] times, and each round asks the
+/// members asked least recently (see [`epoch_ahead_catchup_peers`]). So a
+/// single later-epoch record reaches a signer that ranks after offline
+/// members, with no further traffic.
 pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
     state: &Arc<AppState>,
     group_id: &str,
@@ -11706,6 +11713,26 @@ async fn request_treekem_catchup_for_epoch_ahead(
     group_id: &str,
     observed_epoch: u64,
 ) {
+    for round in 0..TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS {
+        if round > 0 {
+            tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+        }
+        if !request_treekem_catchup_round(state, group_id, observed_epoch, round).await {
+            return;
+        }
+    }
+}
+
+/// One round of [`request_treekem_catchup_for_epoch_ahead`]. Returns
+/// `false` when no later round is needed: this member left the group,
+/// reached `observed_epoch`, or every candidate is inside the throttle
+/// window (another task asks them).
+async fn request_treekem_catchup_round(
+    state: &Arc<AppState>,
+    group_id: &str,
+    observed_epoch: u64,
+    round: usize,
+) -> bool {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let (key, from_revision, from_epoch, peers) = {
         let groups = state.named_groups.read().await;
@@ -11714,10 +11741,10 @@ async fn request_treekem_catchup_for_epoch_ahead(
                 .iter()
                 .find(|(_, info)| info.stable_group_id() == group_id)
         }) else {
-            return;
+            return false;
         };
         if info.withdrawn || !info.has_active_member(&local_agent_hex) {
-            return;
+            return false;
         }
         // Owner and admins first: they sign membership commits, and only
         // the signer can deliver a removal whose binding is the legacy
@@ -11739,12 +11766,13 @@ async fn request_treekem_catchup_for_epoch_ahead(
         (key.clone(), info.state_revision, info.secret_epoch, peers)
     };
     let Some(local_epoch) = current_treekem_epoch(state, &key).await else {
-        return;
+        return false;
     };
     if observed_epoch <= local_epoch {
-        return;
+        return false;
     }
     tracing::info!(
+        round,
         group_id = %LogHexId::group(&key),
         local_epoch,
         observed_epoch,
@@ -11762,16 +11790,20 @@ async fn request_treekem_catchup_for_epoch_ahead(
         }
         chosen
     };
+    if chosen.is_empty() {
+        return false;
+    }
     for peer in chosen {
         let _sent = request_treekem_catchup_page(state, &key, &peer).await;
     }
+    true
 }
 
-/// #1427: the peers one epoch-ahead observation asks. `candidates` is in
+/// #1427: the peers one epoch-ahead round asks. `candidates` is in
 /// preference order. A peer asked inside the throttle window is skipped.
 /// The rest are taken least recently asked first (never asked before
-/// asked), so a later observation moves past offline or stale peers to the
-/// next members instead of asking the same few again.
+/// asked), so a later round moves past offline or stale peers to the next
+/// members instead of asking the same few again.
 fn epoch_ahead_catchup_peers(
     candidates: Vec<AgentId>,
     last_asked: impl Fn(&AgentId) -> Option<Instant>,

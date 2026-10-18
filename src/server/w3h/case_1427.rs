@@ -8,19 +8,22 @@
 //! e+1. V stays down for ten virtual minutes, far past the last metadata
 //! resend, and then starts again at epoch e. V is a plain member, so the
 //! startup self-leave catch-up does not apply to it. No later membership
-//! event follows. The only signal V gets is store traffic from epoch e+1:
-//! the signer writes a new key every few seconds. A removal whose binding
-//! is the legacy `treekem:epoch=<n>` form can only be delivered by its
-//! signer (`catchup_may_apply_removed_as_author`).
+//! event follows. Metadata-topic frames toward V are dropped from the
+//! removal on, so the removal cannot reach V by topic redelivery. The only
+//! signal V gets is store traffic from epoch e+1: the signer writes one
+//! key, then nothing more. A removal whose binding is the legacy
+//! `treekem:epoch=<n>` form can only be delivered by its signer
+//! (`catchup_may_apply_removed_as_author`).
 //!
 //! Two arms, the same scenario:
 //! - plain: nodes O (owner, the signer), B, V and R, all reachable. This
 //!   is the shape the issue reports.
 //! - rotation: nodes O, P, Q, S (owner and three admins), V and R. The
 //!   signer is the admin or owner with the highest agent id, so on V's
-//!   candidate order it ranks after the other three admins. Those three
-//!   are crash-stopped before V returns, so the first catch-up attempt
-//!   reaches nobody and a later attempt must move on to the signer.
+//!   candidate order it ranks after the other three admins. Those three go
+//!   off the fabric after V is back and connected to the signer, so the
+//!   first catch-up round reaches nobody. The single write gives one
+//!   observation, so that observation must move on to the signer.
 //!
 //! GREEN: V's live TreeKEM epoch reaches the signer's, then V reads a
 //! value the signer writes and the signer reads a value V writes. RED (the
@@ -31,29 +34,28 @@
 #![cfg(test)]
 
 use super::control::{
-    create_group, invite, join, local_membership, members, mesh, open_store, path_segment,
-    put_value, read_value, try_open_store,
+    create_group, invite, join, local_membership, members, mesh, open_store, put_value, read_value,
+    try_open_store,
 };
 use super::receipt::{Receipt, Verdict};
 use super::*;
-use crate::network::sim::LaneClass;
+use crate::network::sim::{Fault, LaneClass, Write};
 use anyhow::ensure;
-use base64::Engine as _;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
-const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const SETUP: Duration = Duration::from_secs(180);
 /// V stays down this long. The issue reports ten minutes. The last metadata
 /// resend is 60 s after the removal (`GROUP_CONTROL_REDELIVERY_SCHEDULE`).
 const OFFLINE: Duration = Duration::from_secs(600);
 /// Bound for V to reach the signer's epoch after it starts again.
 const CATCHUP: Duration = Duration::from_secs(120);
-/// The signer writes a new store key this often during the bound.
-const TICK: Duration = Duration::from_secs(5);
 /// Bound for each data-plane check after V caught up.
 const DATA: Duration = Duration::from_secs(60);
 const KEY: &str = "w3h-1427-before";
 const FINAL: &str = "returning_member_reaches_the_new_epoch_and_reads_and_writes";
+const DM_TOPIC_MARKER: &[u8] = b"x0x/dm/v1/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
@@ -77,6 +79,74 @@ impl Arm {
             Self::Plain => &[],
             Self::SignerAfterThreeOfflineAdmins => &["P", "Q", "S"],
         }
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn on_topic(write: &Write, topic: &str) -> bool {
+    write.lane.class == LaneClass::PubSub
+        && !contains(&write.bytes, DM_TOPIC_MARKER)
+        && contains(&write.bytes, topic.as_bytes())
+}
+
+/// Drops metadata-topic frames toward `target` while held, and counts them.
+struct TopicBlock {
+    held: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl TopicBlock {
+    fn install(sim: &Sim, target: &str, topic: &str) -> Result<Self> {
+        let machine = sim.peer(target)?.0;
+        let topic = topic.to_string();
+        let held = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        sim.fabric().add_rule(move |write| {
+            if rule_held.load(Ordering::SeqCst)
+                && write.lane.dst == machine
+                && on_topic(write, &topic)
+            {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        Ok(Self { held, dropped })
+    }
+
+    fn set(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+async fn metadata_topic(sim: &Sim, label: &str, group: &str) -> Result<String> {
+    let state = sim.state(label)?;
+    let groups = state.named_groups.read().await;
+    crate::server::resolve_group_entry_locked(&groups, group)
+        .map(|(_, info)| info.metadata_topic.clone())
+        .with_context(|| format!("{label} has no record of {group}"))
+}
+
+/// Whether `label` has a live fabric link to `other`.
+async fn connected_to(sim: &Sim, label: &str, other: &str) -> bool {
+    let (Ok(state), Ok(other)) = (sim.state(label), sim.peer(other)) else {
+        return false;
+    };
+    match state.agent.network() {
+        Some(network) => network.connected_peers().await.contains(&other),
+        None => false,
     }
 }
 
@@ -138,20 +208,6 @@ fn served_pages(sim: &Sim, label: &str) -> Result<usize> {
                 .is_some_and(|events| !events.is_empty())
         })
         .count())
-}
-
-/// `label` writes `value` under `key` without a barrier (for use inside one).
-async fn try_put(sim: &Sim, label: &str, store: &str, key: &str, value: &str) -> Result<()> {
-    let (status, put) = sim
-        .request(
-            label,
-            Method::PUT,
-            &format!("/stores/{}/{}", path_segment(store), path_segment(key)),
-            Some(json!({"value": BASE64.encode(value), "content_type": "text/plain"})),
-        )
-        .await?;
-    ensure!(status.is_success(), "{label} put {key}: {status} {put}");
-    Ok(())
 }
 
 async fn open_everywhere(sim: &Sim, labels: &[&str], group: &str, store: &str) -> Result<()> {
@@ -249,7 +305,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         "INFRA: V at {e} and {signer} at {signer_e} before the removal"
     );
 
+    let topic = sim
+        .at_instant("read metadata topic", metadata_topic(sim, "O", &group))
+        .await??;
+    let metadata = TopicBlock::install(sim, "V", &topic)?;
     sim.stop("V", RestartMode::Crash).await?;
+    metadata.set(true);
     let (status, removed) = sim
         .api(
             signer,
@@ -273,17 +334,17 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         async { tokio::time::sleep(OFFLINE).await },
     )
     .await?;
-    // Empty in the plain arm: O is the only admin.
-    for decoy in &decoys {
-        sim.stop(decoy, RestartMode::Crash).await?;
-    }
     sim.start_again("V").await?;
-    let online: Vec<&str> = labels
-        .iter()
-        .copied()
-        .filter(|label| !decoys.contains(label))
-        .collect();
-    mesh(sim, &online).await?;
+    mesh(sim, labels).await?;
+    sim.until("V is connected to the signer", SETUP, async |s: &Sim| {
+        connected_to(s, "V", signer).await
+    })
+    .await?;
+    // Empty in the plain arm: O is the only admin. The decoys go off the
+    // fabric only now, so V still has its usual peers to come back to.
+    for decoy in &decoys {
+        sim.set_online(decoy, false)?;
+    }
     let restarted = epoch(sim, "V", &group).await?;
     ensure!(
         restarted == e,
@@ -312,20 +373,13 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
 
     let served_before = served_pages(sim, signer)?;
-    let mut ticks = 0_u32;
-    let mut tick_failures = Vec::new();
-    let mut next_tick = sim.fabric().now();
+    // One later-epoch write, then silence: no further traffic restarts a
+    // catch-up request.
+    let ticks = 1_u32;
+    put_value(sim, signer, &store, "w3h-1427-ahead", "e+1").await?;
     let mut seen = Observations::default();
     let waited = sim
         .until("V reaches the signer's epoch", CATCHUP, async |s: &Sim| {
-            if s.fabric().now() >= next_tick {
-                next_tick = s.fabric().now().saturating_add(TICK);
-                ticks += 1;
-                let key = format!("w3h-1427-tick-{ticks}");
-                if let Err(error) = try_put(s, signer, &store, &key, "e+1").await {
-                    tick_failures.push(format!("{error:#}"));
-                }
-            }
             let Some(v) = seen.observe(epoch_now(s, "V", &group)).await else {
                 return true;
             };
@@ -341,12 +395,6 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         }
     }
     seen.verify("V reaches the signer's epoch")?;
-    ensure!(
-        tick_failures.is_empty(),
-        "INFRA: {} of {ticks} signer writes failed; first: {}",
-        tick_failures.len(),
-        tick_failures.first().map_or("", String::as_str)
-    );
     let v_epoch = epoch(sim, "V", &group).await?;
     let signer_epoch = epoch(sim, signer, &group).await?;
     let served = served_pages(sim, signer)?.saturating_sub(served_before);
@@ -401,6 +449,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         format!("signer writes={ticks} pubsub frames signer->V={traffic}"),
         at(sim),
     );
+    receipt.note(format!(
+        "metadata-topic frames toward V dropped={}",
+        metadata.dropped()
+    ));
     let passed = caught_up && data_ok;
     if !passed {
         receipt.cause(
