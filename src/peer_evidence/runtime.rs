@@ -7,9 +7,9 @@ pub(crate) type GroupContext = dyn Fn(AgentId, AgentId) -> Option<bool> + Send +
 
 type GroupPolicy = dyn Fn(AgentId) -> Option<bool> + Send + Sync;
 
-struct AbortLookupOnDrop(tokio::task::AbortHandle);
+struct AbortWorkerOnDrop(tokio::task::AbortHandle);
 
-impl Drop for AbortLookupOnDrop {
+impl Drop for AbortWorkerOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -149,6 +149,9 @@ impl EvidencePolicy for RuntimePolicy {
 pub struct EvidenceRuntime {
     #[cfg(test)]
     pub(crate) lookup_responder: std::sync::OnceLock<Arc<LookupResponder>>,
+    #[cfg(test)]
+    pub(crate) evidence_dial: std::sync::OnceLock<Arc<LookupResponder>>,
+    reads: Arc<tokio::sync::Semaphore>,
     pub(crate) lookup_context: std::sync::OnceLock<std::sync::Weak<crate::evidence_wire::Context>>,
     pub(crate) group_context: std::sync::RwLock<Option<Arc<GroupContext>>>,
     pub(crate) lookup_hints: crate::evidence_wire::lookup::RoutingHints,
@@ -172,6 +175,9 @@ impl Default for EvidenceRuntime {
         Self {
             #[cfg(test)]
             lookup_responder: Default::default(),
+            #[cfg(test)]
+            evidence_dial: Default::default(),
+            reads: Arc::new(tokio::sync::Semaphore::new(16)),
             lookup_context: Default::default(),
             group_context: Default::default(),
             lookup_hints: Default::default(),
@@ -206,7 +212,10 @@ impl EvidenceRuntime {
     }
 
     /// #1239: Lookup's store and responder-policy reads are synchronous.
-    /// Run them off the async executor, with the caller's absolute deadline.
+    /// The entire Lookup stays on this worker because responder selection and
+    /// exchanges share synchronous policy reads in evidence_wire::lookup.
+    /// The awaiting caller keeps driving I/O and timers, including on a
+    /// current-thread runtime. The caller's absolute deadline also applies.
     /// Reserve the existing Lookup permit before spawning: even workers that
     /// cannot leave a synchronous read yet stay within the 16-Lookup cap.
     pub(crate) async fn lookup_before(
@@ -222,30 +231,79 @@ impl EvidenceRuntime {
         };
         let runtime = Arc::clone(self);
         let executor = tokio::runtime::Handle::current();
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let _cancel = cancelled.clone().drop_guard();
         let worker = tokio::task::spawn_blocking(move || {
             executor.block_on(async move {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(());
+                tokio::select! {
+                    biased;
+                    _ = cancelled.cancelled() => Err(()),
+                    result = async {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(());
+                        }
+                        tokio::time::timeout_at(
+                            deadline,
+                            runtime.lookup_with_permit(agent, None, permit, Some(deadline)),
+                        )
+                        .await
+                        .map_err(|_| ())?;
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(());
+                        }
+                        Ok(())
+                    } => result,
                 }
-                tokio::time::timeout_at(
-                    deadline,
-                    runtime.lookup_with_permit(agent, None, permit, Some(deadline)),
-                )
-                .await
-                .map_err(|_| ())?;
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(());
-                }
-                Ok(())
             })
         });
-        let _abort = AbortLookupOnDrop(worker.abort_handle());
+        let _abort = AbortWorkerOnDrop(worker.abort_handle());
         // Dropping a queued worker aborts it. A running synchronous read cannot
         // be aborted; its permit stays held until it exits, and the deadline
         // checks below prevent a late read from starting a new exchange.
+        // Cancellation also wakes an async worker without needing a timer
+        // driver after the caller returns (notably on current-thread runtimes).
         tokio::time::timeout_at(deadline, worker)
             .await
             .map_err(|_| ())?
+            .map_err(|_| ())?
+    }
+
+    /// Wait for a synchronous point-of-use read within the send's budget.
+    /// Reserve before spawning, so reads stuck behind a store writer cannot
+    /// grow the blocking pool without bound. Cancellation aborts queued work;
+    /// a running read keeps its permit until it leaves the synchronous lock.
+    pub(crate) async fn usable_before(
+        self: &Arc<Self>,
+        agent: AgentId,
+        machine: Option<MachineId>,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        let read = async {
+            let permit = Arc::clone(&self.reads)
+                .acquire_owned()
+                .await
+                .map_err(|_| ())?;
+            let runtime = Arc::clone(self);
+            let worker = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                if tokio::time::Instant::now() >= deadline {
+                    return None;
+                }
+                let now = crate::dm_capability::now_unix_ms();
+                match machine {
+                    Some(machine) => runtime.usable(agent, machine, now),
+                    None => runtime.usable_agent(agent, now),
+                }
+            });
+            let _abort = AbortWorkerOnDrop(worker.abort_handle());
+            let view = worker.await.map_err(|_| ())?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            Ok(view)
+        };
+        tokio::time::timeout_at(deadline, read)
+            .await
             .map_err(|_| ())?
     }
 
