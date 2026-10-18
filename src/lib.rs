@@ -9702,7 +9702,14 @@ impl Agent {
         // binding and the DM-registry/raw-QUIC resolutions re-check below
         // (they can resolve a machine the discovery cache never saw).
         if let Some(machine_id) = {
-            let cache = self.identity_discovery_cache.read().await;
+            // #1239: this preflight read precedes the transport timeouts.
+            // A held writer must not keep an ordinary or waiting send open.
+            let cache = tokio::time::timeout(
+                config.timeout_per_attempt,
+                self.identity_discovery_cache.read(),
+            )
+            .await
+            .map_err(|_| Self::pinned_bound_expired("discovery"))?;
             cache.get(to).map(|entry| entry.machine_id)
         } {
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
@@ -40087,3 +40094,6 @@ mod d08_tests;
 
 #[cfg(test)]
 mod issue1099_tests;
+
+#[cfg(test)]
+mod issue1239_tests;
