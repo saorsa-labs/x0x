@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-kind gossip efficiency counters on `GET /diagnostics/gossip` (#1170).**
+  `per_kind` reports rolling-window `verify_ok` / `verify_err` (count and
+  `total_ns`), `bus_dispatched` / `bus_dropped`, `delivered`, and `published`
+  per PlumTree message kind, with `since_ts` and an M1 health verdict that
+  flags kinds over a 40% share of verify CPU or bus pressure. Verify rows
+  come from saorsa-gossip `verify_by_kind_stats()`; `delivered` /
+  `published` are Eager-only. Needs the pending saorsa-gossip release that
+  ships that API (PR #122) before CI can compile.
+
 ### Changed
 
 - **`x0xd --check-updates` now only reports update availability (#1370).**

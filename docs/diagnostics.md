@@ -180,6 +180,29 @@ counts capability adverts and digest extensions that were dropped by the
 freshness pre-check (#674) without an ML-DSA-65 verify because the store
 already held state at least as new.
 
+## Per-kind efficiency counters (#1170 / Track E M1)
+
+`GET /diagnostics/gossip` exposes `per_kind` for the four efficiency signals
+per PlumTree `MessageKind`:
+
+| Field | Meaning |
+|---|---|
+| `since_ts` | Unix milliseconds when the reporting window started. |
+| `window_secs` | Window length (default 60). Underneath, counters are cumulative; the JSON row is a delta of those cumulatives. When the window elapses, the previous completed interval is retained so a slow poller still sees the measurement; `since_ts` then advances for the new window. |
+| `kinds.<kind>.verify_ok` / `verify_err` | Outer-frame ML-DSA verify observations for that kind (`count` and `total_ns`). Sourced from saorsa-gossip `verify_by_kind_stats()` (cumulative, never reset by a read). `verify_err.count` is the native `failures` counter. Wall time is not split by outcome upstream — `total_ns` is reported under `verify_ok`. |
+| `kinds.<kind>.bus_dispatched` / `bus_dropped` | Recv-pump PubSub forward enqueue vs shed/full drop for that kind. |
+| `kinds.<kind>.delivered` | Local subscriber hand-offs. **Eager-only** (control kinds do not deliver payloads to subscribers). |
+| `kinds.<kind>.published` | Local mesh publishes. **Eager-only** (local publish emits Eager wire frames). |
+| `health.cpu_pressure_kinds` | Kinds whose share of verify `total_ns` exceeds `cpu_share_threshold` (default 0.40). |
+| `health.bus_pressure_kinds` | Kinds whose share of `bus_dispatched + bus_dropped` exceeds `bus_share_threshold` (default 0.40). |
+
+Kind keys match `inbound_by_topic` / `outbound_by_kind`. Untouched kinds are
+omitted. Rates use Δcount / Δtime against `since_ts` within one window; do not
+cross a window boundary. The gossip `failures` counter (and therefore
+`verify_err.count`) counts ML-DSA signature verify failures only — it excludes
+ADR-012 payload-hash mismatches and RejectV1 policy rejections. x0x does not
+call `stage_stats()` or re-count verifies on the receive path.
+
 ## Soak instrumentation (#288)
 
 All fields below are on `GET /diagnostics/gossip`. Every counter is cumulative

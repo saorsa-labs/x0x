@@ -1243,6 +1243,8 @@ fn deliver_copied_notification(
                 stats
                     .delivered_to_subscriber
                     .fetch_add(1, Ordering::Relaxed);
+                // Local subscriber deliveries are Eager payloads (#1170).
+                crate::gossip::per_kind::per_kind_counters().record_delivered(MessageKind::Eager);
                 index += 1;
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2708,6 +2710,15 @@ impl PubSubManager {
         self.plumtree.stage_stats()
     }
 
+    /// Cheap cumulative per-[`MessageKind`] outer ML-DSA verify meters.
+    ///
+    /// Atomic loads only — does not call [`Self::stage_stats`]. Reads never
+    /// reset the counters. Used by `#1170` / Track E M1 `per_kind` diagnostics.
+    #[must_use]
+    pub fn verify_by_kind_stats(&self) -> saorsa_gossip_pubsub::PerKindVerifyMeterSnapshot {
+        self.plumtree.verify_by_kind_stats()
+    }
+
     /// Snapshot of inbound frames/bytes per (topic class, PlumTree kind).
     ///
     /// Surfaced at `GET /diagnostics/gossip` as `inbound_by_topic` (#674)
@@ -3270,6 +3281,8 @@ impl PubSubManager {
         match self.publish_plumtree_and_pump(topic_id, encoded).await {
             Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+                // Local publish onto the mesh is an Eager wire frame (#1170).
+                crate::gossip::per_kind::per_kind_counters().record_published(MessageKind::Eager);
                 let attempted = counts.map(|c| c.attempted).unwrap_or(0);
                 let fan_out = u32::try_from(attempted).unwrap_or(u32::MAX);
                 #[cfg(test)]
@@ -3318,6 +3331,8 @@ impl PubSubManager {
                     self.stats
                         .delivered_to_subscriber
                         .fetch_add(1, Ordering::Relaxed);
+                    crate::gossip::per_kind::per_kind_counters()
+                        .record_delivered(MessageKind::Eager);
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3394,7 +3409,11 @@ impl PubSubManager {
         // the other receive workers (ADR 0009). A completed plain delivery
         // stamps one exclusive payload when it is the sole producer.
         // Recovery, cancellation, a replay, and a failed verification drain
-        // with the id absent. This path does not snapshot stage stats.
+        // with the id absent.
+        //
+        // #1170: outer ML-DSA verify cost is attributed per MessageKind inside
+        // saorsa-gossip (`verify_by_kind_stats`). Do not call `stage_stats()`
+        // or re-count verifies on this hot path.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
@@ -9942,6 +9961,97 @@ mod tests {
         assert_eq!(decoded.sender, Some(kp.agent_id()));
         assert_eq!(decoded.topic, topic);
         assert_eq!(decoded.payload, Bytes::from("signed-modern"));
+    }
+
+    /// #1170: `handle_incoming` must attribute outer verify via the native
+    /// gossip meter (not `stage_stats` deltas) and merge into `per_kind`.
+    #[tokio::test]
+    async fn issue1170_handle_incoming_wires_native_verify_by_kind() {
+        let meter = crate::gossip::per_kind::PerKindGossipCounters::new();
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
+        let topic = "issue1170-verify-wire";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let _sub = manager.subscribe(topic.to_string()).await;
+        let before = manager.verify_by_kind_stats().for_kind(MessageKind::Eager);
+
+        let inner = remote_signed_inner(topic, Bytes::from("verify-wire"));
+        let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, true);
+        manager
+            .handle_incoming(PeerId::new([0x17; 32]), None, frame)
+            .await;
+
+        let after = manager.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        assert!(
+            after.attempts > before.attempts,
+            "native meter must count the Eager verify: before={before:?} after={after:?}"
+        );
+        assert_eq!(
+            after.failures, before.failures,
+            "valid signature must not increment failures"
+        );
+        let snap = meter.snapshot_with_verify(manager.verify_by_kind_stats());
+        let eager = snap.kinds.get("eager").expect("eager row");
+        assert!(eager.verify_ok.count >= 1);
+        assert_eq!(
+            eager.verify_err.count,
+            after.failures.saturating_sub(before.failures)
+        );
+    }
+
+    /// #1170: local publish/deliver paths record Eager-only published/delivered.
+    #[tokio::test]
+    async fn issue1170_publish_and_forward_wire_eager_delivered_published() {
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
+        let topic = "issue1170-forward-wire".to_string();
+        let mut sub = manager.subscribe(topic.clone()).await;
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![PeerId::new([0x42; 32])],
+            sends: Vec::new(),
+        });
+
+        let global_before = crate::gossip::per_kind::per_kind_counters().snapshot();
+        let pub_before = global_before
+            .kinds
+            .get("eager")
+            .map(|r| r.published)
+            .unwrap_or(0);
+        let del_before = global_before
+            .kinds
+            .get("eager")
+            .map(|r| r.delivered)
+            .unwrap_or(0);
+
+        manager
+            .publish(topic.clone(), Bytes::from("forward-wire"))
+            .await
+            .expect("publish");
+        let _ = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+            .await
+            .expect("local delivery timeout")
+            .expect("subscriber closed");
+
+        let global_after = crate::gossip::per_kind::per_kind_counters()
+            .snapshot_with_verify(manager.verify_by_kind_stats());
+        let pub_after = global_after
+            .kinds
+            .get("eager")
+            .map(|r| r.published)
+            .unwrap_or(0);
+        let del_after = global_after
+            .kinds
+            .get("eager")
+            .map(|r| r.delivered)
+            .unwrap_or(0);
+        assert!(
+            pub_after > pub_before,
+            "publish path must record Eager published: before={pub_before} after={pub_after}"
+        );
+        assert!(
+            del_after > del_before,
+            "forward/deliver path must record Eager delivered: before={del_before} after={del_after}"
+        );
     }
 
     /// A broken signer must refuse every network entrypoint before PlumTree.

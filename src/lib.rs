@@ -7466,6 +7466,20 @@ impl Agent {
             .map(|rt| rt.pubsub().stage_stats())
     }
 
+    /// Cumulative per-kind outer ML-DSA verify meters from saorsa-gossip.
+    ///
+    /// Returns `None` when the agent has no gossip runtime. Cheap atomic
+    /// loads; never resets. Merged into `GET /diagnostics/gossip` `per_kind`
+    /// (#1170).
+    #[must_use]
+    pub fn gossip_verify_by_kind_stats(
+        &self,
+    ) -> Option<saorsa_gossip_pubsub::PerKindVerifyMeterSnapshot> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().verify_by_kind_stats())
+    }
+
     /// Snapshot of inbound PubSub frames/bytes per (topic class, kind).
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
