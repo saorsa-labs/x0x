@@ -11692,15 +11692,20 @@ const TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS: usize = 6;
 /// applies the served commits with all its usual checks.
 ///
 /// One task runs per group. It holds the highest epoch observed for the
-/// group in `AppState::treekem_epoch_ahead_targets`. A later observation
-/// while the task runs raises that target and starts the task's round
-/// count again, so a late answer for an older epoch does not end the
-/// recovery of a newer one. Each round asks the members asked least
-/// recently (see [`epoch_ahead_catchup_peers`]), one throttle window
-/// apart. The task runs at least [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`]
-/// rounds, and continues until every candidate was asked once (ADR 0088
-/// L1: any one reachable holder is enough). Each such round asks at least
-/// one candidate not yet asked, so the round count is bounded.
+/// group, and a count of observations, in
+/// `AppState::treekem_epoch_ahead_targets`. A later observation while the
+/// task runs raises that target and starts the task's round count again,
+/// so a late answer for an older epoch does not end the recovery of a
+/// newer one. Each round asks the members asked least recently (see
+/// [`epoch_ahead_catchup_peers`]), one throttle window apart. The task
+/// runs at least [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`] rounds, and
+/// continues until every candidate was asked once (ADR 0088 L1: any one
+/// reachable holder is enough). Each such round asks at least one
+/// candidate not yet asked, so the round count is bounded. When the rounds
+/// end without the target, an observation of the same epoch after the
+/// start of the last round starts a new cycle of rounds. That observation
+/// can come from a holder that was offline when the last round asked it.
+/// Without new traffic, the task stops after one cycle.
 pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
     state: &Arc<AppState>,
     group_id: &str,
@@ -11734,16 +11739,18 @@ async fn request_treekem_catchup_for_epoch_ahead(
         };
         key.clone()
     };
-    {
-        let mut targets = state.treekem_epoch_ahead_targets.lock().await;
-        if let Some(target) = targets.get_mut(&key) {
-            // The running task picks up the higher target.
-            *target = (*target).max(observed_epoch);
-            return;
-        }
-        targets.insert(key.clone(), observed_epoch);
+    if !note_epoch_ahead_observation(
+        &mut *state.treekem_epoch_ahead_targets.lock().await,
+        &key,
+        observed_epoch,
+    ) {
+        // The running task picks up the observation.
+        return;
     }
     let mut target = observed_epoch;
+    // Observations the current round covers.
+    let mut covered = 0;
+    let mut renew = false;
     let mut asked = HashSet::new();
     let mut round = 0;
     loop {
@@ -11756,12 +11763,16 @@ async fn request_treekem_catchup_for_epoch_ahead(
             .await
             .get(&key)
             .copied()
-            .unwrap_or(target);
-        if latest > target {
-            target = latest;
+            .unwrap_or(EpochAheadTarget {
+                epoch: target,
+                observations: covered,
+            });
+        if std::mem::take(&mut renew) || latest.epoch > target {
+            target = target.max(latest.epoch);
             asked.clear();
             round = 0;
         }
+        covered = latest.observations;
         let outcome = request_treekem_catchup_round(state, &key, target, round, &mut asked).await;
         round += 1;
         let more = outcome
@@ -11770,13 +11781,50 @@ async fn request_treekem_catchup_for_epoch_ahead(
             continue;
         }
         let mut targets = state.treekem_epoch_ahead_targets.lock().await;
-        if targets.get(&key).is_some_and(|latest| *latest > target) {
-            // A later observation arrived during this round.
+        let latest = targets.get(&key).copied();
+        // A later epoch, or (when the rounds ran out before the target) a
+        // new observation since this round started, starts a new cycle.
+        if latest.is_some_and(|latest| {
+            latest.epoch > target || (outcome.is_some() && latest.observations > covered)
+        }) {
+            renew = true;
             continue;
         }
         targets.remove(&key);
         return;
     }
+}
+
+/// #1427: the epoch-ahead traffic seen for one group while its catch-up
+/// task runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::server) struct EpochAheadTarget {
+    /// The highest TreeKEM epoch observed.
+    pub(in crate::server) epoch: u64,
+    /// How many observations arrived after the first one, at any epoch.
+    pub(in crate::server) observations: u64,
+}
+
+/// Records one epoch-ahead observation for `key`. Returns `true` when no
+/// task runs for the group, so the caller must run one.
+fn note_epoch_ahead_observation(
+    targets: &mut HashMap<String, EpochAheadTarget>,
+    key: &str,
+    observed_epoch: u64,
+) -> bool {
+    if let Some(target) = targets.get_mut(key) {
+        target.epoch = target.epoch.max(observed_epoch);
+        target.observations = target.observations.saturating_add(1);
+        return false;
+    }
+    targets.insert(
+        key.to_string(),
+        EpochAheadTarget {
+            epoch: observed_epoch,
+            observations: 0,
+        },
+    );
+    true
 }
 
 /// One round of [`request_treekem_catchup_for_epoch_ahead`]. Returns

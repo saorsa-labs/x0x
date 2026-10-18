@@ -4026,7 +4026,7 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
             .treekem_epoch_ahead_targets
             .try_lock()
             .ok()
-            .and_then(|targets| targets.get(group_id).copied())
+            .and_then(|targets| targets.get(group_id).map(|target| target.epoch))
     };
     wait_until(|| target() == Some(second_epoch)).await;
     assert_eq!(
@@ -4048,6 +4048,85 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
         sent() > before,
         "the recovery must go on asking for the newer epoch"
     );
+    Ok(())
+}
+
+/// #1427 (Codex RC4): the last round of a recovery asks the signer, which
+/// is offline. The signer then comes back and sends one record at the
+/// same missed epoch, after that attempt and before the round ends. The
+/// observation changes no target epoch, but it must not be lost: the
+/// recovery must ask the signer again, with no further traffic.
+#[tokio::test]
+async fn same_epoch_observation_in_the_last_round_asks_again() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let victim = &cast.victim_state;
+    let group_id = &cast.fixture.group_id;
+    let signer = cast.fixture.state.agent.agent_id();
+    let missed = cast.epoch_before + 1;
+    victim
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let sent = || {
+        victim
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .expect("catch-up recorder")
+            .iter()
+            .filter(|recorded| *recorded == group_id.as_bytes())
+            .count()
+    };
+    // The throttle uses the wall clock, which paused time does not move.
+    // Removing a peer's entry stands for its throttle window passing.
+    let expire = |throttle: &mut HashMap<String, Instant>, peer: &AgentId| {
+        let prefix = format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
+        throttle.retain(|key, _| !key.starts_with(&prefix));
+    };
+    tokio::time::pause();
+
+    spawn_treekem_epoch_ahead_catchup(victim, group_id, missed);
+    wait_until(|| sent() >= 3).await;
+    assert_eq!(sent(), 3, "the first round asks all three members");
+
+    // Halfway between the rounds before the last one and the last one.
+    let rounds = u32::try_from(TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS)?;
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (rounds - 2) + TREEKEM_CATCHUP_THROTTLE / 2)
+        .await;
+    assert_eq!(sent(), 3, "the middle rounds find every member throttled");
+    // Hold the throttle so the last round stops after it reads its target.
+    let mut throttle = victim.treekem_catchup_throttle.write().await;
+    expire(&mut throttle, &signer);
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+    // Hold the targets so the last round stops before it ends.
+    let mut targets = victim.treekem_epoch_ahead_targets.lock().await;
+    drop(throttle);
+    wait_until(|| sent() >= 4).await;
+    assert_eq!(sent(), 4, "the last round asks the offline signer");
+
+    // The signer is back and sends one record at the same epoch.
+    assert!(
+        !note_epoch_ahead_observation(&mut targets, group_id, missed),
+        "the running recovery takes the observation"
+    );
+    expire(&mut *victim.treekem_catchup_throttle.write().await, &signer);
+    drop(targets);
+
+    wait_until(|| sent() > 4).await;
+    assert!(
+        sent() > 4,
+        "a same-epoch observation in the last round must start a new request"
+    );
+    let asked_signer = {
+        let prefix = format!("{group_id}:{}:", hex::encode(signer.as_bytes()));
+        victim
+            .treekem_catchup_throttle
+            .read()
+            .await
+            .keys()
+            .any(|key| key.starts_with(&prefix))
+    };
+    assert!(asked_signer, "the new request asks the signer");
     Ok(())
 }
 
