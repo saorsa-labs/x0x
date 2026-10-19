@@ -301,24 +301,34 @@ version bump.
   `connect_addr`, so ant-quic's own bootstrap counter never sees the join).
   Degrades when seeds are configured, none is reachable, and uptime passed the
   120 s grace. `configured: 0` (`--no-hard-coded-bootstrap`, no config
-  peers) is not applicable and stays `ok`.
+  peers) is not applicable and stays `ok`. `connected` counts live seed
+  links in the connection table: once the mesh has formed, ant-quic may let
+  seed links idle out, and a healthy seeded node can then read `degraded`
+  after the grace. This is unverified on the fleet — do not alert on this
+  input until it has been checked there (#1466 review finding).
 - `send_failure_rate` — failed/(attempted) gossip publishes over a rolling
   60 s window. Below 5 attempts the `rate` is `null` and the input stays
   `ok`; at ≥ 5 attempts a rate ≥ 0.5 degrades.
 - `delivery_probe` — a local-only probe, every 30 s (first at ~10 s after
   start). Each round signs a nonce payload (a fixed magic prefix plus 16
-  random bytes — it carries no ids and no addresses) with the daemon's
-  ML-DSA-65 key, encodes the signed V2 envelope, then decodes and verifies
-  it in-process; it then publishes the nonce on the `local:` topic
+  random bytes — it carries no ids and no addresses) twice, both
+  in-process: with the agent key — the signer production publishes sign
+  message payloads with — encoding and verifying the signed V2 envelope;
+  and with the machine-bound transport key — the signer PlumTree signs
+  outer frames with, also checking its binding to the node's transport
+  peer id. It then publishes the nonce on the `local:` topic
   `local:x0x.health.probe.v1` and requires its own payload back through
   subscribe → subscriber handoff within 5 s. No frame leaves the node, no
   peer receives or verifies the probe, and no network-visible topic
   exists (RC5 review of #1380: the probe's earlier form broadcast a
   network-wide signed frame every 30 s while its own-nonce self-delivery
-  proved nothing about remote delivery). Covered: the wire-crypto path
-  (sign, encode, decode, verify) and the same-daemon dispatch path. Not
-  covered: PlumTree fan-out and delivery to remote peers — a network-wide
-  probe would be a separate wire decision. `probes_run: 0` (no gossip
+  proved nothing about remote delivery). Covered: the inner-envelope
+  wire crypto (sign, encode, decode, verify), the machine-key transport
+  signer's sign/verify and peer-id binding, and the same-daemon dispatch
+  path — the probe's verifies count into its own counters, not the wire
+  diagnostics. Not covered: PlumTree fan-out, outer-frame construction
+  for a real peer, and delivery to remote peers — a network-wide probe
+  would be a separate wire decision. `probes_run: 0` (no gossip
   runtime, or before the first probe) is `ok`; the last failed probe
   degrades (#288's blind spot at local scope: serving HTTP while the
   local dispatch pipeline is wedged). `last_latency_ms` is `null` when
@@ -360,7 +370,14 @@ after the last refresh.
 counts, booleans and classifications only. It never reports agent or
 machine ids (presence booleans only; the ids stay on the authed `/agent`),
 never the raw custom plane id, never seed addresses, and never the upgrade
-repository.
+repository. The counts are still host detail — disk free/total bytes,
+`latest_version`, `user_present`, windowed error and publish-failure
+counts. On the default loopback bind only the local operator can read
+them; on a non-loopback `api_address` bind (which logs a loud startup
+warning) any unauthenticated caller that reaches the port can. Treat
+loopback-by-default as part of this boundary; an off-loopback bind that
+must not disclose host detail needs a reverse proxy in front (#1466
+review finding).
 
 ### Example: status
 

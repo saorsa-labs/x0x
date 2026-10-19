@@ -4777,9 +4777,17 @@ fn verify_signature(
 }
 
 /// Sign, encode, decode and verify one V2 envelope entirely on this node —
-/// the same wire-crypto path a network publish takes (signing payload,
-/// ML-DSA-65 signature, envelope encode, decode with signature verify),
-/// without PlumTree admission and without a frame ever reaching a peer.
+/// the inner-envelope half of a network publish (signing payload, ML-DSA-65
+/// signature with the given signer, envelope encode, decode with signature
+/// verify), without PlumTree admission and without a frame ever reaching a
+/// peer. The outer PlumTree frame is signed by the machine-bound transport
+/// key (`NetworkNode::pubsub_signing_key`), which this function does not
+/// touch; callers that need that coverage exercise the signer separately
+/// (the health probe does).
+///
+/// Verify time is recorded into the caller's `verify_stats`, not the
+/// process-wide [`INNER_VERIFY_STATS`]: a local probe must not add counts
+/// to the wire diagnostics behind [`inner_verify_stats`].
 ///
 /// The RC5 local-only health probe (#1380) uses this to keep the
 /// sign/verify/decode half of its delivery coverage after leaving the
@@ -4790,6 +4798,7 @@ pub(crate) fn sign_decode_verify_local(
     signing: &SigningContext,
     topic: &str,
     payload: &Bytes,
+    verify_stats: &InnerVerifyStats,
 ) -> NetworkResult<PubSubMessage> {
     let version = SignedVersion::V2;
     let signing_payload =
@@ -4803,7 +4812,7 @@ pub(crate) fn sign_decode_verify_local(
         topic,
         payload,
     )?;
-    let message = decode_signed(&envelope, version, &INNER_VERIFY_STATS)?;
+    let message = decode_signed(&envelope, version, verify_stats)?;
     if !message.verified {
         return Err(NetworkError::SerializationError(
             "locally signed envelope did not verify".to_string(),
