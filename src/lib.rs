@@ -13333,7 +13333,7 @@ impl Agent {
             // so dialing on each received announcement copy leaks memory
             // without bound (see ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN).
             let mut auto_connect_attempts =
-                std::collections::HashMap::<identity::AgentId, std::time::Instant>::new();
+                std::collections::HashMap::<identity::AgentId, tokio::time::Instant>::new();
 
             let mut seen_identity_payloads: std::collections::HashMap<
                 blake3::Hash,
@@ -14320,7 +14320,7 @@ impl Agent {
                     && !auto_connect_addresses.is_empty()
                     && announcement_auto_connect_retry_allowed(
                         auto_connect_attempts.get(&announcement.agent_id).copied(),
-                        std::time::Instant::now(),
+                        tokio::time::Instant::now(),
                     )
                 {
                     if let Some(net) = &network {
@@ -14336,7 +14336,7 @@ impl Agent {
                         let connected = net.is_connected(&ant_peer).await;
                         if announcement_should_auto_connect(suppressed, connected) {
                             auto_connect_attempts
-                                .insert(announcement.agent_id, std::time::Instant::now());
+                                .insert(announcement.agent_id, tokio::time::Instant::now());
                             let net = std::sync::Arc::clone(net);
                             let addresses = auto_connect_addresses.clone();
                             let target_machine = announcement.machine_id;
@@ -20581,9 +20581,14 @@ const ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN: std::time::Duration =
 /// Pure so the anti-storm invariant (at most one dial per
 /// [`ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN`] per agent) is unit-testable
 /// independently of the gossip stack.
+///
+/// #1427: the window is on the runtime clock, as the reconnect backoff is.
+/// On a paused (virtual) clock a wall-clock window outlived a ten-minute
+/// absence, so a peer that dialled at startup never dialled the returning
+/// node again.
 fn announcement_auto_connect_retry_allowed(
-    last_attempt: Option<std::time::Instant>,
-    now: std::time::Instant,
+    last_attempt: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
 ) -> bool {
     last_attempt.is_none_or(|last| {
         now.saturating_duration_since(last) >= ANNOUNCEMENT_AUTO_CONNECT_RETRY_COOLDOWN
@@ -31637,7 +31642,7 @@ mod tests {
     /// so an unbounded dial rate was an unbounded memory leak (v0.31 testnet OOM).
     #[test]
     fn announcement_auto_connect_retry_cooldown_gates_redials() {
-        let now = std::time::Instant::now();
+        let now = tokio::time::Instant::now();
         // First-ever announcement: dial immediately.
         assert!(announcement_auto_connect_retry_allowed(None, now));
         // Same instant as the last attempt: refuse.
@@ -31657,6 +31662,24 @@ mod tests {
         assert!(!announcement_auto_connect_retry_allowed(
             Some(at_boundary),
             now
+        ));
+    }
+
+    /// #1427: a peer that auto-dialled at startup must dial a node that
+    /// comes back after a ten-minute absence. The window is on the runtime
+    /// clock, so ten virtual minutes pass it even though almost no wall
+    /// time passes.
+    #[tokio::test(start_paused = true)]
+    async fn announcement_auto_connect_retry_window_follows_the_runtime_clock() {
+        let dialled = tokio::time::Instant::now();
+        assert!(!announcement_auto_connect_retry_allowed(
+            Some(dialled),
+            tokio::time::Instant::now()
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        assert!(announcement_auto_connect_retry_allowed(
+            Some(dialled),
+            tokio::time::Instant::now()
         ));
     }
 

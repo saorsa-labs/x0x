@@ -1694,6 +1694,18 @@ struct CatchupRelay {
     epoch_before: u64,
 }
 
+impl CatchupRelay {
+    /// The daemon's shutdown path for both states: drain the server tasks
+    /// (an epoch-ahead catch-up still between rounds is one), then shut the
+    /// Agent down, so nothing outlives the test.
+    async fn shutdown(self) {
+        for state in [&self.victim_state, &self.fixture.state] {
+            crate::server::drain_server_tasks(state, Vec::new()).await;
+            state.agent.shutdown().await;
+        }
+    }
+}
+
 async fn catchup_relay_fixture() -> Result<CatchupRelay> {
     let mut fixture = two_member_treekem_group().await?;
     let member_b_kp = x0x::identity::AgentKeypair::generate()?;
@@ -1904,6 +1916,7 @@ async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
             .is_err(),
         "the removed member must not read the author's new ciphertext"
     );
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -1994,6 +2007,7 @@ async fn catchup_third_party_relays_a_digest_bound_rekey() -> Result<()> {
             .is_err(),
         "the leaver must not read the relayed epoch"
     );
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -3762,6 +3776,7 @@ async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "decrypt after catch-up: {body:?}");
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -3824,6 +3839,7 @@ async fn epoch_ahead_store_record_requests_catchup() -> Result<()> {
         asked() > 0,
         "a later-epoch store record must start a TreeKEM catch-up request"
     );
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -3937,6 +3953,7 @@ async fn single_epoch_ahead_observation_reaches_the_fourth_ranked_signer() -> Re
         asked(&cast.fixture.member_id) && asked(&cast.member_b),
         "the later round asks the remaining members too"
     );
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -4048,6 +4065,7 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
         sent() > before,
         "the recovery must go on asking for the newer epoch"
     );
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -4127,6 +4145,7 @@ async fn same_epoch_observation_in_the_last_round_asks_again() -> Result<()> {
             .any(|key| key.starts_with(&prefix))
     };
     assert!(asked_signer, "the new request asks the signer");
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -4232,6 +4251,7 @@ async fn same_epoch_observation_in_the_penultimate_round_asks_the_holder_again()
         asked(&signer),
         "the recovery must ask the signer again after its observation"
     );
+    cast.shutdown().await;
     Ok(())
 }
 
@@ -4289,5 +4309,6 @@ async fn single_epoch_ahead_observation_asks_every_candidate() -> Result<()> {
     for peer in &everyone {
         assert!(asked(peer), "every candidate is asked");
     }
+    cast.shutdown().await;
     Ok(())
 }
