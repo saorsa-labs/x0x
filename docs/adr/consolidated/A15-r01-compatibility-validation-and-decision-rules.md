@@ -22,23 +22,24 @@ Current CI protects accepted ADR text and associated frozen evidence. Code, test
 
 Use stable current IDs [A01](A01-r01-purpose-and-product-limits.md)–A15. Archived records and previous accepted revisions do not count towards the limit.
 
-A new or changed decision is `docs/adr/transient/T-<slug>.md` (D242). It
-names one target slot from A01 to A15. Write 300 to 600 words. Use about
-80% ASD-STE100 style. Follow the [style guide](../../documentation-style.md).
-It stays Proposed until accepted under the [transient acceptance rule](../transient/README.md):
-David, or Claude and Codex consensus for no wire-format or public-API change.
-David folds it into that slot only
-when he asks. Reserved numbers and slices keep the [numbered decision path](README.md).
+David's 19 Oct 2026 ruling prohibits new ADR files, including transient
+records and folded overlays. Keep the pack at 15. Put rationale in the PR
+body and existing documentation or code doc comments. Wire-format or
+public-API changes need a `FOR ENGINEER:` line for David's decision. Record
+his approval in the PR body or comment. An approved additive API needs no
+new ADR. Preserve Accepted bytes and frozen evidence. See the
+[current authoring rule](../transient/README.md).
 
 After transfer and revision-aware gate support, the proposed model selects
-one accepted revision per active slot. A successor uses that slot's next
-revision; David accepts it, and the earlier accepted text remains unchanged.
+one accepted revision per active slot. That historical future model does not
+authorize a new revision file under the current no-new-ADR ruling. David
+directs any later change; earlier Accepted text remains unchanged.
 The present gate supports one Proposed draft per slot. An agent cannot accept
 it or create A16.
 
 Target 500–1,000 words per ADR. Review records above 1,500 words. Keep the key guarantees, alternatives and consequences in the decision record.
 
-Supporting specifications contain wire layouts, complete state machines, schemas and test detail. They may evolve only within the accepted guarantees. A material authority or compatibility change needs an accepted decision. Record that decision as `docs/adr/transient/T-<slug>.md` (D242). Name one target slot from A01 to A15. Keep reserved numbers 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63). Slices 0109–0114 continue to acceptance as numbered ADRs.
+Supporting specifications contain wire layouts, complete state machines, schemas and test detail. They may evolve only within the accepted guarantees. A material authority or compatibility change needs its existing decision gate. Explain the rationale in the PR and existing documentation. Route wire-format or public-API questions to Engineer for David. Preserve reserved numbers and existing team gates; do not add a record.
 
 ## Language
 

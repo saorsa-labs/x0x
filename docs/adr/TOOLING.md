@@ -2,25 +2,26 @@
 
 ## Use the 15 slot plan
 
-Read [the consolidation rules](consolidated/README.md) before creating a record.
-A new or changed decision is [`docs/adr/transient/T-<slug>.md`](transient/README.md)
-(D242). It names one target slot from A01 to A15. Write 300 to 600 words.
-Use about 80% ASD-STE100 style. Follow the [style guide](../documentation-style.md).
-It stays Proposed until accepted under the [transient acceptance rule](transient/README.md):
-David, or Claude and Codex consensus for no wire-format or public-API change.
-David folds it into that slot only
-when he asks. Slot revisions are
-drafts until David accepts the transfer. Do not allocate A16 or start a
-second consolidated series. Keep reserved numbers 0090/0091 (D18), 0097
-(D20), 0098 (D35), and 0084–0105 (D63). Slices 0109–0114 continue to
-acceptance as numbered ADRs. The tools below support that numbered series.
-Use [the writing guide](../documentation-style.md) for new and changed prose.
+Read [the consolidation rules](consolidated/README.md) and the
+[current authoring rule](transient/README.md#current-authoring-rule-19-oct-2026).
+Do not add ADR files, including transient records or folded overlays. Keep
+A01 through A15; do not allocate A16 or a second consolidated series.
+Put the rationale in the PR body and existing docs or code doc comments.
+A wire-format or public-API change needs a `FOR ENGINEER:` line for David's
+decision. Record his approval in the PR body or comment. An approved additive
+API does not need a new ADR.
+
+Existing Accepted records and frozen evidence remain unchanged. The tools
+below inspect the retained collection; their support for the earlier numbered
+and transient formats is not permission to create files. Follow
+[the writing guide](../documentation-style.md) for changed prose.
 
 We use ADRs as engineering memory, not paperwork. They capture *why* a decision was made, what alternatives were rejected, and what consequences we accept.
 
 ## Install `adrs`
 
-`adrs` is the preferred local CLI for creating, searching, and checking ADRs.
+`adrs` can list, search and check the existing ADR collection. Do not use it
+to create a record.
 
 ```bash
 cargo install adrs
@@ -54,19 +55,21 @@ If the published package name differs on your machine, install from the project 
 Add this project instruction to every AI coding harness profile (`AGENTS.md`, `CLAUDE.md`, Codex/OpenCode project rules, pi harness prompts, etc.):
 
 ```text
-Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models, or operational invariants, inspect docs/adr/.
-D242: a new or changed decision is docs/adr/transient/T-<slug>.md. Name one slot A01-A15. Write 300 to 600 words. Use about 80% ASD-STE100 style. Follow docs/documentation-style.md. Stay Proposed until accepted under docs/adr/transient/README.md: David, or Claude and Codex consensus for no wire-format or public-API change. Fold it into that slot only when David asks.
-A01-A15 slot revisions are drafts until David accepts the transfer. Do not create A16 or a second consolidated series.
-Keep reserved numbers 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63); slices 0109–0114 continue to numbered acceptance. Keep their current gates.
-Use approximately 80% ASD-STE100 style in ADRs, docs and communication with David. Follow docs/documentation-style.md.
-Never edit an Accepted ADR. Create a superseding ADR instead.
-Never mark an ADR Accepted without David's acceptance or the recorded Claude and Codex consensus permitted by docs/adr/transient/README.md.
-During review, check ADR correctness, rejected alternatives, evidence, consequences, and immutable-Accepted compliance.
+Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models or operational invariants, inspect docs/adr/ and its status overlay.
+Keep the ADR pack at 15. Do not add ADR files, including transient T-*.md records or folded overlays (David's 19 Oct 2026 ruling).
+Put the rationale in the PR body and existing documentation or code doc comments.
+If a change touches the wire format or public API, write a FOR ENGINEER: line for David's decision. Record his approval in the PR body/comment; an approved additive API needs no new ADR.
+Preserve Accepted records and frozen evidence. Do not create a successor record or change an acceptance status as a workaround.
+Use approximately 80% ASD-STE100 style. Follow docs/documentation-style.md.
+During review, check correctness, alternatives, evidence, consequences and unchanged Accepted bytes. Existing release, security and independent-review gates still apply.
 ```
 
 ## Review standard
 
-Do **not** "vibe code" ADRs. A useful ADR must show clear thinking: context, options, trade-offs, consequences, and validation. AI can help prepare a draft. Acceptance requires David or the recorded consensus permitted by [the transient rules](transient/README.md).
+Review the rationale where it lives: the PR body and existing docs or code
+comments. State the context, alternatives, consequences and validation.
+Keep an unresolved David decision visible; a document or a green CI run does
+not grant approval. Preserve the existing Accepted text and frozen evidence.
 
 ## Transition check coverage
 
@@ -82,14 +85,12 @@ map keep their exact paths as links and stay outside that count. The count
 excludes a path only when that path is an approved historical source and
 `docs/adr-archive/move.json` records it as that archive link. A new
 `move.json` entry outside that set is rejected. Files under
-`docs/adr/transient/` do not count (D242). A new decision there is
-`T-<slug>.md`, names one target slot from A01 to A15, and stays Proposed
-until accepted under the [transient acceptance rule](transient/README.md).
-The validator checks lifecycle and immutability, not reviewer identity or
-the no-wire/no-API claim; review must verify the acceptance evidence.
-An Accepted transient body stays frozen. Folding
-adds `T-<slug>.folded.md` beside that file. The Accepted bytes stay the
-same. A nested
+`docs/adr/transient/` do not count (D242). The validator still understands
+the existing `T-<slug>.md` format and its lifecycle. It checks structure and
+immutability, not reviewer identity, approval scope or the current prohibition
+on new ADR files. Review must enforce that prohibition separately.
+An Accepted transient body stays frozen. Existing folded overlays refer to
+that body without changing it. A nested
 file that reuses a mapped number counts. A legal run prints the pass line
 only. It does not name an unplaced record.
 
