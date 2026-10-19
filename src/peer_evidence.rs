@@ -527,6 +527,8 @@ pub struct PeerEvidenceStore {
     max_age: u64,
     policy: Arc<dyn EvidencePolicy>,
     state: Mutex<State>,
+    #[cfg(test)]
+    pub(crate) usable_agent_entered: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<()>>,
     // Serializes snapshot mutations and disk writes; readers never acquire it.
     // Always acquire before state, and release state before any disk write.
     mutation: Mutex<()>,
@@ -607,6 +609,8 @@ impl PeerEvidenceStore {
                 counters,
                 ..State::default()
             }),
+            #[cfg(test)]
+            usable_agent_entered: Default::default(),
             mutation: Mutex::new(()),
             #[cfg(test)]
             slow_write: Mutex::new(None),
@@ -829,6 +833,10 @@ impl PeerEvidenceStore {
 
     /// Resolve an unknown machine, then run the same point-of-use authority check.
     pub fn usable_agent(&self, agent: AgentId, now: u64) -> Option<Arc<EvidenceView>> {
+        #[cfg(test)]
+        if let Some(entered) = self.usable_agent_entered.get() {
+            let _ = entered.send(());
+        }
         let machine = self
             .state
             .lock()

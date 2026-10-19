@@ -9146,6 +9146,8 @@ impl Agent {
         // 1. Signal every token-aware loop to break. Inert until now, so this
         //    is the first thing that changes steady-state behavior.
         self.shutdown_token.cancel();
+        // Retain and join evidence workers even if this shutdown is cancelled.
+        self.peer_evidence().shutdown_workers().await;
         self.capability_refreshes.shutdown_workers().await;
 
         // 2. Stop the simple Option<JoinHandle> background tasks.
