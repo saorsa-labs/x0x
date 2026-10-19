@@ -196,15 +196,21 @@ fn fixture_role_host_backup_apply_worker() {
     let outcome = upgrader
         .perform_upgrade(&incoming, &Version::parse(TO).unwrap())
         .expect("perform_upgrade");
-    assert!(
-        matches!(outcome, UpgradeResult::Success { .. }),
-        "disk-already-matches must still be Success, not NoUpgrade: {outcome:?}"
-    );
 
     // Skip leaves the incoming path in place; replace renames it onto the target.
+    // Public perform_upgrade reports NoUpgrade on an already-matching disk
+    // (#1447 RC4); replace still returns Success.
     let kind = if incoming.exists() {
+        assert!(
+            matches!(outcome, UpgradeResult::NoUpgrade),
+            "disk-already-matches must be public NoUpgrade: {outcome:?}"
+        );
         "skipped"
     } else {
+        assert!(
+            matches!(outcome, UpgradeResult::Success { .. }),
+            "replace must be Success: {outcome:?}"
+        );
         "replaced"
     };
     fs::write(&result, kind).unwrap();
@@ -337,7 +343,8 @@ fn two_processes_preserve_original_backup_unconditionally() {
 }
 
 /// Two old-running units (both `current_version` older than the candidate)
-/// share one on-disk target: both return Success; backup keeps pre-upgrade bytes.
+/// share one on-disk target: one replaces, one may skip (public NoUpgrade);
+/// backup keeps pre-upgrade bytes.
 #[test]
 fn two_old_processes_one_shared_target_both_succeed() {
     if std::env::var_os(WORKER_ENV).is_some() {

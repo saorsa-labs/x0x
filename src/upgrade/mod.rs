@@ -150,10 +150,13 @@ impl Upgrader {
     /// Under a host-wide exclusive lock beside this target
     /// (`<target-file-name>.upgrade.lock`), if the on-disk target already
     /// matches the incoming bytes, backup and replace are skipped and
-    /// [`UpgradeResult::Success`] is still returned so the carried restart
-    /// path runs (T-self-update-host-backup-guard / #1447). Companion
-    /// binaries (e.g. `x0x` next to `x0xd`) take their own lock file beside
-    /// that path via the same mechanism.
+    /// [`UpgradeResult::NoUpgrade`] is returned (public API; same meaning as
+    /// an already-satisfied install). The auto-apply restart-owner path uses
+    /// [`Self::finish_upgrade_under_host_lock`] with
+    /// [`HostMatchOutcome::RestartOwner`] so an old-running process still
+    /// restarts into those bytes (T-self-update-host-backup-guard / #1447).
+    /// Companion binaries (e.g. `x0x` next to `x0xd`) take their own lock
+    /// file beside that path via the same mechanism.
     pub fn perform_upgrade(
         &self,
         new_binary_path: &Path,
@@ -165,17 +168,26 @@ impl Upgrader {
         // Dropping the guard releases the OS lock; the lock file is never
         // unlinked, so reclaim cannot remove a file another process still holds.
         let _host_lock = acquire_host_upgrade_lock(&self.target_path)?;
-        self.finish_upgrade_under_host_lock(new_binary_path, target_version)
+        self.finish_upgrade_under_host_lock(
+            new_binary_path,
+            target_version,
+            HostMatchOutcome::PublicNoUpgrade,
+        )
     }
 
     /// Compare / backup / replace while the caller already holds this target's
     /// host lock. Used by the offloaded multi-target apply so every lock can
     /// be taken before any mutation (cancel must not install bytes without a
     /// restart owner).
+    ///
+    /// `on_match` selects the public [`UpgradeResult::NoUpgrade`] report versus
+    /// the crate-internal restart-owner [`UpgradeResult::Success`] when disk
+    /// already matches the incoming bytes.
     pub(super) fn finish_upgrade_under_host_lock(
         &self,
         new_binary_path: &Path,
         target_version: &Version,
+        on_match: HostMatchOutcome,
     ) -> Result<UpgradeResult, UpgradeError> {
         if on_disk_matches_incoming(&self.target_path, new_binary_path)? {
             info!(
@@ -183,8 +195,11 @@ impl Upgrader {
                 target = %self.target_path.display(),
                 "On-disk target already matches incoming binary; skipping backup and replace"
             );
-            return Ok(UpgradeResult::Success {
-                version: target_version.to_string(),
+            return Ok(match on_match {
+                HostMatchOutcome::PublicNoUpgrade => UpgradeResult::NoUpgrade,
+                HostMatchOutcome::RestartOwner => UpgradeResult::Success {
+                    version: target_version.to_string(),
+                },
             });
         }
 
@@ -223,6 +238,20 @@ impl Upgrader {
     }
 }
 
+/// How [`Upgrader::finish_upgrade_under_host_lock`] reports an on-disk match.
+///
+/// Crate-internal only: the public [`Upgrader::perform_upgrade`] always uses
+/// [`HostMatchOutcome::PublicNoUpgrade`]. Auto-apply uses
+/// [`HostMatchOutcome::RestartOwner`] so admission can still own restart.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum HostMatchOutcome {
+    /// Public API: already-installed bytes → [`UpgradeResult::NoUpgrade`].
+    PublicNoUpgrade,
+    /// Auto-apply / restart-owner: already-installed bytes → Success so the
+    /// carried restart continuation still runs.
+    RestartOwner,
+}
+
 /// Persistent lock file beside `target`: `<file-name>.upgrade.lock`.
 ///
 /// Never unlinked on release or reclaim — only the OS advisory lock is dropped
@@ -246,13 +275,17 @@ pub(super) fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeEr
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .map_err(|source| UpgradeError::HostLockFailed {
-            path: lock_path.clone(),
-            source,
+        .map_err(|source| {
+            UpgradeError::Other(format!(
+                "failed to take host upgrade lock at {}: {source}",
+                lock_path.display()
+            ))
         })?;
-    file.lock().map_err(|source| UpgradeError::HostLockFailed {
-        path: lock_path,
-        source,
+    file.lock().map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to take host upgrade lock at {}: {source}",
+            lock_path.display()
+        ))
     })?;
     Ok(file)
 }
@@ -408,12 +441,6 @@ pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duratio
 pub enum UpgradeError {
     #[error("downgrade not allowed: current {current} -> target {target}")]
     DowngradeAttempt { current: String, target: String },
-
-    #[error("failed to take host upgrade lock at {path}: {source}")]
-    HostLockFailed {
-        path: PathBuf,
-        source: std::io::Error,
-    },
 
     #[error("failed to create backup at {path}: {source}")]
     BackupFailed {
@@ -595,7 +622,10 @@ mod tests {
         let result = upgrader
             .perform_upgrade(&first, &Version::new(2, 0, 0))
             .unwrap();
-        assert!(matches!(result, UpgradeResult::Success { .. }));
+        assert!(
+            matches!(result, UpgradeResult::NoUpgrade),
+            "public perform_upgrade must report NoUpgrade when disk already matches: {result:?}"
+        );
         // First call also matches → skip; incoming left in place; backup untouched.
         assert!(first.exists(), "skip must not consume the incoming path");
         assert_eq!(
@@ -606,12 +636,27 @@ mod tests {
         let result2 = upgrader
             .perform_upgrade(&second, &Version::new(2, 0, 0))
             .unwrap();
-        assert!(matches!(result2, UpgradeResult::Success { .. }));
+        assert!(matches!(result2, UpgradeResult::NoUpgrade));
         assert!(second.exists());
         assert_eq!(
             fs::read(binary_path.with_extension("backup")).unwrap(),
             b"prior version",
             "a second skip must never rewrite the backup"
+        );
+
+        // Internal restart-owner path still returns Success so auto-apply can
+        // arm restart for an old-running process on already-installed bytes.
+        let _lock = acquire_host_upgrade_lock(&binary_path).unwrap();
+        let restart_owner = upgrader
+            .finish_upgrade_under_host_lock(
+                &second,
+                &Version::new(2, 0, 0),
+                HostMatchOutcome::RestartOwner,
+            )
+            .unwrap();
+        assert!(
+            matches!(restart_owner, UpgradeResult::Success { .. }),
+            "restart-owner finish must stay Success on match: {restart_owner:?}"
         );
     }
 

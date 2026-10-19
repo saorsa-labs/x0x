@@ -16,7 +16,12 @@ use sha2::{Digest, Sha256};
 use super::manifest::{current_platform_target, ReleaseManifest};
 use super::restart;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
-use super::{UpgradeError, UpgradeResult, Upgrader};
+use super::{HostMatchOutcome, UpgradeError, UpgradeResult, Upgrader};
+
+/// Delay before the HTTP-owned deferred restart so the apply response can flush.
+/// Shared with the historical route helper's 750 ms window (#261 / #1447 RC4).
+pub(crate) const HTTP_DEFERRED_RESTART_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(750);
 
 /// Removes an upgrade temp dir when dropped, so it is never leaked on an
 /// early-return error path (e.g. a failed binary replace on Windows, which
@@ -104,8 +109,10 @@ async fn apply_replacements_offloaded(
     let worker_alive = Arc::clone(&caller_alive);
 
     let join = tokio::task::spawn_blocking(move || {
-        // Custody stays with this task for the whole locked section.
-        let _temp_custody = temp_guard;
+        // Custody stays with this task through every replace. Dropped
+        // explicitly before any on_success continuation that may exit without
+        // unwinding (#1447 RC4 P2).
+        let mut temp_custody = Some(temp_guard);
 
         upgrader.validate_upgrade(&target_version)?;
 
@@ -153,15 +160,26 @@ async fn apply_replacements_offloaded(
         // owns mutation through on_success — the async caller is only an
         // observer and may be cancelled without orphaning restart.
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
-            match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
+            match x0x_upgrader.finish_upgrade_under_host_lock(
+                &extracted_x0x,
+                &target_version,
+                HostMatchOutcome::RestartOwner,
+            ) {
                 Ok(_) => info!("x0x companion upgraded successfully"),
                 Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
             }
         }
 
-        let result = upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version)?;
+        let result = upgrader.finish_upgrade_under_host_lock(
+            &extracted_path,
+            &target_version,
+            HostMatchOutcome::RestartOwner,
+        )?;
         if matches!(result, UpgradeResult::Success { .. }) {
             if let Some(cont) = on_success.take() {
+                // Clean temp before a continuation that may `_exit` / `exit`
+                // without running Drop (#1447 RC4 P2).
+                drop(temp_custody.take());
                 cont();
             }
         }
@@ -200,6 +218,9 @@ pub struct AutoApplyUpgrader {
     stop_on_upgrade: bool,
     /// Whether a successful apply should immediately restart/exec.
     restart_on_success: bool,
+    /// HTTP apply only: arm the ~750 ms deferred restart at admission inside
+    /// `apply.rs` (crate-internal). Not inferred from [`RestartContext`].
+    http_deferred_restart: bool,
     /// Data directory / API address / shutdown hook for the restart planner.
     restart_context: RestartContext,
 }
@@ -210,6 +231,7 @@ impl AutoApplyUpgrader {
             binary_name: binary_name.to_string(),
             stop_on_upgrade: false,
             restart_on_success: true,
+            http_deferred_restart: false,
             restart_context: RestartContext::default(),
         }
     }
@@ -232,6 +254,17 @@ impl AutoApplyUpgrader {
     /// restart asynchronously so clients can observe the apply result.
     pub fn with_restart_on_success(mut self, restart: bool) -> Self {
         self.restart_on_success = restart;
+        self
+    }
+
+    /// Crate-internal HTTP opt-in: after admission, `apply.rs` owns one deferred
+    /// restart (~750 ms + shared planner) on a non-Tokio thread so cancel of
+    /// the HTTP task (or runtime shutdown of async tasks) cannot leave
+    /// installed bytes without a restart owner. Does not change public
+    /// [`Self::with_restart_on_success`] behaviour; CLI `--check-updates`
+    /// keeps `restart_on_success=false` without this flag and never restarts.
+    pub(crate) fn with_http_deferred_restart(mut self, enable: bool) -> Self {
+        self.http_deferred_restart = enable;
         self
     }
 
@@ -462,13 +495,14 @@ impl AutoApplyUpgrader {
         }
 
         // Move temp-dir custody into the blocking task so cancel cannot delete
-        // extracted binaries mid-replace. The guard cleans up when that task ends.
+        // extracted binaries mid-replace. The guard cleans up when that task ends
+        // (and is dropped before any non-returning restart continuation — RC4 P2).
         //
-        // When restart_on_success is set, arm the restart continuation inside
-        // the blocking worker at admission so cancel of this async caller
-        // cannot install bytes without an owner (#1447 RC3). Deferred HTTP
-        // restart (restart_on_success=false) still schedules after await in
-        // the fenced route — see PR body FOR ENGINEER note.
+        // Restart ownership at admission (#1447 RC3/RC4):
+        // - restart_on_success=true → immediate worker-owned trigger_restart
+        // - http_deferred_restart=true → OS-thread deferred (~750 ms) owner
+        // - both false (CLI --check-updates) → no restart
+        // Do not infer HTTP from RestartContext presence.
         let restart_plan_for_cont = restart_plan.clone();
         let version_for_cont = target_version.to_string();
         let binary_name = self.binary_name.clone();
@@ -491,6 +525,40 @@ impl AutoApplyUpgrader {
                     );
                 }
             }))
+        } else if self.http_deferred_restart {
+            Some(Box::new(move || {
+                // OS thread survives Tokio task cancel and runtime shutdown of
+                // async tasks; a detached tokio::spawn alone does not.
+                let spawn_result = std::thread::Builder::new()
+                    .name("x0x-http-deferred-restart".to_string())
+                    .spawn(move || {
+                        std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
+                        let owner = AutoApplyUpgrader::new(&binary_name)
+                            .with_stop_on_upgrade(stop_on_upgrade)
+                            .with_restart_context(restart_context)
+                            .with_restart_on_success(false);
+                        if let Err(e) =
+                            owner.trigger_restart(&restart_plan_for_cont, &version_for_cont)
+                        {
+                            warn!(
+                                error = %e,
+                                installed_bytes = true,
+                                restart = "not_started",
+                                readiness_observed = false,
+                                "Deferred HTTP restart after successful upgrade did not start: {e}; \
+                                 old process keeps serving"
+                            );
+                        }
+                    });
+                if let Err(e) = spawn_result {
+                    warn!(
+                        error = %e,
+                        installed_bytes = true,
+                        restart = "not_started",
+                        "Failed to spawn HTTP deferred-restart owner after admission"
+                    );
+                }
+            }))
         } else {
             None
         };
@@ -508,22 +576,24 @@ impl AutoApplyUpgrader {
         if matches!(result, UpgradeResult::Success { .. }) {
             // ADR-0061 §6 — report honestly. Installed bytes, a pending
             // restart, observed readiness and recovery are four distinct
-            // facts; only the first is established at this point. When
-            // restart_on_success was true, the worker already owned and
-            // attempted the restart continuation at admission.
+            // facts; only the first is established at this point. Immediate
+            // and HTTP-deferred owners are armed at admission (RC3/RC4).
+            let restart = if self.restart_on_success {
+                "owned_at_admission"
+            } else if self.http_deferred_restart {
+                "http_deferred_owned_at_admission"
+            } else {
+                "none"
+            };
             info!(
                 version = %target_version,
                 installed_bytes = true,
-                restart = if self.restart_on_success {
-                    "owned_at_admission"
-                } else {
-                    "pending_caller"
-                },
+                restart,
                 restart_mode = ?restart_plan.mode,
                 readiness_observed = false,
                 recovery = "none",
                 "Upgrade bytes installed for version {}; restart ownership \
-                 follows restart_on_success (worker-owned when true)",
+                 follows restart_on_success / http_deferred_restart",
                 target_version
             );
         }
@@ -2308,6 +2378,16 @@ mod tests {
                 .expect("apply");
         }
 
+        // RC4 drops temp custody before on_success, so "scratch gone" is no
+        // longer a proxy for "continuation finished". Wait for the restart
+        // marker (or settle), then assert cleanup.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !restart_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("restart continuation must run after admission");
         tokio::time::timeout(Duration::from_secs(3), async {
             while scratch.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2442,6 +2522,13 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
 
         tokio::time::timeout(Duration::from_secs(3), async {
+            while !restart_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("restart continuation must run despite late cancel");
+        tokio::time::timeout(Duration::from_secs(3), async {
             while scratch.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -2456,6 +2543,223 @@ mod tests {
             !installed || restarted,
             "late cancel before result consumption must not detach restart \
              (installed={installed}, restarted={restarted})"
+        );
+    }
+
+    /// RC4: CLI `--check-updates` shape (`restart_on_success=false` + context,
+    /// no HTTP deferred opt-in) must never arm a restart owner.
+    #[test]
+    fn cli_false_with_context_does_not_arm_http_deferred_restart() {
+        let upgrader = AutoApplyUpgrader::new("x0xd")
+            .with_restart_on_success(false)
+            .with_restart_context(RestartContext {
+                data_dir: Some(PathBuf::from("/var/lib/x0x")),
+                api_addr: Some("127.0.0.1:12700".parse().unwrap()),
+                shutdown: None,
+            });
+        assert!(!upgrader.restart_on_success);
+        assert!(
+            !upgrader.http_deferred_restart,
+            "CLI check-updates must not opt into HTTP deferred restart"
+        );
+    }
+
+    /// RC4: HTTP apply opts in explicitly; public false alone is unchanged.
+    #[test]
+    fn http_deferred_restart_is_explicit_crate_opt_in() {
+        let plain = AutoApplyUpgrader::new("x0xd").with_restart_on_success(false);
+        assert!(!plain.http_deferred_restart);
+        let http = plain.with_http_deferred_restart(true);
+        assert!(!http.restart_on_success);
+        assert!(http.http_deferred_restart);
+    }
+
+    /// RC4: after admission, a deferred OS-thread owner still fires exactly once
+    /// when the async caller is cancelled during the defer window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_during_http_deferred_window_retains_exactly_one_restart() {
+        use std::future::{poll_fn, Future};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let primary = root.path().join("x0xd");
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        let incoming = scratch.join("daemon");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+
+        let restart_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&restart_count);
+        let scratch_for_task = scratch.clone();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let entered_worker = Arc::clone(&entered);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            // Mirrors production HTTP deferred ownership: arm at admission on
+            // an OS thread (not a cancellable Tokio task), sleep, then restart.
+            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    entered_worker.wait();
+                    std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
+                    counter.fetch_add(1, AtomicOrdering::SeqCst);
+                });
+            }));
+            let replacement = apply_replacements_offloaded(
+                Upgrader::new(primary, semver::Version::new(1, 0, 0)),
+                incoming,
+                semver::Version::new(2, 0, 0),
+                None,
+                TempDirGuard {
+                    path: scratch_for_task,
+                },
+                on_success,
+            );
+            tokio::pin!(replacement);
+            let mut ready_tx = Some(ready_tx);
+            // Park after Ready so abort can still cancel this observer during
+            // the OS-thread defer window (apply itself returns quickly).
+            poll_fn(|cx| -> Poll<()> {
+                match replacement.as_mut().poll(cx) {
+                    Poll::Ready(r) => {
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.send(r);
+                        }
+                        Poll::Pending
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            unreachable!("caller parked after Ready; abort must win");
+        });
+
+        let apply_result = tokio::time::timeout(Duration::from_secs(3), ready_rx)
+            .await
+            .expect("apply ready timeout")
+            .expect("ready signal");
+        assert!(
+            matches!(apply_result, Ok(UpgradeResult::Success { .. })),
+            "apply must succeed before deferred restart: {apply_result:?}"
+        );
+
+        // Deferred owner armed at admission; sync into its sleep window.
+        tokio::task::spawn_blocking(move || {
+            entered.wait();
+        })
+        .await
+        .expect("barrier wait");
+        assert_eq!(restart_count.load(AtomicOrdering::SeqCst), 0);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while restart_count.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("deferred owner must fire after cancel");
+        // Allow a second tick window to prove we do not double-fire.
+        tokio::time::sleep(HTTP_DEFERRED_RESTART_DELAY + Duration::from_millis(100)).await;
+        assert_eq!(
+            restart_count.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one deferred restart owner"
+        );
+        assert!(
+            !scratch.exists(),
+            "temp custody must be cleaned before deferred continuation returns"
+        );
+    }
+
+    /// RC4 P2: success continuation must observe temp custody already released
+    /// (so a later `process::exit` / `_exit` cannot skip cleanup). Red on RC3
+    /// where `cont()` ran while `_temp_custody` was still alive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn success_continuation_sees_temp_already_cleaned() {
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("archive.bin"), b"payload").unwrap();
+        let primary = root.path().join("x0xd");
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        let incoming = scratch.join("daemon");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+
+        let scratch_watch = scratch.clone();
+        let cleaned_before_cont = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cleaned_before_cont);
+        let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            flag.store(!scratch_watch.exists(), Ordering::SeqCst);
+        }));
+
+        let result = apply_replacements_offloaded(
+            Upgrader::new(primary, semver::Version::new(1, 0, 0)),
+            incoming,
+            semver::Version::new(2, 0, 0),
+            None,
+            TempDirGuard { path: scratch },
+            on_success,
+        )
+        .await
+        .expect("replace");
+        assert!(matches!(result, UpgradeResult::Success { .. }));
+        assert!(
+            cleaned_before_cont.load(Ordering::SeqCst),
+            "temp custody must be dropped before on_success runs"
+        );
+    }
+
+    /// RC4 P2 child-process: drop custody then `process::exit` (no destructor
+    /// unwind). Parent asserts the scratch directory is gone — proves cleanup
+    /// is not relying on Drop after a non-returning restart.
+    #[test]
+    fn process_exit_after_temp_drop_leaves_no_scratch() {
+        use std::process::{Command, Stdio};
+
+        const CHILD_ENV: &str = "X0X_1447_RC4_EXIT_CLEANUP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let scratch = PathBuf::from(std::env::var("X0X_1447_RC4_SCRATCH").unwrap());
+            let marker = PathBuf::from(std::env::var("X0X_1447_RC4_MARKER").unwrap());
+            let custody = TempDirGuard {
+                path: scratch.clone(),
+            };
+            drop(custody);
+            std::fs::write(&marker, b"exiting").unwrap();
+            // process::exit does not run destructors — custody must already
+            // have been dropped (same constraint as supervised restart exit).
+            std::process::exit(0);
+        }
+
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("archive.bin"), b"payload").unwrap();
+        let marker = root.path().join("marker");
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "upgrade::apply::tests::process_exit_after_temp_drop_leaves_no_scratch",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("X0X_1447_RC4_SCRATCH", &scratch)
+            .env("X0X_1447_RC4_MARKER", &marker)
+            .env("RUST_TEST_THREADS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("spawn exit-cleanup child");
+        assert!(status.success(), "child exited with {status}");
+        assert!(marker.exists(), "child must reach the exit continuation");
+        assert!(
+            !scratch.exists(),
+            "temp dir must be gone after drop-before-process::exit"
         );
     }
 }
