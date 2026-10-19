@@ -19953,16 +19953,29 @@ enum NotMemberJoinRow {
 }
 
 impl NotMemberJoinRow {
-    fn refusal_response(self) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    fn refusal_response(
+        self,
+        info: &x0x::groups::GroupInfo,
+    ) -> Option<(StatusCode, Json<serde_json::Value>)> {
         match self {
-            Self::JoinFailed => Some(api_error(
-                StatusCode::CONFLICT,
-                "join failed: this device holds a lineage-free not_member group row; \
-                 a fresh invite is refused before invite handling, DELETE /groups/:id \
-                 leave requires an active seat, and clear_stale_not_member_join_row \
-                 only clears UnseatedJoinRemnant — no supported recovery path exists \
-                 for this shape",
-            )),
+            Self::JoinFailed => {
+                // Honest limit: invite join refuses this local record before
+                // invite handling, so another invite cannot replace it. When
+                // admission is request_access, an eligible non-member may still
+                // submit POST /groups/:id/requests; admin approval seats them
+                // (card-import stubs are the intended producer of this shape).
+                let mut message = String::from(
+                    "join failed: this device already has a local group record with no \
+                     invite lineage and no seat; a fresh invite cannot replace that record",
+                );
+                if info.policy.admission == x0x::groups::GroupAdmission::RequestAccess {
+                    message.push_str(
+                        "; if you are not banned, request access with \
+                         POST /groups/:id/requests and wait for an admin to approve",
+                    );
+                }
+                Some(api_error(StatusCode::CONFLICT, message))
+            }
             Self::Quarantined => Some(api_error_with_reason(
                 StatusCode::CONFLICT,
                 "this device's earlier join of the group is fork-quarantined, so a new \
@@ -20529,8 +20542,7 @@ pub(in crate::server) async fn join_group_via_invite(
                     local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
                 let not_member_row = (membership_state == "not_member")
                     .then(|| classify_not_member_join_row(&info, &joiner_hex));
-                if let Some(response) = not_member_row.and_then(NotMemberJoinRow::refusal_response)
-                {
+                if let Some(response) = not_member_row.and_then(|row| row.refusal_response(&info)) {
                     return response;
                 }
                 if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
