@@ -7,11 +7,15 @@ pub(crate) type GroupContext = dyn Fn(AgentId, AgentId) -> Option<bool> + Send +
 
 type GroupPolicy = dyn Fn(AgentId) -> Option<bool> + Send + Sync;
 
+/// One grace for the closed registry, including cancelled/repeated drains.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Admission and handle custody share one lock. No worker can be spawned
 /// between closing the registry and observing that its join set is empty.
 #[derive(Default)]
 struct EvidenceWorkers {
     closed: bool,
+    shutdown_deadline: Option<tokio::time::Instant>,
     tasks: tokio::task::JoinSet<()>,
 }
 
@@ -241,19 +245,23 @@ impl EvidenceRuntime {
         workers.tasks.spawn(work);
     }
 
-    /// Close admission and cancel queued/async work, then join every worker.
+    /// Close admission and cancel queued/async work, then join within one grace.
     /// Poll the owned set in place: cancelling this shutdown future never
-    /// takes or drops a handle. A later Agent shutdown resumes the same drain.
-    /// Started synchronous reads cannot be aborted and must finish first.
-    pub(crate) async fn shutdown_workers(&self) {
-        {
+    /// takes or drops a handle or resets the deadline. Started synchronous
+    /// reads cannot be aborted. Return their unfinished count after the grace,
+    /// retaining custody so a later Agent shutdown can observe completion.
+    pub(crate) async fn shutdown_workers(&self) -> usize {
+        let deadline = {
             let mut workers = self.workers();
             workers.closed = true;
             self.reads.close();
             self.stopping.cancel();
             workers.tasks.abort_all();
-        }
-        futures::future::poll_fn(|cx| {
+            *workers
+                .shutdown_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + SHUTDOWN_GRACE)
+        };
+        let drain = futures::future::poll_fn(|cx| {
             let mut workers = self.workers();
             loop {
                 match workers.tasks.poll_join_next(cx) {
@@ -262,8 +270,14 @@ impl EvidenceRuntime {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                 }
             }
-        })
-        .await;
+        });
+        // timeout_at polls the drain first, even past the deadline. Repeated
+        // calls can therefore reap finished workers without another grace.
+        if tokio::time::timeout_at(deadline, drain).await.is_ok() {
+            0
+        } else {
+            self.workers().tasks.len()
+        }
     }
 
     /// Install a live shared-roster predicate, including local membership.
@@ -685,6 +699,76 @@ impl EvidenceRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Deliberately stall the actual load worker.
+    async fn started_store_load_has_bounded_shutdown_with_retained_custody() {
+        struct NoPeers;
+        impl EvidencePolicy for NoPeers {
+            fn relation(
+                &self,
+                _: AgentId,
+                _: MachineId,
+                _: Option<&AgentCertificate>,
+                _: u64,
+            ) -> u8 {
+                0
+            }
+            fn revoked(&self, _: AgentId, _: MachineId, _: Option<UserId>) -> bool {
+                false
+            }
+            fn contains_agent(&self, _: AgentId, _: u64) -> bool {
+                false
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(EvidenceRuntime::default());
+        let wire = Arc::new(VerifiedWireCapture::default());
+        // The actual store-load worker publishes its store before consulting
+        // captured adverts. Hold that real synchronous read through shutdown.
+        let held = wire.inner.lock().unwrap();
+        assert!(runtime.start(
+            dir.path().to_path_buf(),
+            EvidenceConfig::default(),
+            Arc::new(NoPeers),
+            Arc::clone(&wire),
+        ));
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.store().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        tokio::time::pause();
+        let mut shutdown = Box::pin(runtime.shutdown_workers());
+        let initially_pending = futures::poll!(&mut shutdown).is_pending();
+        tokio::time::advance(std::time::Duration::from_millis(5001)).await;
+        let ended = futures::poll!(&mut shutdown).is_ready();
+        drop(shutdown);
+        let retained = runtime.workers().tasks.len();
+        let ready = runtime.is_ready();
+        drop(held);
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                runtime.shutdown_workers().await;
+                if runtime.workers().tasks.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(loaded.is_ok(), "store load never entered the held read");
+        assert!(initially_pending, "store-load worker was not joined");
+        assert!(ended, "store-load worker kept shutdown past its grace");
+        assert_eq!(retained, 1, "unfinished load lost its worker handle");
+        assert!(!ready, "held load was incorrectly marked ready");
+        assert!(runtime.is_ready());
+        assert_eq!(Arc::strong_count(&runtime), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn s2_load_barrier_hold_release_timeout_and_overflow() {
         use futures::FutureExt;
