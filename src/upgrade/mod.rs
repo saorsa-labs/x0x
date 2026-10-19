@@ -13,6 +13,8 @@ pub mod rollout;
 pub mod signature;
 pub mod verification_probe;
 
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -135,16 +137,40 @@ impl Upgrader {
         Ok(temp_dir)
     }
 
-    /// Full upgrade workflow: validate -> backup -> replace.
+    /// Full upgrade workflow: host lock -> compare -> backup -> replace.
     ///
     /// The caller is responsible for downloading and verifying the new binary
     /// before calling this method.
+    ///
+    /// Under a host-wide exclusive lock beside this target
+    /// (`<target-file-name>.upgrade.lock`), if the on-disk target already
+    /// matches the incoming bytes, backup and replace are skipped and
+    /// [`UpgradeResult::Success`] is still returned so the carried restart
+    /// path runs (T-self-update-host-backup-guard / #1447). Companion
+    /// binaries (e.g. `x0x` next to `x0xd`) take their own lock file beside
+    /// that path via the same mechanism.
     pub fn perform_upgrade(
         &self,
         new_binary_path: &Path,
         target_version: &Version,
     ) -> Result<UpgradeResult, UpgradeError> {
         self.validate_upgrade(target_version)?;
+
+        // Hold for the whole compare / backup / replace critical section.
+        // Dropping the guard releases the OS lock; the lock file is never
+        // unlinked, so reclaim cannot remove a file another process still holds.
+        let _host_lock = acquire_host_upgrade_lock(&self.target_path)?;
+
+        if on_disk_matches_incoming(&self.target_path, new_binary_path)? {
+            info!(
+                version = %target_version,
+                target = %self.target_path.display(),
+                "On-disk target already matches incoming binary; skipping backup and replace"
+            );
+            return Ok(UpgradeResult::Success {
+                version: target_version.to_string(),
+            });
+        }
 
         let backup_path = self.create_backup()?;
 
@@ -177,6 +203,96 @@ impl Upgrader {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Persistent lock file beside `target`: `<file-name>.upgrade.lock`.
+///
+/// Never unlinked on release or reclaim — only the OS advisory lock is dropped
+/// when the holder process dies or the returned file is closed.
+fn host_upgrade_lock_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".upgrade.lock");
+    target.with_file_name(name)
+}
+
+/// Exclusive OS lock (`std::fs::File::lock`: flock/fcntl on Unix, LockFileEx
+/// on Windows). Created if missing; never truncated or unlinked.
+fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeError> {
+    let lock_path = host_upgrade_lock_path(target);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| UpgradeError::HostLockFailed {
+            path: lock_path.clone(),
+            source,
+        })?;
+    file.lock().map_err(|source| UpgradeError::HostLockFailed {
+        path: lock_path,
+        source,
+    })?;
+    Ok(file)
+}
+
+/// True when the installed target exists and its bytes equal `incoming`.
+fn on_disk_matches_incoming(target: &Path, incoming: &Path) -> Result<bool, UpgradeError> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    let target_meta = std::fs::metadata(target).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to stat target {}: {source}",
+            target.display()
+        ))
+    })?;
+    let incoming_meta = std::fs::metadata(incoming).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to stat incoming {}: {source}",
+            incoming.display()
+        ))
+    })?;
+    if target_meta.len() != incoming_meta.len() {
+        return Ok(false);
+    }
+    let mut target_file = File::open(target).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to open target {}: {source}",
+            target.display()
+        ))
+    })?;
+    let mut incoming_file = File::open(incoming).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to open incoming {}: {source}",
+            incoming.display()
+        ))
+    })?;
+    let mut target_buf = [0u8; 64 * 1024];
+    let mut incoming_buf = [0u8; 64 * 1024];
+    loop {
+        let n_t = target_file.read(&mut target_buf).map_err(|source| {
+            UpgradeError::Other(format!(
+                "failed to read target {}: {source}",
+                target.display()
+            ))
+        })?;
+        let n_i = incoming_file.read(&mut incoming_buf).map_err(|source| {
+            UpgradeError::Other(format!(
+                "failed to read incoming {}: {source}",
+                incoming.display()
+            ))
+        })?;
+        if n_t != n_i || target_buf[..n_t] != incoming_buf[..n_i] {
+            return Ok(false);
+        }
+        if n_t == 0 {
+            return Ok(true);
         }
     }
 }
@@ -276,6 +392,12 @@ pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duratio
 pub enum UpgradeError {
     #[error("downgrade not allowed: current {current} -> target {target}")]
     DowngradeAttempt { current: String, target: String },
+
+    #[error("failed to take host upgrade lock at {path}: {source}")]
+    HostLockFailed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[error("failed to create backup at {path}: {source}")]
     BackupFailed {
@@ -436,6 +558,45 @@ mod tests {
             .unwrap();
         assert!(matches!(result, UpgradeResult::Success { .. }));
         assert_eq!(fs::read(&binary_path).unwrap(), b"new binary");
+        assert!(
+            host_upgrade_lock_path(&binary_path).exists(),
+            "perform_upgrade must create the host lock file beside the target"
+        );
+    }
+
+    #[test]
+    fn test_perform_upgrade_skips_when_disk_already_matches() {
+        let dir = TempDir::new().unwrap();
+        let binary_path = create_test_binary(&dir, "test-binary", b"same bytes");
+        let first = create_test_binary(&dir, "new-binary-1", b"same bytes");
+        let second = create_test_binary(&dir, "new-binary-2", b"same bytes");
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+
+        // Seed a good backup of a prior version, then install matching bytes.
+        fs::write(binary_path.with_extension("backup"), b"prior version").unwrap();
+        fs::write(&binary_path, b"same bytes").unwrap();
+
+        let result = upgrader
+            .perform_upgrade(&first, &Version::new(2, 0, 0))
+            .unwrap();
+        assert!(matches!(result, UpgradeResult::Success { .. }));
+        // First call also matches → skip; incoming left in place; backup untouched.
+        assert!(first.exists(), "skip must not consume the incoming path");
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version"
+        );
+
+        let result2 = upgrader
+            .perform_upgrade(&second, &Version::new(2, 0, 0))
+            .unwrap();
+        assert!(matches!(result2, UpgradeResult::Success { .. }));
+        assert!(second.exists());
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version",
+            "a second skip must never rewrite the backup"
+        );
     }
 
     #[test]

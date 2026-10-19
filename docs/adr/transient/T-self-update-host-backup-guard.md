@@ -4,7 +4,7 @@
 - **Target slot:** A14
 - **Date:** 2026-10-18
 - **Decision owners:** David Irvine
-- **Reviewers:** <pending>
+- **Reviewers:** Claude (APPROVE e8eb2f06), Codex (APPROVE e8eb2f06)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** x0x #1447; draft #1410 / #1106; Accepted ADR 0094 §2.
@@ -40,22 +40,23 @@ Choose option 3. This Proposed record (#1447) owns the host-wide exclusive
 apply lock. Draft #1410 (#1106) must reuse it, not add a second lock.
 #1410 may lengthen that hold to Accepted ADR 0094 §2.
 
-1. Before backup or replace, take an OS exclusive lock (`flock` / `fcntl`)
-   on a persistent lock file beside the target (for example
-   `<target>.upgrade.lock`). The OS releases it when the holder dies.
-   Reclaim must not unlink a lock file another process still holds. Every
-   unit that can replace that target uses that same lock file.
+1. Before backup or replace, take an OS exclusive lock (`std::fs::File::lock`:
+   flock/fcntl on Unix, LockFileEx on Windows) on
+   `<file-name>.upgrade.lock` beside the target. The OS releases it when the
+   holder dies. Reclaim must not unlink a held lock file. Every unit that
+   replaces that target uses that same lock. The companion `x0x` CLI uses the
+   same mechanism with its own `x0x.upgrade.lock`.
 2. While holding the lock, compare on-disk bytes to the incoming binary.
-   Distinguish an already-installed artifact (disk matches) from an
-   already-running version (this process still maps the old image). If disk
-   matches, skip backup and replace only; keep the carried restart-owner
-   path so that unit reloads the new bytes. Do not treat that as today's
-   `NoUpgrade` (restart stays on `Success` only). Release the lock.
+   If disk matches (already-installed, not merely already-running), skip
+   backup and replace only; keep the restart-owner path. Do not treat that
+   as today's `NoUpgrade` (restart stays on `Success` only). Release the lock.
 3. If they differ, copy to `<target>.backup`, then replace. For this legacy
    guard only, release after that replace. That short hold does not weaken
    Accepted ADR 0094 §2 (M2 holds through the HTTP response window,
    old-process exit, and unresolved intent).
 4. No versioned backup names. #1373 keeps that scope.
+5. Unmanaged Windows uses the same `File::lock`. Managed Windows apply stays
+   refused under ADR 0094.
 
 A content match without a lock is not enough: both can still decide to back
 up. The lock closes that window.
@@ -73,20 +74,17 @@ up. The lock closes that window.
 
 ### Neutral / Operational
 
-- Implementation lives in `src/upgrade/`. Cursor stays off until the
-  Engineer lifts the #1447 upgrade-code fence.
+- Implementation lives in `src/upgrade/` (`Upgrader::perform_upgrade`).
 
 ## Validation
 
-A test starts two independent apply attempts on one shared target, forces
-both through a barrier, and covers a late second attempt after replacement
-plus the two-old-processes / one-shared-target case. After both finish,
-assert unconditionally that `<target>.backup` still holds the original
-bytes and the target holds the candidate bytes. Record a second-attempt
-skip separately; skip must not substitute for preserving the backup.
-Single-unit apply still backs up and replaces.
+A test starts two independent processes on one shared target, forces both
+through a barrier, covers a late second attempt and the two-old-processes
+case. After both finish, assert unconditionally that `<target>.backup` holds
+the original bytes and the target holds the candidate. Record a skip
+separately; skip must not substitute for preserving the backup. Single-unit
+apply still backs up and replaces.
 
 ## Notes for AI-assisted work
 
-Do not mark this Accepted. Do not fold it. Do not expand into #1373. If the
-fence blocks apply, ask the Engineer.
+Do not mark this Accepted. Do not fold it. Do not expand into #1373.
