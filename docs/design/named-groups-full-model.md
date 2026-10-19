@@ -835,6 +835,37 @@ Notes:
 - card-import stub creation so non-members can submit join requests
 - note: this phase alone is **not** sufficient for real public discovery; Phase C.2 completes that story
 
+#### Card-import stub and verified invite (#1161)
+
+`import_card_into_groups` inserts an inert local row: owner-only authority
+roster, no importer seat, `shared_secret = None`, `secret_epoch = 0`, no
+invite lineage / MLS group. That shape classifies as
+`InertCardImportStub` (not general `JoinFailed`). After full v4 invite
+verification, when the invite's stable group id and signed creator equal
+the stub genesis `group_id` / `creator_agent_id`, join clears that
+metadata under the same write-locked path as `UnseatedJoinRemnant`, then
+runs the ordinary first join. Clearing grants no seat or key.
+
+`JoinFailed` stays a refusal for every other lineage-free not_member row
+(secret, issued invites, join-request / denial evidence, extra roster
+entries, mismatched invite owner or stable id, conflicting same-stable
+alias, keyed TreeKEM/MLS material).
+
+**Leftover after a failed or timed-out fresh join** (the card stub is
+already gone):
+
+| Failure point | Local leftover | Recovery |
+| --- | --- | --- |
+| Pre-install (e.g. MemberJoined sign failure) | No named-group row | Re-import the card (then `POST /groups/:id/requests` when admission is request_access), or redeem another verified invite |
+| Post-install timeout / lost result | `UnseatedJoinRemnant` or pending attempt | Fresh invite (clear / ADR 0107 re-arm), or request_access when eligible |
+
+Clearing removes the row from the live map only (same as other
+not_member clears). The durable `named_groups.json` still holds the
+imported card until a later roster save rewrites it. A daemon restart
+before that save reloads the old stub; recovery is then card re-import
+(then `POST /groups/:id/requests` when admission is request_access) or
+another verified invite — there is no new persistence contract.
+
 ### Phase C.2 — distributed discovery index
 
 Partition-tolerant, DHT-free group discovery using existing gossip primitives.

@@ -520,6 +520,10 @@ jobs:
           --expect w3h_1427_offline_member_reaches_the_epoch_it_missed=GREEN
           --require w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer
           --expect w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer=GREEN
+          --require w3h_1161_card_import_invite
+          --expect w3h_1161_card_import_invite=GREEN
+          --require w3h_1161_control_share_withheld_is_red
+          --expect w3h_1161_control_share_withheld_is_red=RED
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer

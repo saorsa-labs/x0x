@@ -19,7 +19,49 @@ fn lineage_free_row() -> (x0x::groups::GroupInfo, String) {
     assert!(info.invite_lineage.is_none());
     assert!(!info.members_v2.contains_key(&joiner));
     assert!(!info.has_active_member(&joiner));
+    // Default PrivateSecure mints a shared_secret — not an inert card stub.
+    assert!(info.shared_secret.is_some());
     (info, joiner)
+}
+
+/// Exact shape [`import_card_into_groups`] inserts for a discoverable card.
+fn card_import_stub(owner: AgentId, group_id: &str, joiner_hex: &str) -> x0x::groups::GroupInfo {
+    let owner_hex = hex::encode(owner.as_bytes());
+    let mut stub = x0x::groups::GroupInfo::with_policy(
+        "card stub".into(),
+        String::new(),
+        owner,
+        group_id.to_string(),
+        x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+    );
+    stub.members_v2.clear();
+    stub.members_v2.insert(
+        owner_hex.clone(),
+        x0x::groups::GroupMember::new_admin(owner_hex.clone(), None, stub.created_at),
+    );
+    stub.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+        group_id.to_string(),
+        owner_hex,
+        stub.created_at,
+        String::new(),
+    ));
+    stub.shared_secret = None;
+    stub.secret_epoch = 0;
+    stub.invite_lineage = None;
+    stub.issued_invites.clear();
+    stub.issued_invite_secrets.clear();
+    stub.join_requests.clear();
+    stub.commit_log.clear();
+    stub.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    assert!(
+        !stub.members_v2.contains_key(joiner_hex),
+        "importer is not a member"
+    );
+    assert_eq!(
+        classify_not_member_join_row(&stub, joiner_hex),
+        NotMemberJoinRow::InertCardImportStub
+    );
+    stub
 }
 
 #[test]
@@ -201,10 +243,16 @@ async fn lineage_free_request_access_stub_seats_after_request_and_approve() -> R
     base.secure_plane = x0x::mls::SecureGroupPlane::Gss;
     assert!(base.invite_lineage.is_none());
     assert!(!base.members_v2.contains_key(&requester_hex));
+    // Card-import shape with no secret is the new clearable stub; request
+    // access remains a recovery path when the caller chooses not to redeem
+    // a fresh invite (or when the stub fails the invite-match gate).
     assert_eq!(
         classify_not_member_join_row(&base, &requester_hex),
-        NotMemberJoinRow::JoinFailed
+        NotMemberJoinRow::InertCardImportStub
     );
+    assert!(classify_not_member_join_row(&base, &requester_hex)
+        .refusal_response(&base)
+        .is_none());
     requester_state
         .named_groups
         .write()
@@ -343,5 +391,1179 @@ async fn lineage_free_request_access_stub_seats_after_request_and_approve() -> R
         seated.has_active_member(&requester_hex),
         "delivered JoinRequestApproved must recover the requester's own stuck row to membership"
     );
+    Ok(())
+}
+
+#[test]
+fn card_import_stub_classifies_as_inert_clearable_not_join_failed() {
+    let owner = AgentId([9; 32]);
+    let joiner = hex::encode(AgentId([8; 32]).as_bytes());
+    let group_id = "1161stub".repeat(4);
+    let stub = card_import_stub(owner, &group_id, &joiner);
+    let row = classify_not_member_join_row(&stub, &joiner);
+    assert_eq!(row, NotMemberJoinRow::InertCardImportStub);
+    assert!(row.refusal_response(&stub).is_none());
+    // JoinFailed stays a distinct refusal — a secret-bearing lineage-free
+    // row must not become clearable just because lineage is absent.
+    let (secret_row, secret_joiner) = lineage_free_row();
+    assert_eq!(
+        classify_not_member_join_row(&secret_row, &secret_joiner),
+        NotMemberJoinRow::JoinFailed
+    );
+    assert!(NotMemberJoinRow::JoinFailed
+        .refusal_response(&secret_row)
+        .is_some());
+}
+
+#[test]
+fn inert_stub_predicate_rejects_secret_seat_pending_invite_denial_and_extra_roster() {
+    let owner = AgentId([9; 32]);
+    let joiner = hex::encode(AgentId([8; 32]).as_bytes());
+    let group_id = "1161pred".repeat(4);
+    let base = card_import_stub(owner, &group_id, &joiner);
+
+    let mut with_secret = base.clone();
+    with_secret.shared_secret = Some(vec![1; 32]);
+    assert_eq!(
+        classify_not_member_join_row(&with_secret, &joiner),
+        NotMemberJoinRow::JoinFailed
+    );
+
+    let mut with_epoch = base.clone();
+    with_epoch.secret_epoch = 1;
+    assert_eq!(
+        classify_not_member_join_row(&with_epoch, &joiner),
+        NotMemberJoinRow::JoinFailed
+    );
+
+    let mut with_seat = base.clone();
+    with_seat.add_member(joiner.clone(), x0x::groups::GroupRole::Member, None, None);
+    assert_eq!(
+        classify_not_member_join_row(&with_seat, &joiner),
+        NotMemberJoinRow::Other
+    );
+
+    let mut with_issued = base.clone();
+    with_issued.issued_invite_secrets.insert("sec".into());
+    assert_eq!(
+        classify_not_member_join_row(&with_issued, &joiner),
+        NotMemberJoinRow::JoinFailed
+    );
+
+    let mut with_request = base.clone();
+    let mut denied = x0x::groups::JoinRequest::new(group_id.clone(), joiner.clone(), None, 1);
+    denied.status = x0x::groups::JoinRequestStatus::Rejected;
+    denied.reviewed_at = Some(2);
+    denied.reviewed_by = Some(hex::encode(owner.as_bytes()));
+    with_request
+        .join_requests
+        .insert(denied.request_id.clone(), denied);
+    assert_eq!(
+        classify_not_member_join_row(&with_request, &joiner),
+        NotMemberJoinRow::JoinFailed
+    );
+
+    let mut with_extra = base.clone();
+    with_extra.add_member(
+        hex::encode(AgentId([7; 32]).as_bytes()),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    assert_eq!(
+        classify_not_member_join_row(&with_extra, &joiner),
+        NotMemberJoinRow::JoinFailed
+    );
+}
+
+#[test]
+fn inert_stub_invite_match_requires_stable_and_owner() {
+    let owner = AgentId([9; 32]);
+    let joiner = hex::encode(AgentId([8; 32]).as_bytes());
+    let group_id = "1161match".repeat(4);
+    let stub = card_import_stub(owner, &group_id, &joiner);
+    let owner_hex = hex::encode(owner.as_bytes());
+    assert!(inert_stub_matches_verified_invite(
+        &stub, &group_id, &owner_hex
+    ));
+    assert!(!inert_stub_matches_verified_invite(
+        &stub,
+        &"dead".repeat(16),
+        &owner_hex
+    ));
+    assert!(!inert_stub_matches_verified_invite(
+        &stub,
+        &group_id,
+        &"ab".repeat(32)
+    ));
+}
+
+/// #1161: verified fresh invite replaces an inert card-import stub, then the
+/// ordinary first-join path seats the requester with a usable GSS key.
+#[tokio::test]
+async fn inert_card_import_stub_replaced_by_verified_invite_seats_with_key() -> Result<()> {
+    let (authority_state, _a) = secure_endpoint_test_state().await?;
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    authority_state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    joiner_state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let group = hex::encode(blake3::hash(b"1161-stub-replace-success").as_bytes());
+    let authority_id = authority_state.agent.agent_id();
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+
+    // Live authority group (InviteOnly / GSS / secret present).
+    let mut authority = x0x::groups::GroupInfo::with_policy(
+        "live".into(),
+        String::new(),
+        authority_id,
+        group.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    authority.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    assert!(authority.shared_secret.is_some());
+    let projection = x0x::groups::state_commit::roster_projection(&authority.members_v2);
+    let stable = authority.stable_group_id().to_string();
+    authority.state_hash = x0x::groups::state_commit::compute_state_hash(
+        &stable,
+        authority.state_revision,
+        authority.prev_state_hash.as_deref(),
+        &x0x::groups::state_commit::roster_root_of_projection(&projection),
+        &x0x::groups::state_commit::compute_policy_hash(&authority.policy),
+        &x0x::groups::state_commit::compute_public_meta_hash(&authority.public_meta()),
+        authority.security_binding.as_deref(),
+        false,
+    );
+    authority_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), authority.clone());
+
+    // Joiner holds the inert card-import stub for the same genesis.
+    let stub = card_import_stub(authority_id, &group, &joiner_hex);
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), stub);
+
+    let (invite, link) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint invite");
+    {
+        let now_secs = now_millis_u64() / 1_000;
+        let mut groups = authority_state.named_groups.write().await;
+        let info = groups.get_mut(&group).expect("authority");
+        info.record_issued_invite_v2(
+            invite.invite_secret.clone(),
+            now_secs.saturating_sub(60),
+            now_secs + 3_600,
+            x0x::groups::GroupRole::Member,
+            None,
+            x0x::groups::InviteOrigin::Explicit,
+            Some(link.clone()),
+        );
+    }
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "join after stub replace: {body}");
+    assert_eq!(
+        body["join_state"].as_str(),
+        Some("pending_authority_commit"),
+        "{body}"
+    );
+    // Clearing grants no seat/key — the join stub is a fresh first-join row.
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&group).expect("fresh join stub");
+        assert!(
+            info.invite_lineage.is_some(),
+            "first-join lineage installed"
+        );
+        assert!(!info.has_active_member(&joiner_hex));
+        assert!(info.shared_secret.is_none());
+    }
+
+    let attempt_event = {
+        let attempts = joiner_state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let entry = attempts
+            .get(&join_result_key(&stable, &joiner_hex))
+            .expect("attempt registered");
+        entry
+            .stored_resend
+            .as_ref()
+            .expect("stored MemberJoined")
+            .event
+            .clone()
+    };
+    assert!(
+        apply_named_group_metadata_event(
+            &authority_state,
+            attempt_event,
+            joiner_state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await
+        .accepted,
+        "authority accepts the joiner's MemberJoined"
+    );
+    assert!(
+        authority_state
+            .named_groups
+            .read()
+            .await
+            .get(&group)
+            .is_some_and(|i| i.has_active_member(&joiner_hex)),
+        "authority seats the joiner"
+    );
+
+    let staged = authority_state
+        .pending_join_results
+        .read()
+        .await
+        .get(&join_result_key(&stable, &joiner_hex))
+        .map(|p| (p.event.clone(), p.head_attestation.clone()))
+        .expect("join result staged");
+    handle_join_result_message(
+        &joiner_state,
+        &authority_id,
+        true,
+        JoinResultMessage::Result {
+            event: Box::new(staged.0),
+            chain: Vec::new(),
+            head_attestation: staged.1.map(Box::new),
+            roster_certificates_b64: Vec::new(),
+            intervening_events: Vec::new(),
+        },
+    )
+    .await;
+    assert!(
+        joiner_state
+            .named_groups
+            .read()
+            .await
+            .get(&group)
+            .is_some_and(|i| i.has_active_member(&joiner_hex)),
+        "requester seat completes after stub replace"
+    );
+
+    let share = authority_state
+        .named_group_test_recorders
+        .secure_share_scheduled
+        .lock()
+        .expect("share witness")
+        .iter()
+        .filter(|(_, to, _)| to == &joiner_hex)
+        .find_map(|(_, _, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .expect("authority sealed a SecureShareDelivered for the joiner");
+    assert!(
+        apply_named_group_metadata_event(&joiner_state, share, authority_id, true, None)
+            .await
+            .accepted,
+        "joiner opens the sealed share"
+    );
+    let (auth_secret, auth_epoch) = {
+        let groups = authority_state.named_groups.read().await;
+        let info = groups.get(&group).expect("authority");
+        (info.shared_secret.clone(), info.secret_epoch)
+    };
+    let (joiner_secret, joiner_epoch) = {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&group).expect("joiner");
+        (info.shared_secret.clone(), info.secret_epoch)
+    };
+    assert!(auth_secret.is_some());
+    assert_eq!(
+        (joiner_secret, joiner_epoch),
+        (auth_secret, auth_epoch),
+        "requester holds the group's current key after stub replace"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inert_stub_owner_or_group_mismatch_keeps_join_failed_refusal() -> Result<()> {
+    let (authority_state, _a) = secure_endpoint_test_state().await?;
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-mismatch").as_bytes());
+    let authority_id = authority_state.agent.agent_id();
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+
+    let mut authority = x0x::groups::GroupInfo::with_policy(
+        "live".into(),
+        String::new(),
+        authority_id,
+        group.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    authority.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    let projection = x0x::groups::state_commit::roster_projection(&authority.members_v2);
+    let stable = authority.stable_group_id().to_string();
+    authority.state_hash = x0x::groups::state_commit::compute_state_hash(
+        &stable,
+        authority.state_revision,
+        authority.prev_state_hash.as_deref(),
+        &x0x::groups::state_commit::roster_root_of_projection(&projection),
+        &x0x::groups::state_commit::compute_policy_hash(&authority.policy),
+        &x0x::groups::state_commit::compute_public_meta_hash(&authority.public_meta()),
+        authority.security_binding.as_deref(),
+        false,
+    );
+    authority_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), authority.clone());
+
+    // Stub genesis owner differs from the invite creator.
+    let foreign_owner = AgentId([0x42; 32]);
+    let mut stub = card_import_stub(foreign_owner, &group, &joiner_hex);
+    stub.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+        group.clone(),
+        hex::encode(foreign_owner.as_bytes()),
+        stub.created_at,
+        String::new(),
+    ));
+    // Re-insert foreign owner as sole admin so the shape stays inert.
+    stub.members_v2.clear();
+    let foreign_hex = hex::encode(foreign_owner.as_bytes());
+    stub.members_v2.insert(
+        foreign_hex.clone(),
+        x0x::groups::GroupMember::new_admin(foreign_hex, None, stub.created_at),
+    );
+    assert_eq!(
+        classify_not_member_join_row(&stub, &joiner_hex),
+        NotMemberJoinRow::InertCardImportStub
+    );
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), stub);
+
+    let (_invite, link) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint invite");
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("fresh invite cannot replace"), "{body}");
+    assert!(
+        joiner_state.named_groups.read().await.contains_key(&group),
+        "mismatch must not clear the stub"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inert_stub_refusal_controls_secret_removed_banned_quarantine_withdrawn_alias_pending(
+) -> Result<()> {
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let (authority_state, _a) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-controls").as_bytes());
+    let authority_id = authority_state.agent.agent_id();
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+
+    let mut authority = x0x::groups::GroupInfo::with_policy(
+        "live".into(),
+        String::new(),
+        authority_id,
+        group.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    authority.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    let projection = x0x::groups::state_commit::roster_projection(&authority.members_v2);
+    let stable = authority.stable_group_id().to_string();
+    authority.state_hash = x0x::groups::state_commit::compute_state_hash(
+        &stable,
+        authority.state_revision,
+        authority.prev_state_hash.as_deref(),
+        &x0x::groups::state_commit::roster_root_of_projection(&projection),
+        &x0x::groups::state_commit::compute_policy_hash(&authority.policy),
+        &x0x::groups::state_commit::compute_public_meta_hash(&authority.public_meta()),
+        authority.security_binding.as_deref(),
+        false,
+    );
+    authority_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), authority.clone());
+    let (invite_a, link_a) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint a");
+    let (invite_b, link_b) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint b");
+    {
+        let now_secs = now_millis_u64() / 1_000;
+        let mut groups = authority_state.named_groups.write().await;
+        let info = groups.get_mut(&group).expect("authority");
+        for (inv, link) in [(&invite_a, &link_a), (&invite_b, &link_b)] {
+            info.record_issued_invite_v2(
+                inv.invite_secret.clone(),
+                now_secs.saturating_sub(60),
+                now_secs + 3_600,
+                x0x::groups::GroupRole::Member,
+                None,
+                x0x::groups::InviteOrigin::Explicit,
+                Some(link.clone()),
+            );
+        }
+    }
+
+    // secret
+    {
+        let mut stub = card_import_stub(authority_id, &group, &joiner_hex);
+        stub.shared_secret = Some(vec![9; 32]);
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(group.clone(), stub);
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a.clone(),
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(joiner_state.named_groups.read().await.contains_key(&group));
+    }
+
+    // existing MLS key on the inert stub — refuse without clearing or deleting key
+    {
+        let stub = card_import_stub(authority_id, &group, &joiner_hex);
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(group.clone(), stub);
+        let group_bytes = hex::decode(&group).expect("group id hex");
+        let mls = x0x::mls::MlsGroup::new(group_bytes, joiner_state.agent.agent_id())
+            .await
+            .expect("mls group");
+        joiner_state
+            .mls_groups
+            .write()
+            .await
+            .insert(group.clone(), mls);
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a.clone(),
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(joiner_state.named_groups.read().await.contains_key(&group));
+        assert!(joiner_state.mls_groups.read().await.contains_key(&group));
+        joiner_state.mls_groups.write().await.remove(&group);
+        joiner_state.named_groups.write().await.remove(&group);
+    }
+
+    // removed / banned
+    for member_state in [
+        x0x::groups::GroupMemberState::Removed,
+        x0x::groups::GroupMemberState::Banned,
+    ] {
+        let mut stub = card_import_stub(authority_id, &group, &joiner_hex);
+        stub.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        stub.members_v2.get_mut(&joiner_hex).expect("seat").state = member_state;
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(group.clone(), stub);
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a.clone(),
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_ne!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(joiner_state.named_groups.read().await.contains_key(&group));
+    }
+
+    // quarantine
+    {
+        let mut stub = card_import_stub(authority_id, &group, &joiner_hex);
+        let header = stub.terminal_commit_header();
+        stub.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 1,
+            state_hash: stub.state_hash.clone(),
+            committed_by: hex::encode(authority_id.as_bytes()),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(group.clone(), stub);
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a.clone(),
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["reason"], "fork_quarantined");
+    }
+
+    // withdrawn
+    {
+        let mut stub = card_import_stub(authority_id, &group, &joiner_hex);
+        stub.withdrawn = true;
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(group.clone(), stub);
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a.clone(),
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    // conflicting same-stable alias
+    {
+        let stub = card_import_stub(authority_id, &group, &joiner_hex);
+        let mut alias = stub.clone();
+        alias.mls_group_id = format!("alias{group}");
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(group.clone(), stub);
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(format!("alias-key-{group}"), alias);
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a.clone(),
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(joiner_state.named_groups.read().await.contains_key(&group));
+        joiner_state.named_groups.write().await.clear();
+    }
+
+    // pending: first invite clears stub and arms an attempt; a different
+    // invite must 409 join_already_pending without a second clear path.
+    {
+        joiner_state.named_groups.write().await.insert(
+            group.clone(),
+            card_import_stub(authority_id, &group, &joiner_hex),
+        );
+        let first = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a,
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_b,
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(second).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("join_already_pending")
+                || body["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("join_already_pending")
+                || body.to_string().contains("join_already_pending"),
+            "pending attempt blocks a different invite: {body}"
+        );
+    }
+    Ok(())
+}
+
+/// Failed join after stub clear: sign failure installs nothing. Recovery is
+/// card re-import (then request_access) or another verified invite.
+#[tokio::test]
+async fn cleared_stub_sign_failure_leaves_no_row_for_reimport_or_request_access() -> Result<()> {
+    let (authority_state, _a) = secure_endpoint_test_state().await?;
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-signfail").as_bytes());
+    let authority_id = authority_state.agent.agent_id();
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+
+    let mut authority = x0x::groups::GroupInfo::with_policy(
+        "live".into(),
+        String::new(),
+        authority_id,
+        group.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    authority.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    let projection = x0x::groups::state_commit::roster_projection(&authority.members_v2);
+    let stable = authority.stable_group_id().to_string();
+    authority.state_hash = x0x::groups::state_commit::compute_state_hash(
+        &stable,
+        authority.state_revision,
+        authority.prev_state_hash.as_deref(),
+        &x0x::groups::state_commit::roster_root_of_projection(&projection),
+        &x0x::groups::state_commit::compute_policy_hash(&authority.policy),
+        &x0x::groups::state_commit::compute_public_meta_hash(&authority.public_meta()),
+        authority.security_binding.as_deref(),
+        false,
+    );
+    authority_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), authority.clone());
+    joiner_state.named_groups.write().await.insert(
+        group.clone(),
+        card_import_stub(authority_id, &group, &joiner_hex),
+    );
+
+    let (_invite, link) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint");
+    let _sign_failure = fail_next_member_joined_sign_for_test(&group, &joiner_hex);
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !joiner_state.named_groups.read().await.contains_key(&group),
+        "cleared stub must not silently remain after a failed fresh join"
+    );
+    assert!(joiner_state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty());
+    let _ = stable;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inert_stub_survives_disk_reload_then_clears_on_verified_invite() -> Result<()> {
+    let (authority_state, _a) = secure_endpoint_test_state().await?;
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-restart").as_bytes());
+    let authority_id = authority_state.agent.agent_id();
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+
+    let mut authority = x0x::groups::GroupInfo::with_policy(
+        "live".into(),
+        String::new(),
+        authority_id,
+        group.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    authority.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    let projection = x0x::groups::state_commit::roster_projection(&authority.members_v2);
+    let stable = authority.stable_group_id().to_string();
+    authority.state_hash = x0x::groups::state_commit::compute_state_hash(
+        &stable,
+        authority.state_revision,
+        authority.prev_state_hash.as_deref(),
+        &x0x::groups::state_commit::roster_root_of_projection(&projection),
+        &x0x::groups::state_commit::compute_policy_hash(&authority.policy),
+        &x0x::groups::state_commit::compute_public_meta_hash(&authority.public_meta()),
+        authority.security_binding.as_deref(),
+        false,
+    );
+    authority_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), authority.clone());
+    let (_invite, link) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint");
+
+    joiner_state.named_groups.write().await.insert(
+        group.clone(),
+        card_import_stub(authority_id, &group, &joiner_hex),
+    );
+    assert!(save_named_groups(&joiner_state).await, "persist stub");
+    joiner_state.named_groups.write().await.clear();
+    let loaded = load_named_groups(&joiner_state.named_groups_path)
+        .await
+        .expect("reload stub");
+    {
+        let mut groups = joiner_state.named_groups.write().await;
+        *groups = loaded;
+    }
+    assert_eq!(
+        classify_not_member_join_row(
+            joiner_state
+                .named_groups
+                .read()
+                .await
+                .get(&group)
+                .expect("stub survived reload"),
+            &joiner_hex
+        ),
+        NotMemberJoinRow::InertCardImportStub
+    );
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "post-reload clear+join: {body}");
+    assert_eq!(
+        body["join_state"].as_str(),
+        Some("pending_authority_commit")
+    );
+    Ok(())
+}
+
+/// #1463 RC2: keyed exclusion stays atomic under TreeKEM → MLS → named_groups
+/// order. Holding the TreeKEM writer (clear's first lock), poll clear to its
+/// wait, insert MLS (as `POST /mls/groups` does without the membership
+/// guard), then release: the concurrent keyed object and the inert stub
+/// must both survive.
+#[tokio::test]
+async fn clear_preserves_mls_key_installed_while_waiting_on_treekem_writer() -> Result<()> {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-concurrent-key").as_bytes());
+    let owner = AgentId([0x11; 32]);
+    let owner_hex = hex::encode(owner.as_bytes());
+    let joiner_hex = hex::encode(AgentId([0x22; 32]).as_bytes());
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), card_import_stub(owner, &group, &joiner_hex));
+
+    let blocked = state.treekem_groups.write().await;
+    let mut clear = Box::pin(clear_stale_not_member_join_row(
+        state.as_ref(),
+        &group,
+        &joiner_hex,
+        &group,
+        &owner_hex,
+    ));
+    poll_fn(|cx| {
+        assert!(
+            matches!(clear.as_mut().poll(cx), Poll::Pending),
+            "clear must wait on the held treekem_groups writer before keyed recheck"
+        );
+        Poll::Ready(())
+    })
+    .await;
+
+    // create_mls_group inserts without taking a group-membership guard.
+    let group_bytes = hex::decode(&group).expect("group id hex");
+    let mls = x0x::mls::MlsGroup::new(group_bytes, state.agent.agent_id())
+        .await
+        .expect("mls group");
+    state.mls_groups.write().await.insert(group.clone(), mls);
+    drop(blocked);
+
+    let outcome = clear.await;
+    assert_eq!(
+        outcome,
+        ClearStaleNotMemberJoinRowResult::RefusedKeyedMaterial,
+        "keyed recheck under the write hold must refuse, not clear"
+    );
+    assert!(
+        state.mls_groups.read().await.contains_key(&group),
+        "concurrent keyed MLS object was deleted"
+    );
+    assert!(
+        state.named_groups.read().await.contains_key(&group),
+        "inert stub must remain when keyed material blocks clear"
+    );
+    Ok(())
+}
+
+/// #1463 RC3 / Codex P2: clear for group Y and a TreeKEM final install
+/// for group X must share TreeKEM → named_groups order at the *final*
+/// install locks. Parking install only on a preliminary named_groups read
+/// (RC2) let clear finish first under `(clear.await, install.await)`, so
+/// the old named_groups→TreeKEM clear order still passed. Hold install at
+/// `notify_before_treekem_final_install_map_write` (owns the wait for
+/// TreeKEM; next lock is named_groups.read), queue clear behind the same
+/// TreeKEM hold, then release and `join!` both — dc4bb502 deadlocks;
+/// TreeKEM→MLS→named_groups completes under the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clear_and_other_group_treekem_final_install_do_not_deadlock() -> Result<()> {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let clear_group = hex::encode(blake3::hash(b"1161-stub-clear-y").as_bytes());
+    let install_group = "59".repeat(32);
+    let install_stable = "5a".repeat(32);
+    let owner = AgentId([0x11; 32]);
+    let owner_hex = hex::encode(owner.as_bytes());
+    let joiner_hex = hex::encode(AgentId([0x22; 32]).as_bytes());
+    state.named_groups.write().await.insert(
+        clear_group.clone(),
+        card_import_stub(owner, &clear_group, &joiner_hex),
+    );
+
+    let install_bytes = hex::decode(&install_group)?;
+    let seed = agent_treekem_seed(state.agent.as_ref(), &install_bytes);
+    let treekem = x0x::mls::TreeKemMlsGroup::create(install_bytes, state.agent.agent_id(), &seed)?;
+    let epoch = treekem.epoch();
+    let mut install_info =
+        super::treekem_metadata_group_info(state.agent.agent_id(), &install_group, &install_stable);
+    install_info.secret_epoch = epoch;
+    install_info.security_binding = Some(format!("treekem:epoch={epoch}"));
+    install_info.recompute_state_hash();
+
+    // Hold TreeKEM so install can finish its preliminary named_groups work
+    // and park at the final map-write (same seam as the withdrawal recheck
+    // regression). That is the inversion site vs clear.
+    let map_guard = state.treekem_groups.write().await;
+    let (notify, _notify_guard) =
+        super::notify_before_treekem_final_install_map_write(&install_group);
+    let state_for_install = Arc::clone(&state);
+    let install_group_for_task = install_group.clone();
+    let install = tokio::spawn(async move {
+        install_joined_treekem_group_after_crypto_recheck(
+            state_for_install.as_ref(),
+            &install_group_for_task,
+            install_info,
+            treekem,
+            "test_1161_clear_vs_treekem_install_order",
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), notify.notified())
+        .await
+        .context("install did not reach the final TreeKEM map write")?;
+
+    // Install is past preliminary named_groups reads and waiting on TreeKEM.
+    // Start clear now so it contends at the final locks (not the prelim read).
+    let mut clear = Box::pin(clear_stale_not_member_join_row(
+        state.as_ref(),
+        &clear_group,
+        &joiner_hex,
+        &clear_group,
+        &owner_hex,
+    ));
+    poll_fn(|cx| {
+        assert!(
+            matches!(clear.as_mut().poll(cx), Poll::Pending),
+            "clear must queue behind the held treekem_groups writer"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    drop(map_guard);
+
+    // Concurrent progress is required: sequential await lets clear finish
+    // before install resumes and hides the old-order wedge.
+    let (clear_outcome, install_join) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(clear, install)
+    })
+    .await
+    .context("clear vs TreeKEM final install deadlocked (named_groups↔treekem inversion)")?;
+    let install_result = install_join.context("install task panicked")?;
+    assert_eq!(
+        clear_outcome,
+        ClearStaleNotMemberJoinRowResult::Cleared,
+        "inert stub without keyed material must clear"
+    );
+    assert!(
+        install_result.is_ok(),
+        "other-group TreeKEM final install must succeed: {install_result:?}"
+    );
+    assert!(
+        !state.named_groups.read().await.contains_key(&clear_group),
+        "cleared stub must be gone"
+    );
+    assert!(
+        state
+            .treekem_groups
+            .read()
+            .await
+            .contains_key(&install_group),
+        "install for the other group must land"
+    );
+    Ok(())
+}
+
+/// Memory-only clear leaves the durable import on disk. A reload before the
+/// next roster save restores the stub; re-import then request_access (or a
+/// fresh invite) is the recovery path — no new persistence contract.
+#[tokio::test]
+async fn memory_only_clear_reloads_stub_from_disk_then_reimport_request_access() -> Result<()> {
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-memclear-reload").as_bytes());
+    let owner = AgentId([0x41; 32]);
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+    let owner_hex = hex::encode(owner.as_bytes());
+
+    let stub = card_import_stub(owner, &group, &joiner_hex);
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), stub);
+    assert!(save_named_groups(&joiner_state).await, "persist stub");
+
+    let clear = clear_stale_not_member_join_row(
+        joiner_state.as_ref(),
+        &group,
+        &joiner_hex,
+        &group,
+        &owner_hex,
+    )
+    .await;
+    assert_eq!(clear, ClearStaleNotMemberJoinRowResult::Cleared);
+    assert!(
+        !joiner_state.named_groups.read().await.contains_key(&group),
+        "live map cleared"
+    );
+
+    let loaded = load_named_groups(&joiner_state.named_groups_path)
+        .await
+        .expect("reload after memory-only clear");
+    {
+        let mut groups = joiner_state.named_groups.write().await;
+        *groups = loaded;
+    }
+    assert_eq!(
+        classify_not_member_join_row(
+            joiner_state
+                .named_groups
+                .read()
+                .await
+                .get(&group)
+                .expect("durable import reloads after memory-only clear"),
+            &joiner_hex
+        ),
+        NotMemberJoinRow::InertCardImportStub,
+        "disk still holds the imported stub until a roster save"
+    );
+
+    // Re-import refreshes the live stub (same shape as POST /groups/cards/import).
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), card_import_stub(owner, &group, &joiner_hex));
+    joiner_state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (create_status, create_body) = response_json(
+        create_join_request(State(Arc::clone(&joiner_state)), Path(group.clone()), None)
+            .await
+            .into_response(),
+    )
+    .await?;
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "re-import then request_access must work on the restored stub: {create_body}"
+    );
+    assert!(create_body["request_id"].as_str().is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_same_invite_while_pending_keeps_single_attempt() -> Result<()> {
+    let (authority_state, _a) = secure_endpoint_test_state().await?;
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-race").as_bytes());
+    let authority_id = authority_state.agent.agent_id();
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+
+    let mut authority = x0x::groups::GroupInfo::with_policy(
+        "live".into(),
+        String::new(),
+        authority_id,
+        group.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    authority.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    let projection = x0x::groups::state_commit::roster_projection(&authority.members_v2);
+    let stable = authority.stable_group_id().to_string();
+    authority.state_hash = x0x::groups::state_commit::compute_state_hash(
+        &stable,
+        authority.state_revision,
+        authority.prev_state_hash.as_deref(),
+        &x0x::groups::state_commit::roster_root_of_projection(&projection),
+        &x0x::groups::state_commit::compute_policy_hash(&authority.policy),
+        &x0x::groups::state_commit::compute_public_meta_hash(&authority.public_meta()),
+        authority.security_binding.as_deref(),
+        false,
+    );
+    authority_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), authority.clone());
+    joiner_state.named_groups.write().await.insert(
+        group.clone(),
+        card_import_stub(authority_id, &group, &joiner_hex),
+    );
+
+    let (invite, link) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint");
+    {
+        let now_secs = now_millis_u64() / 1_000;
+        let mut groups = authority_state.named_groups.write().await;
+        groups
+            .get_mut(&group)
+            .expect("auth")
+            .record_issued_invite_v2(
+                invite.invite_secret.clone(),
+                now_secs.saturating_sub(60),
+                now_secs + 3_600,
+                x0x::groups::GroupRole::Member,
+                None,
+                x0x::groups::InviteOrigin::Explicit,
+                Some(link.clone()),
+            );
+    }
+
+    let first = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: link.clone(),
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(second).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        joiner_state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len(),
+        1,
+        "exactly one attempt owns the join"
+    );
+    let _ = (stable, joiner_hex);
     Ok(())
 }
