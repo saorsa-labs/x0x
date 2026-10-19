@@ -7948,7 +7948,10 @@ impl Agent {
         let machine = view.announcement.machine_id;
         let denial = self.recipient_pairing_denied(&agent, &machine);
         let denial = match bound.as_deref() {
-            Some(bound) => bound.bounded("evidence pairing policy", denial).await?,
+            Some(bound) => match bound.bounded("evidence pairing policy", denial).await? {
+                Some(denial) => denial,
+                None => return Ok(None),
+            },
             None => denial.await,
         };
         if denial.is_some() {
@@ -9703,7 +9706,12 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
-        let mut evidence = dm_evidence::SendEvidence::new(self, *to, config.timeout_per_attempt);
+        let mut evidence = dm_evidence::SendEvidence::new(
+            self,
+            *to,
+            config.timeout_per_attempt,
+            config.require_durable_app_ack,
+        );
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
         // the raw agent key, so the gate must refuse HERE, before any
@@ -9727,7 +9735,7 @@ impl Agent {
             // #1239: this preflight read precedes the transport timeouts.
             // A held writer must not keep an ordinary or waiting send open.
             let cache = evidence
-                .bounded("discovery", self.identity_discovery_cache.read())
+                .discovery(self.identity_discovery_cache.read())
                 .await?;
             cache.get(to).map(|entry| entry.machine_id)
         } {
@@ -9820,55 +9828,19 @@ impl Agent {
         let advert_gossip_ready = advert_cap
             .as_ref()
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
-        let (cap, cap_machine, cap_source) = if advert_gossip_ready {
+        let (mut cap, mut cap_machine, cap_source) = if advert_gossip_ready {
             (advert_cap, advert_machine, "advert_cache")
         } else if advert_cap.is_none() && stored_cap.is_some() {
             // Re-check after the refresh await; never retain authority across it.
-            match evidence.usable_agent().await? {
-                Some(view) => (
-                    Some(view.advert.capabilities.clone()),
-                    Some(view.announcement.machine_id),
-                    "peer_evidence",
-                ),
-                None => {
-                    return Err(dm::DmError::RecipientUndiscovered(
-                        "peer evidence no longer usable".into(),
-                    ))
-                }
-            }
-        } else if config.require_durable_app_ack {
-            // Strict semantics need a signed, machine-bound capability from
-            // the TTL-bounded runtime cache. The unbound contact-card fallback
-            // below cannot pin the ACK waiter to a machine, so it is never
-            // sufficient here.
-            (
-                advert_cap,
-                advert_machine,
-                "advert_cache_unusable_for_durable_ack",
-            )
+            evidence
+                .current_capability(evidence.usable_agent().await?)
+                .await?
         } else {
-            let contact_cap = {
-                let contacts = self.contact_store.read().await;
-                contacts.get(to).and_then(|contact| {
-                    contact
-                        .dm_capabilities
-                        .as_ref()
-                        .filter(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty())
-                        .cloned()
-                })
-            };
-            match contact_cap {
-                Some(cap) if advert_cap.is_some() => {
-                    (Some(cap), None, "contact_card_after_unusable_advert")
-                }
-                Some(cap) => (Some(cap), None, "contact_card"),
-                None if advert_cap.is_some() => {
-                    (advert_cap, advert_machine, "advert_cache_unusable")
-                }
-                None => (None, None, "none"),
-            }
+            evidence
+                .fallback_capability(advert_cap, advert_machine)
+                .await
         };
-        let gossip_ok = cap
+        let mut gossip_ok = cap
             .as_ref()
             .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
             .unwrap_or(false);
@@ -9962,23 +9934,6 @@ impl Agent {
             stages.strict_gate_ms = dm::millis_since(send_started);
         }
 
-        // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
-        // key clone when the engine is enabled AND we have a key to seal
-        // a fresh envelope with. With the default disabled policy this
-        // closure never runs - the happy path pays nothing.
-        //
-        // A strict send never seeds the relay: a relayed envelope is resealed
-        // by a third party and cannot carry the machine-bound v2 receipt the
-        // caller demanded.
-        let relay_seed: Option<(Vec<u8>, Vec<u8>)> =
-            if self.peer_relay.policy().enabled && !config.require_durable_app_ack {
-                cap.as_ref()
-                    .filter(|c| !c.kem_public_key.is_empty())
-                    .map(|c| (payload.clone(), c.kem_public_key.clone()))
-            } else {
-                None
-            };
-
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
         let mut config = config;
         // Direct transport RTT is a valid hint for raw-QUIC work, but it is
@@ -10003,14 +9958,7 @@ impl Agent {
         // corrupt). Fail with a retryable, distinctly-named error here rather
         // than letting envelope construction surface it downstream as an
         // opaque 400-class `EnvelopeConstruction`.
-        if gossip_ok {
-            if let Some(caps) = &cap {
-                if let Err(reason) = dm::validate_recipient_kem_key(&caps.kem_public_key) {
-                    self.direct_messaging.record_outgoing_failed(*to);
-                    return Err(dm::DmError::RecipientKeyInvalid(reason));
-                }
-            }
-        }
+        evidence.validate_capability(cap.as_ref())?;
 
         if cap_source == "peer_evidence" {
             let _ = self
@@ -10021,11 +9969,30 @@ impl Agent {
                 None => None,
             };
             if still_usable.is_none() {
-                return Err(dm::DmError::RecipientUndiscovered(
-                    "peer evidence no longer usable".into(),
-                ));
+                (cap, cap_machine, _) = evidence.current_capability(still_usable).await?;
+                evidence.validate_capability(cap.as_ref())?;
+                gossip_ok = cap
+                    .as_ref()
+                    .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
             }
         }
+
+        // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
+        // key clone when the engine is enabled AND we have a key to seal
+        // a fresh envelope with. With the default disabled policy this
+        // closure never runs - the happy path pays nothing.
+        //
+        // A strict send never seeds the relay: a relayed envelope is resealed
+        // by a third party and cannot carry the machine-bound v2 receipt the
+        // caller demanded.
+        let relay_seed: Option<(Vec<u8>, Vec<u8>)> =
+            if self.peer_relay.policy().enabled && !config.require_durable_app_ack {
+                cap.as_ref()
+                    .filter(|c| !c.kem_public_key.is_empty())
+                    .map(|c| (payload.clone(), c.kem_public_key.clone()))
+            } else {
+                None
+            };
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);

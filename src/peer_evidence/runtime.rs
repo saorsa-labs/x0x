@@ -173,7 +173,7 @@ pub struct EvidenceRuntime {
     bytes: tokio::sync::Semaphore,
     /// Number of operations waiting for startup verification.
     pub evidence_load_barrier_waits: AtomicU64,
-    /// Operations that exhausted the five-second deadline.
+    /// Load barriers or send evidence budgets that reached their deadline.
     pub evidence_barrier_timeout: AtomicU64,
     /// Operations refused by the aggregate queue bounds.
     pub evidence_barrier_overflow: AtomicU64,
