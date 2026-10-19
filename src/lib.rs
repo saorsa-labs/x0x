@@ -9123,6 +9123,20 @@ impl Agent {
     /// teardown step, so an aborted leader can neither wedge a snapshot
     /// path in `Retiring` nor let a follower return while the drained
     /// writer is still running.
+    ///
+    /// Peer-evidence workers (#1239) drain within one five-second grace.
+    /// The first call closes admission, cancels queued and asynchronous
+    /// work, and fixes an absolute deadline. A cancelled, concurrent or
+    /// repeated call reuses that deadline and cannot extend it. A started
+    /// synchronous store read cannot be aborted: if it is still running at
+    /// the deadline, its handle stays in the closed registry, its permit is
+    /// not released, and this call continues the other cleanup steps and
+    /// then returns `NetworkError::NodeError` naming the unfinished count.
+    /// A later call reaps finished workers without a new grace and succeeds
+    /// only when every evidence worker has actually finished. This bounds
+    /// only the evidence drain; it does not make disk work abortable or
+    /// bound other stages. An embedder must treat that error as an
+    /// incomplete shutdown.
     pub async fn try_shutdown(&self) -> error::NetworkResult<()> {
         // #765 r4 test instrument: this future was polled. Counted before
         // anything else so a caller parked on the serialize lock below
