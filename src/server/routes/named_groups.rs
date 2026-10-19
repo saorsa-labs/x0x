@@ -19941,12 +19941,58 @@ enum NotMemberJoinRow {
     /// the roster holds no entry at all for the joiner (not Pending, not
     /// Removed, not Banned). Only this shape may be cleared for a retry.
     UnseatedJoinRemnant,
+    /// No local seat or invite provenance. Report the failed join without
+    /// clearing a row whose origin cannot be established.
+    JoinFailed,
     /// Fork-quarantined (marker or lineage fork evidence): containment is
     /// kept and the retry is refused.
     Quarantined,
-    /// Anything else (a removal, a ban, a group never joined by invite):
+    /// Anything else (including a removal, a ban or a withdrawn group):
     /// left exactly as it is.
     Other,
+}
+
+impl NotMemberJoinRow {
+    fn refusal_response(
+        self,
+        info: &x0x::groups::GroupInfo,
+    ) -> Option<(StatusCode, Json<serde_json::Value>)> {
+        match self {
+            Self::JoinFailed => {
+                // Honest limit: invite join refuses this local record before
+                // invite handling, so another invite cannot replace it. When
+                // admission is request_access, an eligible non-member may still
+                // submit POST /groups/:id/requests; admin approval seats them
+                // (card-import stubs are the intended producer of this shape).
+                // After a lost join result the authority may already have
+                // seated this non-banned device; its JoinRequestCreated
+                // handler then rejects, so "wait for approval" never
+                // completes — advise catch-up of that seating instead.
+                let mut message = String::from(
+                    "join failed: this device already has a local group record with no \
+                     invite lineage and no seat; a fresh invite cannot replace that record",
+                );
+                if info.policy.admission == x0x::groups::GroupAdmission::RequestAccess {
+                    message.push_str(
+                        "; if you are not banned and the authority has not already \
+                         seated this device, request access with POST /groups/:id/requests \
+                         and wait for an admin to approve; if a prior join already seated \
+                         you there, a new request is rejected — wait for that seating \
+                         result or group catch-up instead",
+                    );
+                }
+                Some(api_error(StatusCode::CONFLICT, message))
+            }
+            Self::Quarantined => Some(api_error_with_reason(
+                StatusCode::CONFLICT,
+                "this device's earlier join of the group is fork-quarantined, so a new \
+                 invite cannot replace it; an operator clears the marker with \
+                 POST /groups/:id/quarantine/clear, then retries the invite",
+                "fork_quarantined",
+            )),
+            Self::UnseatedJoinRemnant | Self::Other => None,
+        }
+    }
 }
 
 fn classify_not_member_join_row(
@@ -19961,6 +20007,10 @@ fn classify_not_member_join_row(
     let no_roster_entry = !info.members_v2.contains_key(joiner_hex);
     if never_seated && no_roster_entry && !info.withdrawn {
         NotMemberJoinRow::UnseatedJoinRemnant
+    } else if lineage.is_none() && no_roster_entry && !info.withdrawn {
+        // #1161: a carry can survive a failed join without local lineage.
+        // It must not return an idempotent success with no recovery advice.
+        NotMemberJoinRow::JoinFailed
     } else {
         NotMemberJoinRow::Other
     }
@@ -20499,16 +20549,8 @@ pub(in crate::server) async fn join_group_via_invite(
                     local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
                 let not_member_row = (membership_state == "not_member")
                     .then(|| classify_not_member_join_row(&info, &joiner_hex));
-                if not_member_row == Some(NotMemberJoinRow::Quarantined) {
-                    // Review r1 P1-2: a fork-quarantined row keeps its
-                    // containment; a retry never clears it.
-                    return api_error_with_reason(
-                        StatusCode::CONFLICT,
-                        "this device's earlier join of the group is fork-quarantined, so a new \
-                         invite cannot replace it; an operator clears the marker with \
-                         POST /groups/:id/quarantine/clear, then retries the invite",
-                        "fork_quarantined",
-                    );
+                if let Some(response) = not_member_row.and_then(|row| row.refusal_response(&info)) {
+                    return response;
                 }
                 if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
                     // ADR 0107 (0088 S8 (a)): the VERIFIED invite base is
@@ -44498,6 +44540,7 @@ pub(in crate::server) mod tests {
     mod issue1113_self_leave_rekey;
     mod issue1139_back_to_back_join;
     mod issue1146_refused_join_record;
+    mod issue1161_not_member_lineage;
     pub(in crate::server) mod issue1187_durable_journal;
     mod issue1228_actor_checks;
     mod issue1238_direct_metadata_lanes;
