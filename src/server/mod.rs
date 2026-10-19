@@ -1393,11 +1393,12 @@ pub async fn serve_with_options(
         }));
     }
 
-    // #1380: the M1 delivery probe. A real signed publish every 30 s that
-    // must come back through this daemon's own subscription within 5 s —
-    // the closed #288's blind spot (serving HTTP while delivery is
-    // wedged). Results land on the health snapshot; the handler reads
-    // them through the verdict sample, never live.
+    // #1380: the M1 delivery probe, local-only (RC5 review): every 30 s
+    // (first at ~10 s) it signs/verifies a probe envelope in-process and
+    // publishes a nonce on a `local:` topic that must come back through
+    // this daemon's own subscription within 5 s — no frame leaves the
+    // node. Results land on the health snapshot; the handler merges them
+    // live at serve time, alongside the peer counts and uptime.
     {
         let probe_agent = Arc::clone(&state.agent);
         let probe_snapshot = Arc::clone(&state.health_snapshot);

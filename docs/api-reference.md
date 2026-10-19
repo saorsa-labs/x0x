@@ -305,16 +305,25 @@ version bump.
 - `send_failure_rate` — failed/(attempted) gossip publishes over a rolling
   60 s window. Below 5 attempts the `rate` is `null` and the input stays
   `ok`; at ≥ 5 attempts a rate ≥ 0.5 degrades.
-- `delivery_probe` — every 30 s the daemon publishes one tiny signed frame
-  on `x0x.health.probe.v1` (a fixed magic prefix plus 16 random bytes,
-  unique per round — it carries no ids and no addresses) and requires its
-  own payload back through
-  subscribe → decode → subscriber handoff within 5 s. `probes_run: 0`
-  (no gossip runtime, or before the first probe ~10 s after start) is
-  `ok`; the last failed probe degrades (the closed #288's blind spot:
-  serving HTTP while delivery is wedged). `last_latency_ms` is `null`
-  when the last probe failed. The probe task records its outcome straight
-  onto the health snapshot and the handler reads it live, so a failure is
+- `delivery_probe` — a local-only probe, every 30 s (first at ~10 s after
+  start). Each round signs a nonce payload (a fixed magic prefix plus 16
+  random bytes — it carries no ids and no addresses) with the daemon's
+  ML-DSA-65 key, encodes the signed V2 envelope, then decodes and verifies
+  it in-process; it then publishes the nonce on the `local:` topic
+  `local:x0x.health.probe.v1` and requires its own payload back through
+  subscribe → subscriber handoff within 5 s. No frame leaves the node, no
+  peer receives or verifies the probe, and no network-visible topic
+  exists (RC5 review of #1380: the probe's earlier form broadcast a
+  network-wide signed frame every 30 s while its own-nonce self-delivery
+  proved nothing about remote delivery). Covered: the wire-crypto path
+  (sign, encode, decode, verify) and the same-daemon dispatch path. Not
+  covered: PlumTree fan-out and delivery to remote peers — a network-wide
+  probe would be a separate wire decision. `probes_run: 0` (no gossip
+  runtime, or before the first probe) is `ok`; the last failed probe
+  degrades (#288's blind spot at local scope: serving HTTP while the
+  local dispatch pipeline is wedged). `last_latency_ms` is `null` when
+  the last probe failed. The probe task records its outcome straight onto
+  the health snapshot and the handler reads it live, so a failure is
   visible on the very next request without waiting for the sampler.
 - `recv_pump_shed` — recv-pump control-frame sheds (ADR 0013) and
   full-queue drops over the last 60 s. Any non-zero window degrades.
@@ -335,8 +344,9 @@ version bump.
   dir degrades. An available update or a failed lookup stays `ok`
   (matching `x0x doctor`).
 
-Every input except the live peer counts/uptime is refreshed by a 5 s
-background sampler, never on the request path — `/health` stays O(1) and
+Every input except the live peer counts/uptime and the delivery-probe
+results is refreshed by a 5 s background sampler, never on the request
+path — `/health` stays O(1) and
 transport-lock-free (#600). Before the first refresh the verdict reads
 `ok` from the unsampled baseline. `verdict.sample_age_secs` states how old
 the sampled inputs were when served; the peer counts, uptime and

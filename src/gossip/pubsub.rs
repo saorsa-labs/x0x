@@ -4776,6 +4776,42 @@ fn verify_signature(
     verified
 }
 
+/// Sign, encode, decode and verify one V2 envelope entirely on this node —
+/// the same wire-crypto path a network publish takes (signing payload,
+/// ML-DSA-65 signature, envelope encode, decode with signature verify),
+/// without PlumTree admission and without a frame ever reaching a peer.
+///
+/// The RC5 local-only health probe (#1380) uses this to keep the
+/// sign/verify/decode half of its delivery coverage after leaving the
+/// shared network topic: a `local:` publish takes the
+/// [`Self::publish_local`] bypass and signs nothing, so the probe checks
+/// that half here instead.
+pub(crate) fn sign_decode_verify_local(
+    signing: &SigningContext,
+    topic: &str,
+    payload: &Bytes,
+) -> NetworkResult<PubSubMessage> {
+    let version = SignedVersion::V2;
+    let signing_payload =
+        version.signing_payload(signing.agent_id.as_bytes(), topic.as_bytes(), payload)?;
+    let signature = signing.sign(&signing_payload)?;
+    let envelope = encode_signed(
+        version,
+        &signing.agent_id,
+        &signing.public_key_bytes,
+        &signature,
+        topic,
+        payload,
+    )?;
+    let message = decode_signed(&envelope, version, &INNER_VERIFY_STATS)?;
+    if !message.verified {
+        return Err(NetworkError::SerializationError(
+            "locally signed envelope did not verify".to_string(),
+        ));
+    }
+    Ok(message)
+}
+
 /// Wire fixtures for crate tests outside this module (#1114 SSE/WS proofs).
 #[cfg(test)]
 pub(crate) mod test_support {

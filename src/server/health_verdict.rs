@@ -46,12 +46,19 @@ use super::routes::status::{
 };
 use super::state::{AppState, PROD_PLANE_ID};
 
-/// Topic the delivery probe publishes on. A real (non-`local:`) topic so
-/// the probe exercises the full same-node path a gossip publish takes:
-/// sign → encode → PlumTree admission → decode → subscriber handoff.
-pub(in crate::server) const DELIVERY_PROBE_TOPIC: &str = "x0x.health.probe.v1";
-/// Probe cadence. Every 30 s one tiny signed frame per daemon — far below
-/// presence-beacon traffic.
+/// Topic the delivery probe publishes on. `local:`-prefixed, so the
+/// payload never reaches PlumTree or any remote peer (issue #89): no
+/// frame leaves the node, no peer receives or verifies the probe, and no
+/// network-visible topic exists. RC5 review of #1380: a shared topic made
+/// every daemon broadcast a signed frame every 30 s that PlumTree spread
+/// network-wide, while own-nonce self-delivery proved nothing about
+/// remote delivery. The wire-crypto half (sign → encode → decode →
+/// verify) is exercised locally by [`sign_decode_verify_local`] instead
+/// of by the publish itself.
+pub(in crate::server) const DELIVERY_PROBE_TOPIC: &str = "local:x0x.health.probe.v1";
+/// Probe cadence. Every 30 s one probe round per daemon; the publish is
+/// same-daemon only and the sign/verify round is in-process, so the
+/// probe adds no network traffic at all.
 pub(in crate::server) const DELIVERY_PROBE_INTERVAL_SECS: u64 = 30;
 /// How long a probe waits for its own payload to come back before the
 /// delivery input is degraded.
@@ -59,8 +66,9 @@ pub(in crate::server) const DELIVERY_PROBE_TIMEOUT_SECS: u64 = 5;
 /// Delay before the first probe so a freshly started daemon is not flagged
 /// while gossip is still joining.
 pub(in crate::server) const DELIVERY_PROBE_STARTUP_DELAY_SECS: u64 = 10;
-/// Magic prefix distinguishing probe frames from any other traffic on the
-/// shared topic (each daemon's probe carries a random nonce after it).
+/// Magic prefix distinguishing probe frames from anything else arriving
+/// on the probe topic; this daemon's probe carries a random nonce after
+/// it, unique per round.
 const PROBE_MAGIC: &[u8] = b"x0x-health-probe-v1:";
 
 /// Window duration every rolling counter measures. The refresher's 5 s
@@ -701,8 +709,10 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
         (_, Some(false)) => {
             bump(InputState::Degraded);
             reasons.push(format!(
-                "delivery probe did not return within \
-                 {DELIVERY_PROBE_TIMEOUT_SECS}s (#288: serving but not delivering)"
+                "delivery probe did not complete within \
+                 {DELIVERY_PROBE_TIMEOUT_SECS}s (#288: serving HTTP while the \
+                 local dispatch pipeline is wedged; local scope only — see \
+                 docs/api-reference.md)"
             ));
             InputState::Degraded
         }
@@ -888,10 +898,20 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
 // Delivery probe
 // ---------------------------------------------------------------------------
 
-/// Background delivery probe (#288's blind spot): publish a nonce to
-/// [`DELIVERY_PROBE_TOPIC`] and wait for our own payload to come back
-/// through subscribe → decode → subscriber handoff. Other daemons'
-/// probes on the same topic are ignored — only the nonce match counts.
+/// Background delivery probe, scoped to this daemon (RC5 review of
+/// #1380): every [`DELIVERY_PROBE_INTERVAL_SECS`] it (a) signs a nonce
+/// with the agent's ML-DSA-65 key, encodes the V2 envelope, decodes and
+/// verifies it — all in-process, [`sign_decode_verify_local`] — and
+/// (b) publishes the nonce on the `local:` [`DELIVERY_PROBE_TOPIC`] and
+/// requires its own payload back through subscribe → subscriber handoff.
+///
+/// What that covers: the wire-crypto path (sign, encode, decode, verify)
+/// and the same-daemon dispatch path. What it deliberately does not
+/// cover: PlumTree admission and delivery to remote peers — that would
+/// need network-wide traffic, which no longer ships with this probe
+/// (any such probe is a wire question for David). The #288 wedge it can
+/// still catch is a daemon serving HTTP while its own dispatch pipeline
+/// is wedged.
 ///
 /// Schedule: the first probe runs at the documented
 /// [`DELIVERY_PROBE_STARTUP_DELAY_SECS`] boundary (10 s, see
@@ -974,17 +994,35 @@ pub(in crate::server) async fn run_delivery_probe(
     }
 }
 
-/// One probe round-trip. `Ok(())` only when this daemon's exact payload
-/// came back on the subscription within the timeout.
+/// One probe round-trip, both halves: the in-process wire-crypto check
+/// (sign → encode → decode → verify, [`sign_decode_verify_local`]) and
+/// the bounded same-daemon dispatch exchange. `Ok(())` only when the
+/// signature verifies, the decoded payload is intact and this daemon's
+/// exact payload came back on the subscription within the timeout.
 async fn probe_once(
     agent: &crate::Agent,
     subscription: &mut crate::gossip::Subscription,
 ) -> Result<(), String> {
+    let payload = probe_payload();
+    // Wire-crypto half. Pure CPU — no locks, no awaits — so it is bounded
+    // by its own work and sits outside the exchange deadline (a deadline
+    // cannot preempt synchronous signing anyway).
+    let signing = crate::gossip::SigningContext::from_keypair(agent.identity().agent_keypair());
+    let message = crate::gossip::pubsub::sign_decode_verify_local(
+        &signing,
+        DELIVERY_PROBE_TOPIC,
+        &bytes::Bytes::from(payload.clone()),
+    )
+    .map_err(|err| format!("probe sign/verify failed: {err}"))?;
+    if message.payload.as_ref() != payload.as_slice() {
+        return Err("probe sign/verify round-trip altered the payload".to_string());
+    }
+    // Dispatch half.
     let mut channel = AgentChannel {
         agent,
         subscription,
     };
-    probe_exchange(&mut channel, probe_payload()).await
+    probe_exchange(&mut channel, payload).await
 }
 
 /// The transport-facing half of one probe, as an injectable seam: the
@@ -995,8 +1033,10 @@ trait ProbeChannel {
     async fn recv(&mut self) -> Option<Vec<u8>>;
 }
 
-/// [`ProbeChannel`] over the real delivery path: a signed publish on the
-/// probe topic and this daemon's own subscription on it.
+/// [`ProbeChannel`] over the real delivery path: a publish on the
+/// `local:` probe topic (which must produce no wire envelope — a
+/// `local:` topic never reaches PlumTree or a peer) and this daemon's
+/// own subscription on it.
 struct AgentChannel<'a> {
     agent: &'a crate::Agent,
     subscription: &'a mut crate::gossip::Subscription,
@@ -1004,10 +1044,23 @@ struct AgentChannel<'a> {
 
 impl ProbeChannel for AgentChannel<'_> {
     async fn publish(&mut self, payload: Vec<u8>) -> Result<(), String> {
-        self.agent
-            .publish(DELIVERY_PROBE_TOPIC, payload)
+        // `publish_and_get_envelope` rather than `publish`: the plain
+        // path counts a zero-fanout publish into the #1135 diagnostics
+        // counter, which a same-daemon probe is not. The envelope result
+        // doubles as the scope guard: a `local:` topic produces `None`,
+        // and `Some(_)` means the topic constant regressed to a network
+        // topic — fail the probe rather than silently broadcast.
+        let envelope = self
+            .agent
+            .publish_and_get_envelope(DELIVERY_PROBE_TOPIC, payload)
             .await
-            .map_err(|err| format!("probe publish failed: {err}"))
+            .map_err(|err| format!("probe publish failed: {err}"))?;
+        if envelope.is_some() {
+            return Err("delivery probe left local scope: a wire envelope \
+                        was produced for the probe topic"
+                .to_string());
+        }
+        Ok(())
     }
 
     async fn recv(&mut self) -> Option<Vec<u8>> {
@@ -1019,8 +1072,9 @@ impl ProbeChannel for AgentChannel<'_> {
 }
 
 /// The payload one probe publishes and must hear back: the probe magic
-/// plus 16 random bytes, unique per round, so other daemons' probes on
-/// the shared topic never satisfy ours.
+/// plus 16 random bytes, unique per round, so nothing else arriving on
+/// the probe topic (another round's stale frame, any other same-daemon
+/// publisher) ever satisfies this round.
 fn probe_payload() -> Vec<u8> {
     use rand::RngCore;
 
@@ -1034,15 +1088,16 @@ fn probe_payload() -> Vec<u8> {
 /// One bounded probe exchange: publish the nonce, then wait for the exact
 /// payload to come back — publish included, all under a single
 /// [`DELIVERY_PROBE_TIMEOUT_SECS`] deadline. A publish that never
-/// completes is precisely the #288 serving-but-not-delivering wedge this
-/// probe exists to expose, so it must fail the probe, not outlive the cap.
+/// completes means the gossip runtime itself is wedged while HTTP still
+/// serves, so it must fail the probe, not outlive the cap.
 async fn probe_exchange<C: ProbeChannel>(channel: &mut C, payload: Vec<u8>) -> Result<(), String> {
     tokio::time::timeout(Duration::from_secs(DELIVERY_PROBE_TIMEOUT_SECS), async {
         channel.publish(payload.clone()).await?;
         loop {
             match channel.recv().await {
                 Some(echo) if echo == payload => return Ok(()),
-                // Another daemon's probe on the shared topic — keep waiting.
+                // Another same-daemon publisher on the probe topic — keep
+                // waiting for this round's nonce.
                 Some(_) => {}
                 // Subscription dropped (shutdown): the outer loop exits on
                 // the shutdown watch right after.
@@ -1820,8 +1875,10 @@ mod tests {
     }
 
     /// The probe round-trips through a real (loopback-only, bootstrap-free,
-    /// mDNS-off) agent: publish → PlumTree → decode → subscriber. This is
-    /// the #288 scenario — serving fine, delivering nothing — caught.
+    /// mDNS-off) agent, both halves: the in-process sign → encode → decode
+    /// → verify check and the local publish → subscriber handoff. This is
+    /// the #288 scenario it can still catch — serving fine, dispatching
+    /// nothing — at local scope.
     #[tokio::test]
     async fn delivery_probe_round_trips_on_a_loopback_agent() {
         let agent = loopback_agent().await;
@@ -1836,6 +1893,62 @@ mod tests {
             .expect("probe round-trip within timeout");
         snapshot.record_probe(true, Some(1));
         assert_eq!(snapshot.probe_results(), (1, Some(true), Some(1)));
+    }
+
+    /// RC5 #1380 (probe scope): the probe topic must be `local:`-prefixed,
+    /// and a probe publish must produce no wire envelope — no frame leaves
+    /// the node, no peer receives or verifies the probe — while the
+    /// same-daemon subscriber still receives the payload. Fails at
+    /// dca38a76, where the topic was the network topic
+    /// `x0x.health.probe.v1` and PlumTree spread every daemon's probe.
+    #[tokio::test]
+    async fn the_probe_topic_stays_local_and_off_the_wire() {
+        assert!(
+            crate::gossip::pubsub::is_local_topic(DELIVERY_PROBE_TOPIC),
+            "the delivery probe topic must stay `local:`-prefixed"
+        );
+        let agent = loopback_agent().await;
+        let mut subscription = agent
+            .subscribe(DELIVERY_PROBE_TOPIC)
+            .await
+            .expect("subscribe");
+        let payload = probe_payload();
+        let envelope = agent
+            .publish_and_get_envelope(DELIVERY_PROBE_TOPIC, payload.clone())
+            .await
+            .expect("probe publish");
+        assert!(
+            envelope.is_none(),
+            "a `local:` probe publish must not produce a signed wire envelope"
+        );
+        let echo = tokio::time::timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("same-daemon delivery within timeout")
+            .expect("subscription open");
+        assert_eq!(echo.payload.to_vec(), payload);
+    }
+
+    /// RC5 #1380 (probe scope): the wire-crypto half — sign with the
+    /// agent's ML-DSA-65 key, encode the V2 envelope, decode and verify —
+    /// runs in-process, so the local-only scope keeps the sign/verify
+    /// coverage the `local:` publish path (which signs nothing) would
+    /// otherwise lose. Fails at dca38a76 (compile:
+    /// `sign_decode_verify_local` is the fix's seam).
+    #[tokio::test]
+    async fn the_probe_sign_verify_half_round_trips_locally() {
+        let agent = loopback_agent().await;
+        let signing = crate::gossip::SigningContext::from_keypair(agent.identity().agent_keypair());
+        let payload = probe_payload();
+        let message = crate::gossip::pubsub::sign_decode_verify_local(
+            &signing,
+            DELIVERY_PROBE_TOPIC,
+            &bytes::Bytes::from(payload.clone()),
+        )
+        .expect("local sign/encode/decode/verify round-trip");
+        assert!(message.verified);
+        assert_eq!(message.topic, DELIVERY_PROBE_TOPIC);
+        assert_eq!(message.payload.to_vec(), payload);
+        assert_eq!(message.sender, Some(agent.agent_id()));
     }
 
     /// RC1 #1380 (P2): the first probe must run at the documented 10 s

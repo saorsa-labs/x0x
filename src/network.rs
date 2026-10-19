@@ -753,6 +753,33 @@ pub fn normalize_v4_mapped_addr(addr: SocketAddr) -> SocketAddr {
         v4 => v4,
     }
 }
+
+/// (#1380 RC5) The pure core of [`NetworkNode::seed_reachability`]:
+/// normalize configured and observed UDP addresses with
+/// [`normalize_v4_mapped_addr`] — a v4-mapped `::ffff:a.b.c.d` config
+/// entry and the plain `a.b.c.d` the connection table reports (or the
+/// reverse; #484 records ant-quic observing mapped forms) are the same
+/// seed — then intersect. Normalization also de-duplicates equivalent
+/// aliases in the configured list. Native IPv6 addresses and ports pass
+/// through untouched, so distinct seeds stay distinct.
+fn count_reachable_seeds(configured: &[SocketAddr], observed_udp: &[SocketAddr]) -> (u64, u64) {
+    let configured: std::collections::HashSet<SocketAddr> = configured
+        .iter()
+        .copied()
+        .map(normalize_v4_mapped_addr)
+        .collect();
+    if configured.is_empty() {
+        return (0, 0);
+    }
+    let connected = observed_udp
+        .iter()
+        .copied()
+        .map(normalize_v4_mapped_addr)
+        .filter(|addr| configured.contains(addr))
+        .collect::<std::collections::HashSet<SocketAddr>>()
+        .len() as u64;
+    (configured.len() as u64, connected)
+}
 impl Default for PeerRelayConfig {
     fn default() -> Self {
         Self {
@@ -4920,30 +4947,28 @@ impl NetworkNode {
     /// from ant-quic's own `connect_known_peers()`; x0x joins through
     /// [`NetworkNode::connect_addr`] (`join_network` phase 2), so a
     /// successful join left the counter at zero and healthy seeded nodes
-    /// read degraded (RC3 review of #1380). Counts only: the
-    /// auth-exempt verdict never reports seed addresses.
+    /// read degraded (RC3 review of #1380). Both sides are normalized
+    /// through `count_reachable_seeds` before matching (RC5 review of
+    /// #1380). Counts only: the auth-exempt verdict never reports seed
+    /// addresses.
     pub async fn seed_reachability(&self) -> (u64, u64) {
-        let configured: std::collections::HashSet<SocketAddr> =
-            self.config.bootstrap_nodes.iter().copied().collect();
-        if configured.is_empty() {
+        if self.config.bootstrap_nodes.is_empty() {
             return (0, 0);
         }
-        let link = self.node.read().await.as_ref().cloned();
-        let Some(link) = link else {
-            return (configured.len() as u64, 0);
+        let observed_udp = match self.node.read().await.as_ref() {
+            Some(link) => link
+                .connected_peers()
+                .await
+                .iter()
+                .filter_map(|conn| match conn.remote_addr {
+                    TransportAddr::Udp(addr) => Some(addr),
+                    _ => None,
+                })
+                .collect::<Vec<SocketAddr>>(),
+            // No transport yet: every configured seed is unreachable.
+            None => Vec::new(),
         };
-        let connected = link
-            .connected_peers()
-            .await
-            .iter()
-            .filter_map(|conn| match conn.remote_addr {
-                TransportAddr::Udp(addr) => Some(addr),
-                _ => None,
-            })
-            .filter(|addr| configured.contains(addr))
-            .collect::<std::collections::HashSet<SocketAddr>>()
-            .len() as u64;
-        (configured.len() as u64, connected)
+        count_reachable_seeds(&self.config.bootstrap_nodes, &observed_udp)
     }
 
     /// Transport-layer diagnostics for the #368 connection-zombie hunt.
@@ -7917,6 +7942,92 @@ mod tests {
 
     fn test_ant_peer(byte: u8) -> AntPeerId {
         ant_quic::PeerId([byte; 32])
+    }
+
+    // #1380 RC5 -----------------------------------------------------------
+
+    /// RC5 #1380 (P2): a configured v4-mapped seed address is the same
+    /// seed as the plain IPv4 form the connection table reports.
+    /// `connect_addr` normalizes mapped dials (#484), so the join dials
+    /// the plain form and the sim fabric reports the seed's plain bind
+    /// address; the configured mapped alias missed the exact match at
+    /// dca38a76 and a healthy seeded node read `(1, 0)` — degraded past
+    /// the 120 s grace. Runtime-RED at dca38a76, where this test's
+    /// `seed_reachability` call returns `(1, 0)` after a successful join.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_configured_mapped_seed_counts_as_reachable_after_a_join_dial() {
+        let plane = "issue1380-rc5-seed-mapped";
+        let fabric = sim::SimFabric::new(1381);
+        sim::register(plane, &fabric);
+        let config = |host: u8, seeds: Vec<SocketAddr>| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: seeds,
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let seed_alias: SocketAddr = "[::ffff:198.18.0.2]:5483".parse().unwrap();
+        let seed = NetworkNode::new(config(2, Vec::new()), None, None)
+            .await
+            .unwrap();
+        let joiner = NetworkNode::new(config(1, vec![seed_alias]), None, None)
+            .await
+            .unwrap();
+
+        // Before the join: configured, not reachable.
+        assert_eq!(joiner.seed_reachability().await, (1, 0));
+
+        // The join-path dial: `connect_addr` normalizes the mapped alias
+        // to the plain form (`seed_addr`) before dialing (#484), as join
+        // phase 2 would.
+        let seed_peer = joiner.connect_addr(seed_alias).await.unwrap();
+        assert_eq!(seed_peer, seed.peer_id());
+
+        let (configured, connected) = joiner.seed_reachability().await;
+        assert_eq!(
+            (configured, connected),
+            (1, 1),
+            "a configured mapped alias must count once the connection exists"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// RC5 #1380 (P2): the pure core of `seed_reachability` — every alias
+    /// pairing of one seed must match, equivalent configured aliases must
+    /// de-duplicate, and ports/native IPv6 keep seeds distinct. Fails at
+    /// dca38a76 (compile: `count_reachable_seeds` is the fix's seam).
+    #[test]
+    fn seed_alias_forms_match_and_deduplicate() {
+        let plain: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:198.18.0.2]:5483".parse().unwrap();
+        let other_port: SocketAddr = "198.18.0.2:443".parse().unwrap();
+        let native_v6: SocketAddr = "[2001:db8::2]:5483".parse().unwrap();
+
+        // Configured mapped, observed plain (the #484 dial-normalized case).
+        assert_eq!(count_reachable_seeds(&[mapped], &[plain]), (1, 1));
+        // Observed mapped, configured plain (ant-quic reporting a mapped peer).
+        assert_eq!(count_reachable_seeds(&[plain], &[mapped]), (1, 1));
+        // Equivalent aliases configure one seed; connections to either
+        // form count it once, not twice.
+        assert_eq!(
+            count_reachable_seeds(&[plain, mapped], &[plain, mapped]),
+            (1, 1)
+        );
+
+        // Ports and native IPv6 keep seed identities distinct.
+        assert_eq!(
+            count_reachable_seeds(&[plain, other_port], &[plain]),
+            (2, 1)
+        );
+        assert_eq!(count_reachable_seeds(&[native_v6], &[native_v6]), (1, 1));
+        assert_eq!(count_reachable_seeds(&[plain], &[native_v6]), (1, 0));
+
+        // No transport / no connections: configured seeds, none reachable.
+        assert_eq!(count_reachable_seeds(&[plain], &[]), (1, 0));
+        assert_eq!(count_reachable_seeds(&[], &[plain]), (0, 0));
     }
 
     #[test]
