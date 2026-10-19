@@ -20671,11 +20671,31 @@ pub(in crate::server) async fn join_group_via_invite(
     // card-import stub — see `classify_not_member_join_row`) must not
     // swallow a fresh verified invite as an idempotent success. It is
     // cleared below and the join proceeds as a NEW attempt — unless ADR
-    // 0107 re-arms an UnseatedJoinRemnant instead. Invite creator is the
-    // card-genesis owner pin for inert-stub match (v4 always carries it).
+    // 0107 re-arms an UnseatedJoinRemnant instead.
+    //
+    // #1471 / Codex P2: every refuse-the-invite check that can still fail
+    // after A2 auth (malformed signed creator, inviter id, group_id hex)
+    // MUST run before any stub clear. Clearing then returning 400 would
+    // drop an inert card-import row and leave later access as 404.
     let invite_owner_hex = match invite.creator.as_deref() {
         Some(creator) => creator,
         None => return refuse_invite(&state, &invite, "invite_unsigned"),
+    };
+    // r1: v4 carries the SIGNED creator (projection has no added_by).
+    let creator_hex = invite_owner_hex.to_string();
+    let creator = match parse_agent_id_hex(&creator_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return bad_request(format!("invalid base-state creator: {e}"));
+        }
+    };
+    // Inviter was already proven at the A2 id step (`inviter_agent`).
+    let inviter = inviter_agent;
+    let group_id_bytes = match hex::decode(&group_id_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return bad_request(format!("invalid group_id hex: {e}"));
+        }
     };
     let mut stale_not_member_row = false;
     let mut rearm_remnant: Option<x0x::groups::GroupInfo> = None;
@@ -20910,32 +20930,12 @@ pub(in crate::server) async fn join_group_via_invite(
             }
         }
     }
-    let inviter = match parse_agent_id_hex(&invite.inviter) {
-        Ok(id) => id,
-        Err(e) => {
-            return bad_request(format!("invalid inviter: {e}"));
-        }
-    };
-    // r1: v4 carries the SIGNED creator (checked above as invite_owner_hex
-    // before any not_member clear; the projection has no added_by/timestamps).
-    let creator_hex = invite_owner_hex.to_string();
-    let creator = match parse_agent_id_hex(&creator_hex) {
-        Ok(id) => id,
-        Err(e) => {
-            return bad_request(format!("invalid base-state creator: {e}"));
-        }
-    };
+    // Creator, inviter and group_id bytes were validated above before any
+    // not_member stub clear — a refused invite leaves the row unchanged.
 
     // Create the MLS group locally (in a real flow, the inviter would send
     // a Welcome message; for now, we create a local group and the inviter
     // will add us when they see our presence on the group topic)
-    let group_id_bytes = match hex::decode(&group_id_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return bad_request(format!("invalid group_id hex: {e}"));
-        }
-    };
-
     let treekem_key_package_b64 = if invite_is_treekem {
         use base64::Engine as _;
         let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);

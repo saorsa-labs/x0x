@@ -1017,6 +1017,108 @@ async fn inert_stub_stable_id_mismatch_keeps_join_failed_refusal() -> Result<()>
     Ok(())
 }
 
+/// #1471 / Codex P2: a crypto-valid, re-signed invite with a malformed
+/// signed creator (`"zz"`) must refuse before any inert-stub clear. On the
+/// RC1 head the stable-id gate passed, the stub was removed, then creator
+/// parse returned HTTP 400 — later access saw 404 until recovery.
+#[tokio::test]
+async fn malformed_signed_creator_refuses_before_clearing_inert_stub() -> Result<()> {
+    let (authority_state, _a) = secure_endpoint_test_state().await?;
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1471-malformed-creator-stub").as_bytes());
+    let authority_id = authority_state.agent.agent_id();
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+
+    let mut authority = x0x::groups::GroupInfo::with_policy(
+        "live".into(),
+        String::new(),
+        authority_id,
+        group.clone(),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    authority.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    let projection = x0x::groups::state_commit::roster_projection(&authority.members_v2);
+    let stable = authority.stable_group_id().to_string();
+    authority.state_hash = x0x::groups::state_commit::compute_state_hash(
+        &stable,
+        authority.state_revision,
+        authority.prev_state_hash.as_deref(),
+        &x0x::groups::state_commit::roster_root_of_projection(&projection),
+        &x0x::groups::state_commit::compute_policy_hash(&authority.policy),
+        &x0x::groups::state_commit::compute_public_meta_hash(&authority.public_meta()),
+        authority.security_binding.as_deref(),
+        false,
+    );
+    authority_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), authority.clone());
+
+    let stub = card_import_stub(authority_id, &group, &joiner_hex);
+    assert_eq!(
+        classify_not_member_join_row(&stub, &joiner_hex),
+        NotMemberJoinRow::InertCardImportStub
+    );
+    assert!(inert_stub_matches_verified_invite(&stub, &group));
+    let stub_before = serde_json::to_value(&stub).expect("stub snapshot");
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), stub);
+
+    let (mut invite, _link) =
+        assemble_signed_v4_invite(&authority_state, &authority, 3_600, None).expect("mint invite");
+    // Otherwise-valid invite: mutate signed creator to malformed, re-sign so
+    // A2 crypto still passes and the stable-id stub gate would clear.
+    invite.creator = Some("zz".to_string());
+    invite
+        .sign_v4(authority_state.agent.identity().agent_keypair(), None)
+        .expect("re-sign with malformed creator");
+    let link = invite.to_link();
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "malformed signed creator must refuse: {body}"
+    );
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("invalid base-state creator"),
+        "expected creator refusal, got {body}"
+    );
+
+    let groups = joiner_state.named_groups.read().await;
+    let after = groups
+        .get(&group)
+        .expect("stub must remain after creator refusal");
+    assert_eq!(
+        serde_json::to_value(after).expect("after snapshot"),
+        stub_before,
+        "refused invite must leave inert stub membership/lineage byte-for-byte unchanged"
+    );
+    assert_eq!(
+        classify_not_member_join_row(after, &joiner_hex),
+        NotMemberJoinRow::InertCardImportStub
+    );
+    assert!(after.invite_lineage.is_none());
+    assert!(!after.has_active_member(&joiner_hex));
+    Ok(())
+}
+
 #[tokio::test]
 async fn inert_stub_refusal_controls_secret_removed_banned_quarantine_withdrawn_alias_pending(
 ) -> Result<()> {
