@@ -13,6 +13,8 @@ pub mod rollout;
 pub mod signature;
 pub mod verification_probe;
 
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -135,10 +137,27 @@ impl Upgrader {
         Ok(temp_dir)
     }
 
-    /// Full upgrade workflow: validate -> backup -> replace.
+    /// Path of the binary this upgrader replaces.
+    pub(super) fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+
+    /// Full upgrade workflow: host lock -> compare -> backup -> replace.
     ///
     /// The caller is responsible for downloading and verifying the new binary
     /// before calling this method.
+    ///
+    /// Under a host-wide exclusive lock beside this target
+    /// (`<target-file-name>.upgrade.lock`), if the on-disk target already
+    /// matches the incoming bytes, backup and replace are skipped (the
+    /// preserved backup is not rewritten). On Unix the target is still made
+    /// executable (`0o755`) before Success — the same postcondition as
+    /// [`Self::atomic_replace`]. Permission repair failure is an error, never
+    /// Success. The public result is otherwise [`UpgradeResult::Success`] with
+    /// the requested version so auto-apply can still restart an old-running
+    /// process into those bytes (T-self-update-host-backup-guard / #1447).
+    /// Companion binaries (e.g. `x0x` next to `x0xd`) take their own lock file
+    /// beside that path via the same mechanism.
     pub fn perform_upgrade(
         &self,
         new_binary_path: &Path,
@@ -146,9 +165,48 @@ impl Upgrader {
     ) -> Result<UpgradeResult, UpgradeError> {
         self.validate_upgrade(target_version)?;
 
+        // Hold for the whole compare / backup / replace critical section.
+        // Dropping the guard releases the OS lock; the lock file is never
+        // unlinked, so reclaim cannot remove a file another process still holds.
+        let _host_lock = acquire_host_upgrade_lock(&self.target_path)?;
+        self.finish_upgrade_under_host_lock(new_binary_path, target_version)
+    }
+
+    /// Compare / backup / replace while the caller already holds this target's
+    /// host lock. Used by the offloaded multi-target apply so every lock can
+    /// be taken before any mutation (cancel must not install bytes without a
+    /// restart owner).
+    ///
+    /// When disk already matches the incoming bytes, backup and replace are
+    /// skipped and [`UpgradeResult::Success`] is returned so public
+    /// `perform_upgrade` matches main and auto-apply can still own restart.
+    /// On Unix, Success still requires the installed target to be executable
+    /// (`0o755`), matching `atomic_replace`; a permission repair failure is
+    /// an error, never Success. The preserved backup is not rewritten.
+    pub(super) fn finish_upgrade_under_host_lock(
+        &self,
+        new_binary_path: &Path,
+        target_version: &Version,
+    ) -> Result<UpgradeResult, UpgradeError> {
+        if on_disk_matches_incoming(&self.target_path, new_binary_path)? {
+            // Host lock is held: repair execute bits without clobbering backup.
+            ensure_target_executable(&self.target_path)?;
+            info!(
+                version = %target_version,
+                target = %self.target_path.display(),
+                "On-disk target already matches incoming binary; skipping backup and replace"
+            );
+            return Ok(UpgradeResult::Success {
+                version: target_version.to_string(),
+            });
+        }
+
         let backup_path = self.create_backup()?;
 
-        info!("Replacing binary...");
+        info!(
+            replace_target = %self.target_path.display(),
+            "Replacing binary..."
+        );
         match self.atomic_replace(new_binary_path) {
             Ok(()) => {
                 info!(version = %target_version, "Successfully upgraded to version {}", target_version);
@@ -177,6 +235,157 @@ impl Upgrader {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Persistent lock file beside `target`: `<file-name>.upgrade.lock`.
+///
+/// Never unlinked on release or reclaim — only the OS advisory lock is dropped
+/// when the holder process dies or the returned file is closed.
+fn host_upgrade_lock_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".upgrade.lock");
+    target.with_file_name(name)
+}
+
+/// Exclusive OS lock (`std::fs::File::lock`: flock/fcntl on Unix, LockFileEx
+/// on Windows). Created if missing; never truncated or unlinked.
+pub(super) fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeError> {
+    let lock_path = host_upgrade_lock_path(target);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| {
+            UpgradeError::Other(format!(
+                "failed to take host upgrade lock at {}: {source}",
+                lock_path.display()
+            ))
+        })?;
+    file.lock().map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to take host upgrade lock at {}: {source}",
+            lock_path.display()
+        ))
+    })?;
+    Ok(file)
+}
+
+/// Unix postcondition shared with [`Upgrader::atomic_replace`]: Success means
+/// the installed target is executable (`0o755`). Runs under the host lock on
+/// the equal-bytes shortcut so a `0644` target is repaired without rewriting
+/// the preserved backup. Permission failure must not become Success.
+#[cfg(unix)]
+fn ensure_target_executable(target: &Path) -> Result<(), UpgradeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(test)]
+    if exec_postcondition_seam::should_fail() {
+        return Err(UpgradeError::ReplaceFailed {
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected executable-postcondition failure",
+            ),
+        });
+    }
+
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
+        .map_err(|source| UpgradeError::ReplaceFailed { source })
+}
+
+#[cfg(not(unix))]
+fn ensure_target_executable(_target: &Path) -> Result<(), UpgradeError> {
+    Ok(())
+}
+
+/// cfg(test) only: force [`ensure_target_executable`] to fail on this thread so
+/// equal-bytes Success cannot be claimed when the execute-bit repair fails.
+#[cfg(all(test, unix))]
+pub(crate) mod exec_postcondition_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL.with(|f| f.set(false));
+        }
+    }
+
+    pub(crate) fn force_fail() -> Guard {
+        FAIL.with(|f| f.set(true));
+        Guard { _private: () }
+    }
+
+    pub(crate) fn should_fail() -> bool {
+        FAIL.with(|f| f.get())
+    }
+}
+
+/// True when the installed target exists and its bytes equal `incoming`.
+fn on_disk_matches_incoming(target: &Path, incoming: &Path) -> Result<bool, UpgradeError> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    let target_meta = std::fs::metadata(target).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to stat target {}: {source}",
+            target.display()
+        ))
+    })?;
+    let incoming_meta = std::fs::metadata(incoming).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to stat incoming {}: {source}",
+            incoming.display()
+        ))
+    })?;
+    if target_meta.len() != incoming_meta.len() {
+        return Ok(false);
+    }
+    let mut target_file = File::open(target).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to open target {}: {source}",
+            target.display()
+        ))
+    })?;
+    let mut incoming_file = File::open(incoming).map_err(|source| {
+        UpgradeError::Other(format!(
+            "failed to open incoming {}: {source}",
+            incoming.display()
+        ))
+    })?;
+    let mut target_buf = [0u8; 64 * 1024];
+    let mut incoming_buf = [0u8; 64 * 1024];
+    loop {
+        let n_t = target_file.read(&mut target_buf).map_err(|source| {
+            UpgradeError::Other(format!(
+                "failed to read target {}: {source}",
+                target.display()
+            ))
+        })?;
+        let n_i = incoming_file.read(&mut incoming_buf).map_err(|source| {
+            UpgradeError::Other(format!(
+                "failed to read incoming {}: {source}",
+                incoming.display()
+            ))
+        })?;
+        if n_t != n_i || target_buf[..n_t] != incoming_buf[..n_i] {
+            return Ok(false);
+        }
+        if n_t == 0 {
+            return Ok(true);
         }
     }
 }
@@ -436,6 +645,163 @@ mod tests {
             .unwrap();
         assert!(matches!(result, UpgradeResult::Success { .. }));
         assert_eq!(fs::read(&binary_path).unwrap(), b"new binary");
+        assert!(
+            host_upgrade_lock_path(&binary_path).exists(),
+            "perform_upgrade must create the host lock file beside the target"
+        );
+    }
+
+    #[test]
+    fn test_perform_upgrade_skips_when_disk_already_matches() {
+        let dir = TempDir::new().unwrap();
+        let binary_path = create_test_binary(&dir, "test-binary", b"same bytes");
+        let first = create_test_binary(&dir, "new-binary-1", b"same bytes");
+        let second = create_test_binary(&dir, "new-binary-2", b"same bytes");
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+
+        // Seed a good backup of a prior version, then install matching bytes.
+        fs::write(binary_path.with_extension("backup"), b"prior version").unwrap();
+        fs::write(&binary_path, b"same bytes").unwrap();
+
+        let result = upgrader
+            .perform_upgrade(&first, &Version::new(2, 0, 0))
+            .unwrap();
+        // Public result matches main 4b0f927e: Success for older current /
+        // newer requested / equal disk+incoming bytes (RC4 wrongly returned
+        // NoUpgrade; main has no matching-byte skip branch and returns Success).
+        assert!(
+            matches!(
+                result,
+                UpgradeResult::Success {
+                    ref version
+                } if version == "2.0.0"
+            ),
+            "public perform_upgrade must match main Success on equal bytes: {result:?}"
+        );
+        // Skip leaves incoming in place; backup untouched.
+        assert!(first.exists(), "skip must not consume the incoming path");
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version"
+        );
+
+        let result2 = upgrader
+            .perform_upgrade(&second, &Version::new(2, 0, 0))
+            .unwrap();
+        assert!(
+            matches!(
+                result2,
+                UpgradeResult::Success {
+                    ref version
+                } if version == "2.0.0"
+            ),
+            "second matching-bytes call must still be public Success: {result2:?}"
+        );
+        assert!(second.exists());
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version",
+            "a second skip must never rewrite the backup"
+        );
+
+        // finish_* under an already-held lock is the same Success result so
+        // auto-apply can arm restart for an old-running process.
+        let _lock = acquire_host_upgrade_lock(&binary_path).unwrap();
+        let restart_owner = upgrader
+            .finish_upgrade_under_host_lock(&second, &Version::new(2, 0, 0))
+            .unwrap();
+        assert!(
+            matches!(restart_owner, UpgradeResult::Success { .. }),
+            "finish on match must stay Success for restart ownership: {restart_owner:?}"
+        );
+    }
+
+    /// Equal bytes + non-executable target must still leave a runnable binary
+    /// (main's atomic_replace sets 0755). Backup must stay untouched.
+    #[cfg(unix)]
+    #[test]
+    fn matching_bytes_repairs_0644_target_to_0755_without_touching_backup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let binary_path = dir.path().join("test-binary");
+        let incoming = dir.path().join("incoming");
+        let bytes = b"same bytes";
+        fs::write(&binary_path, bytes).unwrap();
+        fs::write(&incoming, bytes).unwrap();
+        fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(binary_path.with_extension("backup"), b"prior version").unwrap();
+
+        assert_eq!(
+            fs::metadata(&binary_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+        let result = upgrader
+            .perform_upgrade(&incoming, &Version::new(2, 0, 0))
+            .expect("equal-bytes upgrade must succeed after execute repair");
+        assert!(
+            matches!(
+                result,
+                UpgradeResult::Success {
+                    ref version
+                } if version == "2.0.0"
+            ),
+            "Success required when bytes match and execute bits can be repaired: {result:?}"
+        );
+        assert_eq!(
+            fs::metadata(&binary_path).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "Success must mean the installed target is executable"
+        );
+        assert_eq!(fs::read(&binary_path).unwrap(), bytes);
+        assert!(
+            incoming.exists(),
+            "equal-bytes path must not consume incoming"
+        );
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version",
+            "execute-bit repair must not rewrite the preserved backup"
+        );
+    }
+
+    /// Permission-repair failure under the equal-bytes shortcut must not report
+    /// Success (restart must not be armed into a non-executable target).
+    #[cfg(unix)]
+    #[test]
+    fn matching_bytes_permission_repair_failure_is_not_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let binary_path = dir.path().join("test-binary");
+        let incoming = dir.path().join("incoming");
+        let bytes = b"same bytes";
+        fs::write(&binary_path, bytes).unwrap();
+        fs::write(&incoming, bytes).unwrap();
+        fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(binary_path.with_extension("backup"), b"prior version").unwrap();
+
+        let _fail = exec_postcondition_seam::force_fail();
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+        let result = upgrader.perform_upgrade(&incoming, &Version::new(2, 0, 0));
+        assert!(
+            matches!(result, Err(UpgradeError::ReplaceFailed { .. })),
+            "permission repair failure must be Err, never Success: {result:?}"
+        );
+        assert_eq!(
+            fs::metadata(&binary_path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "failed repair must leave the target mode unchanged"
+        );
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version",
+            "failed repair must not rewrite the preserved backup"
+        );
     }
 
     #[test]
