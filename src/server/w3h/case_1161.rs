@@ -178,8 +178,8 @@ async fn run() -> Receipt {
 }
 
 /// #1161 on main: card-import stub + verified invite is 409 JoinFailed.
-/// The test expects the fixed verdict, so this run is red until the stub
-/// clear ships.
+/// Red-proof branch: the test asserts RED so nextest stress can complete
+/// 20 iterations (CI `--expect …=RED` alone cannot override a Green ensure).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -188,8 +188,8 @@ async fn run() -> Receipt {
 async fn w3h_1161_card_import_invite() -> Result<()> {
     let receipt = run().await;
     ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{CASE}: expected GREEN, got {:?} (RED is the #1161 baseline on main)",
+        receipt.verdict() == Some(Verdict::Red),
+        "{CASE}: expected RED on unfixed main, got {:?}",
         receipt.verdict()
     );
     Ok(())
