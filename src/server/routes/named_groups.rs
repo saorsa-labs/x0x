@@ -20163,14 +20163,16 @@ async fn clear_stale_not_member_join_row(
     invite_stable_group_id: &str,
     invite_owner_hex: &str,
 ) -> ClearStaleNotMemberJoinRowResult {
-    // Hold named-group + crypto writers together so an inert-stub keyed
-    // exclusion cannot race `POST /mls/groups` (which inserts into
-    // `mls_groups` without the join membership guard). Snapshot-then-wait
-    // would clear the card row and then delete a session object installed
-    // while waiting on `named_groups`.
-    let mut groups = state.named_groups.write().await;
+    // Established order in src/: TreeKEM → MLS → named_groups (see
+    // `install_joined_treekem_group_after_crypto_recheck`). Hold all three
+    // writers across the inert-stub keyed recheck so `POST /mls/groups`
+    // (which inserts into `mls_groups` without the join membership guard)
+    // cannot land between an empty snapshot and row removal — without
+    // inverting that order against a concurrent TreeKEM final install for
+    // another group.
     let mut treekem = state.treekem_groups.write().await;
     let mut mls = state.mls_groups.write().await;
+    let mut groups = state.named_groups.write().await;
 
     let mut refused_keyed = false;
     let mut keys: Vec<String> = Vec::new();
@@ -20755,27 +20757,20 @@ pub(in crate::server) async fn join_group_via_invite(
                 } else if not_member_row == Some(NotMemberJoinRow::InertCardImportStub) {
                     // #1161: replace inert card-import metadata only when
                     // the verified invite names the same stable group and
-                    // owner, and runtime predicates still hold (no keyed
-                    // crypto, no conflicting same-stable alias). Mismatch
-                    // keeps today's JoinFailed refusal.
-                    let keyed = {
-                        let treekem = state.treekem_groups.read().await;
-                        let mls = state.mls_groups.read().await;
-                        treekem.contains_key(&local_key)
-                            || treekem.contains_key(&info.mls_group_id)
-                            || treekem.contains_key(info.stable_group_id())
-                            || mls.contains_key(&local_key)
-                            || mls.contains_key(&info.mls_group_id)
-                            || mls.contains_key(info.stable_group_id())
-                    };
+                    // owner, and shape/alias predicates still hold.
+                    // Keyed TreeKEM/MLS is rechecked under clear's
+                    // TreeKEM→MLS→named_groups write hold — do not take
+                    // crypto locks while this named_groups read is held
+                    // (that order deadlocks against a TreeKEM final
+                    // install for another group). Mismatch keeps today's
+                    // JoinFailed refusal.
                     let eligible = is_inert_card_import_stub_shape(&info, &joiner_hex)
                         && inert_stub_matches_verified_invite(
                             &info,
                             invite_stable_group_id,
                             invite_owner_hex,
                         )
-                        && !has_conflicting_same_stable_alias(&groups, &local_key, &info)
-                        && !keyed;
+                        && !has_conflicting_same_stable_alias(&groups, &local_key, &info);
                     if eligible {
                         stale_not_member_row = true;
                     } else if let Some(response) =

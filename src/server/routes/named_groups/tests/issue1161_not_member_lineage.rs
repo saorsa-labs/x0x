@@ -1221,12 +1221,13 @@ async fn inert_stub_survives_disk_reload_then_clears_on_verified_invite() -> Res
     Ok(())
 }
 
-/// #1463 / Codex P2: keyed exclusion must be atomic with replacement.
-/// Holding `named_groups` write, poll clear to its first wait, insert MLS
-/// (as `POST /mls/groups` does without the membership guard), then release:
-/// the concurrent keyed object and the inert stub must both survive.
+/// #1463 RC2: keyed exclusion stays atomic under TreeKEM → MLS → named_groups
+/// order. Holding the TreeKEM writer (clear's first lock), poll clear to its
+/// wait, insert MLS (as `POST /mls/groups` does without the membership
+/// guard), then release: the concurrent keyed object and the inert stub
+/// must both survive.
 #[tokio::test]
-async fn clear_preserves_mls_key_installed_while_waiting_on_named_groups_writer() -> Result<()> {
+async fn clear_preserves_mls_key_installed_while_waiting_on_treekem_writer() -> Result<()> {
     use std::future::{poll_fn, Future};
     use std::task::Poll;
 
@@ -1241,7 +1242,7 @@ async fn clear_preserves_mls_key_installed_while_waiting_on_named_groups_writer(
         .await
         .insert(group.clone(), card_import_stub(owner, &group, &joiner_hex));
 
-    let blocked = state.named_groups.write().await;
+    let blocked = state.treekem_groups.write().await;
     let mut clear = Box::pin(clear_stale_not_member_join_row(
         state.as_ref(),
         &group,
@@ -1252,7 +1253,7 @@ async fn clear_preserves_mls_key_installed_while_waiting_on_named_groups_writer(
     poll_fn(|cx| {
         assert!(
             matches!(clear.as_mut().poll(cx), Poll::Pending),
-            "clear must wait on the held named_groups writer before keyed recheck"
+            "clear must wait on the held treekem_groups writer before keyed recheck"
         );
         Poll::Ready(())
     })
@@ -1280,6 +1281,177 @@ async fn clear_preserves_mls_key_installed_while_waiting_on_named_groups_writer(
         state.named_groups.read().await.contains_key(&group),
         "inert stub must remain when keyed material blocks clear"
     );
+    Ok(())
+}
+
+/// #1463 RC2 / Claude+Codex P1: clear for group Y and a TreeKEM final
+/// install for group X must share TreeKEM → named_groups order. On
+/// dc4bb502 (named_groups then TreeKEM in clear) this pair deadlocks;
+/// with the fixed order both complete under a short timeout.
+#[tokio::test]
+async fn clear_and_other_group_treekem_final_install_do_not_deadlock() -> Result<()> {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let clear_group = hex::encode(blake3::hash(b"1161-stub-clear-y").as_bytes());
+    let install_group = "59".repeat(32);
+    let install_stable = "5a".repeat(32);
+    let owner = AgentId([0x11; 32]);
+    let owner_hex = hex::encode(owner.as_bytes());
+    let joiner_hex = hex::encode(AgentId([0x22; 32]).as_bytes());
+    state.named_groups.write().await.insert(
+        clear_group.clone(),
+        card_import_stub(owner, &clear_group, &joiner_hex),
+    );
+
+    let install_bytes = hex::decode(&install_group)?;
+    let seed = agent_treekem_seed(state.agent.as_ref(), &install_bytes);
+    let treekem = x0x::mls::TreeKemMlsGroup::create(install_bytes, state.agent.agent_id(), &seed)?;
+    let epoch = treekem.epoch();
+    let mut install_info =
+        super::treekem_metadata_group_info(state.agent.agent_id(), &install_group, &install_stable);
+    install_info.secret_epoch = epoch;
+    install_info.security_binding = Some(format!("treekem:epoch={epoch}"));
+    install_info.recompute_state_hash();
+
+    // Hold TreeKEM so both futures queue on the first lock of the established
+    // order, then release and require both to finish (no cross-wait wedge).
+    let blocked = state.treekem_groups.write().await;
+    let mut clear = Box::pin(clear_stale_not_member_join_row(
+        state.as_ref(),
+        &clear_group,
+        &joiner_hex,
+        &clear_group,
+        &owner_hex,
+    ));
+    let mut install = Box::pin(install_joined_treekem_group_after_crypto_recheck(
+        state.as_ref(),
+        &install_group,
+        install_info,
+        treekem,
+        "test_1161_clear_vs_treekem_install_order",
+    ));
+    poll_fn(|cx| {
+        assert!(
+            matches!(clear.as_mut().poll(cx), Poll::Pending),
+            "clear must wait on treekem_groups"
+        );
+        assert!(
+            matches!(install.as_mut().poll(cx), Poll::Pending),
+            "TreeKEM final install must wait on treekem_groups"
+        );
+        Poll::Ready(())
+    })
+    .await;
+    drop(blocked);
+
+    let (clear_outcome, install_result) = tokio::time::timeout(Duration::from_secs(2), async {
+        (clear.await, install.await)
+    })
+    .await
+    .context("clear vs TreeKEM final install deadlocked (named_groups↔treekem inversion)")?;
+    assert_eq!(
+        clear_outcome,
+        ClearStaleNotMemberJoinRowResult::Cleared,
+        "inert stub without keyed material must clear"
+    );
+    assert!(
+        install_result.is_ok(),
+        "other-group TreeKEM final install must succeed: {install_result:?}"
+    );
+    assert!(
+        !state.named_groups.read().await.contains_key(&clear_group),
+        "cleared stub must be gone"
+    );
+    assert!(
+        state
+            .treekem_groups
+            .read()
+            .await
+            .contains_key(&install_group),
+        "install for the other group must land"
+    );
+    Ok(())
+}
+
+/// Memory-only clear leaves the durable import on disk. A reload before the
+/// next roster save restores the stub; re-import then request_access (or a
+/// fresh invite) is the recovery path — no new persistence contract.
+#[tokio::test]
+async fn memory_only_clear_reloads_stub_from_disk_then_reimport_request_access() -> Result<()> {
+    let (joiner_state, _j) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-memclear-reload").as_bytes());
+    let owner = AgentId([0x41; 32]);
+    let joiner_hex = hex::encode(joiner_state.agent.agent_id().as_bytes());
+    let owner_hex = hex::encode(owner.as_bytes());
+
+    let stub = card_import_stub(owner, &group, &joiner_hex);
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), stub);
+    assert!(save_named_groups(&joiner_state).await, "persist stub");
+
+    let clear = clear_stale_not_member_join_row(
+        joiner_state.as_ref(),
+        &group,
+        &joiner_hex,
+        &group,
+        &owner_hex,
+    )
+    .await;
+    assert_eq!(clear, ClearStaleNotMemberJoinRowResult::Cleared);
+    assert!(
+        !joiner_state.named_groups.read().await.contains_key(&group),
+        "live map cleared"
+    );
+
+    let loaded = load_named_groups(&joiner_state.named_groups_path)
+        .await
+        .expect("reload after memory-only clear");
+    {
+        let mut groups = joiner_state.named_groups.write().await;
+        *groups = loaded;
+    }
+    assert_eq!(
+        classify_not_member_join_row(
+            joiner_state
+                .named_groups
+                .read()
+                .await
+                .get(&group)
+                .expect("durable import reloads after memory-only clear"),
+            &joiner_hex
+        ),
+        NotMemberJoinRow::InertCardImportStub,
+        "disk still holds the imported stub until a roster save"
+    );
+
+    // Re-import refreshes the live stub (same shape as POST /groups/cards/import).
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), card_import_stub(owner, &group, &joiner_hex));
+    joiner_state
+        .named_group_test_recorders
+        .metadata_publish_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (create_status, create_body) = response_json(
+        create_join_request(State(Arc::clone(&joiner_state)), Path(group.clone()), None)
+            .await
+            .into_response(),
+    )
+    .await?;
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "re-import then request_access must work on the restored stub: {create_body}"
+    );
+    assert!(create_body["request_id"].as_str().is_some());
     Ok(())
 }
 

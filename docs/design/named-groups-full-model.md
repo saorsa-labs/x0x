@@ -859,8 +859,12 @@ already gone):
 | Pre-install (e.g. MemberJoined sign failure) | No named-group row | Re-import the card (then `POST /groups/:id/requests` when admission is request_access), or redeem another verified invite |
 | Post-install timeout / lost result | `UnseatedJoinRemnant` or pending attempt | Fresh invite (clear / ADR 0107 re-arm), or request_access when eligible |
 
-The cleared card stub is never silently restored; one of those recovery
-paths must recreate a stub or complete a join.
+Clearing removes the row from the live map only (same as other
+not_member clears). The durable `named_groups.json` still holds the
+imported card until a later roster save rewrites it. A daemon restart
+before that save reloads the old stub; recovery is then card re-import
+(then `POST /groups/:id/requests` when admission is request_access) or
+another verified invite — there is no new persistence contract.
 
 ### Phase C.2 — distributed discovery index
 
