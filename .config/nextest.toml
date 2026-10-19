@@ -26,6 +26,9 @@ run-wrapper = 'x0x-test-home'
 # `just w3h-shim`) and its canonical trace written under target/w3h/traces.
 # The shim stays inert unless W3H_SHIM_ACTIVE=1 and W3H_ENTROPY_SEED are set,
 # which only this wrapper does.
+# Recipes/CI pass `--run-ignored all` so LD_PRELOAD-only unit tests declared
+# `#[ignore]` (ADR 0025 §3–4) actually execute their assertions here and are
+# not silent passes under the default Test Suite / Coverage jobs.
 # The `W3-H harness` CI job runs the `w3h-gate` profile with `--stress-count
 # 20`, and `scripts/ci/w3h-trace-check.py` requires the same verdict with
 # complete receipts in every rerun (D196); distinct traces are reported.

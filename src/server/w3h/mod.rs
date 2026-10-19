@@ -1273,6 +1273,18 @@ impl Sim {
     /// the digest; a barrier timeout or a supervisor error still fails the
     /// run (after the trace is written).
     pub(crate) async fn finish(mut self) -> Result<String> {
+        // Always clear the pull callback, even if an earlier step fails or
+        // panics: a live callback must not outlive this scenario's runtime.
+        struct ClearVirtOnDrop(Option<Shim>);
+        impl Drop for ClearVirtOnDrop {
+            fn drop(&mut self) {
+                if let Some(shim) = self.0.take() {
+                    shim.clear_virt_time();
+                }
+            }
+        }
+        let _clear_virt = ClearVirtOnDrop(self.shim);
+
         // Diagnostics only (never digested): read while the daemons run.
         let kv = match gated("kv probe", self.kv_probe()).await {
             Ok(kv) => kv,
@@ -1363,9 +1375,6 @@ impl Sim {
         }
         for line in stats.iter().flat_map(|stats| stats.lines()) {
             eprintln!("W3H-ENTROPY {} {line}", self.case);
-        }
-        if let Some(shim) = self.shim {
-            shim.clear_virt_time();
         }
         if !teardown_errors.is_empty() {
             bail!("teardown failed: {}", teardown_errors.join("; "));

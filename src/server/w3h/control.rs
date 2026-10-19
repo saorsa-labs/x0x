@@ -252,37 +252,35 @@ async fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
     Ok(())
 }
 
-/// #1245: on Linux with the shim preloaded, `SystemTime::now()` must follow
+/// #1245: with the W3-H shim preloaded, `SystemTime::now()` must follow
 /// the pull callback after a virtual jump (no separate wall-offset push).
-/// When the shim env is set but detection fails, this fails so registration
-/// or interposition bugs cannot hide. Without the shim env (coverage), skip.
+///
+/// Declared `#[ignore]`: it needs `LD_PRELOAD=libw3h_shim.so` and cannot
+/// honestly pass without it (ADR 0025 §3–4). The W3-H harness job runs it
+/// via `nextest --profile w3h-gate --run-ignored all`. A missing shim under
+/// that job is a hard failure, never a silent `Ok`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "W3-H wall-clock shim is Linux LD_PRELOAD only"
-)]
+#[ignore = "requires W3-H LD_PRELOAD shim (nextest profile w3h / w3h-gate --run-ignored all)"]
 async fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
-    let shim_env =
-        std::env::var_os("W3H_SHIM_ACTIVE").as_deref() == Some(std::ffi::OsStr::new("1"));
-    let shim = match super::Shim::detect() {
-        Ok(shim) => shim,
-        Err(reason) if !shim_env => {
-            eprintln!("W3H-SKIP system_time_via_shim: {reason}");
-            return Ok(());
-        }
-        Err(reason) => {
-            bail!("W3H_SHIM_ACTIVE=1 but shim detect failed: {reason}");
-        }
-    };
+    let shim = super::Shim::detect().map_err(|reason| {
+        anyhow::anyhow!("W3-H shim required for wall-clock interposition: {reason}")
+    })?;
     let origin = tokio::time::Instant::now();
     // Install the pull callback before the baseline so both reads go through the
     // virtual clock (real wall time would make wall_after look like it went
     // backwards after a jump to the 2026-01-01 epoch).
     shim.install_virt_time(origin);
+    // Always clear the pull callback, including on early `?` / panic.
+    struct ClearVirt(super::Shim);
+    impl Drop for ClearVirt {
+        fn drop(&mut self) {
+            self.0.clear_virt_time();
+        }
+    }
+    let _clear = ClearVirt(shim);
     let wall_before = std::time::SystemTime::now();
     tokio::time::advance(Duration::from_secs(600)).await;
     let wall_after = std::time::SystemTime::now();
-    shim.clear_virt_time();
     let elapsed = wall_after
         .duration_since(wall_before)
         .map_err(|e| anyhow::anyhow!("SystemTime went backwards: {e}"))?;
@@ -294,13 +292,29 @@ async fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
     Ok(())
 }
 
+/// Restores `W3H_SHIM_ACTIVE` on drop so an early `?` / panic cannot leak
+/// the env into another test in the same process.
+struct W3hShimEnvGuard;
+impl W3hShimEnvGuard {
+    fn arm() -> Self {
+        // SAFETY: test-only env mutation; Drop restores.
+        std::env::set_var("W3H_SHIM_ACTIVE", "1");
+        Self
+    }
+}
+impl Drop for W3hShimEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: paired with [`W3hShimEnvGuard::arm`].
+        std::env::remove_var("W3H_SHIM_ACTIVE");
+    }
+}
+
 /// #1245: with the W3-H shim env set, history `run_blocking` runs inline so
 /// a completion cannot reorder other ready tasks via the blocking pool.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn w3h_run_blocking_is_inline_when_shim_env_set() -> Result<()> {
     let runtime_tid = std::thread::current().id();
-    // SAFETY: test-only env mutation; restored below.
-    std::env::set_var("W3H_SHIM_ACTIVE", "1");
+    let _shim_env = W3hShimEnvGuard::arm();
     let blocking_tid = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = std::sync::Arc::clone(&blocking_tid);
     let value = crate::history::run_blocking(move || {
@@ -310,7 +324,6 @@ async fn w3h_run_blocking_is_inline_when_shim_env_set() -> Result<()> {
         7u32
     })
     .await?;
-    std::env::remove_var("W3H_SHIM_ACTIVE");
     ensure!(value == 7);
     let got = blocking_tid
         .lock()

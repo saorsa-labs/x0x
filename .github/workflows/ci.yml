@@ -458,7 +458,9 @@ jobs:
         env:
           X0X_ISOLATION_ROLE: w3h-harness
           X0X_RUNTIME_TIMEOUT_SECONDS: 4800
-        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --stress-count 20
+        # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
+        # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
+        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 20
 
       # D196: blocking on the verdict (the same in all 20 reruns, every
       # receipt complete); the per-case distinct-trace counts are printed

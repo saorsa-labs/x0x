@@ -3669,6 +3669,23 @@ mod tests {
         );
     }
 
+    /// Restores `W3H_SHIM_ACTIVE` on drop so an early return / panic cannot
+    /// leak the env into another test in the same process.
+    struct W3hShimEnvGuard;
+    impl W3hShimEnvGuard {
+        fn arm() -> Self {
+            // SAFETY: test-only env mutation; Drop restores.
+            std::env::set_var("W3H_SHIM_ACTIVE", "1");
+            Self
+        }
+    }
+    impl Drop for W3hShimEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with [`W3hShimEnvGuard::arm`].
+            std::env::remove_var("W3H_SHIM_ACTIVE");
+        }
+    }
+
     /// #1245: with the W3-H shim env set, durable create/write/sync must
     /// run inline on the current-thread runtime so an occupied blocking
     /// pool worker cannot stall the write (same-instant wakeup cause).
@@ -3682,8 +3699,7 @@ mod tests {
             .build()
             .expect("current-thread runtime");
         rt.block_on(async {
-            // SAFETY: test-only env mutation; restored below.
-            std::env::set_var("W3H_SHIM_ACTIVE", "1");
+            let _shim_env = W3hShimEnvGuard::arm();
             let (lock_tx, lock_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || {
@@ -3701,7 +3717,6 @@ mod tests {
             .await;
             let _ = release_tx.send(());
             let _ = blocker.await;
-            std::env::remove_var("W3H_SHIM_ACTIVE");
             let result = timed.expect(
                 "durable write stalled behind the occupied pool worker; \
                  File::create/write/sync must be inline under W3H_SHIM_ACTIVE=1",
