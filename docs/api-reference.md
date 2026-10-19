@@ -283,7 +283,9 @@ cannot do its job (identity missing, or the data-dir filesystem under
 64 MiB free). `ok` in the outer envelope stays `true` whenever the process
 answers at all — it is the watchdog's liveness signal and never follows the
 verdict. The legacy `status`/`degraded_reason` fields keep their exact
-peer-only semantics; the verdict is additive.
+peer-only semantics; the verdict is additive only — a client must ignore
+unknown fields, and later x0x versions may add `verdict` fields without a
+version bump.
 
 `reasons` carries one sentence per non-`ok` input. Each input object has a
 `state` badge (`ok`/`degraded`/`error`) plus its fields:
@@ -303,8 +305,10 @@ peer-only semantics; the verdict is additive.
 - `send_failure_rate` — failed/(attempted) gossip publishes over a rolling
   60 s window. Below 5 attempts the `rate` is `null` and the input stays
   `ok`; at ≥ 5 attempts a rate ≥ 0.5 degrades.
-- `delivery_probe` — every 30 s the daemon publishes a nonce on
-  `x0x.health.probe.v1` and requires its own payload back through
+- `delivery_probe` — every 30 s the daemon publishes one tiny signed frame
+  on `x0x.health.probe.v1` (a fixed magic prefix plus 16 random bytes,
+  unique per round — it carries no ids and no addresses) and requires its
+  own payload back through
   subscribe → decode → subscriber handoff within 5 s. `probes_run: 0`
   (no gossip runtime, or before the first probe ~10 s after start) is
   `ok`; the last failed probe degrades (the closed #288's blind spot:
@@ -341,6 +345,12 @@ delivery-probe results are merged live at serve time. Past 15 s
 degrades with a staleness reason — a stalled sampler's frozen inputs cannot
 vouch for current health, and they cannot hide a probe failure recorded
 after the last refresh.
+
+**Privacy boundary.** `/health` is auth-exempt, so the verdict reports
+counts, booleans and classifications only. It never reports agent or
+machine ids (presence booleans only; the ids stay on the authed `/agent`),
+never the raw custom plane id, never seed addresses, and never the upgrade
+repository.
 
 ### Example: status
 
