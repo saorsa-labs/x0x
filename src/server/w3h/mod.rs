@@ -45,6 +45,7 @@ mod case_1161;
 mod case_1191;
 mod case_1256;
 mod case_1427;
+mod case_1471;
 mod case_811;
 
 use std::collections::BTreeMap;

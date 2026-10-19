@@ -19942,13 +19942,15 @@ enum NotMemberJoinRow {
     /// Removed, not Banned). Cleared for a retry when the verified invite
     /// does not re-arm it.
     UnseatedJoinRemnant,
-    /// #1161 follow-up: inert card-import cache metadata
+    /// #1161 / #1471: inert card-import cache metadata
     /// ([`import_card_into_groups`]): owner-only authority roster, no local
     /// seat, no shared secret / epoch, no lineage, no issued-invite or
     /// join-request evidence. Cleared only after a fully verified invite
-    /// whose stable id and owner match the stub genesis, under the same
-    /// write-lock recheck as [`Self::UnseatedJoinRemnant`]. Clearing grants
-    /// no seat or key — the ordinary first-join path does that.
+    /// whose stable id matches the stub genesis (`group_id`), under the
+    /// same write-lock recheck as [`Self::UnseatedJoinRemnant`]. Card
+    /// owner/creator text is unauthenticated, so a forged owner must not
+    /// block that clear (#1471). Clearing grants no seat or key — the
+    /// ordinary first-join path does that.
     InertCardImportStub,
     /// No local seat or invite provenance, and not an inert card-import
     /// stub. Report the failed join without clearing a row whose origin
@@ -20013,7 +20015,7 @@ impl NotMemberJoinRow {
 /// `secret_epoch = 0`, no lineage, no issued-invite ledger, no join-request
 /// or denial evidence, genesis present with that owner. Quarantine and
 /// withdrawal are excluded by the caller. AppState checks (TreeKEM / MLS
-/// keys, same-stable aliases) and verified-invite owner/stable match run
+/// keys, same-stable aliases) and verified-invite stable-id match run
 /// separately under membership serialization and again under the write lock.
 fn is_inert_card_import_stub_shape(info: &x0x::groups::GroupInfo, joiner_hex: &str) -> bool {
     if info.invite_lineage.is_some()
@@ -20043,12 +20045,18 @@ fn is_inert_card_import_stub_shape(info: &x0x::groups::GroupInfo, joiner_hex: &s
         && owner_hex.eq_ignore_ascii_case(&genesis.creator_agent_id)
 }
 
-/// Verified invite stable id + signed creator must equal the stub's card
-/// genesis `group_id` / `creator_agent_id` (card `owner_agent_id`).
+/// Verified invite stable id must equal the stub's card genesis `group_id`.
+///
+/// Card `owner_agent_id` / genesis `creator_agent_id` are unauthenticated
+/// import text (#1471): a forged owner with the real group id must not keep
+/// an inert stub in front of a verified invite. Match is stable-group-id only;
+/// do not compare card owner or genesis creator here. The invite's signed
+/// creator is checked elsewhere before this gate. #1161 inert-shape, same-
+/// stable alias, and TreeKEM/MLS keyed-material gates still refuse; seated or
+/// keyed rows never classify as [`NotMemberJoinRow::InertCardImportStub`].
 fn inert_stub_matches_verified_invite(
     info: &x0x::groups::GroupInfo,
     invite_stable_group_id: &str,
-    invite_owner_hex: &str,
 ) -> bool {
     let Some(genesis) = info.genesis.as_ref() else {
         return false;
@@ -20056,9 +20064,6 @@ fn inert_stub_matches_verified_invite(
     genesis
         .group_id
         .eq_ignore_ascii_case(invite_stable_group_id)
-        && genesis
-            .creator_agent_id
-            .eq_ignore_ascii_case(invite_owner_hex)
 }
 
 /// True when another map entry shares this stub's stable id (conflicting
@@ -20092,10 +20097,11 @@ fn classify_not_member_join_row(
     if never_seated && no_roster_entry && !info.withdrawn {
         NotMemberJoinRow::UnseatedJoinRemnant
     } else if lineage.is_none() && no_roster_entry && !info.withdrawn {
-        // #1161: a carry can survive a failed join without local lineage.
-        // Narrow inert card-import stubs are clearable after a verified
-        // matching invite; every other lineage-free shape stays a refusal
-        // (`JoinFailed` is never clearable in general).
+        // #1161 / #1471: a carry can survive a failed join without local
+        // lineage. Narrow inert card-import stubs are clearable after a
+        // verified invite for the same stable group id (card owner text is
+        // not authenticated); every other lineage-free shape stays a
+        // refusal (`JoinFailed` is never clearable in general).
         if is_inert_card_import_stub_shape(info, joiner_hex) {
             NotMemberJoinRow::InertCardImportStub
         } else {
@@ -20161,7 +20167,6 @@ async fn clear_stale_not_member_join_row(
     group_id_hex: &str,
     joiner_hex: &str,
     invite_stable_group_id: &str,
-    invite_owner_hex: &str,
 ) -> ClearStaleNotMemberJoinRowResult {
     // Established order in src/: TreeKEM → MLS → named_groups (see
     // `install_joined_treekem_group_after_crypto_recheck`). Hold all three
@@ -20184,11 +20189,7 @@ async fn clear_stale_not_member_join_row(
             NotMemberJoinRow::UnseatedJoinRemnant => keys.push(key.clone()),
             NotMemberJoinRow::InertCardImportStub => {
                 let eligible_shape = is_inert_card_import_stub_shape(info, joiner_hex)
-                    && inert_stub_matches_verified_invite(
-                        info,
-                        invite_stable_group_id,
-                        invite_owner_hex,
-                    )
+                    && inert_stub_matches_verified_invite(info, invite_stable_group_id)
                     && !has_conflicting_same_stable_alias(&groups, key, info);
                 if !eligible_shape {
                     continue;
@@ -20670,11 +20671,31 @@ pub(in crate::server) async fn join_group_via_invite(
     // card-import stub — see `classify_not_member_join_row`) must not
     // swallow a fresh verified invite as an idempotent success. It is
     // cleared below and the join proceeds as a NEW attempt — unless ADR
-    // 0107 re-arms an UnseatedJoinRemnant instead. Invite creator is the
-    // card-genesis owner pin for inert-stub match (v4 always carries it).
+    // 0107 re-arms an UnseatedJoinRemnant instead.
+    //
+    // #1471 / Codex P2: every refuse-the-invite check that can still fail
+    // after A2 auth (malformed signed creator, inviter id, group_id hex)
+    // MUST run before any stub clear. Clearing then returning 400 would
+    // drop an inert card-import row and leave later access as 404.
     let invite_owner_hex = match invite.creator.as_deref() {
         Some(creator) => creator,
         None => return refuse_invite(&state, &invite, "invite_unsigned"),
+    };
+    // r1: v4 carries the SIGNED creator (projection has no added_by).
+    let creator_hex = invite_owner_hex.to_string();
+    let creator = match parse_agent_id_hex(&creator_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return bad_request(format!("invalid base-state creator: {e}"));
+        }
+    };
+    // Inviter was already proven at the A2 id step (`inviter_agent`).
+    let inviter = inviter_agent;
+    let group_id_bytes = match hex::decode(&group_id_hex) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return bad_request(format!("invalid group_id hex: {e}"));
+        }
     };
     let mut stale_not_member_row = false;
     let mut rearm_remnant: Option<x0x::groups::GroupInfo> = None;
@@ -20755,21 +20776,18 @@ pub(in crate::server) async fn join_group_via_invite(
                         stale_not_member_row = true;
                     }
                 } else if not_member_row == Some(NotMemberJoinRow::InertCardImportStub) {
-                    // #1161: replace inert card-import metadata only when
-                    // the verified invite names the same stable group and
-                    // owner, and shape/alias predicates still hold.
-                    // Keyed TreeKEM/MLS is rechecked under clear's
-                    // TreeKEM→MLS→named_groups write hold — do not take
-                    // crypto locks while this named_groups read is held
-                    // (that order deadlocks against a TreeKEM final
-                    // install for another group). Mismatch keeps today's
-                    // JoinFailed refusal.
+                    // #1161 / #1471: replace inert card-import metadata when
+                    // the verified invite names the same stable group id
+                    // and shape/alias predicates still hold. Card owner
+                    // text is unauthenticated — do not require it to match
+                    // the invite's signed creator. Keyed TreeKEM/MLS is
+                    // rechecked under clear's TreeKEM→MLS→named_groups
+                    // write hold — do not take crypto locks while this
+                    // named_groups read is held (that order deadlocks
+                    // against a TreeKEM final install for another group).
+                    // Stable-id mismatch keeps today's JoinFailed refusal.
                     let eligible = is_inert_card_import_stub_shape(&info, &joiner_hex)
-                        && inert_stub_matches_verified_invite(
-                            &info,
-                            invite_stable_group_id,
-                            invite_owner_hex,
-                        )
+                        && inert_stub_matches_verified_invite(&info, invite_stable_group_id)
                         && !has_conflicting_same_stable_alias(&groups, &local_key, &info);
                     if eligible {
                         stale_not_member_row = true;
@@ -20888,7 +20906,6 @@ pub(in crate::server) async fn join_group_via_invite(
             &group_id_hex,
             &hex::encode(agent_id.as_bytes()),
             invite_stable_group_id,
-            invite_owner_hex,
         )
         .await
         {
@@ -20913,32 +20930,12 @@ pub(in crate::server) async fn join_group_via_invite(
             }
         }
     }
-    let inviter = match parse_agent_id_hex(&invite.inviter) {
-        Ok(id) => id,
-        Err(e) => {
-            return bad_request(format!("invalid inviter: {e}"));
-        }
-    };
-    // r1: v4 carries the SIGNED creator (checked above as invite_owner_hex
-    // before any not_member clear; the projection has no added_by/timestamps).
-    let creator_hex = invite_owner_hex.to_string();
-    let creator = match parse_agent_id_hex(&creator_hex) {
-        Ok(id) => id,
-        Err(e) => {
-            return bad_request(format!("invalid base-state creator: {e}"));
-        }
-    };
+    // Creator, inviter and group_id bytes were validated above before any
+    // not_member stub clear — a refused invite leaves the row unchanged.
 
     // Create the MLS group locally (in a real flow, the inviter would send
     // a Welcome message; for now, we create a local group and the inviter
     // will add us when they see our presence on the group topic)
-    let group_id_bytes = match hex::decode(&group_id_hex) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return bad_request(format!("invalid group_id hex: {e}"));
-        }
-    };
-
     let treekem_key_package_b64 = if invite_is_treekem {
         use base64::Engine as _;
         let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
