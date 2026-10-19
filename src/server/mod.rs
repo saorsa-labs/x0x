@@ -19,6 +19,10 @@ mod crdt_subscriptions;
 mod delegations;
 mod delivery_gate;
 mod group_access;
+/// M1 structured `/health` verdict (#1380). `pub` because the `x0xd`
+/// binary installs [`health_verdict::ErrorCountLayer`] in its tracing
+/// registry — the ERROR-event count is the verdict's log input.
+pub mod health_verdict;
 mod instance_lock;
 mod legacy_store_migration;
 mod rider_auth;
@@ -1325,12 +1329,21 @@ pub async fn serve_with_options(
     // table takes its `connection_lifecycle` parking_lot write lock per peer,
     // which is exactly the lock a gossip storm keeps hot. Do the walk here,
     // once every HEALTH_SNAPSHOT_REFRESH_SECS, and let the handler read
-    // atomics. If this task is itself starved, `/health` still answers with a
-    // slightly stale count instead of hanging — which is the correct failure
+    // atomics. If this task is itself starved, `/health` still answers with
+    // a slightly stale count instead of hanging — which is the correct failure
     // mode for a liveness probe.
+    //
+    // #1380: the same tick gathers every M1 verdict input that needs more
+    // than an atomic read (seed counts, recv-pump shed counters, publish
+    // totals, disk stats, upgrade artifacts) into the snapshot's verdict
+    // sample. The handler still touches no transport state.
     {
         let snapshot_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
+        // The effective plane is fixed for the process lifetime; capture it
+        // here rather than reaching back into the config from the task.
+        let resolved_plane = config.resolved_network_id();
+        let mut verdict_windows = health_verdict::VerdictWindows::default();
         bg_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                 routes::status::HEALTH_SNAPSHOT_REFRESH_SECS,
@@ -1369,7 +1382,29 @@ pub async fn serve_with_options(
                         snapshot_state.health_snapshot.clear_one_sided_ids();
                     }
                 };
+                let sample = health_verdict::sample_verdict_inputs(
+                    &snapshot_state,
+                    resolved_plane.clone(),
+                    &mut verdict_windows,
+                )
+                .await;
+                snapshot_state.health_snapshot.store_verdict_sample(sample);
             }
+        }));
+    }
+
+    // #1380: the M1 delivery probe, local-only (RC5 review): every 30 s
+    // (first at ~10 s) it signs/verifies a probe envelope in-process and
+    // publishes a nonce on a `local:` topic that must come back through
+    // this daemon's own subscription within 5 s — no frame leaves the
+    // node. Results land on the health snapshot; the handler merges them
+    // live at serve time, alongside the peer counts and uptime.
+    {
+        let probe_agent = Arc::clone(&state.agent);
+        let probe_snapshot = Arc::clone(&state.health_snapshot);
+        let shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            health_verdict::run_delivery_probe(probe_agent, probe_snapshot, shutdown_rx).await;
         }));
     }
 

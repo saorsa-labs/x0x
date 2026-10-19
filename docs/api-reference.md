@@ -14,7 +14,7 @@ There is **not** a single universal `data` wrapper.
 Examples:
 
 ```json
-{"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300,"unsigned_group_cards_refused":0}
+{"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300,"unsigned_group_cards_refused":0,"verdict":{"verdict":"ok","reasons":[],"inputs":{...}}}
 ```
 
 `status` is `"healthy"`, or `"degraded"` when the daemon has had zero peers
@@ -229,7 +229,7 @@ table (#446–#451). This reference documents **175 endpoints — exactly the se
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/health` | `x0x health` | Health probe |
+| GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380) |
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
@@ -241,12 +241,126 @@ table (#446–#451). This reference documents **175 endpoints — exactly the se
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300,"unsigned_group_cards_refused":0}
+# {
+#   "ok": true,
+#   "status": "healthy",
+#   "version": "<x.y.z>",
+#   "peers": 4,
+#   "send_ready_peers": 4,
+#   "uptime_secs": 300,
+#   "unsigned_group_cards_refused": 0,
+#   "verdict": {
+#     "verdict": "ok",
+#     "reasons": [],
+#     "sample_age_secs": 4,
+#     "inputs": {
+#       "plane":              { "state": "ok", "plane": "prod" },
+#       "peers":              { "state": "ok", "peers": 4, "send_ready_peers": 4, "one_sided_peers": 0 },
+#       "seed_reachable":     { "state": "ok", "configured": 2, "connected": 1 },
+#       "send_failure_rate":  { "state": "ok", "window_secs": 60, "attempts": 42, "failed": 0, "rate": 0.0 },
+#       "delivery_probe":     { "state": "ok", "probes_run": 9, "last_ok": true, "last_latency_ms": 3 },
+#       "recv_pump_shed":     { "state": "ok", "window_secs": 60, "shed": 0, "dropped_full": 0 },
+#       "disk":               { "state": "ok", "free_bytes": 83012300800, "total_bytes": 250685575168 },
+#       "log":                { "state": "ok", "window_secs": 60, "errors": 0 },
+#       "identity":           { "state": "ok", "agent": true, "machine": true, "user_present": false },
+#       "upgrade":            { "state": "ok", "checks_enabled": true, "update_available": false,
+#                              "latest_version": null, "checked_age_secs": 254,
+#                              "handoff_pending": false, "failed_artifact": false }
+#     }
+#   }
+# }
 ```
 
 `unsigned_group_cards_refused` counts GroupCards this process dropped on
 discovery, shard, contact, and metadata ingress because the signature did
 not verify. It starts at zero.
+
+#### The structured verdict (#1380, ADR 0096 §6)
+
+`verdict.verdict` is the M1 health verdict: `ok`, `degraded` when at least
+one input is degraded, or `error` when an input fails so hard the node
+cannot do its job (identity missing, or the data-dir filesystem under
+64 MiB free). `ok` in the outer envelope stays `true` whenever the process
+answers at all — it is the watchdog's liveness signal and never follows the
+verdict. The legacy `status`/`degraded_reason` fields keep their exact
+peer-only semantics; the verdict is additive only — a client must ignore
+unknown fields, and later x0x versions may add `verdict` fields without a
+version bump.
+
+`reasons` carries one sentence per non-`ok` input. Each input object has a
+`state` badge (`ok`/`degraded`/`error`) plus its fields:
+
+- `plane` — the effective gossip plane, classified `prod`, `custom` or
+  `open` (never the raw custom id — `/health` is auth-exempt). `open`
+  (`network_id = ""` in the TOML) degrades: plane isolation is off.
+- `peers` — the #262/#1419 classification behind `status`: zero peers past
+  the 120 s grace, send-ready-less outer peers, or a one-sided link
+  degrade.
+- `seed_reachable` — `connected` of `configured` bootstrap seeds,
+  measured from the connections the node actually holds (x0x joins via
+  `connect_addr`, so ant-quic's own bootstrap counter never sees the join).
+  Degrades when seeds are configured, none is reachable, and uptime passed the
+  120 s grace. `configured: 0` (`--no-hard-coded-bootstrap`, no config
+  peers) is not applicable and stays `ok`.
+- `send_failure_rate` — failed/(attempted) gossip publishes over a rolling
+  60 s window. Below 5 attempts the `rate` is `null` and the input stays
+  `ok`; at ≥ 5 attempts a rate ≥ 0.5 degrades.
+- `delivery_probe` — a local-only probe, every 30 s (first at ~10 s after
+  start). Each round signs a nonce payload (a fixed magic prefix plus 16
+  random bytes — it carries no ids and no addresses) with the daemon's
+  ML-DSA-65 key, encodes the signed V2 envelope, then decodes and verifies
+  it in-process; it then publishes the nonce on the `local:` topic
+  `local:x0x.health.probe.v1` and requires its own payload back through
+  subscribe → subscriber handoff within 5 s. No frame leaves the node, no
+  peer receives or verifies the probe, and no network-visible topic
+  exists (RC5 review of #1380: the probe's earlier form broadcast a
+  network-wide signed frame every 30 s while its own-nonce self-delivery
+  proved nothing about remote delivery). Covered: the wire-crypto path
+  (sign, encode, decode, verify) and the same-daemon dispatch path. Not
+  covered: PlumTree fan-out and delivery to remote peers — a network-wide
+  probe would be a separate wire decision. `probes_run: 0` (no gossip
+  runtime, or before the first probe) is `ok`; the last failed probe
+  degrades (#288's blind spot at local scope: serving HTTP while the
+  local dispatch pipeline is wedged). `last_latency_ms` is `null` when
+  the last probe failed. The probe task records its outcome straight onto
+  the health snapshot and the handler reads it live, so a failure is
+  visible on the very next request without waiting for the sampler.
+- `recv_pump_shed` — recv-pump control-frame sheds (ADR 0013) and
+  full-queue drops over the last 60 s. Any non-zero window degrades.
+- `disk` — free/total bytes of the data-dir filesystem. Under 1 GiB free
+  degrades; under 64 MiB is an `error` verdict. `null` bytes where the
+  platform cannot stat (non-unix).
+- `log` — ERROR-level tracing events in the last 60 s, counted by a layer
+  `x0xd` installs in its tracing registry. ≥ 50 degrades. Embedders that
+  bring their own subscriber without the layer read a permanent 0 — the
+  count is a lower bound, not a claim of silence.
+- `identity` — presence booleans only (ids stay on the authed `/agent`).
+  A missing machine or agent identity is an `error` verdict; the optional
+  user key never moves the verdict.
+- `upgrade` — read from existing upgrade surfaces: `update_available` and
+  `latest_version` mirror the cached `/upgrade` response
+  (`null` until a check runs), `checked_age_secs` is its age. A staged
+  `upgrade-handoff.json` or the loud `UPGRADE_FAILED` artifact in the data
+  dir degrades. An available update or a failed lookup stays `ok`
+  (matching `x0x doctor`).
+
+Every input except the live peer counts/uptime and the delivery-probe
+results is refreshed by a 5 s background sampler, never on the request
+path — `/health` stays O(1) and
+transport-lock-free (#600). Before the first refresh the verdict reads
+`ok` from the unsampled baseline. `verdict.sample_age_secs` states how old
+the sampled inputs were when served; the peer counts, uptime and
+delivery-probe results are merged live at serve time. Past 15 s
+(3 × the refresh interval) without a completed refresh the overall verdict
+degrades with a staleness reason — a stalled sampler's frozen inputs cannot
+vouch for current health, and they cannot hide a probe failure recorded
+after the last refresh.
+
+**Privacy boundary.** `/health` is auth-exempt, so the verdict reports
+counts, booleans and classifications only. It never reports agent or
+machine ids (presence booleans only; the ids stay on the authed `/agent`),
+never the raw custom plane id, never seed addresses, and never the upgrade
+repository.
 
 ### Example: status
 

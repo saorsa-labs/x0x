@@ -865,7 +865,12 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
 
     let registry = tracing_subscriber::registry()
         .with(filter)
-        .with(stdout_layer);
+        .with(stdout_layer)
+        // #1380 (M1 log input): one relaxed atomic per ERROR event feeds
+        // the /health verdict's rolling error count. Cheapest possible
+        // layer — no formatting, no I/O — so it keeps the #600 logging
+        // path non-blocking.
+        .with(x0x::server::health_verdict::ErrorCountLayer);
     if let Some(layer) = file_layer {
         registry.with(layer).init();
     } else {
