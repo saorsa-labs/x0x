@@ -19939,10 +19939,20 @@ enum NotMemberJoinRow {
     /// The remnant of THIS device's own join that never seated: the join
     /// route's lineage marker is present with no `seated_at_revision`, and
     /// the roster holds no entry at all for the joiner (not Pending, not
-    /// Removed, not Banned). Only this shape may be cleared for a retry.
+    /// Removed, not Banned). Cleared for a retry when the verified invite
+    /// does not re-arm it.
     UnseatedJoinRemnant,
-    /// No local seat or invite provenance. Report the failed join without
-    /// clearing a row whose origin cannot be established.
+    /// #1161 follow-up: inert card-import cache metadata
+    /// ([`import_card_into_groups`]): owner-only authority roster, no local
+    /// seat, no shared secret / epoch, no lineage, no issued-invite or
+    /// join-request evidence. Cleared only after a fully verified invite
+    /// whose stable id and owner match the stub genesis, under the same
+    /// write-lock recheck as [`Self::UnseatedJoinRemnant`]. Clearing grants
+    /// no seat or key — the ordinary first-join path does that.
+    InertCardImportStub,
+    /// No local seat or invite provenance, and not an inert card-import
+    /// stub. Report the failed join without clearing a row whose origin
+    /// cannot be established. Never becomes clearable in general.
     JoinFailed,
     /// Fork-quarantined (marker or lineage fork evidence): containment is
     /// kept and the retry is refused.
@@ -19963,11 +19973,12 @@ impl NotMemberJoinRow {
                 // invite handling, so another invite cannot replace it. When
                 // admission is request_access, an eligible non-member may still
                 // submit POST /groups/:id/requests; admin approval seats them
-                // (card-import stubs are the intended producer of this shape).
-                // After a lost join result the authority may already have
-                // seated this non-banned device; its JoinRequestCreated
-                // handler then rejects, so "wait for approval" never
-                // completes — advise catch-up of that seating instead.
+                // (card-import stubs that fail the inert-stub predicate are a
+                // producer of this shape). After a lost join result the
+                // authority may already have seated this non-banned device;
+                // its JoinRequestCreated handler then rejects, so "wait for
+                // approval" never completes — advise catch-up of that seating
+                // instead.
                 let mut message = String::from(
                     "join failed: this device already has a local group record with no \
                      invite lineage and no seat; a fresh invite cannot replace that record",
@@ -19990,9 +20001,82 @@ impl NotMemberJoinRow {
                  POST /groups/:id/quarantine/clear, then retries the invite",
                 "fork_quarantined",
             )),
-            Self::UnseatedJoinRemnant | Self::Other => None,
+            Self::UnseatedJoinRemnant | Self::InertCardImportStub | Self::Other => None,
         }
     }
+}
+
+/// Sync half of the #1161 inert card-import stub predicate (GroupInfo only).
+///
+/// Matches what [`import_card_into_groups`] inserts: owner-only authority
+/// roster, no local seat for `joiner_hex`, `shared_secret = None`,
+/// `secret_epoch = 0`, no lineage, no issued-invite ledger, no join-request
+/// or denial evidence, genesis present with that owner. Quarantine and
+/// withdrawal are excluded by the caller. AppState checks (TreeKEM / MLS
+/// keys, same-stable aliases) and verified-invite owner/stable match run
+/// separately under membership serialization and again under the write lock.
+fn is_inert_card_import_stub_shape(info: &x0x::groups::GroupInfo, joiner_hex: &str) -> bool {
+    if info.invite_lineage.is_some()
+        || info.withdrawn
+        || info.is_fork_quarantined()
+        || info.members_v2.contains_key(joiner_hex)
+        || info.shared_secret.is_some()
+        || info.secret_epoch != 0
+        || !info.issued_invites.is_empty()
+        || !info.issued_invite_secrets.is_empty()
+        || !info.join_requests.is_empty()
+        || !info.commit_log.is_empty()
+    {
+        return false;
+    }
+    let Some(genesis) = info.genesis.as_ref() else {
+        return false;
+    };
+    if info.members_v2.len() != 1 {
+        return false;
+    }
+    let Some((owner_hex, seat)) = info.members_v2.iter().next() else {
+        return false;
+    };
+    seat.is_active()
+        && seat.role.at_least(x0x::groups::GroupRole::Admin)
+        && owner_hex.eq_ignore_ascii_case(&genesis.creator_agent_id)
+}
+
+/// Verified invite stable id + signed creator must equal the stub's card
+/// genesis `group_id` / `creator_agent_id` (card `owner_agent_id`).
+fn inert_stub_matches_verified_invite(
+    info: &x0x::groups::GroupInfo,
+    invite_stable_group_id: &str,
+    invite_owner_hex: &str,
+) -> bool {
+    let Some(genesis) = info.genesis.as_ref() else {
+        return false;
+    };
+    genesis
+        .group_id
+        .eq_ignore_ascii_case(invite_stable_group_id)
+        && genesis
+            .creator_agent_id
+            .eq_ignore_ascii_case(invite_owner_hex)
+}
+
+/// True when another map entry shares this stub's stable id (conflicting
+/// same-stable alias). The stub's own key and identical mls/stable strings
+/// on that same entry are not conflicts.
+fn has_conflicting_same_stable_alias(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
+    let stable = info.stable_group_id();
+    groups.iter().any(|(other_key, other)| {
+        other_key.as_str() != key
+            && (other.stable_group_id() == stable
+                || other.mls_group_id == stable
+                || other.stable_group_id() == info.mls_group_id
+                || other.mls_group_id == info.mls_group_id)
+    })
 }
 
 fn classify_not_member_join_row(
@@ -20009,37 +20093,81 @@ fn classify_not_member_join_row(
         NotMemberJoinRow::UnseatedJoinRemnant
     } else if lineage.is_none() && no_roster_entry && !info.withdrawn {
         // #1161: a carry can survive a failed join without local lineage.
-        // It must not return an idempotent success with no recovery advice.
-        NotMemberJoinRow::JoinFailed
+        // Narrow inert card-import stubs are clearable after a verified
+        // matching invite; every other lineage-free shape stays a refusal
+        // (`JoinFailed` is never clearable in general).
+        if is_inert_card_import_stub_shape(info, joiner_hex) {
+            NotMemberJoinRow::InertCardImportStub
+        } else {
+            NotMemberJoinRow::JoinFailed
+        }
     } else {
         NotMemberJoinRow::Other
     }
 }
 
-/// D39(A): clear a local row the joining daemon is NOT a member of, so a
-/// fresh invite starts a NEW join attempt instead of returning an
+/// D39(A) / #1161: clear a local row the joining daemon is NOT a member of,
+/// so a fresh invite starts a NEW join attempt instead of returning an
 /// idempotent `already_joined: false, join_state: "not_member"` with no
-/// attempt. The row exists only because an earlier join's state-only
-/// intermediate apply persisted it before the join failed or timed out
-/// (the timeout finalizer removes only a still-pending stub). Only the
-/// in-memory state is cleared, like the finalizer's own stub removal: the
-/// fresh join installs its in-memory stub over the same key, and the
-/// durable record is rewritten when the member's own seat persists. A
-/// leftover TreeKEM group for the key is dropped too — a non-member must
+/// attempt. The row exists either as an earlier join's state-only
+/// intermediate ([`NotMemberJoinRow::UnseatedJoinRemnant`]) or as inert
+/// card-import cache metadata ([`NotMemberJoinRow::InertCardImportStub`]).
+/// Only the in-memory state is cleared, like the finalizer's own stub
+/// removal: the fresh join installs its in-memory stub over the same key,
+/// and the durable record is rewritten when the member's own seat persists.
+/// A leftover TreeKEM group for the key is dropped too — a non-member must
 /// not hold it, and it would falsely satisfy the join poll's
-/// `treekem_groups.contains_key` confirmation. Only an
-/// [`NotMemberJoinRow::UnseatedJoinRemnant`] is cleared (re-checked under the
-/// write lock): seated, removed, banned and quarantined rows are never
-/// touched, and the #446 leave guard is unaffected.
-async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, joiner_hex: &str) {
+/// `treekem_groups.contains_key` confirmation. Only clearable shapes are
+/// removed (re-checked under the write lock): `JoinFailed`, seated, removed,
+/// banned and quarantined rows are never touched, and the #446 leave guard
+/// is unaffected. Clearing metadata grants no seat or key.
+///
+/// After a cleared card stub, a failed or timed-out fresh join leaves either
+/// no local row (pre-install failure) or an [`UnseatedJoinRemnant`] /
+/// pending attempt (post-install). Recovery is then a new verified invite
+/// (remnant clear / re-arm), `POST /groups/:id/requests` when admission is
+/// request_access, or card re-import then request_access / invite again —
+/// the cleared stub is not silently restored.
+async fn clear_stale_not_member_join_row(
+    state: &AppState,
+    group_id_hex: &str,
+    joiner_hex: &str,
+    invite_stable_group_id: &str,
+    invite_owner_hex: &str,
+) {
+    // Peek keyed crypto before taking the groups write lock so an inert
+    // stub that somehow holds a TreeKEM / legacy MLS group is not cleared.
+    // The caller holds the membership guard, so install races for this
+    // group cannot interleave.
+    let keyed_crypto: HashSet<String> = {
+        let treekem = state.treekem_groups.read().await;
+        let mls = state.mls_groups.read().await;
+        treekem.keys().chain(mls.keys()).cloned().collect()
+    };
     let cleared: Vec<String> = {
         let mut groups = state.named_groups.write().await;
         let keys: Vec<String> = groups
             .iter()
             .filter(|(key, info)| {
-                (key.as_str() == group_id_hex || info.mls_group_id == group_id_hex)
-                    && classify_not_member_join_row(info, joiner_hex)
-                        == NotMemberJoinRow::UnseatedJoinRemnant
+                if key.as_str() != group_id_hex && info.mls_group_id != group_id_hex {
+                    return false;
+                }
+                match classify_not_member_join_row(info, joiner_hex) {
+                    NotMemberJoinRow::UnseatedJoinRemnant => true,
+                    NotMemberJoinRow::InertCardImportStub => {
+                        is_inert_card_import_stub_shape(info, joiner_hex)
+                            && inert_stub_matches_verified_invite(
+                                info,
+                                invite_stable_group_id,
+                                invite_owner_hex,
+                            )
+                            && !has_conflicting_same_stable_alias(&groups, key, info)
+                            && !keyed_crypto.contains(key.as_str())
+                            && !keyed_crypto.contains(info.mls_group_id.as_str())
+                            && !keyed_crypto.contains(info.stable_group_id())
+                    }
+                    _ => false,
+                }
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -20058,6 +20186,12 @@ async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, j
         }
     }
     {
+        let mut mls = state.mls_groups.write().await;
+        for key in &cleared {
+            mls.remove(key);
+        }
+    }
+    {
         let mut stubs = state
             .pending_join_stubs
             .lock()
@@ -20069,7 +20203,7 @@ async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, j
     tracing::info!(
         group_id = %LogHexId::group(group_id_hex),
         cleared = cleared.len(),
-        "D39: cleared a not_member local row so a fresh invite starts a new join attempt"
+        "D39/#1161: cleared a not_member local row so a fresh invite starts a new join attempt"
     );
 }
 
@@ -20499,10 +20633,16 @@ pub(in crate::server) async fn join_group_via_invite(
     if let Some(resp) = join_pending_invite_check(state.as_ref(), &invite, &req.invite).await {
         return resp;
     }
-    // D39(A): the provably-unseated remnant of this device's OWN failed
-    // join (see `classify_not_member_join_row`) must not swallow a fresh
-    // invite as an idempotent success. It is cleared below and the join
-    // proceeds as a NEW attempt — unless ADR 0107 re-arms it instead.
+    // D39(A) / #1161: a clearable not_member row (unseated remnant or inert
+    // card-import stub — see `classify_not_member_join_row`) must not
+    // swallow a fresh verified invite as an idempotent success. It is
+    // cleared below and the join proceeds as a NEW attempt — unless ADR
+    // 0107 re-arms an UnseatedJoinRemnant instead. Invite creator is the
+    // card-genesis owner pin for inert-stub match (v4 always carries it).
+    let invite_owner_hex = match invite.creator.as_deref() {
+        Some(creator) => creator,
+        None => return refuse_invite(&state, &invite, "invite_unsigned"),
+    };
     let mut stale_not_member_row = false;
     let mut rearm_remnant: Option<x0x::groups::GroupInfo> = None;
     {
@@ -20543,6 +20683,16 @@ pub(in crate::server) async fn join_group_via_invite(
                 .cloned();
             if let Some(info) = info {
                 let joiner_hex = hex::encode(agent_id.as_bytes());
+                let local_key = groups
+                    .get(&group_id_hex)
+                    .map(|_| group_id_hex.clone())
+                    .or_else(|| {
+                        groups
+                            .iter()
+                            .find(|(_, i)| i.mls_group_id == group_id_hex)
+                            .map(|(k, _)| k.clone())
+                    })
+                    .unwrap_or_else(|| group_id_hex.clone());
                 #[allow(clippy::disallowed_methods)]
                 // #1166 S5: join-flow classification, not route admission
                 let membership_state =
@@ -20570,6 +20720,43 @@ pub(in crate::server) async fn join_group_via_invite(
                         rearm_remnant = Some(info);
                     } else {
                         stale_not_member_row = true;
+                    }
+                } else if not_member_row == Some(NotMemberJoinRow::InertCardImportStub) {
+                    // #1161: replace inert card-import metadata only when
+                    // the verified invite names the same stable group and
+                    // owner, and runtime predicates still hold (no keyed
+                    // crypto, no conflicting same-stable alias). Mismatch
+                    // keeps today's JoinFailed refusal.
+                    let keyed = {
+                        let treekem = state.treekem_groups.read().await;
+                        let mls = state.mls_groups.read().await;
+                        treekem.contains_key(&local_key)
+                            || treekem.contains_key(&info.mls_group_id)
+                            || treekem.contains_key(info.stable_group_id())
+                            || mls.contains_key(&local_key)
+                            || mls.contains_key(&info.mls_group_id)
+                            || mls.contains_key(info.stable_group_id())
+                    };
+                    let eligible = is_inert_card_import_stub_shape(&info, &joiner_hex)
+                        && inert_stub_matches_verified_invite(
+                            &info,
+                            invite_stable_group_id,
+                            invite_owner_hex,
+                        )
+                        && !has_conflicting_same_stable_alias(&groups, &local_key, &info)
+                        && !keyed;
+                    if eligible {
+                        stale_not_member_row = true;
+                    } else if let Some(response) =
+                        NotMemberJoinRow::JoinFailed.refusal_response(&info)
+                    {
+                        return response;
+                    } else {
+                        return api_error(
+                            StatusCode::CONFLICT,
+                            "join failed: this device already has a local group record with no \
+                             invite lineage and no seat; a fresh invite cannot replace that record",
+                        );
                     }
                 } else {
                     let still_pending = membership_state == "pending_authority_commit";
@@ -20672,6 +20859,8 @@ pub(in crate::server) async fn join_group_via_invite(
             state.as_ref(),
             &group_id_hex,
             &hex::encode(agent_id.as_bytes()),
+            invite_stable_group_id,
+            invite_owner_hex,
         )
         .await;
     }
@@ -20681,12 +20870,9 @@ pub(in crate::server) async fn join_group_via_invite(
             return bad_request(format!("invalid inviter: {e}"));
         }
     };
-    // r1: v4 carries the SIGNED creator (the projection has no
-    // added_by/timestamps; the legacy derivation 400'd every v4 invite).
-    let creator_hex = match invite.creator.clone() {
-        Some(creator) => creator,
-        None => return refuse_invite(&state, &invite, "invite_unsigned"),
-    };
+    // r1: v4 carries the SIGNED creator (checked above as invite_owner_hex
+    // before any not_member clear; the projection has no added_by/timestamps).
+    let creator_hex = invite_owner_hex.to_string();
     let creator = match parse_agent_id_hex(&creator_hex) {
         Ok(id) => id,
         Err(e) => {
