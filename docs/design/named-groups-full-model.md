@@ -841,15 +841,19 @@ Notes:
 roster, no importer seat, `shared_secret = None`, `secret_epoch = 0`, no
 invite lineage / MLS group. That shape classifies as
 `InertCardImportStub` (not general `JoinFailed`). After full v4 invite
-verification, when the invite's stable group id and signed creator equal
-the stub genesis `group_id` / `creator_agent_id`, join clears that
-metadata under the same write-locked path as `UnseatedJoinRemnant`, then
-runs the ordinary first join. Clearing grants no seat or key.
+verification, when the invite's stable group id equals the stub genesis
+`group_id`, join clears that metadata under the same write-locked path as
+`UnseatedJoinRemnant`, then runs the ordinary first join. Card
+`owner_agent_id` / genesis `creator_agent_id` are unauthenticated, so a
+forged owner that reuses the real group id does not block the clear
+(#1471). The invite's signed creator is still checked on the ordinary
+verified-invite path before this gate. Clearing grants no seat or key.
 
 `JoinFailed` stays a refusal for every other lineage-free not_member row
 (secret, issued invites, join-request / denial evidence, extra roster
-entries, mismatched invite owner or stable id, conflicting same-stable
-alias, keyed TreeKEM/MLS material).
+entries, mismatched invite stable id, conflicting same-stable alias,
+keyed TreeKEM/MLS material). Owner/creator text mismatch alone is not a
+refusal when the stable id matches and the row stays inert.
 
 **Leftover after a failed or timed-out fresh join** (the card stub is
 already gone):

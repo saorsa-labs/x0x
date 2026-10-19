@@ -757,7 +757,7 @@ async fn inert_stub_forged_owner_replaced_by_verified_invite() -> Result<()> {
     let foreign_hex = hex::encode(foreign_owner.as_bytes());
     stub.members_v2.insert(
         foreign_hex.clone(),
-        x0x::groups::GroupMember::new_admin(foreign_hex, None, stub.created_at),
+        x0x::groups::GroupMember::new_admin(foreign_hex.clone(), None, stub.created_at),
     );
     assert_eq!(
         classify_not_member_join_row(&stub, &joiner_hex),
@@ -809,6 +809,7 @@ async fn inert_stub_forged_owner_replaced_by_verified_invite() -> Result<()> {
         Some("pending_authority_commit"),
         "{body}"
     );
+    let authority_hex = hex::encode(authority_id.as_bytes());
     {
         let groups = joiner_state.named_groups.read().await;
         let info = groups
@@ -820,15 +821,124 @@ async fn inert_stub_forged_owner_replaced_by_verified_invite() -> Result<()> {
         );
         assert!(!info.has_active_member(&joiner_hex));
         assert!(info.shared_secret.is_none());
-        // Foreign attacker must not remain the sole admin on the join row.
+        // Forged card owner must be gone; verified invite authority must be
+        // the sole admin on the first-join row (#1471 / Codex P2).
         assert!(
-            !info
-                .members_v2
-                .contains_key(&hex::encode(foreign_owner.as_bytes()))
-                || info.invite_lineage.is_some(),
-            "forged card owner must not keep shadowing the real join"
+            !info.members_v2.contains_key(&foreign_hex),
+            "forged card owner must be absent after verified invite displace"
+        );
+        assert!(
+            info.members_v2.contains_key(&authority_hex),
+            "verified invite authority must be present on the join row"
         );
     }
+
+    let attempt_event = {
+        let attempts = joiner_state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let entry = attempts
+            .get(&join_result_key(&stable, &joiner_hex))
+            .expect("attempt registered");
+        entry
+            .stored_resend
+            .as_ref()
+            .expect("stored MemberJoined")
+            .event
+            .clone()
+    };
+    assert!(
+        apply_named_group_metadata_event(
+            &authority_state,
+            attempt_event,
+            joiner_state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await
+        .accepted,
+        "authority accepts the joiner's MemberJoined after forged-stub clear"
+    );
+    assert!(
+        authority_state
+            .named_groups
+            .read()
+            .await
+            .get(&group)
+            .is_some_and(|i| i.has_active_member(&joiner_hex)),
+        "authority seats the joiner after forged-stub clear"
+    );
+
+    let staged = authority_state
+        .pending_join_results
+        .read()
+        .await
+        .get(&join_result_key(&stable, &joiner_hex))
+        .map(|p| (p.event.clone(), p.head_attestation.clone()))
+        .expect("join result staged");
+    handle_join_result_message(
+        &joiner_state,
+        &authority_id,
+        true,
+        JoinResultMessage::Result {
+            event: Box::new(staged.0),
+            chain: Vec::new(),
+            head_attestation: staged.1.map(Box::new),
+            roster_certificates_b64: Vec::new(),
+            intervening_events: Vec::new(),
+        },
+    )
+    .await;
+    assert!(
+        joiner_state
+            .named_groups
+            .read()
+            .await
+            .get(&group)
+            .is_some_and(|i| i.has_active_member(&joiner_hex)),
+        "joiner seat completes after forged-stub clear"
+    );
+
+    let share = authority_state
+        .named_group_test_recorders
+        .secure_share_scheduled
+        .lock()
+        .expect("share witness")
+        .iter()
+        .filter(|(_, to, _)| to == &joiner_hex)
+        .find_map(|(_, _, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .expect("authority sealed a SecureShareDelivered for the joiner");
+    assert!(
+        apply_named_group_metadata_event(&joiner_state, share, authority_id, true, None)
+            .await
+            .accepted,
+        "joiner opens the sealed share after forged-stub clear"
+    );
+    let (auth_secret, auth_epoch) = {
+        let groups = authority_state.named_groups.read().await;
+        let info = groups.get(&group).expect("authority");
+        (info.shared_secret.clone(), info.secret_epoch)
+    };
+    let (joiner_secret, joiner_epoch) = {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&group).expect("joiner");
+        assert!(
+            !info.members_v2.contains_key(&foreign_hex),
+            "forged admin must stay absent once joiner is seated"
+        );
+        assert!(
+            info.members_v2.contains_key(&authority_hex),
+            "verified authority must remain on the seated roster"
+        );
+        (info.shared_secret.clone(), info.secret_epoch)
+    };
+    assert!(auth_secret.is_some());
+    assert_eq!(
+        (joiner_secret, joiner_epoch),
+        (auth_secret, auth_epoch),
+        "joiner holds the group's current key after forged-stub displace"
+    );
     Ok(())
 }
 
