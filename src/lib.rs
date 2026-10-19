@@ -8036,37 +8036,37 @@ impl Agent {
 
         // A live identity can legitimately carry no dial hints. Borrow the
         // stored addresses only for that exact live machine, never rebind it.
+        // Ordinary load and point-of-use reads share the connector's evidence
+        // budget. Expiry means no extra hints; keep the existing connect path.
         let mut discovered = discovered;
-        if discovered
-            .as_ref()
-            .is_some_and(|entry| entry.addresses.is_empty())
-            && if nonblocking_evidence {
-                self.peer_evidence().ready_now()
-            } else {
-                self.peer_evidence().wait(0).await
-            }
+        if let Some(entry) = discovered
+            .as_mut()
+            .filter(|entry| entry.addresses.is_empty())
         {
-            if let Some(entry) = discovered.as_mut() {
-                let now = dm_capability::now_unix_ms();
-                let view = if nonblocking_evidence {
-                    self.peer_evidence()
-                        .try_usable(*agent_id, entry.machine_id, now)
-                        .ok()
-                        .flatten()
-                } else {
-                    self.peer_evidence()
-                        .usable(*agent_id, entry.machine_id, now)
-                };
-                if let Some(view) = view {
-                    let local_scope = self
-                        .network
-                        .as_ref()
-                        .is_some_and(|n| allow_local_discovery_addresses(n.config()));
-                    entry.addresses = filter_discovery_announcement_addrs(
-                        view.announcement.addresses.clone(),
-                        local_scope,
-                    );
-                }
+            let view = if nonblocking_evidence {
+                self.peer_evidence()
+                    .try_usable(*agent_id, entry.machine_id, dm_capability::now_unix_ms())
+                    .ok()
+                    .flatten()
+            } else {
+                let bound = dm_evidence::SendEvidence::new(
+                    self,
+                    *agent_id,
+                    dm::dm_attempt_timeout(None),
+                    false,
+                );
+                let _ = bound.wait(0).await;
+                bound.usable(entry.machine_id).await.ok().flatten()
+            };
+            if let Some(view) = view {
+                let local_scope = self
+                    .network
+                    .as_ref()
+                    .is_some_and(|n| allow_local_discovery_addresses(n.config()));
+                entry.addresses = filter_discovery_announcement_addrs(
+                    view.announcement.addresses.clone(),
+                    local_scope,
+                );
             }
         }
 
