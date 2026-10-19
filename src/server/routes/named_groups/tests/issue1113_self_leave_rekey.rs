@@ -3843,14 +3843,34 @@ async fn epoch_ahead_store_record_requests_catchup() -> Result<()> {
     Ok(())
 }
 
+/// #1427 (W3-H determinism red): the catch-up throttle window runs on the
+/// runtime clock. On the wall clock, a paused runtime never let a peer out
+/// of its window: a recovery that asked the signer before it knew the
+/// signer's identity never asked it again.
+#[tokio::test(start_paused = true)]
+async fn epoch_ahead_catchup_window_runs_on_the_runtime_clock() {
+    let peer = AgentId([7; 32]);
+    let asked = tokio::time::Instant::now();
+    assert!(
+        epoch_ahead_catchup_peers(vec![peer], |_| Some(asked)).is_empty(),
+        "a peer asked now is inside its window"
+    );
+    tokio::time::advance(TREEKEM_CATCHUP_THROTTLE).await;
+    assert_eq!(
+        epoch_ahead_catchup_peers(vec![peer], |_| Some(asked)),
+        vec![peer],
+        "the window ends one throttle period later on the runtime clock"
+    );
+}
+
 /// #1427: one epoch-ahead observation asks at most three peers. The next
 /// observation asks the peers not yet asked, so a reachable fourth peer
 /// (for example the removal's signer) is tried after three silent ones.
 #[test]
 fn epoch_ahead_catchup_rotates_past_unanswered_peers() {
     let peers: Vec<AgentId> = (1..=5u8).map(|byte| AgentId([byte; 32])).collect();
-    let mut asked: Vec<(AgentId, Instant)> = Vec::new();
-    let last = |asked: &[(AgentId, Instant)], peer: &AgentId| {
+    let mut asked: Vec<(AgentId, tokio::time::Instant)> = Vec::new();
+    let last = |asked: &[(AgentId, tokio::time::Instant)], peer: &AgentId| {
         asked
             .iter()
             .find(|(seen, _)| seen == peer)
@@ -3863,7 +3883,7 @@ fn epoch_ahead_catchup_rotates_past_unanswered_peers() {
         peers[..3],
         "the first observation keeps preference order"
     );
-    let now = Instant::now();
+    let now = tokio::time::Instant::now();
     asked.extend(first.iter().map(|peer| (*peer, now)));
 
     let second = epoch_ahead_catchup_peers(peers.clone(), |peer| last(&asked, peer));
@@ -3885,7 +3905,7 @@ fn epoch_ahead_catchup_rotates_past_unanswered_peers() {
     let old = now
         .checked_sub(TREEKEM_CATCHUP_THROTTLE * 2)
         .expect("monotonic clock past two windows");
-    let asked: Vec<(AgentId, Instant)> = peers
+    let asked: Vec<(AgentId, tokio::time::Instant)> = peers
         .iter()
         .enumerate()
         .map(|(index, peer)| (*peer, if index < 2 { old } else { older }))
@@ -4095,11 +4115,19 @@ async fn same_epoch_observation_in_the_last_round_asks_again() -> Result<()> {
             .filter(|recorded| *recorded == group_id.as_bytes())
             .count()
     };
-    // The throttle uses the wall clock, which paused time does not move.
-    // Removing a peer's entry stands for its throttle window passing.
-    let expire = |throttle: &mut HashMap<String, Instant>, peer: &AgentId| {
-        let prefix = format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
-        throttle.retain(|key, _| !key.starts_with(&prefix));
+    let prefix = format!("{group_id}:{}:", hex::encode(signer.as_bytes()));
+    let signer_asked_at = || {
+        victim
+            .treekem_catchup_throttle
+            .try_read()
+            .ok()
+            .and_then(|throttle| {
+                throttle
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(_, at)| *at)
+                    .max()
+            })
     };
     tokio::time::pause();
 
@@ -4107,53 +4135,56 @@ async fn same_epoch_observation_in_the_last_round_asks_again() -> Result<()> {
     wait_until(|| sent() >= 3).await;
     assert_eq!(sent(), 3, "the first round asks all three members");
 
-    // Halfway between the rounds before the last one and the last one.
-    let rounds = u32::try_from(TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS)?;
-    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (rounds - 2) + TREEKEM_CATCHUP_THROTTLE / 2)
+    // Halfway between the rounds before the last one and the last one. The
+    // throttle runs on the runtime clock, so each window passes between
+    // rounds and each round asks every member again.
+    let rounds = TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS;
+    let windows = u32::try_from(rounds)?;
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (windows - 2) + TREEKEM_CATCHUP_THROTTLE / 2)
         .await;
-    assert_eq!(sent(), 3, "the middle rounds find every member throttled");
+    assert_eq!(
+        sent(),
+        3 * (rounds - 1),
+        "each round after a throttle window asks every member again"
+    );
     // Hold the throttle so the last round stops after it reads its target.
-    let mut throttle = victim.treekem_catchup_throttle.write().await;
-    expire(&mut throttle, &signer);
+    let throttle = victim.treekem_catchup_throttle.write().await;
     tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
     // Hold the targets so the last round stops before it ends.
     let mut targets = victim.treekem_epoch_ahead_targets.lock().await;
     drop(throttle);
-    wait_until(|| sent() >= 4).await;
-    assert_eq!(sent(), 4, "the last round asks the offline signer");
+    wait_until(|| sent() >= 3 * rounds).await;
+    assert_eq!(sent(), 3 * rounds, "the last round asks the offline signer");
+    let last_round = signer_asked_at().expect("the last round stamps the signer");
 
     // The signer is back and sends one record at the same epoch.
     assert!(
         !note_epoch_ahead_observation(&mut targets, group_id, missed),
         "the running recovery takes the observation"
     );
-    expire(&mut *victim.treekem_catchup_throttle.write().await, &signer);
     drop(targets);
 
-    wait_until(|| sent() > 4).await;
+    wait_until(|| sent() > 3 * rounds).await;
     assert!(
-        sent() > 4,
+        sent() > 3 * rounds,
         "a same-epoch observation in the last round must start a new request"
     );
-    let asked_signer = {
-        let prefix = format!("{group_id}:{}:", hex::encode(signer.as_bytes()));
-        victim
-            .treekem_catchup_throttle
-            .read()
-            .await
-            .keys()
-            .any(|key| key.starts_with(&prefix))
-    };
-    assert!(asked_signer, "the new request asks the signer");
+    wait_until(|| signer_asked_at().is_some_and(|at| at > last_round)).await;
+    assert!(
+        signer_asked_at().is_some_and(|at| at > last_round),
+        "the new request asks the signer"
+    );
     cast.shutdown().await;
     Ok(())
 }
 
-/// #1427 (Codex RC5): six candidates, three per round. The penultimate
-/// round asks the signer, which is offline. The signer then comes back
-/// and sends one record at the same missed epoch. The last round asks
-/// only other members. The observation must not be lost: the recovery
-/// must ask the signer again, with no further traffic.
+/// #1427 (Codex RC5): eight candidates, three per round. The throttle
+/// runs on the runtime clock, so each round asks the three members asked
+/// least recently. The signer ranks sixth: the second round asks it, and
+/// the penultimate round asks it again while it is offline. The signer
+/// then comes back and sends one record at the same missed epoch. The last
+/// round asks only other members. The observation must not be lost: the
+/// recovery must ask the signer again, with no further traffic.
 #[tokio::test]
 async fn same_epoch_observation_in_the_penultimate_round_asks_the_holder_again() -> Result<()> {
     let cast = catchup_relay_fixture().await?;
@@ -4162,8 +4193,8 @@ async fn same_epoch_observation_in_the_penultimate_round_asks_the_holder_again()
     let signer = cast.fixture.state.agent.agent_id();
     let signer_hex = hex::encode(signer.as_bytes());
     let missed = cast.epoch_before + 1;
-    // Admins rank first by agent id, so these three rank before the signer.
-    let silent: Vec<AgentId> = (1..=3u8)
+    // Admins rank first by agent id, so these five rank before the signer.
+    let silent: Vec<AgentId> = (1..=5u8)
         .map(|last| {
             let mut id = [0u8; 32];
             id[31] = last;
@@ -4196,40 +4227,46 @@ async fn same_epoch_observation_in_the_penultimate_round_asks_the_holder_again()
             .filter(|recorded| *recorded == group_id.as_bytes())
             .count()
     };
-    let prefix = |peer: &AgentId| format!("{group_id}:{}:", hex::encode(peer.as_bytes()));
-    // The throttle uses the wall clock, which paused time does not move.
-    // Removing a peer's entry stands for its throttle window passing.
-    let expire = |peers: &[AgentId]| {
-        let mut throttle = victim
+    let prefix = format!("{group_id}:{}:", hex::encode(signer.as_bytes()));
+    let signer_asked_at = || {
+        victim
             .treekem_catchup_throttle
-            .try_write()
-            .expect("no round holds the throttle");
-        throttle.retain(|key, _| !peers.iter().any(|peer| key.starts_with(&prefix(peer))));
+            .try_read()
+            .ok()
+            .and_then(|throttle| {
+                throttle
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(_, at)| *at)
+                    .max()
+            })
     };
-    let asked = |peer: &AgentId| {
-        let throttle = victim.treekem_catchup_throttle.try_read();
-        throttle.is_ok_and(|throttle| throttle.keys().any(|key| key.starts_with(&prefix(peer))))
-    };
-    let others: Vec<AgentId> = silent
-        .iter()
-        .copied()
-        .chain([cast.fixture.member_id, cast.member_b])
-        .collect();
     tokio::time::pause();
 
     spawn_treekem_epoch_ahead_catchup(victim, group_id, missed);
     wait_until(|| sent() >= 6).await;
-    assert_eq!(sent(), 6, "the first two rounds ask all six members");
-    assert!(asked(&signer), "the second round asks the signer");
+    assert_eq!(
+        sent(),
+        6,
+        "the first two rounds ask six of the eight members"
+    );
+    let second_round = signer_asked_at().expect("the second round asks the signer");
 
-    // Between the third and fourth rounds after the first ask.
-    let rounds = u32::try_from(TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS)?;
-    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (rounds - 4) + TREEKEM_CATCHUP_THROTTLE / 2)
+    // Between the penultimate and the last round.
+    let rounds = TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS;
+    let windows = u32::try_from(rounds)?;
+    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE * (windows - 3) + TREEKEM_CATCHUP_THROTTLE / 2)
         .await;
-    assert_eq!(sent(), 6, "the middle rounds find every member throttled");
-    expire(&[signer]);
-    tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
-    assert_eq!(sent(), 7, "the penultimate round asks the offline signer");
+    assert_eq!(
+        sent(),
+        3 * (rounds - 1),
+        "each round asks the three members asked least recently"
+    );
+    let penultimate = signer_asked_at().expect("the signer was asked");
+    assert!(
+        penultimate > second_round,
+        "the penultimate round asks the offline signer again"
+    );
 
     // The signer is back and sends one record at the same epoch.
     assert!(
@@ -4240,15 +4277,21 @@ async fn same_epoch_observation_in_the_penultimate_round_asks_the_holder_again()
         ),
         "the running recovery takes the observation"
     );
-    // The last round finds the signer still inside its window.
-    expire(&others);
-    wait_until(|| sent() >= 10).await;
-    assert_eq!(sent(), 10, "the last round asks three other members");
+    wait_until(|| sent() >= 3 * rounds).await;
+    assert_eq!(
+        sent(),
+        3 * rounds,
+        "the last round asks three other members"
+    );
+    assert_eq!(
+        signer_asked_at(),
+        Some(penultimate),
+        "the last round does not ask the signer"
+    );
 
-    expire(&[signer]);
-    wait_until(|| asked(&signer)).await;
+    wait_until(|| signer_asked_at().is_some_and(|at| at > penultimate)).await;
     assert!(
-        asked(&signer),
+        signer_asked_at().is_some_and(|at| at > penultimate),
         "the recovery must ask the signer again after its observation"
     );
     cast.shutdown().await;

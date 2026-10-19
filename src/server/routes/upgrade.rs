@@ -1064,28 +1064,28 @@ pub(in crate::server) async fn apply_upgrade(
             &state.shutdown_tx,
         )),
     };
+    // RC4: HTTP-only crate-internal deferred-restart opt-in. apply.rs owns the
+    // ~750 ms deferred restart at admission; do not schedule a second owner here.
     let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
         .with_stop_on_upgrade(stop_on_upgrade)
         .with_restart_on_success(false)
-        .with_restart_context(restart_context.clone());
+        .with_http_deferred_restart(true)
+        .with_restart_context(restart_context);
 
     match upgrader
         .apply_upgrade_from_manifest(&release.manifest)
         .await
     {
-        Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-            schedule_restart_after_response(stop_on_upgrade, restart_context, version.clone());
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "applied": true,
-                    "version": version,
-                    "previous_version": env!("CARGO_PKG_VERSION"),
-                    "restart_scheduled": true
-                })),
-            )
-        }
+        Ok(x0x::upgrade::UpgradeResult::Success { version }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "applied": true,
+                "version": version,
+                "previous_version": env!("CARGO_PKG_VERSION"),
+                "restart_scheduled": true
+            })),
+        ),
         Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -1117,6 +1117,10 @@ pub(in crate::server) async fn apply_upgrade(
     }
 }
 
+/// Legacy helper retained for planner-parity unit tests. Production HTTP apply
+/// no longer calls this: `AutoApplyUpgrader::with_http_deferred_restart(true)`
+/// owns the deferred restart inside `src/upgrade/apply.rs` (#1447 RC4).
+#[allow(dead_code)]
 fn schedule_restart_after_response(
     stop_on_upgrade: bool,
     restart_context: RestartContext,
