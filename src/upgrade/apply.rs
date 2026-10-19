@@ -37,6 +37,40 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// Companion + primary [`Upgrader::perform_upgrade`] on the blocking pool.
+///
+/// Both production callsites (daemon target and optional companion CLI) take
+/// an exclusive host lock via blocking `File::lock`. Running that critical
+/// section here keeps Tokio workers free while another process holds the lock
+/// (T-self-update-host-backup-guard / #1447 RC1).
+///
+/// `temp_guard` moves into the blocking task so a cancelled async caller cannot
+/// remove the temp directory while compare/backup/replace still needs the
+/// extracted binaries. Cleanup happens when the blocking task finishes.
+async fn apply_replacements_offloaded(
+    upgrader: Upgrader,
+    extracted_path: PathBuf,
+    target_version: semver::Version,
+    companion: Option<(Upgrader, PathBuf)>,
+    temp_guard: TempDirGuard,
+) -> Result<UpgradeResult, UpgradeError> {
+    tokio::task::spawn_blocking(move || {
+        // Custody stays with this task for the whole locked section.
+        let _temp_custody = temp_guard;
+
+        if let Some((x0x_upgrader, extracted_x0x)) = companion {
+            match x0x_upgrader.perform_upgrade(&extracted_x0x, &target_version) {
+                Ok(_) => info!("x0x companion upgraded successfully"),
+                Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
+            }
+        }
+
+        upgrader.perform_upgrade(&extracted_path, &target_version)
+    })
+    .await
+    .map_err(|join_err| UpgradeError::Other(format!("upgrade replace task failed: {join_err}")))?
+}
+
 /// Context the restart planner needs from the running daemon: where the
 /// handoff file lives, which API address the replacement must serve, and how
 /// to trigger a bounded graceful shutdown before the old process exits.
@@ -296,7 +330,8 @@ impl AutoApplyUpgrader {
         let extracted_path = temp_dir.join("extracted-binary");
         extract_binary_from_archive(&archive_path, &extracted_path, &binary_name)?;
 
-        // If we are upgrading x0xd, also check for companion x0x binary and upgrade it too.
+        // Prepare an optional companion replace; both locks run off-worker below.
+        let mut companion = None;
         if self.binary_name == "x0xd" {
             let parent_dir = target_path
                 .parent()
@@ -314,22 +349,24 @@ impl AutoApplyUpgrader {
                 {
                     warn!("Failed to extract companion x0x binary: {e}");
                 } else {
-                    let x0x_upgrader = Upgrader::new(x0x_path.clone(), current_version.clone());
-                    match x0x_upgrader.perform_upgrade(&extracted_x0x, &target_version) {
-                        Ok(_) => info!("x0x companion upgraded successfully"),
-                        Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
-                    }
+                    companion = Some((
+                        Upgrader::new(x0x_path, current_version.clone()),
+                        extracted_x0x,
+                    ));
                 }
             }
         }
 
-        // Replace binary (with backup + rollback)
-        let result = upgrader.perform_upgrade(&extracted_path, &target_version)?;
-
-        // Clean up temp dir
-        if let Err(e) = std::fs::remove_dir_all(&temp_dir) {
-            debug!("Failed to clean temp dir: {e}");
-        }
+        // Move temp-dir custody into the blocking task so cancel cannot delete
+        // extracted binaries mid-replace. The guard cleans up when that task ends.
+        let result = apply_replacements_offloaded(
+            upgrader,
+            extracted_path,
+            target_version.clone(),
+            companion,
+            _temp_guard,
+        )
+        .await?;
 
         if matches!(result, UpgradeResult::Success { .. }) {
             // ADR-0061 §6 — report honestly. Installed bytes, a pending
@@ -1643,5 +1680,80 @@ mod tests {
         let result = download_to_file(&url, &destination).await;
         assert!(matches!(result, Err(UpgradeError::BinaryTooLarge { .. })));
         assert!(!destination.exists());
+    }
+
+    /// Host lock waits must not stall the Tokio worker (#1447 RC1).
+    ///
+    /// On a current-thread runtime the polling thread is the only worker. If
+    /// `File::lock` ran inline, a 20ms timer would only fire after the external
+    /// holder released (here ~500ms). Offloading keeps the timer near 20ms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_replacements_offload_keeps_runtime_responsive_while_lock_held() {
+        use std::fs::OpenOptions;
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("x0xd");
+        let incoming = dir.path().join("incoming");
+        let temp_dir = dir.path().join("upgrade-temp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(&target, b"original-v1").unwrap();
+        std::fs::write(&incoming, b"candidate-v2").unwrap();
+
+        let mut lock_name = target.file_name().unwrap().to_os_string();
+        lock_name.push(".upgrade.lock");
+        let lock_path = target.with_file_name(lock_name);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .expect("open host lock");
+            file.lock().expect("hold host lock");
+            ready_tx.send(()).expect("signal lock held");
+            std::thread::sleep(Duration::from_millis(500));
+            drop(file);
+        });
+        ready_rx.recv().expect("holder ready");
+
+        let upgrader = Upgrader::new(target, semver::Version::parse("1.0.0").unwrap());
+        let temp_guard = TempDirGuard {
+            path: temp_dir.clone(),
+        };
+        // Keep a second path under temp so Drop has something to remove.
+        std::fs::write(temp_dir.join("marker"), b"keep").unwrap();
+
+        let apply = apply_replacements_offloaded(
+            upgrader,
+            incoming,
+            semver::Version::parse("2.0.0").unwrap(),
+            None,
+            temp_guard,
+        );
+
+        let start = Instant::now();
+        tokio::pin!(apply);
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < Duration::from_millis(200),
+                    "20ms Tokio timer stalled for {elapsed:?}; host lock wait must not run on the runtime worker"
+                );
+            }
+            _ = &mut apply => {
+                panic!("apply finished before the responsiveness probe timer; holder should still own the lock");
+            }
+        }
+
+        // Finish the upgrade after the holder releases.
+        let result = apply.await.expect("offloaded replace");
+        assert!(matches!(result, UpgradeResult::Success { .. }));
+        holder.join().expect("lock holder thread");
     }
 }

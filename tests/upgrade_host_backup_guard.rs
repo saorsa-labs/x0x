@@ -4,9 +4,10 @@
 //! `<target>.backup` holding the original bytes. Uses a libtest self-exec
 //! pattern so the race runs in independent processes (not threads).
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use semver::Version;
 use tempfile::TempDir;
@@ -21,6 +22,9 @@ const WORKER_ENV: &str = "X0X_1447_HOST_BACKUP_WORKER";
 /// Fixture filter name — real test names in this file must not contain it.
 const APPLY_WORKER: &str = "fixture_role_host_backup_apply_worker";
 
+/// Bound for parent waits so a crashed worker fails the test instead of hanging.
+const WAIT_DEADLINE: Duration = Duration::from_secs(15);
+
 fn test_exe() -> PathBuf {
     std::env::current_exe().unwrap()
 }
@@ -34,14 +38,135 @@ fn write_bytes(path: &Path, bytes: &[u8]) {
     }
 }
 
-fn wait_until_exists(path: &Path) {
-    while !path.exists() {
-        std::thread::yield_now();
+fn backup_path(target: &Path) -> PathBuf {
+    target.with_extension("backup")
+}
+
+fn host_lock_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".upgrade.lock");
+    target.with_file_name(name)
+}
+
+fn acquire_host_lock(target: &Path) -> File {
+    let lock_path = host_lock_path(target);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|e| panic!("open host lock {}: {e}", lock_path.display()));
+    file.lock()
+        .unwrap_or_else(|e| panic!("take host lock {}: {e}", lock_path.display()));
+    file
+}
+
+/// Kills and reaps any still-running children on drop (failure or panic).
+struct ChildReaper {
+    children: Vec<Child>,
+}
+
+impl ChildReaper {
+    fn new() -> Self {
+        Self {
+            children: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, child: Child) -> usize {
+        self.children.push(child);
+        self.children.len() - 1
+    }
+
+    fn get_mut(&mut self, index: usize) -> &mut Child {
+        &mut self.children[index]
+    }
+
+    fn try_wait_one(&mut self, index: usize) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.children[index].try_wait()
+    }
+
+    fn kill_all(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.children.clear();
     }
 }
 
-fn backup_path(target: &Path) -> PathBuf {
-    target.with_extension("backup")
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        self.kill_all();
+    }
+}
+
+fn wait_until_exists(path: &Path, reaper: &mut ChildReaper, label: &str) {
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        for i in 0..reaper.children.len() {
+            if let Ok(Some(status)) = reaper.try_wait_one(i) {
+                reaper.kill_all();
+                panic!(
+                    "{label}: child {i} exited with {status} before {} appeared",
+                    path.display()
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reaper.kill_all();
+    panic!(
+        "{label}: timed out after {WAIT_DEADLINE:?} waiting for {}",
+        path.display()
+    );
+}
+
+fn wait_for_result(path: &Path, reaper: &mut ChildReaper, label: &str) -> String {
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    while Instant::now() < deadline {
+        if path.exists() {
+            let text = fs::read_to_string(path).unwrap_or_default();
+            if text == "skipped" || text == "replaced" {
+                return text;
+            }
+        }
+        for i in 0..reaper.children.len() {
+            if let Ok(Some(status)) = reaper.try_wait_one(i) {
+                if !status.success() {
+                    reaper.kill_all();
+                    panic!(
+                        "{label}: child {i} failed with {status} while waiting for result {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    reaper.kill_all();
+    panic!(
+        "{label}: timed out after {WAIT_DEADLINE:?} waiting for result {}",
+        path.display()
+    );
+}
+
+fn reap_success(reaper: &mut ChildReaper, index: usize, label: &str) {
+    let status = reaper
+        .get_mut(index)
+        .wait()
+        .unwrap_or_else(|e| panic!("{label}: wait child {index}: {e}"));
+    assert!(
+        status.success(),
+        "{label}: child {index} exited with {status}"
+    );
 }
 
 /// Child: wait for the barrier, then `perform_upgrade`, record skip vs replace.
@@ -58,7 +183,14 @@ fn fixture_role_host_backup_apply_worker() {
     let result = dir.join(std::env::var("X0X_1447_RESULT").unwrap());
 
     fs::write(&ready, b"ready").unwrap();
-    wait_until_exists(&go);
+    // Worker-side barrier wait: bounded so a missing go file fails the child.
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    while !go.exists() {
+        if Instant::now() >= deadline {
+            panic!("worker timed out waiting for barrier_go");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let upgrader = Upgrader::new(target, Version::parse(FROM).unwrap());
     let outcome = upgrader
@@ -97,17 +229,6 @@ fn spawn_apply_worker(
         .expect("spawn apply worker")
 }
 
-fn wait_for_result(path: &Path) -> String {
-    wait_until_exists(path);
-    loop {
-        let text = fs::read_to_string(path).unwrap_or_default();
-        if text == "skipped" || text == "replaced" {
-            return text;
-        }
-        std::thread::yield_now();
-    }
-}
-
 fn assert_backup_and_target(target: &Path) {
     // Unconditional postcondition (Codex nit on #1451): backup keeps original
     // bytes and target holds the candidate. A skip never stands in for this.
@@ -138,17 +259,36 @@ fn two_processes_preserve_original_backup_unconditionally() {
     write_bytes(&root.join("incoming_a"), CANDIDATE);
     write_bytes(&root.join("incoming_b"), CANDIDATE);
 
-    let mut child_a = spawn_apply_worker(root, "incoming_a", "ready_a", "result_a");
-    let mut child_b = spawn_apply_worker(root, "incoming_b", "ready_b", "result_b");
+    let mut reaper = ChildReaper::new();
+    let idx_a = reaper.push(spawn_apply_worker(
+        root,
+        "incoming_a",
+        "ready_a",
+        "result_a",
+    ));
+    let idx_b = reaper.push(spawn_apply_worker(
+        root,
+        "incoming_b",
+        "ready_b",
+        "result_b",
+    ));
 
-    wait_until_exists(&root.join("ready_a"));
-    wait_until_exists(&root.join("ready_b"));
+    wait_until_exists(&root.join("ready_a"), &mut reaper, "two_processes ready_a");
+    wait_until_exists(&root.join("ready_b"), &mut reaper, "two_processes ready_b");
     fs::write(root.join("barrier_go"), b"go").unwrap();
 
-    let outcome_a = wait_for_result(&root.join("result_a"));
-    let outcome_b = wait_for_result(&root.join("result_b"));
-    assert!(child_a.wait().unwrap().success());
-    assert!(child_b.wait().unwrap().success());
+    let outcome_a = wait_for_result(
+        &root.join("result_a"),
+        &mut reaper,
+        "two_processes result_a",
+    );
+    let outcome_b = wait_for_result(
+        &root.join("result_b"),
+        &mut reaper,
+        "two_processes result_b",
+    );
+    reap_success(&mut reaper, idx_a, "two_processes");
+    reap_success(&mut reaper, idx_b, "two_processes");
 
     assert_backup_and_target(&target);
 
@@ -173,11 +313,25 @@ fn two_processes_preserve_original_backup_unconditionally() {
     // Late second attempt after replacement (disk already matches).
     write_bytes(&root.join("incoming_late"), CANDIDATE);
     let _ = fs::remove_file(root.join("barrier_go"));
-    let mut child_late = spawn_apply_worker(root, "incoming_late", "ready_late", "result_late");
-    wait_until_exists(&root.join("ready_late"));
+    let mut late_reaper = ChildReaper::new();
+    let idx_late = late_reaper.push(spawn_apply_worker(
+        root,
+        "incoming_late",
+        "ready_late",
+        "result_late",
+    ));
+    wait_until_exists(
+        &root.join("ready_late"),
+        &mut late_reaper,
+        "two_processes ready_late",
+    );
     fs::write(root.join("barrier_go"), b"go").unwrap();
-    let late = wait_for_result(&root.join("result_late"));
-    assert!(child_late.wait().unwrap().success());
+    let late = wait_for_result(
+        &root.join("result_late"),
+        &mut late_reaper,
+        "two_processes result_late",
+    );
+    reap_success(&mut late_reaper, idx_late, "two_processes late");
     assert_eq!(late, "skipped", "late attempt must skip backup and replace");
     assert_backup_and_target(&target);
 }
@@ -198,19 +352,83 @@ fn two_old_processes_one_shared_target_both_succeed() {
     write_bytes(&root.join("incoming_a"), CANDIDATE);
     write_bytes(&root.join("incoming_b"), CANDIDATE);
 
-    let mut child_a = spawn_apply_worker(root, "incoming_a", "ready_a", "result_a");
-    let mut child_b = spawn_apply_worker(root, "incoming_b", "ready_b", "result_b");
-    wait_until_exists(&root.join("ready_a"));
-    wait_until_exists(&root.join("ready_b"));
+    let mut reaper = ChildReaper::new();
+    let idx_a = reaper.push(spawn_apply_worker(
+        root,
+        "incoming_a",
+        "ready_a",
+        "result_a",
+    ));
+    let idx_b = reaper.push(spawn_apply_worker(
+        root,
+        "incoming_b",
+        "ready_b",
+        "result_b",
+    ));
+    wait_until_exists(&root.join("ready_a"), &mut reaper, "two_old ready_a");
+    wait_until_exists(&root.join("ready_b"), &mut reaper, "two_old ready_b");
     fs::write(root.join("barrier_go"), b"go").unwrap();
 
-    let a = wait_for_result(&root.join("result_a"));
-    let b = wait_for_result(&root.join("result_b"));
-    assert!(child_a.wait().unwrap().success());
-    assert!(child_b.wait().unwrap().success());
+    let a = wait_for_result(&root.join("result_a"), &mut reaper, "two_old result_a");
+    let b = wait_for_result(&root.join("result_b"), &mut reaper, "two_old result_b");
+    reap_success(&mut reaper, idx_a, "two_old");
+    reap_success(&mut reaper, idx_b, "two_old");
     assert!(
         (a == "replaced" || a == "skipped") && (b == "replaced" || b == "skipped"),
         "both old processes must finish with Success-side outcomes: a={a} b={b}"
+    );
+    assert_backup_and_target(&target);
+}
+
+/// Parent holds the real host lock: a ready worker must not replace until unlock.
+#[test]
+fn held_host_lock_excludes_ready_worker_until_released() {
+    if std::env::var_os(WORKER_ENV).is_some() {
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let target = root.join("target");
+    write_bytes(&target, ORIGINAL);
+    write_bytes(&root.join("incoming_a"), CANDIDATE);
+
+    let host_lock = acquire_host_lock(&target);
+
+    let mut reaper = ChildReaper::new();
+    let idx = reaper.push(spawn_apply_worker(
+        root,
+        "incoming_a",
+        "ready_a",
+        "result_a",
+    ));
+    wait_until_exists(&root.join("ready_a"), &mut reaper, "exclusion ready_a");
+    fs::write(root.join("barrier_go"), b"go").unwrap();
+
+    // Worker is past the barrier and blocked on File::lock. Give it time to
+    // prove it cannot replace while we still hold the lock.
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        ORIGINAL,
+        "worker must not replace the target while the parent holds the host lock"
+    );
+    assert!(
+        !root.join("result_a").exists(),
+        "worker must still be waiting on the host lock (no result file yet)"
+    );
+    if let Ok(Some(status)) = reaper.try_wait_one(idx) {
+        reaper.kill_all();
+        panic!("worker exited with {status} while parent still held the host lock");
+    }
+
+    drop(host_lock);
+
+    let outcome = wait_for_result(&root.join("result_a"), &mut reaper, "exclusion result_a");
+    reap_success(&mut reaper, idx, "exclusion");
+    assert_eq!(
+        outcome, "replaced",
+        "worker must replace once the lock is released"
     );
     assert_backup_and_target(&target);
 }
