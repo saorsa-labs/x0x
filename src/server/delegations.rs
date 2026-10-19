@@ -185,7 +185,7 @@ pub(in crate::server) async fn committed_delegations(
     if let Some(history) = state.agent.history() {
         let store = std::sync::Arc::clone(history.store());
         let scope = group_id.to_string();
-        newest = tokio::task::spawn_blocking(move || newest_row_id(&store, &scope))
+        newest = crate::history::run_blocking(move || newest_row_id(&store, &scope))
             .await
             .ok()
             .flatten();
@@ -208,7 +208,7 @@ pub(in crate::server) async fn committed_delegations(
     if let Some(history) = state.agent.history() {
         let store = std::sync::Arc::clone(history.store());
         let scope = group_id.to_string();
-        scanned = tokio::task::spawn_blocking(move || scan_group_history(&store, &scope))
+        scanned = crate::history::run_blocking(move || scan_group_history(&store, &scope))
             .await
             .ok()
             .flatten();
@@ -338,7 +338,7 @@ pub(in crate::server) async fn rebuild_global_delegation_registry(state: &AppSta
         return;
     };
     let store = std::sync::Arc::clone(history.store());
-    let scanned = tokio::task::spawn_blocking(move || {
+    let scanned = crate::history::run_blocking(move || {
         // Total-or-nothing, uncapped, across ALL scopes in rowid order.
         let mut rows: Vec<x0x::history::StoredRecord> = Vec::new();
         let mut before_id: Option<i64> = None;
@@ -474,7 +474,7 @@ pub(in crate::server) async fn index_committed(
     if let Some(history) = state.agent.history() {
         let store = std::sync::Arc::clone(history.store());
         let scope = group_id.to_string();
-        newest = tokio::task::spawn_blocking(move || newest_row_id(&store, &scope))
+        newest = crate::history::run_blocking(move || newest_row_id(&store, &scope))
             .await
             .ok()
             .flatten();

@@ -1408,7 +1408,7 @@ async fn durable_history_logical_request(
 ) -> crate::error::HistoryResult<DurableLogicalRequestLookup> {
     let store = Arc::clone(history.store());
     let ingress = hex::encode(sender.as_bytes());
-    tokio::task::spawn_blocking(move || {
+    crate::history::run_blocking(move || {
         let rows = store.find_by_logical_request(&ingress, request_id)?;
         if rows.is_empty() {
             return Ok(DurableLogicalRequestLookup::Missing);

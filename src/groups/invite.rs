@@ -661,26 +661,66 @@ impl SignedInvite {
         !self.signature.is_empty()
     }
 
-    /// Derive best-effort historical creator provenance from the invite's
-    /// embedded base-state roster snapshot.
+    /// Derive historical creator provenance from the invite's base state.
     ///
-    /// `inviter` is unsigned routing metadata. Current invite-join handling must
-    /// not treat it as creator provenance. The derived value seeds the display
-    /// `creator` / genesis field only and is never consulted for authority.
-    /// This is not a tamper-evident or exhaustive historical reconstruction:
-    /// unusual roster shapes (for example, a creator re-added with
-    /// `added_by = Some`) may not be represented by the `added_by.is_none()`
-    /// filter. Because creator identity is non-authority metadata, this helper
-    /// intentionally keeps the derivation simple instead of adding tiebreaking
-    /// logic for unusual history.
+    /// `inviter` is never creator provenance, on any invite version: a
+    /// promoted non-creator admin can issue invites (#1458). Legacy invites
+    /// carry it as unsigned routing metadata. V4 invites sign it inside
+    /// [`InviteSignedViewV4`], but a signed `inviter` still names only the
+    /// issuing admin; only the signed `creator` field is creator provenance. The derived value seeds the display `creator`
+    /// / genesis field only and is never consulted for authority.
+    ///
+    /// * **v4 invites** (`version >= 4`) carry the explicit `creator` field
+    ///   inside the signed view ([`InviteSignedViewV4::creator`]), and the
+    ///   v4 mint never sets `base_members_v2` (the projection
+    ///   `base_roster` replaces it and has no `added_by` / `joined_at`
+    ///   history). The value is the signed `creator` field only. It is not
+    ///   cross-checked against `base_roster`: the projection holds only
+    ///   Active and Banned members, so a creator that left the group is
+    ///   correctly absent from it. The value is authenticated only after
+    ///   the caller verifies the v4 signatures
+    ///   ([`Self::verify_v4_signatures`]); the join path does this before
+    ///   it uses the invite.
+    /// * **Legacy invites** (`version < 4`) derive it best-effort from the
+    ///   fat `base_members_v2` roster snapshot: the seeded member with
+    ///   `added_by.is_none()`, preferring `joined_at == group_created_at`.
+    ///   This is not a tamper-evident or exhaustive historical
+    ///   reconstruction: unusual roster shapes (for example, a creator
+    ///   re-added with `added_by = Some`) may not be represented. Because
+    ///   creator identity is non-authority metadata, this path keeps the
+    ///   derivation simple instead of adding tiebreaking logic for unusual
+    ///   history.
     ///
     /// # Errors
     ///
-    /// Returns an error when the invite has no base roster snapshot, no seeded
-    /// base-state member entry, or the derived member id is not a 32-byte hex
-    /// agent id. Legacy/missing-base invites are rejected by the current join
-    /// path rather than falling back to unsigned `inviter` metadata.
+    /// Returns an error when a v4 invite has no signed `creator`, when a
+    /// legacy invite has no base roster snapshot or no seeded base-state
+    /// member entry, or when the creator id is not a 32-byte hex agent id.
+    /// There is no fallback to unsigned `inviter` metadata.
     pub fn creator_agent_id_from_base_state(&self) -> Result<String, String> {
+        let creator_hex = if self.version >= INVITE_VERSION_V4 {
+            self.creator.as_deref().ok_or_else(|| {
+                "v4 invite missing signed creator; cannot derive creator provenance".to_string()
+            })?
+        } else {
+            self.legacy_creator_from_base_members()?
+        };
+
+        let creator_bytes =
+            hex::decode(creator_hex).map_err(|e| format!("invalid base-state creator hex: {e}"))?;
+        if creator_bytes.len() != crate::identity::PEER_ID_LENGTH {
+            return Err(format!(
+                "invalid base-state creator length: expected 32 bytes, got {}",
+                creator_bytes.len()
+            ));
+        }
+
+        Ok(creator_hex.to_string())
+    }
+
+    /// Legacy (pre-v4) creator derivation from the fat `base_members_v2`
+    /// snapshot. See [`Self::creator_agent_id_from_base_state`].
+    fn legacy_creator_from_base_members(&self) -> Result<&str, String> {
         let base_members = self.base_members_v2.as_ref().ok_or_else(|| {
             "invite missing base member snapshot; cannot derive creator provenance".to_string()
         })?;
@@ -703,7 +743,7 @@ impl SignedInvite {
             }
         }
 
-        let (creator_hex, _) = candidates
+        candidates
             .into_iter()
             .min_by(|(left_id, left), (right_id, right)| {
                 left.joined_at
@@ -711,20 +751,10 @@ impl SignedInvite {
                     .then_with(|| left.updated_at.cmp(&right.updated_at))
                     .then_with(|| left_id.cmp(right_id))
             })
+            .map(|(creator_hex, _)| creator_hex.as_str())
             .ok_or_else(|| {
                 "invite base member snapshot has no seeded creator provenance".to_string()
-            })?;
-
-        let creator_bytes =
-            hex::decode(creator_hex).map_err(|e| format!("invalid base-state creator hex: {e}"))?;
-        if creator_bytes.len() != crate::identity::PEER_ID_LENGTH {
-            return Err(format!(
-                "invalid base-state creator length: expected 32 bytes, got {}",
-                creator_bytes.len()
-            ));
-        }
-
-        Ok(creator_hex.to_string())
+            })
     }
 
     /// D5: validate every capped field. Returns the first violation.
@@ -1189,8 +1219,10 @@ mod tests {
             None,
         );
 
+        // Legacy (pre-v4) shape: provenance comes from the fat roster.
         let mut invite =
             SignedInvite::new(info.mls_group_id.clone(), info.name.clone(), &inviter, 0);
+        invite.version = 0;
         invite.group_created_at = Some(info.created_at);
         invite.base_members_v2 = Some(info.members_v2.clone());
 
@@ -1219,8 +1251,10 @@ mod tests {
         );
         info.set_member_role(&creator_hex, crate::groups::GroupRole::Member);
 
+        // Legacy (pre-v4) shape: provenance comes from the fat roster.
         let mut invite =
             SignedInvite::new(info.mls_group_id.clone(), info.name.clone(), &inviter, 0);
+        invite.version = 0;
         invite.group_created_at = Some(info.created_at);
         invite.base_members_v2 = Some(info.members_v2.clone());
 
@@ -1235,11 +1269,57 @@ mod tests {
     #[test]
     fn creator_provenance_does_not_fall_back_to_unsigned_inviter() {
         let inviter = agent(2);
-        let invite = SignedInvite::new("aa".repeat(16), "T".to_string(), &inviter, 0);
+        let mut invite = SignedInvite::new("aa".repeat(16), "T".to_string(), &inviter, 0);
 
+        // v4 without the signed creator: no fallback to `inviter`.
+        assert_eq!(
+            invite.creator_agent_id_from_base_state().unwrap_err(),
+            "v4 invite missing signed creator; cannot derive creator provenance"
+        );
+
+        // Legacy without the fat roster: no fallback to `inviter` either.
+        invite.version = 0;
         assert_eq!(
             invite.creator_agent_id_from_base_state().unwrap_err(),
             "invite missing base member snapshot; cannot derive creator provenance"
+        );
+    }
+
+    /// #1458: v4 invites carry no `base_members_v2`; provenance is the
+    /// signed `creator` field, even when a promoted admin is the inviter.
+    #[test]
+    fn v4_creator_provenance_comes_from_signed_creator_not_inviter() {
+        let creator = agent(1);
+        let inviter = agent(2);
+        let creator_hex = hex::encode(creator.as_bytes());
+        let mut invite = SignedInvite::new("aa".repeat(16), "T".to_string(), &inviter, 0);
+        invite.creator = Some(creator_hex.clone());
+
+        assert_eq!(invite.version, INVITE_VERSION_V4);
+        assert!(invite.base_members_v2.is_none());
+        assert_eq!(
+            invite
+                .creator_agent_id_from_base_state()
+                .expect("derive creator from signed v4 creator"),
+            creator_hex
+        );
+    }
+
+    #[test]
+    fn v4_creator_provenance_rejects_malformed_signed_creator() {
+        let inviter = agent(2);
+        let mut invite = SignedInvite::new("aa".repeat(16), "T".to_string(), &inviter, 0);
+
+        invite.creator = Some("zz".to_string());
+        assert!(invite
+            .creator_agent_id_from_base_state()
+            .unwrap_err()
+            .starts_with("invalid base-state creator hex"));
+
+        invite.creator = Some("ab".repeat(16));
+        assert_eq!(
+            invite.creator_agent_id_from_base_state().unwrap_err(),
+            "invalid base-state creator length: expected 32 bytes, got 16"
         );
     }
 

@@ -2756,3 +2756,68 @@ pub(in crate::server::routes) mod revocation_persistence_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod issue1458_tests {
+    use super::populate_invite_base_state_v4;
+    use crate::groups::invite::SignedInvite;
+    use crate::groups::{GroupInfo, GroupPolicyPreset, GroupRole};
+    use crate::identity::AgentKeypair;
+
+    /// #1458: a v4 invite minted by the daemon mint path
+    /// (`populate_invite_base_state_v4` + `sign_v4`) by a promoted
+    /// non-creator admin must still carry creator provenance. The v4 mint
+    /// never sets the legacy `base_members_v2`, so provenance must come
+    /// from the signed `creator` field, never from the unsigned `inviter`.
+    #[test]
+    fn promoted_admin_v4_invite_carries_signed_creator_provenance() {
+        let creator = AgentKeypair::generate().unwrap();
+        let admin = AgentKeypair::generate().unwrap();
+        let creator_hex = hex::encode(creator.agent_id().as_bytes());
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+
+        let mut info = GroupInfo::with_policy(
+            "T".to_string(),
+            "desc".to_string(),
+            creator.agent_id(),
+            "aa".repeat(16),
+            GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.add_member(
+            admin_hex.clone(),
+            GroupRole::Admin,
+            Some(creator_hex.clone()),
+            None,
+        );
+        info.recompute_state_hash();
+
+        let mut invite = SignedInvite::new(
+            info.mls_group_id.clone(),
+            info.name.clone(),
+            &admin.agent_id(),
+            3600,
+        );
+        populate_invite_base_state_v4(&mut invite, &info, None);
+        invite
+            .sign_v4(&admin, None)
+            .expect("admin signs the v4 invite");
+
+        let link = invite.encode_link().expect("v4 invite under budget");
+        let parsed = SignedInvite::from_link(&link).expect("v4 link parses");
+        parsed
+            .verify_v4_signatures()
+            .expect("v4 invite signature verifies");
+        assert!(
+            parsed.base_members_v2.is_none(),
+            "v4 mint is projection-only"
+        );
+        assert_eq!(parsed.inviter, admin_hex);
+        assert_eq!(
+            parsed
+                .creator_agent_id_from_base_state()
+                .expect("creator provenance derives from the signed v4 creator"),
+            creator_hex,
+            "creator provenance must be the group creator, not the inviting admin"
+        );
+    }
+}
