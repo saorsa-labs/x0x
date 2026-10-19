@@ -672,6 +672,26 @@ mod tests {
         assert_eq!(snapshot.verdict_sample().seeds_connected, 1);
     }
 
+    /// RC1 #1380 (P2): the *actual* default snapshot — not an explicitly
+    /// constructed `unsampled()` sample — must classify `ok` before the
+    /// first refresher tick. At 8646cc84 the derived `Default` left the
+    /// identity booleans false, so a never-refreshed snapshot read
+    /// `error` ("agent or machine identity missing"). Fails there.
+    #[test]
+    fn default_health_snapshot_classifies_ok_before_the_first_sample() {
+        let verdict = health_verdict::classify(&HealthSnapshot::default().verdict_sample());
+        assert_eq!(
+            verdict.verdict, "ok",
+            "before the first sample is not an error: {:?}",
+            verdict.reasons
+        );
+        assert!(
+            verdict.reasons.is_empty(),
+            "an unsampled snapshot carries no reasons: {:?}",
+            verdict.reasons
+        );
+    }
+
     /// #1380: probe recording publishes before the handler reads — a probe
     /// outcome must be visible immediately, and none-yet must read as
     /// `(0, None, None)`.

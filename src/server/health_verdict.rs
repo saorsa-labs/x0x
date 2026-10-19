@@ -56,9 +56,11 @@ pub(in crate::server) const DELIVERY_PROBE_STARTUP_DELAY_SECS: u64 = 10;
 /// shared topic (each daemon's probe carries a random nonce after it).
 const PROBE_MAGIC: &[u8] = b"x0x-health-probe-v1:";
 
-/// Rolling-window length in refresher ticks (12 × 5 s = 60 s).
-const WINDOW_TICKS: usize = 12;
-/// Window duration implied by [`WINDOW_TICKS`] and the 5 s refresh cadence.
+/// Window duration every rolling counter measures. The refresher's 5 s
+/// cadence makes that roughly 12 ticks, but expiry is by elapsed time, not
+/// tick count: quiet ticks record no entry, so a count-only window would
+/// keep the last nonzero deltas alive for as long as the node stays idle
+/// (RC1 review of #1380).
 pub(in crate::server) const WINDOW_SECS: u64 = 60;
 
 /// Publish attempts below this in the window make the rate statistically
@@ -156,8 +158,12 @@ impl From<Option<&str>> for PlaneSample {
 /// Everything [`classify`] needs, gathered off-path by the refresher and
 /// merged with live peer counts/uptime by the handler. `Default` is the
 /// unsampled-but-benign state: before the first 5 s refresh the verdict
-/// must read `ok`, not a transient error from absent data.
-#[derive(Debug, Clone, Default)]
+/// must read `ok`, not a transient error from absent data. The default
+/// carries identity presence because a serving daemon cannot lack its
+/// auto-generated keys — a derived default would flip those booleans to
+/// `false` and classify a never-refreshed snapshot as `error` (RC1 review
+/// of #1380).
+#[derive(Debug, Clone)]
 pub(in crate::server) struct VerdictSample {
     /// Effective gossip plane (handler-irrelevant, refresher-sampled).
     pub plane: PlaneSample,
@@ -190,26 +196,62 @@ pub(in crate::server) struct VerdictSample {
     pub upgrade_failed_artifact: bool,
 }
 
+impl Default for VerdictSample {
+    fn default() -> Self {
+        Self {
+            plane: PlaneSample::NotSampled,
+            peers: 0,
+            send_ready_peers: 0,
+            one_sided_peers: 0,
+            uptime_secs: 0,
+            seeds_configured: 0,
+            seeds_connected: 0,
+            send_attempts_window: 0,
+            send_failed_window: 0,
+            probes_run: 0,
+            last_probe_ok: None,
+            last_probe_latency_ms: None,
+            shed_window: 0,
+            dropped_full_window: 0,
+            disk_free_bytes: None,
+            disk_total_bytes: None,
+            log_errors_window: 0,
+            identity_agent: true,
+            identity_machine: true,
+            identity_user: false,
+            upgrade_checks_enabled: false,
+            upgrade_update_available: None,
+            upgrade_latest_version: None,
+            upgrade_checked_age_secs: None,
+            upgrade_handoff_pending: false,
+            upgrade_failed_artifact: false,
+        }
+    }
+}
+
 impl VerdictSample {
     /// The unsampled baseline: every input `ok` by absence of contrary
     /// data (identity presence is assumed — a serving daemon cannot lack
     /// its auto-generated keys — and unknown disk/log/upgrade read `ok`).
     pub(in crate::server) fn unsampled() -> Self {
-        Self {
-            identity_agent: true,
-            identity_machine: true,
-            ..Self::default()
-        }
+        Self::default()
     }
 }
 
-/// Rolling sum of per-tick counter deltas over the last [`WINDOW_TICKS`]
-/// ticks. Fed by the refresher from monotonic counters (publish totals,
+/// Rolling sum of per-tick counter deltas over the last [`WINDOW_SECS`]
+/// seconds. Fed by the refresher from monotonic counters (publish totals,
 /// recv-pump shed totals, the ERROR-event count); each push records the
 /// delta since the previous push.
+///
+/// Expiry runs on the runtime clock so every window measures the same
+/// elapsed [`WINDOW_SECS`], including across quiet periods where no delta
+/// is recorded: a burst ages out 60 s after it happened, not the next time
+/// enough newer entries arrive. Timestamps therefore come from
+/// `tokio::time::Instant` (testable under a paused clock); production
+/// callers only ever run inside the refresher task's runtime.
 #[derive(Debug, Default)]
 pub(in crate::server) struct CounterWindow {
-    entries: VecDeque<(Instant, u64)>,
+    entries: VecDeque<(tokio::time::Instant, u64)>,
     last_total: Option<u64>,
 }
 
@@ -219,23 +261,46 @@ impl CounterWindow {
         let delta = self.last_total.map_or(0, |prev| total.saturating_sub(prev));
         self.last_total = Some(total);
         if delta > 0 {
-            self.entries.push_back((Instant::now(), delta));
+            self.entries.push_back((tokio::time::Instant::now(), delta));
         }
         self.prune();
         delta
     }
 
-    /// Sum of deltas recorded within the window duration.
+    /// Sum of deltas recorded within the last [`WINDOW_SECS`]. Reading
+    /// filters by age as well, so the answer stays true to the window even
+    /// between pushes.
     fn window_sum(&self) -> u64 {
-        self.entries.iter().map(|(_, delta)| *delta).sum()
+        match recent_cutoff() {
+            Some(cutoff) => self
+                .entries
+                .iter()
+                .take_while(|(at, _)| *at > cutoff)
+                .map(|(_, delta)| *delta)
+                .sum(),
+            // The runtime clock is younger than the window: nothing
+            // recorded can be stale yet.
+            None => self.entries.iter().map(|(_, delta)| *delta).sum(),
+        }
     }
 
+    /// Drop entries older than [`WINDOW_SECS`] — on quiet ticks too, so an
+    /// idle node's last burst cannot outlive its window.
     fn prune(&mut self) {
-        let cutoff = WINDOW_TICKS;
-        while self.entries.len() > cutoff {
+        let Some(cutoff) = recent_cutoff() else {
+            return;
+        };
+        while self.entries.front().is_some_and(|(at, _)| *at <= cutoff) {
             self.entries.pop_front();
         }
     }
+}
+
+/// The instant before which window entries are stale: [`WINDOW_SECS`] ago.
+/// `None` when the runtime clock cannot look that far back (a clock younger
+/// than the window has no stale entries at all).
+fn recent_cutoff() -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_sub(Duration::from_secs(WINDOW_SECS))
 }
 
 /// Per-daemon rolling-window state owned by the refresher task.
@@ -781,26 +846,31 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
 /// [`DELIVERY_PROBE_TOPIC`] and wait for our own payload to come back
 /// through subscribe → decode → subscriber handoff. Other daemons'
 /// probes on the same topic are ignored — only the nonce match counts.
+///
+/// Schedule: the first probe runs at the documented
+/// [`DELIVERY_PROBE_STARTUP_DELAY_SECS`] boundary (10 s, see
+/// `docs/api-reference.md`), then every [`DELIVERY_PROBE_INTERVAL_SECS`].
 pub(in crate::server) async fn run_delivery_probe(
     agent: Arc<crate::Agent>,
     snapshot: Arc<HealthSnapshot>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut subscription = match agent.subscribe(DELIVERY_PROBE_TOPIC).await {
-        Ok(subscription) => subscription,
-        Err(err) => {
-            // No gossip runtime (embed path): the input stays `ok` with
-            // `probes_run: 0` — there is nothing to probe.
-            tracing::debug!(error = %err, "health delivery probe: no gossip runtime, not probing");
-            return;
-        }
-    };
+    // Startup delay, bounded by shutdown: gossip is still joining on a
+    // freshly started daemon.
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(DELIVERY_PROBE_STARTUP_DELAY_SECS)) => {}
+        _ = shutdown_rx.changed() => return,
+    }
+    if *shutdown_rx.borrow() {
+        return;
+    }
 
-    tokio::time::sleep(Duration::from_secs(DELIVERY_PROBE_STARTUP_DELAY_SECS)).await;
     let mut ticker = tokio::time::interval(Duration::from_secs(DELIVERY_PROBE_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await; // the first tick of `interval` fires immediately
+    let mut subscription: Option<crate::gossip::Subscription> = None;
     loop {
+        // The interval's first tick fires immediately, so the first probe
+        // runs at the 10 s boundary above — not one interval later.
         tokio::select! {
             _ = ticker.tick() => {}
             _ = shutdown_rx.changed() => return,
@@ -808,8 +878,43 @@ pub(in crate::server) async fn run_delivery_probe(
         if *shutdown_rx.borrow() {
             return;
         }
+        // Subscribe lazily, under the same deadline as the probe itself:
+        // an unbounded initial subscribe would park this task (and leave
+        // the delivery input `ok`) exactly when the path is wedged. A
+        // subscribe that fails outright means no gossip runtime (embed
+        // path): `probes_run: 0`, the input stays `ok`, and the task ends.
+        // A subscribe that stalls is a delivery failure — recorded, then
+        // retried on the next tick.
+        let subscription = match subscription.as_mut() {
+            Some(subscription) => subscription,
+            None => {
+                match tokio::time::timeout(
+                    Duration::from_secs(DELIVERY_PROBE_TIMEOUT_SECS),
+                    agent.subscribe(DELIVERY_PROBE_TOPIC),
+                )
+                .await
+                {
+                    Ok(Ok(fresh)) => subscription.insert(fresh),
+                    Ok(Err(err)) => {
+                        tracing::debug!(
+                            error = %err,
+                            "health delivery probe: no gossip runtime, not probing"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "health delivery probe: subscribe did not complete \
+                             within {DELIVERY_PROBE_TIMEOUT_SECS}s"
+                        );
+                        snapshot.record_probe(false, None);
+                        continue;
+                    }
+                }
+            }
+        };
         let started = Instant::now();
-        match probe_once(&agent, &mut subscription).await {
+        match probe_once(&agent, subscription).await {
             Ok(()) => {
                 snapshot.record_probe(true, Some(started.elapsed().as_millis() as u64));
             }
@@ -829,42 +934,78 @@ async fn probe_once(
     agent: &crate::Agent,
     subscription: &mut crate::gossip::Subscription,
 ) -> Result<(), String> {
-    let mut nonce = [0u8; 16];
+    let mut channel = AgentChannel {
+        agent,
+        subscription,
+    };
+    probe_exchange(&mut channel, probe_payload()).await
+}
+
+/// The transport-facing half of one probe, as an injectable seam: the
+/// production pair is [`Agent::publish`] plus the subscription's recv,
+/// and tests substitute channels that block, echo or stall.
+trait ProbeChannel {
+    async fn publish(&mut self, payload: Vec<u8>) -> Result<(), String>;
+    async fn recv(&mut self) -> Option<Vec<u8>>;
+}
+
+/// [`ProbeChannel`] over the real delivery path: a signed publish on the
+/// probe topic and this daemon's own subscription on it.
+struct AgentChannel<'a> {
+    agent: &'a crate::Agent,
+    subscription: &'a mut crate::gossip::Subscription,
+}
+
+impl ProbeChannel for AgentChannel<'_> {
+    async fn publish(&mut self, payload: Vec<u8>) -> Result<(), String> {
+        self.agent
+            .publish(DELIVERY_PROBE_TOPIC, payload)
+            .await
+            .map_err(|err| format!("probe publish failed: {err}"))
+    }
+
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.subscription
+            .recv()
+            .await
+            .map(|message| message.payload.to_vec())
+    }
+}
+
+/// The payload one probe publishes and must hear back: the probe magic
+/// plus 16 random bytes, unique per round, so other daemons' probes on
+/// the shared topic never satisfy ours.
+fn probe_payload() -> Vec<u8> {
     use rand::RngCore;
+
+    let mut nonce = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut nonce);
     let mut payload = PROBE_MAGIC.to_vec();
     payload.extend_from_slice(&nonce);
+    payload
+}
 
-    agent
-        .publish(DELIVERY_PROBE_TOPIC, payload.clone())
-        .await
-        .map_err(|err| format!("probe publish failed: {err}"))?;
-
-    let deadline = Instant::now() + Duration::from_secs(DELIVERY_PROBE_TIMEOUT_SECS);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(format!(
-                "probe payload not delivered within {DELIVERY_PROBE_TIMEOUT_SECS}s"
-            ));
-        }
-        match tokio::time::timeout(remaining, subscription.recv()).await {
-            Ok(Some(message)) => {
-                if message.payload.as_ref() == payload.as_slice() {
-                    return Ok(());
-                }
+/// One bounded probe exchange: publish the nonce, then wait for the exact
+/// payload to come back — publish included, all under a single
+/// [`DELIVERY_PROBE_TIMEOUT_SECS`] deadline. A publish that never
+/// completes is precisely the #288 serving-but-not-delivering wedge this
+/// probe exists to expose, so it must fail the probe, not outlive the cap.
+async fn probe_exchange<C: ProbeChannel>(channel: &mut C, payload: Vec<u8>) -> Result<(), String> {
+    tokio::time::timeout(Duration::from_secs(DELIVERY_PROBE_TIMEOUT_SECS), async {
+        channel.publish(payload.clone()).await?;
+        loop {
+            match channel.recv().await {
+                Some(echo) if echo == payload => return Ok(()),
                 // Another daemon's probe on the shared topic — keep waiting.
-            }
-            // Subscription dropped (shutdown): treat as failure, the outer
-            // loop exits on the shutdown watch right after.
-            Ok(None) => return Err("probe subscription closed".to_string()),
-            Err(_) => {
-                return Err(format!(
-                    "probe payload not delivered within {DELIVERY_PROBE_TIMEOUT_SECS}s"
-                ))
+                Some(_) => {}
+                // Subscription dropped (shutdown): the outer loop exits on
+                // the shutdown watch right after.
+                None => return Err("probe subscription closed".to_string()),
             }
         }
-    }
+    })
+    .await
+    .map_err(|_| format!("probe did not complete within {DELIVERY_PROBE_TIMEOUT_SECS}s"))?
 }
 
 #[cfg(test)]
@@ -1232,18 +1373,81 @@ mod tests {
 
     // Windows ------------------------------------------------------------
 
-    #[test]
-    fn counter_window_sums_only_the_last_window_ticks() {
+    /// RC1 #1380 (P1): expiry is by elapsed time, not entry count. Quiet
+    /// ticks record no entry, so a count-only window kept the last nonzero
+    /// deltas alive for as long as the node stayed idle — a 61 s-old error
+    /// burst still degraded the verdict after 12 unchanged-total pushes.
+    /// Fails at 8646cc84, where the window ignored the runtime clock.
+    #[tokio::test(start_paused = true)]
+    async fn counter_window_expires_an_old_burst_by_time_not_ticks() {
         let mut window = CounterWindow::default();
-        for i in 0..WINDOW_TICKS + 5 {
-            window.push_total((i + 1) as u64 * 10);
+        window.push_total(0); // baseline
+        assert_eq!(window.push_total(50), 50); // the error burst
+        tokio::time::advance(Duration::from_secs(WINDOW_SECS + 1)).await;
+        // Twelve quiet pushes: unchanged totals record nothing, but must
+        // still age the burst out of the window.
+        for _ in 0..12 {
+            assert_eq!(window.push_total(50), 0);
         }
-        // 17 pushes of +10: only the last 12 count.
-        assert_eq!(window.window_sum(), 12 * 10);
+        assert_eq!(window.window_sum(), 0, "a 61 s-old burst must age out");
     }
 
-    #[test]
-    fn counter_window_ignores_zero_and_negative_deltas() {
+    /// RC1 #1380 (P1): the attempt and failure windows must measure the
+    /// same elapsed 60 s. Count-based eviction retired them on different
+    /// activity schedules, so the rate divided mismatched windows.
+    /// Fails at 8646cc84, where both sums stayed at their burst values.
+    #[tokio::test(start_paused = true)]
+    async fn attempt_and_failure_windows_expire_on_the_same_clock() {
+        let mut attempts = CounterWindow::default();
+        let mut failed = CounterWindow::default();
+        attempts.push_total(0); // baselines
+        failed.push_total(0);
+        attempts.push_total(100);
+        failed.push_total(60);
+        assert_eq!(attempts.window_sum(), 100, "fresh bursts still count");
+        assert_eq!(failed.window_sum(), 60);
+        tokio::time::advance(Duration::from_secs(WINDOW_SECS + 1)).await;
+        attempts.push_total(100); // quiet: unchanged total
+        failed.push_total(60);
+        assert_eq!(attempts.window_sum(), 0);
+        assert_eq!(failed.window_sum(), 0);
+    }
+
+    /// RC1 #1380 (P1): a recovered pump — one shed burst, then quiet —
+    /// must stop feeding the recv-pump input once its window passes. The
+    /// shed/dropped counters run through the same time-based windows.
+    /// Fails at 8646cc84, where the shed burst never aged out.
+    #[tokio::test(start_paused = true)]
+    async fn recovered_pump_shed_ages_out_of_the_window() {
+        let mut windows = VerdictWindows::default();
+        windows.shed.push_total(0); // baseline
+        windows.shed.push_total(40); // the near-overload burst
+        assert_eq!(windows.shed.window_sum(), 40);
+        tokio::time::advance(Duration::from_secs(WINDOW_SECS + 1)).await;
+        windows.shed.push_total(40); // quiet: the pump recovered
+        assert_eq!(
+            windows.shed.window_sum(),
+            0,
+            "a 61 s-old shed burst must age out"
+        );
+    }
+
+    /// A burst inside the window still counts, whatever the tick count.
+    #[tokio::test(start_paused = true)]
+    async fn counter_window_keeps_fresh_bursts_regardless_of_entry_count() {
+        let mut window = CounterWindow::default();
+        window.push_total(0); // baseline
+        for i in 0..17 {
+            window.push_total((i + 1) as u64 * 10);
+        }
+        // 17 nonzero pushes within the window: all 17 count, not "the last 12".
+        assert_eq!(window.window_sum(), 17 * 10);
+    }
+
+    /// The window reads the runtime clock, so this runs under tokio; an
+    /// impossible total reset must not fabricate drops.
+    #[tokio::test(start_paused = true)]
+    async fn counter_window_ignores_zero_and_negative_deltas() {
         let mut window = CounterWindow::default();
         window.push_total(100);
         window.push_total(100);
@@ -1281,13 +1485,12 @@ mod tests {
 
     // Delivery probe ------------------------------------------------------
 
-    /// The probe round-trips through a real (loopback-only, bootstrap-free,
-    /// mDNS-off) agent: publish → PlumTree → decode → subscriber. This is
-    /// the #288 scenario — serving fine, delivering nothing — caught.
-    #[tokio::test]
-    async fn delivery_probe_round_trips_on_a_loopback_agent() {
+    /// A loopback-only, bootstrap-free, mDNS-off agent: inert for test
+    /// purposes, and the same shape the daemon runs in production.
+    async fn loopback_agent() -> crate::Agent {
         let dir = tempfile::tempdir().expect("tempdir");
-        let agent = crate::Agent::builder()
+        let dir = Box::leak(Box::new(dir)); // lives as long as the agent
+        crate::Agent::builder()
             .with_identity_dir(dir.path())
             .with_machine_key(dir.path().join("machine.key"))
             .with_agent_key_path(dir.path().join("agent.key"))
@@ -1306,7 +1509,118 @@ mod tests {
             })
             .build()
             .await
-            .expect("agent");
+            .expect("loopback agent")
+    }
+
+    /// Step the paused clock forward until `started.elapsed()` reaches
+    /// `target`, in small hops so timer-driven tasks (probe rounds, their
+    /// deadlines) actually run between hops. Auto-advance may already have
+    /// moved the clock past `target`; the callers' checkpoints are one-sided.
+    async fn advance_past(started: tokio::time::Instant, target: Duration) {
+        while started.elapsed() < target {
+            tokio::time::advance(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// RC1 #1380 (P1): the deadline must bound the whole probe, publish
+    /// included. At 8646cc84 the publish was awaited before the deadline
+    /// existed, so a stalled publish left the probe pending forever and
+    /// the delivery input kept its previous verdict. This test targets the
+    /// bounded exchange seam introduced by the fix; the paused-clock
+    /// harness in the RC1 evidence reproduces the old unbounded shape.
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_publish_fails_within_the_probe_deadline() {
+        struct BlockedPublish;
+
+        impl ProbeChannel for BlockedPublish {
+            async fn publish(&mut self, _payload: Vec<u8>) -> Result<(), String> {
+                std::future::pending().await
+            }
+
+            async fn recv(&mut self) -> Option<Vec<u8>> {
+                std::future::pending().await
+            }
+        }
+
+        let started = tokio::time::Instant::now();
+        let mut channel = BlockedPublish;
+        let result = probe_exchange(&mut channel, probe_payload()).await;
+        let Err(err) = result else {
+            panic!("a publish that never completes must fail the probe");
+        };
+        assert!(
+            err.contains(&format!("within {DELIVERY_PROBE_TIMEOUT_SECS}s")),
+            "error names the deadline: {err}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(DELIVERY_PROBE_TIMEOUT_SECS),
+            "probe failed before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(DELIVERY_PROBE_TIMEOUT_SECS + 1),
+            "probe outlived its deadline: {elapsed:?}"
+        );
+    }
+
+    /// A healthy exchange: the publish completes, a foreign probe's echo
+    /// is skipped, and this daemon's own payload completes the probe.
+    #[tokio::test(start_paused = true)]
+    async fn an_immediate_echo_after_a_foreign_one_succeeds() {
+        struct Echo {
+            queued: VecDeque<Vec<u8>>,
+        }
+
+        impl ProbeChannel for Echo {
+            async fn publish(&mut self, _payload: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn recv(&mut self) -> Option<Vec<u8>> {
+                self.queued.pop_front()
+            }
+        }
+
+        let payload = probe_payload();
+        let mut foreign = PROBE_MAGIC.to_vec();
+        foreign.extend_from_slice(&[0xAA; 16]);
+        let mut channel = Echo {
+            queued: VecDeque::from(vec![foreign, payload.clone()]),
+        };
+        let result = probe_exchange(&mut channel, payload).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    /// A publish that completes but never echoes still fails at the
+    /// deadline — the recv side of the exchange stays bounded too.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_receive_fails_at_the_deadline() {
+        struct StalledRecv;
+
+        impl ProbeChannel for StalledRecv {
+            async fn publish(&mut self, _payload: Vec<u8>) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn recv(&mut self) -> Option<Vec<u8>> {
+                std::future::pending().await
+            }
+        }
+
+        let started = tokio::time::Instant::now();
+        let mut channel = StalledRecv;
+        let result = probe_exchange(&mut channel, probe_payload()).await;
+        assert!(result.is_err(), "a never-echoing exchange must fail");
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(DELIVERY_PROBE_TIMEOUT_SECS + 1));
+    }
+
+    /// The probe round-trips through a real (loopback-only, bootstrap-free,
+    /// mDNS-off) agent: publish → PlumTree → decode → subscriber. This is
+    /// the #288 scenario — serving fine, delivering nothing — caught.
+    #[tokio::test]
+    async fn delivery_probe_round_trips_on_a_loopback_agent() {
+        let agent = loopback_agent().await;
 
         let snapshot = Arc::new(HealthSnapshot::default());
         let mut subscription = agent
@@ -1318,5 +1632,77 @@ mod tests {
             .expect("probe round-trip within timeout");
         snapshot.record_probe(true, Some(1));
         assert_eq!(snapshot.probe_results(), (1, Some(true), Some(1)));
+    }
+
+    /// RC1 #1380 (P2): the first probe must run at the documented 10 s
+    /// boundary (`docs/api-reference.md`), not at 10 + 30 s. At 8646cc84
+    /// the startup sleep was followed by discarding the interval's
+    /// immediate tick, so the first publish happened at 40 s. Checkpoints
+    /// are one-sided (at least N probes by T) so a probe that wedges under
+    /// the paused clock still resolves via its own deadline.
+    #[tokio::test(start_paused = true)]
+    async fn first_probe_runs_at_the_documented_10s_boundary() {
+        let agent = Arc::new(loopback_agent().await);
+        let snapshot = Arc::new(HealthSnapshot::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_delivery_probe(
+            Arc::clone(&agent),
+            Arc::clone(&snapshot),
+            shutdown_rx,
+        ));
+        let started = tokio::time::Instant::now();
+
+        // Before the startup delay: no probe.
+        advance_past(
+            started,
+            Duration::from_secs(DELIVERY_PROBE_STARTUP_DELAY_SECS - 2),
+        )
+        .await;
+        assert_eq!(
+            snapshot.probe_results().0,
+            0,
+            "no probe before the startup delay"
+        );
+
+        // First probe at 10 s: even a wedged round trip resolves (success
+        // or failure) once its 5 s deadline expires, so by 16 s exactly
+        // one probe has been recorded. Fails at 8646cc84, where the first
+        // probe only fires at 40 s.
+        advance_past(
+            started,
+            Duration::from_secs(
+                DELIVERY_PROBE_STARTUP_DELAY_SECS + DELIVERY_PROBE_TIMEOUT_SECS + 1,
+            ),
+        )
+        .await;
+        assert_eq!(
+            snapshot.probe_results().0,
+            1,
+            "first probe must run at the 10 s boundary, not 10 s + one interval"
+        );
+
+        // 30 s cadence afterwards: the second probe fires at 40 s and
+        // resolves by 45 s.
+        advance_past(
+            started,
+            Duration::from_secs(
+                DELIVERY_PROBE_STARTUP_DELAY_SECS
+                    + DELIVERY_PROBE_INTERVAL_SECS
+                    + DELIVERY_PROBE_TIMEOUT_SECS
+                    + 1,
+            ),
+        )
+        .await;
+        assert_eq!(
+            snapshot.probe_results().0,
+            2,
+            "30 s cadence after the first probe"
+        );
+
+        shutdown_tx.send(true).expect("shutdown send");
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("probe task exits on shutdown")
+            .expect("probe task join");
     }
 }
