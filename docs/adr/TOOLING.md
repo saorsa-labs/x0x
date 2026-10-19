@@ -6,7 +6,9 @@ Read [the consolidation rules](consolidated/README.md) before creating a record.
 A new or changed decision is [`docs/adr/transient/T-<slug>.md`](transient/README.md)
 (D242). It names one target slot from A01 to A15. Write 300 to 600 words.
 Use about 80% ASD-STE100 style. Follow the [style guide](../documentation-style.md).
-It stays Proposed until David accepts it. David folds it into that slot only
+It stays Proposed until accepted under the [transient acceptance rule](transient/README.md):
+David, or Claude and Codex consensus for no wire-format or public-API change.
+David folds it into that slot only
 when he asks. Slot revisions are
 drafts until David accepts the transfer. Do not allocate A16 or start a
 second consolidated series. Keep reserved numbers 0090/0091 (D18), 0097
@@ -53,18 +55,18 @@ Add this project instruction to every AI coding harness profile (`AGENTS.md`, `C
 
 ```text
 Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models, or operational invariants, inspect docs/adr/.
-D242: a new or changed decision is docs/adr/transient/T-<slug>.md. Name one slot A01-A15. Write 300 to 600 words. Use about 80% ASD-STE100 style. Follow docs/documentation-style.md. Stay Proposed until David accepts it. Fold it into that slot only when David asks.
+D242: a new or changed decision is docs/adr/transient/T-<slug>.md. Name one slot A01-A15. Write 300 to 600 words. Use about 80% ASD-STE100 style. Follow docs/documentation-style.md. Stay Proposed until accepted under docs/adr/transient/README.md: David, or Claude and Codex consensus for no wire-format or public-API change. Fold it into that slot only when David asks.
 A01-A15 slot revisions are drafts until David accepts the transfer. Do not create A16 or a second consolidated series.
 Keep reserved numbers 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63); slices 0109–0114 continue to numbered acceptance. Keep their current gates.
 Use approximately 80% ASD-STE100 style in ADRs, docs and communication with David. Follow docs/documentation-style.md.
 Never edit an Accepted ADR. Create a superseding ADR instead.
-Never mark an ADR Accepted autonomously; that requires human engineering review and debate.
+Never mark an ADR Accepted without David's acceptance or the recorded Claude and Codex consensus permitted by docs/adr/transient/README.md.
 During review, check ADR correctness, rejected alternatives, evidence, consequences, and immutable-Accepted compliance.
 ```
 
 ## Review standard
 
-Do **not** "vibe code" ADRs. A useful ADR must show clear thinking: context, options, trade-offs, consequences, and validation. AI can help prepare a draft, but humans must debate and own the decision.
+Do **not** "vibe code" ADRs. A useful ADR must show clear thinking: context, options, trade-offs, consequences, and validation. AI can help prepare a draft. Acceptance requires David or the recorded consensus permitted by [the transient rules](transient/README.md).
 
 ## Transition check coverage
 
@@ -82,7 +84,10 @@ excludes a path only when that path is an approved historical source and
 `move.json` entry outside that set is rejected. Files under
 `docs/adr/transient/` do not count (D242). A new decision there is
 `T-<slug>.md`, names one target slot from A01 to A15, and stays Proposed
-until David accepts it. An Accepted transient body stays frozen. Folding
+until accepted under the [transient acceptance rule](transient/README.md).
+The validator checks lifecycle and immutability, not reviewer identity or
+the no-wire/no-API claim; review must verify the acceptance evidence.
+An Accepted transient body stays frozen. Folding
 adds `T-<slug>.folded.md` beside that file. The Accepted bytes stay the
 same. A nested
 file that reuses a mapped number counts. A legal run prints the pass line

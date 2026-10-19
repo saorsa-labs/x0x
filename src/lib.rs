@@ -173,6 +173,7 @@ pub mod dm_capability_service;
 /// [`direct::DirectMessaging`].
 pub mod dm_inbox;
 
+mod dm_evidence;
 /// Sender-side gossip DM path — envelope construction, publish + retry,
 /// and `InFlightAcks` wait.
 pub mod dm_send;
@@ -7903,15 +7904,30 @@ impl Agent {
         agent: identity::AgentId,
         cold: ColdResolution,
     ) -> Option<connectivity::ConnectOutcome> {
+        self.connect_from_evidence_inner(agent, cold, None)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn connect_from_evidence_inner(
+        &self,
+        agent: identity::AgentId,
+        cold: ColdResolution,
+        mut bound: Option<&mut dm_evidence::SendEvidence<'_>>,
+    ) -> Result<Option<connectivity::ConnectOutcome>, dm::DmError> {
         let nonblocking = cold.opted_in();
         if nonblocking {
             if !self.peer_evidence().ready_now() {
-                return None;
+                return Ok(None);
             }
             self.peer_evidence().spawn_agent_lookup(agent);
+        } else if let Some(bound) = bound.as_deref() {
+            bound.wait(0).await?;
+            bound.lookup().await?;
         } else {
             if !self.peer_evidence().wait(0).await {
-                return None;
+                return Ok(None);
             }
             self.peer_evidence().lookup(agent, None).await;
         }
@@ -7921,46 +7937,52 @@ impl Agent {
                 .try_usable_agent(agent, now)
                 .ok()
                 .flatten()
+        } else if let Some(bound) = bound.as_deref() {
+            bound.usable_agent().await?
         } else {
             self.peer_evidence().usable_agent(agent, now)
-        }?;
+        };
+        let Some(view) = view else {
+            return Ok(None);
+        };
         let machine = view.announcement.machine_id;
-        if self
-            .recipient_pairing_denied(&agent, &machine)
-            .await
-            .is_some()
-        {
-            return None;
+        let denial = self.recipient_pairing_denied(&agent, &machine);
+        let denial = match bound.as_deref() {
+            Some(bound) => match bound.bounded("evidence pairing policy", denial).await? {
+                Some(denial) => denial,
+                None => return Ok(None),
+            },
+            None => denial.await,
+        };
+        if denial.is_some() {
+            return Ok(None);
         }
-        let network = self.network.as_ref()?;
-        let peer = ant_quic::PeerId(machine.0);
-        if network.is_connected(&peer).await {
-            return Some(connectivity::ConnectOutcome::AlreadyConnected);
+        let dial = self.dial_evidence_view(&view);
+        let result = match bound.as_deref_mut() {
+            Some(bound) => bound.transport(dial).await,
+            None => dial.await,
+        };
+        if matches!(
+            result,
+            None | Some(connectivity::ConnectOutcome::AlreadyConnected)
+        ) {
+            return Ok(result);
         }
-        let addrs = filter_discovery_announcement_addrs(
-            view.announcement.addresses.clone(),
-            allow_local_discovery_addresses(network.config()),
-        );
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            network.connect_peer_with_addrs(peer, addrs),
-        )
-        .await;
         let now = dm_capability::now_unix_ms();
-        if nonblocking {
+        let still_usable = if nonblocking {
             self.peer_evidence()
                 .try_usable(agent, machine, now)
                 .ok()
-                .flatten()?;
+                .flatten()
+        } else if let Some(bound) = bound.as_deref() {
+            bound.usable(machine).await?
         } else {
-            self.peer_evidence().usable(agent, machine, now)?;
+            self.peer_evidence().usable(agent, machine, now)
+        };
+        if still_usable.is_none() {
+            return Ok(None);
         }
-        Some(match result {
-            Ok(Ok((addr, connected))) if connected == peer => {
-                connectivity::ConnectOutcome::Direct(addr)
-            }
-            _ => connectivity::ConnectOutcome::Unreachable,
-        })
+        Ok(result)
     }
 
     /// ADR 0115 §2: a dial result becomes routing state only
@@ -9127,6 +9149,8 @@ impl Agent {
         // 1. Signal every token-aware loop to break. Inert until now, so this
         //    is the first thing that changes steady-state behavior.
         self.shutdown_token.cancel();
+        // Retain and join evidence workers even if this shutdown is cancelled.
+        self.peer_evidence().shutdown_workers().await;
         self.capability_refreshes.shutdown_workers().await;
 
         // 2. Stop the simple Option<JoinHandle> background tasks.
@@ -9682,6 +9706,12 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        let mut evidence = dm_evidence::SendEvidence::new(
+            self,
+            *to,
+            config.timeout_per_attempt,
+            config.require_durable_app_ack,
+        );
         // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
         // funnel — every gossip/relay/raw-QUIC envelope below signs with
         // the raw agent key, so the gate must refuse HERE, before any
@@ -9704,12 +9734,9 @@ impl Agent {
         if let Some(machine_id) = {
             // #1239: this preflight read precedes the transport timeouts.
             // A held writer must not keep an ordinary or waiting send open.
-            let cache = tokio::time::timeout(
-                config.timeout_per_attempt,
-                self.identity_discovery_cache.read(),
-            )
-            .await
-            .map_err(|_| Self::pinned_bound_expired("discovery"))?;
+            let cache = evidence
+                .discovery(self.identity_discovery_cache.read())
+                .await?;
             cache.get(to).map(|entry| entry.machine_id)
         } {
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
@@ -9755,23 +9782,13 @@ impl Agent {
         let send_started = std::time::Instant::now();
         let mut stages = dm::DurableSendStages::default();
         let mut advert_binding = self.capability_store.lookup_binding(to);
-        let evidence_ready = if advert_binding.is_none() {
-            self.peer_evidence().wait(payload.len()).await
-        } else {
-            true
-        };
-        if advert_binding.is_none() && !evidence_ready {
-            return Err(dm::DmError::RecipientUndiscovered(
-                "peer evidence startup barrier unavailable".into(),
-            ));
-        }
         if advert_binding.is_none() {
-            self.peer_evidence().lookup(*to, None).await;
+            evidence.wait(payload.len()).await?;
+            evidence.lookup().await?;
             advert_binding = self.capability_store.lookup_binding(to);
         }
         let stored_cap = if advert_binding.is_none() {
-            self.peer_evidence()
-                .usable_agent(*to, dm_capability::now_unix_ms())
+            evidence.usable_agent().await?
         } else {
             None
         };
@@ -9811,58 +9828,19 @@ impl Agent {
         let advert_gossip_ready = advert_cap
             .as_ref()
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
-        let (cap, cap_machine, cap_source) = if advert_gossip_ready {
+        let (mut cap, mut cap_machine, cap_source) = if advert_gossip_ready {
             (advert_cap, advert_machine, "advert_cache")
         } else if advert_cap.is_none() && stored_cap.is_some() {
             // Re-check after the refresh await; never retain authority across it.
-            match self
-                .peer_evidence()
-                .usable_agent(*to, dm_capability::now_unix_ms())
-            {
-                Some(view) => (
-                    Some(view.advert.capabilities.clone()),
-                    Some(view.announcement.machine_id),
-                    "peer_evidence",
-                ),
-                None => {
-                    return Err(dm::DmError::RecipientUndiscovered(
-                        "peer evidence no longer usable".into(),
-                    ))
-                }
-            }
-        } else if config.require_durable_app_ack {
-            // Strict semantics need a signed, machine-bound capability from
-            // the TTL-bounded runtime cache. The unbound contact-card fallback
-            // below cannot pin the ACK waiter to a machine, so it is never
-            // sufficient here.
-            (
-                advert_cap,
-                advert_machine,
-                "advert_cache_unusable_for_durable_ack",
-            )
+            evidence
+                .current_capability(evidence.usable_agent().await?)
+                .await?
         } else {
-            let contact_cap = {
-                let contacts = self.contact_store.read().await;
-                contacts.get(to).and_then(|contact| {
-                    contact
-                        .dm_capabilities
-                        .as_ref()
-                        .filter(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty())
-                        .cloned()
-                })
-            };
-            match contact_cap {
-                Some(cap) if advert_cap.is_some() => {
-                    (Some(cap), None, "contact_card_after_unusable_advert")
-                }
-                Some(cap) => (Some(cap), None, "contact_card"),
-                None if advert_cap.is_some() => {
-                    (advert_cap, advert_machine, "advert_cache_unusable")
-                }
-                None => (None, None, "none"),
-            }
+            evidence
+                .fallback_capability(advert_cap, advert_machine)
+                .await
         };
-        let gossip_ok = cap
+        let mut gossip_ok = cap
             .as_ref()
             .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
             .unwrap_or(false);
@@ -9956,23 +9934,6 @@ impl Agent {
             stages.strict_gate_ms = dm::millis_since(send_started);
         }
 
-        // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
-        // key clone when the engine is enabled AND we have a key to seal
-        // a fresh envelope with. With the default disabled policy this
-        // closure never runs - the happy path pays nothing.
-        //
-        // A strict send never seeds the relay: a relayed envelope is resealed
-        // by a third party and cannot carry the machine-bound v2 receipt the
-        // caller demanded.
-        let relay_seed: Option<(Vec<u8>, Vec<u8>)> =
-            if self.peer_relay.policy().enabled && !config.require_durable_app_ack {
-                cap.as_ref()
-                    .filter(|c| !c.kem_public_key.is_empty())
-                    .map(|c| (payload.clone(), c.kem_public_key.clone()))
-            } else {
-                None
-            };
-
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
         let mut config = config;
         // Direct transport RTT is a valid hint for raw-QUIC work, but it is
@@ -9997,29 +9958,41 @@ impl Agent {
         // corrupt). Fail with a retryable, distinctly-named error here rather
         // than letting envelope construction surface it downstream as an
         // opaque 400-class `EnvelopeConstruction`.
-        if gossip_ok {
-            if let Some(caps) = &cap {
-                if let Err(reason) = dm::validate_recipient_kem_key(&caps.kem_public_key) {
-                    self.direct_messaging.record_outgoing_failed(*to);
-                    return Err(dm::DmError::RecipientKeyInvalid(reason));
-                }
-            }
-        }
+        evidence.validate_capability(cap.as_ref())?;
 
         if cap_source == "peer_evidence" {
             let _ = self
-                .connect_from_evidence_with(*to, ColdResolution::Off)
-                .await;
-            let still_usable = cap_machine.and_then(|m| {
-                self.peer_evidence()
-                    .usable(*to, m, dm_capability::now_unix_ms())
-            });
+                .connect_from_evidence_inner(*to, ColdResolution::Off, Some(&mut evidence))
+                .await?;
+            let still_usable = match cap_machine {
+                Some(machine) => evidence.usable(machine).await?,
+                None => None,
+            };
             if still_usable.is_none() {
-                return Err(dm::DmError::RecipientUndiscovered(
-                    "peer evidence no longer usable".into(),
-                ));
+                (cap, cap_machine, _) = evidence.current_capability(still_usable).await?;
+                evidence.validate_capability(cap.as_ref())?;
+                gossip_ok = cap
+                    .as_ref()
+                    .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
             }
         }
+
+        // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
+        // key clone when the engine is enabled AND we have a key to seal
+        // a fresh envelope with. With the default disabled policy this
+        // closure never runs - the happy path pays nothing.
+        //
+        // A strict send never seeds the relay: a relayed envelope is resealed
+        // by a third party and cannot carry the machine-bound v2 receipt the
+        // caller demanded.
+        let relay_seed: Option<(Vec<u8>, Vec<u8>)> =
+            if self.peer_relay.policy().enabled && !config.require_durable_app_ack {
+                cap.as_ref()
+                    .filter(|c| !c.kem_public_key.is_empty())
+                    .map(|c| (payload.clone(), c.kem_public_key.clone()))
+            } else {
+                None
+            };
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);

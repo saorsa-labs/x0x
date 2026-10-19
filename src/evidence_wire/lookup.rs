@@ -66,29 +66,66 @@ impl From<EvidenceRecordV1> for Found {
     }
 }
 
+// A selected target is provisional until exchange dispatch starts. A cancelled
+// or deadline-rejected attempt releases only its own entry, even if another
+// attempt has replaced it after the cooldown elapsed.
+struct TargetClaim<'a> {
+    limits: &'a Limits,
+    target: AgentId,
+    at: Instant,
+    retained: bool,
+}
+
+impl TargetClaim<'_> {
+    fn retain(mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for TargetClaim<'_> {
+    fn drop(&mut self) {
+        if self.retained {
+            return;
+        }
+        let Ok(mut state) = self.limits.state.lock() else {
+            return;
+        };
+        if state.targets.get(&self.target) == Some(&self.at) {
+            state.targets.remove(&self.target);
+        }
+    }
+}
+
 impl Limits {
     pub(crate) fn try_lookup_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         Arc::clone(&self.lookups).try_acquire_owned().ok()
     }
 
-    fn claim_target(&self, target: AgentId) -> bool {
+    fn claim_target(&self, target: AgentId) -> Option<TargetClaim<'_>> {
+        let mut state = self.state.lock().ok()?;
+        // Sample under the lock: contention must not backdate a new cooldown.
+        // A replacement for this target is at least LOOKUP_INTERVAL newer, so
+        // the timestamp also identifies which attempt owns the entry.
         let now = Instant::now();
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
         state
             .targets
             .retain(|_, at| now.duration_since(*at) < LOOKUP_INTERVAL);
         if state.targets.contains_key(&target) || state.targets.len() >= MACHINE_CAP {
-            return false;
+            return None;
         }
         state.targets.insert(target, now);
-        true
+        Some(TargetClaim {
+            limits: self,
+            target,
+            at: now,
+            retained: false,
+        })
     }
     #[cfg(test)]
     fn begin_lookup(&self, target: AgentId) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let permit = Arc::clone(&self.lookups).try_acquire_owned().ok()?;
-        self.claim_target(target).then_some(permit)
+        self.claim_target(target)?.retain();
+        Some(permit)
     }
 }
 
@@ -371,8 +408,10 @@ impl Context {
         self: Arc<Self>,
         target: AgentId,
         permit: tokio::sync::OwnedSemaphorePermit,
+        send_deadline: Option<Instant>,
     ) {
         let deadline = Instant::now() + DEADLINE;
+        let deadline = send_deadline.map_or(deadline, |send| send.min(deadline));
         let _ = tokio::time::timeout_at(deadline, async {
             let Some(relations) = self.relations() else {
                 return;
@@ -397,24 +436,15 @@ impl Context {
                     ) != Some(false)
                 })
                 .collect();
-            // A pre-seat send or a disconnected peer must not consume the
-            // target cooldown: no Lookup has been sent yet (D30 30b).
-            if responders.is_empty() || !self.runtime.wire_limits.claim_target(target) {
-                return;
-            }
-            // No task queue: at most three exchanges, each also needing the
-            // shared machine stream and aggregate allocation reservations.
-            let mut requests = futures::stream::FuturesUnordered::new();
             let permit = Arc::new(permit);
-            for machine in responders {
-                requests.push(self.pull(machine, target, deadline, Arc::clone(&permit)));
-            }
-            use futures::StreamExt;
-            while let Some(result) = requests.next().await {
-                if result.is_ok() {
-                    break;
-                }
-            }
+            lookup_selected(
+                &self.runtime.wire_limits,
+                target,
+                responders,
+                deadline,
+                |machine| self.pull(machine, target, deadline, Arc::clone(&permit)),
+            )
+            .await;
         })
         .await;
     }
@@ -480,6 +510,43 @@ impl Context {
     }
 }
 
+// Keep final admission and exchange dispatch together. Tests use an in-memory
+// exchange at this boundary; production uses Context::pull above.
+async fn lookup_selected<F: std::future::Future<Output = io::Result<()>>>(
+    limits: &Limits,
+    target: AgentId,
+    responders: Vec<MachineId>,
+    deadline: Instant,
+    mut pull: impl FnMut(MachineId) -> F,
+) {
+    // A pre-seat send or a disconnected peer must not consume the
+    // target cooldown: no Lookup has been sent yet (D30 30b).
+    if responders.is_empty() {
+        return;
+    }
+    let Some(claim) = limits.claim_target(target) else {
+        return;
+    };
+    // Responder selection and policy/cooldown reads may block. A send
+    // worker released after its deadline must not start an exchange.
+    if Instant::now() >= deadline {
+        return;
+    }
+    // No task queue: at most three exchanges, each also needing the
+    // shared machine stream and aggregate allocation reservations.
+    let mut requests = futures::stream::FuturesUnordered::new();
+    for machine in responders {
+        requests.push(pull(machine));
+    }
+    claim.retain();
+    use futures::StreamExt;
+    while let Some(result) = requests.next().await {
+        if result.is_ok() {
+            break;
+        }
+    }
+}
+
 fn ingest_found(
     store: &crate::peer_evidence::PeerEvidenceStore,
     limits: &Limits,
@@ -523,6 +590,211 @@ fn reply_material(
     }
     // The persisted map is intentionally not consulted, even within L.
     Ok(store.and_then(|s| s.live(target, now)).map(Found::from))
+}
+
+#[cfg(test)]
+mod cooldown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Exercise the production selection/dispatch boundary without a socket,
+    // NetworkNode or daemon. A started exchange writes the target to a duplex.
+    #[derive(Clone)]
+    struct Exchange {
+        send: Arc<tokio::sync::Mutex<tokio::io::DuplexStream>>,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl Exchange {
+        fn new() -> (Self, tokio::io::DuplexStream) {
+            let (send, recv) = tokio::io::duplex(256);
+            (
+                Self {
+                    send: Arc::new(tokio::sync::Mutex::new(send)),
+                    started: Arc::default(),
+                },
+                recv,
+            )
+        }
+
+        async fn attempt(
+            &self,
+            limits: &Limits,
+            target: AgentId,
+            responders: Vec<MachineId>,
+            deadline: Instant,
+        ) {
+            lookup_selected(limits, target, responders, deadline, |_| async {
+                self.send.lock().await.write_all(&target.0).await?;
+                self.started.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        }
+
+        async fn assert_sent(&self, recv: &mut tokio::io::DuplexStream, target: AgentId) {
+            assert_eq!(self.started.load(Ordering::SeqCst), 1);
+            let mut bytes = [0; 32];
+            recv.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(bytes, target.0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_selection_allows_immediate_retry() {
+        let limits = Arc::new(Limits::default());
+        let target = AgentId([1; 32]);
+        let machine = MachineId([2; 32]);
+        let (exchange, mut recv) = Exchange::new();
+        let deadline = Instant::now() + DEADLINE;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_limits = Arc::clone(&limits);
+        let worker_exchange = exchange.clone();
+        let handle = tokio::runtime::Handle::current();
+        let worker = tokio::task::spawn_blocking(move || {
+            handle.block_on(async {
+                let _ = tokio::time::timeout_at(deadline, async {
+                    // Like synchronous responder/policy selection, this poll
+                    // cannot be preempted by the surrounding timeout.
+                    assert!(Instant::now() < deadline);
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let responders = select(target, [(target, machine)]);
+                    assert!(Instant::now() >= deadline);
+                    worker_exchange
+                        .attempt(&worker_limits, target, responders, deadline)
+                        .await;
+                })
+                .await;
+            });
+        });
+        entered_rx.await.unwrap();
+        tokio::time::advance(DEADLINE).await;
+        release_tx.send(()).unwrap();
+        worker.await.unwrap();
+        assert_eq!(exchange.started.load(Ordering::SeqCst), 0);
+
+        exchange
+            .attempt(&limits, target, vec![machine], Instant::now() + DEADLINE)
+            .await;
+        exchange.assert_sent(&mut recv, target).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_claim_crossing_deadline_allows_immediate_retry() {
+        let limits = Arc::new(Limits::default());
+        let target = AgentId([1; 32]);
+        let machine = MachineId([2; 32]);
+        let (exchange, mut recv) = Exchange::new();
+        let deadline = Instant::now() + DEADLINE;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let worker_limits = Arc::clone(&limits);
+        let worker_exchange = exchange.clone();
+        let handle = tokio::runtime::Handle::current();
+        // The state lock cannot become available until after the deadline.
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_limits = Arc::clone(&limits);
+        let holder = tokio::task::spawn_blocking(move || {
+            let held = holder_limits.state.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(held);
+        });
+        locked_rx.await.unwrap();
+        let worker = tokio::task::spawn_blocking(move || {
+            handle.block_on(async {
+                assert!(Instant::now() < deadline);
+                assert!(worker_limits.state.try_lock().is_err());
+                entered_tx.send(()).unwrap();
+                worker_exchange
+                    .attempt(&worker_limits, target, vec![machine], deadline)
+                    .await;
+            });
+        });
+        entered_rx.await.unwrap();
+        tokio::time::advance(DEADLINE).await;
+        release_tx.send(()).unwrap();
+        holder.await.unwrap();
+        worker.await.unwrap();
+        assert_eq!(exchange.started.load(Ordering::SeqCst), 0);
+        exchange
+            .attempt(&limits, target, vec![machine], Instant::now() + DEADLINE)
+            .await;
+        exchange.assert_sent(&mut recv, target).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn valid_selection_retains_cooldown() {
+        let limits = Limits::default();
+        let target = AgentId([1; 32]);
+        let machine = MachineId([2; 32]);
+        let (exchange, mut recv) = Exchange::new();
+        let deadline = Instant::now() + DEADLINE;
+        exchange
+            .attempt(&limits, target, vec![machine], deadline)
+            .await;
+        exchange.assert_sent(&mut recv, target).await;
+        exchange
+            .attempt(&limits, target, vec![machine], deadline)
+            .await;
+        assert_eq!(exchange.started.load(Ordering::SeqCst), 1);
+        assert!(limits.state.lock().unwrap().targets.contains_key(&target));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_selection_does_not_spend_cooldown() {
+        let limits = Limits::default();
+        let target = AgentId([1; 32]);
+        let (exchange, mut recv) = Exchange::new();
+        let deadline = Instant::now() + DEADLINE;
+        exchange.attempt(&limits, target, vec![], deadline).await;
+        assert_eq!(exchange.started.load(Ordering::SeqCst), 0);
+        assert!(limits.state.lock().unwrap().targets.is_empty());
+        exchange
+            .attempt(&limits, target, vec![MachineId([2; 32])], deadline)
+            .await;
+        exchange.assert_sent(&mut recv, target).await;
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn rollback_releases_only_its_target_and_blocks_same_target_while_pending() {
+        let limits = Limits::default();
+        let target = AgentId([1; 32]);
+        let other = AgentId([2; 32]);
+        let pending = limits.claim_target(target).unwrap();
+        assert!(limits.claim_target(target).is_none());
+        limits.claim_target(other).unwrap().retain();
+        drop(pending);
+        assert!(!limits.state.lock().unwrap().targets.contains_key(&target));
+        assert!(limits.claim_target(other).is_none());
+        limits.claim_target(target).unwrap().retain();
+        assert_eq!(limits.state.lock().unwrap().targets.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rollback_preserves_a_newer_claim_on_the_same_target() {
+        let limits = Limits::default();
+        let target = AgentId([1; 32]);
+        let pending = limits.claim_target(target).unwrap();
+        tokio::time::advance(LOOKUP_INTERVAL).await;
+        let replacement = limits.claim_target(target).unwrap();
+        assert!(replacement.at > pending.at);
+        let replacement_at = replacement.at;
+        replacement.retain();
+        drop(pending);
+        assert_eq!(
+            limits.state.lock().unwrap().targets.get(&target),
+            Some(&replacement_at)
+        );
+        assert!(limits.claim_target(target).is_none());
+    }
 }
 
 #[cfg(test)]

@@ -41,7 +41,7 @@ Every clear calls `reset_fork_evidence_after_quarantine_clear`. The evidence gat
 
 ## Consequences
 
-The operator can serve the group on this node after the clear. The other sealed epoch remains. A later conflicting commit quarantines this node again. This record stays Proposed until David accepts it. The accepted A09 bytes stay unchanged.
+The operator can serve the group on this node after the clear. The other sealed epoch remains. A later conflicting commit quarantines this node again. This record stays Proposed until accepted under the [transient acceptance rule](README.md). The accepted A09 bytes stay unchanged.
 
 ## Validation
 

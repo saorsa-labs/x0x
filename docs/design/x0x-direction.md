@@ -4,8 +4,9 @@
   David Irvine made from 2026-09-28 to 2026-10-05 (decisions D01–D200 and the
   efficiency decisions E-D1–E-D17).
 - **Updated:** 2026-10-05.
-- **Relationship to ADRs:** ADRs remain the decision records, and only David
-  marks an ADR Accepted. Where a ruling here changes what an Accepted ADR
+- **Relationship to ADRs:** ADRs remain the decision records. Acceptance needs
+  David, with the [19 Oct 2026 transient consensus exception](../adr/transient/README.md).
+  Where a ruling here changes what an Accepted ADR
   means in practice, the status overlay at the top of the
   [ADR README](../adr/README.md) says so. New work follows the ruling until the named successor ADR is
   decided.
@@ -428,8 +429,9 @@ deliberately bad canary is rolled back and recalled automatically.
   written after the fact to record shipped behaviour uses the status
   `Accepted (record)`.
 - **Accepted ADRs are immutable.** A change is a new ADR that amends or
-  supersedes, or a README erratum for a factual correction. Only David marks
-  an ADR Accepted. Implementation holds are decisions, not status changes
+  supersedes, or a README erratum for a factual correction. Acceptance needs
+  David, with the [transient consensus exception](../adr/transient/README.md).
+  Implementation holds are decisions, not status changes
   (D28).
 - **Cross-model review.** A change is reviewed by a model family other than
   its author's. A should-land fix that is not green within two
