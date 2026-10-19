@@ -372,7 +372,39 @@ impl EvidenceRuntime {
         machine: Option<MachineId>,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
-        let read = async {
+        self.read_before(deadline, move |runtime| {
+            let now = crate::dm_capability::now_unix_ms();
+            match machine {
+                Some(machine) => runtime.usable(agent, machine, now),
+                None => runtime.usable_agent(agent, now),
+            }
+        })
+        .await
+    }
+
+    /// The ordinary authority check uses the same bounded readers as send
+    /// evidence, without changing the store's evidence-use counters.
+    pub(crate) async fn confirms_pairing_before(
+        self: &Arc<Self>,
+        agent: AgentId,
+        machine: MachineId,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<bool, ()> {
+        self.read_before(deadline, move |runtime| {
+            runtime.confirms_pairing(agent, machine, crate::dm_capability::now_unix_ms())
+        })
+        .await
+    }
+
+    /// Admission, the synchronous read and its result share one deadline.
+    /// Both read kinds retain the existing 16-reader cap, cancellation guard
+    /// and shutdown custody, including when a running read cannot stop yet.
+    async fn read_before<T: Send + 'static>(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        read: impl FnOnce(&Self) -> T + Send + 'static,
+    ) -> std::result::Result<T, ()> {
+        let work = async {
             let permit = Arc::clone(&self.reads)
                 .acquire_owned()
                 .await
@@ -381,22 +413,18 @@ impl EvidenceRuntime {
             let (result, abort) = self.spawn_blocking_worker(move || {
                 let _permit = permit;
                 if tokio::time::Instant::now() >= deadline {
-                    return None;
+                    return Err(());
                 }
-                let now = crate::dm_capability::now_unix_ms();
-                match machine {
-                    Some(machine) => runtime.usable(agent, machine, now),
-                    None => runtime.usable_agent(agent, now),
-                }
+                Ok(read(&runtime))
             })?;
             let _abort = AbortWorkerOnDrop(abort);
-            let view = result.await.map_err(|_| ())?;
+            let value = result.await.map_err(|_| ())??;
             if tokio::time::Instant::now() >= deadline {
                 return Err(());
             }
-            Ok(view)
+            Ok(value)
         };
-        tokio::time::timeout_at(deadline, read)
+        tokio::time::timeout_at(deadline, work)
             .await
             .map_err(|_| ())?
     }
