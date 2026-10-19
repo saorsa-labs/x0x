@@ -269,13 +269,15 @@ impl CounterWindow {
 
     /// Sum of deltas recorded within the last [`WINDOW_SECS`]. Reading
     /// filters by age as well, so the answer stays true to the window even
-    /// between pushes.
+    /// between pushes — pruning only runs on push, so the front may have
+    /// gone stale since; those entries are skipped, not stopped at (a
+    /// `take_while` here would discard every newer delta too).
     fn window_sum(&self) -> u64 {
         match recent_cutoff() {
             Some(cutoff) => self
                 .entries
                 .iter()
-                .take_while(|(at, _)| *at > cutoff)
+                .filter(|(at, _)| *at > cutoff)
                 .map(|(_, delta)| *delta)
                 .sum(),
             // The runtime clock is younger than the window: nothing
@@ -1390,6 +1392,58 @@ mod tests {
             assert_eq!(window.push_total(50), 0);
         }
         assert_eq!(window.window_sum(), 0, "a 61 s-old burst must age out");
+    }
+
+    /// RC2 #1380 (P2): a read between pushes must skip the stale prefix,
+    /// not stop at it. `window_sum` took a prefix oldest-first, so once
+    /// the front entry expired it returned 0 and discarded every newer
+    /// delta — a fresh 50-error burst read 61 s after a +1 at t=0 still
+    /// reported `ok`. Fails at ec57af67, where the sum read 0.
+    #[tokio::test(start_paused = true)]
+    async fn window_sum_skips_a_stale_front_and_keeps_the_fresh_tail() {
+        let mut window = CounterWindow::default();
+        // Baseline, then the +1 that ages out first.
+        window.push_total(0);
+        assert_eq!(window.push_total(1), 1);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        // The fresh burst.
+        assert_eq!(window.push_total(51), 50);
+        // No push prunes the +1 before this read; the 31 s-old burst must
+        // still count.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let sum = window.window_sum();
+        assert_eq!(sum, 50, "a stale front entry must not hide the fresh tail");
+        let mut fresh = sample();
+        fresh.log_errors_window = sum;
+        let verdict = classify(&fresh);
+        assert_eq!(verdict.verdict, "degraded");
+        assert!(verdict
+            .reasons
+            .iter()
+            .any(|r| r.contains("error-level log events")));
+    }
+
+    /// RC2 #1380 (P2): the boundary can also cross between a pruning push
+    /// and the next read (a refresher descheduled across it). After a
+    /// quiet push retires the +1 at t=0, the +50 at t=30 goes stale at
+    /// t=91 while the +10 at t=35 is still fresh. Fails at ec57af67,
+    /// where the read returned 0 instead of 10.
+    #[tokio::test(start_paused = true)]
+    async fn window_sum_survives_a_boundary_crossed_after_a_pruning_push() {
+        let mut window = CounterWindow::default();
+        window.push_total(0); // baseline
+        window.push_total(1); // +1 at t=0
+        tokio::time::advance(Duration::from_secs(30)).await;
+        window.push_total(51); // +50 at t=30
+        tokio::time::advance(Duration::from_secs(5)).await;
+        window.push_total(61); // +10 at t=35
+        tokio::time::advance(Duration::from_secs(26)).await; // t=61
+        window.push_total(61); // quiet push prunes only the +1 at t=0
+        assert_eq!(window.window_sum(), 60, "control: 50 + 10 still fresh");
+        // Descheduled across the next boundary: the read must skip the
+        // now-stale +50 and keep the +10.
+        tokio::time::advance(Duration::from_secs(30)).await; // t=91
+        assert_eq!(window.window_sum(), 10);
     }
 
     /// RC1 #1380 (P1): the attempt and failure windows must measure the
