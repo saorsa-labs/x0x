@@ -20049,9 +20049,11 @@ fn is_inert_card_import_stub_shape(info: &x0x::groups::GroupInfo, joiner_hex: &s
 ///
 /// Card `owner_agent_id` / genesis `creator_agent_id` are unauthenticated
 /// import text (#1471): a forged owner with the real group id must not keep
-/// an inert stub in front of a verified invite. The invite's signed creator
-/// is checked elsewhere before this gate; seated or keyed rows never classify
-/// as [`NotMemberJoinRow::InertCardImportStub`].
+/// an inert stub in front of a verified invite. Match is stable-group-id only;
+/// do not compare card owner or genesis creator here. The invite's signed
+/// creator is checked elsewhere before this gate. #1161 inert-shape, same-
+/// stable alias, and TreeKEM/MLS keyed-material gates still refuse; seated or
+/// keyed rows never classify as [`NotMemberJoinRow::InertCardImportStub`].
 fn inert_stub_matches_verified_invite(
     info: &x0x::groups::GroupInfo,
     invite_stable_group_id: &str,
