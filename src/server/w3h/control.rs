@@ -17,7 +17,7 @@
 #![cfg(test)]
 
 use super::*;
-use anyhow::ensure;
+use anyhow::{bail, ensure};
 use base64::Engine as _;
 use serde_json::json;
 
@@ -215,6 +215,124 @@ async fn w3h_clock_gate_holds_virtual_time_outside_barriers() -> Result<()> {
     gate.open().await;
     sleeper.await?;
     ensure!(tokio::time::Instant::now() >= start + Duration::from_secs(10));
+    Ok(())
+}
+
+/// #1245: pull-based wall offset tracks a virtual-time jump immediately,
+/// without waiting for a 1 ms ticker task to be polled first.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
+    let origin = tokio::time::Instant::now();
+    super::install_virt_clock_for_test(origin);
+    // SAFETY: same callback the shim invokes on every clock_gettime.
+    let before = unsafe { super::virt_offset_ns() };
+    ensure!(
+        before < 1_000_000,
+        "offset at origin should be ~0 ns, got {before}"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let after_runtime = unsafe { super::virt_offset_ns() };
+    // Plain OS thread: must enter the owning runtime Handle, not read real time.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // SAFETY: same C ABI callback the shim calls from any thread.
+        let _ = tx.send(unsafe { super::virt_offset_ns() });
+    });
+    let after_os = rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("OS-thread callback did not return"))?;
+    super::clear_virt_clock_for_test();
+    let expected = Duration::from_secs(5).as_nanos() as u64;
+    for (label, after) in [("runtime", after_runtime), ("os-thread", after_os)] {
+        ensure!(
+            after >= expected.saturating_sub(1_000) && after <= expected.saturating_add(1_000),
+            "pull offset after 5s jump on {label} should be ~{expected} ns, got {after}"
+        );
+    }
+    Ok(())
+}
+
+/// #1245: with the W3-H shim preloaded, `SystemTime::now()` must follow
+/// the pull callback after a virtual jump (no separate wall-offset push).
+///
+/// Declared `#[ignore]`: it needs `LD_PRELOAD=libw3h_shim.so` and cannot
+/// honestly pass without it (ADR 0025 §3–4). The W3-H harness job runs it
+/// via `nextest --profile w3h-gate --run-ignored all`. A missing shim under
+/// that job is a hard failure, never a silent `Ok`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[ignore = "requires W3-H LD_PRELOAD shim (nextest profile w3h / w3h-gate --run-ignored all)"]
+async fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
+    let shim = super::Shim::detect().map_err(|reason| {
+        anyhow::anyhow!("W3-H shim required for wall-clock interposition: {reason}")
+    })?;
+    let origin = tokio::time::Instant::now();
+    // Install the pull callback before the baseline so both reads go through the
+    // virtual clock (real wall time would make wall_after look like it went
+    // backwards after a jump to the 2026-01-01 epoch).
+    shim.install_virt_time(origin);
+    // Always clear the pull callback, including on early `?` / panic.
+    struct ClearVirt(super::Shim);
+    impl Drop for ClearVirt {
+        fn drop(&mut self) {
+            self.0.clear_virt_time();
+        }
+    }
+    let _clear = ClearVirt(shim);
+    let wall_before = std::time::SystemTime::now();
+    tokio::time::advance(Duration::from_secs(600)).await;
+    let wall_after = std::time::SystemTime::now();
+    let elapsed = wall_after
+        .duration_since(wall_before)
+        .map_err(|e| anyhow::anyhow!("SystemTime went backwards: {e}"))?;
+    ensure!(
+        elapsed >= Duration::from_secs(599) && elapsed <= Duration::from_secs(601),
+        "SystemTime::now() after 600s virtual jump should advance ~600s, got {elapsed:?} \
+         (registration/interposition failure would leave real wall time)"
+    );
+    Ok(())
+}
+
+/// Restores `W3H_SHIM_ACTIVE` on drop so an early `?` / panic cannot leak
+/// the env into another test in the same process.
+struct W3hShimEnvGuard;
+impl W3hShimEnvGuard {
+    fn arm() -> Self {
+        // SAFETY: test-only env mutation; Drop restores.
+        std::env::set_var("W3H_SHIM_ACTIVE", "1");
+        Self
+    }
+}
+impl Drop for W3hShimEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: paired with [`W3hShimEnvGuard::arm`].
+        std::env::remove_var("W3H_SHIM_ACTIVE");
+    }
+}
+
+/// #1245: with the W3-H shim env set, history `run_blocking` runs inline so
+/// a completion cannot reorder other ready tasks via the blocking pool.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn w3h_run_blocking_is_inline_when_shim_env_set() -> Result<()> {
+    let runtime_tid = std::thread::current().id();
+    let _shim_env = W3hShimEnvGuard::arm();
+    let blocking_tid = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&blocking_tid);
+    let value = crate::history::run_blocking(move || {
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current().id());
+        7u32
+    })
+    .await?;
+    ensure!(value == 7);
+    let got = blocking_tid
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ok_or_else(|| anyhow::anyhow!("run_blocking body did not run"))?;
+    ensure!(
+        got == runtime_tid,
+        "inline blocking must run on the runtime thread"
+    );
     Ok(())
 }
 

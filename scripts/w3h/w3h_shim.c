@@ -23,10 +23,13 @@
  *     and std (HashMap RandomState, which also seeds tokio's select! RNG)
  *     via getrandom().
  *
- *  2. Wall clock. Once the harness calls w3h_shim_set_wall_offset_ns(),
- *     clock_gettime(CLOCK_REALTIME*) returns 2026-01-01T00:00:00Z plus the
- *     harness's virtual time. CLOCK_MONOTONIC is NOT changed: kernel waits
- *     with absolute monotonic deadlines (futex, condvars) keep real time.
+ *  2. Wall clock. clock_gettime(CLOCK_REALTIME*) returns 2026-01-01T00:00:00Z
+ *     plus the harness's virtual time. Prefer w3h_shim_set_virt_time_ns_fn():
+ *     each clock_gettime pulls the current virtual offset, so a time jump is
+ *     visible to every task without a 1 ms ticker race (#1245).
+ *     w3h_shim_set_wall_offset_ns() remains as a push fallback when no pull
+ *     fn is registered. CLOCK_MONOTONIC is NOT changed: kernel waits with
+ *     absolute monotonic deadlines (futex, condvars) keep real time.
  *
  * syscall() is interposed by an assembly trampoline that never reads
  * variadic arguments in C: SYS_getrandom is redirected with its three
@@ -366,9 +369,13 @@ int getentropy(void *buffer, size_t length) {
 static const uint64_t WALL_BASE_SECS = 1767225600ULL;
 static atomic_int wall_active;
 static atomic_uint_fast64_t wall_offset_ns;
+/* Optional pull source: when set, clock_gettime reads virtual now from it
+ * instead of the last pushed wall_offset_ns (#1245 stale-ticker fix). */
+typedef uint64_t (*w3h_virt_ns_fn)(void);
+static atomic_uintptr_t virt_ns_fn;
 
 /* Exported for the harness (found with dlsym(RTLD_DEFAULT, ...)). */
-unsigned int w3h_shim_version(void) { return 2; }
+unsigned int w3h_shim_version(void) { return 3; }
 
 int w3h_shim_active(void) { return atomic_load(&shim_active); }
 
@@ -412,12 +419,25 @@ void w3h_shim_set_wall_offset_ns(uint64_t offset_ns) {
     atomic_store(&wall_active, 1);
 }
 
+/* Register a pull source for CLOCK_REALTIME. Pass NULL to clear. Each
+ * clock_gettime then calls fn() for the current virtual offset in ns. */
+void w3h_shim_set_virt_time_ns_fn(w3h_virt_ns_fn fn) {
+    if (!atomic_load(&shim_active)) {
+        return;
+    }
+    atomic_store(&virt_ns_fn, (uintptr_t)fn);
+    if (fn != NULL) {
+        atomic_store(&wall_active, 1);
+    }
+}
+
 int clock_gettime(clockid_t clockid, struct timespec *tp) {
     if (atomic_load(&wall_active) &&
         (clockid == CLOCK_REALTIME || clockid == CLOCK_REALTIME_COARSE)) {
         /* glibc declares `tp` nonnull; a NULL here is the caller's UB, as
          * with the real clock_gettime. */
-        uint64_t offset = atomic_load(&wall_offset_ns);
+        w3h_virt_ns_fn fn = (w3h_virt_ns_fn)atomic_load(&virt_ns_fn);
+        uint64_t offset = fn != NULL ? fn() : atomic_load(&wall_offset_ns);
         tp->tv_sec = (time_t)(WALL_BASE_SECS + offset / 1000000000ULL);
         tp->tv_nsec = (long)(offset % 1000000000ULL);
         return 0;

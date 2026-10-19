@@ -45,6 +45,23 @@ pub use writer::{HistoryCounters, WriterHandle, WRITER_QUEUE_CAPACITY};
 
 pub use reaper::HISTORY_REAPER_INTERVAL_SECS;
 
+/// Run `f` on tokio's blocking pool, or inline on the current-thread
+/// runtime when the W3-H shim is active (#1245). Inline execution stops
+/// blocking-pool wakeups from reordering same-instant ready tasks.
+pub(crate) async fn run_blocking<F, R>(f: F) -> Result<R, tokio::task::JoinError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    #[cfg(test)]
+    {
+        if std::env::var_os("W3H_SHIM_ACTIVE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            return Ok(f());
+        }
+    }
+    tokio::task::spawn_blocking(f).await
+}
+
 /// Default whole-database byte budget: 1 GiB (ADR-0023 §6).
 pub const DEFAULT_MAX_BYTES: u64 = 1_073_741_824;
 
@@ -433,7 +450,7 @@ impl HistoryHandle {
         let started = std::time::Instant::now();
         let store = Arc::clone(&self.store);
         let scope = scope.clone();
-        match tokio::task::spawn_blocking(move || store.purge_admitted(&scope)).await {
+        match run_blocking(move || store.purge_admitted(&scope)).await {
             Ok(outcome) => outcome,
             Err(join) => Err(RetainError::Failed {
                 error: HistoryError::Database(format!(
@@ -500,7 +517,7 @@ impl HistoryHandle {
         let rules = Arc::clone(&self.policy);
         let counters = self.writer.counters();
         let max_rows = u64::from(options.max_rows);
-        let joined = tokio::task::spawn_blocking(move || {
+        let joined = run_blocking(move || {
             let result = store.trim(
                 &retention,
                 &rules,
@@ -712,7 +729,7 @@ impl HistoryService {
         // the thread immediately because this same deadline has passed.
         let budget = writer::SHUTDOWN_DRAIN_GRACE;
         let deadline = std::time::Instant::now() + budget;
-        let join = tokio::task::spawn_blocking(move || writer.shutdown_until(deadline));
+        let join = run_blocking(move || writer.shutdown_until(deadline));
         // `SHUTDOWN_SUBMIT_SLACK` only covers the last sleep inside a
         // worker that already started. A job still queued at `deadline`
         // is not awaited: dropping `join` detaches it, and that later

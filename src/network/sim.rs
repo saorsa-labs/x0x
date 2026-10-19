@@ -408,6 +408,12 @@ impl SimFabric {
         Instant::now().saturating_duration_since(self.start)
     }
 
+    /// The paused-time origin used by [`Self::now`]. The W3-H wall-clock
+    /// shim pulls offsets from this same instant (#1245).
+    pub(crate) fn origin(&self) -> Instant {
+        self.start
+    }
+
     /// Name a node for the canonical trace.
     pub(crate) fn label(&self, node: &PeerId, name: &str) {
         self.lock().labels.insert(node.0, name.to_string());

@@ -38,7 +38,7 @@ pub(super) fn spawn(
             counters
                 .quarantine_pinned_scopes
                 .store(pinned.len() as u64, Ordering::Relaxed);
-            let result = tokio::task::spawn_blocking(move || {
+            let result = crate::history::run_blocking(move || {
                 store.retain_with_rules(&policy, &rules, &pinned)
             })
             .await;
