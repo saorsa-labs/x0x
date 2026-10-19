@@ -663,9 +663,11 @@ impl SignedInvite {
 
     /// Derive historical creator provenance from the invite's base state.
     ///
-    /// `inviter` is unsigned routing metadata. It is never creator
-    /// provenance, on any invite version: a promoted non-creator admin can
-    /// issue invites (#1458). The derived value seeds the display `creator`
+    /// `inviter` is never creator provenance, on any invite version: a
+    /// promoted non-creator admin can issue invites (#1458). Legacy invites
+    /// carry it as unsigned routing metadata. V4 invites sign it inside
+    /// [`InviteSignedViewV4`], but a signed `inviter` still names only the
+    /// issuing admin; only the signed `creator` field is creator provenance. The derived value seeds the display `creator`
     /// / genesis field only and is never consulted for authority.
     ///
     /// * **v4 invites** (`version >= 4`) carry the explicit `creator` field
