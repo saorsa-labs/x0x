@@ -78,11 +78,31 @@ fn issue_invite_semantics(
     invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
     invite.base_state_revision = Some(info.state_revision);
     invite.base_state_hash = Some(info.state_hash.clone());
-    invite.base_members_v2 = Some(info.members_v2.clone());
+    invite.base_home = info.home.clone();
+    // #1458: mirror the v4 mint (`populate_invite_base_state_v4`) — the
+    // roster rides as the projection, the legacy fat roster is never set,
+    // and creator provenance is the explicit signed `creator` field.
+    invite.base_roster = Some(x0x::groups::state_commit::roster_projection(
+        &info.members_v2,
+    ));
+    invite.base_members_v2 = None;
+    invite.public_meta = Some(info.public_meta());
+    invite.creator = Some(
+        info.genesis
+            .as_ref()
+            .map(|g| g.creator_agent_id.clone())
+            .unwrap_or_else(|| hex::encode(info.creator.as_bytes())),
+    );
     invite.base_prev_state_hash = info.prev_state_hash.clone();
     invite.secure_plane = Some(info.secure_plane);
     invite.base_secret_epoch = Some(info.secret_epoch);
     invite.base_security_binding = info.security_binding.clone();
+    invite
+        .sign_v4(inviter, None)
+        .expect("well-formed v4 invite signs");
+    invite
+        .verify_v4_signatures()
+        .expect("v4 invite signature verifies");
 
     info.record_issued_invite(
         invite.invite_secret.clone(),
