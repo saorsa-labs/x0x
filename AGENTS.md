@@ -75,9 +75,12 @@ behaviour, public APIs or operational invariants, check `docs/adr/` and its
 status overlay. A new or changed decision is `docs/adr/transient/T-<slug>.md`
 (D242). It names one target slot from A01 to A15. Write 300 to 600 words.
 Use about 80% ASD-STE100 style. Follow `docs/documentation-style.md`. It
-stays Proposed until David accepts it. David folds it into that slot only
-when he asks. Accepted ADRs
-are immutable. Supersede them instead. Only David marks an ADR Accepted.
+stays Proposed until David accepts it or Claude and Codex both record ACCEPT
+for the same head and confirm no wire-format or public-API change (David,
+19 Oct 2026, 13:29 BST). Wire or API changes still need David's acceptance.
+Record consensus as specified in `docs/adr/transient/README.md`. David folds
+it into that slot only when he asks. Accepted ADRs are immutable. Supersede
+them instead. Other ADRs still need David's acceptance.
 
 The 15-slot direction, A01 through A15, is confirmed by David (D198).
 David accepted the transfer on 10 Oct 2026. Slot files stay Proposed.

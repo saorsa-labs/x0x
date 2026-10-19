@@ -36,7 +36,9 @@ Enforces:
   that path, link, and sha256. The archived bytes must stay identical to the
   frozen Accepted snapshot. Any other content change still fails.
 - A new decision lives at ``docs/adr/transient/T-<slug>.md`` (D242). It names
-  one target slot from A01 to A15 and stays Proposed until David accepts it.
+  one target slot from A01 to A15 and stays Proposed until accepted under
+  docs/adr/transient/README.md (David, or Claude and Codex consensus for no
+  wire-format or public-API change). Review verifies the acceptance evidence.
   After acceptance, the body bytes stay frozen across later commits and
   folding. Deleting or editing those bytes fails. Folding is recorded in
   ``T-<slug>.folded.md``. That overlay does not change the Accepted bytes.
@@ -727,7 +729,7 @@ def _transient_shape_errors(path: str, text: str) -> list[str]:
         errors.append(f"{path}: filename must be docs/adr/transient/T-<slug>.md.")
     status = status_of(text)
     if status is None or status_token(status) not in TRANSIENT_STATUSES:
-        errors.append(f"{path}: lifecycle must stay Proposed until David accepts it.")
+        errors.append(f"{path}: lifecycle must be Proposed or Accepted; use a .folded.md overlay for Folded.")
     slots = TARGET_SLOT_RE.findall(text)
     if len(slots) != 1:
         errors.append(f"{path}: name one target slot from A01 to A15.")

@@ -2291,8 +2291,8 @@ David folded this Accepted record into A02. The Accepted file stays unchanged.
         _commit_all(work, "rejected lifecycle")
         rc, out = _run_validator(work)
         results.append(check(
-            "transient: lifecycle must stay Proposed until David accepts it",
-            rc == 1 and "lifecycle must stay Proposed until David accepts it." in out,
+            "transient: lifecycle must be Proposed or Accepted",
+            rc == 1 and "lifecycle must be Proposed or Accepted; use a .folded.md overlay for Folded." in out,
         ))
 
     with tempfile.TemporaryDirectory() as tmp:

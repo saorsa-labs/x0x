@@ -25,7 +25,9 @@ Use stable current IDs [A01](A01-r01-purpose-and-product-limits.md)–A15. Archi
 A new or changed decision is `docs/adr/transient/T-<slug>.md` (D242). It
 names one target slot from A01 to A15. Write 300 to 600 words. Use about
 80% ASD-STE100 style. Follow the [style guide](../../documentation-style.md).
-It stays Proposed until David accepts it. David folds it into that slot only
+It stays Proposed until accepted under the [transient acceptance rule](../transient/README.md):
+David, or Claude and Codex consensus for no wire-format or public-API change.
+David folds it into that slot only
 when he asks. Reserved numbers and slices keep the [numbered decision path](README.md).
 
 After transfer and revision-aware gate support, the proposed model selects
