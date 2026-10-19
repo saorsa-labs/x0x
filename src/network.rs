@@ -4913,6 +4913,39 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
+    /// (#1380 M1 `seed_reachable`) The configured bootstrap seeds, and how
+    /// many of them currently hold a connected peer — measured from the
+    /// connection table this node actually holds, not from ant-quic's
+    /// `connected_bootstrap_nodes` counter. That counter only advances
+    /// from ant-quic's own `connect_known_peers()`; x0x joins through
+    /// [`NetworkNode::connect_addr`] (`join_network` phase 2), so a
+    /// successful join left the counter at zero and healthy seeded nodes
+    /// read degraded (RC3 review of #1380). Counts only: the
+    /// auth-exempt verdict never reports seed addresses.
+    pub async fn seed_reachability(&self) -> (u64, u64) {
+        let configured: std::collections::HashSet<SocketAddr> =
+            self.config.bootstrap_nodes.iter().copied().collect();
+        if configured.is_empty() {
+            return (0, 0);
+        }
+        let link = self.node.read().await.as_ref().cloned();
+        let Some(link) = link else {
+            return (configured.len() as u64, 0);
+        };
+        let connected = link
+            .connected_peers()
+            .await
+            .iter()
+            .filter_map(|conn| match conn.remote_addr {
+                TransportAddr::Udp(addr) => Some(addr),
+                _ => None,
+            })
+            .filter(|addr| configured.contains(addr))
+            .collect::<std::collections::HashSet<SocketAddr>>()
+            .len() as u64;
+        (configured.len() as u64, connected)
+    }
+
     /// Transport-layer diagnostics for the #368 connection-zombie hunt.
     ///
     /// Divergence between `active_connections` and the x0x-visible peer

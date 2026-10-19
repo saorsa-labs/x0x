@@ -17,8 +17,13 @@
 //!   Every expensive input (seed counts, recv-pump counters, disk stats,
 //!   upgrade artifacts, identity presence) is therefore sampled off-path
 //!   by the 5 s background refresher in `serve_with_options` into a
-//!   `VerdictSample`; the handler clones that sample, merges the live
-//!   peer atomics and uptime, and runs `classify` — a pure function.
+//!   `VerdictSample`; the handler merges that cached sample with the live
+//!   peer atomics, uptime and delivery-probe atomics, stamps the sample's
+//!   age, and runs `classify` — a pure function. The live probe merge and
+//!   the age stamp keep the verdict truthful when the refresher stalls:
+//!   a probe failure recorded after the last refresh still degrades, and
+//!   a sample older than the freshness bound cannot vouch for health
+//!   (RC3 review of #1380).
 //!
 //! - **`/health` is auth-exempt (ADR-0038 review fix, issue #600).** The
 //!   verdict reports counts, booleans and classifications only: no agent
@@ -36,7 +41,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::watch;
 
-use super::routes::status::{classify_health, HealthSnapshot, CONNECTIVITY_GRACE_SECS};
+use super::routes::status::{
+    classify_health, HealthSnapshot, CONNECTIVITY_GRACE_SECS, VERDICT_SAMPLE_MAX_AGE_SECS,
+};
 use super::state::{AppState, PROD_PLANE_ID};
 
 /// Topic the delivery probe publishes on. A real (non-`local:`) topic so
@@ -194,6 +201,13 @@ pub(in crate::server) struct VerdictSample {
     pub upgrade_checked_age_secs: Option<u64>,
     pub upgrade_handoff_pending: bool,
     pub upgrade_failed_artifact: bool,
+    /// Age of the refresher's cached sample when it was served, set by
+    /// the handler merge in `HealthSnapshot::merged_verdict_inputs`.
+    /// `None` on a bare/unsampled sample (no staleness claim). Past
+    /// `routes::status::VERDICT_SAMPLE_MAX_AGE_SECS` the overall verdict
+    /// degrades: a stalled refresher's frozen inputs cannot vouch for
+    /// current health (RC3 review of #1380).
+    pub sample_age_secs: Option<u64>,
 }
 
 impl Default for VerdictSample {
@@ -225,6 +239,7 @@ impl Default for VerdictSample {
             upgrade_checked_age_secs: None,
             upgrade_handoff_pending: false,
             upgrade_failed_artifact: false,
+            sample_age_secs: None,
         }
     }
 }
@@ -342,9 +357,14 @@ pub(in crate::server) async fn sample_verdict_inputs(
 
     // Seed reachability + recv-pump shed/drop counters need the transport.
     if let Some(network) = state.agent.network() {
-        let transport = network.transport_diagnostics().await;
-        sample.seeds_configured = transport.total_bootstrap_nodes;
-        sample.seeds_connected = transport.connected_bootstrap_nodes;
+        // RC3 #1380 (P2): count seeds from the connection table x0x
+        // actually holds. ant-quic's `connected_bootstrap_nodes` counter
+        // only advances from its own `connect_known_peers()`; x0x joins
+        // through `connect_addr()`, so a successful join still measured
+        // zero reachable seeds and healthy seeded nodes read degraded.
+        let (seeds_configured, seeds_connected) = network.seed_reachability().await;
+        sample.seeds_configured = seeds_configured;
+        sample.seeds_connected = seeds_connected;
 
         let pump = network.recv_pump_diagnostics();
         let shed_total =
@@ -395,12 +415,12 @@ pub(in crate::server) async fn sample_verdict_inputs(
         .join(crate::upgrade::restart::UPGRADE_FAILED_FILE_NAME)
         .exists();
 
-    // Delivery probe results are published to the health snapshot by the
-    // probe task; read them back for the sample.
-    let (probes_run, last_ok, latency) = state.health_snapshot.probe_results();
-    sample.probes_run = probes_run;
-    sample.last_probe_ok = last_ok;
-    sample.last_probe_latency_ms = latency;
+    // Delivery probe results are NOT copied into the stored sample: the
+    // probe task records them straight onto the health snapshot, and the
+    // handler merges them live at serve time. A refresher-side copy would
+    // freeze the last outcome at refresh time, so a stalled refresher
+    // could hide a newer probe failure behind a cached success (RC3
+    // review of #1380).
 
     sample
 }
@@ -480,7 +500,7 @@ macro_rules! input_report {
     (struct $name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Debug, Serialize)]
         pub(in crate::server) struct $name {
-            state: &'static str,
+            pub(in crate::server) state: &'static str,
             $(pub(in crate::server) $field: $ty,)*
         }
     };
@@ -588,6 +608,11 @@ pub(in crate::server) struct HealthVerdict {
     pub(in crate::server) verdict: &'static str,
     pub(in crate::server) reasons: Vec<String>,
     pub(in crate::server) inputs: InputsReport,
+    /// How old the refresher's cached sample was when it was served.
+    /// Always set by the serving path; `None` only on a bare sample that
+    /// never went through the handler merge (omitted from the JSON).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) sample_age_secs: Option<u64>,
 }
 
 /// Classify the M1 verdict over a sample. Pure: no I/O, no locks beyond
@@ -767,6 +792,24 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
         InputState::Ok
     };
 
+    // Sample freshness (RC3 review of #1380): the refresher's tick awaits
+    // transport operations with no deadline, so it can stall — and a
+    // stalled refresher freezes every sampled input at its last value.
+    // Past the freshness bound the overall verdict degrades and says why.
+    // This is not an input badge: the ten inputs above describe their
+    // data as of the sample; staleness is a property of the sample
+    // itself. `None` (a bare sample that never went through the handler
+    // merge) makes no age claim and does not degrade.
+    let sample_age = sample.sample_age_secs;
+    if let Some(age) = sample_age.filter(|age| *age > VERDICT_SAMPLE_MAX_AGE_SECS) {
+        bump(InputState::Degraded);
+        reasons.push(format!(
+            "verdict inputs are {age}s old (bound \
+             {VERDICT_SAMPLE_MAX_AGE_SECS}s): the background sampler has not \
+             completed a refresh recently"
+        ));
+    }
+
     let verdict = match worst {
         2 => "error",
         1 => "degraded",
@@ -776,6 +819,7 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
     HealthVerdict {
         verdict,
         reasons,
+        sample_age_secs: sample_age,
         inputs: InputsReport {
             plane: PlaneReport {
                 state: plane_state.as_str(),
@@ -1137,6 +1181,83 @@ mod tests {
         assert_ok(&verdict);
     }
 
+    /// RC3 #1380 (P2): healthy seeded nodes reported degraded. The seed
+    /// input read ant-quic's `connected_bootstrap_nodes`, which only that
+    /// crate's own `connect_known_peers()` advances; x0x joins through
+    /// `connect_addr()` (`join_network` phase 2 →
+    /// `connect_peers_parallel_tracked` → `NetworkNode::connect_addr`),
+    /// so a successful join still measured zero reachable seeds past the
+    /// 120 s grace. This test dials a configured seed through that exact
+    /// join-path call and asserts the measurement sees the connection x0x
+    /// actually holds. Fails at 3ecb64c8 (compile: `seed_reachability` is
+    /// the fix; see the RC3 evidence for the runtime demonstration of the
+    /// old counter staying at zero after this same dial).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_successful_join_path_dial_counts_as_a_reachable_seed() {
+        let plane = "issue1380-rc3-seed-join";
+        let fabric = crate::network::sim::SimFabric::new(1380);
+        crate::network::sim::register(plane, &fabric);
+        let config = |host: u8, seeds: Vec<std::net::SocketAddr>| crate::network::NetworkConfig {
+            bind_addr: Some(std::net::SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: seeds,
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        };
+        let seed_addr = std::net::SocketAddr::from(([198, 18, 0, 2], 5483));
+        let seed = crate::network::NetworkNode::new(config(2, Vec::new()), None, None)
+            .await
+            .expect("seed node");
+        let joiner = crate::network::NetworkNode::new(config(1, vec![seed_addr]), None, None)
+            .await
+            .expect("joiner node");
+        let bystander = crate::network::NetworkNode::new(config(3, Vec::new()), None, None)
+            .await
+            .expect("bystander node");
+
+        // Before the join: the seed is configured but not reachable.
+        assert_eq!(joiner.seed_reachability().await, (1, 0));
+
+        // The real join-path dial: `join_network` phase 2 calls exactly
+        // this (`net.connect_addr(addr)` under a per-dial timeout).
+        let seed_peer = joiner.connect_addr(seed_addr).await.expect("join dial");
+        assert_eq!(seed_peer, seed.peer_id());
+
+        // The successful join must count: 1 of 1 configured seeds
+        // reachable, measured from the connection table x0x holds.
+        let (configured, connected) = joiner.seed_reachability().await;
+        assert_eq!(
+            (configured, connected),
+            (1, 1),
+            "a successful join-path dial must count as a reachable seed"
+        );
+
+        // A connection to a non-seed peer does not count.
+        let bystander_addr = std::net::SocketAddr::from(([198, 18, 0, 3], 5483));
+        joiner
+            .connect_addr(bystander_addr)
+            .await
+            .expect("bystander dial");
+        assert_eq!(
+            joiner.seed_reachability().await,
+            (1, 1),
+            "only configured seed addresses count"
+        );
+
+        // Fed into the verdict, the measurement keeps a seeded, connected
+        // node past the grace `ok` — the state 3ecb64c8 read degraded.
+        let mut seeded = sample();
+        seeded.seeds_configured = configured;
+        seeded.seeds_connected = connected;
+        seeded.uptime_secs = CONNECTIVITY_GRACE_SECS + 1;
+        assert_ok(&classify(&seeded));
+
+        joiner.try_shutdown().await.expect("joiner shutdown");
+        seed.try_shutdown().await.expect("seed shutdown");
+        bystander.try_shutdown().await.expect("bystander shutdown");
+    }
+
     // Send-failure rate -------------------------------------------------
 
     #[test]
@@ -1371,6 +1492,35 @@ mod tests {
         let verdict = classify(&sample());
         assert_ok(&verdict);
         assert!(verdict.reasons.is_empty());
+    }
+
+    // Sample freshness ---------------------------------------------------
+
+    /// RC3 #1380 (P2): a stale sample must not vouch for health. The
+    /// refresher's tick awaits transport operations with no deadline, so
+    /// it can stall; past the freshness bound the overall verdict
+    /// degrades with a staleness reason. At or below the bound — and on a
+    /// bare sample that makes no age claim — the verdict is unchanged.
+    #[test]
+    fn a_stale_sample_age_degrades_the_verdict() {
+        let mut sample = sample();
+        sample.sample_age_secs = None;
+        assert_ok(&classify(&sample));
+
+        sample.sample_age_secs = Some(VERDICT_SAMPLE_MAX_AGE_SECS);
+        assert_ok(&classify(&sample));
+
+        sample.sample_age_secs = Some(VERDICT_SAMPLE_MAX_AGE_SECS + 1);
+        let verdict = classify(&sample);
+        assert_eq!(verdict.verdict, "degraded");
+        assert_eq!(
+            verdict.sample_age_secs,
+            Some(VERDICT_SAMPLE_MAX_AGE_SECS + 1)
+        );
+        assert!(verdict
+            .reasons
+            .iter()
+            .any(|r| r.contains("background sampler")));
     }
 
     // Windows ------------------------------------------------------------

@@ -22,6 +22,15 @@ const STATUS_CONNECTING_GRACE_SECS: u64 = 45;
 /// probe sees a snapshot at most one refresh old.
 pub(in crate::server) const HEALTH_SNAPSHOT_REFRESH_SECS: u64 = 5;
 
+/// Freshness bound for the cached verdict sample (#1380, RC3 review). The
+/// refresher's tick awaits transport operations with no deadline, so it can
+/// stall — and a stalled refresher freezes every sampled input at its last
+/// value. Past three missed refreshes the sample can no longer vouch for
+/// health: the overall verdict degrades with a staleness reason (the input
+/// badges stay as-of-sample; the live peer counts and delivery-probe
+/// results are merged at serve time and stay current).
+pub(in crate::server) const VERDICT_SAMPLE_MAX_AGE_SECS: u64 = 3 * HEALTH_SNAPSHOT_REFRESH_SECS;
+
 /// Cached transport peer counts for the auth-exempt `GET /health` (issue #600).
 ///
 /// `/health` is the one endpoint the API watchdog probes (every 10 s, 3 s
@@ -53,6 +62,10 @@ pub(in crate::server) struct HealthSnapshot {
     /// `one_sided_ids`, and nothing like the per-peer parking_lot walk
     /// that #600 removed from the handler.
     verdict_sample: std::sync::Mutex<super::super::health_verdict::VerdictSample>,
+    /// When `verdict_sample` was last stored. `tokio::time::Instant` so
+    /// paused-clock tests observe the same freshness bound production
+    /// does. `None` until the first refresher tick lands.
+    verdict_sample_refreshed_at: std::sync::Mutex<Option<tokio::time::Instant>>,
     /// Delivery-probe results published by the probe task (#1380).
     probes_run: AtomicUsize,
     last_probe_ok: std::sync::atomic::AtomicBool,
@@ -113,7 +126,9 @@ impl HealthSnapshot {
         )
     }
 
-    /// Publish the refresher's last M1 verdict sample (#1380).
+    /// Publish the refresher's last M1 verdict sample (#1380). Stamping
+    /// the store time is part of the publish: the freshness bound below
+    /// reads it back at serve time.
     pub(in crate::server) fn store_verdict_sample(
         &self,
         sample: super::super::health_verdict::VerdictSample,
@@ -122,6 +137,10 @@ impl HealthSnapshot {
             .verdict_sample
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = sample;
+        *self
+            .verdict_sample_refreshed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tokio::time::Instant::now());
     }
 
     /// Clone the last stored verdict sample. Before the first refresher
@@ -131,6 +150,45 @@ impl HealthSnapshot {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// The sample `GET /health` classifies: the refresher's cached sample
+    /// with the live counts, uptime and delivery-probe results merged in
+    /// (#1380). RC3 review: probe outcomes are atomics the probe task
+    /// records directly, so they must reach the handler without waiting
+    /// for the refresher — a stalled refresher cannot hide a newer probe
+    /// failure behind the cached copy. The merged sample carries its own
+    /// age; `classify` degrades it past
+    /// [`VERDICT_SAMPLE_MAX_AGE_SECS`]. A sample that never arrived ages
+    /// from process start: the unsampled baseline cannot vouch for
+    /// health forever either.
+    pub(in crate::server) fn merged_verdict_inputs(
+        &self,
+        peers: usize,
+        send_ready_peers: usize,
+        one_sided_peers: usize,
+        uptime_secs: u64,
+    ) -> super::super::health_verdict::VerdictSample {
+        let mut sample = self.verdict_sample();
+        sample.peers = peers;
+        sample.send_ready_peers = send_ready_peers;
+        sample.one_sided_peers = one_sided_peers;
+        sample.uptime_secs = uptime_secs;
+
+        let (probes_run, last_probe_ok, last_probe_latency_ms) = self.probe_results();
+        sample.probes_run = probes_run;
+        sample.last_probe_ok = last_probe_ok;
+        sample.last_probe_latency_ms = last_probe_latency_ms;
+
+        let refreshed_at = *self
+            .verdict_sample_refreshed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sample.sample_age_secs = Some(match refreshed_at {
+            Some(at) => at.elapsed().as_secs(),
+            None => uptime_secs,
+        });
+        sample
     }
 
     /// Record one delivery-probe outcome (#1380). `latency_ms` is `None`
@@ -317,9 +375,10 @@ pub(in crate::server) struct StatusData {
 /// Deliberately O(1) and lock-free (issue #600): the peer counts come from
 /// [`HealthSnapshot`], never from a live peer-table walk. See that type for
 /// why the live read made the watchdog abort live daemons. The #1380
-/// verdict is the same discipline: the handler clones the refresher's
-/// sample, merges the live atomics and uptime, and classifies — no
-/// transport state is touched.
+/// verdict is the same discipline: the handler merges the refresher's
+/// cached sample with the live atomics (peer counts, uptime, delivery-probe
+/// results and the sample's age) and classifies — no transport state is
+/// touched.
 pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<HealthData>> {
@@ -328,11 +387,12 @@ pub(in crate::server) async fn health(
     let (status, degraded_reason) =
         classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers);
 
-    let mut sample = state.health_snapshot.verdict_sample();
-    sample.peers = peers;
-    sample.send_ready_peers = send_ready_peers;
-    sample.one_sided_peers = one_sided_peers;
-    sample.uptime_secs = uptime_secs;
+    let sample = state.health_snapshot.merged_verdict_inputs(
+        peers,
+        send_ready_peers,
+        one_sided_peers,
+        uptime_secs,
+    );
     let verdict = super::super::health_verdict::classify(&sample);
 
     Json(ApiResponse {
@@ -518,7 +578,9 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_health, classify_runtime_status, HealthSnapshot};
+    use super::{
+        classify_health, classify_runtime_status, HealthSnapshot, VERDICT_SAMPLE_MAX_AGE_SECS,
+    };
     use crate as x0x;
     use crate::server::health_verdict;
 
@@ -706,6 +768,122 @@ mod tests {
         let (run, ok, latency) = snapshot.probe_results();
         assert_eq!((run, ok), (3, Some(true)));
         assert_eq!(latency, Some(1), "sub-millisecond latency clamps to 1 ms");
+    }
+
+    /// RC3 #1380 (P2): a stalled refresher plus a recorded probe failure
+    /// must not read healthy. The old handler read probe results only
+    /// from the cached verdict sample — frozen at the refresher's last
+    /// tick — so once the refresher stalled, later probe failures never
+    /// reached `/health` and the stale success vouched forever. The merge
+    /// now reads the probe atomics directly and stamps the sample's age.
+    /// Fails at 3ecb64c8 (compile: `merged_verdict_inputs` is the fix;
+    /// see the RC3 evidence for the runtime demonstration of the old
+    /// handler merge returning `ok` in this exact scenario).
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_refresher_and_a_recorded_probe_failure_do_not_read_healthy() {
+        use std::time::Duration;
+
+        let snapshot = HealthSnapshot::default();
+        // Last-known-good: the refresher stored a healthy seeded sample...
+        let mut healthy = health_verdict::VerdictSample::unsampled();
+        healthy.seeds_configured = 2;
+        healthy.seeds_connected = 2;
+        snapshot.store_verdict_sample(healthy);
+        // ...then stalled (no further stores). The probe task is separate
+        // from the refresher and still records: its failure must reach the
+        // verdict without waiting for the refresher's next tick.
+        tokio::time::advance(Duration::from_secs(VERDICT_SAMPLE_MAX_AGE_SECS + 1)).await;
+        snapshot.record_probe(false, None);
+
+        let verdict = health_verdict::classify(&snapshot.merged_verdict_inputs(4, 4, 0, 3_600));
+        assert_ne!(
+            verdict.verdict, "ok",
+            "a stalled refresher must not hide a recorded probe failure: {:?}",
+            verdict.reasons
+        );
+        assert_eq!(
+            verdict.inputs.delivery_probe.state, "degraded",
+            "the failure is read from the live atomics, not the cached copy"
+        );
+        assert!(
+            matches!(verdict.sample_age_secs, Some(age) if age > VERDICT_SAMPLE_MAX_AGE_SECS),
+            "the stale sample's age is reported: {:?}",
+            verdict.sample_age_secs
+        );
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("background sampler")),
+            "staleness itself carries a reason: {:?}",
+            verdict.reasons
+        );
+    }
+
+    /// Control for the RC3 regression above: while the refresher is alive
+    /// (a fresh sample), a recorded failure degrades from the probe alone
+    /// and a clean snapshot stays `ok` — the freshness bound must not fire
+    /// on healthy refreshes.
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_sample_degrades_only_from_the_probe_and_a_clean_one_stays_ok() {
+        use std::time::Duration;
+
+        let failed = HealthSnapshot::default();
+        failed.store_verdict_sample(health_verdict::VerdictSample::unsampled());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        failed.record_probe(false, None);
+        let verdict = health_verdict::classify(&failed.merged_verdict_inputs(4, 4, 0, 600));
+        assert_eq!(verdict.verdict, "degraded");
+        assert!(
+            verdict.reasons.iter().any(|r| r.contains("delivery probe")),
+            "the degradation comes from the probe: {:?}",
+            verdict.reasons
+        );
+        assert!(
+            !verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("background sampler")),
+            "a 2 s-old sample is fresh: {:?}",
+            verdict.reasons
+        );
+
+        let clean = HealthSnapshot::default();
+        clean.store_verdict_sample(health_verdict::VerdictSample::unsampled());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let verdict = health_verdict::classify(&clean.merged_verdict_inputs(4, 4, 0, 600));
+        assert_eq!(
+            verdict.verdict, "ok",
+            "a fresh clean snapshot stays ok: {:?}",
+            verdict.reasons
+        );
+    }
+
+    /// RC3 #1380 (P2): a sample that never arrived (a refresher stalled
+    /// from startup) ages from process start — the unsampled baseline
+    /// cannot vouch for health forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_refreshed_sample_goes_stale_with_uptime() {
+        let snapshot = HealthSnapshot::default();
+        // Young uptime: the unsampled baseline keeps the startup contract.
+        let fresh = health_verdict::classify(&snapshot.merged_verdict_inputs(2, 2, 0, 5));
+        assert_eq!(
+            fresh.verdict, "ok",
+            "startup before the first refresh is not stale: {:?}",
+            fresh.reasons
+        );
+        // Past the bound with no sample ever stored: stale.
+        let stale = health_verdict::classify(&snapshot.merged_verdict_inputs(
+            2,
+            2,
+            0,
+            VERDICT_SAMPLE_MAX_AGE_SECS + 1,
+        ));
+        assert_eq!(stale.verdict, "degraded");
+        assert!(stale
+            .reasons
+            .iter()
+            .any(|r| r.contains("background sampler")));
     }
 
     /// Startup gets a grace window: bootstrap takes seconds-to-a-minute, and

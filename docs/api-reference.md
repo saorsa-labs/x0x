@@ -252,6 +252,7 @@ curl http://127.0.0.1:12700/health
 #   "verdict": {
 #     "verdict": "ok",
 #     "reasons": [],
+#     "sample_age_secs": 4,
 #     "inputs": {
 #       "plane":              { "state": "ok", "plane": "prod" },
 #       "peers":              { "state": "ok", "peers": 4, "send_ready_peers": 4, "one_sided_peers": 0 },
@@ -293,8 +294,10 @@ peer-only semantics; the verdict is additive.
 - `peers` — the #262/#1419 classification behind `status`: zero peers past
   the 120 s grace, send-ready-less outer peers, or a one-sided link
   degrade.
-- `seed_reachable` — `connected` of `configured` bootstrap seeds. Degrades
-  when seeds are configured, none is reachable, and uptime passed the
+- `seed_reachable` — `connected` of `configured` bootstrap seeds,
+  measured from the connections the node actually holds (x0x joins via
+  `connect_addr`, so ant-quic's own bootstrap counter never sees the join).
+  Degrades when seeds are configured, none is reachable, and uptime passed the
   120 s grace. `configured: 0` (`--no-hard-coded-bootstrap`, no config
   peers) is not applicable and stays `ok`.
 - `send_failure_rate` — failed/(attempted) gossip publishes over a rolling
@@ -306,7 +309,9 @@ peer-only semantics; the verdict is additive.
   (no gossip runtime, or before the first probe ~10 s after start) is
   `ok`; the last failed probe degrades (the closed #288's blind spot:
   serving HTTP while delivery is wedged). `last_latency_ms` is `null`
-  when the last probe failed.
+  when the last probe failed. The probe task records its outcome straight
+  onto the health snapshot and the handler reads it live, so a failure is
+  visible on the very next request without waiting for the sampler.
 - `recv_pump_shed` — recv-pump control-frame sheds (ADR 0013) and
   full-queue drops over the last 60 s. Any non-zero window degrades.
 - `disk` — free/total bytes of the data-dir filesystem. Under 1 GiB free
@@ -329,7 +334,13 @@ peer-only semantics; the verdict is additive.
 Every input except the live peer counts/uptime is refreshed by a 5 s
 background sampler, never on the request path — `/health` stays O(1) and
 transport-lock-free (#600). Before the first refresh the verdict reads
-`ok` from the unsampled baseline.
+`ok` from the unsampled baseline. `verdict.sample_age_secs` states how old
+the sampled inputs were when served; the peer counts, uptime and
+delivery-probe results are merged live at serve time. Past 15 s
+(3 × the refresh interval) without a completed refresh the overall verdict
+degrades with a staleness reason — a stalled sampler's frozen inputs cannot
+vouch for current health, and they cannot hide a probe failure recorded
+after the last refresh.
 
 ### Example: status
 
