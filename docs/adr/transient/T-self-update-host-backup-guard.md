@@ -1,10 +1,15 @@
 # T-self-update-host-backup-guard: one host keeps one previous binary
 
-- **Status:** Proposed (awaiting Claude+Codex no-wire/no-API acceptance on the RC5 head under David's 19 Oct 2026 rule)
+- **Status:** Accepted (Claude+Codex consensus, 2026-10-19, under David Irvine's
+  19 Oct 2026 rule for transient decisions with no wire or public API change)
 - **Target slot:** A14
 - **Date:** 2026-10-18
 - **Decision owners:** David Irvine
-- **Reviewers:** pending
+- **Reviewers:** Claude and Codex, both on implementation head
+  `8339e66ec10204cbce74e5b2a7a404696f0f7b29` in PR #1462.
+- **Acceptance receipts:**
+  [Codex explicit ACCEPT vote](https://github.com/saorsa-labs/x0x/pull/1462#issuecomment-6270969308);
+  [independent verification of Claude's explicit ACCEPT-ADR-1462 receipt](https://github.com/saorsa-labs/x0x/pull/1462#issuecomment-6272288596).
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** x0x #1447; draft #1410 / #1106; Accepted ADR 0094 §2.
