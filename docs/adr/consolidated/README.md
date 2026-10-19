@@ -41,20 +41,18 @@ frozen evidence and active issue gates still govern implementation.
    the approximately 80% ASD-STE100 style target.
 
 The limit applies to current decisions after transfer. Archived records and
-past accepted revisions do not count. A new or changed decision is
-`docs/adr/transient/T-<slug>.md` (D242). It names one target slot from A01
-to A15. Write 300 to 600 words. Use about 80% ASD-STE100 style. Follow
-[the style guide](../../documentation-style.md). It stays Proposed until
-accepted under the [transient acceptance rule](../transient/README.md):
-David, or Claude and Codex consensus for no wire-format or public-API change.
-David folds it into that slot only when he asks. Slot
-revisions stay Proposed. The transition check
-rejects an Accepted slot.
-Keep reserved numbers
-0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
-Slices 0109–0114 continue to acceptance as numbered ADRs. Map their rulings
-to the slots without changing that decision path. The transition check does
-not yet support multiple revision files per slot; see [coverage gaps](../TOOLING.md#transition-check-coverage).
+past accepted revisions do not count. David's 19 Oct 2026 ruling prohibits
+new ADR files, including transient records, folded overlays and extra slot
+revisions. Put rationale in the PR body and existing docs or code comments.
+Route wire-format or public-API questions with a `FOR ENGINEER:` line for
+David's decision. Record approval in the PR; an approved additive API needs
+no new ADR. See the [current authoring rule](../transient/README.md).
+
+Slot revisions stay Proposed; the transition check rejects an Accepted slot.
+Keep reserved numbers and existing team gates. The historical numbered lanes
+and transfer rules do not authorize adding files. The transition check does
+not support multiple revision files per slot; see
+[coverage gaps](../TOOLING.md#transition-check-coverage).
 
 `python3 scripts/check-adr-count.py` counts the current records. The limit
 is 15. This file is the plan. David accepted the transfer on 10 Oct 2026.
@@ -63,7 +61,8 @@ as a link. Its bytes live in `docs/adr-archive/` and stay outside the count.
 David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026. They are
 in that map. ADR 0115 also touches A03. ADR 0116 also touches A08 and cites
 ADR 0030. Those are secondary links, not second placements. Files under
-`docs/adr/transient/` do not count (D242). Another numbered ADR outside
+`docs/adr/transient/` do not count (D242). This exclusion does not permit
+new transient files. Another numbered ADR outside
 that directory, or an A16 record, makes the count exceed 15 and the check fails.
 
 ## Transfer before activation

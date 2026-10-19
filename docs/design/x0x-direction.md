@@ -3,7 +3,7 @@
 - **Status:** maintained digest, not an ADR. It records the design rulings
   David Irvine made from 2026-09-28 to 2026-10-05 (decisions D01–D200 and the
   efficiency decisions E-D1–E-D17).
-- **Updated:** 2026-10-05.
+- **Updated:** 2026-10-19 (authoring-rule overlay).
 - **Relationship to ADRs:** ADRs remain the decision records. Acceptance needs
   David, with the [19 Oct 2026 transient consensus exception](../adr/transient/README.md).
   Where a ruling here changes what an Accepted ADR
@@ -14,6 +14,19 @@
   allocated when the ADR PR is opened on `main`.
 - **Keep in sync:** a PR that changes a ruling updates this file and the ADR
   README overlay together.
+
+## Current authoring rule (19 Oct 2026)
+
+David keeps the ADR pack at 15. Do not add ADR files, including transient
+records and folded overlays. Put rationale in the PR body and existing docs
+or code doc comments. If a change touches the wire format or public API,
+write a `FOR ENGINEER:` line for David's decision. Record his approval in the
+PR body or comment; an approved additive API needs no new ADR.
+
+This ruling overrides the historical instructions below to create a new,
+successor or transient ADR. Accepted bytes and frozen evidence stay unchanged.
+Existing security, release, compatibility and independent-review gates remain.
+See the [authoring guidance](../adr/transient/README.md).
 
 ## 1. What x0x is
 

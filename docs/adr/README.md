@@ -19,14 +19,18 @@ This directory contains architecture decision records for x0x.
 ## Transfer rulings (2026-10-05)
 
 D198 confirms the consolidation direction and writing target. David accepted
-the transfer on 10 Oct 2026. The slot files stay Proposed. A new or changed
-decision is `docs/adr/transient/T-<slug>.md` (D242). It names one target
-slot from A01 to A15. Write 300 to 600 words. Use about 80% ASD-STE100
-style. Follow the [style guide](../documentation-style.md). It stays
-Proposed until accepted under the [transient acceptance rule](transient/README.md):
-David, or Claude and Codex consensus for no wire-format or public-API change.
-David folds it into that slot only when he asks. The reserved numbers and 0109–0114 acceptance lanes
-stand; slot revisions are drafts.
+the transfer on 10 Oct 2026. The slot files stay Proposed.
+
+David's 19 Oct 2026 ruling replaces D242's instruction to add transient
+records: **do not add ADR files**, including `T-*.md` records and folded
+overlays. Keep the pack at 15. Put rationale in the PR body and existing docs
+or code doc comments. A wire-format or public-API change needs a
+`FOR ENGINEER:` line for David's decision. Record approval in the PR body or
+comment. An approved additive API needs no new ADR. Preserve Accepted bytes,
+frozen evidence, and existing team gates. See the
+[current authoring rule](transient/README.md#current-authoring-rule-19-oct-2026)
+and [style guide](../documentation-style.md). Historical references below to
+new or successor ADRs do not authorize a new file under this ruling.
 
 D200 confirms ADR 0040's `owner_agent` and current-owner-signed transfers;
 implementation status does not defer that decision. D197 confirms that
@@ -72,8 +76,10 @@ Goal E counts in place of an R under rule 5 when the change keeps the wire
 format, API, stored format and dependencies unchanged, and the rule-21
 delivery matrix shows no loss. The decision states a target gain when
 Proposed. It is Folded only after a measured before-and-after result that
-meets E-D15 rule 15. Any wire, protocol, API or dependency change needs a
-transient ADR (D242) that names an R.
+meets E-D15 rule 15. Any wire, protocol, API or dependency change still needs
+its existing approval gate. Explain its R and rationale in the PR and existing docs.
+Route wire-format or public-API questions to Engineer for David; do not add
+a transient ADR.
 
 ### Do not start new work: parked, retired, rejected, withdrawn or held
 

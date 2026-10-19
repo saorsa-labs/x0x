@@ -1,8 +1,9 @@
 # ADR NNNN: <Decision Title>
 
-<!-- The numbered ADRs are archived (#1313). A new decision is
-docs/adr/transient/T-<slug>.md. It has a "- **Target slot:** A0x" line
-instead of a number. See docs/adr/transient/README.md. -->
+<!-- Retained historical template. David's 19 Oct 2026 ruling prohibits new
+ADR files, including transient records. Do not copy this into a new ADR.
+Put rationale in the PR body and existing docs/code comments. Wire-format or
+public-API questions go to Engineer for David. See transient/README.md. -->
 
 - **Status:** Proposed
 - **Date:** YYYY-MM-DD
@@ -13,13 +14,8 @@ instead of a number. See docs/adr/transient/README.md. -->
 - **Related:** <issues/PRs/specs>
 
 <!-- Use approximately 80% ASD-STE100 style. See docs/documentation-style.md.
-D242: the 15 current ADRs are the A01-A15 slots. Do not add a new numbered
-ADR. Record a new or changed decision as a transient decision in
-docs/adr/transient/T-<slug>.md that names one target slot (see
-docs/adr/transient/README.md). Acceptance follows that rule: David, or
-Claude and Codex consensus for no wire-format or public-API change. Keep reserved numbers
-0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63); slices
-0109–0114 continue through numbered acceptance. -->
+The current pack remains A01-A15. Preserve Accepted records and frozen
+history. The fields below document the existing format only. -->
 
 ## Context
 
@@ -61,4 +57,7 @@ How will we know this decision remains correct? Include tests, metrics, audit ch
 
 ## Notes for AI-assisted work
 
-AI tools may help draft this ADR. Acceptance requires David, or Claude and Codex consensus for a transient ADR with no wire-format or public-API change. Record acceptance as specified in [the transient rules](transient/README.md). Accepted ADRs are immutable: create a new superseding ADR rather than editing an Accepted ADR.
+Do not use this template to create a new ADR or a superseding record. Put the
+rationale in the PR body and existing docs or code comments. Preserve Accepted
+bytes. A wire-format or public-API question needs a `FOR ENGINEER:` line for
+David's decision; record his approval in the PR body or comment.

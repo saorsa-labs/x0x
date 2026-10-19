@@ -72,15 +72,18 @@ The documentation and communication style is in `docs/documentation-style.md`.
 ## Architecture decisions (ADRs)
 Before changing architecture, protocols, storage formats, crypto, network
 behaviour, public APIs or operational invariants, check `docs/adr/` and its
-status overlay. A new or changed decision is `docs/adr/transient/T-<slug>.md`
-(D242). It names one target slot from A01 to A15. Write 300 to 600 words.
-Use about 80% ASD-STE100 style. Follow `docs/documentation-style.md`. It
-stays Proposed until David accepts it or Claude and Codex both record ACCEPT
-for the same head and confirm no wire-format or public-API change (David,
-19 Oct 2026, 13:29 BST). Wire or API changes still need David's acceptance.
-Record consensus as specified in `docs/adr/transient/README.md`. David folds
-it into that slot only when he asks. Accepted ADRs are immutable. Supersede
-them instead. Other ADRs still need David's acceptance.
+status overlay. Keep the current ADR pack at 15. Under David's 19 Oct 2026
+ruling, do not add ADR files, including transient `T-*.md` records or folded
+overlays. Put the rationale in the PR body and existing documentation or code
+doc comments. Use about 80% ASD-STE100 style; follow
+`docs/documentation-style.md`.
+
+If a change touches the wire format or public API, write a `FOR ENGINEER:`
+line describing the change for David's decision. Record any approval in the
+PR body or comment. An approved additive API does not need a new ADR.
+Preserve Accepted records and frozen evidence. Do not create a superseding
+ADR or change an acceptance status as a workaround. Read
+`docs/adr/transient/README.md` for the retained records' historical rules.
 
 The 15-slot direction, A01 through A15, is confirmed by David (D198).
 David accepted the transfer on 10 Oct 2026. Slot files stay Proposed.

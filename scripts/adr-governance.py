@@ -15,9 +15,9 @@ Enforces:
   the frozen ADR bytes as well as its grounding snapshot. At every later
   HEAD, the ADR must remain byte-identical to that snapshot; body edits,
   status rollback (Accepted→Proposed), deletion, and rename fail closed —
-  even when the PR base predates the ADR entirely. If a decision changes,
-  create a new ADR and supersede by reference rather than editing the
-  Accepted ADR.
+  even when the PR base predates the ADR entirely. The 19 Oct 2026 authoring
+  rule prohibits new ADR files; explain a changed decision in the PR body
+  and existing docs or code comments without editing Accepted bytes.
 - Same-stem grounding files in docs/grounding/ are paired with their ADR by
   NNNN-short-title stem.  Grounding freezes at the first commit in the compared
   history (base..HEAD) where the paired ADR is Accepted, or at the base if the
@@ -35,13 +35,14 @@ Enforces:
   symlink to ``docs/adr-archive/`` when ``docs/adr-archive/move.json`` records
   that path, link, and sha256. The archived bytes must stay identical to the
   frozen Accepted snapshot. Any other content change still fails.
-- A new decision lives at ``docs/adr/transient/T-<slug>.md`` (D242). It names
-  one target slot from A01 to A15 and stays Proposed until accepted under
-  docs/adr/transient/README.md (David, or Claude and Codex consensus for no
-  wire-format or public-API change). Review verifies the acceptance evidence.
-  After acceptance, the body bytes stay frozen across later commits and
-  folding. Deleting or editing those bytes fails. Folding is recorded in
-  ``T-<slug>.folded.md``. That overlay does not change the Accepted bytes.
+- Existing transient records use ``docs/adr/transient/T-<slug>.md`` (D242).
+  The validator retains their structure and lifecycle checks. After acceptance,
+  body bytes stay frozen across later commits and folding. Deleting or editing
+  those bytes fails. Existing ``T-<slug>.folded.md`` overlays do not change
+  the Accepted bytes. See docs/adr/transient/README.md for the current
+  authoring rule: no new ADR files, including transient records or overlays.
+  Review enforces that rule and verifies any required approval; this validator
+  does not enforce the no-new-file prohibition or reviewer identity.
   One exception (David, 15 Oct 2026, D280): pull request 1401 may change
   ``docs/adr/transient/T-installed-catchup-admin-consent.md`` in place.
   One exception (David, 16 Oct 2026): pull request 1337 may replace

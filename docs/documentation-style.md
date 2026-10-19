@@ -40,7 +40,8 @@ dictionary words to manufacture an 80% score.
 Use this style for new and changed text. Improve editable old prose when that
 work is in scope. Preserve accepted ADRs, frozen evidence, exact quotations,
 protocol identifiers and retained historical reports. Do not rewrite immutable
-records only to meet the style target. Use a proposed successor revision.
+records only to meet the style target. Put the rationale in existing docs
+or code comments and the PR body; follow the current no-new-ADR rule.
 
 The same style applies to agent updates, review notes, PR descriptions and
 answers to David. Retain technical detail needed to make a decision.
