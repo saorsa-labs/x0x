@@ -1,10 +1,10 @@
 # T-self-update-host-backup-guard: one host keeps one previous binary
 
-- **Status:** Accepted — Claude+Codex consensus under David's 19 Oct 2026 rule (no wire/API change), 19 Oct 2026
+- **Status:** Proposed (awaiting Claude+Codex no-wire/no-API acceptance on the RC5 head under David's 19 Oct 2026 rule)
 - **Target slot:** A14
 - **Date:** 2026-10-18
 - **Decision owners:** David Irvine
-- **Reviewers:** Claude and Codex, accepted on the RC4 head under David's 19 Oct 2026 rule (no wire/API change), with exact-head approvals on the PR
+- **Reviewers:** pending
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** x0x #1447; draft #1410 / #1106; Accepted ADR 0094 §2.
@@ -41,9 +41,10 @@ Draft #1410 must reuse it, not add a second lock.
    holder dies. Reclaim must not unlink a held lock file. The companion `x0x`
    CLI uses the same mechanism with its own lock file.
 2. If on-disk bytes match the incoming binary, skip backup and replace only.
-   Public `perform_upgrade` still reports `NoUpgrade`. The
-   restart-on-already-installed path is internal: auto-apply uses a
-   crate-internal finish helper that returns `Success` so admission can still
+   Public `perform_upgrade` still returns `Success` with the requested
+   version — the same public result as main for older current / newer
+   requested / equal disk and incoming bytes. The restart-on-already-installed
+   path is internal: auto-apply uses that `Success` so admission can still
    own restart for an old-running process.
 3. If they differ, copy to `<target>.backup`, then replace. Release after that
    replace for this legacy guard. That short hold does not weaken Accepted
@@ -54,7 +55,11 @@ Draft #1410 must reuse it, not add a second lock.
 6. After every host lock is held and the async caller is still alive,
    replacement is admitted. From then the blocking worker owns restart.
    Cancel after admission must not leave installed bytes without that owner.
-   Pre-admission cancel still refuses mutation.
+   Pre-admission cancel still refuses mutation. A fallible hand-off of the
+   deferred restart owner (for example `Builder::spawn`) must either refuse
+   before mutation or keep exactly one continuation or fallback owner; it
+   must not report Success with `restart_scheduled: true` after dropping the
+   only owner.
 7. HTTP apply opts into an explicit crate-internal deferred-restart mode.
    `apply.rs` owns one deferred restart (~750 ms delay, shared planner) that
    survives HTTP-task cancel and Tokio async shutdown. A detached
@@ -84,10 +89,11 @@ Wire, public API, routes, JSON and schemas stay unchanged under David's rule.
 
 ## Validation
 
-Two-process barrier tests assert backup and target bytes. RC4 covers HTTP
-opt-in versus CLI, cancel in the defer window (one restart), cleanup before
-exit continuation, and public `NoUpgrade` with internal restart-owner
-`Success`.
+Two-process barrier tests assert backup and target bytes. RC5 covers HTTP
+opt-in versus CLI, cancel in the defer window (one restart), spawn failure
+before mutation (refuse, no orphan owner), cleanup before exit continuation,
+and public `Success` on matching bytes (unchanged from main) with internal
+restart-owner `Success`.
 
 ## Notes for AI-assisted work
 

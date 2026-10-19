@@ -198,12 +198,12 @@ fn fixture_role_host_backup_apply_worker() {
         .expect("perform_upgrade");
 
     // Skip leaves the incoming path in place; replace renames it onto the target.
-    // Public perform_upgrade reports NoUpgrade on an already-matching disk
-    // (#1447 RC4); replace still returns Success.
+    // Public perform_upgrade reports Success on an already-matching disk
+    // (same observable result as main; #1447 RC5). Replace is also Success.
     let kind = if incoming.exists() {
         assert!(
-            matches!(outcome, UpgradeResult::NoUpgrade),
-            "disk-already-matches must be public NoUpgrade: {outcome:?}"
+            matches!(outcome, UpgradeResult::Success { .. }),
+            "disk-already-matches must be public Success (main-compatible): {outcome:?}"
         );
         "skipped"
     } else {
@@ -343,7 +343,7 @@ fn two_processes_preserve_original_backup_unconditionally() {
 }
 
 /// Two old-running units (both `current_version` older than the candidate)
-/// share one on-disk target: one replaces, one may skip (public NoUpgrade);
+/// share one on-disk target: one replaces, one may skip (both public Success);
 /// backup keeps pre-upgrade bytes.
 #[test]
 fn two_old_processes_one_shared_target_both_succeed() {

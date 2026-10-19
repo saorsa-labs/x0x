@@ -16,12 +16,106 @@ use sha2::{Digest, Sha256};
 use super::manifest::{current_platform_target, ReleaseManifest};
 use super::restart;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
-use super::{HostMatchOutcome, UpgradeError, UpgradeResult, Upgrader};
+use super::{UpgradeError, UpgradeResult, Upgrader};
 
 /// Delay before the HTTP-owned deferred restart so the apply response can flush.
 /// Shared with the historical route helper's 750 ms window (#261 / #1447 RC4).
 pub(crate) const HTTP_DEFERRED_RESTART_DELAY: std::time::Duration =
     std::time::Duration::from_millis(750);
+
+/// Arm the HTTP deferred-restart owner before any host mutation (#1447 RC5).
+///
+/// Spawns a parked OS thread first. On `Builder::spawn` failure, returns `Err`
+/// so the caller can refuse the apply before backup/replace. On success, the
+/// returned closure releases that single owner at admission (`send`); if the
+/// apply fails or is cancelled before admission, dropping the sender makes the
+/// parked thread exit without restarting.
+fn arm_http_deferred_restart_owner(
+    binary_name: String,
+    stop_on_upgrade: bool,
+    restart_context: RestartContext,
+    restart_plan: restart::RestartPlan,
+    version: String,
+) -> Result<Box<dyn FnOnce() + Send>, std::io::Error> {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    spawn_http_deferred_restart_thread(move || match go_rx.recv() {
+        Ok(()) => {
+            std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
+            let owner = AutoApplyUpgrader::new(&binary_name)
+                .with_stop_on_upgrade(stop_on_upgrade)
+                .with_restart_context(restart_context)
+                .with_restart_on_success(false);
+            if let Err(e) = owner.trigger_restart(&restart_plan, &version) {
+                warn!(
+                    error = %e,
+                    installed_bytes = true,
+                    restart = "not_started",
+                    readiness_observed = false,
+                    "Deferred HTTP restart after successful upgrade did not start: {e}; \
+                     old process keeps serving"
+                );
+            }
+        }
+        Err(_) => {
+            // Pre-admission cancel / apply failure: sender dropped; no restart.
+        }
+    })?;
+    Ok(Box::new(move || {
+        if go_tx.send(()).is_err() {
+            warn!(
+                installed_bytes = true,
+                restart = "not_started",
+                "HTTP deferred-restart owner gone before admission signal"
+            );
+        }
+    }))
+}
+
+/// Spawn the parked HTTP deferred-restart thread (test seam can force failure).
+fn spawn_http_deferred_restart_thread<F>(f: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    if deferred_spawn_seam::should_fail() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "injected HTTP deferred-spawn failure",
+        ));
+    }
+    std::thread::Builder::new()
+        .name("x0x-http-deferred-restart".to_string())
+        .spawn(f)
+}
+
+/// cfg(test) only: force `spawn_http_deferred_restart_thread` to return
+/// `WouldBlock` so RC5 can prove refuse-before-mutation (and prove the RC4
+/// post-admission pattern loses the only owner).
+#[cfg(test)]
+pub(crate) mod deferred_spawn_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn force_would_block() -> Guard {
+        FAIL.store(true, Ordering::SeqCst);
+        Guard { _private: () }
+    }
+
+    pub(crate) fn should_fail() -> bool {
+        FAIL.load(Ordering::SeqCst)
+    }
+}
 
 /// Removes an upgrade temp dir when dropped, so it is never leaked on an
 /// early-return error path (e.g. a failed binary replace on Windows, which
@@ -160,21 +254,13 @@ async fn apply_replacements_offloaded(
         // owns mutation through on_success — the async caller is only an
         // observer and may be cancelled without orphaning restart.
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
-            match x0x_upgrader.finish_upgrade_under_host_lock(
-                &extracted_x0x,
-                &target_version,
-                HostMatchOutcome::RestartOwner,
-            ) {
+            match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
                 Ok(_) => info!("x0x companion upgraded successfully"),
                 Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
             }
         }
 
-        let result = upgrader.finish_upgrade_under_host_lock(
-            &extracted_path,
-            &target_version,
-            HostMatchOutcome::RestartOwner,
-        )?;
+        let result = upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version)?;
         if matches!(result, UpgradeResult::Success { .. }) {
             if let Some(cont) = on_success.take() {
                 // Clean temp before a continuation that may `_exit` / `exit`
@@ -526,39 +612,23 @@ impl AutoApplyUpgrader {
                 }
             }))
         } else if self.http_deferred_restart {
-            Some(Box::new(move || {
-                // OS thread survives Tokio task cancel and runtime shutdown of
-                // async tasks; a detached tokio::spawn alone does not.
-                let spawn_result = std::thread::Builder::new()
-                    .name("x0x-http-deferred-restart".to_string())
-                    .spawn(move || {
-                        std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
-                        let owner = AutoApplyUpgrader::new(&binary_name)
-                            .with_stop_on_upgrade(stop_on_upgrade)
-                            .with_restart_context(restart_context)
-                            .with_restart_on_success(false);
-                        if let Err(e) =
-                            owner.trigger_restart(&restart_plan_for_cont, &version_for_cont)
-                        {
-                            warn!(
-                                error = %e,
-                                installed_bytes = true,
-                                restart = "not_started",
-                                readiness_observed = false,
-                                "Deferred HTTP restart after successful upgrade did not start: {e}; \
-                                 old process keeps serving"
-                            );
-                        }
-                    });
-                if let Err(e) = spawn_result {
-                    warn!(
-                        error = %e,
-                        installed_bytes = true,
-                        restart = "not_started",
-                        "Failed to spawn HTTP deferred-restart owner after admission"
-                    );
-                }
-            }))
+            // RC5: create the parked deferred owner *before* host mutation so a
+            // Builder::spawn failure refuses the apply instead of returning
+            // Success / restart_scheduled:true with no owner.
+            Some(
+                arm_http_deferred_restart_owner(
+                    binary_name,
+                    stop_on_upgrade,
+                    restart_context,
+                    restart_plan_for_cont,
+                    version_for_cont,
+                )
+                .map_err(|e| {
+                    UpgradeError::Other(format!(
+                        "failed to create HTTP deferred-restart owner before apply: {e}"
+                    ))
+                })?,
+            )
         } else {
             None
         };
@@ -2543,6 +2613,125 @@ mod tests {
             !installed || restarted,
             "late cancel before result consumption must not detach restart \
              (installed={installed}, restarted={restarted})"
+        );
+    }
+
+    /// RC5: `Builder::spawn` WouldBlock before mutation must refuse the apply
+    /// (no host bytes changed, no Success / restart_scheduled without an owner).
+    /// Red on RC4 (`f2f10b22`): spawn ran inside `on_success` after replace,
+    /// warned, and still returned Success with the only owner dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_deferred_spawn_failure_refuses_before_host_mutation() {
+        let _seam = deferred_spawn_seam::force_would_block();
+
+        let root = TempDir::new().unwrap();
+        let primary = root.path().join("x0xd");
+        let old = b"old-daemon";
+        std::fs::write(&primary, old).unwrap();
+        let data_root = root.path().join("data");
+        std::fs::create_dir(&data_root).unwrap();
+
+        let plan = restart::RestartPlan {
+            mode: restart::RestartMode::TransactionalHandoff,
+            supervised_exit_code: None,
+            supervision_signal: None,
+            executable: primary.clone(),
+            argv: vec!["x0xd".into()],
+            cwd: root.path().to_path_buf(),
+            data_root,
+            api_addr: "127.0.0.1:9".parse().unwrap(),
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+
+        let arm = arm_http_deferred_restart_owner(
+            "x0xd".into(),
+            true,
+            RestartContext::default(),
+            plan,
+            "2.0.0".into(),
+        );
+        assert!(
+            arm.is_err(),
+            "spawn failure must refuse before apply_replacements_offloaded"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            old,
+            "host bytes must be untouched when deferred-owner spawn fails"
+        );
+
+        // Control flow mirror of apply_upgrade_from_manifest: never call
+        // apply_replacements_offloaded when arming fails.
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let incoming = scratch.join("daemon");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+        // No on_success / no offload — production returns Err at arm time.
+        assert_eq!(std::fs::read(&primary).unwrap(), old);
+        assert!(
+            incoming.exists(),
+            "incoming must remain when apply is refused"
+        );
+    }
+
+    /// RC5: production arming + offload keeps exactly one owner when spawn works,
+    /// and never reaches offload when spawn fails (paired with refuse test).
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_deferred_arm_then_admission_runs_exactly_one_restart() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let primary = root.path().join("x0xd");
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        let incoming = scratch.join("daemon");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+        let data_root = root.path().join("data");
+        std::fs::create_dir(&data_root).unwrap();
+
+        let restart_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&restart_count);
+        // Production arm path, but restart body writes a counter instead of
+        // trigger_restart (avoid non-returning handoff in-unit).
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        spawn_http_deferred_restart_thread(move || {
+            if go_rx.recv().is_ok() {
+                std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
+                counter.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        })
+        .expect("normal spawn must succeed");
+        let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let _ = go_tx.send(());
+        }));
+
+        let result = apply_replacements_offloaded(
+            Upgrader::new(primary, semver::Version::new(1, 0, 0)),
+            incoming,
+            semver::Version::new(2, 0, 0),
+            None,
+            TempDirGuard { path: scratch },
+            on_success,
+        )
+        .await
+        .expect("replace");
+        assert!(matches!(result, UpgradeResult::Success { .. }));
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while restart_count.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("deferred owner must fire");
+        tokio::time::sleep(HTTP_DEFERRED_RESTART_DELAY + Duration::from_millis(100)).await;
+        assert_eq!(
+            restart_count.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one deferred restart owner after admission"
         );
     }
 
