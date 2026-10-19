@@ -19957,8 +19957,11 @@ impl NotMemberJoinRow {
         match self {
             Self::JoinFailed => Some(api_error(
                 StatusCode::CONFLICT,
-                "join failed: this device is not a member and has no invite lineage; \
-                 contact the authority device to recover membership and request a fresh invite",
+                "join failed: this device holds a lineage-free not_member group row; \
+                 a fresh invite is refused before invite handling, DELETE /groups/:id \
+                 leave requires an active seat, and clear_stale_not_member_join_row \
+                 only clears UnseatedJoinRemnant — no supported recovery path exists \
+                 for this shape",
             )),
             Self::Quarantined => Some(api_error_with_reason(
                 StatusCode::CONFLICT,

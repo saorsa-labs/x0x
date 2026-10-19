@@ -34,8 +34,16 @@ fn absent_lineage_reports_failed_join_with_existing_error_shape_and_remedy() {
     assert_eq!(body.as_object().expect("error object").len(), 2);
     let error = body["error"].as_str().expect("existing error field");
     assert!(error.contains("join failed"));
-    assert!(error.contains("authority device"));
-    assert!(error.contains("fresh invite"));
+    assert!(error.contains("lineage-free not_member"));
+    assert!(error.contains("fresh invite is refused"));
+    assert!(error.contains("DELETE /groups/:id"));
+    assert!(error.contains("active seat"));
+    assert!(error.contains("UnseatedJoinRemnant"));
+    assert!(error.contains("no supported recovery path"));
+    // Honest remedy: do not claim authority/fresh-invite recovery works for
+    // this shape — those steps leave the local row unchanged.
+    assert!(!error.contains("authority device"));
+    assert!(!error.contains("request a fresh invite"));
     assert_eq!(serde_json::to_value(&info).expect("snapshot"), before);
 }
 
