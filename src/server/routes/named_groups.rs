@@ -10003,7 +10003,7 @@ async fn request_treekem_catchup_for_gap(
             {
                 continue;
             }
-            throttle.insert(throttle_key, Instant::now());
+            throttle.insert(throttle_key, tokio::time::Instant::now());
         }
         let request = TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),
@@ -11755,7 +11755,7 @@ async fn request_treekem_catchup_for_epoch_ahead(
     let mut renew = false;
     let mut asked = HashSet::new();
     // When the current pass over the candidates started.
-    let mut since = Instant::now();
+    let mut since = tokio::time::Instant::now();
     let mut round = 0;
     loop {
         if round > 0 {
@@ -11778,7 +11778,7 @@ async fn request_treekem_catchup_for_epoch_ahead(
         }
         if renewed || latest.observations > covered {
             asked.clear();
-            since = Instant::now();
+            since = tokio::time::Instant::now();
         }
         covered = latest.observations;
         let outcome =
@@ -11846,7 +11846,7 @@ async fn request_treekem_catchup_round(
     group_id: &str,
     target_epoch: u64,
     round: usize,
-    since: Instant,
+    since: tokio::time::Instant,
     asked: &mut HashSet<AgentId>,
 ) -> Option<bool> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -11900,7 +11900,7 @@ async fn request_treekem_catchup_round(
         let chosen = epoch_ahead_catchup_peers([fresh, repeat].concat(), |peer| {
             throttle.get(&throttle_key(peer)).copied()
         });
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         for peer in &chosen {
             throttle.insert(throttle_key(peer), now);
         }
@@ -11931,9 +11931,9 @@ async fn request_treekem_catchup_round(
 /// members instead of asking the same few again.
 fn epoch_ahead_catchup_peers(
     candidates: Vec<AgentId>,
-    last_asked: impl Fn(&AgentId) -> Option<Instant>,
+    last_asked: impl Fn(&AgentId) -> Option<tokio::time::Instant>,
 ) -> Vec<AgentId> {
-    let mut open: Vec<(Option<Instant>, AgentId)> = candidates
+    let mut open: Vec<(Option<tokio::time::Instant>, AgentId)> = candidates
         .into_iter()
         .map(|peer| (last_asked(&peer), peer))
         .filter(|(last, _)| last.is_none_or(|last| last.elapsed() >= TREEKEM_CATCHUP_THROTTLE))
@@ -12015,7 +12015,7 @@ async fn request_member_key_package_catchup(
             {
                 continue;
             }
-            throttle.insert(throttle_key, Instant::now());
+            throttle.insert(throttle_key, tokio::time::Instant::now());
         }
         let request = TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),

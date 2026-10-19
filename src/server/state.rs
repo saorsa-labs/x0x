@@ -1202,8 +1202,9 @@ pub(super) struct AppState {
     /// global count/byte limits, and owns lifecycle pruning, serialized
     /// persistence, dirty retry state, and diagnostics.
     pub(super) treekem_member_key_packages: super::routes::TreeKemMemberKeyPackageCache,
-    /// Anti-spam throttle for outbound catch-up requests.
-    pub(super) treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
+    /// Anti-spam throttle for outbound catch-up requests. It runs on the
+    /// runtime clock, as the catch-up rounds do (#1427).
+    pub(super) treekem_catchup_throttle: RwLock<HashMap<String, tokio::time::Instant>>,
     /// #1427: per group key, the epoch-ahead traffic seen while an
     /// epoch-ahead catch-up task runs for that group. An entry means one
     /// task runs; each later observation updates the entry.
