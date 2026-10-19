@@ -19964,14 +19964,21 @@ impl NotMemberJoinRow {
                 // admission is request_access, an eligible non-member may still
                 // submit POST /groups/:id/requests; admin approval seats them
                 // (card-import stubs are the intended producer of this shape).
+                // After a lost join result the authority may already have
+                // seated this non-banned device; its JoinRequestCreated
+                // handler then rejects, so "wait for approval" never
+                // completes — advise catch-up of that seating instead.
                 let mut message = String::from(
                     "join failed: this device already has a local group record with no \
                      invite lineage and no seat; a fresh invite cannot replace that record",
                 );
                 if info.policy.admission == x0x::groups::GroupAdmission::RequestAccess {
                     message.push_str(
-                        "; if you are not banned, request access with \
-                         POST /groups/:id/requests and wait for an admin to approve",
+                        "; if you are not banned and the authority has not already \
+                         seated this device, request access with POST /groups/:id/requests \
+                         and wait for an admin to approve; if a prior join already seated \
+                         you there, a new request is rejected — wait for that seating \
+                         result or group catch-up instead",
                     );
                 }
                 Some(api_error(StatusCode::CONFLICT, message))
