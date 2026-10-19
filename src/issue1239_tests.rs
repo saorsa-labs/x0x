@@ -546,6 +546,7 @@ async fn issue1239_lookup_worker_awaits_current_thread_driver() {
     }
 }
 
+mod address_hints;
 mod connector;
 mod fallback;
 mod shutdown;
