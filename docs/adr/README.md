@@ -23,8 +23,9 @@ the transfer on 10 Oct 2026. The slot files stay Proposed. A new or changed
 decision is `docs/adr/transient/T-<slug>.md` (D242). It names one target
 slot from A01 to A15. Write 300 to 600 words. Use about 80% ASD-STE100
 style. Follow the [style guide](../documentation-style.md). It stays
-Proposed until David accepts it. David folds it into that slot only when
-he asks. The reserved numbers and 0109–0114 acceptance lanes
+Proposed until accepted under the [transient acceptance rule](transient/README.md):
+David, or Claude and Codex consensus for no wire-format or public-API change.
+David folds it into that slot only when he asks. The reserved numbers and 0109–0114 acceptance lanes
 stand; slot revisions are drafts.
 
 D200 confirms ADR 0040's `owner_agent` and current-owner-signed transfers;

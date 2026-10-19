@@ -16,7 +16,8 @@ instead of a number. See docs/adr/transient/README.md. -->
 D242: the 15 current ADRs are the A01-A15 slots. Do not add a new numbered
 ADR. Record a new or changed decision as a transient decision in
 docs/adr/transient/T-<slug>.md that names one target slot (see
-docs/adr/transient/README.md). Only David accepts it. Keep reserved numbers
+docs/adr/transient/README.md). Acceptance follows that rule: David, or
+Claude and Codex consensus for no wire-format or public-API change. Keep reserved numbers
 0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63); slices
 0109–0114 continue through numbered acceptance. -->
 
@@ -60,4 +61,4 @@ How will we know this decision remains correct? Include tests, metrics, audit ch
 
 ## Notes for AI-assisted work
 
-AI tools may help draft this ADR, but **must not mark it Accepted without human review**. Accepted ADRs are immutable: create a new superseding ADR rather than editing an Accepted ADR.
+AI tools may help draft this ADR. Acceptance requires David, or Claude and Codex consensus for a transient ADR with no wire-format or public-API change. Record acceptance as specified in [the transient rules](transient/README.md). Accepted ADRs are immutable: create a new superseding ADR rather than editing an Accepted ADR.

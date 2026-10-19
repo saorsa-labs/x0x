@@ -45,7 +45,9 @@ past accepted revisions do not count. A new or changed decision is
 `docs/adr/transient/T-<slug>.md` (D242). It names one target slot from A01
 to A15. Write 300 to 600 words. Use about 80% ASD-STE100 style. Follow
 [the style guide](../../documentation-style.md). It stays Proposed until
-David accepts it. David folds it into that slot only when he asks. Slot
+accepted under the [transient acceptance rule](../transient/README.md):
+David, or Claude and Codex consensus for no wire-format or public-API change.
+David folds it into that slot only when he asks. Slot
 revisions stay Proposed. The transition check
 rejects an Accepted slot.
 Keep reserved numbers

@@ -53,7 +53,7 @@ The durable rebuild runs only after the carrier opens under this rule. An incomp
 
 ### Neutral / Operational
 
-- This file does not change the Accepted record. The status stays Proposed until David accepts it. Do not fold it until David asks.
+- This file does not change the Accepted record. The status stays Proposed until accepted under the [transient acceptance rule](README.md). Do not fold it until David asks.
 
 ## Validation
 
@@ -61,4 +61,4 @@ Isolated tests must show four results. Two free agent keys do not open a carrier
 
 ## Notes for AI-assisted work
 
-Do not mark this record Accepted. Do not edit `T-revocation-store-corrupt.md`. Do not fold this file.
+Acceptance follows the [transient acceptance rule](README.md). Do not edit `T-revocation-store-corrupt.md`. Do not fold this file.
