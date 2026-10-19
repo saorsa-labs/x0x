@@ -1284,11 +1284,16 @@ async fn clear_preserves_mls_key_installed_while_waiting_on_treekem_writer() -> 
     Ok(())
 }
 
-/// #1463 RC2 / Claude+Codex P1: clear for group Y and a TreeKEM final
-/// install for group X must share TreeKEM → named_groups order. On
-/// dc4bb502 (named_groups then TreeKEM in clear) this pair deadlocks;
-/// with the fixed order both complete under a short timeout.
-#[tokio::test]
+/// #1463 RC3 / Codex P2: clear for group Y and a TreeKEM final install
+/// for group X must share TreeKEM → named_groups order at the *final*
+/// install locks. Parking install only on a preliminary named_groups read
+/// (RC2) let clear finish first under `(clear.await, install.await)`, so
+/// the old named_groups→TreeKEM clear order still passed. Hold install at
+/// `notify_before_treekem_final_install_map_write` (owns the wait for
+/// TreeKEM; next lock is named_groups.read), queue clear behind the same
+/// TreeKEM hold, then release and `join!` both — dc4bb502 deadlocks;
+/// TreeKEM→MLS→named_groups completes under the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clear_and_other_group_treekem_final_install_do_not_deadlock() -> Result<()> {
     use std::future::{poll_fn, Future};
     use std::task::Poll;
@@ -1316,9 +1321,30 @@ async fn clear_and_other_group_treekem_final_install_do_not_deadlock() -> Result
     install_info.security_binding = Some(format!("treekem:epoch={epoch}"));
     install_info.recompute_state_hash();
 
-    // Hold TreeKEM so both futures queue on the first lock of the established
-    // order, then release and require both to finish (no cross-wait wedge).
-    let blocked = state.treekem_groups.write().await;
+    // Hold TreeKEM so install can finish its preliminary named_groups work
+    // and park at the final map-write (same seam as the withdrawal recheck
+    // regression). That is the inversion site vs clear.
+    let map_guard = state.treekem_groups.write().await;
+    let (notify, _notify_guard) =
+        super::notify_before_treekem_final_install_map_write(&install_group);
+    let state_for_install = Arc::clone(&state);
+    let install_group_for_task = install_group.clone();
+    let install = tokio::spawn(async move {
+        install_joined_treekem_group_after_crypto_recheck(
+            state_for_install.as_ref(),
+            &install_group_for_task,
+            install_info,
+            treekem,
+            "test_1161_clear_vs_treekem_install_order",
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), notify.notified())
+        .await
+        .context("install did not reach the final TreeKEM map write")?;
+
+    // Install is past preliminary named_groups reads and waiting on TreeKEM.
+    // Start clear now so it contends at the final locks (not the prelim read).
     let mut clear = Box::pin(clear_stale_not_member_join_row(
         state.as_ref(),
         &clear_group,
@@ -1326,32 +1352,24 @@ async fn clear_and_other_group_treekem_final_install_do_not_deadlock() -> Result
         &clear_group,
         &owner_hex,
     ));
-    let mut install = Box::pin(install_joined_treekem_group_after_crypto_recheck(
-        state.as_ref(),
-        &install_group,
-        install_info,
-        treekem,
-        "test_1161_clear_vs_treekem_install_order",
-    ));
     poll_fn(|cx| {
         assert!(
             matches!(clear.as_mut().poll(cx), Poll::Pending),
-            "clear must wait on treekem_groups"
-        );
-        assert!(
-            matches!(install.as_mut().poll(cx), Poll::Pending),
-            "TreeKEM final install must wait on treekem_groups"
+            "clear must queue behind the held treekem_groups writer"
         );
         Poll::Ready(())
     })
     .await;
-    drop(blocked);
+    drop(map_guard);
 
-    let (clear_outcome, install_result) = tokio::time::timeout(Duration::from_secs(2), async {
-        (clear.await, install.await)
+    // Concurrent progress is required: sequential await lets clear finish
+    // before install resumes and hides the old-order wedge.
+    let (clear_outcome, install_join) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(clear, install)
     })
     .await
     .context("clear vs TreeKEM final install deadlocked (named_groups↔treekem inversion)")?;
+    let install_result = install_join.context("install task panicked")?;
     assert_eq!(
         clear_outcome,
         ClearStaleNotMemberJoinRowResult::Cleared,
