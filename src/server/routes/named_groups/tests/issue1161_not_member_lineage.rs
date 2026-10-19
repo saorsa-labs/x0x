@@ -864,6 +864,41 @@ async fn inert_stub_refusal_controls_secret_removed_banned_quarantine_withdrawn_
         assert!(joiner_state.named_groups.read().await.contains_key(&group));
     }
 
+    // existing MLS key on the inert stub — refuse without clearing or deleting key
+    {
+        let stub = card_import_stub(authority_id, &group, &joiner_hex);
+        joiner_state
+            .named_groups
+            .write()
+            .await
+            .insert(group.clone(), stub);
+        let group_bytes = hex::decode(&group).expect("group id hex");
+        let mls = x0x::mls::MlsGroup::new(group_bytes, joiner_state.agent.agent_id())
+            .await
+            .expect("mls group");
+        joiner_state
+            .mls_groups
+            .write()
+            .await
+            .insert(group.clone(), mls);
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner_state)),
+            Json(JoinGroupRequest {
+                invite: link_a.clone(),
+                display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(joiner_state.named_groups.read().await.contains_key(&group));
+        assert!(joiner_state.mls_groups.read().await.contains_key(&group));
+        joiner_state.mls_groups.write().await.remove(&group);
+        joiner_state.named_groups.write().await.remove(&group);
+    }
+
     // removed / banned
     for member_state in [
         x0x::groups::GroupMemberState::Removed,
@@ -1182,6 +1217,68 @@ async fn inert_stub_survives_disk_reload_then_clears_on_verified_invite() -> Res
     assert_eq!(
         body["join_state"].as_str(),
         Some("pending_authority_commit")
+    );
+    Ok(())
+}
+
+/// #1463 / Codex P2: keyed exclusion must be atomic with replacement.
+/// Holding `named_groups` write, poll clear to its first wait, insert MLS
+/// (as `POST /mls/groups` does without the membership guard), then release:
+/// the concurrent keyed object and the inert stub must both survive.
+#[tokio::test]
+async fn clear_preserves_mls_key_installed_while_waiting_on_named_groups_writer() -> Result<()> {
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group = hex::encode(blake3::hash(b"1161-stub-concurrent-key").as_bytes());
+    let owner = AgentId([0x11; 32]);
+    let owner_hex = hex::encode(owner.as_bytes());
+    let joiner_hex = hex::encode(AgentId([0x22; 32]).as_bytes());
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group.clone(), card_import_stub(owner, &group, &joiner_hex));
+
+    let blocked = state.named_groups.write().await;
+    let mut clear = Box::pin(clear_stale_not_member_join_row(
+        state.as_ref(),
+        &group,
+        &joiner_hex,
+        &group,
+        &owner_hex,
+    ));
+    poll_fn(|cx| {
+        assert!(
+            matches!(clear.as_mut().poll(cx), Poll::Pending),
+            "clear must wait on the held named_groups writer before keyed recheck"
+        );
+        Poll::Ready(())
+    })
+    .await;
+
+    // create_mls_group inserts without taking a group-membership guard.
+    let group_bytes = hex::decode(&group).expect("group id hex");
+    let mls = x0x::mls::MlsGroup::new(group_bytes, state.agent.agent_id())
+        .await
+        .expect("mls group");
+    state.mls_groups.write().await.insert(group.clone(), mls);
+    drop(blocked);
+
+    let outcome = clear.await;
+    assert_eq!(
+        outcome,
+        ClearStaleNotMemberJoinRowResult::RefusedKeyedMaterial,
+        "keyed recheck under the write hold must refuse, not clear"
+    );
+    assert!(
+        state.mls_groups.read().await.contains_key(&group),
+        "concurrent keyed MLS object was deleted"
+    );
+    assert!(
+        state.named_groups.read().await.contains_key(&group),
+        "inert stub must remain when keyed material blocks clear"
     );
     Ok(())
 }

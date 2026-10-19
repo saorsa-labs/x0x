@@ -20128,83 +20128,114 @@ fn classify_not_member_join_row(
 /// (remnant clear / re-arm), `POST /groups/:id/requests` when admission is
 /// request_access, or card re-import then request_access / invite again —
 /// the cleared stub is not silently restored.
+///
+/// Outcome of [`clear_stale_not_member_join_row`]: a keyed-material refusal
+/// must stop the join route before replacement; other non-clears leave the
+/// ordinary first-join path to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearStaleNotMemberJoinRowResult {
+    Cleared,
+    /// No clearable row matched (already gone, shape changed, alias, …).
+    Unchanged,
+    /// Inert card stub still present with TreeKEM / MLS keyed material —
+    /// replacement must refuse (`JoinFailed`), not continue.
+    RefusedKeyedMaterial,
+}
+
+fn inert_stub_has_keyed_crypto<T, M>(
+    key: &str,
+    info: &x0x::groups::GroupInfo,
+    treekem: &HashMap<String, T>,
+    mls: &HashMap<String, M>,
+) -> bool {
+    treekem.contains_key(key)
+        || treekem.contains_key(info.mls_group_id.as_str())
+        || treekem.contains_key(info.stable_group_id())
+        || mls.contains_key(key)
+        || mls.contains_key(info.mls_group_id.as_str())
+        || mls.contains_key(info.stable_group_id())
+}
+
 async fn clear_stale_not_member_join_row(
     state: &AppState,
     group_id_hex: &str,
     joiner_hex: &str,
     invite_stable_group_id: &str,
     invite_owner_hex: &str,
-) {
-    // Peek keyed crypto before taking the groups write lock so an inert
-    // stub that somehow holds a TreeKEM / legacy MLS group is not cleared.
-    // The caller holds the membership guard, so install races for this
-    // group cannot interleave.
-    let keyed_crypto: HashSet<String> = {
-        let treekem = state.treekem_groups.read().await;
-        let mls = state.mls_groups.read().await;
-        treekem.keys().chain(mls.keys()).cloned().collect()
-    };
-    let cleared: Vec<String> = {
-        let mut groups = state.named_groups.write().await;
-        let keys: Vec<String> = groups
-            .iter()
-            .filter(|(key, info)| {
-                if key.as_str() != group_id_hex && info.mls_group_id != group_id_hex {
-                    return false;
+) -> ClearStaleNotMemberJoinRowResult {
+    // Hold named-group + crypto writers together so an inert-stub keyed
+    // exclusion cannot race `POST /mls/groups` (which inserts into
+    // `mls_groups` without the join membership guard). Snapshot-then-wait
+    // would clear the card row and then delete a session object installed
+    // while waiting on `named_groups`.
+    let mut groups = state.named_groups.write().await;
+    let mut treekem = state.treekem_groups.write().await;
+    let mut mls = state.mls_groups.write().await;
+
+    let mut refused_keyed = false;
+    let mut keys: Vec<String> = Vec::new();
+    for (key, info) in groups.iter() {
+        if key.as_str() != group_id_hex && info.mls_group_id != group_id_hex {
+            continue;
+        }
+        match classify_not_member_join_row(info, joiner_hex) {
+            NotMemberJoinRow::UnseatedJoinRemnant => keys.push(key.clone()),
+            NotMemberJoinRow::InertCardImportStub => {
+                let eligible_shape = is_inert_card_import_stub_shape(info, joiner_hex)
+                    && inert_stub_matches_verified_invite(
+                        info,
+                        invite_stable_group_id,
+                        invite_owner_hex,
+                    )
+                    && !has_conflicting_same_stable_alias(&groups, key, info);
+                if !eligible_shape {
+                    continue;
                 }
-                match classify_not_member_join_row(info, joiner_hex) {
-                    NotMemberJoinRow::UnseatedJoinRemnant => true,
-                    NotMemberJoinRow::InertCardImportStub => {
-                        is_inert_card_import_stub_shape(info, joiner_hex)
-                            && inert_stub_matches_verified_invite(
-                                info,
-                                invite_stable_group_id,
-                                invite_owner_hex,
-                            )
-                            && !has_conflicting_same_stable_alias(&groups, key, info)
-                            && !keyed_crypto.contains(key.as_str())
-                            && !keyed_crypto.contains(info.mls_group_id.as_str())
-                            && !keyed_crypto.contains(info.stable_group_id())
-                    }
-                    _ => false,
+                if inert_stub_has_keyed_crypto(key, info, &treekem, &mls) {
+                    refused_keyed = true;
+                } else {
+                    keys.push(key.clone());
                 }
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in &keys {
-            groups.remove(key);
-        }
-        keys
-    };
-    if cleared.is_empty() {
-        return;
-    }
-    {
-        let mut treekem = state.treekem_groups.write().await;
-        for key in &cleared {
-            treekem.remove(key);
+            }
+            _ => {}
         }
     }
-    {
-        let mut mls = state.mls_groups.write().await;
-        for key in &cleared {
-            mls.remove(key);
-        }
+
+    if keys.is_empty() {
+        return if refused_keyed {
+            ClearStaleNotMemberJoinRowResult::RefusedKeyedMaterial
+        } else {
+            ClearStaleNotMemberJoinRowResult::Unchanged
+        };
     }
+
+    for key in &keys {
+        groups.remove(key);
+        // Remnants may hold leftover TreeKEM; inert stubs reach here only
+        // when the live keyed check was empty, so these removes are no-ops
+        // for that shape and cannot delete a concurrent install.
+        treekem.remove(key);
+        mls.remove(key);
+    }
+    drop(mls);
+    drop(treekem);
+    drop(groups);
+
     {
         let mut stubs = state
             .pending_join_stubs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for key in &cleared {
+        for key in &keys {
             stubs.remove(key);
         }
     }
     tracing::info!(
         group_id = %LogHexId::group(group_id_hex),
-        cleared = cleared.len(),
+        cleared = keys.len(),
         "D39/#1161: cleared a not_member local row so a fresh invite starts a new join attempt"
     );
+    ClearStaleNotMemberJoinRowResult::Cleared
 }
 
 /// ADR 0107 (0088 S8 (a)): re-arm this device's sealed-but-unconfirmed
@@ -20854,15 +20885,38 @@ pub(in crate::server) async fn join_group_via_invite(
     }
     if stale_not_member_row {
         // Still under the membership guard taken above, so no concurrent
-        // join, apply or finalizer can interleave with the clear.
-        clear_stale_not_member_join_row(
+        // join, apply or finalizer can interleave with the clear. A
+        // keyed-material refusal from the write-hold recheck must stop
+        // replacement — unit return previously continued over the row.
+        match clear_stale_not_member_join_row(
             state.as_ref(),
             &group_id_hex,
             &hex::encode(agent_id.as_bytes()),
             invite_stable_group_id,
             invite_owner_hex,
         )
-        .await;
+        .await
+        {
+            ClearStaleNotMemberJoinRowResult::Cleared
+            | ClearStaleNotMemberJoinRowResult::Unchanged => {}
+            ClearStaleNotMemberJoinRowResult::RefusedKeyedMaterial => {
+                let groups = state.named_groups.read().await;
+                if let Some(info) = groups.get(&group_id_hex).or_else(|| {
+                    groups
+                        .values()
+                        .find(|info| info.mls_group_id == group_id_hex)
+                }) {
+                    if let Some(response) = NotMemberJoinRow::JoinFailed.refusal_response(info) {
+                        return response;
+                    }
+                }
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "join failed: this device already has a local group record with no \
+                     invite lineage and no seat; a fresh invite cannot replace that record",
+                );
+            }
+        }
     }
     let inviter = match parse_agent_id_hex(&invite.inviter) {
         Ok(id) => id,
