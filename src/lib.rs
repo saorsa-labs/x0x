@@ -9149,8 +9149,8 @@ impl Agent {
         // 1. Signal every token-aware loop to break. Inert until now, so this
         //    is the first thing that changes steady-state behavior.
         self.shutdown_token.cancel();
-        // Retain and join evidence workers even if this shutdown is cancelled.
-        self.peer_evidence().shutdown_workers().await;
+        // Bound the evidence drain without discarding unfinished workers.
+        let evidence_workers_unfinished = self.peer_evidence().shutdown_workers().await;
         self.capability_refreshes.shutdown_workers().await;
 
         // 2. Stop the simple Option<JoinHandle> background tasks.
@@ -9305,6 +9305,11 @@ impl Agent {
         // alive; the daemon binary survives only by process exit, but an
         // embedded host needs these released to re-`serve()` on the same port.
         let mut shutdown_errors = Vec::new();
+        if evidence_workers_unfinished != 0 {
+            shutdown_errors.push(format!(
+                "{evidence_workers_unfinished} peer evidence workers unfinished after the shutdown grace"
+            ));
+        }
         if history_writer_unfinished {
             shutdown_errors
                 .push("history writer still owns the store after the shutdown grace".to_string());
