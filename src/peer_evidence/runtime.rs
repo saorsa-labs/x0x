@@ -8,6 +8,11 @@ pub(crate) type GroupContext = dyn Fn(AgentId, AgentId) -> Option<bool> + Send +
 type GroupPolicy = dyn Fn(AgentId) -> Option<bool> + Send + Sync;
 
 /// One grace for the closed registry, including cancelled/repeated drains.
+/// The deadline is absolute and fixed by the first drain call, so no caller
+/// can extend it. Five seconds matches the history-writer drain allowance;
+/// it is an internal cleanup budget, not a wire, storage or API constant.
+/// Unfinished workers stay in custody after the deadline (permits held, not
+/// marked complete) and are reported to `Agent::try_shutdown` by count.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Admission and handle custody share one lock. No worker can be spawned
