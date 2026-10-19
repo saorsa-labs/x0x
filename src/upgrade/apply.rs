@@ -46,8 +46,11 @@ impl Drop for TempDirGuard {
 /// Awaits a `spawn_blocking` replace job while tying caller liveness to Drop.
 ///
 /// Aborting/dropping the async caller clears `caller_alive` before the
-/// `JoinHandle` is dropped, so the blocking worker can refuse mutation after
-/// it acquires host locks. `spawn_blocking` itself is not cancelled by Drop.
+/// `JoinHandle` is dropped, so the blocking worker can refuse mutation **before
+/// admission** (after it acquires host locks, before any backup/replace).
+/// Once the worker admits, restart ownership lives with the worker's
+/// `on_success` continuation — not with this droppable observer.
+/// `spawn_blocking` itself is not cancelled by Drop.
 struct CallerAliveJoin {
     caller_alive: Arc<AtomicBool>,
     join: JoinHandle<Result<UpgradeResult, UpgradeError>>,
@@ -81,14 +84,21 @@ impl Drop for CallerAliveJoin {
 ///
 /// All host locks are taken before any mutation. If the async caller is
 /// cancelled while the worker waits on a lock, the worker releases the locks
-/// without replacing bytes — so cancel cannot leave installed binaries without
-/// a restart owner (#1447 RC2).
+/// without replacing bytes (#1447 RC2).
+///
+/// Once every lock is held and the caller is still alive, replacement is
+/// **admitted**: `on_success` (restart / handoff continuation) is owned by
+/// this blocking worker for the rest of the critical section. Cancelling the
+/// async observer after admission cannot detach installed bytes from that
+/// continuation (#1447 RC3). Extra pre-rename boolean checks only move the
+/// window; ownership transfer at admission closes it.
 async fn apply_replacements_offloaded(
     upgrader: Upgrader,
     extracted_path: PathBuf,
     target_version: semver::Version,
     companion: Option<(Upgrader, PathBuf)>,
     temp_guard: TempDirGuard,
+    mut on_success: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<UpgradeResult, UpgradeError> {
     let caller_alive = Arc::new(AtomicBool::new(true));
     let worker_alive = Arc::clone(&caller_alive);
@@ -139,6 +149,9 @@ async fn apply_replacements_offloaded(
             ));
         }
 
+        // Admission: locks held + caller still alive. From here the worker
+        // owns mutation through on_success — the async caller is only an
+        // observer and may be cancelled without orphaning restart.
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
             match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
                 Ok(_) => info!("x0x companion upgraded successfully"),
@@ -146,7 +159,13 @@ async fn apply_replacements_offloaded(
             }
         }
 
-        upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version)
+        let result = upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version)?;
+        if matches!(result, UpgradeResult::Success { .. }) {
+            if let Some(cont) = on_success.take() {
+                cont();
+            }
+        }
+        Ok(result)
     });
 
     CallerAliveJoin { caller_alive, join }
@@ -444,32 +463,24 @@ impl AutoApplyUpgrader {
 
         // Move temp-dir custody into the blocking task so cancel cannot delete
         // extracted binaries mid-replace. The guard cleans up when that task ends.
-        let result = apply_replacements_offloaded(
-            upgrader,
-            extracted_path,
-            target_version.clone(),
-            companion,
-            _temp_guard,
-        )
-        .await?;
-
-        if matches!(result, UpgradeResult::Success { .. }) {
-            // ADR-0061 §6 — report honestly. Installed bytes, a pending
-            // restart, observed readiness and recovery are four distinct
-            // facts; only the first is established at this point.
-            info!(
-                version = %target_version,
-                installed_bytes = true,
-                restart = "pending",
-                restart_mode = ?restart_plan.mode,
-                readiness_observed = false,
-                recovery = "none",
-                "Upgrade bytes installed for version {}; restart is pending and \
-                 replacement readiness has not been observed yet",
-                target_version
-            );
-            if self.restart_on_success {
-                if let Err(e) = self.trigger_restart(&restart_plan, &target_version.to_string()) {
+        //
+        // When restart_on_success is set, arm the restart continuation inside
+        // the blocking worker at admission so cancel of this async caller
+        // cannot install bytes without an owner (#1447 RC3). Deferred HTTP
+        // restart (restart_on_success=false) still schedules after await in
+        // the fenced route — see PR body FOR ENGINEER note.
+        let restart_plan_for_cont = restart_plan.clone();
+        let version_for_cont = target_version.to_string();
+        let binary_name = self.binary_name.clone();
+        let stop_on_upgrade = self.stop_on_upgrade;
+        let restart_context = self.restart_context.clone();
+        let on_success: Option<Box<dyn FnOnce() + Send>> = if self.restart_on_success {
+            Some(Box::new(move || {
+                let owner = AutoApplyUpgrader::new(&binary_name)
+                    .with_stop_on_upgrade(stop_on_upgrade)
+                    .with_restart_context(restart_context)
+                    .with_restart_on_success(false);
+                if let Err(e) = owner.trigger_restart(&restart_plan_for_cont, &version_for_cont) {
                     warn!(
                         error = %e,
                         installed_bytes = true,
@@ -479,7 +490,42 @@ impl AutoApplyUpgrader {
                          old process keeps serving"
                     );
                 }
-            }
+            }))
+        } else {
+            None
+        };
+
+        let result = apply_replacements_offloaded(
+            upgrader,
+            extracted_path,
+            target_version.clone(),
+            companion,
+            _temp_guard,
+            on_success,
+        )
+        .await?;
+
+        if matches!(result, UpgradeResult::Success { .. }) {
+            // ADR-0061 §6 — report honestly. Installed bytes, a pending
+            // restart, observed readiness and recovery are four distinct
+            // facts; only the first is established at this point. When
+            // restart_on_success was true, the worker already owned and
+            // attempted the restart continuation at admission.
+            info!(
+                version = %target_version,
+                installed_bytes = true,
+                restart = if self.restart_on_success {
+                    "owned_at_admission"
+                } else {
+                    "pending_caller"
+                },
+                restart_mode = ?restart_plan.mode,
+                readiness_observed = false,
+                recovery = "none",
+                "Upgrade bytes installed for version {}; restart ownership \
+                 follows restart_on_success (worker-owned when true)",
+                target_version
+            );
         }
 
         Ok(result)
@@ -1818,6 +1864,7 @@ mod tests {
             semver::Version::parse("2.0.0").unwrap(),
             None,
             temp_guard,
+            None,
         );
 
         let start = Instant::now();
@@ -1887,6 +1934,11 @@ mod tests {
         });
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            // Worker-owned continuation: same ownership site as production
+            // restart_on_success (RC3). Pre-admission cancel must not run it.
+            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+                std::fs::write(&marker, b"restart reached").unwrap();
+            }));
             let replacement = apply_replacements_offloaded(
                 upgrade,
                 incoming,
@@ -1895,6 +1947,7 @@ mod tests {
                 TempDirGuard {
                     path: scratch_for_task,
                 },
+                on_success,
             );
             tokio::pin!(replacement);
             let mut waiting_tx = Some(waiting_tx);
@@ -1908,11 +1961,7 @@ mod tests {
                 polled
             })
             .await?;
-            // Same Success-dependent continuation site as apply_upgrade_from_manifest
-            // (restart / handoff). Marker only — no real restart in this unit test.
-            if matches!(result, UpgradeResult::Success { .. }) {
-                std::fs::write(&marker, b"restart reached").unwrap();
-            }
+            let _ = result;
             Ok::<_, UpgradeError>(())
         });
 
@@ -2014,6 +2063,9 @@ mod tests {
         let scratch_for_task = scratch.clone();
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+                std::fs::write(&marker, b"restart reached").unwrap();
+            }));
             let replacement = apply_replacements_offloaded(
                 Upgrader::new(primary, semver::Version::new(1, 0, 0)),
                 incoming,
@@ -2025,6 +2077,7 @@ mod tests {
                 TempDirGuard {
                     path: scratch_for_task,
                 },
+                on_success,
             );
             tokio::pin!(replacement);
             let mut waiting_tx = Some(waiting_tx);
@@ -2038,9 +2091,7 @@ mod tests {
                 polled
             })
             .await?;
-            if matches!(result, UpgradeResult::Success { .. }) {
-                std::fs::write(&marker, b"restart reached").unwrap();
-            }
+            let _ = result;
             Ok::<_, UpgradeError>(())
         });
 
@@ -2065,5 +2116,346 @@ mod tests {
             "live success must reach the restart continuation"
         );
         assert!(!scratch.exists(), "temp-dir custody must clean up");
+    }
+
+    /// Pause the blocking worker at the existing `Replacing binary...` event
+    /// (after backup, after the final caller-alive check, before rename) so
+    /// cancel can land in the admitted window Codex probed on a29beec8.
+    struct PauseAtReplacingBinary;
+
+    struct ReplaceHook {
+        remaining: usize,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    static REPLACE_HOOK: std::sync::Mutex<Option<ReplaceHook>> = std::sync::Mutex::new(None);
+    static REPLACE_HOOK_INIT: std::sync::Once = std::sync::Once::new();
+
+    #[derive(Default)]
+    struct TraceMessage(String);
+
+    impl tracing::field::Visit for TraceMessage {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for PauseAtReplacingBinary {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut msg = TraceMessage::default();
+            event.record(&mut msg);
+            if msg.0 != "Replacing binary..." {
+                return;
+            }
+            let hook = {
+                let mut slot = REPLACE_HOOK.lock().expect("replace hook lock");
+                if let Some(h) = slot.as_mut() {
+                    h.remaining = h.remaining.saturating_sub(1);
+                    if h.remaining == 0 {
+                        slot.take()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(h) = hook {
+                let _ = h.entered.send(());
+                h.release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("test must release paused replace worker");
+            }
+        }
+    }
+
+    /// Cancel after admission (locks held + alive), between companion/primary
+    /// renames, and before the await result is consumed. Installed bytes must
+    /// not outlive the restart continuation (Codex P1 on a29beec8 / #1447 RC3).
+    async fn cancel_after_admission_must_retain_restart(
+        cancel: bool,
+        companion: bool,
+        pause_number: usize,
+    ) {
+        use std::time::Duration;
+
+        REPLACE_HOOK_INIT.call_once(|| {
+            tracing::subscriber::set_global_default(PauseAtReplacingBinary)
+                .expect("install replace-pause subscriber once");
+        });
+
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let primary = root.path().join("x0xd");
+        let cli = root.path().join("x0x");
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        std::fs::write(&cli, b"old-cli").unwrap();
+        let incoming = scratch.join("daemon");
+        let incoming_cli = scratch.join("cli");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+        std::fs::write(&incoming_cli, b"new-cli").unwrap();
+
+        let restart_marker = root.path().join("restart-continuation");
+        let marker = restart_marker.clone();
+        let scratch_for_task = scratch.clone();
+        let primary_for_task = primary.clone();
+        let cli_for_task = cli.clone();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *REPLACE_HOOK.lock().expect("replace hook lock") = Some(ReplaceHook {
+            remaining: pause_number,
+            entered: entered_tx,
+            release: release_rx,
+        });
+
+        let task = tokio::spawn(async move {
+            // Worker-owned restart continuation (production restart_on_success
+            // site). Survives abort of this async observer after admission.
+            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+                std::fs::write(&marker, b"restart reached").unwrap();
+            }));
+            let result = apply_replacements_offloaded(
+                Upgrader::new(primary_for_task, semver::Version::new(1, 0, 0)),
+                incoming,
+                semver::Version::new(2, 0, 0),
+                companion.then(|| {
+                    (
+                        Upgrader::new(cli_for_task, semver::Version::new(1, 0, 0)),
+                        incoming_cli,
+                    )
+                }),
+                TempDirGuard {
+                    path: scratch_for_task,
+                },
+                on_success,
+            )
+            .await?;
+            let _ = result;
+            Ok::<_, UpgradeError>(())
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .expect("worker reached Replacing binary...")
+            .expect("entered signal");
+
+        let paused_target = if companion && pause_number == 1 {
+            &cli
+        } else {
+            &primary
+        };
+        let expected_old: &[u8] = if companion && pause_number == 1 {
+            b"old-cli"
+        } else {
+            b"old-daemon"
+        };
+        assert_eq!(std::fs::read(paused_target).unwrap(), expected_old);
+        assert_eq!(
+            std::fs::read(paused_target.with_extension("backup")).unwrap(),
+            expected_old
+        );
+        assert!(!restart_marker.exists());
+
+        // Trace-hook pause is on the blocking pool; async timers still progress.
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await
+        .expect("runtime stays responsive while replace is paused");
+
+        if cancel {
+            task.abort();
+            assert!(
+                task.await.unwrap_err().is_cancelled(),
+                "caller must observe abort"
+            );
+            assert!(
+                scratch.exists(),
+                "blocking worker must retain temp-dir custody across cancel"
+            );
+            release_tx.send(()).expect("release paused worker");
+        } else {
+            release_tx.send(()).expect("release paused worker");
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("live apply timeout")
+                .expect("join")
+                .expect("apply");
+        }
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while scratch.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("temp-dir custody must release after the worker finishes");
+
+        let installed = std::fs::read(&primary).unwrap() == b"new-daemon";
+        let cli_installed = companion && std::fs::read(&cli).unwrap() == b"new-cli";
+        let restarted = restart_marker.exists();
+        assert_eq!(
+            std::fs::read(primary.with_extension("backup")).unwrap(),
+            b"old-daemon"
+        );
+        if companion {
+            assert_eq!(
+                std::fs::read(cli.with_extension("backup")).unwrap(),
+                b"old-cli"
+            );
+        }
+        assert!(installed, "admitted replace must install daemon bytes");
+        if companion {
+            assert!(
+                cli_installed,
+                "admitted replace must install companion bytes"
+            );
+        }
+        assert!(
+            !installed || restarted,
+            "replacement must not outlive its restart continuation after admission \
+             (cancel={cancel}, companion={companion}, pause_number={pause_number}, \
+             installed={installed}, cli_installed={cli_installed}, restarted={restarted})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_primary_after_admission_retains_restart() {
+        cancel_after_admission_must_retain_restart(false, false, 1).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_companion_after_admission_retains_restart() {
+        cancel_after_admission_must_retain_restart(false, true, 1).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_after_admission_primary_must_retain_restart() {
+        cancel_after_admission_must_retain_restart(true, false, 1).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_after_admission_companion_must_retain_restart() {
+        cancel_after_admission_must_retain_restart(true, true, 1).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_between_companion_and_primary_must_retain_restart() {
+        cancel_after_admission_must_retain_restart(true, true, 2).await;
+    }
+
+    /// Cancel after the blocking worker has finished (bytes installed) but
+    /// before the abortable caller consumes Success for restart.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_before_result_consumed_must_retain_restart() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let primary = root.path().join("x0xd");
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        let incoming = scratch.join("daemon");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+
+        let restart_marker = root.path().join("restart-continuation");
+        let marker = restart_marker.clone();
+        let scratch_for_task = scratch.clone();
+        let primary_watch = primary.clone();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+                std::fs::write(&marker, b"restart reached").unwrap();
+            }));
+            let replacement = apply_replacements_offloaded(
+                Upgrader::new(primary, semver::Version::new(1, 0, 0)),
+                incoming,
+                semver::Version::new(2, 0, 0),
+                None,
+                TempDirGuard {
+                    path: scratch_for_task,
+                },
+                on_success,
+            );
+            tokio::pin!(replacement);
+            let mut done_tx = Some(done_tx);
+            // Observe Ready (worker finished + on_success ran) then park so
+            // this abortable observer never "consumes" Success for restart.
+            poll_fn(|cx| -> Poll<()> {
+                match replacement.as_mut().poll(cx) {
+                    Poll::Ready(r) => {
+                        if let Some(tx) = done_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        drop(r);
+                        Poll::Pending
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            unreachable!("caller parked after Ready; abort must win");
+        });
+
+        // Wait until daemon bytes are installed (worker finished replace).
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if std::fs::read(&primary_watch).ok().as_deref() == Some(b"new-daemon".as_slice()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("worker must install bytes");
+        let _ = tokio::time::timeout(Duration::from_secs(1), done_rx).await;
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while scratch.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("temp-dir custody must release");
+
+        let installed = std::fs::read(&primary_watch).unwrap() == b"new-daemon";
+        let restarted = restart_marker.exists();
+        assert!(installed, "bytes must stay installed after late cancel");
+        assert!(
+            !installed || restarted,
+            "late cancel before result consumption must not detach restart \
+             (installed={installed}, restarted={restarted})"
+        );
     }
 }

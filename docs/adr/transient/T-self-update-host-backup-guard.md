@@ -4,7 +4,7 @@
 - **Target slot:** A14
 - **Date:** 2026-10-18
 - **Decision owners:** David Irvine
-- **Reviewers:** Claude and Codex APPROVE covered the e8eb2f06 text; the revised text (point 5, Windows, and the companion-lock sentence) awaits re-review
+- **Reviewers:** Claude and Codex APPROVE covered the e8eb2f06 text; RC1/RC2 revised text awaited re-review; RC3 revised text (admission transfers restart ownership to the blocking worker) awaits re-review
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** x0x #1447; draft #1410 / #1106; Accepted ADR 0094 §2.
@@ -57,6 +57,13 @@ apply lock. Draft #1410 (#1106) must reuse it, not add a second lock.
 4. No versioned backup names. #1373 keeps that scope.
 5. Unmanaged Windows uses the same `File::lock`. Managed Windows apply stays
    refused under ADR 0094.
+6. Offloaded apply (#1447 RC3): after every host lock is held and the async
+   caller is still alive, replacement is admitted. From that point the
+   blocking worker owns the restart/handoff continuation for daemon and
+   companion alike. Cancelling the async observer after admission must not
+   leave installed bytes without that owner. Pre-admission cancel still
+   refuses mutation (RC2). Extra boolean checks before rename only move the
+   window.
 
 A content match without a lock is not enough: both can still decide to back
 up. The lock closes that window.

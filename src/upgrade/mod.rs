@@ -137,6 +137,11 @@ impl Upgrader {
         Ok(temp_dir)
     }
 
+    /// Path of the binary this upgrader replaces.
+    pub(super) fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+
     /// Full upgrade workflow: host lock -> compare -> backup -> replace.
     ///
     /// The caller is responsible for downloading and verifying the new binary
@@ -149,11 +154,6 @@ impl Upgrader {
     /// path runs (T-self-update-host-backup-guard / #1447). Companion
     /// binaries (e.g. `x0x` next to `x0xd`) take their own lock file beside
     /// that path via the same mechanism.
-    /// Path of the binary this upgrader replaces.
-    pub(super) fn target_path(&self) -> &Path {
-        &self.target_path
-    }
-
     pub fn perform_upgrade(
         &self,
         new_binary_path: &Path,
