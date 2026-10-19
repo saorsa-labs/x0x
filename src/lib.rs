@@ -7898,13 +7898,17 @@ impl Agent {
     /// evidence load barrier, never takes a blocking point-of-use check
     /// (contention: no dial), and never runs a Lookup on itself: the
     /// Lookup's responder selection blocks synchronously. An opted-in send
-    /// starts the Lookup in the background.
+    /// starts the Lookup in the background. Ordinary callers share the default
+    /// send evidence budget across load, Lookup and point-of-use reads; expiry
+    /// means no evidence, so the caller keeps its existing fallback.
     async fn connect_from_evidence_with(
         &self,
         agent: identity::AgentId,
         cold: ColdResolution,
     ) -> Option<connectivity::ConnectOutcome> {
-        self.connect_from_evidence_inner(agent, cold, None)
+        let mut bound =
+            dm_evidence::SendEvidence::new(self, agent, dm::dm_attempt_timeout(None), false);
+        self.connect_from_evidence_inner(agent, cold, &mut bound)
             .await
             .ok()
             .flatten()
@@ -7914,7 +7918,7 @@ impl Agent {
         &self,
         agent: identity::AgentId,
         cold: ColdResolution,
-        mut bound: Option<&mut dm_evidence::SendEvidence<'_>>,
+        bound: &mut dm_evidence::SendEvidence<'_>,
     ) -> Result<Option<connectivity::ConnectOutcome>, dm::DmError> {
         let nonblocking = cold.opted_in();
         if nonblocking {
@@ -7922,14 +7926,9 @@ impl Agent {
                 return Ok(None);
             }
             self.peer_evidence().spawn_agent_lookup(agent);
-        } else if let Some(bound) = bound.as_deref() {
+        } else {
             bound.wait(0).await?;
             bound.lookup().await?;
-        } else {
-            if !self.peer_evidence().wait(0).await {
-                return Ok(None);
-            }
-            self.peer_evidence().lookup(agent, None).await;
         }
         let now = dm_capability::now_unix_ms();
         let view = if nonblocking {
@@ -7937,31 +7936,27 @@ impl Agent {
                 .try_usable_agent(agent, now)
                 .ok()
                 .flatten()
-        } else if let Some(bound) = bound.as_deref() {
-            bound.usable_agent().await?
         } else {
-            self.peer_evidence().usable_agent(agent, now)
+            bound.usable_agent().await?
         };
         let Some(view) = view else {
             return Ok(None);
         };
         let machine = view.announcement.machine_id;
         let denial = self.recipient_pairing_denied(&agent, &machine);
-        let denial = match bound.as_deref() {
-            Some(bound) => match bound.bounded("evidence pairing policy", denial).await? {
+        let denial = if nonblocking {
+            denial.await
+        } else {
+            match bound.bounded("evidence pairing policy", denial).await? {
                 Some(denial) => denial,
                 None => return Ok(None),
-            },
-            None => denial.await,
+            }
         };
         if denial.is_some() {
             return Ok(None);
         }
         let dial = self.dial_evidence_view(&view);
-        let result = match bound.as_deref_mut() {
-            Some(bound) => bound.transport(dial).await,
-            None => dial.await,
-        };
+        let result = bound.transport(dial).await;
         if matches!(
             result,
             None | Some(connectivity::ConnectOutcome::AlreadyConnected)
@@ -7974,10 +7969,8 @@ impl Agent {
                 .try_usable(agent, machine, now)
                 .ok()
                 .flatten()
-        } else if let Some(bound) = bound.as_deref() {
-            bound.usable(machine).await?
         } else {
-            self.peer_evidence().usable(agent, machine, now)
+            bound.usable(machine).await?
         };
         if still_usable.is_none() {
             return Ok(None);
@@ -9967,7 +9960,7 @@ impl Agent {
 
         if cap_source == "peer_evidence" {
             let _ = self
-                .connect_from_evidence_inner(*to, ColdResolution::Off, Some(&mut evidence))
+                .connect_from_evidence_inner(*to, ColdResolution::Off, &mut evidence)
                 .await?;
             let still_usable = match cap_machine {
                 Some(machine) => evidence.usable(machine).await?,
