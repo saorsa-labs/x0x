@@ -149,14 +149,15 @@ impl Upgrader {
     ///
     /// Under a host-wide exclusive lock beside this target
     /// (`<target-file-name>.upgrade.lock`), if the on-disk target already
-    /// matches the incoming bytes, backup and replace are skipped. The public
-    /// result is still [`UpgradeResult::Success`] with the requested version —
-    /// the same observable result as main when current is older, the request is
-    /// newer, and disk already equals the incoming bytes. Auto-apply uses that
-    /// Success so an old-running process can still restart into those bytes
-    /// (T-self-update-host-backup-guard / #1447). Companion binaries (e.g.
-    /// `x0x` next to `x0xd`) take their own lock file beside that path via the
-    /// same mechanism.
+    /// matches the incoming bytes, backup and replace are skipped (the
+    /// preserved backup is not rewritten). On Unix the target is still made
+    /// executable (`0o755`) before Success — the same postcondition as
+    /// [`Self::atomic_replace`]. Permission repair failure is an error, never
+    /// Success. The public result is otherwise [`UpgradeResult::Success`] with
+    /// the requested version so auto-apply can still restart an old-running
+    /// process into those bytes (T-self-update-host-backup-guard / #1447).
+    /// Companion binaries (e.g. `x0x` next to `x0xd`) take their own lock file
+    /// beside that path via the same mechanism.
     pub fn perform_upgrade(
         &self,
         new_binary_path: &Path,
@@ -179,12 +180,17 @@ impl Upgrader {
     /// When disk already matches the incoming bytes, backup and replace are
     /// skipped and [`UpgradeResult::Success`] is returned so public
     /// `perform_upgrade` matches main and auto-apply can still own restart.
+    /// On Unix, Success still requires the installed target to be executable
+    /// (`0o755`), matching `atomic_replace`; a permission repair failure is
+    /// an error, never Success. The preserved backup is not rewritten.
     pub(super) fn finish_upgrade_under_host_lock(
         &self,
         new_binary_path: &Path,
         target_version: &Version,
     ) -> Result<UpgradeResult, UpgradeError> {
         if on_disk_matches_incoming(&self.target_path, new_binary_path)? {
+            // Host lock is held: repair execute bits without clobbering backup.
+            ensure_target_executable(&self.target_path)?;
             info!(
                 version = %target_version,
                 target = %self.target_path.display(),
@@ -197,7 +203,10 @@ impl Upgrader {
 
         let backup_path = self.create_backup()?;
 
-        info!("Replacing binary...");
+        info!(
+            replace_target = %self.target_path.display(),
+            "Replacing binary..."
+        );
         match self.atomic_replace(new_binary_path) {
             Ok(()) => {
                 info!(version = %target_version, "Successfully upgraded to version {}", target_version);
@@ -266,6 +275,63 @@ pub(super) fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeEr
         ))
     })?;
     Ok(file)
+}
+
+/// Unix postcondition shared with [`Upgrader::atomic_replace`]: Success means
+/// the installed target is executable (`0o755`). Runs under the host lock on
+/// the equal-bytes shortcut so a `0644` target is repaired without rewriting
+/// the preserved backup. Permission failure must not become Success.
+#[cfg(unix)]
+fn ensure_target_executable(target: &Path) -> Result<(), UpgradeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(test)]
+    if exec_postcondition_seam::should_fail() {
+        return Err(UpgradeError::ReplaceFailed {
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected executable-postcondition failure",
+            ),
+        });
+    }
+
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
+        .map_err(|source| UpgradeError::ReplaceFailed { source })
+}
+
+#[cfg(not(unix))]
+fn ensure_target_executable(_target: &Path) -> Result<(), UpgradeError> {
+    Ok(())
+}
+
+/// cfg(test) only: force [`ensure_target_executable`] to fail on this thread so
+/// equal-bytes Success cannot be claimed when the execute-bit repair fails.
+#[cfg(all(test, unix))]
+pub(crate) mod exec_postcondition_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL.with(|f| f.set(false));
+        }
+    }
+
+    pub(crate) fn force_fail() -> Guard {
+        FAIL.with(|f| f.set(true));
+        Guard { _private: () }
+    }
+
+    pub(crate) fn should_fail() -> bool {
+        FAIL.with(|f| f.get())
+    }
 }
 
 /// True when the installed target exists and its bytes equal `incoming`.
@@ -647,6 +713,94 @@ mod tests {
         assert!(
             matches!(restart_owner, UpgradeResult::Success { .. }),
             "finish on match must stay Success for restart ownership: {restart_owner:?}"
+        );
+    }
+
+    /// Equal bytes + non-executable target must still leave a runnable binary
+    /// (main's atomic_replace sets 0755). Backup must stay untouched.
+    #[cfg(unix)]
+    #[test]
+    fn matching_bytes_repairs_0644_target_to_0755_without_touching_backup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let binary_path = dir.path().join("test-binary");
+        let incoming = dir.path().join("incoming");
+        let bytes = b"same bytes";
+        fs::write(&binary_path, bytes).unwrap();
+        fs::write(&incoming, bytes).unwrap();
+        fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(binary_path.with_extension("backup"), b"prior version").unwrap();
+
+        assert_eq!(
+            fs::metadata(&binary_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+        let result = upgrader
+            .perform_upgrade(&incoming, &Version::new(2, 0, 0))
+            .expect("equal-bytes upgrade must succeed after execute repair");
+        assert!(
+            matches!(
+                result,
+                UpgradeResult::Success {
+                    ref version
+                } if version == "2.0.0"
+            ),
+            "Success required when bytes match and execute bits can be repaired: {result:?}"
+        );
+        assert_eq!(
+            fs::metadata(&binary_path).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "Success must mean the installed target is executable"
+        );
+        assert_eq!(fs::read(&binary_path).unwrap(), bytes);
+        assert!(
+            incoming.exists(),
+            "equal-bytes path must not consume incoming"
+        );
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version",
+            "execute-bit repair must not rewrite the preserved backup"
+        );
+    }
+
+    /// Permission-repair failure under the equal-bytes shortcut must not report
+    /// Success (restart must not be armed into a non-executable target).
+    #[cfg(unix)]
+    #[test]
+    fn matching_bytes_permission_repair_failure_is_not_success() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let binary_path = dir.path().join("test-binary");
+        let incoming = dir.path().join("incoming");
+        let bytes = b"same bytes";
+        fs::write(&binary_path, bytes).unwrap();
+        fs::write(&incoming, bytes).unwrap();
+        fs::set_permissions(&binary_path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(binary_path.with_extension("backup"), b"prior version").unwrap();
+
+        let _fail = exec_postcondition_seam::force_fail();
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+        let result = upgrader.perform_upgrade(&incoming, &Version::new(2, 0, 0));
+        assert!(
+            matches!(result, Err(UpgradeError::ReplaceFailed { .. })),
+            "permission repair failure must be Err, never Success: {result:?}"
+        );
+        assert_eq!(
+            fs::metadata(&binary_path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "failed repair must leave the target mode unchanged"
+        );
+        assert_eq!(
+            fs::read(binary_path.with_extension("backup")).unwrap(),
+            b"prior version",
+            "failed repair must not rewrite the preserved backup"
         );
     }
 

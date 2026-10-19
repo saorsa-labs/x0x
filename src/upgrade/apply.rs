@@ -91,11 +91,16 @@ where
 /// cfg(test) only: force `spawn_http_deferred_restart_thread` to return
 /// `WouldBlock` so RC5 can prove refuse-before-mutation (and prove the RC4
 /// post-admission pattern loses the only owner).
+///
+/// Thread-local so parallel libtest workers cannot steal each other's inject
+/// (process-global AtomicBool raced under `--test-threads=8`).
 #[cfg(test)]
 pub(crate) mod deferred_spawn_seam {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::cell::Cell;
 
-    static FAIL: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
 
     pub(crate) struct Guard {
         _private: (),
@@ -103,17 +108,17 @@ pub(crate) mod deferred_spawn_seam {
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            FAIL.store(false, Ordering::SeqCst);
+            FAIL.with(|f| f.set(false));
         }
     }
 
     pub(crate) fn force_would_block() -> Guard {
-        FAIL.store(true, Ordering::SeqCst);
+        FAIL.with(|f| f.set(true));
         Guard { _private: () }
     }
 
     pub(crate) fn should_fail() -> bool {
-        FAIL.load(Ordering::SeqCst)
+        FAIL.with(|f| f.get())
     }
 }
 
@@ -2261,24 +2266,56 @@ mod tests {
     /// Pause the blocking worker at the existing `Replacing binary...` event
     /// (after backup, after the final caller-alive check, before rename) so
     /// cancel can land in the admitted window Codex probed on a29beec8.
+    ///
+    /// Hooks are keyed by `replace_target` path so parallel libtest workers
+    /// cannot overwrite or consume each other's pause (Codex/Greptile RC6 P2).
     struct PauseAtReplacingBinary;
 
     struct ReplaceHook {
-        remaining: usize,
         entered: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
     }
 
-    static REPLACE_HOOK: std::sync::Mutex<Option<ReplaceHook>> = std::sync::Mutex::new(None);
+    static REPLACE_HOOKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, ReplaceHook>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     static REPLACE_HOOK_INIT: std::sync::Once = std::sync::Once::new();
 
-    #[derive(Default)]
-    struct TraceMessage(String);
+    /// Removes a registered pause hook on drop so a failed test cannot leave a
+    /// stale entry that later steals another worker's replace event.
+    struct ReplaceHookGuard {
+        target: PathBuf,
+    }
 
-    impl tracing::field::Visit for TraceMessage {
+    impl Drop for ReplaceHookGuard {
+        fn drop(&mut self) {
+            let mut hooks = REPLACE_HOOKS.lock().expect("replace hooks lock");
+            hooks.remove(&self.target);
+        }
+    }
+
+    #[derive(Default)]
+    struct TraceReplaceFields {
+        message: String,
+        replace_target: Option<String>,
+    }
+
+    impl tracing::field::Visit for TraceReplaceFields {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            let unquoted = rendered.trim_matches('"');
             if field.name() == "message" {
-                self.0 = format!("{value:?}");
+                self.message = unquoted.to_string();
+            } else if field.name() == "replace_target" {
+                self.replace_target = Some(unquoted.to_string());
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else if field.name() == "replace_target" {
+                self.replace_target = Some(value.to_string());
             }
         }
     }
@@ -2304,23 +2341,18 @@ mod tests {
         fn enter(&self, _: &tracing::span::Id) {}
         fn exit(&self, _: &tracing::span::Id) {}
         fn event(&self, event: &tracing::Event<'_>) {
-            let mut msg = TraceMessage::default();
-            event.record(&mut msg);
-            if msg.0 != "Replacing binary..." {
+            let mut fields = TraceReplaceFields::default();
+            event.record(&mut fields);
+            if fields.message != "Replacing binary..." {
                 return;
             }
+            let Some(target_s) = fields.replace_target else {
+                return;
+            };
+            let target = PathBuf::from(target_s);
             let hook = {
-                let mut slot = REPLACE_HOOK.lock().expect("replace hook lock");
-                if let Some(h) = slot.as_mut() {
-                    h.remaining = h.remaining.saturating_sub(1);
-                    if h.remaining == 0 {
-                        slot.take()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                let mut hooks = REPLACE_HOOKS.lock().expect("replace hooks lock");
+                hooks.remove(&target)
             };
             if let Some(h) = hook {
                 let _ = h.entered.send(());
@@ -2364,13 +2396,28 @@ mod tests {
         let primary_for_task = primary.clone();
         let cli_for_task = cli.clone();
 
+        // pause_number 1 with companion → first replace (cli); otherwise primary.
+        // Key the hook to that exact path so concurrent tests cannot steal it.
+        let paused_target = if companion && pause_number == 1 {
+            cli.clone()
+        } else {
+            primary.clone()
+        };
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        *REPLACE_HOOK.lock().expect("replace hook lock") = Some(ReplaceHook {
-            remaining: pause_number,
-            entered: entered_tx,
-            release: release_rx,
-        });
+        {
+            let mut hooks = REPLACE_HOOKS.lock().expect("replace hooks lock");
+            hooks.insert(
+                paused_target.clone(),
+                ReplaceHook {
+                    entered: entered_tx,
+                    release: release_rx,
+                },
+            );
+        }
+        let _hook_guard = ReplaceHookGuard {
+            target: paused_target.clone(),
+        };
 
         let task = tokio::spawn(async move {
             // Worker-owned restart continuation (production restart_on_success
@@ -2403,17 +2450,12 @@ mod tests {
             .expect("worker reached Replacing binary...")
             .expect("entered signal");
 
-        let paused_target = if companion && pause_number == 1 {
-            &cli
-        } else {
-            &primary
-        };
         let expected_old: &[u8] = if companion && pause_number == 1 {
             b"old-cli"
         } else {
             b"old-daemon"
         };
-        assert_eq!(std::fs::read(paused_target).unwrap(), expected_old);
+        assert_eq!(std::fs::read(&paused_target).unwrap(), expected_old);
         assert_eq!(
             std::fs::read(paused_target.with_extension("backup")).unwrap(),
             expected_old
