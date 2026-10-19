@@ -1,8 +1,14 @@
 //! Binary upgrade application: download, verify SHA-256, extract, and atomically
 //! replace the running binary with rollback on failure.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use sha2::{Digest, Sha256};
@@ -37,7 +43,32 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// Companion + primary [`Upgrader::perform_upgrade`] on the blocking pool.
+/// Awaits a `spawn_blocking` replace job while tying caller liveness to Drop.
+///
+/// Aborting/dropping the async caller clears `caller_alive` before the
+/// `JoinHandle` is dropped, so the blocking worker can refuse mutation after
+/// it acquires host locks. `spawn_blocking` itself is not cancelled by Drop.
+struct CallerAliveJoin {
+    caller_alive: Arc<AtomicBool>,
+    join: JoinHandle<Result<UpgradeResult, UpgradeError>>,
+}
+
+impl Future for CallerAliveJoin {
+    type Output = Result<Result<UpgradeResult, UpgradeError>, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.join).poll(cx)
+    }
+}
+
+impl Drop for CallerAliveJoin {
+    fn drop(&mut self) {
+        // Signal first: the JoinHandle drop does not stop the blocking worker.
+        self.caller_alive.store(false, Ordering::Release);
+    }
+}
+
+/// Companion + primary replace on the blocking pool.
 ///
 /// Both production callsites (daemon target and optional companion CLI) take
 /// an exclusive host lock via blocking `File::lock`. Running that critical
@@ -47,6 +78,11 @@ impl Drop for TempDirGuard {
 /// `temp_guard` moves into the blocking task so a cancelled async caller cannot
 /// remove the temp directory while compare/backup/replace still needs the
 /// extracted binaries. Cleanup happens when the blocking task finishes.
+///
+/// All host locks are taken before any mutation. If the async caller is
+/// cancelled while the worker waits on a lock, the worker releases the locks
+/// without replacing bytes — so cancel cannot leave installed binaries without
+/// a restart owner (#1447 RC2).
 async fn apply_replacements_offloaded(
     upgrader: Upgrader,
     extracted_path: PathBuf,
@@ -54,21 +90,70 @@ async fn apply_replacements_offloaded(
     companion: Option<(Upgrader, PathBuf)>,
     temp_guard: TempDirGuard,
 ) -> Result<UpgradeResult, UpgradeError> {
-    tokio::task::spawn_blocking(move || {
+    let caller_alive = Arc::new(AtomicBool::new(true));
+    let worker_alive = Arc::clone(&caller_alive);
+
+    let join = tokio::task::spawn_blocking(move || {
         // Custody stays with this task for the whole locked section.
         let _temp_custody = temp_guard;
 
+        upgrader.validate_upgrade(&target_version)?;
+
+        // Companion validate / lock / replace failures stay warn-and-skip (same
+        // as the pre-RC2 perform_upgrade match); they must not refuse the
+        // daemon replace.
+        let mut companion = companion.and_then(|(x0x_upgrader, extracted_x0x)| match x0x_upgrader
+            .validate_upgrade(&target_version)
+        {
+            Ok(()) => Some((x0x_upgrader, extracted_x0x)),
+            Err(e) => {
+                warn!("Failed to upgrade x0x companion: {e}");
+                None
+            }
+        });
+
+        // Take every host lock before any backup/replace. Nested perform_upgrade
+        // locks would deadlock; finish_* assumes the caller already holds them.
+        let _companion_lock = if let Some((ref x0x_upgrader, _)) = companion {
+            match super::acquire_host_upgrade_lock(x0x_upgrader.target_path()) {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    warn!("Failed to upgrade x0x companion: {e}");
+                    companion = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if !worker_alive.load(Ordering::Acquire) {
+            return Err(UpgradeError::Other(
+                "upgrade cancelled before host replace".to_string(),
+            ));
+        }
+
+        let _daemon_lock = super::acquire_host_upgrade_lock(upgrader.target_path())?;
+        if !worker_alive.load(Ordering::Acquire) {
+            return Err(UpgradeError::Other(
+                "upgrade cancelled before host replace".to_string(),
+            ));
+        }
+
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
-            match x0x_upgrader.perform_upgrade(&extracted_x0x, &target_version) {
+            match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
                 Ok(_) => info!("x0x companion upgraded successfully"),
                 Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
             }
         }
 
-        upgrader.perform_upgrade(&extracted_path, &target_version)
-    })
-    .await
-    .map_err(|join_err| UpgradeError::Other(format!("upgrade replace task failed: {join_err}")))?
+        upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version)
+    });
+
+    CallerAliveJoin { caller_alive, join }
+        .await
+        .map_err(|join_err| {
+            UpgradeError::Other(format!("upgrade replace task failed: {join_err}"))
+        })?
 }
 
 /// Context the restart planner needs from the running daemon: where the
@@ -1755,5 +1840,230 @@ mod tests {
         let result = apply.await.expect("offloaded replace");
         assert!(matches!(result, UpgradeResult::Success { .. }));
         holder.join().expect("lock holder thread");
+    }
+
+    /// Hold a host lock, prove the offload submitted, abort the caller, then
+    /// release. After cancel the host must not keep replaced bytes without a
+    /// restart continuation (Codex P1 on b937a806 / #1447 RC2).
+    async fn cancel_while_lock_held_must_not_orphan_restart(hold_companion: bool) {
+        use std::fs::OpenOptions;
+        use std::future::{poll_fn, Future};
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let primary = root.path().join("x0xd");
+        let cli = root.path().join("x0x");
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        std::fs::write(&cli, b"old-cli").unwrap();
+        let incoming = scratch.join("daemon");
+        let incoming_cli = scratch.join("cli");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+        std::fs::write(&incoming_cli, b"new-cli").unwrap();
+
+        let held_target = if hold_companion { &cli } else { &primary };
+        let mut lock_name = held_target.file_name().unwrap().to_os_string();
+        lock_name.push(".upgrade.lock");
+        let lock_path = held_target.with_file_name(lock_name);
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open held host lock");
+        held.lock().expect("hold host lock");
+
+        let restart_marker = root.path().join("restart-continuation");
+        let marker = restart_marker.clone();
+        let scratch_for_task = scratch.clone();
+        let upgrade = Upgrader::new(primary.clone(), semver::Version::new(1, 0, 0));
+        let companion = hold_companion.then(|| {
+            (
+                Upgrader::new(cli.clone(), semver::Version::new(1, 0, 0)),
+                incoming_cli,
+            )
+        });
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let replacement = apply_replacements_offloaded(
+                upgrade,
+                incoming,
+                semver::Version::new(2, 0, 0),
+                companion,
+                TempDirGuard {
+                    path: scratch_for_task,
+                },
+            );
+            tokio::pin!(replacement);
+            let mut waiting_tx = Some(waiting_tx);
+            let result = poll_fn(|cx| {
+                let polled = replacement.as_mut().poll(cx);
+                if polled.is_pending() {
+                    if let Some(tx) = waiting_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                polled
+            })
+            .await?;
+            // Same Success-dependent continuation site as apply_upgrade_from_manifest
+            // (restart / handoff). Marker only — no real restart in this unit test.
+            if matches!(result, UpgradeResult::Success { .. }) {
+                std::fs::write(&marker, b"restart reached").unwrap();
+            }
+            Ok::<_, UpgradeError>(())
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), waiting_rx)
+            .await
+            .expect("offload submitted within timeout")
+            .expect("waiting signal");
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            b"old-daemon",
+            "must still be waiting on the held lock"
+        );
+        assert!(!restart_marker.exists());
+
+        task.abort();
+        assert!(
+            task.await.unwrap_err().is_cancelled(),
+            "caller must observe abort"
+        );
+        assert!(
+            scratch.exists(),
+            "blocking worker must retain temp-dir custody across cancel"
+        );
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while scratch.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("temp-dir custody must release after the worker finishes");
+
+        let installed = std::fs::read(&primary).unwrap() == b"new-daemon";
+        let companion_installed = hold_companion && std::fs::read(&cli).unwrap() == b"new-cli";
+        let restarted = restart_marker.exists();
+        assert!(
+            !installed,
+            "cancelled caller must not leave the daemon binary replaced without restart ownership"
+        );
+        assert!(
+            !companion_installed,
+            "cancelled caller must not leave the companion binary replaced without restart ownership"
+        );
+        assert!(
+            !installed || restarted,
+            "replacement must not outlive its restart continuation"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"old-daemon");
+        if hold_companion {
+            assert_eq!(std::fs::read(&cli).unwrap(), b"old-cli");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_while_daemon_lock_held_must_not_orphan_restart() {
+        cancel_while_lock_held_must_not_orphan_restart(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_while_companion_lock_held_must_not_orphan_restart() {
+        cancel_while_lock_held_must_not_orphan_restart(true).await;
+    }
+
+    /// Live control: with companion lock held then released, both installs and
+    /// the restart continuation complete together.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_companion_lock_retains_restart_continuation() {
+        use std::fs::OpenOptions;
+        use std::future::{poll_fn, Future};
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let primary = root.path().join("x0xd");
+        let cli = root.path().join("x0x");
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        std::fs::write(&cli, b"old-cli").unwrap();
+        let incoming = scratch.join("daemon");
+        let incoming_cli = scratch.join("cli");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+        std::fs::write(&incoming_cli, b"new-cli").unwrap();
+
+        let mut lock_name = cli.file_name().unwrap().to_os_string();
+        lock_name.push(".upgrade.lock");
+        let lock_path = cli.with_file_name(lock_name);
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open companion host lock");
+        held.lock().expect("hold companion lock");
+
+        let restart_marker = root.path().join("restart-continuation");
+        let marker = restart_marker.clone();
+        let scratch_for_task = scratch.clone();
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let replacement = apply_replacements_offloaded(
+                Upgrader::new(primary, semver::Version::new(1, 0, 0)),
+                incoming,
+                semver::Version::new(2, 0, 0),
+                Some((
+                    Upgrader::new(cli, semver::Version::new(1, 0, 0)),
+                    incoming_cli,
+                )),
+                TempDirGuard {
+                    path: scratch_for_task,
+                },
+            );
+            tokio::pin!(replacement);
+            let mut waiting_tx = Some(waiting_tx);
+            let result = poll_fn(|cx| {
+                let polled = replacement.as_mut().poll(cx);
+                if polled.is_pending() {
+                    if let Some(tx) = waiting_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                polled
+            })
+            .await?;
+            if matches!(result, UpgradeResult::Success { .. }) {
+                std::fs::write(&marker, b"restart reached").unwrap();
+            }
+            Ok::<_, UpgradeError>(())
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), waiting_rx)
+            .await
+            .expect("offload submitted")
+            .expect("waiting signal");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("live apply timeout")
+            .expect("join")
+            .expect("apply");
+
+        assert_eq!(
+            std::fs::read(root.path().join("x0xd")).unwrap(),
+            b"new-daemon"
+        );
+        assert_eq!(std::fs::read(root.path().join("x0x")).unwrap(), b"new-cli");
+        assert!(
+            restart_marker.exists(),
+            "live success must reach the restart continuation"
+        );
+        assert!(!scratch.exists(), "temp-dir custody must clean up");
     }
 }

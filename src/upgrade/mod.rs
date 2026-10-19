@@ -149,6 +149,11 @@ impl Upgrader {
     /// path runs (T-self-update-host-backup-guard / #1447). Companion
     /// binaries (e.g. `x0x` next to `x0xd`) take their own lock file beside
     /// that path via the same mechanism.
+    /// Path of the binary this upgrader replaces.
+    pub(super) fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+
     pub fn perform_upgrade(
         &self,
         new_binary_path: &Path,
@@ -160,7 +165,18 @@ impl Upgrader {
         // Dropping the guard releases the OS lock; the lock file is never
         // unlinked, so reclaim cannot remove a file another process still holds.
         let _host_lock = acquire_host_upgrade_lock(&self.target_path)?;
+        self.finish_upgrade_under_host_lock(new_binary_path, target_version)
+    }
 
+    /// Compare / backup / replace while the caller already holds this target's
+    /// host lock. Used by the offloaded multi-target apply so every lock can
+    /// be taken before any mutation (cancel must not install bytes without a
+    /// restart owner).
+    pub(super) fn finish_upgrade_under_host_lock(
+        &self,
+        new_binary_path: &Path,
+        target_version: &Version,
+    ) -> Result<UpgradeResult, UpgradeError> {
         if on_disk_matches_incoming(&self.target_path, new_binary_path)? {
             info!(
                 version = %target_version,
@@ -222,7 +238,7 @@ fn host_upgrade_lock_path(target: &Path) -> PathBuf {
 
 /// Exclusive OS lock (`std::fs::File::lock`: flock/fcntl on Unix, LockFileEx
 /// on Windows). Created if missing; never truncated or unlinked.
-fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeError> {
+pub(super) fn acquire_host_upgrade_lock(target: &Path) -> Result<File, UpgradeError> {
     let lock_path = host_upgrade_lock_path(target);
     let file = OpenOptions::new()
         .read(true)

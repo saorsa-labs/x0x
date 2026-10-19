@@ -4,7 +4,7 @@
 - **Target slot:** A14
 - **Date:** 2026-10-18
 - **Decision owners:** David Irvine
-- **Reviewers:** Claude (APPROVE e8eb2f06), Codex (APPROVE e8eb2f06)
+- **Reviewers:** Claude and Codex APPROVE covered the e8eb2f06 text; the revised text (point 5, Windows, and the companion-lock sentence) awaits re-review
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** x0x #1447; draft #1410 / #1106; Accepted ADR 0094 §2.
