@@ -14,7 +14,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const CONNECTIVITY_GRACE_SECS: u64 = 120;
+pub(in crate::server) const CONNECTIVITY_GRACE_SECS: u64 = 120;
 const STATUS_CONNECTING_GRACE_SECS: u64 = 45;
 
 /// How often the background refresher re-reads the transport peer counts that
@@ -48,6 +48,15 @@ pub(in crate::server) struct HealthSnapshot {
     /// Peer ids from the same refresher store as `one_sided_peers`.
     /// `GET /peers` reads this set so its `link` matches `/health`.
     one_sided_ids: std::sync::Mutex<Vec<[u8; 32]>>,
+    /// Last M1 verdict sample gathered by the refresher (#1380). Plain
+    /// data under a short std mutex — the same pattern as
+    /// `one_sided_ids`, and nothing like the per-peer parking_lot walk
+    /// that #600 removed from the handler.
+    verdict_sample: std::sync::Mutex<super::super::health_verdict::VerdictSample>,
+    /// Delivery-probe results published by the probe task (#1380).
+    probes_run: AtomicUsize,
+    last_probe_ok: std::sync::atomic::AtomicBool,
+    last_probe_latency_ms: AtomicUsize,
 }
 
 impl HealthSnapshot {
@@ -103,6 +112,58 @@ impl HealthSnapshot {
             self.one_sided_peers.load(Ordering::Relaxed),
         )
     }
+
+    /// Publish the refresher's last M1 verdict sample (#1380).
+    pub(in crate::server) fn store_verdict_sample(
+        &self,
+        sample: super::super::health_verdict::VerdictSample,
+    ) {
+        *self
+            .verdict_sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sample;
+    }
+
+    /// Clone the last stored verdict sample. Before the first refresher
+    /// tick this is the unsampled baseline (every input `ok`).
+    pub(in crate::server) fn verdict_sample(&self) -> super::super::health_verdict::VerdictSample {
+        self.verdict_sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Record one delivery-probe outcome (#1380). `latency_ms` is `None`
+    /// when the probe failed before a measurable round-trip.
+    pub(in crate::server) fn record_probe(&self, ok: bool, latency_ms: Option<u64>) {
+        self.probes_run.fetch_add(1, Ordering::Relaxed);
+        self.last_probe_ok.store(ok, Ordering::Relaxed);
+        // 0 is the "no latency recorded" sentinel, so a real sub-millisecond
+        // round-trip clamps up to 1 ms rather than vanishing.
+        self.last_probe_latency_ms.store(
+            latency_ms.map(|ms| ms.max(1) as usize).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// `(probes_run, last_ok, last_latency_ms)`. `last_ok` and the latency
+    /// are `None` until the first probe completes.
+    pub(in crate::server) fn probe_results(&self) -> (u64, Option<bool>, Option<u64>) {
+        let run = self.probes_run.load(Ordering::Relaxed);
+        if run == 0 {
+            return (0, None, None);
+        }
+        let latency = self.last_probe_latency_ms.load(Ordering::Relaxed);
+        (
+            run as u64,
+            Some(self.last_probe_ok.load(Ordering::Relaxed)),
+            if latency == 0 {
+                None
+            } else {
+                Some(latency as u64)
+            },
+        )
+    }
 }
 
 /// Sample one-sided links, store the snapshot, then start a repair task.
@@ -151,9 +212,15 @@ pub(in crate::server) struct HealthData {
     /// GroupCards this process refused at discovery, shard, contact, and
     /// metadata ingress because the signature did not verify (#1224).
     unsigned_group_cards_refused: u64,
+    /// M1 structured verdict `ok|degraded|error` with its ten inputs
+    /// (#1380, ADR 0096 §6). Additive: `status`/`degraded_reason` above
+    /// keep their exact legacy semantics — the watchdog and the fleet
+    /// monitor keep reading those; agents and operators read this.
+    verdict: super::super::health_verdict::HealthVerdict,
 }
 
-/// Classify liveness for `GET /health` (issue #262).
+/// Classify liveness for `GET /health` (issue #262). Shared with the M1
+/// verdict's peers input (#1380) so the two surfaces can never disagree.
 ///
 /// A daemon that has been up past the bootstrap grace window with ZERO peers
 /// is not "healthy" — the prod NYC bootstrap sat in exactly that state for
@@ -172,7 +239,7 @@ fn one_sided_reason(count: usize) -> String {
     )
 }
 
-fn classify_health(
+pub(in crate::server) fn classify_health(
     peers: usize,
     send_ready_peers: usize,
     uptime_secs: u64,
@@ -249,7 +316,10 @@ pub(in crate::server) struct StatusData {
 ///
 /// Deliberately O(1) and lock-free (issue #600): the peer counts come from
 /// [`HealthSnapshot`], never from a live peer-table walk. See that type for
-/// why the live read made the watchdog abort live daemons.
+/// why the live read made the watchdog abort live daemons. The #1380
+/// verdict is the same discipline: the handler clones the refresher's
+/// sample, merges the live atomics and uptime, and classifies — no
+/// transport state is touched.
 pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<HealthData>> {
@@ -257,6 +327,13 @@ pub(in crate::server) async fn health(
     let uptime_secs = state.start_time.elapsed().as_secs();
     let (status, degraded_reason) =
         classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers);
+
+    let mut sample = state.health_snapshot.verdict_sample();
+    sample.peers = peers;
+    sample.send_ready_peers = send_ready_peers;
+    sample.one_sided_peers = one_sided_peers;
+    sample.uptime_secs = uptime_secs;
+    let verdict = super::super::health_verdict::classify(&sample);
 
     Json(ApiResponse {
         ok: true,
@@ -269,6 +346,7 @@ pub(in crate::server) async fn health(
             degraded_reason,
             warnings: Vec::new(),
             unsigned_group_cards_refused: super::named_groups::unsigned_group_cards_refused(),
+            verdict,
         },
     })
 }
@@ -442,6 +520,7 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 mod tests {
     use super::{classify_health, classify_runtime_status, HealthSnapshot};
     use crate as x0x;
+    use crate::server::health_verdict;
 
     /// The `health` handler's own source, for the structural guard below.
     /// Matches the `include_str!`-of-route-source convention in
@@ -515,6 +594,98 @@ mod tests {
         let (status, reason) = classify_health(0, 0, 121, 0);
         assert_eq!(status, "degraded");
         assert!(reason.is_some(), "degraded must carry a reason");
+    }
+
+    /// WHY (#1380): the verdict is additive JSON only. Every legacy key —
+    /// the ones the VPS fleet monitor, `x0x doctor` and the upgrade
+    /// handoff's readiness probe parse — must keep its exact name and
+    /// semantics, with `verdict` arriving as a new sibling.
+    #[test]
+    fn health_json_is_additive_over_the_legacy_shape() {
+        let (peers, send_ready, one_sided) = (4, 4, 0);
+        let uptime = 300_u64;
+        let (status, degraded_reason) = classify_health(peers, send_ready, uptime, one_sided);
+        let mut sample = health_verdict::VerdictSample::unsampled();
+        sample.peers = peers;
+        sample.send_ready_peers = send_ready;
+        sample.one_sided_peers = one_sided;
+        sample.uptime_secs = uptime;
+        let data = super::HealthData {
+            status: status.to_string(),
+            version: x0x::VERSION.to_string(),
+            peers,
+            send_ready_peers: send_ready,
+            uptime_secs: uptime,
+            degraded_reason,
+            warnings: Vec::new(),
+            unsigned_group_cards_refused: 0,
+            verdict: health_verdict::classify(&sample),
+        };
+        let json =
+            serde_json::to_value(&super::ApiResponse { ok: true, data }).expect("serializes");
+        for legacy_key in [
+            "ok",
+            "status",
+            "version",
+            "peers",
+            "send_ready_peers",
+            "uptime_secs",
+        ] {
+            assert!(
+                json.get(legacy_key).is_some(),
+                "legacy key {legacy_key} gone"
+            );
+        }
+        assert_eq!(json["status"], "healthy");
+        assert_eq!(json["peers"], 4);
+        assert_eq!(json["verdict"]["verdict"], "ok");
+        for input in [
+            "plane",
+            "peers",
+            "seed_reachable",
+            "send_failure_rate",
+            "delivery_probe",
+            "recv_pump_shed",
+            "disk",
+            "log",
+            "identity",
+            "upgrade",
+        ] {
+            assert!(
+                json["verdict"]["inputs"][input]["state"].is_string(),
+                "verdict input {input} missing its state badge"
+            );
+        }
+    }
+
+    /// #1380: the verdict sample is a faithful store/load pass-through, so
+    /// the handler serves the refresher's last classification inputs.
+    #[test]
+    fn health_snapshot_round_trips_the_verdict_sample() {
+        let snapshot = HealthSnapshot::default();
+        let mut sample = snapshot.verdict_sample();
+        assert_eq!(sample.plane, health_verdict::PlaneSample::NotSampled);
+        sample.seeds_configured = 2;
+        sample.seeds_connected = 1;
+        snapshot.store_verdict_sample(sample.clone());
+        assert_eq!(snapshot.verdict_sample().seeds_configured, 2);
+        assert_eq!(snapshot.verdict_sample().seeds_connected, 1);
+    }
+
+    /// #1380: probe recording publishes before the handler reads — a probe
+    /// outcome must be visible immediately, and none-yet must read as
+    /// `(0, None, None)`.
+    #[test]
+    fn health_snapshot_records_probe_outcomes() {
+        let snapshot = HealthSnapshot::default();
+        assert_eq!(snapshot.probe_results(), (0, None, None));
+        snapshot.record_probe(true, Some(12));
+        snapshot.record_probe(false, None);
+        assert_eq!(snapshot.probe_results(), (2, Some(false), None));
+        snapshot.record_probe(true, Some(0));
+        let (run, ok, latency) = snapshot.probe_results();
+        assert_eq!((run, ok), (3, Some(true)));
+        assert_eq!(latency, Some(1), "sub-millisecond latency clamps to 1 ms");
     }
 
     /// Startup gets a grace window: bootstrap takes seconds-to-a-minute, and
