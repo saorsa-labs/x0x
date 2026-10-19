@@ -19942,13 +19942,15 @@ enum NotMemberJoinRow {
     /// Removed, not Banned). Cleared for a retry when the verified invite
     /// does not re-arm it.
     UnseatedJoinRemnant,
-    /// #1161 follow-up: inert card-import cache metadata
+    /// #1161 / #1471: inert card-import cache metadata
     /// ([`import_card_into_groups`]): owner-only authority roster, no local
     /// seat, no shared secret / epoch, no lineage, no issued-invite or
     /// join-request evidence. Cleared only after a fully verified invite
-    /// whose stable id and owner match the stub genesis, under the same
-    /// write-lock recheck as [`Self::UnseatedJoinRemnant`]. Clearing grants
-    /// no seat or key — the ordinary first-join path does that.
+    /// whose stable id matches the stub genesis (`group_id`), under the
+    /// same write-lock recheck as [`Self::UnseatedJoinRemnant`]. Card
+    /// owner/creator text is unauthenticated, so a forged owner must not
+    /// block that clear (#1471). Clearing grants no seat or key — the
+    /// ordinary first-join path does that.
     InertCardImportStub,
     /// No local seat or invite provenance, and not an inert card-import
     /// stub. Report the failed join without clearing a row whose origin
@@ -20013,7 +20015,7 @@ impl NotMemberJoinRow {
 /// `secret_epoch = 0`, no lineage, no issued-invite ledger, no join-request
 /// or denial evidence, genesis present with that owner. Quarantine and
 /// withdrawal are excluded by the caller. AppState checks (TreeKEM / MLS
-/// keys, same-stable aliases) and verified-invite owner/stable match run
+/// keys, same-stable aliases) and verified-invite stable-id match run
 /// separately under membership serialization and again under the write lock.
 fn is_inert_card_import_stub_shape(info: &x0x::groups::GroupInfo, joiner_hex: &str) -> bool {
     if info.invite_lineage.is_some()
@@ -20043,12 +20045,16 @@ fn is_inert_card_import_stub_shape(info: &x0x::groups::GroupInfo, joiner_hex: &s
         && owner_hex.eq_ignore_ascii_case(&genesis.creator_agent_id)
 }
 
-/// Verified invite stable id + signed creator must equal the stub's card
-/// genesis `group_id` / `creator_agent_id` (card `owner_agent_id`).
+/// Verified invite stable id must equal the stub's card genesis `group_id`.
+///
+/// Card `owner_agent_id` / genesis `creator_agent_id` are unauthenticated
+/// import text (#1471): a forged owner with the real group id must not keep
+/// an inert stub in front of a verified invite. The invite's signed creator
+/// is checked elsewhere before this gate; seated or keyed rows never classify
+/// as [`NotMemberJoinRow::InertCardImportStub`].
 fn inert_stub_matches_verified_invite(
     info: &x0x::groups::GroupInfo,
     invite_stable_group_id: &str,
-    invite_owner_hex: &str,
 ) -> bool {
     let Some(genesis) = info.genesis.as_ref() else {
         return false;
@@ -20056,9 +20062,6 @@ fn inert_stub_matches_verified_invite(
     genesis
         .group_id
         .eq_ignore_ascii_case(invite_stable_group_id)
-        && genesis
-            .creator_agent_id
-            .eq_ignore_ascii_case(invite_owner_hex)
 }
 
 /// True when another map entry shares this stub's stable id (conflicting
@@ -20092,10 +20095,11 @@ fn classify_not_member_join_row(
     if never_seated && no_roster_entry && !info.withdrawn {
         NotMemberJoinRow::UnseatedJoinRemnant
     } else if lineage.is_none() && no_roster_entry && !info.withdrawn {
-        // #1161: a carry can survive a failed join without local lineage.
-        // Narrow inert card-import stubs are clearable after a verified
-        // matching invite; every other lineage-free shape stays a refusal
-        // (`JoinFailed` is never clearable in general).
+        // #1161 / #1471: a carry can survive a failed join without local
+        // lineage. Narrow inert card-import stubs are clearable after a
+        // verified invite for the same stable group id (card owner text is
+        // not authenticated); every other lineage-free shape stays a
+        // refusal (`JoinFailed` is never clearable in general).
         if is_inert_card_import_stub_shape(info, joiner_hex) {
             NotMemberJoinRow::InertCardImportStub
         } else {
@@ -20161,7 +20165,6 @@ async fn clear_stale_not_member_join_row(
     group_id_hex: &str,
     joiner_hex: &str,
     invite_stable_group_id: &str,
-    invite_owner_hex: &str,
 ) -> ClearStaleNotMemberJoinRowResult {
     // Established order in src/: TreeKEM → MLS → named_groups (see
     // `install_joined_treekem_group_after_crypto_recheck`). Hold all three
@@ -20184,11 +20187,7 @@ async fn clear_stale_not_member_join_row(
             NotMemberJoinRow::UnseatedJoinRemnant => keys.push(key.clone()),
             NotMemberJoinRow::InertCardImportStub => {
                 let eligible_shape = is_inert_card_import_stub_shape(info, joiner_hex)
-                    && inert_stub_matches_verified_invite(
-                        info,
-                        invite_stable_group_id,
-                        invite_owner_hex,
-                    )
+                    && inert_stub_matches_verified_invite(info, invite_stable_group_id)
                     && !has_conflicting_same_stable_alias(&groups, key, info);
                 if !eligible_shape {
                     continue;
@@ -20755,21 +20754,18 @@ pub(in crate::server) async fn join_group_via_invite(
                         stale_not_member_row = true;
                     }
                 } else if not_member_row == Some(NotMemberJoinRow::InertCardImportStub) {
-                    // #1161: replace inert card-import metadata only when
-                    // the verified invite names the same stable group and
-                    // owner, and shape/alias predicates still hold.
-                    // Keyed TreeKEM/MLS is rechecked under clear's
-                    // TreeKEM→MLS→named_groups write hold — do not take
-                    // crypto locks while this named_groups read is held
-                    // (that order deadlocks against a TreeKEM final
-                    // install for another group). Mismatch keeps today's
-                    // JoinFailed refusal.
+                    // #1161 / #1471: replace inert card-import metadata when
+                    // the verified invite names the same stable group id
+                    // and shape/alias predicates still hold. Card owner
+                    // text is unauthenticated — do not require it to match
+                    // the invite's signed creator. Keyed TreeKEM/MLS is
+                    // rechecked under clear's TreeKEM→MLS→named_groups
+                    // write hold — do not take crypto locks while this
+                    // named_groups read is held (that order deadlocks
+                    // against a TreeKEM final install for another group).
+                    // Stable-id mismatch keeps today's JoinFailed refusal.
                     let eligible = is_inert_card_import_stub_shape(&info, &joiner_hex)
-                        && inert_stub_matches_verified_invite(
-                            &info,
-                            invite_stable_group_id,
-                            invite_owner_hex,
-                        )
+                        && inert_stub_matches_verified_invite(&info, invite_stable_group_id)
                         && !has_conflicting_same_stable_alias(&groups, &local_key, &info);
                     if eligible {
                         stale_not_member_row = true;
@@ -20888,7 +20884,6 @@ pub(in crate::server) async fn join_group_via_invite(
             &group_id_hex,
             &hex::encode(agent_id.as_bytes()),
             invite_stable_group_id,
-            invite_owner_hex,
         )
         .await
         {
