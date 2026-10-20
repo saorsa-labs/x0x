@@ -328,7 +328,7 @@ macro_rules! staging_runtime_regression_tests {
                 }
             }
 
-            // Polling wait_for_staging once starts its blocking lock acquisition.
+            // Identity readback precedes the blocking install-lock acquisition.
             // Retaining the actual lock prevents either record creation or progress.
             // A Weak clock owner is a completion witness for every cloned worker:
             // checking bytes immediately after cancellation would miss a late write.
@@ -347,6 +347,11 @@ macro_rules! staging_runtime_regression_tests {
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 {
                     let upgrader = crate::upgrade::apply::AutoApplyUpgrader::new("x0xd")
+                        .with_restart_context(crate::upgrade::restart::RestartContext {
+                            data_dir: Some(request.data_root.clone()),
+                            api_addr: None,
+                            shutdown: None,
+                        })
                         .with_staging_request(request.clone())
                         .with_staging_clock(Some(test_clock));
                     let (sender, mut shutdown) = tokio::sync::watch::channel(false);
@@ -365,10 +370,17 @@ macro_rules! staging_runtime_regression_tests {
                             first.is_pending(),
                             "actual install lock must block the worker"
                         );
-                        assert!(
-                            owners.strong_count() >= 2,
-                            "worker must carry the real gate"
-                        );
+                        // Identity readback is now asynchronous. Wait for the
+                        // actual gate clone in the queued worker, while still
+                        // holding the install lock, before testing cancellation.
+                        while owners.strong_count() < 2 {
+                            assert!(std::time::Instant::now() < deadline, "worker ownership deadline");
+                            tokio::select! {
+                                biased;
+                                result = wait.as_mut() => panic!("wait ended before lock admission: {result:?}"),
+                                _ = tokio::task::yield_now() => {}
+                            }
+                        }
                         sender.as_ref().unwrap().send(true).unwrap();
                     }
                     let result = loop {
@@ -524,6 +536,15 @@ macro_rules! staging_runtime_regression_tests {
                     );
                     refused.push(bytes);
                 }
+                let plan = crate::upgrade::restart::resolve_restart_plan(
+                    false,
+                    &crate::upgrade::restart::SupervisionSignals::default(),
+                    &request.install,
+                    Some(&request.data_root),
+                    None,
+                    &crate::upgrade::restart::LaunchdPolicyReadback::NotApplicable,
+                    &crate::upgrade::restart::SystemdPolicyReadback::NotApplicable,
+                ).unwrap();
                 let gate = Gate {
                     request: request.clone(),
                     clock: Some(std::sync::Arc::new(|| Ok(clock("a", 1000)))),
@@ -531,7 +552,7 @@ macro_rules! staging_runtime_regression_tests {
                 };
                 for bytes in refused {
                     fs::write(&path, &bytes).unwrap();
-                    assert!(gate.require_due(&request.install).is_err());
+                    assert!(gate.require_due(&request.install, &plan).is_err());
                     assert_eq!(fs::read(&path).unwrap(), bytes);
                     assert!(
                         !receipt_path(&request).unwrap().exists(),
@@ -544,7 +565,7 @@ macro_rules! staging_runtime_regression_tests {
                     read_pair_record(&request.install).unwrap().unwrap().phase,
                     PairPhase::Restored
                 );
-                gate.require_due(&request.install).unwrap();
+                gate.require_due(&request.install, &plan).unwrap();
                 assert_eq!(
                     read_receipt(&request).unwrap().unwrap().remaining,
                     Duration::ZERO
@@ -552,7 +573,7 @@ macro_rules! staging_runtime_regression_tests {
                 assert_eq!(fs::read(&path).unwrap(), valid);
                 fs::write(&pending, b"{torn intent").unwrap();
                 let receipt = fs::read(receipt_path(&request).unwrap()).unwrap();
-                assert!(gate.require_due(&request.install).is_err());
+                assert!(gate.require_due(&request.install, &plan).is_err());
                 assert_eq!(fs::read(&pending).unwrap(), b"{torn intent");
                 assert_eq!(fs::read(receipt_path(&request).unwrap()).unwrap(), receipt);
                 assert_eq!(fs::read(&path).unwrap(), valid);

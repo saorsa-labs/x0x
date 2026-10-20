@@ -310,3 +310,8 @@ fn invalid_authority() -> io::Error {
         "invalid embedded deployment authority for fleet rollout",
     )
 }
+
+#[cfg(test)]
+include!("../../tests/upgrade_fleet.rs");
+#[cfg(test)]
+fleet_policy_regression_tests!();
