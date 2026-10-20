@@ -56,8 +56,10 @@ pub(crate) fn parse_source(
     let text = std::str::from_utf8(bytes).map_err(|_| refusal("unit source is not UTF-8"))?;
     let mut section = "";
     let mut commands = Vec::new();
+    // systemd read_line accepts both CR and LF as line boundaries. Empty
+    // segments from paired delimiters are ignored; NUL was refused above.
     for line in text
-        .lines()
+        .split(['\r', '\n'])
         .map(|line| line.trim_matches(SOURCE_WHITESPACE))
         .filter(|line| !line.is_empty() && !line.starts_with(['#', ';']))
     {
