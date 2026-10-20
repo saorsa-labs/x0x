@@ -99,6 +99,7 @@ fn torn_legacy_handoff_read_preserves_diagnostic_bytes() {
     assert_eq!(std::fs::read(&path).unwrap(), torn);
 }
 
+#[cfg(unix)]
 #[test]
 fn handoff_writer_refuses_missing_parent_without_creating_directories() {
     let dir = TempDir::new().unwrap();
@@ -106,6 +107,89 @@ fn handoff_writer_refuses_missing_parent_without_creating_directories() {
     let path = missing.join(HANDOFF_FILE_NAME);
     assert!(legacy_handoff(dir.path(), "0.48.2").write(&path).is_err());
     assert!(!dir.path().join("missing").exists());
+}
+
+#[test]
+fn unmanaged_legacy_writer_preserves_released_shape_and_referenced_files() {
+    let dir = TempDir::new().unwrap();
+    let path = dir
+        .path()
+        .join("missing")
+        .join("data")
+        .join(HANDOFF_FILE_NAME);
+    let mut handoff = legacy_handoff(dir.path(), "0.48.2");
+    std::fs::write(&handoff.target_path, b"configured binary").unwrap();
+    std::fs::write(&handoff.backup_path, b"rollback binary").unwrap();
+
+    // Exercise the Windows compatibility writer through its private seam on
+    // every CI platform. Its success is not an M2 directory-barrier receipt.
+    for version in ["0.48.2", "0.48.3"] {
+        handoff.to_version = version.to_owned();
+        journal::write_legacy_handoff(&path, &handoff).unwrap();
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(encoded, serde_json::to_value(&handoff).unwrap());
+        assert_eq!(UpgradeHandoff::read(&path).unwrap().to_version, version);
+        assert_eq!(
+            std::fs::read(&handoff.target_path).unwrap(),
+            b"configured binary"
+        );
+        assert_eq!(
+            std::fs::read(&handoff.backup_path).unwrap(),
+            b"rollback binary"
+        );
+        assert_diagnostic_only(&journal::read_boot_records(path.parent().unwrap()));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unmanaged_legacy_replacement_keeps_the_previous_record_inode() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join(HANDOFF_FILE_NAME);
+    let retained = dir.path().join("retained-handoff.json");
+    journal::write_legacy_handoff(&path, &legacy_handoff(dir.path(), "0.48.2")).unwrap();
+    let previous = std::fs::read(&path).unwrap();
+    std::fs::hard_link(&path, &retained).unwrap();
+
+    journal::write_legacy_handoff(&path, &legacy_handoff(dir.path(), "0.48.3")).unwrap();
+
+    assert_eq!(std::fs::read(&retained).unwrap(), previous);
+    assert_eq!(UpgradeHandoff::read(&path).unwrap().to_version, "0.48.3");
+}
+
+#[test]
+fn unmanaged_legacy_writer_preserves_untrusted_and_m2_records() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join(HANDOFF_FILE_NAME);
+    let handoff = legacy_handoff(dir.path(), "0.48.2");
+    std::fs::write(&handoff.target_path, b"configured binary").unwrap();
+    std::fs::write(&handoff.backup_path, b"rollback binary").unwrap();
+    let mut m2 = serde_json::to_value(&handoff).unwrap();
+    m2["schema_version"] = serde_json::json!(1);
+    m2["record_kind"] = serde_json::json!("handoff");
+    m2["transaction_id"] = serde_json::json!("transaction-a");
+    m2["generation"] = serde_json::json!(3);
+    m2["instance_id"] = serde_json::json!("alice");
+    for bytes in [
+        br#"{"schema_version":"#.to_vec(),
+        br#"{"schema_version":999}"#.to_vec(),
+        serde_json::to_vec(&m2).unwrap(),
+    ] {
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(journal::write_legacy_handoff(&path, &handoff).is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(&handoff.target_path).unwrap(),
+            b"configured binary"
+        );
+        assert_eq!(
+            std::fs::read(&handoff.backup_path).unwrap(),
+            b"rollback binary"
+        );
+    }
 }
 
 #[test]
@@ -117,35 +201,148 @@ fn recovery_records_preserve_real_cleanup_candidates() {
     std::fs::create_dir(&staged).unwrap();
     std::fs::write(staged.join("candidate"), b"candidate").unwrap();
     std::fs::write(&sidelined, b"rollback").unwrap();
-    let record = data.path().join(journal::JOURNAL_FILE_NAME);
-    for bytes in [
-        br#"{"schema_version":999}"#.as_slice(),
-        br#"{"schema_version":"#.as_slice(),
+    for name in [
+        journal::JOURNAL_FILE_NAME,
+        journal::HANDOFF_FILE_NAME,
+        journal::BOOT_FILE_NAME,
     ] {
-        std::fs::write(&record, bytes).unwrap();
-        let removed = journal::sweep_if_no_records(data.path(), || {
-            x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
-        });
-        assert_eq!(removed, 0);
-        assert_eq!(std::fs::read(&record).unwrap(), bytes);
-        assert_eq!(
-            std::fs::read(staged.join("candidate")).unwrap(),
-            b"candidate"
-        );
-        assert_eq!(std::fs::read(&sidelined).unwrap(), b"rollback");
+        let record = data.path().join(name);
+        for bytes in [
+            br#"{"schema_version":999}"#.as_slice(),
+            br#"{"schema_version":"#.as_slice(),
+        ] {
+            std::fs::write(&record, bytes).unwrap();
+            let removed = journal::sweep_if_no_pending_records(data.path(), || {
+                x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
+            });
+            assert_eq!(removed, 0);
+            assert_eq!(std::fs::read(&record).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(staged.join("candidate")).unwrap(),
+                b"candidate"
+            );
+            assert_eq!(std::fs::read(&sidelined).unwrap(), b"rollback");
+        }
+        std::fs::remove_file(record).unwrap();
     }
-    std::fs::remove_file(record).unwrap();
+
+    let record = data.path().join(journal::HANDOFF_FILE_NAME);
+    let mut m2 = serde_json::to_value(legacy_handoff(dir.path(), "0.48.2")).unwrap();
+    m2["schema_version"] = serde_json::json!(1);
+    m2["record_kind"] = serde_json::json!("handoff");
+    m2["transaction_id"] = serde_json::json!("transaction-a");
+    m2["generation"] = serde_json::json!(3);
+    m2["instance_id"] = serde_json::json!("alice");
+    let bytes = serde_json::to_vec(&m2).unwrap();
+    std::fs::write(&record, &bytes).unwrap();
+    assert!(matches!(
+        journal::read_boot_records(data.path()).handoff,
+        journal::RecordRead::Handoff(_)
+    ));
     assert_eq!(
-        journal::sweep_if_no_records(data.path(), || {
+        journal::sweep_if_no_pending_records(data.path(), || {
+            x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
+        }),
+        0
+    );
+    assert_eq!(std::fs::read(&record).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(staged.join("candidate")).unwrap(),
+        b"candidate"
+    );
+    assert_eq!(std::fs::read(&sidelined).unwrap(), b"rollback");
+    std::fs::remove_file(&record).unwrap();
+    assert_eq!(
+        journal::sweep_if_no_pending_records(data.path(), || {
             x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
         }),
         2
     );
 }
 
+#[test]
+fn legacy_only_handoff_allows_unrelated_cleanup_and_preserves_its_files() {
+    for versioned in [false, true] {
+        let install = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let handoff = legacy_handoff(install.path(), "0.48.2");
+        std::fs::write(&handoff.target_path, b"configured binary").unwrap();
+        std::fs::write(&handoff.backup_path, b"referenced rollback").unwrap();
+        let staged = install.path().join(".x0x-upgrade-unrelated");
+        let sidelined = install.path().join("x0xd.x0xold-unrelated");
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("candidate"), b"unrelated stage").unwrap();
+        std::fs::write(&sidelined, b"unrelated sideline").unwrap();
+        let mut value = serde_json::to_value(&handoff).unwrap();
+        if versioned {
+            value["schema_version"] = serde_json::json!(1);
+            value["record_kind"] = serde_json::json!("legacy_handoff");
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let record = data.path().join(journal::HANDOFF_FILE_NAME);
+        std::fs::write(&record, &bytes).unwrap();
+
+        // A zero minimum age makes the fixtures eligible without sleeps.
+        let removed = journal::sweep_if_no_pending_records(data.path(), || {
+            x0x::upgrade::sweep_stale_upgrade_artifacts(install.path(), std::time::Duration::ZERO)
+        });
+
+        assert_eq!(
+            removed, 2,
+            "a validated legacy-only handoff must not stop unrelated cleanup"
+        );
+        assert!(!staged.exists());
+        assert!(!sidelined.exists());
+        assert_eq!(std::fs::read(&record).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(&handoff.target_path).unwrap(),
+            b"configured binary"
+        );
+        assert_eq!(
+            std::fs::read(&handoff.backup_path).unwrap(),
+            b"referenced rollback"
+        );
+    }
+}
+
+#[test]
+fn legacy_handoff_referencing_a_cleanup_pattern_keeps_its_recovery_bytes() {
+    for reference_staged_directory in [false, true] {
+        let install = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let mut handoff = legacy_handoff(install.path(), "0.48.2");
+        if reference_staged_directory {
+            let staged = install.path().join(".x0x-upgrade-referenced");
+            std::fs::create_dir(&staged).unwrap();
+            handoff.target_path = staged.join("x0xd");
+        } else {
+            handoff.backup_path = install.path().join("x0xd.x0xold-referenced");
+        }
+        std::fs::write(&handoff.target_path, b"configured binary").unwrap();
+        std::fs::write(&handoff.backup_path, b"referenced rollback").unwrap();
+        let bytes = serde_json::to_vec(&handoff).unwrap();
+        let record = data.path().join(journal::HANDOFF_FILE_NAME);
+        std::fs::write(&record, &bytes).unwrap();
+
+        journal::sweep_if_no_pending_records(data.path(), || {
+            x0x::upgrade::sweep_stale_upgrade_artifacts(install.path(), std::time::Duration::ZERO)
+        });
+
+        assert_eq!(std::fs::read(&record).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(&handoff.target_path).unwrap(),
+            b"configured binary"
+        );
+        assert_eq!(
+            std::fs::read(&handoff.backup_path).unwrap(),
+            b"referenced rollback"
+        );
+    }
+}
+
 #[cfg(not(unix))]
 #[test]
-fn unsupported_record_barriers_refuse_before_mutation() {
+fn unsupported_m2_record_barriers_refuse_before_mutation() {
     let dir = TempDir::new().unwrap();
     assert_eq!(
         journal::check_record_barrier_support(dir.path())
@@ -153,15 +350,75 @@ fn unsupported_record_barriers_refuse_before_mutation() {
             .kind(),
         std::io::ErrorKind::Unsupported
     );
+    let path = dir.path().join(journal::BOOT_FILE_NAME);
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "record_kind": "boot",
+        "transaction_id": "transaction-a",
+        "generation": 3,
+        "instance_id": "alice",
+        "attempt": 1,
+        "pid": 5678,
+        "process_start": 200,
+        "boot_id": "boot-a",
+        "started_at_ns": 300,
+        "deadline_ns": 600
+    });
+    let target = dir.path().join("x0xd.exe");
+    let backup = dir.path().join("x0xd.backup");
+    std::fs::write(&target, b"configured binary").unwrap();
+    std::fs::write(&backup, b"rollback binary").unwrap();
+    for preexisting in [false, true] {
+        let previous = serde_json::to_vec(&record).unwrap();
+        if preexisting {
+            std::fs::write(&path, &previous).unwrap();
+        }
+        assert_eq!(
+            journal::write_record(&path, &record).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        if preexisting {
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+        } else {
+            assert!(!path.exists());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"configured binary");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"rollback binary");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_unmanaged_legacy_handoff_still_writes_and_reads() {
+    let dir = TempDir::new().unwrap();
     let path = dir.path().join(HANDOFF_FILE_NAME);
-    assert_eq!(
-        legacy_handoff(dir.path(), "0.48.2")
-            .write(&path)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::Unsupported
-    );
-    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    let mut handoff = legacy_handoff(dir.path(), "0.48.2");
+    std::fs::write(&handoff.target_path, b"configured binary").unwrap();
+    std::fs::write(&handoff.backup_path, b"rollback binary").unwrap();
+    for version in ["0.48.2", "0.48.3"] {
+        handoff.to_version = version.to_owned();
+        handoff.write(&path).unwrap();
+
+        let parsed = UpgradeHandoff::read(&path).unwrap();
+        let encoded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(encoded.get("schema_version").is_none());
+        assert!(encoded.get("record_kind").is_none());
+        assert_eq!(parsed.to_version, version);
+        assert_eq!(parsed.mode, RestartMode::TransactionalHandoff);
+        assert_eq!(parsed.argv, handoff.argv);
+        assert_eq!(parsed.target_path, handoff.target_path);
+        assert_eq!(parsed.backup_path, handoff.backup_path);
+        assert_eq!(
+            std::fs::read(&handoff.target_path).unwrap(),
+            b"configured binary"
+        );
+        assert_eq!(
+            std::fs::read(&handoff.backup_path).unwrap(),
+            b"rollback binary"
+        );
+        assert_diagnostic_only(&journal::read_boot_records(dir.path()));
+    }
 }
 
 #[cfg(unix)]
