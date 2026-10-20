@@ -153,14 +153,34 @@ macro_rules! http_staging_regression_tests {
                 manifest.assets[0].archive_url = "http-fixture://no-download".into();
                 manifest.assets[0].signature_url = "http-fixture://no-download".into();
                 let started = tokio::time::Instant::now();
+                let (_shutdown_tx, shutdown_watch) = watch::channel(false);
+                let runtime = HttpUpgradeRuntime {
+                    config,
+                    restart_context: listener_restart_context(&data,
+                        SocketAddr::from(([127, 0, 0, 1], 12700)), Arc::clone(&shutdown)),
+                    apply_lock: Arc::new(Mutex::new(())), shutdown: shutdown_watch,
+                    staging: Some(StartupStagingContext {
+                        install: install.clone(), identity_root: data.clone(), machine_id: [42; 32],
+                        observed: None,
+                        clock: Some(Arc::new(move || Ok(crate::upgrade::probe::ProbeClock {
+                            boot_id: "http-copied-fixture".into(),
+                            monotonic_ms: 1000 + u64::try_from(started.elapsed().as_millis())
+                                .map_err(std::io::Error::other)?,
+                        }))),
+                    }),
+                    operation_observer: None,
+                    wait_slot: Arc::new(Arc::new(Mutex::new(())).try_lock_owned().unwrap()),
+                };
+                let release = crate::upgrade::monitor::VerifiedRelease {
+                    manifest_json: serde_json::to_vec(&manifest).unwrap(), manifest,
+                    signature: Vec::new(), gossip_payload: Vec::new(),
+                };
                 let mut result = None;
                 {
                     // This is the helper called by the actual POST apply route.
-                    // No staging request or ignored future configuration is
-                    // attached by the fixture to alter the baseline behavior.
-                    let context = listener_restart_context(&data,
-                        SocketAddr::from(([127, 0, 0, 1], 12700)), Arc::clone(&shutdown));
-                    let operation = apply_http_release(&config, context, &manifest);
+                    // The GREEN helper carries the actual owned boot context
+                    // and original release bytes through its production gate.
+                    let operation = apply_http_release(&runtime, &release, false);
                     tokio::pin!(operation);
                     for step in 0..2 {
                         if step == 1 {
