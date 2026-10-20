@@ -36,6 +36,7 @@ const OLD_DAEMON: &[u8] = b"original daemon 1.2.3";
 const OLD_CLI: &[u8] = b"original managed CLI 1.2.0";
 const WORKER_ROOT: &str = "X0X_1373_PAIR_WORKER_ROOT";
 const WORKER_NAME: &str = "fixture_second_pair_writer";
+const WORKER_PREPARED: &str = "X0X_1373_PAIR_WORKER_PREPARED";
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
@@ -120,51 +121,64 @@ impl PairFixture {
     }
 
     fn run_second_writer(&self) -> serde_json::Value {
-        let result_path = self.root.path().join("second-result.json");
-        assert!(!result_path.exists());
-        let child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", WORKER_NAME, "--ignored", "--nocapture"])
-            .env(WORKER_ROOT, self.root.path())
-            .env("HOME", self.root.path().join("home"))
-            .env("XDG_CONFIG_HOME", self.root.path().join("home"))
-            .env("XDG_DATA_HOME", self.root.path().join("home"))
-            .env("XDG_CACHE_HOME", self.root.path().join("home"))
-            .env("TMPDIR", self.root.path().join("tmp"))
-            .env("TMP", self.root.path().join("tmp"))
-            .env("TEMP", self.root.path().join("tmp"))
-            .env(
-                "LLVM_PROFILE_FILE",
-                self.root.path().join("profiles/worker-%p-%m.profraw"),
-            )
-            .current_dir(self.root.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn inert second writer");
-        let mut child = ReapedChild(Some(child));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "second writer did not finish within its bound"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.0.take().unwrap().wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "second writer fixture failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        serde_json::from_slice(
-            &std::fs::read(result_path).expect("the exact worker must write its result"),
-        )
-        .unwrap()
+        finish_second_writer(self.spawn_second_writer(false), self.root.path())
     }
+
+    fn spawn_second_writer(&self, prepared_request: bool) -> ReapedChild {
+        spawn_second_writer(self.root.path(), prepared_request)
+    }
+}
+
+fn spawn_second_writer(root: &Path, prepared_request: bool) -> ReapedChild {
+    let result_path = root.join("second-result.json");
+    assert!(!result_path.exists());
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", WORKER_NAME, "--ignored", "--nocapture"])
+        .env(WORKER_ROOT, root)
+        .env(WORKER_PREPARED, if prepared_request { "1" } else { "0" })
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("home"))
+        .env("XDG_DATA_HOME", root.join("home"))
+        .env("XDG_CACHE_HOME", root.join("home"))
+        .env("TMPDIR", root.join("tmp"))
+        .env("TMP", root.join("tmp"))
+        .env("TEMP", root.join("tmp"))
+        .env(
+            "LLVM_PROFILE_FILE",
+            root.join("profiles/worker-%p-%m.profraw"),
+        )
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn inert second writer");
+    ReapedChild(Some(child))
+}
+
+fn finish_second_writer(mut child: ReapedChild, root: &Path) -> serde_json::Value {
+    let result_path = root.join("second-result.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "second writer did not finish within its bound"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "second writer fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(
+        &std::fs::read(result_path).expect("the exact worker must write its result"),
+    )
+    .unwrap()
 }
 
 fn request_at(root: &Path, second: bool) -> PairRequest {
@@ -336,7 +350,27 @@ fn successful_cli_then_failed_daemon_swap_restores_both_original_binaries() {
     let mut fault = options();
     fault.cli_first = true;
     fault.fail_at = Some(PairStep::BeforeSwap(PairRole::Daemon));
-    let result = pair::execute_pair_with_options(&request, &AtomicBool::new(true), &fault);
+    let observed = std::sync::Arc::new(AtomicBool::new(false));
+    let witness = std::sync::Arc::clone(&observed);
+    let root = fixture.root.path().to_path_buf();
+    let result =
+        pair::execute_pair_with_observer(&request, &AtomicBool::new(true), &fault, move |step| {
+            if step == PairStep::BeforeSwap(PairRole::Daemon) {
+                assert_eq!(
+                    std::fs::read(root.join("install/x0x")).unwrap(),
+                    candidate_bytes(false, PairRole::Cli)
+                );
+                assert_eq!(
+                    std::fs::read(root.join("install/x0xd")).unwrap(),
+                    OLD_DAEMON
+                );
+                witness.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
+    assert!(
+        observed.load(std::sync::atomic::Ordering::Acquire),
+        "must observe the CLI-new/daemon-old state before the injected daemon failure"
+    );
     eprintln!("CLI-first swap with failed daemon result: {result:?}");
     // Check bytes before the result variant so RED names the broken pair,
     // rather than merely a missing new result or journal representation.
@@ -402,6 +436,93 @@ fn second_writer_with_different_candidate_cannot_destroy_first_pair_rollback_byt
     assert_eq!(second["outcome"], "refused");
     assert_eq!(
         std::fs::read(fixture.root.path().join("install/x0xd")).unwrap(),
+        candidate_bytes(false, PairRole::Daemon)
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.path().join("install/x0x")).unwrap(),
+        candidate_bytes(false, PairRole::Cli)
+    );
+}
+
+#[test]
+fn concurrent_stale_writer_waits_for_the_pair_lock_and_preserves_first_backups() {
+    let fixture = PairFixture::new();
+    let request = fixture.request(false);
+    std::fs::write(
+        fixture.root.path().join("prepared-request.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let child = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observer_child = std::sync::Arc::clone(&child);
+    let root = fixture.root.path().to_path_buf();
+    let result = pair::execute_pair_with_observer(
+        &request,
+        &AtomicBool::new(true),
+        &options(),
+        move |step| {
+            if step != PairStep::AfterSwapRename(PairRole::Daemon) {
+                return;
+            }
+            assert_eq!(
+                std::fs::read(root.join("install/x0xd")).unwrap(),
+                candidate_bytes(false, PairRole::Daemon)
+            );
+            assert_eq!(std::fs::read(root.join("install/x0x")).unwrap(), OLD_CLI);
+            let mut second = spawn_second_writer(&root, true);
+            let ready = root.join("second-lock-observed.json");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    second.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                    "second writer exited before reaching pair admission"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "second writer did not reach the held lock"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let observation: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+            assert_eq!(
+                observation["would_block"], true,
+                "a separate process must observe A's actual persistent CLI lock"
+            );
+            assert_ne!(
+                observation["pid"].as_u64().unwrap(),
+                u64::from(std::process::id())
+            );
+            // The positive WouldBlock observation distinguishes lock contention
+            // from a slow-to-start child. A stays paused throughout this bound.
+            let blocked_until = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < blocked_until {
+                assert!(
+                    !root.join("second-result.json").exists(),
+                    "second writer completed while A still held the pair locks"
+                );
+                assert!(second.0.as_mut().unwrap().try_wait().unwrap().is_none());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            *observer_child.lock().unwrap() = Some(second);
+        },
+    );
+    let PairOutcome::Swapped(receipt) = result.unwrap() else {
+        panic!("first transaction must complete its actual swap");
+    };
+    let second = finish_second_writer(
+        child
+            .lock()
+            .unwrap()
+            .take()
+            .expect("second writer was started"),
+        fixture.root.path(),
+    );
+    assert_eq!(second["outcome"], "refused");
+    assert!(second["detail"].as_str().unwrap().contains("Unresolved"));
+    assert_retained_backups(&receipt);
+    assert_eq!(
+        std::fs::read(&request.daemon.target).unwrap(),
         candidate_bytes(false, PairRole::Daemon)
     );
     assert_eq!(
@@ -507,13 +628,16 @@ fn already_new_bytes_cannot_be_recorded_as_the_previous_recovery_pair() {
 fn insufficient_capacity_and_cancelled_owner_do_not_prepare_or_swap() {
     let fixture = PairFixture::new();
     let request = fixture.request(false);
-    let mut tight = options();
-    tight.available_bytes = Some(1024 * 1024 * 1024 - 1);
-    assert_refused(
-        pair::execute_pair_with_options(&request, &AtomicBool::new(true), &tight),
-        PairRefusal::InsufficientDisk,
-    );
-    fixture.assert_no_pair_preparation();
+    for available in [1024 * 1024 * 1024 - 1, 1024 * 1024 * 1024] {
+        let mut tight = options();
+        tight.available_bytes = Some(available);
+        assert_refused(
+            pair::execute_pair_with_options(&request, &AtomicBool::new(true), &tight),
+            PairRefusal::InsufficientDisk,
+        );
+        // The reserve alone is insufficient: protected copies need space too.
+        fixture.assert_no_pair_preparation();
+    }
     assert_refused(
         pair::execute_pair_with_options(&request, &AtomicBool::new(false), &options()),
         PairRefusal::Cancelled,
@@ -546,11 +670,13 @@ fn split_cli_is_untouched_and_signed_skill_is_only_staged() {
         panic!("daemon-only managed transaction must swap");
     };
     assert!(receipt.cli_untouched);
-    assert!(receipt
-        .cli_untouched_reason
-        .as_deref()
-        .unwrap()
-        .contains("package-managed"));
+    assert!(
+        receipt
+            .cli_untouched_reason
+            .as_deref()
+            .unwrap()
+            .contains("package-managed")
+    );
     assert!(receipt.cli_backup.is_none());
     assert_eq!(
         std::fs::read(external_cli).unwrap(),
@@ -568,6 +694,51 @@ fn split_cli_is_untouched_and_signed_skill_is_only_staged() {
     let record = pair::read_pair_record(&request.install).unwrap().unwrap();
     assert_eq!(record.phase, PairPhase::Swapped);
     assert!(record.cli_progress.is_none());
+}
+
+#[test]
+fn skill_hash_failure_and_pair_rollback_preserve_the_prior_guide() {
+    for corrupt in [true, false] {
+        let fixture = PairFixture::new();
+        let mut request = fixture.request(false);
+        let active = fixture.root.path().join("home/SKILL.md");
+        let staged = fixture.root.path().join("first/SKILL.md");
+        std::fs::write(&active, b"prior guide").unwrap();
+        std::fs::write(
+            &staged,
+            if corrupt {
+                b"changed guide".as_slice()
+            } else {
+                b"verified guide".as_slice()
+            },
+        )
+        .unwrap();
+        request.skill = Some(SkillInput {
+            target: active.clone(),
+            staged,
+            candidate_sha256: digest(b"verified guide"),
+        });
+        let mut fault = options();
+        fault.fail_at = Some(PairStep::BeforeSwap(PairRole::Cli));
+        let result = pair::execute_pair_with_options(&request, &AtomicBool::new(true), &fault);
+        if corrupt {
+            assert!(
+                result.is_err(),
+                "mismatched guide bytes must not prepare a transaction"
+            );
+            fixture.assert_no_pair_preparation();
+        } else {
+            let PairOutcome::Restored { receipt, .. } = result.unwrap() else {
+                panic!("failed pair must restore");
+            };
+            assert_eq!(
+                std::fs::read(receipt.staged_skill.unwrap()).unwrap(),
+                b"verified guide"
+            );
+            fixture.assert_original_pair();
+        }
+        assert_eq!(std::fs::read(active).unwrap(), b"prior guide");
+    }
 }
 
 #[test]
@@ -706,17 +877,210 @@ fn a_new_transaction_after_restore_preserves_both_earlier_versioned_backups() {
         .plan
         .previous_record
         .expect("retained resolved record");
-    let previous: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(previous).unwrap()).unwrap();
-    assert_eq!(previous["transaction_id"], first.transaction_id);
+    let archived_bytes = std::fs::read(&previous).unwrap();
+    let previous_value: serde_json::Value = serde_json::from_slice(&archived_bytes).unwrap();
+    assert_eq!(previous_value["transaction_id"], first.transaction_id);
+    let install_dir = fixture.root.path().join("install");
+    let stale_dir = install_dir.join(".x0x-upgrade-unrelated");
+    std::fs::create_dir(&stale_dir).unwrap();
+    std::fs::write(stale_dir.join("unused"), b"unrelated scratch").unwrap();
+    let stale_file = install_dir.join("x0xd.x0xold-unrelated");
+    std::fs::write(&stale_file, b"unrelated stale binary").unwrap();
+    assert_eq!(
+        x0x::upgrade::sweep_stale_upgrade_artifacts(&install_dir, Duration::ZERO),
+        2
+    );
+    assert!(!stale_dir.exists());
+    assert!(!stale_file.exists());
+    assert_retained_backups(&first);
+    assert_retained_backups(&second);
+    assert_eq!(std::fs::read(previous).unwrap(), archived_bytes);
+    assert_eq!(
+        std::fs::read(&record.plan.daemon.input.target).unwrap(),
+        candidate_bytes(true, PairRole::Daemon)
+    );
+    assert_eq!(
+        std::fs::read(&record.plan.cli.unwrap().input.target).unwrap(),
+        candidate_bytes(true, PairRole::Cli)
+    );
+}
+
+#[test]
+fn equal_retained_record_bytes_require_fresh_archive_barrier_acknowledgements() {
+    let fixture = PairFixture::new();
+    let mut fault = options();
+    fault.fail_at = Some(PairStep::BeforeSwap(PairRole::Cli));
+    let PairOutcome::Restored { receipt: first, .. } =
+        pair::execute_pair_with_options(&fixture.request(false), &AtomicBool::new(true), &fault)
+            .unwrap()
+    else {
+        panic!("first transaction must resolve by restoring");
+    };
+    let request = fixture.request(true);
+    let path = pair::pair_record_path(&request.install).unwrap();
+    let prior = std::fs::read(&path).unwrap();
+    let archive = fixture.root.path().join(format!(
+        "install/x0xd.upgrade-pair-{}.json",
+        first.transaction_id
+    ));
+    assert!(!archive.exists());
+    for step in [
+        journal::BarrierStep::DirectorySync,
+        journal::BarrierStep::DirectorySync,
+        journal::BarrierStep::FileSync,
+    ] {
+        assert_refused(
+            pair::execute_pair_with_archive_failure(
+                &request,
+                &AtomicBool::new(true),
+                &options(),
+                step,
+            ),
+            PairRefusal::Unresolved,
+        );
+        // First rename succeeded; readable equal bytes are not a durable ACK.
+        assert_eq!(std::fs::read(&archive).unwrap(), prior);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            prior,
+            "current Restored evidence must not be replaced after {step:?}"
+        );
+        assert!(!pair::pair_pending_path(&request.install).unwrap().exists());
+        fixture.assert_original_pair();
+        assert_retained_backups(&first);
+    }
+    let PairOutcome::Swapped(second) =
+        pair::execute_pair_with_options(&request, &AtomicBool::new(true), &options()).unwrap()
+    else {
+        panic!("barrier-acknowledged retry should proceed");
+    };
+    assert_retained_backups(&first);
+    assert_retained_backups(&second);
+    assert_eq!(std::fs::read(&archive).unwrap(), prior);
+    assert_eq!(
+        pair::read_pair_record(&request.install)
+            .unwrap()
+            .unwrap()
+            .plan
+            .previous_record,
+        Some(archive)
+    );
+}
+
+#[test]
+fn restore_copy_barriers_for_each_member_preserve_recovery_evidence() {
+    for role in [PairRole::Daemon, PairRole::Cli] {
+        for step in [
+            PairStep::RestoreFileSync(role),
+            PairStep::RestoreCopyDirectorySync(role),
+        ] {
+            let fixture = PairFixture::new();
+            let request = fixture.request(false);
+            let mut fault = options();
+            // Let this member really become candidate bytes, then fail the
+            // other swap so the restore must copy its retained old backup.
+            fault.cli_first = role == PairRole::Cli;
+            fault.fail_at = Some(PairStep::BeforeSwap(if role == PairRole::Daemon {
+                PairRole::Cli
+            } else {
+                PairRole::Daemon
+            }));
+            let result =
+                pair::execute_pair_with_failures(&request, &AtomicBool::new(true), &fault, &[step]);
+            assert!(
+                matches!(result, Err(PairError::RecoveryFailed { .. })),
+                "{step:?}: {result:?}"
+            );
+            let record = pair::read_pair_record(&request.install).unwrap().unwrap();
+            assert_eq!(record.phase, PairPhase::RecoveryFailed);
+            assert_eq!(
+                std::fs::read(&record.plan.daemon.backup).unwrap(),
+                OLD_DAEMON
+            );
+            assert_eq!(
+                std::fs::read(&record.plan.cli.as_ref().unwrap().backup).unwrap(),
+                OLD_CLI
+            );
+            let affected = if role == PairRole::Daemon {
+                &request.daemon.target
+            } else {
+                &record.plan.cli.as_ref().unwrap().input.target
+            };
+            assert_eq!(
+                std::fs::read(affected).unwrap(),
+                candidate_bytes(false, role),
+                "restore rename must not precede its copy barrier"
+            );
+            let path = pair::pair_record_path(&request.install).unwrap();
+            let pending = pair::pair_pending_path(&request.install).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let marker = std::fs::read(&pending).unwrap();
+            let backups = retained_backup_snapshot(fixture.root.path());
+            assert_eq!(fixture.run_second_writer()["outcome"], "refused");
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert_eq!(std::fs::read(pending).unwrap(), marker);
+            assert_eq!(retained_backup_snapshot(fixture.root.path()), backups);
+        }
+    }
+}
+
+#[test]
+fn cleanup_marker_inheritance_refuses_protected_pair_artifacts_before_preparation() {
+    for source in ["target", "skill", "previous_version"] {
+        let fixture = PairFixture::new();
+        let mut request = fixture.request(false);
+        match source {
+            "target" => {
+                let CliInput::Managed(cli) = &mut request.cli else {
+                    unreachable!()
+                };
+                let target = fixture.root.path().join("install/.x0x-upgrade-cli");
+                std::fs::rename(&cli.target, &target).unwrap();
+                cli.target = target;
+            }
+            "skill" => {
+                let directory = fixture.root.path().join("home/.x0x-upgrade-skills");
+                std::fs::create_dir(&directory).unwrap();
+                let staged = fixture.root.path().join("first/SKILL.md");
+                std::fs::write(&staged, b"candidate guide").unwrap();
+                std::fs::write(directory.join("SKILL.md"), b"prior guide").unwrap();
+                request.skill = Some(SkillInput {
+                    target: directory.join("SKILL.md"),
+                    staged,
+                    candidate_sha256: digest(b"candidate guide"),
+                });
+            }
+            "previous_version" => {
+                request.daemon.previous_version = "1.2.3-build.x0xold-proof".to_owned()
+            }
+            _ => unreachable!(),
+        }
+        assert_refused(
+            pair::execute_pair_with_options(&request, &AtomicBool::new(true), &options()),
+            PairRefusal::InvalidPlan,
+        );
+        assert_eq!(std::fs::read(&request.daemon.target).unwrap(), OLD_DAEMON);
+        let CliInput::Managed(cli) = &request.cli else {
+            unreachable!()
+        };
+        assert_eq!(std::fs::read(&cli.target).unwrap(), OLD_CLI);
+        if let Some(skill) = &request.skill {
+            assert_eq!(std::fs::read(&skill.target).unwrap(), b"prior guide");
+        }
+        assert!(retained_backup_snapshot(fixture.root.path()).is_empty());
+        assert!(!pair::pair_record_path(&request.install).unwrap().exists());
+        assert!(!pair::pair_pending_path(&request.install).unwrap().exists());
+    }
 }
 
 #[test]
 fn every_pair_record_barrier_withholds_unsafe_completion() {
     for phase in [
         PairPhase::Prepared,
+        PairPhase::Swapping,
         PairPhase::Swapped,
         PairPhase::RollingBack,
+        PairPhase::Restoring,
         PairPhase::Restored,
     ] {
         for step in [
@@ -728,7 +1092,10 @@ fn every_pair_record_barrier_withholds_unsafe_completion() {
             let fixture = PairFixture::new();
             let request = fixture.request(false);
             let mut fault = options();
-            if matches!(phase, PairPhase::RollingBack | PairPhase::Restored) {
+            if matches!(
+                phase,
+                PairPhase::RollingBack | PairPhase::Restoring | PairPhase::Restored
+            ) {
                 fault.fail_at = Some(PairStep::BeforeSwap(PairRole::Cli));
             }
             let result = pair::execute_pair_with_record_failure(
@@ -738,7 +1105,7 @@ fn every_pair_record_barrier_withholds_unsafe_completion() {
                 phase,
                 step,
             );
-            if phase == PairPhase::Swapped {
+            if matches!(phase, PairPhase::Swapping | PairPhase::Swapped) {
                 let PairOutcome::Restored { receipt, .. } =
                     result.unwrap_or_else(|error| panic!("{phase:?}/{step:?}: {error}"))
                 else {
@@ -760,7 +1127,7 @@ fn every_pair_record_barrier_withholds_unsafe_completion() {
             assert_eq!(backups.len(), 2);
             assert!(backups.iter().any(|(_, bytes)| bytes == OLD_DAEMON));
             assert!(backups.iter().any(|(_, bytes)| bytes == OLD_CLI));
-            if phase != PairPhase::RollingBack {
+            if !matches!(phase, PairPhase::RollingBack | PairPhase::Restoring) {
                 fixture.assert_original_pair();
             }
             let second = fixture.run_second_writer();
@@ -834,8 +1201,8 @@ fn installed_hash_is_rechecked_after_preparation_without_overwriting_unrelated_b
 
 #[test]
 fn cancellation_after_first_rename_restores_the_pair_before_returning() {
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let fixture = PairFixture::new();
     let request = fixture.request(false);
@@ -867,11 +1234,33 @@ fn fixture_second_pair_writer() {
     let Some(root) = std::env::var_os(WORKER_ROOT).map(PathBuf::from) else {
         return;
     };
-    let result = pair::execute_pair_with_options(
-        &request_at(&root, true),
-        &AtomicBool::new(true),
-        &options(),
-    );
+    let request = if std::env::var(WORKER_PREPARED).as_deref() == Ok("1") {
+        let request: PairRequest =
+            serde_json::from_slice(&std::fs::read(root.join("prepared-request.json")).unwrap())
+                .unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("install/x0x.upgrade.lock"))
+            .unwrap();
+        let would_block = matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+        assert!(
+            would_block,
+            "A must own the persistent CLI lock before B's real admission call"
+        );
+        drop(lock);
+        let observation = serde_json::to_vec(
+            &serde_json::json!({"pid": std::process::id(), "would_block": would_block}),
+        )
+        .unwrap();
+        let temporary = root.join("second-lock-observed.partial");
+        std::fs::write(&temporary, observation).unwrap();
+        std::fs::rename(temporary, root.join("second-lock-observed.json")).unwrap();
+        request
+    } else {
+        request_at(&root, true)
+    };
+    let result = pair::execute_pair_with_options(&request, &AtomicBool::new(true), &options());
     let outcome = match &result {
         Ok(PairOutcome::Swapped(_)) => "swapped",
         Ok(PairOutcome::Restored { .. }) => "restored",
