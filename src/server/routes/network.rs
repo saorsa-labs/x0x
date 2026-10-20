@@ -1193,7 +1193,10 @@ mod participation_diagnostics_tests {
     /// format change and must bump `VERSION_POLICY_DIGEST_TAG`.
     #[test]
     fn version_policy_digest_preimage_is_frozen() {
-        let cfg = crate::server::state::DaemonUpdateConfig::default();
+        let cfg = crate::server::state::DaemonUpdateConfig {
+            rollout_window_minutes: 0,
+            ..Default::default()
+        };
         let input = version_policy_digest_input("0.48.1", &cfg);
         assert_eq!(
             input,
