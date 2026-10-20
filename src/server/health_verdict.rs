@@ -52,9 +52,10 @@ use super::state::{AppState, PROD_PLANE_ID};
 /// network-visible topic exists. RC5 review of #1380: a shared topic made
 /// every daemon broadcast a signed frame every 30 s that PlumTree spread
 /// network-wide, while own-nonce self-delivery proved nothing about
-/// remote delivery. The wire-crypto half (sign → encode → decode →
-/// verify) is exercised locally by [`sign_decode_verify_local`] instead
-/// of by the publish itself.
+/// remote delivery. The wire-crypto halves (inner envelope: sign → encode
+/// → decode → verify; machine-key transport signer: sign, verify and
+/// peer-id binding) are exercised locally by [`sign_decode_verify_local`]
+/// and [`transport_signer_round_trip`] instead of by the publish itself.
 pub(in crate::server) const DELIVERY_PROBE_TOPIC: &str = "local:x0x.health.probe.v1";
 /// Probe cadence. Every 30 s one probe round per daemon; the publish is
 /// same-daemon only and the sign/verify round is in-process, so the
@@ -693,9 +694,12 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
     let send_state = match rate {
         Some(rate) if rate >= SEND_FAILURE_RATE_DEGRADED => {
             bump(InputState::Degraded);
+            // Two decimals: the real values (0.75 ≥ 0.50), not the
+            // whole-number rounding that printed "rate 1 ≥ 0" (#1466
+            // review finding).
             reasons.push(format!(
                 "{failed}/{attempts} publishes failed in the last {WINDOW_SECS}s \
-                 (rate {rate:.0} ≥ {SEND_FAILURE_RATE_DEGRADED:.0})"
+                 (rate {rate:.2} ≥ {SEND_FAILURE_RATE_DEGRADED:.2})"
             ));
             InputState::Degraded
         }
@@ -900,18 +904,23 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
 
 /// Background delivery probe, scoped to this daemon (RC5 review of
 /// #1380): every [`DELIVERY_PROBE_INTERVAL_SECS`] it (a) signs a nonce
-/// with the agent's ML-DSA-65 key, encodes the V2 envelope, decodes and
-/// verifies it — all in-process, [`sign_decode_verify_local`] — and
-/// (b) publishes the nonce on the `local:` [`DELIVERY_PROBE_TOPIC`] and
-/// requires its own payload back through subscribe → subscriber handoff.
+/// with the agent's ML-DSA-65 key — the signer production publishes sign
+/// message payloads with — encodes the V2 envelope, decodes and verifies
+/// it, all in-process, [`sign_decode_verify_local`]; (a2) signs the same
+/// nonce with the machine-bound transport key — the signer PlumTree signs
+/// outer frames with, [`transport_signer_round_trip`] — and checks its
+/// binding to this node's transport peer id; and (b) publishes the nonce
+/// on the `local:` [`DELIVERY_PROBE_TOPIC`] and requires its own payload
+/// back through subscribe → subscriber handoff.
 ///
-/// What that covers: the wire-crypto path (sign, encode, decode, verify)
-/// and the same-daemon dispatch path. What it deliberately does not
-/// cover: PlumTree admission and delivery to remote peers — that would
-/// need network-wide traffic, which no longer ships with this probe
-/// (any such probe is a wire question for David). The #288 wedge it can
-/// still catch is a daemon serving HTTP while its own dispatch pipeline
-/// is wedged.
+/// What that covers: the inner-envelope wire crypto (sign, encode, decode,
+/// verify) and the machine-key transport signer's sign/verify plus its
+/// peer-id binding, and the same-daemon dispatch path. What it deliberately
+/// does not cover: PlumTree admission, outer-frame construction for a real
+/// peer, and delivery to remote peers — that would need network-wide
+/// traffic, which no longer ships with this probe (any such probe is a wire
+/// question for David). The #288 wedge it can still catch is a daemon
+/// serving HTTP while its own dispatch pipeline is wedged.
 ///
 /// Schedule: the first probe runs at the documented
 /// [`DELIVERY_PROBE_STARTUP_DELAY_SECS`] boundary (10 s, see
@@ -931,6 +940,10 @@ pub(in crate::server) async fn run_delivery_probe(
         return;
     }
 
+    // Probe-owned verify counters: the inner-envelope round must not add
+    // verifies to the wire diagnostics behind `inner_verify_stats` (#1466
+    // review finding).
+    let verify_stats = crate::gossip::InnerVerifyStats::default();
     let mut ticker = tokio::time::interval(Duration::from_secs(DELIVERY_PROBE_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut subscription: Option<crate::gossip::Subscription> = None;
@@ -980,7 +993,7 @@ pub(in crate::server) async fn run_delivery_probe(
             }
         };
         let started = Instant::now();
-        match probe_once(&agent, subscription).await {
+        match probe_once(&agent, subscription, &verify_stats).await {
             Ok(()) => {
                 snapshot.record_probe(true, Some(started.elapsed().as_millis() as u64));
             }
@@ -994,28 +1007,42 @@ pub(in crate::server) async fn run_delivery_probe(
     }
 }
 
-/// One probe round-trip, both halves: the in-process wire-crypto check
-/// (sign → encode → decode → verify, [`sign_decode_verify_local`]) and
-/// the bounded same-daemon dispatch exchange. `Ok(())` only when the
-/// signature verifies, the decoded payload is intact and this daemon's
-/// exact payload came back on the subscription within the timeout.
+/// One probe round-trip, three halves: the in-process inner-envelope check
+/// (sign → encode → decode → verify, [`sign_decode_verify_local`]), the
+/// in-process machine-key transport-signer check
+/// ([`transport_signer_round_trip`]), and the bounded same-daemon dispatch
+/// exchange. `Ok(())` only when both signatures verify, the decoded payload
+/// is intact and this daemon's exact payload came back on the subscription
+/// within the timeout.
 async fn probe_once(
     agent: &crate::Agent,
     subscription: &mut crate::gossip::Subscription,
+    verify_stats: &crate::gossip::InnerVerifyStats,
 ) -> Result<(), String> {
     let payload = probe_payload();
-    // Wire-crypto half. Pure CPU — no locks, no awaits — so it is bounded
+    // Inner-envelope half. Pure CPU — no locks, no awaits — so it is bounded
     // by its own work and sits outside the exchange deadline (a deadline
-    // cannot preempt synchronous signing anyway).
+    // cannot preempt synchronous signing anyway). The stats land in the
+    // probe's own counters: a local round must not add verifies to the
+    // wire diagnostics behind `inner_verify_stats` (#1466 review finding).
     let signing = crate::gossip::SigningContext::from_keypair(agent.identity().agent_keypair());
     let message = crate::gossip::pubsub::sign_decode_verify_local(
         &signing,
         DELIVERY_PROBE_TOPIC,
         &bytes::Bytes::from(payload.clone()),
+        verify_stats,
     )
     .map_err(|err| format!("probe sign/verify failed: {err}"))?;
     if message.payload.as_ref() != payload.as_slice() {
         return Err("probe sign/verify round-trip altered the payload".to_string());
+    }
+    // Machine-key transport-signer half (#1466 review finding 2): the
+    // publish path's outer PlumTree frame is signed by the machine-bound
+    // transport key, which the inner half above never touches. Same
+    // pure-CPU boundedness. Skipped on the embed path (no network node —
+    // there the dispatch exchange below cannot run either).
+    if let Some(network) = agent.network() {
+        transport_signer_round_trip(&network.pubsub_signing_key(), &network.peer_id(), &payload)?;
     }
     // Dispatch half.
     let mut channel = AgentChannel {
@@ -1023,6 +1050,34 @@ async fn probe_once(
         subscription,
     };
     probe_exchange(&mut channel, payload).await
+}
+
+/// The machine-key half of one probe: sign the nonce with the transport
+/// signer — the same key copy the pub-sub manager handed PlumTree for
+/// outer-frame signing at construction (`pubsub_signing_key`) — verify the
+/// signature against the signer's public key, and check the binding to this
+/// node's transport peer id (an outer frame must authenticate as the
+/// adjacent QUIC peer; `bound_transport_signing_key` enforces the same
+/// match at node construction). In-process: no frame is constructed and no
+/// peer is contacted.
+fn transport_signer_round_trip(
+    signer: &saorsa_gossip_identity::MlDsaKeyPair,
+    transport_peer_id: &ant_quic::PeerId,
+    payload: &[u8],
+) -> Result<(), String> {
+    if signer.peer_id().to_bytes() != transport_peer_id.0 {
+        return Err("transport signer is not bound to this node's peer id".to_string());
+    }
+    let signature = signer
+        .sign(payload)
+        .map_err(|err| format!("transport signer sign failed: {err}"))?;
+    let verified =
+        saorsa_gossip_identity::MlDsaKeyPair::verify(signer.public_key(), payload, &signature)
+            .map_err(|err| format!("transport signer verify failed: {err}"))?;
+    if !verified {
+        return Err("transport signer signature did not verify".to_string());
+    }
+    Ok(())
 }
 
 /// The transport-facing half of one probe, as an injectable seam: the
@@ -1328,6 +1383,27 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains("publishes failed")));
+    }
+
+    /// #1466 review finding 1: the reason must show the real rate and
+    /// threshold. At 52a8f6c the format used `{:.0}`, which printed
+    /// `rate 1 ≥ 0` for a 0.75 rate against the 0.5 threshold — the
+    /// classification was right, the human-readable numbers were not.
+    #[test]
+    fn send_failure_rate_reason_shows_unrounded_values() {
+        let mut sample = sample();
+        sample.send_attempts_window = 100;
+        sample.send_failed_window = 75;
+        let verdict = classify(&sample);
+        assert_eq!(verdict.inputs.send_failure_rate.rate, Some(0.75));
+        assert!(
+            verdict
+                .reasons
+                .iter()
+                .any(|r| r.contains("(rate 0.75 ≥ 0.50)")),
+            "reasons: {:?}",
+            verdict.reasons
+        );
     }
 
     #[test]
@@ -1884,11 +1960,12 @@ mod tests {
         let agent = loopback_agent().await;
 
         let snapshot = Arc::new(HealthSnapshot::default());
+        let verify_stats = crate::gossip::InnerVerifyStats::default();
         let mut subscription = agent
             .subscribe(DELIVERY_PROBE_TOPIC)
             .await
             .expect("subscribe");
-        probe_once(&agent, &mut subscription)
+        probe_once(&agent, &mut subscription, &verify_stats)
             .await
             .expect("probe round-trip within timeout");
         snapshot.record_probe(true, Some(1));
@@ -1939,16 +2016,90 @@ mod tests {
         let agent = loopback_agent().await;
         let signing = crate::gossip::SigningContext::from_keypair(agent.identity().agent_keypair());
         let payload = probe_payload();
+        let verify_stats = crate::gossip::InnerVerifyStats::default();
         let message = crate::gossip::pubsub::sign_decode_verify_local(
             &signing,
             DELIVERY_PROBE_TOPIC,
             &bytes::Bytes::from(payload.clone()),
+            &verify_stats,
         )
         .expect("local sign/encode/decode/verify round-trip");
         assert!(message.verified);
         assert_eq!(message.topic, DELIVERY_PROBE_TOPIC);
         assert_eq!(message.payload.to_vec(), payload);
         assert_eq!(message.sender, Some(agent.agent_id()));
+    }
+
+    /// #1466 review finding 2: the probe's verifies must land in its own
+    /// counters, never in the wire diagnostics behind `inner_verify_stats`
+    /// (`GET /diagnostics/gossip` → `inner_envelope_verify`), which one
+    /// probe verify per 30 s used to pollute. Fails at 52a8f6c (compile:
+    /// `sign_decode_verify_local` took no stats then — and it counted
+    /// every probe round into the shared `INNER_VERIFY_STATS`).
+    #[tokio::test]
+    async fn the_probe_crypto_round_does_not_count_into_wire_verify_stats() {
+        let agent = loopback_agent().await;
+        let signing = crate::gossip::SigningContext::from_keypair(agent.identity().agent_keypair());
+        let payload = probe_payload();
+        let verify_stats = crate::gossip::InnerVerifyStats::default();
+
+        let before = crate::gossip::inner_verify_stats();
+        let transport = agent.network().expect("loopback agent has a network node");
+        transport_signer_round_trip(
+            &transport.pubsub_signing_key(),
+            &transport.peer_id(),
+            &payload,
+        )
+        .expect("transport signer round-trip");
+        let message = crate::gossip::pubsub::sign_decode_verify_local(
+            &signing,
+            DELIVERY_PROBE_TOPIC,
+            &bytes::Bytes::from(payload.clone()),
+            &verify_stats,
+        )
+        .expect("local sign/encode/decode/verify round-trip");
+        let after = crate::gossip::inner_verify_stats();
+
+        assert!(message.verified);
+        assert_eq!(
+            before.count, after.count,
+            "a local probe round must not add verifies to the wire diagnostics"
+        );
+        assert_eq!(
+            verify_stats.snapshot().count,
+            1,
+            "the probe-owned counters see exactly the probe's own verify"
+        );
+    }
+
+    /// #1466 review finding 2: the probe must also exercise the
+    /// machine-bound transport signer — the key PlumTree signs outer
+    /// frames with — not only the agent keypair, so a broken machine
+    /// signer shows up in the delivery input. Fails at 52a8f6c (compile:
+    /// `transport_signer_round_trip` is this fix's seam).
+    #[tokio::test]
+    async fn the_probe_exercises_the_machine_bound_transport_signer() {
+        let agent = loopback_agent().await;
+        let network = agent.network().expect("loopback agent has a network node");
+        let payload = probe_payload();
+
+        // The real signer, as the probe uses it: bound to this node's
+        // transport peer id, signs and verifies.
+        transport_signer_round_trip(&network.pubsub_signing_key(), &network.peer_id(), &payload)
+            .expect("real transport signer round-trips");
+
+        // A fresh key is a valid ML-DSA keypair but not bound to this
+        // node: the peer-id guard must refuse it, exactly as
+        // `bound_transport_signing_key` does at construction.
+        let unbound = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("fresh key");
+        assert_ne!(
+            unbound.peer_id().to_bytes(),
+            network.peer_id().0,
+            "the fresh key must actually differ from this node's transport id"
+        );
+        let err = transport_signer_round_trip(&unbound, &network.peer_id(), &payload)
+            .expect_err("an unbound key must not pass the transport-signer check");
+        assert!(err.contains("not bound"), "unexpected error: {err}");
     }
 
     /// RC1 #1380 (P2): the first probe must run at the documented 10 s
