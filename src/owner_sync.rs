@@ -834,8 +834,11 @@ pub struct OwnerSyncStore {
     /// #1055: machine → deletion time (Unix ms). Written BEFORE the device
     /// row is removed, so a crash between the two writes leaves the machine
     /// blocked (fail closed), never re-admittable from a stale enrollment.
-    /// Guard order everywhere: this lock is never held while `devices` is
-    /// acquired for writing.
+    /// Guard order everywhere: `tombstones` BEFORE `devices`, never the
+    /// reverse. `enroll` holds the tombstone READ across its device insert
+    /// and `unenroll` holds the WRITE across both of its mutations, so
+    /// enrollment and deletion serialize on this lock (RC1: no delete can
+    /// land between `enroll`'s check and its insert).
     unenroll_tombstones: tokio::sync::RwLock<BTreeMap<[u8; 32], u64>>,
     // Verified once on load/enroll, consulted under the devices read lock.
     evidence_owners: std::sync::RwLock<VerifiedEnrollmentOwners>,
@@ -874,15 +877,23 @@ pub struct OwnerSyncStore {
     /// which wraps it), [`Self::mint`], and
     /// [`Self::records_insert_for_testing`]. Writes that touch no
     /// `HomePointer` record skip the gate, so ordinary name and journal sync
-    /// is never serialized behind a seat.
+    /// is never serialized behind a seat. Session commits
+    /// (`commit_session_batch`) and `unenroll` are the #1055 RC1 exception:
+    /// both take the gate UNCONDITIONALLY, because the session commit
+    /// re-validates peer admission while holding it and `unenroll`'s removal
+    /// must not land between that check and the records mutation.
     ///
     /// **Lock order, never to be violated.** Readers:
     /// `canonical_home_gate` → per-group membership lock → `named_groups`
-    /// and persistence. Writers: `canonical_home_gate` → `records`. The two
-    /// cannot cycle because `commit_batch`, `mint` and `apply_record` never
-    /// take a membership lock or `named_groups` (`apply_record`'s
-    /// `HomePointer` arm is a no-op and its names arm spawns), and the
-    /// reader never touches `records` while holding a membership lock.
+    /// and persistence. Writers: `canonical_home_gate` → `records`. Removal:
+    /// `canonical_home_gate` → `unenroll_tombstones` → `devices`. The
+    /// orders cannot cycle because `commit_batch`, `mint` and `apply_record`
+    /// never take a membership lock or `named_groups` (`apply_record`'s
+    /// `HomePointer` arm is a no-op and its names arm spawns), the reader
+    /// never touches `records` while holding a membership lock, and no path
+    /// acquires the gate while already holding `unenroll_tombstones` or
+    /// `devices` (the enrollment and `is_enrolled` paths touch those maps
+    /// without the gate and never take it).
     ///
     /// This is a LOCAL linearization boundary only. It claims nothing about
     /// cross-device election ordering.
@@ -1237,8 +1248,9 @@ impl OwnerSyncStore {
     /// `devices.json` cannot resurrect a deleted machine.
     #[must_use]
     pub async fn is_enrolled(&self, machine: &MachineId, owner: &UserId) -> bool {
-        // Read order (tombstones → devices) never opposes a writer: no
-        // mutation holds both locks (see `unenroll_tombstones`).
+        // Read order (tombstones → devices) never opposes a writer: every
+        // mutation takes the two locks in this same order (see
+        // `unenroll_tombstones`).
         let tombstones = self.unenroll_tombstones.read().await;
         let devices = self.devices.read().await;
         devices.get(&machine.0).is_some_and(|e| {
@@ -1328,19 +1340,19 @@ impl OwnerSyncStore {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
-        // #1055 (ADR 0084 finding 3): the tombstone check happens before
-        // any mutation, under its own read (never with `devices` held for
-        // writing — see `unenroll_tombstones`).
+        // #1055 (ADR 0084 finding 3): the tombstone read is held across the
+        // whole mutation, so `unenroll`'s tombstone write cannot land
+        // between this check and the device insert — enrollment and
+        // deletion are serialized by `unenroll_tombstones` (RC1; lock
+        // order: tombstones → devices).
+        let tombstones = self.unenroll_tombstones.read().await;
+        if tombstones
+            .get(&enrollment.machine_id)
+            .is_some_and(|deleted_at| enrollment.enrolled_at_ms <= *deleted_at)
         {
-            let tombstones = self.unenroll_tombstones.read().await;
-            if tombstones
-                .get(&enrollment.machine_id)
-                .is_some_and(|deleted_at| enrollment.enrolled_at_ms <= *deleted_at)
-            {
-                return Err(SyncError::EnrollmentTombstoned {
-                    machine: enrollment.machine_id,
-                });
-            }
+            return Err(SyncError::EnrollmentTombstoned {
+                machine: enrollment.machine_id,
+            });
         }
         // Preserve the store's verified-by-caller contract. Invalid material
         // stays incapable of contributing evidence, just as is_enrolled denies it.
@@ -1392,7 +1404,10 @@ impl OwnerSyncStore {
     /// `/sync/devices/:id` path; review R2 finding 1) and persist a
     /// deletion tombstone: from the deletion moment on, enroll refuses any
     /// enrollment for the machine with `enrolled_at_ms <= deleted_at_ms`
-    /// (#1055, ADR 0084 finding 3). The tombstone advances monotonically —
+    /// (#1055, ADR 0084 finding 3). RC1: `deleted_at_ms` is at least the
+    /// deleted enrollment's OWN `enrolled_at_ms` (max with the wall clock),
+    /// so a clock rollback cannot make a restore or replay of that
+    /// enrollment clear the tombstone. The tombstone advances monotonically —
     /// a repeat DELETE never rewinds it — and is written even when the
     /// machine is not currently enrolled, so a stale enrollment signed
     /// before the delete cannot slip in behind a no-op delete. Poisoning
@@ -1402,16 +1417,30 @@ impl OwnerSyncStore {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
+        // #1055 RC1: removal is linearized against session commits by the
+        // canonical-home gate — a commit that already re-validated
+        // admission under the gate finishes before the tombstone lands,
+        // and a commit that waits takes the gate only after this removal,
+        // so its re-validation sees the tombstone
+        // (see `commit_session_batch`).
+        let _removal_gate = self.canonical_home_gate.write().await;
         // Tombstone FIRST (#1055): a crash between the two writes leaves
         // the machine blocked (fail closed) instead of re-admittable from
-        // a stale enrollment. The tombstone lock is released before the
-        // devices lock is taken — see `unenroll_tombstones`.
+        // a stale enrollment. The tombstone write lock is held across the
+        // whole removal, serializing against `enroll` (which holds the
+        // read lock across its insert) — see `unenroll_tombstones`.
         {
             let mut tombstones = self.unenroll_tombstones.write().await;
-            let now = now_unix_ms();
+            let enrollment_at = self
+                .devices
+                .read()
+                .await
+                .get(&machine.0)
+                .map_or(0, |enrollment| enrollment.enrolled_at_ms);
+            let deleted_at = now_unix_ms().max(enrollment_at);
             let previous = tombstones.get(&machine.0).copied();
-            if previous.is_none_or(|old| old < now) {
-                tombstones.insert(machine.0, now);
+            if previous.is_none_or(|old| old < deleted_at) {
+                tombstones.insert(machine.0, deleted_at);
                 if let Err(e) = self.persist_tombstones(&tombstones).await {
                     if matches!(e, SyncError::Poisoned(_)) {
                         // Disk already holds the tombstone: keep it and poison.
@@ -1529,6 +1558,43 @@ impl OwnerSyncStore {
         } else {
             None
         };
+        self.commit_batch_locked(batch, owner).await
+    }
+
+    /// The #1055 RC1 session commit: [`Self::commit_batch`] plus admission
+    /// re-validation AFTER the commit locks are held. The pre-commit
+    /// boundary inside `negotiate_sync_session` cannot cover the gate wait
+    /// in front of a commit — a HomePointer batch can wait behind a seat
+    /// mint — so the delivering peer's admission is re-checked under the
+    /// gate, which `unenroll` also takes first: a removal either finishes
+    /// before this commit's check, or is fully visible to it. Fail-closed,
+    /// with nothing committed.
+    async fn commit_session_batch(
+        &self,
+        batch: Vec<VersionedRecord>,
+        admission: &SessionAdmission<'_>,
+    ) -> Result<CommitOutcome, SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
+        // Unconditional (RC1): the admission check below is sound against a
+        // concurrent removal only because both hold the gate (see
+        // `canonical_home_gate`). A batch that waited behind a gate holder
+        // re-validates against every delete or revocation that landed while
+        // it waited.
+        let _canonical_gate = self.canonical_home_gate.write().await;
+        admission.still_admissible().await?;
+        self.commit_batch_locked(batch, admission.owner).await
+    }
+
+    /// [`Self::commit_batch`]'s body under the records lock; the caller
+    /// has already made the canonical-home gate decision (lock order:
+    /// gate → records).
+    async fn commit_batch_locked(
+        &self,
+        batch: Vec<VersionedRecord>,
+        owner: &UserId,
+    ) -> Result<CommitOutcome, SyncError> {
         let mut records = self.records.write().await;
         // (kind, key) → the value held BEFORE this batch first touched it.
         let mut touched: BTreeMap<(SyncKind, String), Option<VersionedRecord>> = BTreeMap::new();
@@ -2021,7 +2087,18 @@ where
     .await
     .map_err(|_| SyncError::SessionTimeout)??;
     let owner_id = owner.user_id();
-    let outcome = store.commit_batch(pending.verified, &owner_id).await?;
+    // #1055 RC1: the commit re-validates the peer's admission AFTER the
+    // commit locks are held — the pre-commit boundary inside
+    // `negotiate_sync_session` cannot cover this commit's own gate wait.
+    let admission = SessionAdmission {
+        store,
+        revocations,
+        owner: &owner_id,
+        peer: peer_machine,
+    };
+    let outcome = store
+        .commit_session_batch(pending.verified, &admission)
+        .await?;
     let mut summary = pending.summary;
     summary.accepted = outcome.accepted.len();
     summary.superseded = outcome.superseded;
@@ -2158,8 +2235,11 @@ where
     admission.still_admissible().await?;
 
     // Paged version vectors both ways (bounded, explicitly terminated).
+    // Both outbound pagers re-check admission at every page boundary (RC1):
+    // a delete or revocation that lands during a blocked page write stops
+    // the rest of the stage, version-vector pages included.
     let local_vector = store.version_vector().await;
-    write_paged_vector(send, &local_vector).await?;
+    write_paged_vector(send, &local_vector, &admission).await?;
     let peer_vector = read_paged_vector(recv, &admission).await?;
     // Phase boundary (pre-ship): nothing leaves this machine after the
     // admission that justified shipping it has lapsed.
@@ -2171,7 +2251,7 @@ where
     // to complete independently of their own send state.
     let to_ship = store.records_for_peer(&peer_vector).await;
     summary.shipped = to_ship.len();
-    write_paged_records(send, &to_ship).await?;
+    write_paged_records(send, &to_ship, &admission).await?;
     write_frame(send, &SyncFrame::Done).await?;
     // Done ends the application frames; FIN ends the transport send half.
     // An unfinished ant-quic SendStream resets on drop, so the peer can
@@ -2196,10 +2276,13 @@ where
 }
 
 /// Write the version table as bounded pages (always at least one page, so
-/// the reader's stage loop always advances).
+/// the reader's stage loop always advances). #1055 RC1: admission is
+/// re-validated before EVERY page frame — a peer stays entitled to each
+/// page it receives, not just to the first.
 async fn write_paged_vector<S: AsyncWrite + Unpin>(
     send: &mut S,
     vector: &[KindVersions],
+    admission: &SessionAdmission<'_>,
 ) -> Result<(), SyncError> {
     // Each frame carries one kind with at most VV_ENTRIES_PER_FRAME
     // entries AND at most ~VV_PAGE_BYTES of serialized entries (byte
@@ -2233,6 +2316,9 @@ async fn write_paged_vector<S: AsyncWrite + Unpin>(
         }
     }
     for page in pages {
+        // Outbound page boundary (#1055 RC1): a delete or revocation that
+        // lands during a blocked page write stops the rest of the stage.
+        admission.still_admissible().await?;
         write_frame(send, &SyncFrame::VersionVector { kinds: vec![page] }).await?;
     }
     // Explicit stage terminator — see [`SyncFrame::VectorEnd`].
@@ -2482,12 +2568,16 @@ pub struct SyncProfileNames {
 /// serialized bytes before flushing, so a page of large (individually
 /// value-capped) records cannot approach the frame limit (review R4).
 /// Always at least one page; a single record always ships (its own size is
-/// value-capped well under [`MAX_FRAME_BYTES`]).
+/// value-capped well under [`MAX_FRAME_BYTES`]). #1055 RC1: admission is
+/// re-validated before EVERY page frame — a peer that is deleted or
+/// revoked while a page write is blocked receives no further pages.
 async fn write_paged_records<S: AsyncWrite + Unpin>(
     send: &mut S,
     records: &[VersionedRecord],
+    admission: &SessionAdmission<'_>,
 ) -> Result<(), SyncError> {
     if records.is_empty() {
+        admission.still_admissible().await?;
         write_frame(
             send,
             &SyncFrame::Records {
@@ -2506,6 +2596,8 @@ async fn write_paged_records<S: AsyncWrite + Unpin>(
         if !page.is_empty()
             && (page.len() >= RECORDS_PER_FRAME || page_bytes + record_bytes > RECORDS_PAGE_BYTES)
         {
+            // Outbound page boundary (#1055 RC1).
+            admission.still_admissible().await?;
             write_frame(
                 send,
                 &SyncFrame::Records {
@@ -2519,6 +2611,9 @@ async fn write_paged_records<S: AsyncWrite + Unpin>(
         page.push(record.clone());
     }
     if !page.is_empty() {
+        // Outbound page boundary (#1055 RC1) — the last page is checked
+        // like every other.
+        admission.still_admissible().await?;
         write_frame(send, &SyncFrame::Records { records: page }).await?;
     }
     Ok(())
@@ -5185,14 +5280,31 @@ mod r3_tests {
 
 #[cfg(test)]
 mod r4_tests {
-    use super::tests::{clock, owner_kp};
+    use super::tests::{clock, machine, owner_kp};
     use super::*;
 
     /// A `Vec<u8>` sink for `write_frame`, decoded back frame-by-frame so
     /// tests can assert the PAGE COUNT and each frame's encoded body size.
+    /// The admission is a live enrolled peer — RC1 made the outbound pager
+    /// re-check admission at every page boundary.
     async fn count_record_frames(records: &[VersionedRecord]) -> Vec<usize> {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(7);
+        let peer = machine(3);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let owner_id = owner.user_id();
+        let admission = SessionAdmission {
+            store: &store,
+            revocations: None,
+            owner: &owner_id,
+            peer: &peer,
+        };
         let mut sink = Vec::new();
-        write_paged_records(&mut sink, records)
+        write_paged_records(&mut sink, records, &admission)
             .await
             .expect("write pages");
         let mut cursor = std::io::Cursor::new(sink);
@@ -5747,7 +5859,7 @@ mod home_pointer_election_tests {
 /// pipes; no daemon, no network, no mesh join.
 #[cfg(test)]
 mod issue_1055_tests {
-    use super::tests::{machine, owner_kp};
+    use super::tests::{clock, machine, owner_kp, sign_names};
     use super::*;
 
     /// WHY (#1055, ADR 0084 finding 3): DELETE leaves a tombstone; an
@@ -6054,6 +6166,304 @@ mod issue_1055_tests {
         assert!(
             store.records_snapshot().await.is_empty(),
             "an aborted session commits nothing"
+        );
+        let _ = peer_task.await;
+    }
+
+    /// WHY (#1055 RC1, review finding 1): the unenroll tombstone must
+    /// cover the deleted enrollment's OWN `enrolled_at_ms`, not just the
+    /// local wall clock. The enrollment below was minted under a clock
+    /// ahead of this machine's current time (a rollback, e.g. an NTP step,
+    /// between enroll and delete); with a wall-clock-only tombstone,
+    /// restoring or replaying that enrollment clears both checks.
+    /// Deterministic: every timestamp is an explicit offset from
+    /// `now_unix_ms()`, so no clock progression is required.
+    #[tokio::test]
+    async fn unenroll_tombstone_covers_enrollment_minted_under_a_rolled_back_clock() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let peer = machine(2);
+        // Enrolled one hour AHEAD of the current wall clock.
+        let enrolled_ahead = now_unix_ms() + 3_600_000;
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, enrolled_ahead, None).expect("sign"))
+            .await
+            .expect("first enroll");
+        assert!(store.unenroll(&peer).await.expect("delete"));
+        // A restore or replay of the deleted enrollment must stay refused.
+        let replay = store
+            .enroll(OwnerEnrollment::sign(peer, &owner, enrolled_ahead, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { machine }) if machine == peer.0),
+            "a replay of an enrollment minted under a rolled-back clock must stay tombstoned, got {replay:?}"
+        );
+        assert!(
+            !store.is_enrolled(&peer, &owner.user_id()).await,
+            "the machine must not be admissible after the delete"
+        );
+    }
+
+    /// WHY (#1055 RC1, review finding 2): admission was checked once
+    /// before shipping; a delete that landed while a record page write was
+    /// BLOCKED let the remaining pages ship. The outbound pager must
+    /// re-check admission at every page boundary. Deterministic: the peer
+    /// stops reading after its version vector, so the local writer is
+    /// blocked inside the records stage when the delete lands, and resumes
+    /// only after it.
+    #[tokio::test]
+    async fn outbound_record_pages_stop_after_mid_ship_unenroll() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        // 64 records = 4 pages at RECORDS_PER_FRAME = 16: the ship stage
+        // spans several page boundaries.
+        let batch: Vec<VersionedRecord> = (0..64)
+            .map(|i| {
+                sign_names(
+                    &format!("page-{i}"),
+                    &format!("v{i}"),
+                    clock(1, i, 1),
+                    &owner,
+                )
+            })
+            .collect();
+        store.commit_batch(batch, &owner_id).await.expect("seed");
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let (vector_sent, peer_paused) = tokio::sync::oneshot::channel::<()>();
+        let (release_reader, read_go) = tokio::sync::oneshot::channel::<()>();
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local vector arrives as pages, then VectorEnd.
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            // Empty peer vector: the local side must ship all 64 records.
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            vector_sent.send(()).ok();
+            // Stop reading: the local writer fills the duplex buffer and
+            // blocks inside the records stage.
+            let _ = read_go.await;
+            // Resume: count what now arrives. Fail-closed behavior: the
+            // in-flight page completes, then the stream aborts — no Done.
+            // The old behavior ships every remaining page and Done.
+            let mut records_frames = 0usize;
+            let mut saw_done = false;
+            loop {
+                match read_frame(&mut c_recv).await {
+                    Ok(SyncFrame::Records { .. }) => records_frames += 1,
+                    Ok(SyncFrame::Done) => {
+                        saw_done = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            // Complete our own stage so the old head can finish its session
+            // and hit its final boundary (errors after a reset are expected).
+            let _ = write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: Vec::new(),
+                },
+            )
+            .await;
+            let _ = write_frame(&mut c_send, &SyncFrame::Done).await;
+            Ok::<(usize, bool), SyncError>((records_frames, saw_done))
+        });
+
+        let session_store = Arc::clone(&store);
+        let session_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let session = tokio::spawn(async move {
+            run_sync_session_with_recheck(
+                SESSION_TIMEOUT,
+                &mut s_send,
+                &mut s_recv,
+                &session_store,
+                None,
+                &session_owner,
+                &local,
+                &peer,
+                |_| {},
+            )
+            .await
+        });
+
+        peer_paused.await.expect("peer stopped reading");
+        // The owner's DELETE lands while the writer is blocked mid-page.
+        assert!(store.unenroll(&peer).await.expect("delete"));
+        release_reader.send(()).ok();
+
+        let result = session.await.expect("session task");
+        assert!(
+            matches!(result, Err(SyncError::NotEnrolled { .. })),
+            "a mid-ship unenroll must stop the remaining record pages, got {result:?}"
+        );
+        // The discriminating assertion is on the wire, not the session
+        // result (the final pre-commit boundary also aborts the old head):
+        // after the delete, at most the page already in flight may arrive,
+        // and Done — which ends the records stage — must never arrive.
+        let (records_frames, saw_done) =
+            peer_task.await.expect("peer task").expect("peer protocol");
+        assert!(
+            !saw_done,
+            "no Done may be shipped after the delete (peer saw {records_frames} record pages)"
+        );
+        assert!(
+            records_frames <= 1,
+            "at most the in-flight page may arrive after the delete, got {records_frames}"
+        );
+    }
+
+    /// WHY (#1055 RC1, review finding 3): admission was last validated at
+    /// the pre-commit boundary, BEFORE the commit's own lock waits — a
+    /// HomePointer batch waiting behind the canonical-home gate could
+    /// commit after the delivering peer was deleted or revoked. The session
+    /// commit re-validates admission after acquiring the commit locks.
+    /// Deterministic: the session runs to a clean `PendingCommit` while the
+    /// peer is enrolled, the DELETE lands before the commit call, and the
+    /// commit must refuse with nothing stored.
+    #[tokio::test]
+    async fn session_batch_cannot_commit_after_peer_removal() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let inbound = sign_names("from-peer", "peer-value", clock(1, 1, 2), &owner);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local vector arrives as pages, then VectorEnd.
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // One owner-signed record, then Done: the batch this session
+            // will try to commit.
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: vec![inbound],
+                },
+            )
+            .await?;
+            write_frame(&mut c_send, &SyncFrame::Done).await?;
+            // The local side's own (empty) records and Done follow.
+            let _ = read_frame(&mut c_recv).await;
+            let _ = read_frame(&mut c_recv).await;
+            Ok::<(), SyncError>(())
+        });
+
+        let pending = negotiate_sync_session(
+            &mut s_send,
+            &mut s_recv,
+            &store,
+            None,
+            &owner,
+            &local,
+            &peer,
+        )
+        .await
+        .expect("negotiate");
+
+        // The owner's DELETE lands after the session's pre-commit boundary
+        // but before the commit — exactly the window the commit's own gate
+        // wait re-opens.
+        assert!(store.unenroll(&peer).await.expect("delete"));
+
+        let admission = SessionAdmission {
+            store: &store,
+            revocations: None,
+            owner: &owner_id,
+            peer: &peer,
+        };
+        let result = store
+            .commit_session_batch(pending.verified, &admission)
+            .await;
+        assert!(
+            matches!(result, Err(SyncError::NotEnrolled { .. })),
+            "a batch from a removed peer must not commit, got {result:?}"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "a refused session commit stores nothing"
         );
         let _ = peer_task.await;
     }
