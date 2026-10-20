@@ -51,6 +51,10 @@
 //!   with `cause = not_on_chain` (A answered its request), and stays
 //!   marked on its fork. The base ([`CAUSE_TYPED`]): X stays marked, and
 //!   `GET /groups/:id` on X has no `recovery` object.
+//! - `s3_forked_node_not_auto_recovered` (§3, 0088 §2 item 7; control,
+//!   GREEN on the base and with S3). Desired: through the window X keeps
+//!   its marker and its fork head, and A and M1 do not change. No
+//!   attestation resolves a fork.
 //!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
@@ -92,6 +96,7 @@ const ATTEST_ROUND: Duration = Duration::from_secs(240);
 const FINAL_TYPED: &str = "x_shows_reseat_required_not_on_chain_and_stays_contained";
 const CAUSE_TYPED: &str = "X stays marked on its fork, and GET /groups/:id on X has no \
                            recovery object in the whole window";
+const FINAL_NOT_AUTO: &str = "x_stays_marked_on_its_fork_and_a_m1_unchanged";
 const FINAL_BYSTANDERS: &str =
     "a_and_m1_never_marked_m1_at_the_seal_no_revision_past_it_recovery_unchanged";
 
@@ -103,6 +108,8 @@ enum Arm {
     SkewBystanders,
     /// §3 and §8: the forked node's typed state.
     ForkTyped,
+    /// §3: no automatic recovery of a forked node.
+    ForkNotAuto,
 }
 
 impl Arm {
@@ -111,7 +118,7 @@ impl Arm {
     }
 
     fn fork(self) -> bool {
-        matches!(self, Self::ForkTyped)
+        matches!(self, Self::ForkTyped | Self::ForkNotAuto)
     }
 }
 
@@ -829,6 +836,7 @@ async fn fork_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
             }
             (FINAL_TYPED, passed)
         }
+        Arm::ForkNotAuto => (FINAL_NOT_AUTO, contained && x1.state_hash != a1.state_hash),
         Arm::AlignedJoin | Arm::SkewBystanders => bail!("INFRA: {arm:?} is not a fork arm"),
     };
     receipt.finish(final_name, passed, at(sim));
@@ -842,6 +850,7 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
         Arm::AlignedJoin => (JOIN_LABELS, FINAL_JOIN),
         Arm::SkewBystanders => (JOIN_LABELS, FINAL_BYSTANDERS),
         Arm::ForkTyped => (FORK_LABELS, FINAL_TYPED),
+        Arm::ForkNotAuto => (FORK_LABELS, FINAL_NOT_AUTO),
     };
     match Sim::start(case, seed, labels).await {
         Ok(mut sim) => {
@@ -920,6 +929,22 @@ async fn w3h_1356_red_s3_forked_node_shows_reseat_required() -> Result<()> {
         0x1356_0003,
         Arm::ForkTyped,
         Verdict::Red,
+    )
+    .await
+}
+
+/// ADR 0109 §3: a forked node is never recovered automatically.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1356_control_s3_forked_node_not_auto_recovered() -> Result<()> {
+    expect(
+        "w3h_1356_control_s3_forked_node_not_auto_recovered",
+        0x1356_0004,
+        Arm::ForkNotAuto,
+        Verdict::Green,
     )
     .await
 }
