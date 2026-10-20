@@ -38,7 +38,7 @@
 
 #![cfg(test)]
 
-use super::control::{invite, join};
+use super::control::invite;
 use super::home::{membership_state, roster, HomeIds};
 use super::receipt::{Receipt, Verdict};
 use super::*;
@@ -269,6 +269,29 @@ async fn create_owner_certified(sim: &Sim, label: &str, owner_user_id: &str) -> 
         .to_string())
 }
 
+/// `joiner` redeems `link`. An owner-certified invite needs the pinned
+/// owner mode (`mode: home`) for any group, not only the Home.
+async fn join(sim: &Sim, joiner: &str, group: &HomeIds, link: &str) -> Result<()> {
+    let (status, joined) = sim
+        .api(
+            joiner,
+            Method::POST,
+            "/groups/join",
+            Some(json!({
+                "invite": link,
+                "display_name": joiner,
+                "mode": "home",
+                "expected_owner_user_id": group.owner_user_id,
+            })),
+        )
+        .await?;
+    ensure!(
+        status.is_success() && joined["ok"] != false,
+        "{joiner} join: {status} {joined}"
+    );
+    Ok(())
+}
+
 /// Whether, within `budget`, `authority` lists `member` in `gid` and
 /// `member` reports itself `active`. "Not admitted" is a verdict only when
 /// every read completed and succeeded; a failed or hanging read is INFRA.
@@ -365,7 +388,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     };
     for member in MEMBERS {
         let link = invite(sim, "O", &group.gid).await?;
-        join(sim, member, &link).await?;
+        join(sim, member, &group, &link).await?;
         ensure!(
             admitted(sim, "O", member, &group.gid, JOIN_BUDGET).await?,
             "setup: O could not seat {member}"
@@ -377,7 +400,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             .await?;
     }
     let link = invite(sim, "O", &group.gid).await?;
-    join(sim, "A", &link).await?;
+    join(sim, "A", &group, &link).await?;
     ensure!(
         admitted(sim, "O", "A", &group.gid, JOIN_BUDGET).await?,
         "setup: O could not seat A"
@@ -535,7 +558,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .fabric()
         .mark_indexed("t2: J redeems A's invite after A's restart");
     let (watcher, received) = watch_join_requests(sim, &home.gid)?;
-    join(sim, "J", &link).await?;
+    join(sim, "J", &home, &link).await?;
     let j_admitted = admitted(sim, "A", "J", &home.gid, JOIN_BUDGET).await?;
     drop(watcher);
     let received = std::mem::take(
