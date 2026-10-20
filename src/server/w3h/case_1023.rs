@@ -32,8 +32,9 @@
 //!   documented #1143 workaround, which the `case_1143.rs` positive
 //!   control also uses. A REST-created owner-certified group that is not
 //!   the Home does not certify the creator's seat, so A has no certificate
-//!   for O. O's default announce is anonymous. Without the consented
-//!   announce, A holds O `InGrace` and every seal of J's add refuses
+//!   for O. O's default announce is anonymous. O repeats the consented
+//!   announce until A verifies it, as a heartbeat would. Without the
+//!   consented announce, A holds O `InGrace` and every seal of J's add refuses
 //!   naming O, in both tests. That is a different defect from #1364 and
 //!   is out of scope. Evidence: A's verdict for O is `Clean`, before and
 //!   again after A's restart (A's discovery cache is in memory, so A must
@@ -647,20 +648,33 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // O announces with consent (the #1143 workaround): A's seat for O has
     // no certificate, so only O's consented announce gives A O's
     // certificate. Without it, every seal of J's add refuses naming O.
-    let (status, body) = sim
-        .api(
-            "O",
-            Method::POST,
-            "/announce",
-            Some(json!({"include_user_identity": true, "human_consent": true})),
-        )
-        .await?;
-    ensure!(status.is_success(), "O announce: {status} {body}");
-    let (o_clean, o_status) = until_a_clean(sim, &home.gid, "O", secs(60)).await?;
+    // A fetches the certificate blob once per announce, and only the
+    // next announce retries a failed fetch. The drop toward A can lose
+    // that blob, so O repeats the announce every 10 s, as a heartbeat
+    // would (run 39384499206).
+    let mut announces = 0_u32;
+    let mut waited = Duration::ZERO;
+    let (o_clean, o_status) = loop {
+        let (status, body) = sim
+            .api(
+                "O",
+                Method::POST,
+                "/announce",
+                Some(json!({"include_user_identity": true, "human_consent": true})),
+            )
+            .await?;
+        ensure!(status.is_success(), "O announce: {status} {body}");
+        announces += 1;
+        let (clean, last) = until_a_clean(sim, &home.gid, "O", secs(10)).await?;
+        waited += secs(10);
+        if clean || waited >= secs(60) {
+            break (clean, last);
+        }
+    };
     receipt.evidence(
         "a_verifies_creator_certificate_from_its_consented_announce",
         o_clean,
-        format!("after O's consented announce, A's verdict for O: {o_status:?}"),
+        format!("after {announces} consented announces from O, A's verdict for O: {o_status:?}"),
         at(sim),
     );
     ensure!(
