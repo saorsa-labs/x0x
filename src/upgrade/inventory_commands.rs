@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 const MAX_BYTES: usize = 1_048_576;
 const MAX_ARGUMENTS: usize = 4096;
 const MAX_COMMANDS: usize = 4096;
+// systemd v255 string-util.h WHITESPACE: other Unicode whitespace is data.
+const SOURCE_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 const COMMAND_PROPERTIES: [&str; 7] = [
     "ExecStart",
     "ExecStartPre",
@@ -56,7 +58,7 @@ pub(crate) fn parse_source(
     let mut commands = Vec::new();
     for line in text
         .lines()
-        .map(str::trim)
+        .map(|line| line.trim_matches(SOURCE_WHITESPACE))
         .filter(|line| !line.is_empty() && !line.starts_with(['#', ';']))
     {
         if line.ends_with('\\') {
@@ -75,7 +77,10 @@ pub(crate) fn parse_source(
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| refusal("ambiguous configured assignment"))?;
-        let (key, value) = (key.trim(), value.trim());
+        let (key, value) = (
+            key.trim_matches(SOURCE_WHITESPACE),
+            value.trim_matches(SOURCE_WHITESPACE),
+        );
         if section.is_empty()
             || key.is_empty()
             || !key
@@ -184,7 +189,7 @@ fn words(text: &str) -> io::Result<Vec<String>> {
         } else if quote.is_none() && (character == '\'' || character == '"') {
             quote = Some(character);
             started = true;
-        } else if quote.is_none() && character.is_whitespace() {
+        } else if quote.is_none() && SOURCE_WHITESPACE.contains(&character) {
             if started {
                 push_word(&mut words, std::mem::take(&mut word))?;
                 started = false;
