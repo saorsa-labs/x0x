@@ -15,7 +15,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use super::super::api_error;
 use super::super::sse::SseEvent;
 use super::super::state::AppState;
 use crate::gui::{
@@ -52,9 +51,15 @@ pub(in crate::server) async fn gui_show(
     let route = parsed.as_route();
 
     let agent_id = state.agent.agent_id();
-    if state.gui_show.is_blocked(&agent_id) {
-        return json_outcome(GuiShowOutcome::Refused, machine_id, request_id);
-    }
+    // Slice 1's requester is this daemon's agent. `blocks_local_show` is
+    // false for that agent, so a banner block does not refuse later local
+    // `POST /gui/show`. The list still refuses a different sender (slice 3).
+    debug_assert!(
+        !state
+            .gui_show
+            .blocks_local_show(&agent_id, &state.agent.agent_id()),
+        "local shows from this daemon must not be refused by the block list"
+    );
 
     let now = Instant::now();
     if !state.gui_show.try_rate_limit(&agent_id, now) {
@@ -65,8 +70,13 @@ pub(in crate::server) async fn gui_show(
     let banner = origin_banner(&agent_label, &machine_label, false);
     let agent_hex = hex::encode(agent_id.as_bytes());
 
-    let has_ws = !state.ws_sessions.read().await.is_empty();
-    if has_ws {
+    let has_gui = state
+        .ws_sessions
+        .read()
+        .await
+        .values()
+        .any(super::super::ws::WsSession::is_visible_gui);
+    if has_gui {
         let _ = state.broadcast_tx.send(SseEvent {
             event_type: "gui.show".to_string(),
             data: json!({
@@ -82,6 +92,8 @@ pub(in crate::server) async fn gui_show(
     }
 
     // Mint a fresh session; never put the durable token in the URL.
+    // The same token keys the pending banner so each opened window gets
+    // its own show when it connects with `gui=1`.
     let session = state.sessions.issue(Instant::now());
     let loopback = loopback_api_addr(state.api_address);
     let url = format!(
@@ -90,13 +102,14 @@ pub(in crate::server) async fn gui_show(
         loopback.port()
     );
     if state.gui_show.open_url(&url) {
-        state.gui_show.set_pending(PendingGuiShow {
+        state.gui_show.enqueue_pending(PendingGuiShow {
             view: route,
             banner,
             agent_id: agent_hex,
             machine_id: machine_id.clone(),
             rider: false,
             request_id: request_id.clone(),
+            session_token: session.clone(),
             created_at: Instant::now(),
         });
         json_outcome(GuiShowOutcome::Opened, machine_id, request_id)
@@ -143,40 +156,6 @@ async fn resolve_banner_labels(state: &AppState) -> (String, String) {
     (agent_label, machine_label)
 }
 
-/// POST /gui/show/block — add an agent to the local `gui_show_blocked` list.
-///
-/// Not in the public registry; used by the GUI origin-banner control over the
-/// session-authenticated loopback plane.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(in crate::server) struct GuiShowBlockRequest {
-    agent_id: String,
-}
-
-pub(in crate::server) async fn gui_show_block(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<GuiShowBlockRequest>,
-) -> Response {
-    let bytes = match hex::decode(req.agent_id.trim()) {
-        Ok(b) => b,
-        Err(_) => {
-            return api_error(StatusCode::BAD_REQUEST, "agent_id must be hex").into_response();
-        }
-    };
-    let arr: [u8; 32] = match bytes.try_into() {
-        Ok(a) => a,
-        Err(_) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "agent_id must be 32 bytes (64 hex chars)",
-            )
-            .into_response();
-        }
-    };
-    state.gui_show.block_agent(&crate::identity::AgentId(arr));
-    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +170,6 @@ mod tests {
     fn router(state: Arc<AppState>) -> axum::Router {
         axum::Router::new()
             .route("/gui/show", post(gui_show))
-            .route("/gui/show/block", post(gui_show_block))
             .with_state(state)
     }
 
@@ -317,7 +295,7 @@ mod tests {
             let mut sessions = state.ws_sessions.write().await;
             sessions.insert(
                 "test-session".to_string(),
-                crate::server::ws::test_ws_session("test-session"),
+                crate::server::ws::test_gui_ws_session("test-session"),
             );
         }
         let mut rx = state.broadcast_tx.subscribe();
@@ -342,6 +320,104 @@ mod tests {
                 .starts_with("Opened by "),
             "banner={}",
             event.data["banner"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_ws_does_not_suppress_opening_the_browser() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        {
+            let mut sessions = state.ws_sessions.write().await;
+            sessions.insert(
+                "agent-ws".to_string(),
+                crate::server::ws::test_ws_session("agent-ws"),
+            );
+            sessions.insert(
+                "agent-direct".to_string(),
+                crate::server::ws::test_ws_session("agent-direct"),
+            );
+        }
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["outcome"], "opened",
+            "an agent /ws or /ws/direct socket is not a visible GUI: {body}"
+        );
+        let urls = cap.urls.lock().unwrap();
+        assert_eq!(urls.len(), 1, "the browser must still be opened");
+        assert!(
+            urls[0].contains("gui=1") || urls[0].contains("/gui?token="),
+            "opened url={}",
+            urls[0]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocking_the_daemon_agent_does_not_refuse_local_show() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        install_capturing_opener(&state);
+        state.gui_show.block_agent(&state.agent.agent_id());
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(
+            body["outcome"], "refused",
+            "a block of this daemon's agent must not disable local POST /gui/show: {body}"
+        );
+        assert!(
+            body["outcome"] == "opened" || body["outcome"] == "navigated",
+            "{body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_shows_before_the_browser_connects_keep_both_pending() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let app = router(Arc::clone(&state));
+        let (status_a, body_a) = post_show(&app, json!({ "view": "people" })).await?;
+        let (status_b, body_b) = post_show(&app, json!({ "view": "network" })).await?;
+        assert_eq!(status_a, StatusCode::OK);
+        assert_eq!(status_b, StatusCode::OK);
+        assert_eq!(body_a["outcome"], "opened", "{body_a}");
+        assert_eq!(body_b["outcome"], "opened", "{body_b}");
+        let urls = cap.urls.lock().unwrap();
+        assert_eq!(urls.len(), 2, "both shows must open a window: {urls:?}");
+        let token = |url: &str| {
+            url.split("token=")
+                .nth(1)
+                .unwrap_or("")
+                .split(['&', '#'])
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        let token_a = token(&urls[0]);
+        let token_b = token(&urls[1]);
+        assert_ne!(token_a, token_b, "each window has its own session");
+        drop(urls);
+        let now = std::time::Instant::now();
+        let first = state
+            .gui_show
+            .take_pending_for_session(&token_a, now)
+            .expect("first show still pending");
+        let second = state
+            .gui_show
+            .take_pending_for_session(&token_b, now)
+            .expect("second show still pending");
+        assert_eq!(first.view, "people");
+        assert_eq!(second.view, "network");
+        assert!(
+            state
+                .gui_show
+                .take_pending_for_session("not-a-gui-session", now)
+                .is_none(),
+            "an arbitrary socket must not receive either banner"
         );
         Ok(())
     }

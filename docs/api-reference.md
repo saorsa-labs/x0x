@@ -2895,7 +2895,7 @@ does not appear in `x0x routes`. What ships today is **point-to-point
 |---|---|---|---|
 | GET | `/gui` | `x0x gui` | Open the embedded browser UI |
 | GET | `/gui/` | — | Alias for `/gui` |
-| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). |
+| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `navigated` means a live GUI tab (`gui=1` on its WebSocket); an agent on `/ws` or `/ws/direct` does not count, and the daemon opens a browser instead. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on), re-read on `POST /acl/reload` from the file startup loaded. |
 
 #### Example: local show
 

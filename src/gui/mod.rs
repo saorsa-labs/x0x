@@ -9,7 +9,8 @@ pub mod show;
 pub mod view_route;
 
 pub use show::{
-    new_request_id, origin_banner, short_id_hex, CapturingOpener, GuiShowConfig, GuiShowOutcome,
-    GuiShowRequest, GuiShowResponse, GuiShowRuntime, PendingGuiShow, PlatformOpener, ShowOpener,
+    new_request_id, origin_banner, parse_gui_ws_query, short_id_hex, startup_config_path,
+    CapturingOpener, GuiShowConfig, GuiShowOutcome, GuiShowRequest, GuiShowResponse,
+    GuiShowRuntime, PendingGuiShow, PlatformOpener, ShowOpener,
 };
 pub use view_route::{parse, ParsedView, HASH_SPACE_APPS, HASH_VIEWS};

@@ -65,7 +65,7 @@ pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
     mls_decrypt, mls_encrypt, remove_mls_member,
 };
-pub(super) use gui_show::{gui_show, gui_show_block};
+pub(super) use gui_show::gui_show;
 pub(super) use history::{
     history_diagnostics, history_list, history_message, history_policy, history_purge,
     history_retain, history_scopes, history_search, history_stats, HISTORY_RETAIN_BODY_LIMIT,

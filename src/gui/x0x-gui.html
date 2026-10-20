@@ -222,6 +222,7 @@ tr:hover td{background:rgba(255,255,255,.01)}
 #gui-show-banner.visible{display:flex}
 #gui-show-banner .banner-text{flex:1;min-width:0}
 #gui-show-banner button{flex-shrink:0;border-color:var(--rd);color:var(--rd);font-size:12px;padding:6px 12px}
+#gui-show-banner button.banner-dismiss{border-color:var(--bd);color:var(--tx)}
 #gui-show-banner button:disabled{opacity:.4;cursor:not-allowed;border-color:var(--bd);color:var(--tx3)}
 
 /* Modal */
@@ -578,6 +579,7 @@ tr:hover td{background:rgba(255,255,255,.01)}
 <button id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')" aria-label="Toggle navigation">&#9776;</button>
 <div id="gui-show-banner" role="status" aria-live="polite">
   <span class="banner-text" id="gui-show-banner-text"></span>
+  <button type="button" class="banner-dismiss" id="gui-show-banner-dismiss" disabled>Hide</button>
   <button type="button" id="gui-show-banner-block" disabled>Stop shows from this agent</button>
 </div>
 
@@ -707,7 +709,12 @@ function readSessionToken(){
 }
 let SESSION_TOKEN=readSessionToken();
 // Built per connect so a reconnect uses the current (refreshed) token.
-function wsUrl(){return BASE.replace(/^http/,'ws')+'/ws/direct'+(SESSION_TOKEN?'?token='+SESSION_TOKEN:'')}
+function wsUrl(){
+  const base=BASE.replace(/^http/,'ws')+'/ws/direct';
+  // gui=1 marks this socket as a visible GUI tab. Agent clients omit it.
+  if(SESSION_TOKEN)return base+'?token='+SESSION_TOKEN+'&gui=1';
+  return base+'?gui=1';
+}
 let ws=null;
 const wsSubs=new Set();
 
@@ -904,21 +911,30 @@ function onGuiShow(m){
   }
   showGuiShowBanner(m.banner||'Opened by an agent', m.agent_id||'');
 }
+function hideGuiShowBanner(){
+  const bar=document.getElementById('gui-show-banner');
+  if(bar)bar.classList.remove('visible');
+}
 function showGuiShowBanner(text, agentId){
   const bar=document.getElementById('gui-show-banner');
   const label=document.getElementById('gui-show-banner-text');
-  const btn=document.getElementById('gui-show-banner-block');
-  if(!bar||!label||!btn)return;
+  const block=document.getElementById('gui-show-banner-block');
+  const hide=document.getElementById('gui-show-banner-dismiss');
+  if(!bar||!label||!block||!hide)return;
   label.textContent=text;
   bar.classList.add('visible');
-  btn.disabled=true;
-  btn.onclick=null;
+  block.disabled=true;
+  hide.disabled=true;
+  block.onclick=null;
+  hide.onclick=null;
   clearTimeout(showGuiShowBanner._t);
   showGuiShowBanner._t=setTimeout(()=>{
-    btn.disabled=false;
-    btn.onclick=()=>{
+    hide.disabled=false;
+    hide.onclick=hideGuiShowBanner;
+    block.disabled=false;
+    block.onclick=()=>{
       if(agentId)wsSend({type:'gui.block',agent_id:agentId});
-      bar.classList.remove('visible');
+      hideGuiShowBanner();
       toast('Future shows from this agent will be blocked','info');
     };
   },3000);

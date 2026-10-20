@@ -1105,10 +1105,6 @@ fn route_set_matches_registry() {
             String::from("GET"),
             String::from("/.well-known/agent-card.json"),
         ),
-        // Origin-banner control (ADR 0083 §5). The embedded GUI sends
-        // `gui.block` on the session WebSocket; this loopback route is not
-        // a CLI command.
-        (String::from("POST"), String::from("/gui/show/block")),
     ]
     .into_iter()
     .collect();

@@ -2824,7 +2824,6 @@ pub async fn serve_with_options(
         .route("/gui/", get(serve_gui))
         // ADR 0083 slice 1: local show (no remote target).
         .route("/gui/show", post(routes::gui_show))
-        .route("/gui/show/block", post(routes::gui_show_block))
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))

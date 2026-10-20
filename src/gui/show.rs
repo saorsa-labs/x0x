@@ -3,8 +3,8 @@
 //! Holds `[gui_show]` config, the rate limiter, the per-agent block list, and
 //! the platform opener behind a test seam.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,13 @@ use crate::identity::AgentId;
 
 use super::rate_limit::GuiShowRateLimit;
 
-/// Pending banner for a freshly opened GUI window (no live WS yet).
+/// How long a pending banner waits for its GUI window to connect.
+const PENDING_FRESHNESS: Duration = Duration::from_secs(60);
+
+/// Pending banner for one freshly opened GUI window (no live WS yet).
+///
+/// Keyed by the session token minted into that window's URL, so two shows
+/// before either browser connects each keep their own banner.
 #[derive(Debug, Clone)]
 pub struct PendingGuiShow {
     pub view: String,
@@ -23,6 +29,8 @@ pub struct PendingGuiShow {
     pub machine_id: String,
     pub rider: bool,
     pub request_id: String,
+    /// Browser session token from the opened `/gui?token=` URL.
+    pub session_token: String,
     pub created_at: Instant,
 }
 
@@ -168,8 +176,8 @@ pub struct GuiShowRuntime {
     /// Optional daemon TOML path for `POST /acl/reload` re-read.
     config_path: Mutex<Option<PathBuf>>,
     blocked_path: PathBuf,
-    /// Last opened show waiting for a GUI WS to attach (banner delivery).
-    pending: Mutex<Option<PendingGuiShow>>,
+    /// Shows waiting for the GUI window that was opened for each one.
+    pending: Mutex<VecDeque<PendingGuiShow>>,
 }
 
 impl std::fmt::Debug for GuiShowRuntime {
@@ -197,7 +205,7 @@ impl GuiShowRuntime {
             opener: Mutex::new(opener),
             config_path: Mutex::new(config_path),
             blocked_path,
-            pending: Mutex::new(None),
+            pending: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -245,6 +253,15 @@ impl GuiShowRuntime {
             .unwrap_or(false)
     }
 
+    /// Whether a local show from `requester` is refused by the block list.
+    ///
+    /// Slice 1 always requests as this daemon's own agent. The block list is
+    /// for a remote sender (slice 3). Blocking the daemon agent — the only
+    /// sender the slice 1 banner can name — does not refuse later local shows.
+    pub fn blocks_local_show(&self, requester: &AgentId, daemon_agent: &AgentId) -> bool {
+        requester != daemon_agent && self.is_blocked(requester)
+    }
+
     /// Add `agent` to the block list and persist.
     pub fn block_agent(&self, agent: &AgentId) {
         if let Ok(mut g) = self.blocked.lock() {
@@ -280,26 +297,78 @@ impl GuiShowRuntime {
         }
     }
 
-    /// Remember a show that opened a new window so the first WS connect
-    /// can deliver the origin banner.
-    pub fn set_pending(&self, pending: PendingGuiShow) {
-        if let Ok(mut g) = self.pending.lock() {
-            *g = Some(pending);
+    /// Remember a show that opened a new window so that window's GUI socket
+    /// can deliver the origin banner. Older shows in the freshness window stay.
+    pub fn enqueue_pending(&self, pending: PendingGuiShow) {
+        if let Ok(mut queue) = self.pending.lock() {
+            let now = Instant::now();
+            queue.retain(|item| pending_is_fresh(item, now));
+            queue.push_back(pending);
         }
     }
 
-    /// Take a pending show if it is still fresh (≤ 60 s).
-    pub fn take_pending(&self, now: Instant) -> Option<PendingGuiShow> {
-        let Ok(mut g) = self.pending.lock() else {
+    /// Take the fresh pending show minted for this GUI session token.
+    ///
+    /// A miss leaves every other pending show in place. Stale entries are
+    /// dropped. An agent socket must not call this.
+    pub fn take_pending_for_session(
+        &self,
+        session_token: &str,
+        now: Instant,
+    ) -> Option<PendingGuiShow> {
+        let Ok(mut queue) = self.pending.lock() else {
             return None;
         };
-        let pending = g.take()?;
-        if now.duration_since(pending.created_at) > Duration::from_secs(60) {
-            None
-        } else {
-            Some(pending)
+        queue.retain(|item| pending_is_fresh(item, now));
+        let idx = queue
+            .iter()
+            .position(|item| item.session_token == session_token)?;
+        queue.remove(idx)
+    }
+}
+
+fn pending_is_fresh(pending: &PendingGuiShow, now: Instant) -> bool {
+    now.saturating_duration_since(pending.created_at) <= PENDING_FRESHNESS
+}
+
+/// Path of the daemon TOML that startup loaded.
+///
+/// An explicit `--config` wins. Otherwise this is the instance default file
+/// when that file exists. `POST /acl/reload` re-reads `[gui_show]` from this
+/// path. A missing default file means startup used in-memory defaults and
+/// there is nothing to re-read.
+pub fn startup_config_path(explicit: Option<&Path>, default_path: &Path) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+    if default_path.exists() {
+        Some(default_path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Whether a WebSocket query is a visible GUI tab, and its session token.
+///
+/// The embedded GUI connects with `gui=1`. Agent clients on `/ws` and
+/// `/ws/direct` omit it, so they are not a live GUI and must not take a
+/// pending banner.
+pub fn parse_gui_ws_query(query: Option<&str>) -> (bool, Option<String>) {
+    let Some(query) = query else {
+        return (false, None);
+    };
+    let mut visible_gui = false;
+    let mut session_token = None;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("gui=") {
+            visible_gui = value == "1";
+        } else if let Some(value) = pair.strip_prefix("token=") {
+            if !value.is_empty() {
+                session_token = Some(value.to_string());
+            }
         }
     }
+    (visible_gui, session_token)
 }
 
 fn load_blocked(path: &std::path::Path) -> HashSet<[u8; 32]> {
@@ -348,4 +417,172 @@ pub fn origin_banner(agent_label: &str, machine_label: &str, rider: bool) -> Str
 pub fn short_id_hex(hex64: &str) -> String {
     let take = hex64.len().min(10);
     hex64[..take].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(dir: &Path, config_path: Option<PathBuf>) -> GuiShowRuntime {
+        GuiShowRuntime::new(
+            GuiShowConfig::default(),
+            config_path,
+            dir,
+            Arc::new(CapturingOpener::new()),
+        )
+    }
+
+    fn pending(token: &str, view: &str, created_at: Instant) -> PendingGuiShow {
+        PendingGuiShow {
+            view: view.to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn blocking_the_daemon_agent_does_not_refuse_local_shows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let daemon = AgentId([1u8; 32]);
+        let remote = AgentId([2u8; 32]);
+        rt.block_agent(&daemon);
+        assert!(
+            !rt.blocks_local_show(&daemon, &daemon),
+            "slice 1 local shows are this daemon's agent; the banner block list is for a remote sender and must not refuse them"
+        );
+        rt.block_agent(&remote);
+        assert!(
+            rt.blocks_local_show(&remote, &daemon),
+            "a blocked remote sender is still refused"
+        );
+    }
+
+    #[test]
+    fn two_shows_before_connect_keep_both_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let now = Instant::now();
+        rt.enqueue_pending(pending("session-a", "people", now));
+        rt.enqueue_pending(pending("session-b", "network", now));
+        assert!(
+            rt.take_pending_for_session("agent-socket", now).is_none(),
+            "an unrelated socket must not drop either pending show"
+        );
+        let first = rt
+            .take_pending_for_session("session-a", now)
+            .expect("first show still pending");
+        let second = rt
+            .take_pending_for_session("session-b", now)
+            .expect("second show still pending");
+        assert_eq!(first.view, "people");
+        assert_eq!(second.view, "network");
+        assert!(rt.take_pending_for_session("session-a", now).is_none());
+    }
+
+    #[test]
+    fn stale_pending_show_is_dropped_without_taking_the_fresh_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let now = Instant::now();
+        let stale_at = now
+            .checked_sub(PENDING_FRESHNESS + Duration::from_secs(1))
+            .expect("instant");
+        rt.enqueue_pending(pending("stale", "people", stale_at));
+        rt.enqueue_pending(pending("fresh", "network", now));
+        assert!(rt.take_pending_for_session("stale", now).is_none());
+        assert_eq!(
+            rt.take_pending_for_session("fresh", now)
+                .expect("fresh show")
+                .view,
+            "network"
+        );
+    }
+
+    #[test]
+    fn reload_reads_local_enabled_from_the_startup_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let default_path = dir.path().join("config.toml");
+        assert!(
+            startup_config_path(None, &default_path).is_none(),
+            "a missing default file is not a reload path"
+        );
+        std::fs::write(
+            &default_path,
+            "[gui_show]\nlocal_enabled = false\nremote_enabled = true\n",
+        )
+        .expect("write config");
+        let loaded = startup_config_path(None, &default_path).expect("default file was loaded");
+        assert_eq!(loaded, default_path);
+        let explicit = dir.path().join("other.toml");
+        assert_eq!(
+            startup_config_path(Some(&explicit), &default_path).as_deref(),
+            Some(explicit.as_path()),
+            "an explicit --config path wins over the default file"
+        );
+        let rt = runtime(dir.path(), Some(loaded));
+        assert!(rt.config().local_enabled);
+        rt.reload_from_disk();
+        assert!(
+            !rt.config().local_enabled,
+            "[gui_show] local_enabled=false in the file startup loaded must apply on reload"
+        );
+    }
+
+    #[test]
+    fn agent_ws_query_is_not_a_visible_gui() {
+        assert_eq!(parse_gui_ws_query(None), (false, None));
+        assert_eq!(
+            parse_gui_ws_query(Some("token=abc")),
+            (false, Some("abc".to_string()))
+        );
+        assert_eq!(parse_gui_ws_query(Some("backfill=1")), (false, None));
+        assert_eq!(
+            parse_gui_ws_query(Some("token=abc&gui=1")),
+            (true, Some("abc".to_string()))
+        );
+        assert_eq!(parse_gui_ws_query(Some("gui=1")), (true, None));
+    }
+
+    #[test]
+    fn origin_banner_can_be_hidden_after_three_seconds_without_blocking() {
+        let html = include_str!("x0x-gui.html");
+        assert!(
+            html.contains("id=\"gui-show-banner-dismiss\""),
+            "the banner needs a hide control that is not the block control"
+        );
+        let start = html
+            .find("function hideGuiShowBanner")
+            .expect("hide helper");
+        let end = html[start..]
+            .find("function navigate")
+            .expect("navigate follows the banner helpers");
+        let src = &html[start..start + end];
+        assert!(
+            src.contains("3000"),
+            "the banner stays non-dismissable for 3 seconds"
+        );
+        let hide = src
+            .find("function hideGuiShowBanner")
+            .expect("hide helper in slice");
+        let show = src.find("function showGuiShowBanner").expect("show helper");
+        let hide_body = &src[hide..show];
+        assert!(
+            !hide_body.contains("gui.block"),
+            "hiding the banner must not block the agent: {hide_body}"
+        );
+        assert!(
+            src.contains("hide.onclick=hideGuiShowBanner"),
+            "after the wait, Hide clears the banner without gui.block"
+        );
+        assert!(
+            html.contains("&gui=1") || html.contains("gui=1"),
+            "the GUI socket must tag itself so an agent /ws client is not a live tab"
+        );
+    }
 }

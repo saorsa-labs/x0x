@@ -237,24 +237,21 @@ async fn run_daemon() -> anyhow::Result<()> {
     // Whether a config file was actually loaded (explicit `--config`, or the
     // instance's default path). A named instance with a file must declare its
     // plane (David, 2026-09-29); one with no file keeps unset = prod.
-    let mut config_file_loaded = true;
-    let (mut config, mut config_findings) = match &config_path {
-        Some(path) => load_config(path).await?,
-        None => {
-            let config_dir_name = match &cli_instance_name {
-                Some(name) => format!("x0x-{}", name.as_str()),
-                None => "x0x".to_string(),
-            };
-            let default_path = dirs::config_dir()
-                .map(|d| d.join(&config_dir_name).join("config.toml"))
-                .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
-            if default_path.exists() {
-                load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
-            } else {
-                config_file_loaded = false;
-                (DaemonConfig::default(), Vec::new())
-            }
-        }
+    // `[gui_show]` reload follows this same path, including the default file
+    // when startup loaded it without `--config`.
+    let config_dir_name = match &cli_instance_name {
+        Some(name) => format!("x0x-{}", name.as_str()),
+        None => "x0x".to_string(),
+    };
+    let default_config_path = dirs::config_dir()
+        .map(|d| d.join(&config_dir_name).join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
+    let loaded_config_path =
+        x0x::gui::startup_config_path(config_path.as_deref().map(Path::new), &default_config_path);
+    let config_file_loaded = loaded_config_path.is_some();
+    let (mut config, mut config_findings) = match loaded_config_path.as_ref() {
+        Some(path) => load_config(path.to_str().unwrap_or("/etc/x0x/config.toml")).await?,
+        None => (DaemonConfig::default(), Vec::new()),
     };
 
     let (instance_name, effective_connect_acl_path) = resolve_instance_startup(
@@ -422,7 +419,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         exec_policy,
         connect_policy,
         self_update_enabled,
-        daemon_config_path: config_path.as_ref().map(std::path::PathBuf::from),
+        daemon_config_path: loaded_config_path,
     };
     let handle = x0x::server::serve_with_options(config, options).await?;
 

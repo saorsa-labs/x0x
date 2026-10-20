@@ -84,19 +84,40 @@ pub(super) struct WsSession {
     subscribed_topics: HashSet<String>,
     /// Whether this session receives direct messages.
     receives_direct: bool,
+    /// ADR 0083: this socket is a visible GUI tab (`gui=1`), not an agent client.
+    visible_gui: bool,
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
     /// The drain owns the `JoinHandle`; this is only the abort handle.
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
 }
 
-/// Build a placeholder WS session for ADR 0083 navigate-in-place tests.
+/// Build a placeholder agent WS session (not a visible GUI tab).
 #[cfg(test)]
 pub(super) fn test_ws_session(id: &str) -> WsSession {
+    test_ws_session_kind(id, false)
+}
+
+/// Build a placeholder visible-GUI WS session for navigate-in-place tests.
+#[cfg(test)]
+pub(super) fn test_gui_ws_session(id: &str) -> WsSession {
+    test_ws_session_kind(id, true)
+}
+
+#[cfg(test)]
+fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
     WsSession {
         id: id.to_string(),
         subscribed_topics: HashSet::new(),
         receives_direct: false,
+        visible_gui,
         topic_forwarders: HashMap::new(),
+    }
+}
+
+impl WsSession {
+    /// Live visible GUI tab. Agent `/ws` and `/ws/direct` sockets are not.
+    pub(super) fn is_visible_gui(&self) -> bool {
+        self.visible_gui
     }
 }
 
@@ -494,6 +515,8 @@ fn detach_ws_session(
     direct_mode: bool,
     direct_backfill: Option<usize>,
     durable_owner: bool,
+    visible_gui: bool,
+    session_token: Option<String>,
 ) -> tokio::sync::oneshot::Sender<axum::extract::ws::WebSocket> {
     let (socket_tx, socket_rx) = tokio::sync::oneshot::channel();
     let session_state = Arc::clone(&state);
@@ -510,6 +533,8 @@ fn detach_ws_session(
             direct_mode,
             direct_backfill,
             durable_owner,
+            visible_gui,
+            session_token,
         )
         .await;
     });
@@ -520,11 +545,20 @@ fn detach_ws_session(
 pub(super) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
-    let socket_tx = detach_ws_session(state, false, None, actor.is_durable_owner());
+    let (visible_gui, session_token) = crate::gui::parse_gui_ws_query(raw.as_deref());
+    let socket_tx = detach_ws_session(
+        state,
+        false,
+        None,
+        actor.is_durable_owner(),
+        visible_gui,
+        session_token,
+    );
     ws.on_upgrade(move |socket| async move {
         let _ = socket_tx.send(socket);
     })
@@ -543,11 +577,20 @@ pub(super) async fn ws_direct_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<DirectWsParams>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
-    let socket_tx = detach_ws_session(state, true, params.backfill, actor.is_durable_owner());
+    let (visible_gui, session_token) = crate::gui::parse_gui_ws_query(raw.as_deref());
+    let socket_tx = detach_ws_session(
+        state,
+        true,
+        params.backfill,
+        actor.is_durable_owner(),
+        visible_gui,
+        session_token,
+    );
     ws.on_upgrade(move |socket| async move {
         let _ = socket_tx.send(socket);
     })
@@ -979,6 +1022,8 @@ async fn handle_ws_connection(
     direct_mode: bool,
     direct_backfill: Option<usize>,
     durable_owner: bool,
+    visible_gui: bool,
+    session_token: Option<String>,
 ) {
     use axum::extract::ws::Message;
     use futures::StreamExt as FutStreamExt;
@@ -1003,6 +1048,7 @@ async fn handle_ws_connection(
         id: session_id.clone(),
         subscribed_topics: HashSet::new(),
         receives_direct: direct_mode,
+        visible_gui,
         topic_forwarders: HashMap::new(),
     };
     state
@@ -1024,21 +1070,29 @@ async fn handle_ws_connection(
         &stats,
     );
 
-    // ADR 0083: deliver a pending origin banner when this tab was just opened
-    // by `POST /gui/show` (no live WS existed at show time).
-    if let Some(pending) = state.gui_show.take_pending(std::time::Instant::now()) {
-        feed_droppable(
-            &outbound_tx,
-            WsOutbound::GuiShow {
-                view: pending.view,
-                banner: pending.banner,
-                agent_id: pending.agent_id,
-                machine_id: pending.machine_id,
-                rider: pending.rider,
-                request_id: pending.request_id,
-            },
-            &stats,
-        );
+    // ADR 0083: deliver this window's pending banner. Only a visible GUI
+    // tab (`gui=1`) may take it, and only the session token minted into
+    // that window's URL. An agent socket leaves every pending show queued.
+    if visible_gui {
+        if let Some(token) = session_token.as_deref() {
+            if let Some(pending) = state
+                .gui_show
+                .take_pending_for_session(token, std::time::Instant::now())
+            {
+                feed_droppable(
+                    &outbound_tx,
+                    WsOutbound::GuiShow {
+                        view: pending.view,
+                        banner: pending.banner,
+                        agent_id: pending.agent_id,
+                        machine_id: pending.machine_id,
+                        rider: pending.rider,
+                        request_id: pending.request_id,
+                    },
+                    &stats,
+                );
+            }
+        }
     }
 
     // Spawn writer task: outbound_rx → ws_tx. Races BOTH the frame arrival and
@@ -1194,6 +1248,9 @@ async fn handle_ws_connection(
                 "call.incoming" => WsOutbound::CallIncoming { call: event.data },
                 "call.state" => WsOutbound::CallState { call: event.data },
                 "gui.show" => {
+                    if !visible_gui {
+                        continue;
+                    }
                     let view = event
                         .data
                         .get("view")
@@ -2233,6 +2290,7 @@ mod tests {
                 id: session_id.to_string(),
                 subscribed_topics: HashSet::new(),
                 receives_direct: false,
+                visible_gui: false,
                 topic_forwarders: HashMap::new(),
             },
         );
