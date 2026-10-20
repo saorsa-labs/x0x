@@ -19,6 +19,7 @@ macro_rules! http_now_regression_tests {
                 shutdown: Option<watch::Sender<bool>>,
                 observed: UnboundedReceiver<staging::Decision>,
                 operations: UnboundedReceiver<bool>,
+                drained: std::sync::mpsc::Receiver<()>,
                 attempts: Arc<AtomicU64>,
                 wait_lock: Arc<Mutex<()>>,
                 install: PathBuf, data: PathBuf, identity: PathBuf, window: u64,
@@ -74,15 +75,19 @@ macro_rules! http_now_regression_tests {
                         x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
                     }));
                     let (operation_tx, operations) = mpsc::unbounded_channel();
+                    let (drained_tx, drained) = std::sync::mpsc::channel();
                     let wait_lock = Arc::new(Mutex::new(()));
                     let runtime = HttpUpgradeRuntime {
                         config: DaemonUpdateConfig { rollout_window_minutes: window, ..Default::default() },
                         restart_context: startup.restart_context, apply_lock: startup.upgrade_apply_lock,
                         shutdown: startup.shutdown_watch, staging: Some(startup.staging),
-                        operation_observer: Some(Arc::new(move |entered| { let _ = operation_tx.send(entered); })),
+                        operation_observer: Some(Arc::new(move |entered| {
+                            let _ = operation_tx.send(entered);
+                            if !entered { let _ = drained_tx.send(()); }
+                        })),
                         wait_slot: Arc::new(Arc::clone(&wait_lock).try_lock_owned().unwrap()),
                     };
-                    Self { runtime, shutdown: Some(shutdown), observed, operations, attempts, wait_lock,
+                    Self { runtime, shutdown: Some(shutdown), observed, operations, drained, attempts, wait_lock,
                         install, data, identity, window, _readback: readback, _apply: apply, _root: root }
                 }
                 fn release(&self, version: &str) -> crate::upgrade::monitor::VerifiedRelease {
@@ -284,21 +289,35 @@ macro_rules! http_now_regression_tests {
                 }
             }
 
+            struct QueuedDrain {
+                held: Option<std::fs::File>,
+                done: std::sync::mpsc::Receiver<()>,
+            }
+            impl Drop for QueuedDrain {
+                fn drop(&mut self) {
+                    drop(self.held.take());
+                    // Runs before fixture/global-hook destruction on failure.
+                    let _ = self.done.recv_timeout(Duration::from_secs(6));
+                }
+            }
+
             #[tokio::test(start_paused = true)]
             async fn http_cancelled_queued_worker_retains_wait_slot_until_actual_exit_without_writes() {
                 for drop_request in [false,true] {
                     let mut f=Fixture::new(60,false); let release=f.release("9.9.9");
                     let held=crate::upgrade::acquire_host_upgrade_lock(&f.install).unwrap();
                     let before=bytes(f._root.path());
+                    let mut drain=QueuedDrain {held:Some(held),done:f.drained};
+                    let entered; let mut cancellation_refused=true;
                     { let mut operation=Box::pin(apply_http_release(&f.runtime,&release,false));
-                      assert!(event(operation.as_mut(),&mut f.operations).await);
-                      if !drop_request { f.shutdown.as_ref().unwrap().send(true).unwrap(); assert!(finish(operation.as_mut()).await.is_err()); }
+                      entered=event(operation.as_mut(),&mut f.operations).await;
+                      if !drop_request { f.shutdown.as_ref().unwrap().send(true).unwrap(); cancellation_refused=finish(operation.as_mut()).await.is_err(); }
                     }
                     // Remove the request/runtime lease. Only the real queued
                     // closure may retain admission capacity from this point.
                     drop(f.runtime);
-                    assert!(Arc::clone(&f.wait_lock).try_lock_owned().is_err());
-                    assert_eq!(bytes(f._root.path()),before); drop(held);
+                    let capacity_retained=Arc::clone(&f.wait_lock).try_lock_owned().is_err();
+                    let queued_bytes=bytes(f._root.path()); drop(drain.held.take());
                     let deadline=std::time::Instant::now()+Duration::from_secs(20);
                     loop {
                         assert!(std::time::Instant::now()<deadline,"cancelled queued worker did not drain");
@@ -310,6 +329,9 @@ macro_rules! http_now_regression_tests {
                         assert!(std::time::Instant::now()<deadline,"worker retained wait slot after exit");
                         tokio::task::yield_now().await;
                     }
+                    drop(drain);
+                    assert!(entered); assert!(cancellation_refused); assert!(capacity_retained);
+                    assert_eq!(queued_bytes,before);
                     assert_eq!(bytes(f._root.path()),before); assert_eq!(f.attempts.load(Ordering::SeqCst),0);
                 }
             }

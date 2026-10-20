@@ -7,9 +7,21 @@ macro_rules! http_custody_regression_tests {
         mod http_custody_regressions {
             use super::*;
             use std::time::Duration;
-            struct ReleasePause(Option<std::sync::mpsc::Sender<()>>);
-            impl Drop for ReleasePause {
-                fn drop(&mut self) { if let Some(sender)=self.0.take() { let _=sender.send(()); } }
+            struct CustodyDrain {
+                release: Option<std::sync::mpsc::Sender<()>>,
+                worker_done: std::sync::mpsc::Receiver<()>,
+                restart_done: std::sync::mpsc::Receiver<()>,
+            }
+            impl CustodyDrain {
+                fn release(&mut self) { if let Some(sender)=self.release.take() { let _=sender.send(()); } }
+            }
+            impl Drop for CustodyDrain {
+                fn drop(&mut self) {
+                    self.release();
+                    // Bounded failure cleanup precedes hook/root destruction.
+                    let _=self.worker_done.recv_timeout(Duration::from_secs(6));
+                    let _=self.restart_done.recv_timeout(Duration::from_secs(2));
+                }
             }
 
             #[tokio::test(flavor="current_thread")]
@@ -31,11 +43,14 @@ macro_rules! http_custody_regression_tests {
                 };
                 let count=Arc::new(std::sync::atomic::AtomicUsize::new(0)); let counted=Arc::clone(&count);
                 let (restarted,mut restart_events)=tokio::sync::mpsc::unbounded_channel();
-                let expected=daemon.clone(); let observed_scratch=scratch.clone();
+                let (restart_done,restart_done_rx)=std::sync::mpsc::channel();
+                let observed_scratch=scratch.clone();
                 let _restart=http_deferred_restart_seam::install(daemon.clone(),Arc::new(move |plan,version| {
-                    assert_eq!(plan.executable,expected); assert_eq!(version,"2.0.0");
-                    assert!(!observed_scratch.exists(),"scratch must be gone before external restart");
-                    counted.fetch_add(1,Ordering::SeqCst); let _=restarted.send(());
+                    let observation=(plan.executable.clone(),version.to_string(),observed_scratch.exists());
+                    counted.fetch_add(1,Ordering::SeqCst); let _=restarted.send(observation);
+                    // Last callback operation. Assertions run on the test
+                    // thread after all owned filesystem observation completes.
+                    let _=restart_done.send(());
                 }));
                 // The actual production owner parks before any mutation, then
                 // waits its real750ms after the worker signals successful apply.
@@ -44,11 +59,15 @@ macro_rules! http_custody_regression_tests {
                 let (entered_tx,entered_rx)=tokio::sync::oneshot::channel();
                 let (release_tx,release_rx)=std::sync::mpsc::channel();
                 REPLACE_HOOKS.lock().unwrap().insert(daemon.clone(),ReplaceHook { entered:entered_tx, release:release_rx });
-                let _pause=ReplaceHookGuard {target:daemon.clone()}; let release=ReleasePause(Some(release_tx));
+                let _pause=ReplaceHookGuard {target:daemon.clone()};
                 let wait_lock=Arc::new(tokio::sync::Mutex::new(()));
                 let mut permit=ReleasePermit::for_http(Arc::new(Arc::clone(&wait_lock).try_lock_owned().unwrap()));
                 let (worker_tx,mut worker_rx)=tokio::sync::mpsc::unbounded_channel();
-                permit.observer=Some(Arc::new(move |entered| { let _=worker_tx.send(entered); }));
+                let (worker_done,worker_done_rx)=std::sync::mpsc::channel();
+                permit.observer=Some(Arc::new(move |entered| {
+                    let _=worker_tx.send(entered); if !entered { let _=worker_done.send(()); }
+                }));
+                let mut drain=CustodyDrain {release:Some(release_tx),worker_done:worker_done_rx,restart_done:restart_done_rx};
                 let mut operation=Box::pin(apply_replacements_with_permit(
                     Upgrader::new(daemon.clone(),semver::Version::new(1,0,0)),incoming,semver::Version::new(2,0,0),
                     Some((Upgrader::new(cli.clone(),semver::Version::new(1,0,0)),incoming_cli)),
@@ -57,17 +76,22 @@ macro_rules! http_custody_regression_tests {
                 tokio::time::timeout(Duration::from_secs(5),async {
                     tokio::select! { result=operation.as_mut()=>panic!("replacement ended before pause: {result:?}"), entered=entered_rx=>entered.unwrap() }
                 }).await.unwrap();
-                assert_eq!(std::fs::read(&cli).unwrap(),b"new-cli"); assert_eq!(std::fs::read(&daemon).unwrap(),b"old-daemon");
-                assert_eq!(count.load(Ordering::SeqCst),0);
+                let mid_cli=std::fs::read(&cli); let mid_daemon=std::fs::read(&daemon);
+                let early_restarts=count.load(Ordering::SeqCst);
                 permit.cancel(); permit.release_http_wait_slot(); drop(operation);
-                assert!(Arc::clone(&wait_lock).try_lock_owned().is_err(),"admitted worker owns capacity until it exits");
-                drop(release);
+                let capacity_retained=Arc::clone(&wait_lock).try_lock_owned().is_err();
+                drain.release();
                 let mut saw_entry=false;
                 tokio::time::timeout(Duration::from_secs(5),async {
                     loop { match worker_rx.recv().await { Some(true)=>saw_entry=true,Some(false)=>break,None=>panic!("worker observer disappeared") } }
                 }).await.unwrap();
-                assert!(saw_entry); assert!(Arc::clone(&wait_lock).try_lock_owned().is_ok());
-                tokio::time::timeout(Duration::from_secs(5),restart_events.recv()).await.unwrap().unwrap();
+                let capacity_released=Arc::clone(&wait_lock).try_lock_owned().is_ok();
+                let (restart_target,restart_version,scratch_present)=tokio::time::timeout(Duration::from_secs(5),restart_events.recv()).await.unwrap().unwrap();
+                drop(drain);
+                assert!(saw_entry); assert!(capacity_retained); assert!(capacity_released);
+                assert_eq!(mid_cli.unwrap(),b"new-cli"); assert_eq!(mid_daemon.unwrap(),b"old-daemon");
+                assert_eq!(early_restarts,0); assert_eq!(restart_target,daemon); assert_eq!(restart_version,"2.0.0");
+                assert!(!scratch_present,"scratch must be gone before external restart");
                 assert_eq!(std::fs::read(&daemon).unwrap(),b"new-daemon"); assert_eq!(std::fs::read(&cli).unwrap(),b"new-cli");
                 assert_eq!(std::fs::read(daemon.with_extension("backup")).unwrap(),b"old-daemon");
                 assert_eq!(std::fs::read(cli.with_extension("backup")).unwrap(),b"old-cli");

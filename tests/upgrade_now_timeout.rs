@@ -109,9 +109,10 @@ macro_rules! upgrade_now_timeout_regression_tests {
                     }
                     drop(pending);
                     drop(transport);
-                    // Reap the owned async peer after the cancelled/failed
-                    // request closes it. This says nothing about arbitrary
-                    // daemon-side disconnect or pipelined HTTP cancellation.
+                    drop(client);
+                    // Reap the owned peer after the pending request AND every
+                    // owned client clone have dropped. This does not prove
+                    // request-only or daemon-side disconnect cancellation.
                     while !server.0.as_ref().unwrap().is_finished() {
                         assert!(std::time::Instant::now() < deadline, "owned peer did not close");
                         tokio::task::yield_now().await;
