@@ -329,6 +329,8 @@ mod execution {
         fn assert_fresh_process_refuses(&self) {
             let path = probe::state_path(&self.request.install).unwrap();
             let before = std::fs::read(&path).unwrap();
+            let pending = probe::uncertainty_path(&self.request.install).unwrap();
+            let pending_before = Self::optional_record_bytes(&pending);
             // Execute only the inert reader below. A new process has no copy
             // of the writer's process-local recovery latch.
             let mut command = self._scratch.command(&std::env::current_exe().unwrap());
@@ -350,6 +352,15 @@ mod execution {
             assert!(String::from_utf8_lossy(&output.stdout)
                 .contains("fresh probe reader refused both versions"));
             assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(Self::optional_record_bytes(&pending), pending_before);
+        }
+
+        fn optional_record_bytes(path: &Path) -> Option<Vec<u8>> {
+            match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("read private record {}: {error}", path.display()),
+            }
         }
 
         fn assert_child_reaped(pid: u32) {
@@ -382,6 +393,12 @@ mod execution {
         assert_eq!(state.daemon_sha256, Some(receipt.daemon_sha256));
         assert_eq!(state.cli_sha256, Some(receipt.cli_sha256));
         assert_eq!(state.transaction_id, receipt.transaction_id);
+        assert!(
+            !probe::uncertainty_path(&fixture.request.install)
+                .unwrap()
+                .exists(),
+            "a fully acknowledged successful result must clear its marker"
+        );
         fixture.assert_installed_pair_unchanged();
         assert_eq!(probe::PROBE_TIMEOUT, Duration::from_secs(90));
     }
@@ -623,6 +640,8 @@ mod execution {
         let install = PathBuf::from(install);
         let path = probe::state_path(&install).unwrap();
         let before = std::fs::read(&path).unwrap();
+        let pending = probe::uncertainty_path(&install).unwrap();
+        let pending_before = ExecutionFixture::optional_record_bytes(&pending);
         let clock = ProbeClock {
             boot_id: "fresh-reader-boot".to_owned(),
             monotonic_ms: 3_000,
@@ -633,6 +652,10 @@ mod execution {
                 Err(ProbeRefusal::RecoveryFailed { .. })
             ));
             assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                ExecutionFixture::optional_record_bytes(&pending),
+                pending_before
+            );
         }
         println!("fresh probe reader refused both versions");
     }
@@ -850,6 +873,146 @@ mod execution {
                 fixture.assert_installed_pair_unchanged();
             }
         }
+    }
+
+    #[test]
+    fn terminal_rename_without_directory_ack_and_failed_recovery_write_refuses_fresh_readers() {
+        for failed_candidate in [false, true] {
+            let fixture = ExecutionFixture::new();
+            if failed_candidate {
+                fixture.write_script(&fixture.request.daemon, "exit 23");
+            }
+            let result = probe::run_before_swap_with_terminal_failure(
+                &fixture.request,
+                &AtomicBool::new(true),
+                &ExecutionFixture::options(1_000),
+            );
+            assert!(matches!(result, Err(ProbeRefusal::RecoveryFailed { .. })));
+            // The terminal rename happened, so the main file alone looks
+            // like a completed success or ordinary failed-release hold.
+            let state = probe::read_state(&fixture.request.install)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.phase,
+                if failed_candidate {
+                    ProbePhase::FailedHold
+                } else {
+                    ProbePhase::Passed
+                }
+            );
+            let pending = probe::uncertainty_path(&fixture.request.install).unwrap();
+            let pending_bytes = std::fs::read(&pending).unwrap();
+            let marker: serde_json::Value = serde_json::from_slice(&pending_bytes).unwrap();
+            assert_eq!(marker["record_kind"], "probe_terminalizing");
+            assert_eq!(marker["transaction_id"], state.transaction_id);
+            let previous: serde_json::Value =
+                serde_json::from_str(marker["previous_record"].as_str().unwrap()).unwrap();
+            assert_eq!(previous["phase"], "running");
+            // This subprocess has no writer latch. Even a newer release must
+            // not clear the apparent FailedHold or use the apparent Passed.
+            fixture.assert_fresh_process_refuses();
+            assert_eq!(std::fs::read(pending).unwrap(), pending_bytes);
+            for pid in fixture.launched_pids() {
+                ExecutionFixture::assert_child_reaped(pid);
+            }
+            fixture.assert_installed_pair_unchanged();
+        }
+    }
+
+    #[test]
+    fn corrupt_uncertainty_markers_block_even_a_complete_passed_record() {
+        for bytes in [b"{torn".as_slice(), br#"{"schema_version":999}"#] {
+            let fixture = ExecutionFixture::new();
+            fixture.run(&ExecutionFixture::options(1_000)).unwrap();
+            let state = probe::read_state(&fixture.request.install)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.phase, ProbePhase::Passed);
+            let pending = probe::uncertainty_path(&fixture.request.install).unwrap();
+            std::fs::write(&pending, bytes).unwrap();
+            fixture.assert_fresh_process_refuses();
+            assert_eq!(std::fs::read(pending).unwrap(), bytes);
+            fixture.assert_installed_pair_unchanged();
+        }
+    }
+
+    #[test]
+    fn exited_parent_with_descendant_holding_stdout_still_times_out_and_is_reaped() {
+        let fixture = ExecutionFixture::new();
+        let response = serde_json::json!({
+            "version": CANDIDATE_VERSION,
+            "platform": fixture.request.platform,
+        });
+        // The private sleep child inherits the pipe and process group. It
+        // does no I/O or networking; successful group cleanup terminates it.
+        fixture.write_script(
+            &fixture.request.daemon,
+            &format!("/bin/sleep 30 &\nprintf '%s\\n' '{response}'\nexit 0"),
+        );
+        let mut options = ExecutionFixture::options(1_000);
+        options.timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        assert!(matches!(
+            fixture.run(&options),
+            Err(ProbeRefusal::Interrupted { .. })
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a descendant-held stdout must not escape the probe deadline"
+        );
+        let state = probe::read_state(&fixture.request.install)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cause, Some(ProbeCause::Timeout));
+        assert_eq!(state.phase, ProbePhase::InterruptedWait);
+        ExecutionFixture::assert_child_reaped(state.last_pid.unwrap());
+        assert_eq!(fixture.launched_pids().len(), 1);
+        fixture.assert_installed_pair_unchanged();
+    }
+
+    #[test]
+    fn malformed_response_is_classified_while_the_child_is_still_waitable() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let fixture = ExecutionFixture::new();
+        fixture.write_script(
+            &fixture.request.daemon,
+            "printf '%s\\n' 'not a JSON response'\nexit 0",
+        );
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_in_child = Arc::clone(&observed);
+        let result = probe::run_before_swap_with_cleanup_observer(
+            &fixture.request,
+            &AtomicBool::new(true),
+            &ExecutionFixture::options(1_000),
+            move |pid| {
+                // SAFETY: siginfo_t is an output buffer for waitid. WNOWAIT
+                // observes only this probe's child without reaping it.
+                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(result, 0, "probe child was reaped before validation");
+                // SAFETY: a successful waitid populated this siginfo_t.
+                assert_eq!(unsafe { status.si_pid() }, i32::try_from(pid).unwrap());
+                observed_in_child.store(true, Ordering::SeqCst);
+            },
+        );
+        assert!(matches!(result, Err(ProbeRefusal::Failed { .. })));
+        assert!(observed.load(Ordering::SeqCst));
+        let state = probe::read_state(&fixture.request.install)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cause, Some(ProbeCause::InvalidOutput));
+        ExecutionFixture::assert_child_reaped(state.last_pid.unwrap());
+        fixture.assert_installed_pair_unchanged();
     }
 
     #[test]
