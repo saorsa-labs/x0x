@@ -11,6 +11,7 @@
 
 pub mod aad;
 pub mod card;
+pub mod crypto_exclusion;
 pub mod diagnostics;
 pub mod directory;
 pub mod discovery;
