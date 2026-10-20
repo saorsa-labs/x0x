@@ -3163,6 +3163,8 @@ CONNECT is the only command. The target is `<64-hex-agent-id>.x0x:port`. A peer 
 
 Owner connect-ACL entries may list an inclusive loopback port range. Pair and grant targets stay exact host:port. See [docs/connect-acl.md](connect-acl.md).
 
+In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact address or inclusive port range). Pair `ConnectAllowEntry.targets` stays `Vec<SocketAddr>`. David approved this break on 20 Oct 2026 at 18:50 BST. The public module is `x0x::socks`.
+
 ### `POST /forwards` request body
 
 ```json

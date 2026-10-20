@@ -62,7 +62,7 @@ targets = ["127.0.0.1:22"]
 It matches any **owner-trusted** requester: the agent presents a valid, unexpired `AgentCertificate` signed by this install's owner (`user.key`), its machine holds a current owner enrollment (`/sync/devices`, ADR-0041), and neither the agent, the machine nor their binding is revoked. A `Blocked` contact is never owner-trusted. An install with no owner key never matches an owner entry.
 
 - Owner trust **does not open connect by itself.** With no `principal = "owner"` entry, an owner-trusted peer is denied exactly as before. The shipped defaults contain no owner entry.
-- Owner entries may list an inclusive loopback port range (`127.0.0.1:8000-8999` or `[::1]:8000-8999`). Pair entries stay exact host:port. No CIDR.
+- Owner entries may list an inclusive loopback port range (`127.0.0.1:8000-8999` or `[::1]:8000-8999`). Pair entries stay exact host:port. No CIDR. In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact address or inclusive port range). Pair `ConnectAllowEntry.targets` stays `Vec<SocketAddr>`. David approved this break on 20 Oct 2026 at 18:50 BST.
 - An owner entry must not also set `agent_id` or `machine_id`; an entry with neither a principal nor both ids, or with any other principal value, is a load-time error.
 - Owner entries apply to the inbound stream gate and to attested `ForwardV2` forwards. The legacy `ForwardV1` path (`require_attestation = false`) matches exact pairs only.
 - Owner entries can be added at runtime; see [Managing the ACL at runtime](#managing-the-acl-at-runtime-adr-0070-3).
