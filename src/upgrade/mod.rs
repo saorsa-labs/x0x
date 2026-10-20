@@ -22,6 +22,9 @@ pub mod signature;
 pub(crate) mod staging;
 pub mod verification_probe;
 
+#[cfg(unix)]
+mod inventory_commands;
+
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
