@@ -136,6 +136,8 @@ pub(crate) enum PairStep {
     CandidateFileSync(PairRole),
     CandidateDirectorySync(PairRole),
     SwapDirectorySync(PairRole),
+    RestoreFileSync(PairRole),
+    RestoreCopyDirectorySync(PairRole),
     RestoreDirectorySync(PairRole),
     BeforeSwapProgress(PairRole),
     BeforeRollbackRecord,
@@ -227,6 +229,8 @@ struct RunOptions {
     #[cfg(test)]
     record_failure: Option<(PairPhase, journal::BarrierStep)>,
     #[cfg(test)]
+    archive_failure: Option<journal::BarrierStep>,
+    #[cfg(test)]
     observer: Option<Box<dyn Fn(PairStep)>>,
 }
 
@@ -306,6 +310,7 @@ fn test_options(options: &PairOptions) -> RunOptions {
         cli_first: options.cli_first,
         failures: options.fail_at.into_iter().collect(),
         record_failure: None,
+        archive_failure: None,
         observer: None,
     }
 }
@@ -344,6 +349,18 @@ pub(crate) fn execute_pair_with_observer(
 ) -> Result<PairOutcome, PairError> {
     let mut run = test_options(options);
     run.observer = Some(Box::new(observer));
+    execute_inner(request, caller_alive, &run)
+}
+
+#[cfg(test)]
+pub(crate) fn execute_pair_with_archive_failure(
+    request: &PairRequest,
+    caller_alive: &AtomicBool,
+    options: &PairOptions,
+    step: journal::BarrierStep,
+) -> Result<PairOutcome, PairError> {
+    let mut run = test_options(options);
+    run.archive_failure = Some(step);
     execute_inner(request, caller_alive, &run)
 }
 
@@ -398,7 +415,7 @@ fn execute_inner(
     verify_inputs(&record.plan.request)?;
     check_alive(caller_alive)?;
     if let Some(previous) = previous {
-        archive_record(&previous).map_err(unresolved)?;
+        archive_record(&previous, options).map_err(unresolved)?;
     }
     let pending_path = pair_pending_path(&record.plan.request.install).map_err(unresolved)?;
     let pending = PairPending {
@@ -640,6 +657,7 @@ fn make_record(
         staged_skill,
         previous_record: previous.map(archive_path).transpose()?,
     };
+    validate_protected_paths(&plan)?;
     let plan_sha256 = plan_digest(&plan)?;
     Ok(PairRecord {
         schema_version: 1,
@@ -653,6 +671,38 @@ fn make_record(
         daemon_progress: PairProgress::default(),
         cause: None,
     })
+}
+
+fn validate_protected_paths(plan: &PairPlan) -> io::Result<()> {
+    // The released startup sweep owns these marker names. Retained pair
+    // records and rollback copies must remain outside that namespace, even
+    // when an unusual install name or version contributes the marker.
+    for binary in std::iter::once(&plan.daemon).chain(plan.cli.iter()) {
+        for path in [
+            &binary.input.target,
+            &binary.backup,
+            &binary.candidate,
+            &binary.restore,
+        ] {
+            reject_cleanup_path(path)?;
+        }
+    }
+    for path in plan.staged_skill.iter().chain(plan.previous_record.iter()) {
+        reject_cleanup_path(path)?;
+    }
+    Ok(())
+}
+
+fn reject_cleanup_path(path: &Path) -> io::Result<()> {
+    if path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        name.starts_with(".x0x-upgrade-") || name.contains(".x0xold-")
+    }) {
+        return Err(invalid(
+            "protected pair artifact overlaps the legacy cleanup namespace",
+        ));
+    }
+    Ok(())
 }
 
 fn prepared_binary(
@@ -908,8 +958,8 @@ fn restore_one(record: &mut PairRecord, role: PairRole, options: &RunOptions) ->
             binary.input.previous_sha256,
             binary.previous_mode,
             MAX_BINARY_BYTES,
-            || Ok(()),
-            || Ok(()),
+            || options.before(PairStep::RestoreFileSync(role)),
+            || options.before(PairStep::RestoreCopyDirectorySync(role)),
         )?;
         std::fs::rename(&binary.restore, &binary.input.target)?;
         options.before(PairStep::AfterRestoreRename(role))?;
@@ -1060,16 +1110,43 @@ fn archive_path(record: &PairRecord) -> io::Result<PathBuf> {
     )
 }
 
-fn archive_record(record: &PairRecord) -> io::Result<()> {
+fn archive_record(record: &PairRecord, options: &RunOptions) -> io::Result<()> {
     let path = archive_path(record)?;
     let encoded = serde_json::to_vec_pretty(record).map_err(invalid)?;
     match journal::read_auxiliary_record(&path) {
-        Ok(existing) if existing == encoded => return Ok(()),
+        Ok(existing) if existing == encoded => {
+            // A prior rename can leave equal, readable bytes after its parent
+            // sync failed. Re-establish both barriers before allowing the
+            // current record to stop referencing this predecessor's backups.
+            let file = open_regular(&path, 1024 * 1024)?;
+            #[cfg(test)]
+            fail_archive_barrier(options, journal::BarrierStep::FileSync)?;
+            file.sync_all()?;
+            #[cfg(test)]
+            fail_archive_barrier(options, journal::BarrierStep::DirectorySync)?;
+            return sync_directory(parent(&path)?);
+        }
         Ok(_) => return Err(invalid("retained pair record already has different bytes")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    #[cfg(test)]
+    if let Some(step) = options.archive_failure {
+        return journal::write_auxiliary_record_with_failure(&path, record, validate_record, step);
+    }
+    let _ = options;
     journal::write_auxiliary_record(&path, record, validate_record)
+}
+
+#[cfg(test)]
+fn fail_archive_barrier(options: &RunOptions, step: journal::BarrierStep) -> io::Result<()> {
+    if options.archive_failure == Some(step) {
+        Err(io::Error::other(
+            "injected retained pair record barrier failure",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn verify_restored_record(record: &PairRecord, supplied: &PairRequest) -> Result<(), PairError> {
@@ -1125,6 +1202,7 @@ fn decode_record(bytes: &[u8]) -> io::Result<PairRecord> {
     }
     uuid::Uuid::parse_str(&record.transaction_id).map_err(invalid)?;
     validate_request_shape(&record.plan.request)?;
+    validate_protected_paths(&record.plan)?;
     if record.plan.request.install != record.plan.request.daemon.target
         || matches!(&record.plan.request.cli, CliInput::Managed(cli)
             if cli.target.parent() != record.plan.request.install.parent()
