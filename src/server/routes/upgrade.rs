@@ -1107,7 +1107,8 @@ pub(in crate::server) async fn run_fallback_github_poll(
         move || {
             let config = config.clone();
             async move {
-                let monitor = UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION)?
+                let monitor = UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION)
+                    .map_err(x0x::upgrade::UpgradeError::Other)?
                     .with_include_prereleases(config.include_prereleases);
                 monitor.check_for_updates().await
             }
