@@ -152,8 +152,16 @@ impl SocksService {
 
 impl Drop for SocksService {
     fn drop(&mut self) {
-        // Cancel only. Drop must not wait on the accept loop.
+        // Cancel in-flight handshakes and abort the accept loop so a dropped
+        // service releases the listen port. Drop must not wait.
         self.shutdown();
+        let slot = self
+            .accept_loop
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(handle) = slot.take() {
+            handle.abort();
+        }
     }
 }
 
