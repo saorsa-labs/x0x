@@ -2352,6 +2352,14 @@ impl SimSend {
         Ok(())
     }
 
+    /// Abort this direction without a FIN (QUIC reset semantics).
+    pub(crate) fn reset(&mut self) -> io::Result<()> {
+        let mut pipe = self.stream.pipe(self.dir);
+        pipe.reset = true;
+        pipe.wake();
+        Ok(())
+    }
+
     /// The lane carrying the other direction of this stream.
     fn reverse_lane(&self) -> LaneKey {
         LaneKey {
