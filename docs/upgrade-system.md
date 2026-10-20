@@ -45,6 +45,10 @@ minimum refuses apply and remains intact. Ordinary installs retain an
 explicit zero window. Only the compiled debug test key permits the fleet
 rehearsal exception.
 
+Selecting a newer eligible release requires a durable supersession record.
+An older waiter cannot then apply its release. The previous receipt remains
+intact; supersession does not delete it or reset the selected release's wait.
+
 This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
 complete host inventory and transaction-bound guide
 installation remain separate M2 work. It does not claim that every apply
