@@ -37,12 +37,28 @@
 //!   the base cannot build; with S3 the case still checks that J's
 //!   recovery acts on J only.
 //!
+//! Fork arms. Nodes A (creator, admin), X (promoted to admin) and M1
+//! (member), in an ordinary `private_secure` group with no owner axis, all
+//! at state revision r. Every write from X is dropped ([`OutboundHold`]);
+//! X renames (r+1′, on X only) and A renames (r+1). X still receives A's
+//! r+1, a sibling of its own head, so X installs a `no_anchor` marker.
+//! After X's resends end the hold is lifted. X's head is on no admin's
+//! chain: X is forked (ADR 0109 §3), while A and M1 share one chain and
+//! are unmarked. The case then advances [`ATTEST_ROUND`].
+//!
+//! - `s3_forked_node_shows_reseat_required` (§3 and §8, RED on the base).
+//!   Desired: X shows the typed wait `recovery.state = reseat_required`
+//!   with `cause = not_on_chain` (A answered its request), and stays
+//!   marked on its fork. The base ([`CAUSE_TYPED`]): X stays marked, and
+//!   `GET /groups/:id` on X has no `recovery` object.
+//!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
 
 #![cfg(test)]
 
 use super::control::{create_group, invite, join, members, mesh};
+use super::home::roster;
 use super::receipt::{Receipt, Verdict};
 use super::*;
 use anyhow::ensure;
@@ -67,6 +83,15 @@ const QUEUED_LOG: &str = "queued TreeKEM membership event pending catch-up/repla
 /// roster clock too (`update_named_group`), so, as in `case_818`, policy
 /// changes make the skew. Two would be enough; four keep a margin.
 const POLICY_CHANGES: [&str; 4] = ["admin_only", "members_only", "admin_only", "members_only"];
+const FORK_LABELS: &[&str] = &["A", "X", "M1"];
+/// PLACEHOLDER (ADR 0109 leaves it to measurement): the time a marked,
+/// forked node takes to reach its typed state. It covers the first
+/// `group_attest_request` and two retries at the §11 backoff (60 s, then
+/// 120 s), each with its answer.
+const ATTEST_ROUND: Duration = Duration::from_secs(240);
+const FINAL_TYPED: &str = "x_shows_reseat_required_not_on_chain_and_stays_contained";
+const CAUSE_TYPED: &str = "X stays marked on its fork, and GET /groups/:id on X has no \
+                           recovery object in the whole window";
 const FINAL_BYSTANDERS: &str =
     "a_and_m1_never_marked_m1_at_the_seal_no_revision_past_it_recovery_unchanged";
 
@@ -76,11 +101,17 @@ enum Arm {
     AlignedJoin,
     /// H-S3-d1 in part: S0 (skewed clocks); only the bystanders are judged.
     SkewBystanders,
+    /// §3 and §8: the forked node's typed state.
+    ForkTyped,
 }
 
 impl Arm {
     fn skew(self) -> bool {
         self == Self::SkewBystanders
+    }
+
+    fn fork(self) -> bool {
+        matches!(self, Self::ForkTyped)
     }
 }
 
@@ -158,6 +189,14 @@ struct Status {
 }
 
 impl Status {
+    fn recovery_state(&self) -> Option<&str> {
+        self.recovery["state"].as_str()
+    }
+
+    fn recovery_cause(&self) -> Option<&str> {
+        self.recovery["cause"].as_str()
+    }
+
     fn describe(&self) -> String {
         format!(
             "GET {} membership={:?} recovery={}",
@@ -551,16 +590,266 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     Ok(())
 }
 
+/// Drops every write from one node while held, and counts them. The node
+/// still receives.
+struct OutboundHold {
+    held: Arc<std::sync::atomic::AtomicBool>,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl OutboundHold {
+    fn install(sim: &Sim, node: &str) -> Result<Self> {
+        use crate::network::sim::Fault;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let machine = sim.peer(node)?.0;
+        let held = Arc::new(AtomicBool::new(true));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        sim.fabric().add_rule(move |write| {
+            if rule_held.load(Ordering::SeqCst) && write.lane.src == machine {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        sim.fabric()
+            .mark(format!("fault: every write from {node} withheld"));
+        Ok(Self { held, dropped })
+    }
+
+    fn release(&self, sim: &Sim, node: &str) {
+        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+        sim.fabric()
+            .mark(format!("fault: writes from {node} released"));
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn rename(sim: &Sim, label: &str, group: &str, name: &str) -> Result<()> {
+    let (code, body) = sim
+        .api(
+            label,
+            Method::PATCH,
+            &format!("/groups/{group}"),
+            Some(json!({"name": name})),
+        )
+        .await?;
+    ensure!(code.is_success(), "{label} renames: {code} {body}");
+    Ok(())
+}
+
+/// Fork arms: X forks off A's chain, then [`ATTEST_ROUND`].
+async fn fork_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
+    mesh(sim, FORK_LABELS).await?;
+    let group = create_group(sim, "A").await?;
+    for member in ["X", "M1"] {
+        seat(sim, "A", member, &group).await?;
+    }
+    let x_hex = sim.agent_hex("X")?;
+    let (code, promoted) = sim
+        .api(
+            "A",
+            Method::PATCH,
+            &format!("/groups/{group}/members/{x_hex}/role"),
+            Some(json!({"role": "admin"})),
+        )
+        .await?;
+    ensure!(code.is_success(), "A promotes X: {code} {promoted}");
+    sim.until("every node sees X as admin", SETUP, async |s: &Sim| {
+        for label in FORK_LABELS {
+            let admin = roster(s, label, &group).await.is_ok_and(|rows| {
+                rows.iter()
+                    .any(|(id, role)| id.eq_ignore_ascii_case(&x_hex) && role == "admin")
+            });
+            if !admin {
+                return false;
+            }
+        }
+        true
+    })
+    .await?;
+    settled(sim, &["X", "M1"], &group, "X and M1 hold A's revision").await?;
+    let base = view(sim, "A", &group).await?;
+
+    let hold = OutboundHold::install(sim, "X")?;
+    rename(sim, "X", &group, "w3h fork X").await?;
+    let fork_at = sim
+        .fabric()
+        .mark_indexed("case: A commits r+1 on the main chain");
+    rename(sim, "A", &group, "w3h main A").await?;
+    settled(sim, &["M1"], &group, "M1 holds A's r+1").await?;
+    sim.within("X's resends end", RESENDS_DONE + secs(2), async {
+        tokio::time::sleep(RESENDS_DONE).await;
+    })
+    .await?;
+    let dropped = hold.dropped();
+    hold.release(sim, "X");
+    let a0 = view(sim, "A", &group).await?;
+    let x0 = view(sim, "X", &group).await?;
+    let m10 = view(sim, "M1", &group).await?;
+    receipt.setup_done(at(sim));
+
+    receipt.evidence(
+        "group_is_ownerless",
+        !a0.owner_axis && !x0.owner_axis,
+        format!(
+            "A owner_axis={} X owner_axis={}",
+            a0.owner_axis, x0.owner_axis
+        ),
+        at(sim),
+    );
+    receipt.evidence(
+        "x_rename_withheld_from_every_peer",
+        dropped > 0,
+        format!("{dropped} writes from X dropped while held"),
+        at(sim),
+    );
+    receipt.evidence(
+        "x_forked_off_a_chain_at_r_plus_1",
+        a0.state_revision == base.state_revision + 1
+            && x0.state_revision == a0.state_revision
+            && x0.state_hash != a0.state_hash,
+        format!(
+            "base {}; A {}; X {}",
+            base.state_revision,
+            a0.describe(),
+            x0.describe()
+        ),
+        at(sim),
+    );
+    receipt.evidence(
+        "x_contained_by_a_marker",
+        x0.marker.is_some(),
+        format!("X {}", x0.describe()),
+        at(sim),
+    );
+    receipt.evidence(
+        "a_and_m1_on_one_chain_unmarked",
+        a0.marker.is_none() && m10.marker.is_none() && m10.state_hash == a0.state_hash,
+        format!("A {}; M1 {}", a0.describe(), m10.describe()),
+        at(sim),
+    );
+    let to_x = delivered_after(sim, "A", "X", fork_at)?;
+    receipt.request_delivered(
+        "a_commit_reached_x",
+        to_x > 0,
+        format!("frames A->X since A's r+1: {to_x}"),
+        at(sim),
+    );
+
+    let mut others_marked: Option<String> = None;
+    let mut x_recovered: Option<String> = None;
+    let mut x_recovery_seen: Option<String> = None;
+    let mut seen = Observations::default();
+    let waited = sim
+        .until("X's attestation round", ATTEST_ROUND, async |s: &Sim| {
+            let Some(a) = seen.observe(view_now(s, "A", &group)).await else {
+                return true;
+            };
+            let Some(x) = seen.observe(view_now(s, "X", &group)).await else {
+                return true;
+            };
+            let Some(m1) = seen.observe(view_now(s, "M1", &group)).await else {
+                return true;
+            };
+            let Some(x_status) = seen.observe(status_now(s, "X", &group)).await else {
+                return true;
+            };
+            let now = s.fabric().now().as_micros();
+            for (label, node) in [("A", &a), ("M1", &m1)] {
+                if node.marker.is_some() || node.state_hash != a0.state_hash {
+                    others_marked
+                        .get_or_insert_with(|| format!("at {now} us: {label} {}", node.describe()));
+                }
+            }
+            if x.marker.is_none() || x.state_hash == a.state_hash {
+                x_recovered.get_or_insert_with(|| format!("at {now} us: X {}", x.describe()));
+            }
+            if let Some(x_status) = x_status.filter(|st| !st.recovery.is_null()) {
+                x_recovery_seen
+                    .get_or_insert_with(|| format!("at {now} us: X {}", x_status.describe()));
+            }
+            // Every fork arm judges the whole window.
+            false
+        })
+        .await;
+    if let Err(error) = waited {
+        if !expired(&error) {
+            return Err(error);
+        }
+    }
+    seen.verify("X's attestation round")?;
+    let a1 = view(sim, "A", &group).await?;
+    let x1 = view(sim, "X", &group).await?;
+    let m11 = view(sim, "M1", &group).await?;
+    let x_status = status(sim, "X", &group).await?;
+    let x_status_text = x_status
+        .as_ref()
+        .map_or_else(|| "404".to_string(), Status::describe);
+    receipt.evidence(
+        "a_and_m1_unchanged_in_the_window",
+        others_marked.is_none()
+            && a1.state_hash == a0.state_hash
+            && m11.state_hash == a0.state_hash,
+        format!(
+            "first change: {others_marked:?}; A {}; M1 {}",
+            a1.describe(),
+            m11.describe()
+        ),
+        at(sim),
+    );
+    receipt.note(format!(
+        "arm={arm:?} after the window: X {x_status_text}; X {}; X recovered: {x_recovered:?}; \
+         X recovery first seen: {x_recovery_seen:?}",
+        x1.describe()
+    ));
+    let contained = x1.marker.is_some() && x_recovered.is_none();
+    let (final_name, passed) = match arm {
+        Arm::ForkTyped => {
+            let typed = x_status.as_ref().is_some_and(|st| {
+                st.recovery_state() == Some("reseat_required")
+                    && st.recovery_cause() == Some("not_on_chain")
+            });
+            let passed = typed && contained;
+            if !passed {
+                receipt.cause(
+                    CAUSE_TYPED,
+                    Some(format!(
+                        "X recovery first seen: {x_recovery_seen:?}; at the end X {x_status_text}, \
+                         X {}",
+                        x1.describe()
+                    )),
+                    contained && x_recovery_seen.is_none(),
+                    at(sim),
+                );
+            }
+            (FINAL_TYPED, passed)
+        }
+        Arm::AlignedJoin | Arm::SkewBystanders => bail!("INFRA: {arm:?} is not a fork arm"),
+    };
+    receipt.finish(final_name, passed, at(sim));
+    Ok(())
+}
+
 async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note("ADR 0109 S3 (#1356); the harness cannot inject DMs, so no ATA is forged.");
     let (labels, final_name) = match arm {
         Arm::AlignedJoin => (JOIN_LABELS, FINAL_JOIN),
         Arm::SkewBystanders => (JOIN_LABELS, FINAL_BYSTANDERS),
+        Arm::ForkTyped => (FORK_LABELS, FINAL_TYPED),
     };
     match Sim::start(case, seed, labels).await {
         Ok(mut sim) => {
-            let outcome = join_scenario(&mut sim, arm, &mut receipt).await;
+            let outcome = if arm.fork() {
+                fork_scenario(&mut sim, arm, &mut receipt).await
+            } else {
+                join_scenario(&mut sim, arm, &mut receipt).await
+            };
             if let Err(error) = outcome {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
             }
@@ -615,6 +904,22 @@ async fn w3h_1356_control_s3_attestation_touches_only_the_subject() -> Result<()
         0x1356_0002,
         Arm::SkewBystanders,
         Verdict::Green,
+    )
+    .await
+}
+
+/// ADR 0109 §3 and §8: a forked node shows `reseat_required {not_on_chain}`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1356_red_s3_forked_node_shows_reseat_required() -> Result<()> {
+    expect(
+        "w3h_1356_red_s3_forked_node_shows_reseat_required",
+        0x1356_0003,
+        Arm::ForkTyped,
+        Verdict::Red,
     )
     .await
 }
