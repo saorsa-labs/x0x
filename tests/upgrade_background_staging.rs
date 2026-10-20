@@ -379,6 +379,7 @@ macro_rules! background_driver_regression_tests {
                 timestamp: u64,
                 _readback: restart::systemd_readback_seam::Guard,
                 _apply: crate::upgrade::apply::apply_attempt_seam::Guard,
+                _current_path: crate::upgrade::apply::current_binary_path_seam::Guard,
                 _root: tempfile::TempDir,
             }
 
@@ -396,6 +397,9 @@ macro_rules! background_driver_regression_tests {
                     let data = data.canonicalize().unwrap();
                     let identity = identity.canonicalize().unwrap();
                     let (mut startup, shutdown) = e2e_startup_runtime(&data);
+                    let current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                        data.join("x0xd"),
+                    );
                     startup.staging.identity_root = identity.clone();
                     let install = startup.staging.install.clone();
                     std::fs::write(data.join("SKILL.md"), b"original guide").unwrap();
@@ -436,7 +440,7 @@ macro_rules! background_driver_regression_tests {
                         processed, observed, operations, applied, attempts, apply_lock,
                         install, data, identity, window,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                        _readback: readback, _apply: apply, _root: root }
+                        _readback: readback, _apply: apply, _current_path: current_path, _root: root }
                 }
 
                 fn release(&self, version: &str) -> crate::upgrade::monitor::VerifiedRelease {
