@@ -1815,6 +1815,11 @@ mod tests {
         "/tests/upgrade_http_staging.rs"
     ));
     http_staging_regression_tests!();
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_http_readback.rs"
+    ));
+    http_readback_regression_tests!();
     #[cfg(unix)]
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
