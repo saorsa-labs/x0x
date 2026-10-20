@@ -196,6 +196,9 @@ macro_rules! fleet_startup_regression_tests {
             let dir = tempfile::Builder::new().prefix("fleet-startup-").tempdir_in(evidence).unwrap();
             let root = dir.path().canonicalize().unwrap();
             let (mut runtime, _shutdown) = e2e_startup_runtime(&root);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                root.join("x0xd"),
+            );
             runtime.staging.machine_id = [42; 32];
             let install = runtime.staging.install.clone();
             let original = std::fs::read(&install).unwrap();
@@ -303,6 +306,9 @@ macro_rules! fleet_startup_regression_tests {
             let dir = tempfile::Builder::new().prefix("fleet-retained-").tempdir_in(evidence).unwrap();
             let root = dir.path().canonicalize().unwrap();
             let (mut runtime, _shutdown) = e2e_startup_runtime(&root);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                root.join("x0xd"),
+            );
             let install = runtime.staging.install.clone();
             let original = std::fs::read(&install).unwrap();
             let apply_lock = Arc::clone(&runtime.upgrade_apply_lock);
