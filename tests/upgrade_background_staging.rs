@@ -328,6 +328,8 @@ macro_rules! background_permit_regression_tests {
                     assert_eq!(std::fs::read(&daemon).unwrap(), b"new-daemon");
                     assert_eq!(std::fs::read(&cli).unwrap(), b"new-cli");
                     assert_eq!(std::fs::read(&marker).unwrap(), b"restart owned");
+                    assert_eq!(std::fs::read(daemon.with_extension("backup")).unwrap(), b"old-daemon");
+                    assert_eq!(std::fs::read(cli.with_extension("backup")).unwrap(), b"old-cli");
                 } else {
                     assert!(result.is_err(), "{result:?}");
                     assert_eq!(std::fs::read(&daemon).unwrap(), b"old-daemon");
