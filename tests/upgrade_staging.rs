@@ -347,7 +347,7 @@ macro_rules! staging_runtime_regression_tests {
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 {
                     let upgrader = crate::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-                        .with_restart_context(crate::upgrade::restart::RestartContext {
+                        .with_restart_context(crate::upgrade::apply::RestartContext {
                             data_dir: Some(request.data_root.clone()),
                             api_addr: None,
                             shutdown: None,
@@ -542,7 +542,9 @@ macro_rules! staging_runtime_regression_tests {
                     &request.install,
                     Some(&request.data_root),
                     None,
-                    &crate::upgrade::restart::LaunchdPolicyReadback::NotApplicable,
+                    &crate::upgrade::restart::LaunchdPolicyReadback::Unavailable {
+                        detail: "owned unsupervised fixture".into(),
+                    },
                     &crate::upgrade::restart::SystemdPolicyReadback::NotApplicable,
                 ).unwrap();
                 let gate = Gate {
