@@ -1269,6 +1269,20 @@ fn kill_and_reap(child: &mut Child) -> io::Result<()> {
     } else {
         Some(io::Error::last_os_error())
     };
+    #[cfg(target_os = "macos")]
+    let group_error = match group_error {
+        // Darwin can report EPERM for a group containing only zombies. Keep
+        // the leader's PID reserved and prove that every member has exited;
+        // EPERM alone must never hide a live descendant or a permission fault.
+        Some(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            match group_has_only_exited_members(pid) {
+                Ok(true) => None,
+                Ok(false) => Some(error),
+                Err(query_error) => Some(query_error),
+            }
+        }
+        other => other,
+    };
     if group_error.is_some() && !exited {
         // A candidate may have left its original group. Its direct PID is
         // still reserved, so killing that child cannot hit a reused PID.
@@ -1290,6 +1304,72 @@ fn kill_and_reap(child: &mut Child) -> io::Result<()> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn group_has_only_exited_members(group: i32) -> io::Result<bool> {
+    if group <= 0 {
+        return Err(invalid("invalid probe process group"));
+    }
+    let members = group_members(group)?;
+    if !members.contains(&group) {
+        return Ok(false);
+    }
+    for &pid in &members {
+        // SAFETY: zero initializes the owned output buffer. The nonzero arg
+        // asks libproc to include zombies, which still reserve their PIDs.
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let size = i32::try_from(std::mem::size_of_val(&info)).map_err(invalid)?;
+        let received = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                1,
+                (&mut info as *mut libc::proc_bsdshortinfo).cast(),
+                size,
+            )
+        };
+        if received == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if received != size {
+            return Err(invalid("incomplete probe process-group member status"));
+        }
+        if info.pbsi_pid != pid as u32
+            || info.pbsi_pgid != group as u32
+            || info.pbsi_status != libc::SZOMB
+        {
+            return Ok(false);
+        }
+    }
+    // A member could have forked between the first snapshot and its exit.
+    // Require the same complete membership after observing all entries as
+    // zombies; an added, vanished or reused identity is not cleanup proof.
+    Ok(group_members(group)? == members)
+}
+
+#[cfg(target_os = "macos")]
+fn group_members(group: i32) -> io::Result<Vec<i32>> {
+    // Bound both allocation and inspection work. A full buffer might omit a
+    // live member, so it must refuse rather than treating the list as complete.
+    let mut members = vec![0_i32; 1024];
+    let size = i32::try_from(std::mem::size_of_val(members.as_slice())).map_err(invalid)?;
+    // SAFETY: libproc receives a writable, correctly sized PID array. The
+    // group leader remains unreaped until this entire check completes.
+    let received = unsafe { libc::proc_listpgrppids(group, members.as_mut_ptr().cast(), size) };
+    if received <= 0 {
+        return Err(invalid("probe process-group membership unavailable"));
+    }
+    let count = usize::try_from(received).map_err(invalid)?;
+    if count >= members.len() {
+        return Err(invalid("probe process-group membership exceeds limit"));
+    }
+    members.truncate(count);
+    if members.iter().any(|pid| *pid <= 0) {
+        return Err(invalid("invalid probe process-group member"));
+    }
+    members.sort_unstable();
+    Ok(members)
 }
 
 #[cfg(target_os = "linux")]
