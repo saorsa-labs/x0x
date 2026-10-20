@@ -13,7 +13,12 @@
 //! certified by A's owner key and seated through `POST /home/seat`. Before
 //! t = 0 the group is settled (every node at A's state revision and TreeKEM
 //! epoch e0, with `n` leaves) and a data-plane check passes (A encrypts; B
-//! and C decrypt).
+//! and C decrypt). Then the case waits the restart sync wait
+//! (`S4Timing::restart_sync_wait`, ADR 0110 §2) from the end of setup.
+//! Every node started before setup ended, so at t = 0 every node is past
+//! its own sync wait from process start, and H measures the S4 path, not
+//! the boot gate. The restart arm still restarts A after t = 0 and
+//! measures its bound from that restart.
 //!
 //! Healthy exit H (ADR 0110 Validation): every survivor lists B as not
 //! active and holds one TreeKEM epoch above e0 with `n - 1` leaves and no
@@ -75,15 +80,23 @@
 //!   within [`Bound::Fallback`]. `main` rekeys at once
 //!   ([`CAUSE_MANUAL`]).
 //! - `s4_designated_late_observation` (RED on `main`, GREEN with S4). Nodes A, D, E, B,
-//!   C with A < D < E. A stays reachable, but revocation-topic gossip
-//!   toward A is dropped until t = W/2, so D, E and C observe at t = 0 and
-//!   A only late (direct messages, the S4 hand-off, still reach A). B
-//!   revokes its own agent at t = 0. Desired (the ADR row): A, reachable,
-//!   acts on D's and E's hand-off and reaches H within the completion
-//!   bound from t = 0 ([`Bound::Completion`]); A signs the exclusion on
-//!   every survivor and no sibling does ([`CAUSE_SIBLING_SIGNED`]). The
-//!   receipt notes each admin's persisted hand-off times. `main` never
-//!   acts ([`CAUSE_LATE`]).
+//!   C with A < D < E. A stays reachable (its membership and plane-hello
+//!   lanes pass), but every other frame toward A (pubsub, so the
+//!   revocation gossip; direct and relayed DMs, so the S4 hand-off; bulk)
+//!   is held and delivered at the release point R = t0 + W/2, in lane
+//!   order (the ADR row's "original gossip reaches A only at t=W/2",
+//!   with the hand-off held too). B revokes its own agent at t = 0, so D,
+//!   E and C observe at t = 0 and A only at R. Two precondition stages:
+//!   just before R, A holds no revocation record for B and has no S4 row
+//!   for B; and A's persisted T_obs (`.evs`) is at or after R. Desired
+//!   (the ADR row "automatic healthy exclusion", with "no early D/E
+//!   sibling" as the safety rule): as A observes before W, A signs the
+//!   exclusion on every survivor and H is within the completion bound
+//!   from A's own T_obs; a sibling signer is [`CAUSE_SIBLING_SIGNED`]. If
+//!   A's T_obs is W or later, D's ranked fallback may sign instead, and H
+//!   must be within [`Bound::Fallback`] from t = 0. The receipt notes each
+//!   admin's persisted hand-off times. `main` never acts
+//!   ([`CAUSE_LATE`]).
 //! - `s4_designated_late_observation`, stalled A (RED on `main`, GREEN
 //!   with S4). As
 //!   above, but A is off the fabric for the whole run; D, the next rank,
@@ -210,6 +223,10 @@ const CAUSE_STALLED: &str = "no ranked fallback on main: with the designated adm
 const CAUSE_SIBLING_SIGNED: &str = "survivors reached H, but the head commit is not signed by \
                                     the designated admin A: a sibling (D or E) signed the \
                                     exclusion while A was reachable";
+const CAUSE_LATE_OVER_BOUND: &str = "survivors reached H with the expected signer, but later \
+                                     than the bound: A's T_obs + the completion bound (A \
+                                     observed before W), or W + \u{394} + the bound from t = 0 \
+                                     (A observed at W or later)";
 const CAUSE_EARLY_SIBLING: &str =
     "a non-designated admin rekeyed before W/2 while the designated admin A was held";
 const CAUSE_MANUAL: &str = "non-designated manual remove rekeys at once on main: D's remove of B \
@@ -261,9 +278,10 @@ enum Hold {
     Reachable,
     /// A is off the fabric from before t = 0 to the end.
     Offline,
-    /// A stays reachable, but revocation-topic gossip toward A is dropped
-    /// until t = W/2: A observes late (direct messages still pass).
-    RevocationGossipUntilHalfW,
+    /// A stays reachable, but every frame toward A other than membership
+    /// and plane-hello is held until t = W/2 and then delivered in lane
+    /// order: A observes late, by gossip and by hand-off alike.
+    AllPathsUntilHalfW,
 }
 
 /// The desired-behaviour assertion.
@@ -375,18 +393,23 @@ const MANUAL_WITHOUT_OBLIGATION: Arm = Arm {
     ..MANUAL_DURING_WINDOW
 };
 
-/// ADR 0110 `s4_designated_late_observation`: D and E hand the evidence to
-/// A (`EvictionHandoffV1`, which every node advertises), so A, reachable,
-/// reaches H within the completion bound from t = 0 and no sibling (D or
-/// E) signs the exclusion. PR #1508 run 39483631672: H at 11.1–13.1 s
-/// over 15 iterations, set by A's restart sync wait from process start
-/// (D73), never at D's fallback (W + 100 ms).
+/// ADR 0110 `s4_designated_late_observation`: every path toward A is held
+/// until t = W/2, so A's T_obs is at or after W/2. A, reachable and
+/// designated, must sign the exclusion and reach H within the completion
+/// bound from its own T_obs; no sibling (D or E) may sign while A observed
+/// before W. The wait budget is [`Bound::Fallback`] so that the "A's T_obs
+/// is W or later" path (D's ranked fallback) can also be judged; the
+/// tighter A-path bound is checked from A's persisted T_obs. Earlier runs
+/// (PR #1508 run 39483631672) held only the revocation gossip; A then
+/// observed by hand-off 6–265 ms after t = 0, and H (11.1–13.1 s) was set
+/// by A's restart sync wait from process start, which the case now waits
+/// out before t = 0.
 const LATE_OBSERVATION: Arm = Arm {
     survivors: &["A", "D", "E", "C"],
-    hold: Hold::RevocationGossipUntilHalfW,
+    hold: Hold::AllPathsUntilHalfW,
     manual: false,
     check: Check::Healthy,
-    bound: Bound::Completion,
+    bound: Bound::Fallback,
     committer: Some("A"),
     cause: CAUSE_LATE,
     ..MANUAL_DURING_WINDOW
@@ -871,53 +894,108 @@ async fn connected_to(sim: &Sim, label: &str, other: &str) -> bool {
     }
 }
 
-/// Drops pubsub frames on the revocation topics toward one node while
-/// held, and counts them. Direct messages (an S4 hand-off) still pass.
-struct RevocationGossipBlock {
-    held: Arc<std::sync::atomic::AtomicBool>,
-    dropped: Arc<std::sync::atomic::AtomicUsize>,
+/// Holds every frame toward one node, except its membership and
+/// plane-hello lanes (so its links and liveness stay up), until a fixed
+/// virtual release point, then delivers the frames there in lane order
+/// (the fabric keeps each lane FIFO). Pubsub (the revocation gossip),
+/// direct and relayed DMs (the S4 hand-off) and bulk are all held. The
+/// fabric cannot delay stream lanes; stream writes toward the node pass
+/// and are counted, and the case's pre-release read shows whether anything
+/// reached the node early.
+struct LateHold {
+    release: Duration,
+    /// Frames held, per lane class (`Debug` name).
+    held: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    /// Stream writes toward the node while held (not delayable).
+    streams: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl RevocationGossipBlock {
-    fn install(sim: &Sim, target: &str) -> Result<Self> {
+impl LateHold {
+    fn install(sim: &Sim, target: &str, release: Duration) -> Result<Self> {
         use crate::network::sim::{Fault, LaneClass};
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        const MARKER: &[u8] = b"x0x.revocation.";
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let machine = sim.peer(target)?.0;
-        let held = Arc::new(AtomicBool::new(true));
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        let held = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let streams = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_streams) = (Arc::clone(&held), Arc::clone(&streams));
         sim.fabric().add_rule(move |write| {
-            let on_topic = write.lane.class == LaneClass::PubSub
-                && write
-                    .bytes
-                    .windows(MARKER.len())
-                    .any(|window| window == MARKER);
-            if rule_held.load(Ordering::SeqCst) && write.lane.dst == machine && on_topic {
-                rule_dropped.fetch_add(1, Ordering::SeqCst);
-                Fault::Drop
-            } else {
-                Fault::Pass
+            if write.lane.dst != machine || write.at >= release {
+                return Fault::Pass;
+            }
+            match write.lane.class {
+                LaneClass::Membership | LaneClass::PlaneHello => Fault::Pass,
+                LaneClass::Stream(_) => {
+                    rule_streams.fetch_add(1, Ordering::SeqCst);
+                    Fault::Pass
+                }
+                class => {
+                    if let Ok(mut counts) = rule_held.lock() {
+                        *counts.entry(format!("{class:?}")).or_insert(0) += 1;
+                    }
+                    Fault::Delay(release.saturating_sub(write.at))
+                }
             }
         });
-        sim.fabric()
-            .mark(format!("fault: revocation gossip toward {target} withheld"));
-        Ok(Self { held, dropped })
+        sim.fabric().mark(format!(
+            "fault: every non-membership frame toward {target} held until {} us",
+            release.as_micros()
+        ));
+        Ok(Self {
+            release,
+            held,
+            streams,
+        })
     }
 
-    fn held(&self) -> bool {
-        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    /// Total frames held.
+    fn total(&self) -> usize {
+        self.held
+            .lock()
+            .map_or(0, |counts| counts.values().copied().sum())
     }
 
-    fn release(&self, sim: &Sim) {
-        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
-        sim.fabric()
-            .mark("fault: revocation gossip withholding released at W/2");
+    fn describe(&self) -> String {
+        let counts = self
+            .held
+            .lock()
+            .map_or_else(|_| "poisoned".to_string(), |counts| format!("{counts:?}"));
+        format!(
+            "held until {} us: {counts}; stream writes passed (not delayable): {}",
+            self.release.as_micros(),
+            self.streams.load(std::sync::atomic::Ordering::SeqCst)
+        )
     }
+}
 
-    fn dropped(&self) -> usize {
-        self.dropped.load(std::sync::atomic::Ordering::SeqCst)
-    }
+/// `label`'s persisted S4 row for `target` (the `.evs` sidecar): its first
+/// observation (T_obs), in wall-clock Unix ms. Under W3-H the wall clock
+/// is a fixed base plus virtual time (the shim, #1245). `None` when the
+/// sidecar has no row for `target`.
+fn persisted_t_obs(sim: &Sim, label: &str, target: &[u8; 32]) -> Result<Option<u64>> {
+    use crate::groups::eviction::{decode_evs, EVS_FILE_NAME};
+    let path = sim.state(label)?.data_dir.join(EVS_FILE_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let body = decode_evs(&bytes).map_err(|error| anyhow::anyhow!("{label} .evs: {error:?}"))?;
+    Ok(body
+        .rows
+        .iter()
+        .find(|row| &row.target == target)
+        .map(|row| row.observed_at_unix_ms))
+}
+
+/// Whether `label`'s public S4 status for `group` has a row for `target`.
+async fn has_s4_row(sim: &Sim, label: &str, group: &str, target_hex: &str) -> Result<bool> {
+    let status = eviction_status(sim, label, group).await?;
+    Ok(status["revocation_evictions"]
+        .as_array()
+        .is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row["target"].as_str() == Some(target_hex))
+        }))
 }
 
 /// The final reply to a request sent through [`retrying`], with each
@@ -1216,8 +1294,38 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         ));
     }
 
-    let gossip_block = (arm.hold == Hold::RevocationGossipUntilHalfW)
-        .then(|| RevocationGossipBlock::install(sim, "A"))
+    // ADR 0110 §2: no S4 seal before a node's restart sync wait from
+    // process start has passed (D73). Every node started before setup
+    // ended, so waiting that long from here puts t = 0 after every node's
+    // sync wait, and H measures the S4 behaviour, not the boot gate.
+    let setup_end = sim.fabric().now();
+    let sync_wait = timing().restart_sync_wait;
+    sim.within(
+        "every node's restart sync wait",
+        sync_wait + secs(2),
+        async {
+            tokio::time::sleep(sync_wait).await;
+        },
+    )
+    .await?;
+    let t0 = sim.fabric().now();
+    receipt.evidence(
+        "every_node_past_its_restart_sync_wait_at_t0",
+        t0.saturating_sub(setup_end) >= sync_wait,
+        format!(
+            "setup ended at {} us (every node started before it); restart sync wait {:?}; \
+             t0 at {} us",
+            setup_end.as_micros(),
+            sync_wait,
+            t0.as_micros()
+        ),
+        at(sim),
+    );
+
+    // The late-observation hold: every path toward A is held until R.
+    let release = t0.saturating_add(timing().designated_window / 2);
+    let late_hold = (arm.hold == Hold::AllPathsUntilHalfW)
+        .then(|| LateHold::install(sim, "A", release))
         .transpose()?;
 
     // t = 0.
@@ -1282,6 +1390,48 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
     if arm.trigger.revokes() {
         await_holders(sim, arm.holders, &b_hex).await?;
+    }
+
+    // Precondition of the late arm, read just before the release point:
+    // A holds no revocation record for B and has no S4 row for B, so its
+    // T_obs is not before R (a row, once created, stays).
+    if let Some(hold) = &late_hold {
+        let read_at = hold.release.saturating_sub(Duration::from_millis(50));
+        let left = read_at.saturating_sub(sim.fabric().now());
+        sim.within(
+            "wait to just before the release point",
+            left + secs(2),
+            async {
+                tokio::time::sleep(left).await;
+            },
+        )
+        .await?;
+        let read = sim.fabric().now();
+        let holds = sim
+            .at_instant(
+                "read A's revocations before the release",
+                holds_revocation(sim, "A", &b_hex),
+            )
+            .await??;
+        let row = sim
+            .at_instant(
+                "read A's S4 status before the release",
+                has_s4_row(sim, "A", &group, &b_hex),
+            )
+            .await??;
+        let persisted = persisted_t_obs(sim, "A", b.as_bytes())?;
+        receipt.evidence(
+            "a_has_not_observed_b_revocation_before_the_release_point",
+            hold.total() > 0 && !holds && !row && persisted.is_none(),
+            format!(
+                "read at {} us (release {} us): A holds B's revocation {holds}, A has an S4 row \
+                 for B {row}, A's .evs T_obs {persisted:?}; {}",
+                read.as_micros(),
+                hold.release.as_micros(),
+                hold.describe()
+            ),
+            at(sim),
+        );
     }
 
     // Crash A after durable intake, restart it, then a duplicate trigger.
@@ -1362,28 +1512,24 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .duration(&timing)
         .saturating_sub(sim.fabric().now().saturating_sub(started));
     let mut reached: Option<String> = None;
+    let mut reached_after: Option<Duration> = None;
     let mut seen = Observations::default();
     let waited = sim
         .until("the survivors reach H", bound, async |s: &Sim| {
-            if let Some(block) = &gossip_block {
-                if block.held()
-                    && s.fabric().now().saturating_sub(started) >= timing.designated_window / 2
-                {
-                    block.release(s);
-                }
-            }
             let Some(now) = seen.observe(views_now(s, survivors, &group, &b)).await else {
                 return true;
             };
             let done = excluded(&now, e0, leaves0);
             if done {
                 let elapsed = s.fabric().now().saturating_sub(started);
+                reached_after.get_or_insert(elapsed);
                 reached.get_or_insert_with(|| {
                     format!(
-                        "at {} us after t=0 (within the completion bound {:?}: {})",
+                        "at {} us after t=0 (arm bound {:?} = {:?}: {})",
                         elapsed.as_micros(),
-                        timing.completion_bound,
-                        elapsed <= timing.completion_bound
+                        arm.bound,
+                        arm.bound.duration(&timing),
+                        elapsed <= arm.bound.duration(&timing)
                     )
                 });
             }
@@ -1396,18 +1542,23 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         }
     }
     seen.verify("the survivors reach H")?;
-    if let Some(block) = &gossip_block {
-        if block.held() {
-            block.release(sim);
-        }
-        // The late-observation fault fired: A's revocation gossip was
-        // withheld, so a RED verdict is not "A observed on time".
+    // The late arm: A's persisted T_obs, in ms after t = 0, and the
+    // second precondition stage (A's T_obs is at or after R).
+    let mut late_t_obs: Option<Duration> = None;
+    if let Some(hold) = &late_hold {
+        let persisted = persisted_t_obs(sim, "A", b.as_bytes())?;
+        late_t_obs = persisted.map(|ms| Duration::from_millis(ms.saturating_sub(zero_ms)));
+        let release_after = hold.release.saturating_sub(started);
         receipt.evidence(
-            "revocation_gossip_toward_a_withheld_until_half_w",
-            block.dropped() > 0,
+            "a_t_obs_at_or_after_the_release_point",
+            // Wall-clock ms are floored; allow that 1 ms rounding.
+            late_t_obs.is_some_and(|t_obs| t_obs + Duration::from_millis(1) >= release_after),
             format!(
-                "revocation-topic frames toward A dropped: {}",
-                block.dropped()
+                "A's .evs T_obs for B {:?} after t=0 (raw {persisted:?}, t=0 wall {zero_ms}); \
+                 release point {:?} after t=0; {}",
+                late_t_obs,
+                release_after,
+                hold.describe()
             ),
             at(sim),
         );
@@ -1443,23 +1594,56 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         body.contains("waiting_for_designated_admin") && body.to_ascii_lowercase().contains(&a_hex)
     });
     let early_unmoved = all_at(&early, e0);
-    let committed_by = match arm.committer {
-        Some(label) => {
-            let want = sim.agent_hex(label)?;
-            let signed = end.iter().all(|(_, seen)| {
-                seen.as_ref()
-                    .is_some_and(|seen| seen.head_committed_by.as_deref() == Some(want.as_str()))
-            });
+    let signed_by = |label: &str| -> Result<bool> {
+        let want = sim.agent_hex(label)?;
+        Ok(end.iter().all(|(_, seen)| {
+            seen.as_ref()
+                .is_some_and(|seen| seen.head_committed_by.as_deref() == Some(want.as_str()))
+        }))
+    };
+    // The late arm follows the ADR row from A's own T_obs: A observed
+    // before W, so A must sign and H must be within A's T_obs + the
+    // completion bound; A observed at W or later, so D's ranked fallback
+    // may sign instead, within the arm's bound from t = 0.
+    let mut in_bound = true;
+    let committed_by = match (&late_hold, late_t_obs) {
+        (Some(_), Some(t_obs)) if t_obs < timing.designated_window => {
+            let signed = signed_by("A")?;
+            let deadline = t_obs.saturating_add(timing.completion_bound);
+            in_bound = reached_after.is_some_and(|after| after <= deadline);
             receipt.note(format!(
-                "exclusion signer: want {label} ({want}) on every survivor: {signed}"
+                "late arm: A's T_obs {t_obs:?} after t=0 is before W {:?}: want A to sign on every                  survivor ({signed}) and H by T_obs + the completion bound = {deadline:?}                  (H at {reached_after:?}: {in_bound})",
+                timing.designated_window
             ));
             signed
         }
-        None => true,
+        (Some(_), t_obs) => {
+            let (by_a, by_d) = (signed_by("A")?, signed_by("D")?);
+            let deadline = arm.bound.duration(&timing);
+            in_bound = reached_after.is_some_and(|after| after <= deadline);
+            receipt.note(format!(
+                "late arm: A's T_obs {t_obs:?} after t=0 is not before W {:?}: want A ({by_a}) or                  D, the ranked fallback ({by_d}), to sign on every survivor, and H by {deadline:?}                  (H at {reached_after:?}: {in_bound})",
+                timing.designated_window
+            ));
+            by_a || by_d
+        }
+        (None, _) => match arm.committer {
+            Some(label) => {
+                let signed = signed_by(label)?;
+                receipt.note(format!(
+                    "exclusion signer: want {label} ({}) on every survivor: {signed}",
+                    sim.agent_hex(label)?
+                ));
+                signed
+            }
+            None => true,
+        },
     };
     let passed = match arm.check {
         Check::ManualQueued => queued_typed && early_unmoved && h && data_plane,
-        Check::Healthy | Check::NoEarlySibling => h && data_plane && stays_removed && committed_by,
+        Check::Healthy | Check::NoEarlySibling => {
+            h && data_plane && stays_removed && committed_by && in_bound
+        }
     };
     receipt.note(format!(
         "S4 status at the end: {}",
@@ -1473,10 +1657,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
     receipt.note(format!(
         "arm={arm:?} e0={e0} leaves0={leaves0}; H {}; manual={manual:?}; \
-         duplicate={duplicate:?}; gossip to A withheld={:?}; early: {}; end: {}; \
+         duplicate={duplicate:?}; late hold toward A: {:?}; early: {}; end: {}; \
          after: {}; {}",
         reached.as_deref().unwrap_or("never reached"),
-        gossip_block.as_ref().map(RevocationGossipBlock::dropped),
+        late_hold.as_ref().map(LateHold::describe),
         describe_all(&early),
         describe_all(&end),
         c_after.1,
@@ -1558,6 +1742,14 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             Check::Healthy | Check::NoEarlySibling if h && !committed_by => {
                 (CAUSE_SIBLING_SIGNED, true, describe_all(&end))
             }
+            Check::Healthy | Check::NoEarlySibling if h && !in_bound => (
+                CAUSE_LATE_OVER_BOUND,
+                true,
+                format!(
+                    "H at {reached_after:?} after t=0; A's T_obs {late_t_obs:?}; {}",
+                    describe_all(&end)
+                ),
+            ),
             Check::Healthy | Check::NoEarlySibling => (
                 arm.cause,
                 retained(
