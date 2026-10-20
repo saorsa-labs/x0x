@@ -20,6 +20,9 @@ macro_rules! staging_supersession_regression_tests {
             // Create the owned install once. Both operations use the same real
             // participant, restart context, shutdown watch and apply mutex.
             let (mut older_runtime, _shutdown) = e2e_startup_runtime(&root);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                root.join("x0xd"),
+            );
             let started = tokio::time::Instant::now();
             older_runtime.staging.machine_id = [42; 32];
             older_runtime.staging.clock = Some(Arc::new(move || {
@@ -148,6 +151,212 @@ macro_rules! staging_supersession_regression_tests {
             assert_eq!(retained.first_receipt_ms, older_first.first_receipt_ms);
             assert_eq!(retained.chosen_delay, older_first.chosen_delay);
             assert_eq!(retained.manifest_sha256, older_request.manifest_sha256);
+        }
+
+        #[cfg(unix)]
+        mod staging_preflight_regressions {
+            use super::*;
+            use crate::upgrade::{apply, probe, staging, staging_selection};
+            use sha2::Digest;
+            use std::{collections::BTreeMap, fs, future::Future, path::{Path, PathBuf}, sync::Mutex as StdMutex};
+
+            struct Fixture {
+                root: PathBuf,
+                request: staging::StagingRequest,
+                manifest: ReleaseManifest,
+                upgrader: AutoApplyUpgrader,
+                attempts: Arc<AtomicU64>,
+                _apply: apply::apply_attempt_seam::Guard,
+                _readback: restart::systemd_readback_seam::Guard,
+                _raw: apply::current_binary_path_seam::Guard,
+                _dir: tempfile::TempDir,
+            }
+
+            fn clock() -> probe::ProbeClock {
+                probe::ProbeClock { boot_id: "preflight-receipt".into(), monotonic_ms: 1000 }
+            }
+
+            fn records(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+                fs::read_dir(root).unwrap().map(|entry| {
+                    let path = entry.unwrap().path();
+                    let bytes = fs::read(&path).unwrap();
+                    (path, bytes)
+                }).collect()
+            }
+
+            async fn complete<F: Future>(operation: F) -> F::Output {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                tokio::pin!(operation);
+                loop {
+                    assert!(std::time::Instant::now() < deadline, "actual preflight worker did not finish");
+                    tokio::select! { biased;
+                        result = operation.as_mut() => return result,
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
+            }
+
+            fn seed_interrupted(install: &Path, manifest: &ReleaseManifest) {
+                let state = probe::ProbeState {
+                    schema_version: 1, record_kind: "probe".into(), install: install.to_owned(),
+                    version: manifest.version.clone(), platform: manifest.assets[0].target.clone(),
+                    archive_sha256: manifest.assets[0].archive_sha256,
+                    transaction_id: "15131513-1513-4513-8513-151315131513".into(), attempt: 1,
+                    phase: probe::ProbePhase::InterruptedWait, cause: Some(probe::ProbeCause::Timeout),
+                    last_pid: None, boot_id: "preflight-previous-boot".into(),
+                    retry_remaining_ms: 1_800_000, retry_deadline_ms: 1_800_001,
+                    daemon_sha256: None, cli_sha256: None,
+                };
+                assert_ne!(state.boot_id, probe::ProbeClock::now().unwrap().boot_id);
+                fs::write(probe::state_path(install).unwrap(), serde_json::to_vec(&state).unwrap()).unwrap();
+                // A typed fixture models retained state; no candidate is run.
+                assert_eq!(probe::read_state(install).unwrap().unwrap().phase, probe::ProbePhase::InterruptedWait);
+            }
+
+            impl Fixture {
+                fn new() -> Self {
+                    let base = std::env::var_os("X0X_UPGRADE_STAGING_EVIDENCE_DIR")
+                        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join(".planning/upgrade-staging-fixtures"));
+                    fs::create_dir_all(&base).unwrap();
+                    let dir = tempfile::Builder::new().prefix("preflight-selection-").tempdir_in(base).unwrap();
+                    let root = dir.path().canonicalize().unwrap();
+                    let (runtime, _shutdown) = e2e_startup_runtime(&root);
+                    let raw = apply::current_binary_path_seam::install(root.join("x0xd"));
+                    let readback = restart::systemd_readback_seam::install(staging_readback(
+                        one_call_scenario("0", "5"), &runtime,
+                    ));
+                    let mut manifest = manifest_for_this_platform("9.9.9");
+                    manifest.timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                    let request = staging::StagingRequest {
+                        install: root.join("x0xd"), data_root: root.clone(), identity_root: root.clone(),
+                        machine_id: [42; 32], version: manifest.version.clone(),
+                        manifest_sha256: sha2::Sha256::digest(serde_json::to_vec(&manifest).unwrap()).into(),
+                        archive_sha256: manifest.assets[0].archive_sha256, window_minutes: 0,
+                    };
+                    {
+                        let _held = crate::upgrade::acquire_host_upgrade_lock(&request.install).unwrap();
+                        assert_eq!(staging_selection::observe_selected(&request, &clock()).unwrap(), staging::Decision::Due);
+                    }
+                    let upgrader = AutoApplyUpgrader::new("x0xd").with_stop_on_upgrade(true)
+                        .with_restart_on_success(false).with_restart_context(runtime.restart_context)
+                        .with_staging_request(request.clone())
+                        .with_staging_clock(Some(Arc::new(|| Ok(clock()))));
+                    let attempts = Arc::new(AtomicU64::new(0));
+                    let counted = Arc::clone(&attempts);
+                    let apply = apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        // Stop before download, candidate execution, swap or restart.
+                        x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
+                    }));
+                    Self { root, request, manifest, upgrader, attempts,
+                        _apply: apply, _readback: readback, _raw: raw, _dir: dir }
+                }
+
+                fn newer(&self) -> staging::StagingRequest {
+                    let mut manifest = self.manifest.clone();
+                    manifest.version = "9.9.10".into();
+                    staging::StagingRequest {
+                        version: manifest.version.clone(),
+                        manifest_sha256: sha2::Sha256::digest(serde_json::to_vec(&manifest).unwrap()).into(),
+                        ..self.request.clone()
+                    }
+                }
+            }
+
+            async fn inter_worker_case(supersede: bool) {
+                let fixture = Fixture::new();
+                let selected = if supersede { fixture.newer() } else { fixture.request.clone() };
+                let snapshot = Arc::new(StdMutex::new(None));
+                let captured = Arc::clone(&snapshot);
+                let calls = Arc::new(AtomicU64::new(0));
+                let counted = Arc::clone(&calls);
+                let root = fixture.root.clone();
+                let manifest = fixture.manifest.clone();
+                let expected_install = fixture.request.install.clone();
+                let _cut = apply::pre_probe_admission_seam::install(expected_install.clone(), Box::new(move |install| {
+                    assert_eq!(install, expected_install);
+                    assert_eq!(counted.fetch_add(1, Ordering::SeqCst), 0);
+                    // Nonblocking acquisition proves the first real Gate released
+                    // this exact lock before the cut; no fixture thread can hang.
+                    let held = fs::OpenOptions::new().read(true).write(true)
+                        .open(root.join("x0xd.upgrade.lock")).unwrap();
+                    held.try_lock().expect("first gate must release the canonical install lock");
+                    assert_eq!(staging_selection::observe_selected(&selected, &clock()).unwrap(), staging::Decision::Due);
+                    // Insert only after the first Gate: seeding it earlier would
+                    // make that Gate acknowledge the clock and skip this cut.
+                    seed_interrupted(install, &manifest);
+                    *captured.lock().unwrap() = Some(records(&root));
+                }));
+                let result = complete(fixture.upgrader.apply_upgrade_from_manifest(&fixture.manifest)).await;
+                // No detached retry is scheduled by this direct real apply path.
+                // Both actual workers finish before snapshots or scoped hooks drop.
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(fixture.attempts.load(Ordering::SeqCst), 0);
+                let mut before = snapshot.lock().unwrap().take().unwrap();
+                let mut after = records(&fixture.root);
+                if supersede {
+                    assert_eq!(after, before, "stale A must refuse before acknowledging its probe clock");
+                    assert!(result.unwrap_err().to_string().contains("superseded"));
+                } else {
+                    let probe_path = probe::state_path(&fixture.request.install).unwrap();
+                    assert_ne!(after.remove(&probe_path).unwrap(), before.remove(&probe_path).unwrap());
+                    assert_eq!(after, before, "probe acknowledgement must not alter selection or receipts");
+                    assert_eq!(probe::read_state(&fixture.request.install).unwrap().unwrap().boot_id,
+                        probe::ProbeClock::now().unwrap().boot_id);
+                    assert!(result.unwrap_err().to_string().contains("probe retry waits"));
+                }
+            }
+
+            #[tokio::test]
+            async fn staging_preflight_supersession_refuses_before_probe_clock_write() {
+                inter_worker_case(true).await;
+            }
+
+            #[tokio::test]
+            async fn staging_preflight_same_selection_reaches_actual_probe_clock_reader() {
+                inter_worker_case(false).await;
+            }
+
+            #[tokio::test]
+            async fn staging_direct_retry_preserves_stale_pending_and_unknown_selection() {
+                for state in ["stale", "pending", "unknown", "valid"] {
+                    let fixture = Fixture::new();
+                    {
+                        let _held = crate::upgrade::acquire_host_upgrade_lock(&fixture.request.install).unwrap();
+                        match state {
+                            "stale" => { staging_selection::observe_selected(&fixture.newer(), &clock()).unwrap(); }
+                            "pending" => { fs::write(staging_selection::pending_path(&fixture.request).unwrap(), b"unresolved selection intent").unwrap(); }
+                            "unknown" => {
+                                let path = staging_selection::selection_path(&fixture.request).unwrap();
+                                let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                                record["schema_version"] = serde_json::json!(999);
+                                fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+                            }
+                            "valid" => {}
+                            _ => unreachable!(),
+                        }
+                        seed_interrupted(&fixture.request.install, &fixture.manifest);
+                    }
+                    let mut before = records(&fixture.root);
+                    let result = complete(fixture.upgrader.probe_retry_delay(&fixture.manifest.version)).await;
+                    let mut after = records(&fixture.root);
+                    assert_eq!(fixture.attempts.load(Ordering::SeqCst), 0);
+                    if state == "valid" {
+                        let wait = result.unwrap().expect("selected A retains its actual probe retry");
+                        assert_eq!(wait.transaction_id, "15131513-1513-4513-8513-151315131513");
+                        assert!(!wait.delay.is_zero());
+                        let path = probe::state_path(&fixture.request.install).unwrap();
+                        assert_ne!(after.remove(&path).unwrap(), before.remove(&path).unwrap());
+                        assert_eq!(probe::read_state(&fixture.request.install).unwrap().unwrap().boot_id,
+                            probe::ProbeClock::now().unwrap().boot_id);
+                    } else {
+                        assert!(result.is_err(), "{state} selection must refuse direct retry");
+                    }
+                    assert_eq!(after, before, "{state}: retry must preserve retained evidence");
+                }
+            }
         }
     };
 }
