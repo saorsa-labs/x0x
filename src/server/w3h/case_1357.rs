@@ -31,7 +31,11 @@
 //! - `s4_idle_revocation_one_admin`, Home variant (RED on `main`). A owns
 //!   the Home and is its only admin. At t = 0 A issuer-revokes B through
 //!   `DELETE /owner/agents/:id` (ADR-0018, signed by the owner key). The
-//!   rest is as above.
+//!   precondition is that A, the designated admin, holds the record. C is
+//!   not required to hold it: in CI run 39443078214 C did not accept the
+//!   issuer-revocation within [`EVIDENCE`] (no subject certificate for B
+//!   on the v1 carrier, it seems), so a C-holds precondition made the arm
+//!   INFRA. The rest is as above.
 //! - `s4_self_leave_crypto_only` (control, GREEN on `main`). Nodes A, B, C.
 //!   At t = 0 B leaves (`DELETE /groups/:id`). #1113 / PR #1337 already
 //!   makes the lowest active admin commit the TreeKEM removal after a
@@ -259,6 +263,7 @@ const IDLE: Arm = Arm {
 
 const HOME_IDLE: Arm = Arm {
     home: true,
+    holders: &["A"],
     trigger: Trigger::OwnerRevoke,
     ..IDLE
 };
