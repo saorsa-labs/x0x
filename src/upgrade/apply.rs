@@ -30,9 +30,13 @@ type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + 
 async fn inspect_probe_admission(
     install: PathBuf,
     version: String,
+    staged: bool,
 ) -> Result<super::probe::Admission, UpgradeError> {
     tokio::task::spawn_blocking(move || {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
+        if staged {
+            ensure_canonical_install(&install)?;
+        }
         super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))
     })
@@ -45,8 +49,20 @@ async fn probe_retry_delay_for_install(
     install: PathBuf,
     version: String,
 ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+    probe_retry_delay_for_bound_install(install, version, false).await
+}
+
+#[cfg(unix)]
+async fn probe_retry_delay_for_bound_install(
+    install: PathBuf,
+    version: String,
+    staged: bool,
+) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
     tokio::task::spawn_blocking(move || {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
+        if staged {
+            ensure_canonical_install(&install)?;
+        }
         let admission = super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))?;
         // Inspect and read under the same lock. An expired durable
@@ -67,6 +83,19 @@ async fn probe_retry_delay_for_install(
     })
     .await
     .map_err(|error| UpgradeError::Other(format!("probe retry-state worker failed: {error}")))?
+}
+
+/// Recheck the carried canonical identity after waiting for its lock. Record
+/// readers must not follow a changed path while holding the previous lock.
+#[cfg(unix)]
+fn ensure_canonical_install(install: &Path) -> Result<(), UpgradeError> {
+    if std::fs::canonicalize(install)
+        .map_err(|error| UpgradeError::Other(format!("staging install unavailable: {error}")))?
+        != install
+    {
+        return Err(UpgradeError::Other("staging install changed".into()));
+    }
+    Ok(())
 }
 
 /// Arm the HTTP deferred-restart owner before any host mutation (#1447 RC5).
@@ -407,6 +436,24 @@ impl AutoApplyUpgrader {
         self
     }
 
+    /// Select the staged install from the independent executable observation,
+    /// not from the receipt. Carry this path through locks, plan and mutation.
+    /// Legacy unstaged callers and Windows retain their existing raw-path flow.
+    fn install_path(&self) -> Result<PathBuf, UpgradeError> {
+        let observed = current_binary_path()?;
+        #[cfg(unix)]
+        if let Some(gate) = &self.staging {
+            let install = std::fs::canonicalize(&observed).map_err(|error| {
+                UpgradeError::Other(format!("staging install unavailable: {error}"))
+            })?;
+            if install != gate.request.install {
+                return Err(UpgradeError::Other("staging install changed".into()));
+            }
+            return Ok(install);
+        }
+        Ok(observed)
+    }
+
     #[cfg(unix)]
     pub(crate) fn with_staging_request(mut self, request: super::staging::StagingRequest) -> Self {
         self.staging = Some(super::staging_runtime::Gate {
@@ -440,14 +487,16 @@ impl AutoApplyUpgrader {
         let Some(gate) = &self.staging else {
             return Ok(());
         };
+        let install = self.install_path()?;
         loop {
             if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
             }
             let gate = gate.clone();
+            let install = install.clone();
             let worker_shutdown = shutdown.clone();
             let worker = run_owned_blocking(move |worker_alive| {
-                let _lock = super::acquire_host_upgrade_lock(&gate.request.install)?;
+                let _lock = super::acquire_host_upgrade_lock(&install)?;
                 // A queued blocking task outlives a dropped JoinHandle. Recheck
                 // custody after obtaining the lock and before any record I/O.
                 let shutdown_value = worker_shutdown.borrow();
@@ -462,7 +511,7 @@ impl AutoApplyUpgrader {
                 let clock = gate
                     .clock()
                     .map_err(|error| UpgradeError::Other(error.to_string()))?;
-                gate.observe_locked_at(&gate.request.install, &clock)
+                gate.observe_locked_at(&install, &clock)
             });
             let decision = tokio::select! {
                 biased;
@@ -551,9 +600,13 @@ impl AutoApplyUpgrader {
     ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
         #[cfg(unix)]
         {
-            let install = current_binary_path()?;
+            let install = self.install_path()?;
             let version = version.to_owned();
-            probe_retry_delay_for_install(install, version).await
+            if self.staging.is_some() {
+                probe_retry_delay_for_bound_install(install, version, true).await
+            } else {
+                probe_retry_delay_for_install(install, version).await
+            }
         }
         #[cfg(not(unix))]
         {
@@ -571,7 +624,7 @@ impl AutoApplyUpgrader {
     /// be started (helper spawn failure) — the old process keeps running in
     /// both cases.
     pub async fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
-        let target_path = current_binary_path()?;
+        let target_path = self.install_path()?;
         let plan = self.resolve_restart_plan(&target_path).await?;
         self.trigger_restart(&plan, target_version)
     }
@@ -668,7 +721,7 @@ impl AutoApplyUpgrader {
             .matches_platform(platform_target)
             .ok_or(UpgradeError::NoPlatformAsset)?;
 
-        let target_path = current_binary_path()?;
+        let target_path = self.install_path()?;
 
         // ADR-0061 §1 — resolve before mutation. The restart owner, intended
         // exit behaviour, executable/argv and effective roots are resolved and
@@ -688,8 +741,12 @@ impl AutoApplyUpgrader {
             UpgradeError::Other(format!("upgrade record barrier unavailable: {error}"))
         })?;
         #[cfg(unix)]
-        if let super::probe::Admission::Waiting { retry_after } =
-            inspect_probe_admission(target_path.clone(), manifest.version.clone()).await?
+        if let super::probe::Admission::Waiting { retry_after } = inspect_probe_admission(
+            target_path.clone(),
+            manifest.version.clone(),
+            self.staging.is_some(),
+        )
+        .await?
         {
             return Err(UpgradeError::Other(
                 super::probe::ProbeRefusal::Waiting { retry_after }.to_string(),
