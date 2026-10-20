@@ -3454,7 +3454,7 @@
       "request": {
         "fields": [
           {
-            "cli": "default",
+            "cli": "NAME",
             "in": "body",
             "name": "name",
             "required": true
@@ -3472,13 +3472,13 @@
       "request": {
         "fields": [
           {
-            "cli": "default",
+            "cli": "LABEL",
             "in": "body",
             "name": "label",
             "required": true
           },
           {
-            "cli": "default",
+            "cli": "USER_ID",
             "in": "body",
             "name": "user_id",
             "required": true
@@ -3506,13 +3506,13 @@
       "request": {
         "fields": [
           {
-            "cli": "default",
+            "cli": "NAME",
             "in": "body",
             "name": "name",
             "required": true
           },
           {
-            "cli": "default",
+            "cli": "MACHINE_ID",
             "in": "body",
             "name": "machine_id",
             "required": true
