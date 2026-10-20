@@ -31,6 +31,28 @@ macro_rules! inventory_commands_regression_tests {
             }
 
             #[test]
+            fn inventory_commands_retain_exec_after_comment_line_boundaries() {
+                for separator in ["\n", "\r\n", "\r", "\n\r"] {
+                    for comment in ["# owned comment", "; owned comment"] {
+                        let source = format!("[Service]\n{comment}{separator}ExecStart={INSTALL} --name owned{separator}");
+                        let commands = parse_source("owned.service", source.as_bytes(), Path::new(INSTALL)).unwrap();
+                        assert_eq!(commands.len(), 1, "{source:?}");
+                        assert_eq!(commands[0].command.argv, argv(&[INSTALL, "--name", "owned"]));
+                    }
+                }
+            }
+
+            #[test]
+            fn inventory_commands_retain_exec_after_ignored_property_line_boundaries() {
+                for separator in ["\n", "\r\n", "\r", "\n\r"] {
+                    let source = format!("[Service]\nDescription=owned note{separator}ExecStart={INSTALL} --name owned{separator}");
+                    let commands = parse_source("owned.service", source.as_bytes(), Path::new(INSTALL)).unwrap();
+                    assert_eq!(commands.len(), 1, "{source:?}");
+                    assert_eq!(commands[0].command.argv, argv(&[INSTALL, "--name", "owned"]));
+                }
+            }
+
+            #[test]
             fn inventory_commands_do_not_split_nbsp_into_executable_authority() {
                 for command in [format!("{INSTALL}\u{a0}--name owned"), format!("{INSTALL}\u{a0}")] {
                     let source = format!("[Service]\nExecStart={command}\n");
