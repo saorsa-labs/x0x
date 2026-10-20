@@ -473,6 +473,9 @@ pub(crate) struct AttestationVerifyCtx {
     /// ADR-0070 §1 owner trust: feeds the trust decision and the
     /// `principal = "owner"` connect-ACL selector.
     owner_trust: crate::owner_trust::OwnerTrust,
+    /// When true (ADR-0074 §4 re-check), grant evaluation uses only local
+    /// authority stores — no EvidenceV1 wait/lookup.
+    local_authority_only: bool,
 }
 
 /// Inbound gate decision for a `ForwardV2` attested stream (#204).
@@ -743,6 +746,7 @@ pub(crate) async fn authorize_attested_opener(
             opener,
             peer_machine,
             ctx.now_ms / 1000,
+            !ctx.local_authority_only,
         )
         .await;
     let grant_port_allowed = access.allows_connect_port(target.port());
@@ -857,17 +861,17 @@ impl ForwardDiagnostics {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *reasons.entry(reason).or_insert(0) += 1;
     }
-    /// Live streams torn down because their authority is gone.
-    #[cfg(test)]
+    /// Live streams torn down because their authority is gone (ADR-0074 §4).
+    /// Exposed on [`ForwardService::diagnostics`] for operators; also logged
+    /// as `torn_down_total` on each teardown.
     #[must_use]
-    pub(crate) fn torn_down_reauth(&self) -> u64 {
+    pub fn torn_down_reauth(&self) -> u64 {
         self.torn_down_reauth.load(Ordering::Relaxed)
     }
     /// `torn_down_reauth` by reason (`revoked`, `trust_rejected`,
     /// `target_not_allowed`, ...).
-    #[cfg(test)]
     #[must_use]
-    pub(crate) fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
+    pub fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
         self.torn_down_reasons
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1039,6 +1043,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                 revocation_set: Arc::clone(&ctx.revocation_set),
                 move_state: Arc::clone(&ctx.move_state),
                 owner_trust: ctx.owner_trust.clone(),
+                local_authority_only: false,
             };
             match decide_inbound_attested_with_authority(
                 &header,
@@ -1156,55 +1161,68 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
     let live = ctx.live.register(gate, authority);
     ctx.reauth.notify_one();
     if live.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, None);
         return;
     }
 
     // Connect the local loopback target with a bounded timeout; abort early
     // if reauth tears the registration down while we wait.
-    let local = tokio::select! {
-        biased;
-        _ = live.token().cancelled() => return,
-        result = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)) => match result {
-            Ok(Ok(tcp)) => tcp,
-            Ok(Err(e)) => {
-                ctx.fwd_diag.record_connect_failed();
-                tracing::info!(
-                    target: "x0x::forward",
-                    peer = %hex::encode(peer.as_bytes()),
-                    target = %target,
-                    error = %e,
-                    "inbound forward: local connect failed"
-                );
-                return;
-            }
-            Err(_) => {
-                ctx.fwd_diag.record_connect_failed();
-                tracing::info!(
-                    target: "x0x::forward",
-                    peer = %hex::encode(peer.as_bytes()),
-                    target = %target,
-                    "inbound forward: local connect timed out"
-                );
-                return;
-            }
-        },
+    let local = match teardown::wait_cancellable(
+        live.token(),
+        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)),
+    )
+    .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, None);
+            return;
+        }
+        Ok(Ok(Ok(tcp))) => tcp,
+        Ok(Ok(Err(e))) => {
+            ctx.fwd_diag.record_connect_failed();
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer.as_bytes()),
+                target = %target,
+                error = %e,
+                "inbound forward: local connect failed"
+            );
+            return;
+        }
+        Ok(Err(_)) => {
+            ctx.fwd_diag.record_connect_failed();
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer.as_bytes()),
+                target = %target,
+                "inbound forward: local connect timed out"
+            );
+            return;
+        }
     };
     if live.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&local));
         return;
     }
 
     // Signal connected, then bridge. The connect-allow counter records that
     // the gate admitted this flow.
     ctx.connect_diag.record_allowed();
-    if stream
-        .send_mut()
-        .write_all(&encode_response_connected())
-        .await
-        .is_err()
+    match teardown::wait_cancellable(
+        live.token(),
+        stream.send_mut().write_all(&encode_response_connected()),
+    )
+    .await
     {
-        return;
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&local));
+            return;
+        }
+        Ok(Err(_)) => return,
+        Ok(Ok(())) => {}
     }
     if live.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&local));
         return;
     }
     let (send, recv) = stream.into_split();
@@ -1631,6 +1649,8 @@ impl ForwardService {
             move_state: Arc::clone(&self.move_state),
             connect_policy: self.agent.connect_policy_holder(),
             owner_trust: self.agent.owner_trust().clone(),
+            announced_bindings: self.agent.announced_machine_bindings(),
+            authenticated_bindings: self.agent.authenticated_machine_bindings(),
             own_machine_id: self.agent.machine_id(),
             clock: teardown::system_clock(),
         };
@@ -1942,6 +1962,7 @@ async fn try_outbound_v2(
     );
     agent.stream_reauth_signal().notify_one();
     if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&tcp));
         return OutboundOutcome::Done;
     }
 
@@ -1983,19 +2004,34 @@ async fn try_outbound_v2(
     }
     // Write the V2 header. If this fails the peer likely reset the stream
     // after reading the unknown V2 protocol byte (old software) — fall back.
-    if write_header_v2(stream.send_mut(), &header).await.is_err() {
-        return OutboundOutcome::PeerRejectedV2(tcp);
+    // Cancel during the write resets both halves (ADR-0074 §4).
+    match teardown::wait_cancellable(guard.token(), write_header_v2(stream.send_mut(), &header))
+        .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return OutboundOutcome::Done;
+        }
+        Ok(Err(_)) => return OutboundOutcome::PeerRejectedV2(tcp),
+        Ok(Ok(())) => {}
     }
     // Read the peer's connect-response byte.
     let mut resp = [0u8; 1];
-    if let Err(error) = stream.recv_mut().read_exact(&mut resp).await {
-        tracing::info!(
-            target: "x0x::forward",
-            peer = %hex::encode(peer_agent.as_bytes()),
-            %error,
-            "outbound forward v2: peer closed/reset before connect response — closing local TCP"
-        );
-        return OutboundOutcome::Done;
+    match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return OutboundOutcome::Done;
+        }
+        Ok(Err(error)) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                %error,
+                "outbound forward v2: peer closed/reset before connect response — closing local TCP"
+            );
+            return OutboundOutcome::Done;
+        }
+        Ok(Ok(())) => {}
     }
     finish_outbound(stream, resp, peer_agent, tcp, guard).await;
     OutboundOutcome::Done
@@ -2035,24 +2071,38 @@ async fn drive_outbound_v1(
     );
     agent.stream_reauth_signal().notify_one();
     if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&tcp));
         return;
     }
     let header = ForwardHeader {
         target_host: target_host.to_string(),
         target_port,
     };
-    if write_header(stream.send_mut(), &header).await.is_err() {
-        return;
+    match teardown::wait_cancellable(guard.token(), write_header(stream.send_mut(), &header)).await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return;
+        }
+        Ok(Err(_)) => return,
+        Ok(Ok(())) => {}
     }
     let mut resp = [0u8; 1];
-    if let Err(error) = stream.recv_mut().read_exact(&mut resp).await {
-        tracing::info!(
-            target: "x0x::forward",
-            peer = %hex::encode(peer_agent.as_bytes()),
-            %error,
-            "outbound forward v1: peer closed/reset before connect response — closing local TCP"
-        );
-        return;
+    match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return;
+        }
+        Ok(Err(error)) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                %error,
+                "outbound forward v1: peer closed/reset before connect response — closing local TCP"
+            );
+            return;
+        }
+        Ok(Ok(())) => {}
     }
     finish_outbound(stream, resp, peer_agent, tcp, guard).await;
 }
@@ -2063,13 +2113,14 @@ async fn drive_outbound_v1(
 /// the peer stream opened (before the header/response window), so a trust
 /// loss during that window still tears it down within the 5 s bound.
 async fn finish_outbound(
-    stream: PeerStream,
+    mut stream: PeerStream,
     resp: [u8; 1],
     peer_agent: &AgentId,
     tcp: TcpStream,
     guard: teardown::LiveStreamGuard,
 ) {
     if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&tcp));
         return;
     }
     match response_connected(resp[0]) {
@@ -2667,6 +2718,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2710,6 +2762,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2744,6 +2797,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2779,6 +2833,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2812,6 +2867,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2847,6 +2903,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2883,6 +2940,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2968,6 +3026,7 @@ mod tests {
             revocation_set: revoked,
             move_state: moves,
             owner_trust: crate::owner_trust::OwnerTrust::default(),
+            local_authority_only: false,
         };
         let good = v2_wire_round_trip(&signed_v2_header("127.0.0.1", 22, &b, recipient)).await;
         assert_eq!(
@@ -2998,6 +3057,7 @@ mod tests {
             )),
             move_state: Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new())),
             owner_trust: crate::owner_trust::OwnerTrust::default(),
+            local_authority_only: false,
         };
         let target = "127.0.0.1:22".parse().unwrap();
         let policy = policy_with_allow(kp.agent_id(), machine, target);
@@ -3244,6 +3304,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3269,6 +3330,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3296,6 +3358,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3322,6 +3385,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3348,6 +3412,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3374,6 +3439,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3428,6 +3494,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await
@@ -3470,6 +3537,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3506,6 +3574,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3545,6 +3614,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3584,6 +3654,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3620,6 +3691,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3691,6 +3763,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3715,6 +3788,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3787,6 +3861,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await

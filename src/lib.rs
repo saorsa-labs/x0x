@@ -12368,13 +12368,23 @@ impl Agent {
     ///     }
     /// }
     /// ```
+    /// The authenticated agent→machine binding store (ADR 0115).
+    pub(crate) fn authenticated_machine_bindings(&self) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.authenticated_machine_bindings)
+    }
+
+    /// The announced-binding store (ADR 0115 class A/B).
+    pub(crate) fn announced_machine_bindings(&self) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.announced_machine_bindings)
+    }
+
     /// Test seam for #1088's frame-level listener tests (unit and the
     /// connectivity integration file): the authenticated machine-binding
     /// registry the raw delivery path consults.
     pub fn authenticated_machine_bindings_for_testing(
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
-        std::sync::Arc::clone(&self.authenticated_machine_bindings)
+        self.authenticated_machine_bindings()
     }
 
     /// Test seam (x0x #1150 r7d): the announced-binding store. Test builds
@@ -12383,7 +12393,7 @@ impl Agent {
     pub(crate) fn announced_machine_bindings_for_testing(
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
-        std::sync::Arc::clone(&self.announced_machine_bindings)
+        self.announced_machine_bindings()
     }
 
     /// Test seam for #1088: record an authenticated machine binding the
@@ -18863,94 +18873,26 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::NetworkResult<identity::MachineId> {
-        let (routing, cert_not_after) = {
-            let cache = self.identity_discovery_cache.read().await;
-            cache
-                .get(agent_id)
-                .map(|entry| (entry.machine_id, entry.cert_not_after))
-                .ok_or(error::NetworkError::PeerNotVerified {
-                    agent_id: agent_id.0,
-                })?
-        };
-        // ADR 0115 §2: a route counts only when an authority
-        // store confirms it.
-        let machine_id = self
-            .authorized_routing_machine(agent_id, Some(routing))
-            .await
-            .ok_or(error::NetworkError::PeerNotVerified {
-                agent_id: agent_id.0,
-            })?;
-        // Runtime cert-expiry gate (issue #191): EP1 drops expired
-        // announcements at ingest but never re-checks a cached entry on
-        // the live path. Absent expiry (None) is fail-open — is_expired
-        // returns false, preserving compatibility with pre-#130 peers.
-        let expired = identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
-
-        let trust_decision = Some(
-            self.owner_trust
-                .evaluate_pair(
-                    &self.contact_store,
-                    &self.identity_discovery_cache,
-                    &self.revocation_set,
-                    agent_id,
-                    &machine_id,
-                )
-                .await
-                .decision,
-        );
-        let (revoked_agent, revoked_machine, resync_required) = {
-            let revoked = self.revocation_set.read().await;
-            (
-                revoked.is_agent_revoked(agent_id),
-                revoked.is_machine_revoked(&machine_id),
-                revoked.revocation_resync_required(),
-            )
-        };
-        if resync_required {
-            tracing::info!(
-                target: "x0x::streams",
-                agent = %hex::encode(agent_id.as_bytes()),
-                outcome = "withhold_revocation_resync",
-                "outbound stream withheld until revocation resync"
-            );
-            return Err(error::NetworkError::PeerNotVerified {
-                agent_id: agent_id.0,
-            });
-        }
-        streams::stream_gate(
+        Self::gate_peer_outbound_at(
+            &self.identity_discovery_cache,
+            &self.contact_store,
+            &self.revocation_set,
+            &self.move_state,
+            &self.owner_trust,
+            &self.announced_machine_bindings,
+            &self.authenticated_machine_bindings,
             agent_id,
-            trust_decision,
-            revoked_agent,
-            revoked_machine,
-            expired,
-        )?;
-        // ADR-0043 §9 checks B and P for the resolved pairing — evaluated
-        // wherever `(agent, machine)` is known. Present evidence fails
-        // closed (retired binding / pin mismatch); absent evidence fails
-        // open (§9.3) until a bundle or placement record arrives.
-        let pairing = {
-            let revoked = self.revocation_set.read().await;
-            let placements = self.move_state.read().await;
-            key_move::enforce_pairing(&revoked, placements.placement_view(), agent_id, &machine_id)
-        };
-        if let Some(denial) = pairing {
-            tracing::info!(
-                target: "x0x::streams",
-                agent = %hex::encode(agent_id.as_bytes()),
-                machine = %hex::encode(machine_id.as_bytes()),
-                outcome = "deny_pairing",
-                reason = ?denial,
-                "outbound pairing denied (ADR-0043 B/P gate)"
-            );
-            return Err(error::NetworkError::PeerNotVerified {
-                agent_id: agent_id.0,
-            });
-        }
-        Ok(machine_id)
+            Self::unix_timestamp_secs(),
+            false,
+        )
+        .await
     }
 
-    /// [`Self::gate_peer_outbound`] over explicit shared state, with cert
-    /// expiry evaluated at `now_secs` (ADR-0074 §4 re-check).
+    /// Shared body for [`Self::gate_peer_outbound`] and the ADR-0074 §4
+    /// re-check. Cert expiry is evaluated at `now_secs`. With
+    /// `local_authority_only`, ADR 0115 confirmation uses only local
+    /// stores / non-blocking evidence (no network EvidenceV1 wait).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn gate_peer_outbound_at(
         identity_discovery_cache: &tokio::sync::RwLock<
             std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
@@ -18959,10 +18901,13 @@ impl Agent {
         revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
         move_state: &tokio::sync::RwLock<key_move::MoveState>,
         owner_trust: &owner_trust::OwnerTrust,
+        announced_bindings: &dm_inbox::AuthenticatedMachineBindings,
+        authenticated_bindings: &dm_inbox::AuthenticatedMachineBindings,
         agent_id: &identity::AgentId,
         now_secs: u64,
+        local_authority_only: bool,
     ) -> error::NetworkResult<identity::MachineId> {
-        let (machine_id, cert_not_after) = {
+        let (routing, cert_not_after) = {
             let cache = identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
@@ -18971,7 +18916,30 @@ impl Agent {
                     agent_id: agent_id.0,
                 })?
         };
+        // ADR 0115 §2: a route counts only when an authority store confirms
+        // it; otherwise the authority stores' machine is used. Admission and
+        // reauth share this body so a stale/unconfirmed cache entry cannot
+        // tear down a stream that a fresh admission would still open.
+        let confirmed = owner_trust
+            .authority_confirms_with(agent_id, &routing, local_authority_only)
+            .await;
+        let authority = {
+            let announced = announced_bindings.read().await.peek(agent_id);
+            let attested = authenticated_bindings.read().await.peek(agent_id);
+            identity_authority::authority_machine(announced, attested)
+        };
+        let machine_id =
+            identity_authority::authorized_machine(Some(routing), confirmed, authority).ok_or(
+                error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                },
+            )?;
+        // Runtime cert-expiry gate (issue #191): EP1 drops expired
+        // announcements at ingest but never re-checks a cached entry on
+        // the live path. Absent expiry (None) is fail-open — is_expired
+        // returns false, preserving compatibility with pre-#130 peers.
         let expired = identity::is_expired(cert_not_after, now_secs);
+
         let trust_decision = Some(
             owner_trust
                 .evaluate_pair(
@@ -18993,6 +18961,14 @@ impl Agent {
             )
         };
         if resync_required {
+            if !local_authority_only {
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    outcome = "withhold_revocation_resync",
+                    "outbound stream withheld until revocation resync"
+                );
+            }
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: agent_id.0,
             });
@@ -19004,12 +18980,26 @@ impl Agent {
             revoked_machine,
             expired,
         )?;
+        // ADR-0043 §9 checks B and P for the resolved pairing — evaluated
+        // wherever `(agent, machine)` is known. Present evidence fails
+        // closed (retired binding / pin mismatch); absent evidence fails
+        // open (§9.3) until a bundle or placement record arrives.
         let pairing = {
             let revoked = revocation_set.read().await;
             let placements = move_state.read().await;
             key_move::enforce_pairing(&revoked, placements.placement_view(), agent_id, &machine_id)
         };
-        if pairing.is_some() {
+        if let Some(denial) = pairing {
+            if !local_authority_only {
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "deny_pairing",
+                    reason = ?denial,
+                    "outbound pairing denied (ADR-0043 B/P gate)"
+                );
+            }
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: agent_id.0,
             });
@@ -19210,6 +19200,7 @@ impl Agent {
                     agent_id,
                     machine_id,
                     now_secs,
+                    true,
                 )
                 .await;
             let has_connect_grant = !access.connect_ports.is_empty();

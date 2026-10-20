@@ -353,11 +353,18 @@ impl OwnerTrust {
             agent_id,
             machine_id,
             unix_now_secs(),
+            true,
         )
         .await
+        .access
     }
 
     /// [`Self::grant_access`] with an explicit clock (ADR-0074 §4 re-check).
+    ///
+    /// With `allow_evidence_lookup = false` the evaluation uses only local
+    /// authority stores — no EvidenceV1 wait/lookup — so a reauth pass stays
+    /// inside the ADR-0074 five-second bound.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn grant_access_at(
         &self,
         contact_store: &RwLock<ContactStore>,
@@ -366,9 +373,10 @@ impl OwnerTrust {
         agent_id: &AgentId,
         machine_id: &MachineId,
         now_unix: u64,
-    ) -> crate::share_grant::GrantAccess {
+        allow_evidence_lookup: bool,
+    ) -> crate::share_grant::GrantAccessEval {
         let Some(store) = self.share_grant_store() else {
-            return crate::share_grant::GrantAccess::default();
+            return crate::share_grant::GrantAccessEval::default();
         };
         let base = {
             let contacts = contact_store.read().await;
@@ -384,8 +392,13 @@ impl OwnerTrust {
             )
         };
         if rejected(base) {
-            return crate::share_grant::GrantAccess::default();
+            return crate::share_grant::GrantAccessEval::default();
         }
+        let evidence = if allow_evidence_lookup {
+            self.evidence()
+        } else {
+            None
+        };
         let access = crate::share_grant::evaluate_grant_access_with_evidence(
             &store,
             &self.bindings,
@@ -394,7 +407,7 @@ impl OwnerTrust {
             agent_id,
             machine_id,
             now_unix,
-            self.evidence().as_deref(),
+            evidence.as_deref(),
         )
         .await;
         // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin
@@ -407,7 +420,7 @@ impl OwnerTrust {
             })
         };
         if rejected(last) {
-            return crate::share_grant::GrantAccess::default();
+            return crate::share_grant::GrantAccessEval::default();
         }
         access
     }

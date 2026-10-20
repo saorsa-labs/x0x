@@ -66,6 +66,11 @@ pub(crate) const REAUTH_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// event.
 pub(crate) const REAUTH_MIN_SPACING: Duration = Duration::from_millis(250);
 
+/// Hard budget for one reauth pass (ADR-0074 §4 five-second bound). Local
+/// authority reads should finish well under this; the deadline fail-closes
+/// any stream still unchecked when it expires.
+pub(crate) const REAUTH_PASS_BUDGET: Duration = Duration::from_secs(5);
+
 /// QUIC application error code sent when a live stream is torn down
 /// because its authority is gone. Peers observe this reset code on the wire.
 pub(crate) const REAUTH_RESET_CODE: u32 = 0x5244;
@@ -332,6 +337,10 @@ pub(crate) struct ReauthCtx {
     pub move_state: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
     pub connect_policy: Arc<std::sync::RwLock<Arc<ConnectPolicy>>>,
     pub owner_trust: crate::owner_trust::OwnerTrust,
+    /// ADR 0115 announced-binding store (same Arc admission reads).
+    pub announced_bindings: crate::dm_inbox::AuthenticatedMachineBindings,
+    /// ADR 0115 authenticated-binding store (same Arc admission reads).
+    pub authenticated_bindings: crate::dm_inbox::AuthenticatedMachineBindings,
     pub own_machine_id: MachineId,
     pub clock: Clock,
 }
@@ -391,8 +400,11 @@ async fn reevaluate(
                 &ctx.revocation_set,
                 &ctx.move_state,
                 &ctx.owner_trust,
+                &ctx.announced_bindings,
+                &ctx.authenticated_bindings,
                 peer_agent,
                 now_secs,
+                true,
             )
             .await
             .map_err(|e| network_reason(&e))?;
@@ -472,6 +484,9 @@ fn pass_inputs(ctx: &ReauthCtx) -> (Arc<ConnectPolicy>, AttestationVerifyCtx) {
         revocation_set: Arc::clone(&ctx.revocation_set),
         move_state: Arc::clone(&ctx.move_state),
         owner_trust: ctx.owner_trust.clone(),
+        // ADR-0074 §4: re-checks stay inside the five-second bound — local
+        // authority only, no EvidenceV1 wait/lookup.
+        local_authority_only: true,
     };
     (policy, verify)
 }
@@ -488,22 +503,37 @@ pub(crate) async fn check_gate(
 
 /// One re-check pass over every live stream. Returns how many were torn
 /// down. Streams sharing gate inputs (many connections through one forward)
-/// are evaluated once per pass.
+/// are evaluated once per pass. The whole pass is bounded by
+/// [`REAUTH_PASS_BUDGET`]; streams still unchecked when the budget expires
+/// are fail-closed torn down.
 pub(crate) async fn reauth_pass(live: &LiveStreams, ctx: &ReauthCtx) -> usize {
     let entries = live.gates();
     if entries.is_empty() {
         return 0;
     }
+    let deadline = tokio::time::Instant::now() + REAUTH_PASS_BUDGET;
     let (policy, verify) = pass_inputs(ctx);
     let mut verdicts: HashMap<StreamGate, Result<StreamAuthority, &'static str>> = HashMap::new();
     let mut torn_down = 0;
     for (id, gate) in entries {
-        let verdict = match verdicts.get(&gate) {
-            Some(verdict) => verdict.clone(),
-            None => {
-                let verdict = reevaluate(&gate, ctx, &verify, &policy).await;
-                verdicts.insert(gate.clone(), verdict.clone());
-                verdict
+        let verdict = if tokio::time::Instant::now() >= deadline {
+            Err("reauth_deadline")
+        } else {
+            match verdicts.get(&gate) {
+                Some(verdict) => verdict.clone(),
+                None => {
+                    let verdict = match tokio::time::timeout_at(
+                        deadline,
+                        reevaluate(&gate, ctx, &verify, &policy),
+                    )
+                    .await
+                    {
+                        Ok(verdict) => verdict,
+                        Err(_) => Err("reauth_deadline"),
+                    };
+                    verdicts.insert(gate.clone(), verdict.clone());
+                    verdict
+                }
             }
         };
         match verdict {
@@ -515,6 +545,7 @@ pub(crate) async fn reauth_pass(live: &LiveStreams, ctx: &ReauthCtx) -> usize {
                         target: "x0x::forward",
                         ?gate,
                         reason,
+                        torn_down_total = live.diag.torn_down_reauth(),
                         outcome = "torn_down_reauth",
                         "live forward stream torn down: its authority is gone (ADR-0074 §4)"
                     );
@@ -621,6 +652,44 @@ pub(crate) fn reset_quic(
 pub(crate) fn reset_tcp(tcp: &impl AsRef<tokio::net::TcpStream>) {
     #[allow(deprecated)]
     let _ = tcp.as_ref().set_linger(Some(Duration::ZERO));
+}
+
+/// A pre-bridge wait that lost the race against reauth cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cancelled;
+
+/// Race `fut` against `cancel` (ADR-0074 §4). Used for every pre-bridge
+/// wait — header write, response read, local connect, response write — so
+/// a stalled peer cannot keep sockets and permits alive after teardown.
+pub(crate) async fn wait_cancellable<T, F>(
+    cancel: &CancellationToken,
+    fut: F,
+) -> Result<T, Cancelled>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(Cancelled),
+        result = fut => Ok(result),
+    }
+}
+
+/// ADR-0074 §4 deny during the connect/header/response window: reset both
+/// QUIC halves with [`REAUTH_RESET_CODE`] and RST the local TCP when present.
+///
+/// Takes [`PeerStream`] so the send and recv borrows are sequential (not
+/// overlapping in one call expression).
+pub(crate) fn deny_pre_bridge(
+    stream: &mut crate::streams::PeerStream,
+    tcp: Option<&tokio::net::TcpStream>,
+) {
+    let code = ant_quic::VarInt::from_u32(REAUTH_RESET_CODE);
+    let _ = stream.send_mut().reset(code);
+    let _ = stream.recv_mut().stop(code);
+    if let Some(tcp) = tcp {
+        reset_tcp(tcp);
+    }
 }
 
 #[cfg(test)]

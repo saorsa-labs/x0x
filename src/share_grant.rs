@@ -968,6 +968,10 @@ fn unix_now_secs() -> u64 {
 
 /// What the grants held here confer on one requester pair, for this
 /// daemon's own agent (ADR-0070 §2). The union over every matching grant.
+///
+/// Public fields only — Connect grant ids used for ADR-0074 live-stream
+/// labels live on the crate-private [`GrantAccessEval`] wrapper so
+/// downstream `GrantAccess { ..Default::default() }` literals keep compiling.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantAccess {
     /// `Dm`: DMs are accepted (`Unknown`/`AcceptWithFlag` → `Accept`).
@@ -977,13 +981,25 @@ pub struct GrantAccess {
     /// `Connect`: `principal = "grant"` connect entries may match for these
     /// target ports.
     pub connect_ports: BTreeSet<u16>,
-    /// Ids of the ShareGrants that contributed a `Connect` capability
-    /// (ADR-0074 §4 authority label for live forward streams).
-    pub(crate) connect_grant_ids: BTreeSet<[u8; 32]>,
     /// `GroupInvite`: groups may be seeded without a contact entry.
     pub group_invite: bool,
     /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).
     pub call: bool,
+}
+
+/// Crate-private evaluation result: public access bits plus the Connect
+/// grant ids that cover a live forward (ADR-0074 §4 authority label).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GrantAccessEval {
+    pub access: GrantAccess,
+    pub connect_grant_ids: BTreeSet<[u8; 32]>,
+}
+
+impl std::ops::Deref for GrantAccessEval {
+    type Target = GrantAccess;
+    fn deref(&self) -> &GrantAccess {
+        &self.access
+    }
 }
 
 impl GrantAccess {
@@ -1008,6 +1024,18 @@ impl GrantAccess {
                 ShareCap::GroupInvite => self.group_invite = true,
                 ShareCap::Call => self.call = true,
             }
+        }
+    }
+}
+
+impl GrantAccessEval {
+    fn absorb(&mut self, caps: &BTreeSet<ShareCap>, grant_id: [u8; 32]) {
+        let conferred_connect = caps
+            .iter()
+            .any(|cap| matches!(cap, ShareCap::Connect { .. }));
+        self.access.absorb(caps);
+        if conferred_connect {
+            self.connect_grant_ids.insert(grant_id);
         }
     }
 }
@@ -1049,6 +1077,7 @@ pub async fn evaluate_grant_access(
         None,
     )
     .await
+    .access
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1061,9 +1090,9 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     requester_machine: &MachineId,
     now_unix: u64,
     evidence: Option<&crate::peer_evidence::EvidenceRuntime>,
-) -> GrantAccess {
+) -> GrantAccessEval {
     let evaluated_at = std::time::Instant::now();
-    let mut access = GrantAccess::default();
+    let mut access = GrantAccessEval::default();
     // A failed clock read maps to 0; never evaluate validity windows
     // against it (it could reactivate a long-expired grant). Fail closed.
     if now_unix == 0 {
@@ -1149,14 +1178,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             }),
         };
         if grantee_matches {
-            let conferred_connect = grant
-                .caps
-                .iter()
-                .any(|cap| matches!(cap, ShareCap::Connect { .. }));
-            access.absorb(&grant.caps);
-            if conferred_connect {
-                access.connect_grant_ids.insert(grant.grant_id);
-            }
+            access.absorb(&grant.caps, grant.grant_id);
         }
     }
     access

@@ -77,6 +77,10 @@ struct World {
     move_state: Arc<RwLock<crate::key_move::MoveState>>,
     policy: Arc<std::sync::RwLock<Arc<ConnectPolicy>>>,
     trust: OwnerTrust,
+    /// ADR 0115 announced-binding store (shared with OwnerTrust).
+    announced: AuthenticatedMachineBindings,
+    /// ADR 0115 authenticated-binding store (shared with OwnerTrust).
+    authenticated: AuthenticatedMachineBindings,
     devices: Arc<OwnerSyncStore>,
     grants: Arc<ShareGrantStore>,
     kick: Arc<Notify>,
@@ -104,7 +108,8 @@ impl World {
             MachineId([0xC0; 32]),
             MachineId([0x0A; 32]),
         );
-        let bindings = AuthenticatedMachineBindings::default();
+        let authenticated = AuthenticatedMachineBindings::default();
+        let announced = AuthenticatedMachineBindings::default();
         let mut cache = HashMap::new();
         for (kp, user, machine) in [
             (&b1_kp, &user_b, mb),
@@ -112,7 +117,14 @@ impl World {
             (&o1_kp, &owner_a, mo),
         ] {
             crate::dm_inbox::record_authenticated_machine_binding(
-                &bindings,
+                &authenticated,
+                kp.agent_id(),
+                machine,
+                base_secs,
+            )
+            .await;
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &announced,
                 kp.agent_id(),
                 machine,
                 base_secs,
@@ -137,7 +149,8 @@ impl World {
             .unwrap();
         devices.set_device_change_notify(Arc::clone(&kick));
         let grants = Arc::new(ShareGrantStore::in_memory(a1, Some(owner_a.user_id())));
-        let trust = OwnerTrust::new(Some(owner_a.user_id()), bindings);
+        let trust = OwnerTrust::new(Some(owner_a.user_id()), Arc::clone(&authenticated));
+        trust.install_announced_bindings(Arc::clone(&announced));
         trust.install_device_store(Arc::clone(&devices));
         trust.install_share_grant_store(Arc::clone(&grants));
 
@@ -159,6 +172,8 @@ impl World {
             move_state: Arc::new(RwLock::new(crate::key_move::MoveState::default())),
             policy: Arc::new(std::sync::RwLock::new(Arc::new(ConnectPolicy::default()))),
             trust,
+            announced,
+            authenticated,
             devices,
             grants,
             kick,
@@ -182,6 +197,8 @@ impl World {
             move_state: Arc::clone(&self.move_state),
             connect_policy: Arc::clone(&self.policy),
             owner_trust: self.trust.clone(),
+            announced_bindings: Arc::clone(&self.announced),
+            authenticated_bindings: Arc::clone(&self.authenticated),
             own_machine_id: MachineId([0xAA; 32]),
             clock: self.clock(),
         }
@@ -679,4 +696,240 @@ async fn ended_stream_leaves_the_registry_uncounted() {
     assert_eq!(w.live.len(), 0);
     assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
     assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
+/// WHY (Claude blocking + Codex P2): admission uses ADR 0115
+/// `authorized_routing_machine` (authority stores win over an unconfirmed
+/// cache route). The re-check must share that body — a stale/unconfirmed
+/// cache rewrite must not tear down a live outbound as `machine_changed`.
+#[tokio::test(start_paused = true)]
+async fn outbound_reauth_keeps_stream_when_cache_route_is_stale_but_authority_names_machine() {
+    let w = World::new().await;
+    w.contacts
+        .write()
+        .await
+        .set_trust(&w.b1, TrustLevel::Trusted);
+
+    // Discovery cache claims a different, unconfirmed machine; the
+    // authenticated/announced stores still name mb (the admitted peer).
+    let stale = MachineId([0xEE; 32]);
+    {
+        let mut cache = w.cache.write().await;
+        let entry = cache.get_mut(&w.b1).expect("b1 cached");
+        entry.machine_id = stale;
+    }
+
+    let resolved = crate::Agent::gate_peer_outbound_at(
+        &w.cache,
+        &w.contacts,
+        &w.revocations,
+        &w.move_state,
+        &w.trust,
+        &w.announced,
+        &w.authenticated,
+        &w.b1,
+        w.base_secs,
+        true,
+    )
+    .await
+    .expect("admission must use authority machine mb, not stale cache");
+    assert_eq!(resolved, w.mb, "ADR 0115 must prefer the authority machine");
+
+    let (stream, authority) = w
+        .admit(StreamGate::Outbound {
+            peer_agent: w.b1,
+            machine: w.mb,
+        })
+        .await;
+    assert_eq!(authority, StreamAuthority::PeerTrust);
+    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert!(
+        !stream.token().is_cancelled(),
+        "reauth must not tear down as machine_changed when authority still names mb"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
+/// WHY (Codex P1): grant evaluation can await a 5 s EvidenceV1 load barrier
+/// when an authenticated binding is absent. Several open streams must not
+/// push revocation past the ADR-0074 five-second bound — reauth uses local
+/// authority only under [`REAUTH_PASS_BUDGET`].
+#[tokio::test(start_paused = true)]
+async fn reauth_enforces_revocation_within_5s_despite_slow_evidence() {
+    use crate::peer_evidence::{EvidenceConfig, EvidenceRuntime, PeerEvidenceStore, RuntimePolicy};
+
+    let w = World::new().await;
+    // Grant-only ACL: streams live only while the grant evaluation passes.
+    w.set_policy_silently(w.acl(&[], false, true));
+    let grant_b = w
+        .grant(0x42, Grantee::Agent(w.b1), w.base_secs + 3_600)
+        .await;
+    let grant_c = w
+        .grant(0x43, Grantee::Agent(w.c1), w.base_secs + 3_600)
+        .await;
+
+    // Several live grant-backed streams across two gates.
+    let mut streams = Vec::new();
+    for _ in 0..3 {
+        let (b, auth) = w.admit(w.inbound(w.b1, w.mb)).await;
+        assert!(matches!(auth, StreamAuthority::Grant { .. }));
+        streams.push(b);
+        let (c, auth) = w.admit(w.inbound(w.c1, w.mc)).await;
+        assert!(matches!(auth, StreamAuthority::Grant { .. }));
+        streams.push(c);
+    }
+
+    // Started-but-not-ready evidence: wait(0) blocks ~5 s. Install it so a
+    // non-local reauth grant path would stall; the ADR-0074 path must not.
+    let policy = Arc::new(RuntimePolicy::new(
+        w.a1,
+        w.trust.clone(),
+        Arc::clone(&w.revocations),
+    ));
+    let store = Arc::new(
+        PeerEvidenceStore::open(
+            w.dir.path(),
+            EvidenceConfig::default(),
+            policy,
+            w.base_secs * 1000,
+        )
+        .unwrap(),
+    );
+    let (evidence, _ready) = EvidenceRuntime::loading_store_for_test(store);
+    w.trust.install_evidence(&evidence);
+
+    // Control: with bindings cleared, non-local grant eval sits in wait(0).
+    {
+        let mut bind = w.authenticated.write().await;
+        *bind = crate::dm_inbox::AuthenticatedMachineBindingCache::default();
+    }
+    let blocked = tokio::spawn({
+        let trust = w.trust.clone();
+        let contacts = Arc::clone(&w.contacts);
+        let cache = Arc::clone(&w.cache);
+        let revocations = Arc::clone(&w.revocations);
+        let b1 = w.b1;
+        let mb = w.mb;
+        let now = w.base_secs;
+        async move {
+            trust
+                .grant_access_at(&contacts, &cache, &revocations, &b1, &mb, now, true)
+                .await
+        }
+    });
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        !blocked.is_finished(),
+        "control: evidence wait(0) must still be pending after 1 s"
+    );
+    blocked.abort();
+    // Restore bindings so revocation has a clean local grant path to deny.
+    for (agent, machine) in [(w.b1, w.mb), (w.c1, w.mc)] {
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &w.authenticated,
+            agent,
+            machine,
+            w.base_secs,
+        )
+        .await;
+    }
+
+    let local_probe = Instant::now();
+    let _ = w
+        .trust
+        .grant_access_at(
+            &w.contacts,
+            &w.cache,
+            &w.revocations,
+            &w.b1,
+            &w.mb,
+            w.base_secs,
+            false,
+        )
+        .await;
+    assert!(
+        local_probe.elapsed() < Duration::from_millis(50),
+        "local grant eval must not await the evidence barrier"
+    );
+
+    let _stop = w.spawn_loop(None);
+    let started = Instant::now();
+    w.revoke_grant(&grant_b).await;
+    w.revoke_grant(&grant_c).await;
+    for stream in &streams {
+        closes_within(stream, EVENT_BOUND).await;
+    }
+    assert!(
+        started.elapsed() <= EVENT_BOUND,
+        "pass exceeded the five-second bound under slow evidence ({:?})",
+        started.elapsed()
+    );
+    assert!(
+        w.diag.torn_down_reauth() >= streams.len() as u64,
+        "expected every live stream torn down; got {:?}",
+        w.reasons()
+    );
+}
+
+/// WHY (Codex P1 / Claude #2): handlers race every pre-bridge I/O against
+/// the cancel token via [`wait_cancellable`] (not a post-hoc `is_cancelled`
+/// poll), then [`deny_pre_bridge`] resets QUIC (0x5244) and RSTs TCP.
+/// This drives that sequence: register → stall on response read →
+/// `tear_down` → wait returns [`Cancelled`] → deny RSTs the local socket.
+#[tokio::test]
+async fn pre_bridge_cancel_interrupts_stalled_io_and_rsts_tcp() {
+    use std::io::ErrorKind;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let server = listener.accept().await.unwrap().0;
+
+    // Same register → wait → tear_down path the outbound handler uses.
+    let diag = Arc::new(ForwardDiagnostics::default());
+    let live = Arc::new(LiveStreams::new(Arc::clone(&diag)));
+    let guard = live.register(
+        StreamGate::Outbound {
+            peer_agent: AgentId([0xB1; 32]),
+            machine: MachineId([0xB0; 32]),
+        },
+        StreamAuthority::PeerTrust,
+    );
+    let id = {
+        // The first registration is id 0.
+        0u64
+    };
+    let token = guard.token().clone();
+    let stalled = tokio::spawn(async move {
+        // Stalled response read — the wait reviewers flagged as uncancellable.
+        wait_cancellable(&token, std::future::pending::<std::io::Result<()>>()).await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        live.tear_down(id, "revoked"),
+        "teardown must cancel the stream"
+    );
+    assert!(
+        matches!(stalled.await.unwrap(), Err(Cancelled)),
+        "stalled pre-bridge wait must return Cancelled when reauth tears down"
+    );
+
+    // Handler deny path after Cancelled: RST TCP (QUIC 0x5244 covered by
+    // reset_quic / bridge teardown with real halves).
+    reset_tcp(&server);
+    drop(server);
+
+    let mut buf = [0u8; 8];
+    match client.read(&mut buf).await {
+        Ok(0) => panic!("got clean EOF (FIN); expected ConnectionReset from linger-0 close"),
+        Ok(n) => panic!("unexpected {n} bytes from reset peer"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            ErrorKind::ConnectionReset,
+            "expected ConnectionReset, got {err:?}"
+        ),
+    }
+    assert_eq!(diag.torn_down_reauth(), 1);
 }
