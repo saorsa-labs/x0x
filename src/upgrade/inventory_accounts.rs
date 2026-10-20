@@ -64,7 +64,10 @@ impl AccountTable {
                 {
                     return Err(refusal("account authority is not exclusively files"));
                 }
-            } else if database.starts_with("passwd") || database.starts_with("group") {
+            } else if database.starts_with("passwd")
+                || database.starts_with("group")
+                || database.starts_with("initgroups")
+            {
                 return Err(refusal("alternate account policy is unsupported"));
             }
         }
