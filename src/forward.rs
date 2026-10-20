@@ -2055,6 +2055,11 @@ impl ForwardService {
         peer: &AgentId,
         target_port: u16,
     ) -> Result<PreparedSocksTunnel, PrepareSocksError> {
+        // ADR-0074 §4: a SOCKS-only embedder (`ForwardService::new` +
+        // `ForwardSocksConnector`) never calls `spawn_inbound` or
+        // `add_forward`. Start the same monitor so a local trust downgrade
+        // still tears the tunnel down.
+        self.ensure_reauth_loop();
         // Same global outbound / per-peer caps as `add_forward`. The permit
         // stays inside the returned tunnel until `bridge` finishes.
         let Some(admission) = self.admit(*peer, false) else {
@@ -2068,6 +2073,7 @@ impl ForwardService {
             target_port,
             &self.live,
             admission,
+            &self.fwd_diag,
         )
         .await
     }
@@ -2088,6 +2094,9 @@ pub struct PreparedSocksTunnel {
     guard: teardown::LiveStreamGuard,
     /// Outbound admission. Held until [`Self::bridge`] returns.
     admission: Admission,
+    /// Active-stream count for `/streams`. Held for the tunnel lifetime,
+    /// including [`Self::bridge`], and released on drop.
+    active: StreamLeaveGuard,
 }
 
 impl PreparedSocksTunnel {
@@ -2097,16 +2106,19 @@ impl PreparedSocksTunnel {
             stream,
             guard,
             admission,
+            active,
         } = self;
         if guard.token().is_cancelled() {
             let mut stream = stream;
             teardown::deny_pre_bridge(&mut stream, Some(&tcp));
             drop(admission);
+            drop(active);
             return;
         }
         let (send, recv) = stream.into_split();
         bridge(tcp, send, recv, guard.token()).await;
         drop(admission);
+        drop(active);
     }
 }
 
@@ -2119,6 +2131,7 @@ async fn prepare_outbound_v2_for_socks(
     target_port: u16,
     live: &Arc<teardown::LiveStreams>,
     admission: Admission,
+    fwd_diag: &Arc<ForwardDiagnostics>,
 ) -> Result<PreparedSocksTunnel, PrepareSocksError> {
     let ready =
         match open_signed_forward_v2(agent, peer_agent, target_host, target_port, live).await {
@@ -2126,11 +2139,15 @@ async fn prepare_outbound_v2_for_socks(
             Err(fail) => return Err(map_socks_v2_fail(fail, peer_agent)),
         };
     match response_connected(ready.response) {
-        Some(true) => Ok(PreparedSocksTunnel {
-            stream: ready.stream,
-            guard: ready.guard,
-            admission,
-        }),
+        Some(true) => {
+            fwd_diag.enter_stream();
+            Ok(PreparedSocksTunnel {
+                stream: ready.stream,
+                guard: ready.guard,
+                admission,
+                active: StreamLeaveGuard(Arc::clone(fwd_diag)),
+            })
+        }
         Some(false) => {
             // Peer denied — reset the QUIC halves; target got zero bytes.
             let mut stream = ready.stream;
@@ -4888,6 +4905,451 @@ mod tests {
         assert!(
             matches!(denied_in, Err(PeerGateError::Network(_))),
             "cert expired during discovery-lock wait must deny inbound: {denied_in:?}"
+        );
+    }
+
+    fn offline_agent_paths(dir: &std::path::Path) -> crate::AgentBuilder {
+        crate::Agent::builder()
+            .with_identity_dir(dir)
+            .with_machine_key(dir.join("machine.key"))
+            .with_agent_key_path(dir.join("agent.key"))
+            .with_user_key_path(dir.join("user.key"))
+            .with_agent_cert_path(dir.join("agent.cert"))
+            .with_contact_store_path(dir.join("contacts.json"))
+            .with_peer_cache_disabled()
+    }
+
+    async fn offline_forward_service() -> (tempfile::TempDir, Arc<crate::Agent>, Arc<ForwardService>)
+    {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let agent = Arc::new(
+            offline_agent_paths(dir.path())
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = Arc::new(
+            ForwardService::new(Arc::clone(&agent), policy, diagnostics, true)
+                .expect("forward acceptor registration"),
+        );
+        (dir, agent, service)
+    }
+
+    fn peer_card(
+        agent_id: AgentId,
+        machine_id: MachineId,
+        now_secs: u64,
+    ) -> crate::DiscoveredAgent {
+        crate::DiscoveredAgent {
+            self_name: None,
+            cert_digest: None,
+            agent_id,
+            machine_id,
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: now_secs,
+            last_seen: now_secs,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
+    }
+
+    /// WHY (Codex P1 / #1505): `prepare_socks_tunnel` is the only entry a
+    /// SOCKS embedder calls. It must start ADR-0074 reauth, so blocking the
+    /// peer closes a live outbound tunnel without `spawn_inbound` or
+    /// `add_forward`.
+    #[tokio::test]
+    async fn socks_prepare_trust_downgrade_closes_live_tunnel() {
+        let (_dir, agent, service) = offline_forward_service().await;
+        let peer = AgentId([0x51; 32]);
+        let machine = MachineId([0xB0; 32]);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        agent
+            .record_authenticated_machine_binding_for_testing(peer, machine)
+            .await;
+        agent
+            .insert_discovered_agent_for_testing(peer_card(peer, machine, now_secs))
+            .await;
+        agent.set_contact_trusted_for_testing(peer).await;
+
+        let prepared = service.prepare_socks_tunnel(&peer, 9).await;
+        match prepared {
+            Err(PrepareSocksError::Failed) => {}
+            Err(other) => panic!("offline SOCKS prepare must fail closed, got {other:?}"),
+            Ok(_) => panic!("offline agent has no QUIC peer; prepare must not succeed"),
+        }
+        assert!(
+            service
+                .inbound_acceptors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "SOCKS-only embedder must not consume inbound acceptors"
+        );
+        assert!(service.list_forwards().is_empty());
+
+        // Let the monitor consume the trust-add kick before the stream exists.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let guard = service.live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: peer,
+                machine,
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert!(
+            !guard.token().is_cancelled(),
+            "trusted peer must not be torn down at registration"
+        );
+
+        agent
+            .contacts()
+            .write()
+            .await
+            .set_trust(&peer, crate::contacts::TrustLevel::Blocked);
+        tokio::time::timeout(std::time::Duration::from_secs(5), guard.token().cancelled())
+            .await
+            .expect("local trust downgrade must close the SOCKS-path tunnel within 5s");
+        assert_eq!(service.diagnostics().torn_down_reauth(), 1);
+        assert_eq!(
+            service
+                .diagnostics()
+                .torn_down_reasons()
+                .get("trust_rejected"),
+            Some(&1)
+        );
+        service.shutdown();
+        agent.shutdown().await;
+    }
+
+    fn loopback_network_config() -> crate::network::NetworkConfig {
+        crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        }
+    }
+
+    fn refused_udp(err: &impl std::fmt::Display) -> bool {
+        let message = err.to_string();
+        let refused = message.contains("Operation not permitted")
+            && (message.contains("bind UDP socket")
+                || message.contains("network initialization failed"));
+        if refused && std::env::var("X0X_REQUIRE_NETWORK_TESTS").as_deref() == Ok("1") {
+            panic!(
+                "network setup refused but X0X_REQUIRE_NETWORK_TESTS=1 requires this test: {message}"
+            );
+        }
+        refused
+    }
+
+    async fn build_loopback_agent(dir: &std::path::Path, name: &str) -> Option<crate::Agent> {
+        let home = dir.join(name);
+        std::fs::create_dir_all(&home).expect("agent home");
+        match crate::Agent::builder()
+            .with_identity_dir(&home)
+            .with_machine_key(home.join("machine.key"))
+            .with_agent_key_path(home.join("agent.key"))
+            .with_user_key_path(home.join("user.key"))
+            .with_agent_cert_path(home.join("agent.cert"))
+            .with_contact_store_path(home.join("contacts.json"))
+            .with_peer_cache_dir(home.join("peer-cache"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+        {
+            Ok(agent) => Some(agent),
+            Err(err) if refused_udp(&err) => None,
+            Err(err) => panic!("agent build failed: {err}"),
+        }
+    }
+
+    fn normalize_loopback(addr: SocketAddr) -> SocketAddr {
+        if addr.ip().is_unspecified() {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), addr.port())
+        } else {
+            addr
+        }
+    }
+
+    fn allow_exact(opener: &crate::Agent, target: SocketAddr) -> Arc<ConnectPolicy> {
+        Arc::new(ConnectPolicy::Enabled(ConnectAcl {
+            loaded_from: "test".into(),
+            loaded_at_unix_ms: 0,
+            allow: vec![ConnectAllowEntry {
+                description: None,
+                agent_id: opener.agent_id(),
+                machine_id: opener.machine_id(),
+                targets: vec![target],
+            }],
+            owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
+        }))
+    }
+
+    async fn link_loopback_pair(alice: &Arc<crate::Agent>, bob: &Arc<crate::Agent>) {
+        alice.join_network().await.expect("alice join");
+        bob.join_network().await.expect("bob join");
+        let alice_net = alice.network().expect("alice network").clone();
+        let bob_net = bob.network().expect("bob network").clone();
+        let bob_addr = normalize_loopback(bob_net.bound_addr().await.expect("bob addr"));
+        alice_net
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice dials bob");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let linked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if alice_net.is_connected(&bob_peer).await
+                    && bob_net
+                        .is_connected(&ant_quic::PeerId(alice.machine_id().0))
+                        .await
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(linked.is_ok(), "loopback pair did not connect");
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let alice_addr = normalize_loopback(alice_net.bound_addr().await.expect("alice addr"));
+        alice
+            .insert_discovered_agent_for_testing({
+                let mut card = peer_card(bob.agent_id(), bob.machine_id(), now_secs);
+                card.addresses = vec![bob_addr];
+                card
+            })
+            .await;
+        alice.set_contact_trusted_for_testing(bob.agent_id()).await;
+        bob.insert_discovered_agent_for_testing({
+            let mut card = peer_card(alice.agent_id(), alice.machine_id(), now_secs);
+            card.addresses = vec![alice_addr];
+            card
+        })
+        .await;
+        bob.set_contact_trusted_for_testing(alice.agent_id()).await;
+        alice
+            .record_authenticated_machine_binding_for_testing(bob.agent_id(), bob.machine_id())
+            .await;
+        bob.record_authenticated_machine_binding_for_testing(alice.agent_id(), alice.machine_id())
+            .await;
+    }
+
+    async fn spawn_counting_target() -> (u16, Arc<std::sync::atomic::AtomicU64>, CancellationToken)
+    {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("target");
+        let port = listener.local_addr().expect("target addr").port();
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = CancellationToken::new();
+        let bytes_task = Arc::clone(&bytes);
+        let cancel_task = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = cancel_task.cancelled() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut sock, _)) = accepted else { break };
+                let bytes_task = Arc::clone(&bytes_task);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                bytes_task.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (port, bytes, cancel)
+    }
+
+    /// SOCKS CONNECT, one payload, then block the peer. Returns the opener's
+    /// active-stream count while the payload was in flight, and whether the
+    /// tunnel closed within 5 s of the downgrade.
+    async fn drive_socks_then_block(
+        alice: &Arc<crate::Agent>,
+        alice_fwd: &Arc<ForwardService>,
+        bob_id: AgentId,
+        target_port: u16,
+        target_bytes: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> (u64, bool) {
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOKEN: &str = "socks-rc2-token";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("socks");
+        let addr = listener.local_addr().expect("socks addr");
+        let (client_res, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut client = client_res.expect("socks client");
+        let (server, _) = accepted.expect("socks accept");
+        let host = format!("{}.x0x", hex::encode(bob_id.as_bytes()));
+        let connector = crate::socks::ForwardSocksConnector::new(Arc::clone(alice_fwd));
+        let denied = AtomicU64::new(0);
+        let cancel = CancellationToken::new();
+        let contacts = alice.contacts().clone();
+        let fwd = Arc::clone(alice_fwd);
+        let bytes = Arc::clone(target_bytes);
+
+        let handler =
+            crate::socks::handle_tcp_client(server, TOKEN, &connector, &denied, None, &cancel);
+        let client_side = async move {
+            client.write_all(&[0x05, 0x01, 0x02]).await.expect("greet");
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).await.expect("method");
+            assert_eq!(method, [0x05, 0x02]);
+            let user = b"x0x";
+            let pass = TOKEN.as_bytes();
+            let mut auth = vec![0x01, user.len() as u8];
+            auth.extend_from_slice(user);
+            auth.push(pass.len() as u8);
+            auth.extend_from_slice(pass);
+            client.write_all(&auth).await.expect("auth");
+            let mut status = [0u8; 2];
+            client.read_exact(&mut status).await.expect("auth status");
+            assert_eq!(status, [0x01, 0x00]);
+            let host_b = host.as_bytes();
+            let mut req = vec![0x05, 0x01, 0x00, 0x03, host_b.len() as u8];
+            req.extend_from_slice(host_b);
+            req.extend_from_slice(&target_port.to_be_bytes());
+            client.write_all(&req).await.expect("connect");
+            let mut resp = [0u8; 10];
+            client.read_exact(&mut resp).await.expect("connect reply");
+            assert_eq!(resp[1], 0x00, "SOCKS CONNECT must succeed");
+            client.write_all(b"ping").await.expect("payload");
+            let saw_bytes = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while bytes.load(std::sync::atomic::Ordering::SeqCst) < 4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                saw_bytes.is_ok(),
+                "proxied payload did not reach the target"
+            );
+            let active = fwd.diagnostics().active_streams();
+            contacts
+                .write()
+                .await
+                .set_trust(&bob_id, crate::contacts::TrustLevel::Blocked);
+            let torn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut buf = [0u8; 8];
+                let _ = client.read(&mut buf).await;
+                while fwd.diagnostics().torn_down_reauth() < 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            (active, torn.is_ok())
+        };
+        let (handler, counted) = tokio::join!(handler, client_side);
+        handler.expect("socks session");
+        counted
+    }
+
+    /// WHY (Codex P2 / #1505): a successful SOCKS proxy must show up in the
+    /// opener's active-stream count (`GET /streams`) while bytes flow, and a
+    /// local trust downgrade must close that tunnel. Alice never calls
+    /// `spawn_inbound` or `add_forward`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn socks_proxy_counts_active_stream_until_trust_downgrade() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
+            return;
+        };
+        let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
+            alice.shutdown().await;
+            return;
+        };
+        let alice = Arc::new(alice);
+        let bob = Arc::new(bob);
+        link_loopback_pair(&alice, &bob).await;
+
+        let (target_port, target_bytes, target_cancel) = spawn_counting_target().await;
+        let bob_policy = allow_exact(&alice, SocketAddr::from(([127, 0, 0, 1], target_port)));
+        let bob_diag = Arc::new(ConnectDiagnostics::new(bob_policy.summary()));
+        let bob_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&bob), bob_policy, bob_diag, true)
+                .expect("bob forwarder"),
+        );
+        bob_fwd.spawn_inbound();
+
+        let alice_policy = Arc::new(ConnectPolicy::default());
+        let alice_diag = Arc::new(ConnectDiagnostics::new(alice_policy.summary()));
+        let alice_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&alice), alice_policy, alice_diag, true)
+                .expect("alice forwarder"),
+        );
+        assert!(
+            alice_fwd
+                .inbound_acceptors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "opener must stay SOCKS-only: no spawn_inbound"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+
+        let counted = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            drive_socks_then_block(
+                &alice,
+                &alice_fwd,
+                bob.agent_id(),
+                target_port,
+                &target_bytes,
+            ),
+        )
+        .await;
+
+        target_cancel.cancel();
+        bob_fwd.shutdown();
+        alice_fwd.shutdown();
+        alice.shutdown().await;
+        bob.shutdown().await;
+
+        let (active_during, closed) = counted.expect("proxy session finished");
+        assert_eq!(
+            active_during, 1,
+            "GET /streams reads this counter and must be non-zero while SOCKS traffic flows"
+        );
+        assert!(
+            closed,
+            "local trust downgrade must close the live SOCKS tunnel within 5s"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+        assert_eq!(alice_fwd.diagnostics().torn_down_reauth(), 1);
+        assert_eq!(
+            alice_fwd
+                .diagnostics()
+                .torn_down_reasons()
+                .get("trust_rejected"),
+            Some(&1)
         );
     }
 }
