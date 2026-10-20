@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 
 const MAX_INPUT: u64 = 1024 * 1024;
 const MAX_MEMBERS: usize = 4096;
+// glibc parses NSS policy bytewise with isspace. Support the C whitespace
+// subset and refuse non-ASCII policy tokens instead of normalizing authority.
+const POLICY_WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\x0b', '\x0c'];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Account {
@@ -36,7 +39,11 @@ impl AccountTable {
         let group_text = input(group)?;
         let mut databases = BTreeSet::new();
         for line in policy.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
+            let line = line.split('#').next().unwrap_or("");
+            if !line.is_ascii() {
+                return Err(refusal("non-ASCII NSS policy authority is unsupported"));
+            }
+            let line = line.trim_matches(POLICY_WHITESPACE);
             if line.is_empty() {
                 continue;
             }
@@ -46,10 +53,14 @@ impl AccountTable {
             let (database, sources) = line
                 .split_once(':')
                 .ok_or_else(|| refusal("invalid NSS policy row"))?;
-            let database = database.trim();
+            let database = database.trim_matches(POLICY_WHITESPACE);
             if ["passwd", "group", "initgroups"].contains(&database) {
                 if !databases.insert(database)
-                    || sources.split_whitespace().collect::<Vec<_>>() != ["files"]
+                    || sources
+                        .split(POLICY_WHITESPACE)
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        != ["files"]
                 {
                     return Err(refusal("account authority is not exclusively files"));
                 }
