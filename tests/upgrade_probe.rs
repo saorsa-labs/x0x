@@ -668,6 +668,83 @@ mod execution {
     }
 
     #[test]
+    fn a_daemon_probe_cannot_change_the_cli_before_its_execution() {
+        let mut fixture = ExecutionFixture::new();
+        fixture.request.launch.env.push((
+            OsString::from("PROBE_TEST_TAMPER"),
+            fixture.request.cli.as_os_str().to_owned(),
+        ));
+        let response = serde_json::json!({
+            "version": CANDIDATE_VERSION,
+            "platform": fixture.request.platform,
+        });
+        fixture.write_script(
+            &fixture.request.daemon,
+            &format!(
+                "printf '\\n# changed before second probe\\n' >> \"$PROBE_TEST_TAMPER\"\n\
+                 printf '%s\\n' '{response}'"
+            ),
+        );
+        assert!(matches!(
+            fixture.run(&ExecutionFixture::options(1_000)),
+            Err(ProbeRefusal::Failed { .. })
+        ));
+        let state = probe::read_state(&fixture.request.install)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cause, Some(ProbeCause::CandidateChanged));
+        assert!(matches!(state.phase, ProbePhase::FailedHold));
+        assert_eq!(
+            fixture.launched_pids().len(),
+            1,
+            "the changed CLI must not execute"
+        );
+        fixture.assert_installed_pair_unchanged();
+    }
+
+    #[test]
+    fn every_staged_file_barrier_must_complete_before_either_candidate_executes() {
+        use probe::StageBarrierStep;
+
+        for step in [
+            StageBarrierStep::DaemonFileSync,
+            StageBarrierStep::DaemonDirectorySync,
+            StageBarrierStep::CliFileSync,
+            StageBarrierStep::CliDirectorySync,
+        ] {
+            let fixture = ExecutionFixture::new();
+            let daemon_before = std::fs::read(&fixture.request.daemon).unwrap();
+            let cli_before = std::fs::read(&fixture.request.cli).unwrap();
+            let options = ExecutionFixture::options(1_000);
+            let result = probe::run_before_swap_with_stage_failure(
+                &fixture.request,
+                &AtomicBool::new(true),
+                &options,
+                step,
+            );
+            assert!(matches!(result, Err(ProbeRefusal::Interrupted { .. })));
+            let state = probe::read_state(&fixture.request.install)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(state.phase, ProbePhase::InterruptedWait));
+            assert_eq!(state.cause, Some(ProbeCause::HostIo));
+            assert_eq!(state.retry_remaining_ms, 30 * 60 * 1_000);
+            assert!(fixture.launched_pids().is_empty());
+            assert!(matches!(
+                fixture.run(&options),
+                Err(ProbeRefusal::Waiting { .. })
+            ));
+            assert!(fixture.launched_pids().is_empty());
+            assert_eq!(
+                std::fs::read(&fixture.request.daemon).unwrap(),
+                daemon_before
+            );
+            assert_eq!(std::fs::read(&fixture.request.cli).unwrap(), cli_before);
+            fixture.assert_installed_pair_unchanged();
+        }
+    }
+
+    #[test]
     fn corrupt_or_unknown_probe_state_never_authorizes_a_candidate_or_rewrites_evidence() {
         for bytes in [b"{torn".as_slice(), br#"{"schema_version":999}"#] {
             let fixture = ExecutionFixture::new();
