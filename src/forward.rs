@@ -1928,6 +1928,18 @@ enum OutboundOutcome {
     PeerRejectedV2(TcpStream),
 }
 
+/// ADR-0074: race the signing-gate await against live-stream cancel.
+///
+/// A stalled move-state lock must not keep the registered stream (and its
+/// TCP/permit) alive past reauth cancel — same pattern as the header write
+/// and response read that follow in [`try_outbound_v2`].
+pub(crate) async fn wait_signing_gate_or_cancel(
+    cancel: &CancellationToken,
+    gate: impl std::future::Future<Output = bool>,
+) -> Result<bool, teardown::Cancelled> {
+    teardown::wait_cancellable(cancel, gate).await
+}
+
 /// Attempt a `ForwardV2` outbound forward. Returns `PeerRejectedV2` only when
 /// the failure is specifically the peer not understanding the V2 protocol
 /// byte (the write to the opened stream fails immediately).
@@ -1974,13 +1986,24 @@ async fn try_outbound_v2(
     // Fail toward the V1 fallback exactly like a signing error would; the
     // V1 path carries no agent signature (transport-machine context only,
     // filtered receiver-side by B/P).
-    if !agent.signing_gate_allows(&agent.agent_id()).await {
-        tracing::info!(
-            target: "x0x::forward",
-            peer = %hex::encode(peer_agent.as_bytes()),
-            "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
-        );
-        return OutboundOutcome::PeerRejectedV2(tcp);
+    // ADR-0074 §4: race the gate against reauth cancel so a stalled
+    // move-state lock cannot hold sockets/permits past the 5 s bound.
+    match wait_signing_gate_or_cancel(guard.token(), agent.signing_gate_allows(&agent.agent_id()))
+        .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return OutboundOutcome::Done;
+        }
+        Ok(false) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
+            );
+            return OutboundOutcome::PeerRejectedV2(tcp);
+        }
+        Ok(true) => {}
     }
     // Build + sign the V2 header with the local agent keypair. The header
     // carries the opener's public key so the verifier doesn't depend on
@@ -3871,5 +3894,123 @@ mod tests {
             .unwrap(),
             target,
         );
+    }
+
+    /// ADR-0074 §4 bound after an applied reauth event (same as teardown tests).
+    const EVENT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// WHY (Codex P2 / RC6): `try_outbound_v2` races the signing-gate await
+    /// against the live-stream cancel token. A forever-pending gate (stalled
+    /// move-state lock) must return [`teardown::Cancelled`] within the 5 s
+    /// bound so the handler can [`teardown::deny_pre_bridge`] / RST TCP and
+    /// drop the registry entry (permit release via guard drop).
+    #[tokio::test]
+    async fn signing_gate_wait_cancel_closes_tcp_and_clears_registry_within_5s() {
+        use std::io::ErrorKind;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let server = listener.accept().await.unwrap().0;
+
+        let diag = Arc::new(ForwardDiagnostics::default());
+        let live = Arc::new(teardown::LiveStreams::new(Arc::clone(&diag)));
+        let guard = live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: AgentId([0x51; 32]),
+                machine: MachineId([0xB0; 32]),
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert_eq!(live.len(), 1);
+
+        let token = guard.token().clone();
+        let started = Instant::now();
+        let stalled = tokio::spawn(async move {
+            wait_signing_gate_or_cancel(&token, std::future::pending::<bool>()).await
+        });
+        tokio::task::yield_now().await;
+        guard.token().cancel();
+
+        let result = tokio::time::timeout(EVENT_BOUND, stalled)
+            .await
+            .expect("signing-gate wait must resolve within ADR-0074 5s bound")
+            .expect("join");
+        assert!(
+            matches!(result, Err(teardown::Cancelled)),
+            "stalled signing-gate wait must return Cancelled on live-stream cancel"
+        );
+        assert!(
+            started.elapsed() <= EVENT_BOUND,
+            "cancel must interrupt within {EVENT_BOUND:?}, took {:?}",
+            started.elapsed()
+        );
+
+        // Handler path after Cancelled: deny_pre_bridge RSTs TCP (QUIC half
+        // needs real PeerStream halves — covered elsewhere).
+        teardown::reset_tcp(&server);
+        drop(server);
+
+        let mut buf = [0u8; 8];
+        match client.read(&mut buf).await {
+            Ok(0) => panic!("got clean EOF (FIN); expected ConnectionReset from linger-0 close"),
+            Ok(n) => panic!("unexpected {n} bytes from reset peer"),
+            Err(err) => assert_eq!(
+                err.kind(),
+                ErrorKind::ConnectionReset,
+                "expected ConnectionReset, got {err:?}"
+            ),
+        }
+
+        drop(guard);
+        assert_eq!(
+            live.len(),
+            0,
+            "LiveStreamGuard drop must remove the stream from the registry"
+        );
+    }
+
+    /// WHY (Codex P2 / RC6): cancel during the signing-gate wait maps to
+    /// [`OutboundOutcome::Done`] (after deny_pre_bridge), never
+    /// [`OutboundOutcome::PeerRejectedV2`]. Refuse (`Ok(false)`) alone falls
+    /// back to V1.
+    #[tokio::test]
+    async fn signing_gate_cancel_is_done_not_peer_rejected_v2() {
+        let cancel = CancellationToken::new();
+        let wait = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { wait_signing_gate_or_cancel(&cancel, std::future::pending::<bool>()).await }
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(EVENT_BOUND, wait)
+            .await
+            .expect("cancel must resolve within ADR-0074 5s bound")
+            .expect("join");
+
+        // Same branch table as try_outbound_v2's signing-gate match.
+        let outcome = match result {
+            Err(teardown::Cancelled) => "Done",
+            Ok(false) => "PeerRejectedV2",
+            Ok(true) => "Continue",
+        };
+        assert_eq!(
+            outcome, "Done",
+            "cancel during signing-gate wait must be Done, not PeerRejectedV2"
+        );
+
+        // Refuse stays on the V1-fallback path (still distinct from cancel).
+        let refuse = wait_signing_gate_or_cancel(&CancellationToken::new(), async { false }).await;
+        assert!(matches!(refuse, Ok(false)));
+        let refuse_outcome = match refuse {
+            Err(teardown::Cancelled) => "Done",
+            Ok(false) => "PeerRejectedV2",
+            Ok(true) => "Continue",
+        };
+        assert_eq!(refuse_outcome, "PeerRejectedV2");
     }
 }

@@ -665,8 +665,13 @@ pub(crate) fn spawn_reauth_loop(
 
 /// Copy both directions between a local socket's halves and a peer
 /// stream's halves until both close (#961 half-close semantics), or until
-/// `cancel` fires. Returns `true` when cancelled (the caller resets), `false`
-/// when the bridge ended on its own.
+/// `cancel` fires or a copy/shutdown errors.
+///
+/// Returns `true` when cancelled or when either direction fails (the caller
+/// resets both halves — ADR-0074 teardown bound for remote reauth). Returns
+/// `false` when both directions complete cleanly. A clean EOF on one side
+/// still finishes that writer and lets the other direction keep flowing
+/// until it also completes or errors.
 pub(crate) async fn bridge_io<TR, TW, QR, QS>(
     tcp_read: &mut TR,
     tcp_write: &mut TW,
@@ -682,21 +687,26 @@ where
 {
     use tokio::io::AsyncWriteExt;
     let to_stream = async move {
-        if tokio::io::copy(tcp_read, send).await.is_ok() {
-            // `SendStream::poll_shutdown` is `finish()`: queues a FIN; the
-            // connection retransmits buffered data even after drop.
-            let _ = send.shutdown().await;
-        }
+        tokio::io::copy(tcp_read, send).await?;
+        // `SendStream::poll_shutdown` is `finish()`: queues a FIN; the
+        // connection retransmits buffered data even after drop.
+        send.shutdown().await?;
+        Ok::<(), std::io::Error>(())
     };
     let from_stream = async move {
-        if tokio::io::copy(recv, tcp_write).await.is_ok() {
-            let _ = tcp_write.shutdown().await;
-        }
+        tokio::io::copy(recv, tcp_write).await?;
+        tcp_write.shutdown().await?;
+        Ok::<(), std::io::Error>(())
     };
     tokio::select! {
         biased;
         () = cancel.cancelled() => true,
-        _ = async { tokio::join!(to_stream, from_stream) } => false,
+        // try_join: first Err cancels/drops the other future so both halves
+        // tear down instead of join! waiting on an idle peer forever.
+        result = async { tokio::try_join!(to_stream, from_stream) } => {
+            // Ok = both halves clean; Err = copy/shutdown failed → tear down.
+            result.is_err()
+        }
     }
 }
 

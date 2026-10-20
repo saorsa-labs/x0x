@@ -652,6 +652,64 @@ async fn bridge_stops_on_teardown_and_ends_normally_otherwise() {
     assert!(!torn_down);
 }
 
+/// WHY (Codex P2 / RC6): a peer reauth reset ends the QUIC-recv copy with an
+/// error. That error must tear down both bridge halves so an idle TCP client
+/// does not keep its socket open while `join!` waits on TCP→stream input.
+/// Dual endpoints: real idle TCP client ↔ `bridge_io` ↔ TCP pair standing in
+/// for the stream (RST on the peer feeding `recv`).
+#[tokio::test]
+async fn bridge_io_quic_recv_error_tears_down_idle_tcp() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    // Local TCP: idle client (connected, not sending) ↔ accepted half.
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp_listener.local_addr().unwrap();
+    let mut tcp_client = TcpStream::connect(tcp_addr).await.unwrap();
+    let (tcp_server, _) = tcp_listener.accept().await.unwrap();
+    let (mut tcp_read, mut tcp_write) = tcp_server.into_split();
+
+    // Stream side: real sockets so a linger-0 drop yields a read error, not
+    // clean EOF (duplex drop would be half-close and must not force teardown).
+    let stream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stream_addr = stream_listener.local_addr().unwrap();
+    let stream_peer = TcpStream::connect(stream_addr).await.unwrap();
+    let (stream_bridge, _) = stream_listener.accept().await.unwrap();
+    let (mut recv, mut send) = stream_bridge.into_split();
+
+    let cancel = CancellationToken::new();
+    let bridge = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            bridge_io(&mut tcp_read, &mut tcp_write, &mut recv, &mut send, &cancel).await
+        })
+    };
+
+    // Settle so both copies are parked; TCP client stays idle.
+    tokio::task::yield_now().await;
+
+    // Abrupt peer reset on the half feeding `recv` (reauth-style error).
+    reset_tcp(&stream_peer);
+    drop(stream_peer);
+
+    let torn_down = tokio::time::timeout(EVENT_BOUND, bridge)
+        .await
+        .expect("bridge hung after QUIC-recv error; idle TCP kept join waiting")
+        .expect("bridge task panicked");
+    assert!(
+        torn_down,
+        "copy/shutdown error must return true so the caller resets both halves"
+    );
+
+    // Idle TCP client must observe EOF/RST within the ADR-0074 bound.
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(EVENT_BOUND, tcp_client.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("unexpected {n} bytes from torn-down bridge"),
+        Err(_) => panic!("idle TCP client stayed open after QUIC-recv error"),
+    }
+}
+
 /// WHY: ADR-0074 §4 requires the local TCP socket to reset (RST), not finish
 /// with a clean FIN that makes a truncated response look complete. Tokio's
 /// `OwnedWriteHalf` would otherwise `shutdown(Write)` on drop after
