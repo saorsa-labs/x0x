@@ -1807,6 +1807,11 @@ fn schedule_restart_after_response(
 mod tests {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_http_now.rs"
+    ));
+    http_now_regression_tests!();
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
         "/tests/upgrade_http_staging.rs"
     ));
     http_staging_regression_tests!();

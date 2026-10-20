@@ -670,6 +670,11 @@ pub fn print_error(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_now_timeout.rs"
+    ));
+    upgrade_now_timeout_regression_tests!();
     use super::*;
 
     #[test]

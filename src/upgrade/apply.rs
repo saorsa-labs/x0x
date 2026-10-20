@@ -1780,6 +1780,11 @@ fn extract_from_zip(
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_http_custody.rs"
+    ));
+    http_custody_regression_tests!();
     #[cfg(unix)]
     include!("../../tests/upgrade_background_staging.rs");
     #[cfg(unix)]
