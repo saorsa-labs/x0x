@@ -176,3 +176,101 @@ macro_rules! fleet_policy_regression_tests {
         }
     };
 }
+
+// This separate macro compiles against the existing staged-startup baseline.
+// Invoke in server::routes::upgrade::tests alongside staging_regression_tests.
+// It uses only real existing release/readback/admission/clock seams.
+#[allow(unused_macros)]
+macro_rules! fleet_startup_regression_tests {
+    () => {
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_production_startup_zero_config_still_uses_the_minimum_window() {
+            use sha2::Digest;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let evidence = std::env::var_os("X0X_UPGRADE_FLEET_EVIDENCE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(".planning/upgrade-fleet-fixtures"));
+            std::fs::create_dir_all(&evidence).unwrap();
+            let dir = tempfile::Builder::new().prefix("fleet-startup-").tempdir_in(evidence).unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (mut runtime, _shutdown) = e2e_startup_runtime(&root);
+            runtime.staging.machine_id = [42; 32];
+            let install = runtime.staging.install.clone();
+            let original = std::fs::read(&install).unwrap();
+            let apply_lock = Arc::clone(&runtime.upgrade_apply_lock);
+            let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+            runtime.staging.observed = Some(Arc::new(move |decision| {
+                observed.send(decision).unwrap();
+            }));
+            let started = tokio::time::Instant::now();
+            runtime.staging.clock = Some(Arc::new(move || {
+                Ok(crate::upgrade::probe::ProbeClock {
+                    boot_id: "fleet-startup-fixture".into(),
+                    monotonic_ms: 1000 + u64::try_from(started.elapsed().as_millis())
+                        .map_err(std::io::Error::other)?,
+                })
+            }));
+            let authority: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/.deployment/authority-inventory.json"
+            ))).unwrap();
+            let unit = std::path::Path::new(authority["instances"][0]["unit"]["destination"]
+                .as_str().unwrap()).file_name().unwrap().to_str().unwrap();
+            let mut scenario = staging_readback(one_call_scenario("0", "5"), &runtime);
+            scenario.cgroup = format!("0::/system.slice/{unit}");
+            let _readback = restart::systemd_readback_seam::install(scenario);
+            let mut manifest = manifest_for_this_platform("9.9.9");
+            manifest.timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let manifest_json = serde_json::to_vec(&manifest).unwrap();
+            let request = crate::upgrade::staging::StagingRequest {
+                install: install.clone(), data_root: root.clone(),
+                identity_root: runtime.staging.identity_root.clone(), machine_id: [42; 32],
+                version: manifest.version.clone(),
+                manifest_sha256: sha2::Sha256::digest(&manifest_json).into(),
+                archive_sha256: manifest.assets[0].archive_sha256, window_minutes: 0,
+            };
+            let attempts = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&attempts);
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                assert!(!plan.systemd_verified.as_ref().unwrap().user_manager);
+                counted.fetch_add(1, Ordering::SeqCst);
+                x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
+            }));
+            let _release = startup_release_seam::install(crate::upgrade::monitor::VerifiedRelease {
+                manifest, manifest_json, signature: Vec::new(), gossip_payload: Vec::new(),
+            });
+            let mut config = DaemonConfig { data_dir: root, ..Default::default() };
+            config.update.rollout_window_minutes = 0;
+            let startup = run_startup_update_check(&config, None, Some(runtime));
+            tokio::pin!(startup);
+            let mut next = staging_next_observation(startup.as_mut(), &mut observations, deadline)
+                .await.unwrap_or_else(|result| panic!("fleet applied before its window: {result:?}"));
+            // Independently known [42;32]/9.9.9 fraction gives3260 seconds
+            // for a60-minute window. The floor is not a minimum chosen delay.
+            assert_eq!(next, crate::upgrade::staging::Decision::Waiting(Duration::from_secs(3260)));
+            let receipt = crate::upgrade::staging::read_receipt(&request).unwrap().unwrap();
+            assert_eq!(receipt.window_minutes, 60, "explicit fleet0 cannot freeze an undersized receipt");
+            assert_eq!(receipt.first_receipt_ms, 1000);
+            assert_eq!(attempts.load(Ordering::SeqCst), 0);
+            assert!(apply_lock.try_lock().is_ok());
+            let result = loop {
+                if let crate::upgrade::staging::Decision::Waiting(wait) = next {
+                    let step = wait.min(Duration::from_secs(30));
+                    assert!(started.elapsed() + step <= Duration::from_secs(3600));
+                    tokio::time::advance(step).await;
+                }
+                match staging_next_observation(startup.as_mut(), &mut observations, deadline).await {
+                    Ok(decision) => next = decision,
+                    Err(result) => break result,
+                }
+            };
+            assert!(matches!(&result, Ok(Some(version)) if version == "9.9.9"), "{result:?}");
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(started.elapsed() >= Duration::from_secs(3260));
+            assert!(started.elapsed() <= Duration::from_secs(3600));
+            assert_eq!(std::fs::read(install).unwrap(), original);
+        }
+    };
+}
