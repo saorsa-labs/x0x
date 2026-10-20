@@ -104,6 +104,15 @@ pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/gossip").await
 }
 
+/// `x0x diagnostics upgrade` — GET /diagnostics/upgrade
+///
+/// Prints this daemon's version, update policy, and the version/policy
+/// digest (#1383). Local only: no update check runs, and nothing is
+/// announced on the wire.
+pub async fn diagnostics_upgrade(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/upgrade").await
+}
+
 /// `x0x diagnostics relay` — GET /diagnostics/relay
 ///
 /// Prints the ADR-0035 relay-decentralization metering page: the

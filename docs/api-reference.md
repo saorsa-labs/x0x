@@ -928,6 +928,7 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 | GET | `/sync/devices` | `x0x sync devices` | bearer | Owner device set + last-sync status |
 | POST | `/sync/devices/enroll` | `x0x sync enroll` | durable-owner (#446) | Owner-key-sign a DeviceEnrollment for a machine |
 | DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | durable-owner (#446) | Remove a machine from the device set |
+| GET | `/owner/machines` | `x0x owner machines` | owner (riders denied) | M1 machine census: enrolled devices + last-sync status + this machine's version/policy digest (#1383) |
 
 All three answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
@@ -957,6 +958,32 @@ omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
 lifetime; omitted = until deleted). Response: `machine_id`, `enrolled_at_ms`,
 `expires_at_ms` (null = no expiry), `device_count`. A persistence failure is a
 `500` — success is never reported on a swallowed write.
+
+**GET /owner/machines (#1383, M1 census)** — the owner's machine census over
+owner-sync. One row per enrolled device with its last-sync status; the local
+daemon's version and `version_policy_digest` (see
+[Upgrade](#upgrade)) ride in `this_machine`. Riders are denied on every
+`/owner/*` route; `409` when no owner identity is configured. Remote rows
+carry no version fields in v1 — per-machine digests arrive only with a later
+approved announcement change (local-only surface by David's 20 Oct 2026
+ruling).
+
+```json
+{
+  "ok": true,
+  "owner_user_id": "02492c…",
+  "this_machine": {
+    "machine_id": "e55130…",
+    "version": "0.48.1",
+    "version_policy_digest": "9f86d0…"
+  },
+  "machines": [
+    {"machine_id":"e55130…","enrolled_at_ms":1788090728080,
+     "expires_at_ms":null,"last_session_ms":null,"last_session_ok":null,
+     "is_this_machine":true}
+  ]
+}
+```
 
 **Enrollment is per-machine and must be bilateral.** A daemon dials sync only
 to machines in *its own* enrolled set (minus itself), and the receiving side
@@ -2593,6 +2620,35 @@ Run a command on **another** agent's machine. Disabled by default; every request
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart |
+| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
+
+**Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
+daemon's `current_version`, the full `update_policy` object
+(`enabled`, `rollout_window_minutes`, `stop_on_upgrade`,
+`fallback_check_interval_minutes`, `repo`, `include_prereleases`,
+`gossip_updates`), and `version_policy_digest` — SHA-256 (lower-case hex) of
+the `digest_input` string, which is returned verbatim:
+
+```
+x0x-version-policy-digest-v1|current_version=<version>|enabled=<bool>|rollout_window_minutes=<u64>|stop_on_upgrade=<bool>|fallback_check_interval_minutes=<u64>|repo=<owner/repo>|include_prereleases=<bool>|gossip_updates=<bool>
+```
+
+Field order is frozen with the `x0x-version-policy-digest-v1` tag; any change
+bumps the tag. This surface is local only by David's 20 Oct 2026 #1383
+ruling: no capability bit, no new field in signed machine announcements.
+Remote machines' digests reach an owner only through a later approved
+announcement change; until then the owner-side census is
+`GET /owner/machines` (see [Device sync](#device-sync-adr-0041-tier-1)).
+
+**Minimum supported version and support window (#1384, D35).** The same
+response carries `minimum_supported_version` and `support_window`. Both ship
+as explicit `null` — by David's 20 Oct 2026 ruling the fields exist now and
+the VALUES are set by David later; `null` is the published state ("no fleet
+minimum published yet"), not a missing field. They are not part of the
+digest preimage: they are centrally published fleet policy, not per-machine
+policy, so they add nothing to a machine-to-machine census comparison. When
+David sets them, the change is a value substitution here and in the daemon —
+no wire or code-shape change.
 
 **The serving daemon owns installation.** `x0x upgrade --apply` sends an
 authenticated `POST /upgrade/apply` through the normal daemon client, using

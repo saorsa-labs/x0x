@@ -611,6 +611,8 @@ enum OwnerSub {
         #[command(subcommand)]
         sub: Option<OwnerRidersSub>,
     },
+    /// M1 machine census over owner-sync (#1383): devices + local version digest.
+    Machines,
     /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
     Placement,
 }
@@ -856,6 +858,8 @@ enum DiagnosticsSub {
     Gossip,
     /// Print transport connection accounting (open/active/orphaned connections, #368).
     Transport,
+    /// Print local version + update-policy digest for the M1 census (#1383).
+    Upgrade,
     /// Print ADR-0035 relay metering: advert census, selection skew, inbound dialers.
     Relay,
     /// Print direct-message counters, fan-out health, and per-peer state.
@@ -2049,7 +2053,7 @@ fn main() -> ExitCode {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("manifest verification failed: {error}");
+                eprintln!("inert upgrade check failed: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -2358,6 +2362,7 @@ async fn run(
                 sub: Some(OwnerRidersSub::Revoke { token_id }),
             }) => commands::identity::owner_riders_revoke(&client, token_id).await,
             Some(OwnerSub::Placement) => commands::identity::owner_placement(&client).await,
+            Some(OwnerSub::Machines) => commands::identity::owner_machines(&client).await,
         },
         Commands::Move { sub } => match sub {
             MoveSub::Authorize {
@@ -2490,6 +2495,7 @@ async fn run(
             DiagnosticsSub::Ack => commands::network::diagnostics_ack(&client).await,
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
             DiagnosticsSub::Transport => commands::network::diagnostics_transport(&client).await,
+            DiagnosticsSub::Upgrade => commands::network::diagnostics_upgrade(&client).await,
             DiagnosticsSub::Relay => commands::network::diagnostics_relay(&client).await,
             DiagnosticsSub::Dm { agent } => {
                 commands::network::diagnostics_dm_for_agent(&client, agent.as_deref()).await

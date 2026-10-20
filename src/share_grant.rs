@@ -968,6 +968,10 @@ fn unix_now_secs() -> u64 {
 
 /// What the grants held here confer on one requester pair, for this
 /// daemon's own agent (ADR-0070 §2). The union over every matching grant.
+///
+/// Public fields only — Connect grant ids used for ADR-0074 live-stream
+/// labels live on the crate-private `GrantAccessEval` wrapper so
+/// downstream `GrantAccess { ..Default::default() }` literals keep compiling.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantAccess {
     /// `Dm`: DMs are accepted (`Unknown`/`AcceptWithFlag` → `Accept`).
@@ -981,6 +985,21 @@ pub struct GrantAccess {
     pub group_invite: bool,
     /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).
     pub call: bool,
+}
+
+/// Crate-private evaluation result: public access bits plus the Connect
+/// grant ids that cover a live forward (ADR-0074 §4 authority label).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GrantAccessEval {
+    pub access: GrantAccess,
+    pub connect_grant_ids: BTreeSet<[u8; 32]>,
+}
+
+impl std::ops::Deref for GrantAccessEval {
+    type Target = GrantAccess;
+    fn deref(&self) -> &GrantAccess {
+        &self.access
+    }
 }
 
 impl GrantAccess {
@@ -1005,6 +1024,18 @@ impl GrantAccess {
                 ShareCap::GroupInvite => self.group_invite = true,
                 ShareCap::Call => self.call = true,
             }
+        }
+    }
+}
+
+impl GrantAccessEval {
+    fn absorb(&mut self, caps: &BTreeSet<ShareCap>, grant_id: [u8; 32]) {
+        let conferred_connect = caps
+            .iter()
+            .any(|cap| matches!(cap, ShareCap::Connect { .. }));
+        self.access.absorb(caps);
+        if conferred_connect {
+            self.connect_grant_ids.insert(grant_id);
         }
     }
 }
@@ -1044,10 +1075,21 @@ pub async fn evaluate_grant_access(
         requester_machine,
         now_unix,
         None,
+        true,
     )
     .await
+    // Blocking path never returns Busy.
+    .unwrap_or_default()
+    .access
 }
 
+/// With `allow_network_lookup = false`, skip EvidenceV1 wait/lookup but still
+/// read local usable evidence (`try_usable`) so a reauth pass keeps
+/// authenticated bindings without network I/O.
+///
+/// Returns `Err(())` when `allow_network_lookup` is false and a `try_usable`
+/// evidence read is contended — callers that need Busy (gates / reauth) must
+/// not collapse this to empty access.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate_grant_access_with_evidence(
     store: &ShareGrantStore,
@@ -1058,21 +1100,23 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     requester_machine: &MachineId,
     now_unix: u64,
     evidence: Option<&crate::peer_evidence::EvidenceRuntime>,
-) -> GrantAccess {
+    allow_network_lookup: bool,
+) -> Result<GrantAccessEval, ()> {
     let evaluated_at = std::time::Instant::now();
-    let mut access = GrantAccess::default();
+    let mut access = GrantAccessEval::default();
     // A failed clock read maps to 0; never evaluate validity windows
     // against it (it could reactivate a long-expired grant). Fail closed.
     if now_unix == 0 {
-        return access;
+        return Ok(access);
     }
     let candidates = store.candidates_for_local_agent(now_unix);
     if candidates.is_empty() {
-        return access;
+        return Ok(access);
     }
-    if crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
-        .await
-        .is_none()
+    if allow_network_lookup
+        && crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
+            .await
+            .is_none()
     {
         if let Some(evidence) = evidence {
             if evidence.wait(0).await {
@@ -1083,18 +1127,22 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
         }
     }
     let now_unix = now_unix.saturating_add(evaluated_at.elapsed().as_secs());
+    let now_ms = now_unix.saturating_mul(1000);
+    // Local usable view: `Err(())` is lock contention on the nonblocking path.
+    let usable_view = |runtime: &crate::peer_evidence::EvidenceRuntime| -> Result<Option<_>, ()> {
+        if allow_network_lookup {
+            Ok(runtime.usable(*requester_agent, *requester_machine, now_ms))
+        } else {
+            runtime.try_usable(*requester_agent, *requester_machine, now_ms)
+        }
+    };
     match crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent).await {
         Some(bound) if bound == *requester_machine => {}
-        None if evidence
-            .and_then(|e| {
-                e.usable(
-                    *requester_agent,
-                    *requester_machine,
-                    now_unix.saturating_mul(1000),
-                )
-            })
-            .is_some() => {}
-        _ => return access,
+        None => match evidence.map(usable_view).transpose()?.flatten() {
+            Some(_) => {}
+            None => return Ok(access),
+        },
+        _ => return Ok(access),
     }
     let live: Vec<ShareGrant> = {
         let revoked = revocation_set.read().await;
@@ -1103,7 +1151,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             || revoked.is_machine_revoked(requester_machine)
             || revoked.is_binding_revoked(requester_agent, requester_machine)
         {
-            return access;
+            return Ok(access);
         }
         candidates
             .into_iter()
@@ -1113,22 +1161,19 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             .collect()
     };
     let cert = if live.iter().any(|g| matches!(g.grantee, Grantee::User(_))) {
-        discovery_cache
+        let from_discovery = discovery_cache
             .read()
             .await
             .get(requester_agent)
-            .and_then(|entry| entry.agent_certificate.clone())
-            .or_else(|| {
-                evidence
-                    .and_then(|e| {
-                        e.usable(
-                            *requester_agent,
-                            *requester_machine,
-                            now_unix.saturating_mul(1000),
-                        )
-                    })
-                    .and_then(|v| v.certificate.clone())
-            })
+            .and_then(|entry| entry.agent_certificate.clone());
+        match from_discovery {
+            Some(cert) => Some(cert),
+            None => evidence
+                .map(usable_view)
+                .transpose()?
+                .flatten()
+                .and_then(|v| v.certificate.clone()),
+        }
     } else {
         None
     };
@@ -1146,10 +1191,10 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             }),
         };
         if grantee_matches {
-            access.absorb(&grant.caps);
+            access.absorb(&grant.caps, grant.grant_id);
         }
     }
-    access
+    Ok(access)
 }
 
 /// The DM-acceptance input of ADR-0070 §2, handed to the DM inbox: a

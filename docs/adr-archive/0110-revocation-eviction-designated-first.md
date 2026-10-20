@@ -1,6 +1,7 @@
 # ADR 0110: Revocation Eviction, Designated First
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-20 13:50 BST by David Irvine (ruling pack of 20 Oct 2026, Group 2, #1357, option B). David accepted the mechanism. The timing values are the W3-H p99.9 measured numbers. The implementing PR body records them before any timing-dependent code merges. The fixed 2 s / 5 s values stay rejected (D69). The option B text in §2 and the capability bit numbers in §4 were changed in place in the accepting change. ADR 0109 (S3) was accepted in the same ruling. The status change was applied by Claude at his instruction.
 - **Date:** 2026-10-04
 - **Decision owners:** David Irvine
 - **Author:** Codex (GPT-6)
@@ -16,7 +17,7 @@ Verified agent revocation, signed self-leave and certificate expiry (D71) create
 The lowest eligible roster admin acts first (D74); others hand off the evidence and wait before staggered fallback.
 This proposal preserves removal authority and adds a capability-gated crypto-only transition for an already-Removed seat.
 It defines `certificate_rebind_v1`, which keeps a renewed seat without eviction (D129), and the exits when no eligible admin remains (D126).
-W, the completion bound, Δ and the restart sync wait come from W3-H harness p99.9 measurements (D69, D73).
+W, the completion bound, Δ and the restart sync wait come from W3-H harness p99.9 measurements (D69, D73). The implementing PR body records them (§2).
 
 ## Context
 
@@ -180,11 +181,11 @@ Only the designated admin starts a target exclusion before W expires.
 Other eligible admins are ranked from r = 1 in raw-ID order excluding the designated admin; rank r may start at **T_obs + W + (r − 1)·Δ**.
 Until then each shows `waiting_for_designated_admin`, naming the designated ID and its own fallback time.
 
-**Timing values come from measurement (D69, D73).**
-- **W and the completion bound:** each is set from the W3-H harness p99.9 of hand-off delivery-and-verification skew, plus persistence (fsync), CPU-stall and seal-and-propagation time, with margin (D69). For expiry triggers, W also covers inter-admin clock skew beyond τ (§1a). The draft's 2 s / 5 s suggestion is withdrawn.
+**Timing values come from measurement (D69, D73; option B, 20 Oct 2026).**
+- **W and the completion bound:** each is set from the W3-H harness p99.9 of hand-off delivery-and-verification skew, plus persistence (fsync), CPU-stall and seal-and-propagation time, with margin (D69). For expiry triggers, W also covers inter-admin clock skew beyond τ (§1a). The fixed 2 s / 5 s values stay rejected (D69).
 - **Δ:** at least the measured p99.9 seal-and-head-propagation time; the harness compares 2 s to 5 s (D73).
 - **Restart sync wait:** at least the measured p99.9 head catch-up, provisionally 10 s to 30 s (D73).
-- **Accept waits for these numbers.** `s4_timing_measurement` (Validation) produces them from main's existing primitives, so it does not need S4 code. The authors then propose each value with its margin, and David accepts the values with the ADR.
+- **The values are the W3-H p99.9 numbers.** `s4_timing_measurement` (Validation) produces them from main's existing primitives, so it does not need S4 code. The implementing PR body records each value with its margin. This record must be in place before any timing-dependent code merges. David accepted the mechanism without fixed values (option B, 20 Oct 2026). Do not use a fixed 2 s / 5 s value instead of a measured one (D69).
 
 Re-derive eligibility/ranks on a verified new roster without granting a fresh W; re-read head and evidence under the membership lock before **every** seal.
 No verified exclusion may have landed, and the replica must have completed a current catch-up round first.
@@ -255,7 +256,7 @@ New wire bodies use distinct typed prefixes (`X0XEVH1` for hand-off and `X0XCE1`
 A capable joiner shows `waiting_for_head_sync` while its gated catch-up crosses the gap. The admin that serves its join result also serves ADR 0108's `JoinPendingNotice` (§8, D117) with cause `crypto_only_gap`, a cause S4 registers against that section with no detail, on the joiner's existing join-result poll under ADR 0107's guard as amended by ADR 0108 §8 for a joiner that is not yet a member (D145). If the existing 120 s poll ends first, the joiner's `TimedOut` carries that cause, never a silent stop (D64). S4 defines no notice shape of its own; a joiner without 0108's notice capability keeps today's cause-free timeout, as 0108 states.
 Hand-off to an unsupported designated admin records the unsupported attempt and waits for W, showing `waiting_for_designated_admin` with cause `designated_admin_unsupported`; a compatible fallback can use legacy removal for a seated target.
 
-Each new bit's number is **allocated at acceptance, in acceptance order, as the next free bit in the README registry**. No number or README registry row is added now; the accepting PR allocates and fixes each name atomically.
+Each new bit's number was **allocated at acceptance, in acceptance order, as the next free bit in the README registry**. The accepting change (20 Oct 2026) added these rows to the registry in `docs/adr/README.md`: `eviction_handoff_v1` = bit 4, `crypto_exclusion_v1` = bit 5, `certificate_rebind_v1` = bit 6 (§4a) and `owner_recovery_v1` = bit 7 (§4b). S4 comes before S3 in 0088's order, so ADR 0109's two bits follow, as bits 8 and 9.
 Existing optional `peer_evidence_v1` remains under ADR 0089's budgets/authorization and establishes no committer authority.
 Keep current signature, parent-roster authority, prev-hash, owner mandate, fork, revocation and TreeKEM adoption-exclusion checks (`src/groups/state_commit.rs:850–913`) for every existing commit kind; keep last-admin checks (`735–746`). `CryptoExclusionV1` and admin-signed `CertificateRebindV1` are signed by an eligible admin and need no exception.
 
@@ -404,7 +405,7 @@ This ADR amends ADR 0088 §2 with three named entries, upon acceptance, each rul
 - Positive: legacy startup remains safe; crashes retain evidence without automatic stale-event publication.
 - Cost: an Active survivor whose current verified advert lacks `crypto_exclusion_v1` holds crypto-only exclusion at `waiting_for_receiver_upgrade` until upgrade or the hold no longer applies; seated-target revocations still use legacy `MemberRemoved`. A pinned device that stays online holds it forever (D76, §6). Timeout races still require containment.
 - Not protected: a legacy survivor that is offline, or whose advert has expired, when the crypto-only exclusion commits does not hold it. On return it cannot cross the chain and epoch gap, because the gated catch-up is never served to it. It stays stranded until it upgrades, which a pinned install may never do. A closed laptop during a self-leave is the typical case. David accepted this (D76); §6 records it.
-- Cost: measured fallback values (D69, D73) make removal slower than the withdrawn 2 s suggestion, and David's Accept waits for the harness numbers.
+- Cost: measured fallback values (D69, D73) make removal slower than the rejected 2 s value. Timing-dependent code waits until the implementing PR body records the harness numbers.
 - Positive: a routine renewal keeps the member in its groups through `certificate_rebind_v1`, signed by an admin or by the member's own agent (D129).
 - Positive: an `OwnerCertified` group or Home whose admins are all revoked recovers through its owner, and an every-admin-expired group recovers through a self-rebind (D126).
 - Cost: until its exit runs, a group with no eligible admin stops, and member sends are refused (D75). An ordinary group in that state ends for good (`group_admin_revoked`); members can only re-create it as a new group (D126).
@@ -455,9 +456,10 @@ Preserve 0106 intervening-event carry for legacy-understood events, with §4's g
 
 ## Rulings and open questions
 
-**Still blocking David's Accept:**
-- the measured values for W, the completion bound, Δ and the restart sync wait (D69, D73);
-- 0088's acceptance order: S4 is accepted after S2 (ADR 0108, which owns the cited §5a lifecycle, §8's `JoinPendingNotice` and its `no_eligible_admin` signer rule, and the D145 amendment of ADR 0107) and S8(a) (ADR 0107).
+**Acceptance (David, 20 Oct 2026 13:50 BST, Group 2, #1357, option B):** this ADR is Accepted.
+- The measured values for W, the completion bound, Δ and the restart sync wait (D69, D73) no longer block acceptance. They are the W3-H p99.9 numbers from `s4_timing_measurement`. The implementing PR body records each value with its margin before any timing-dependent code merges (§2). The fixed 2 s / 5 s values stay rejected (D69).
+- 0088's acceptance order is met: S2 (ADR 0108) and S8(a) (ADR 0107) are Accepted. ADR 0109 (S3) was accepted in the same ruling.
+- The capability bits are allocated: 4 to 7 (§4).
 
 No open question remains.
 
@@ -511,4 +513,4 @@ Only David Irvine marks this ADR Accepted; Accepted ADRs remain immutable.
 Acceptance order: 0088, then S2 and **S8(a) (ADR 0107)**, then S4 and S3, then S5, S6, S7. S8(b) (ADR 0114) follows S4, as 0107 specifies; “S8” in the earlier order means S8(a) (D65).
 Land S4 **Proposed on main** before governed code merges; David must accept S4 before its code merges, and each red W3-H case must be committed and shown red on main first.
 No D55 exception applies to S4. D63 permits drafting bound slices now, not skipping acceptance or harness-first.
-Use the single `named_groups.rs` code lane; acceptance allocates capability names/numbers together. Values and policy still open above remain recommendations until David rules them.
+Use the single `named_groups.rs` code lane. Acceptance allocated the capability names and numbers together (bits 4 to 7, §4). The timing values come from the W3-H measurement and go in the implementing PR body (§2).
