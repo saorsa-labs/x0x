@@ -103,8 +103,8 @@ const RESENDS_DONE: Duration = Duration::from_secs(90);
 const CATCHUP: Duration = Duration::from_secs(130);
 
 const FINAL_JOIN: &str = "j_active_at_the_authority_revision_and_epoch_never_marked_within_130s";
-const CAUSE_ALIGNED: &str = "J is never marked and is not active at the end: the aligned-clock \
-                             gap is queued, the r+1 page needs a TreeKEM group J does not have, \
+const CAUSE_ALIGNED: &str = "J is never marked and is not active at the end: the frontier gate \
+                             queued the aligned-clock add as revision_gap (its WARN line seen), \
                              and the join attempt ends with no typed state";
 
 /// The WARN line the frontier gate writes when it queues an event.
@@ -682,7 +682,7 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
                 "J marked: {j_marked:?}; at the end J {j_status_text}, J {j_text}; \
                  revision_gap queue WARN lines: {queued}"
             )),
-            j_marked.is_none() && !active,
+            j_marked.is_none() && !active && queued > 0,
             at(sim),
         );
     }
