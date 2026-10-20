@@ -10,22 +10,25 @@
 //! fails the eval instead of being papered over by prior knowledge.
 //!
 //! `agent_usability_first_actions_from_onboard_and_skill` is `#[ignore]`
-//! — it boots real x0xd daemons. Run it with:
-//! cargo nextest run --all-features --test agent_usability_eval -- -- --ignored
-//! CI runs it inside the isolated loopback runtime via
-//! scripts/ci/nextest-isolated.sh, in the planned `agent-usability` job.
-//! `agent_usability_docs_surface_the_first_actions` is fast and not
-//! ignored: it needs no daemon, so a SKILL.md or onboard-recipe
-//! regression fails the ordinary test suite too.
+//! — it boots real x0xd daemons. CI runs it inside the isolated loopback
+//! runtime via scripts/ci/nextest-isolated.sh, in the `agent-usability`
+//! job; run it locally with the same isolation, because plain
+//! `cargo nextest run` bypasses what daemon tests require:
+//! python3 scripts/dev/test-isolated.py nextest --all-features -- -E 'test(agent_usability)'
+//! The fast half needs no daemon and runs in the ordinary suite: the
+//! doc-surface check renders the REAL `x0x onboard` recipe through a
+//! loopback stub, the negative controls prove that mutated docs fail by
+//! name, and the timeout proof pins `run_cli`'s kill-and-reap duty.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use scripted_agent::{DocContext, InviterGroup, DM_PAYLOAD};
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 #[path = "harness/src/cluster.rs"]
 mod cluster;
@@ -35,59 +38,6 @@ mod cluster;
 // it in tests/agent_usability_eval/ keeps it out of test auto-discovery.
 #[path = "agent_usability_eval/scripted_agent.rs"]
 mod scripted_agent;
-
-/// `x0x onboard --card-file` stdout for a 64-hex inviter id. This is the
-/// exact markdown `recipe_text()` emits in src/cli/commands/onboard.rs
-/// with `Card::File("x0x-invite-card.txt")` — that function is the source
-/// of truth. When its output changes, change this sample in the same
-/// commit, or the doc-surface check scores a recipe that no longer ships.
-const ONBOARD_RECIPE_SAMPLE: &str = r#"# Join x0x and message me
-
-x0x is a post-quantum agent-to-agent network. I am agent ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12.
-Run these steps in a shell to install x0x, start it, and send me a direct message.
-
-## 1. Install x0xd + x0x (macOS / Linux, x64 or arm64)
-
-```sh
-curl -sfLO https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh
-cat install.sh   # review it first
-sh install.sh    # installs to ~/.local/bin and starts the daemon
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Ask your human before installing software or starting a background daemon. Windows: not yet supported natively; see https://github.com/saorsa-labs/x0x/issues/894
-
-## 2. Start the daemon (no-op if the installer already started it)
-
-```sh
-x0x health || x0x start
-```
-
-## 3. Import my card (adds me to your contacts)
-
-```sh
-x0x agent import "$(cat 'x0x-invite-card.txt')" --trust known
-```
-
-I will send you the file x0x-invite-card.txt separately; run this in the directory where you saved it.
-
-## 4. DM me back
-
-```sh
-x0x direct send ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12 "hello from <your name>"
-x0x direct events   # read replies (streams until Ctrl+C)
-```
-
-A 409 recipient_ack_semantics_unavailable means my capabilities have not reached you yet: retry in a minute, or add --no-durable-ack.
-
-## 5. Optional: let me import you
-
-```sh
-x0x agent card   # send me the x0x://agent/... link
-```
-
-Full reference: https://github.com/saorsa-labs/x0x/blob/main/SKILL.md
-"#;
 
 /// The #1174 eval: a fresh agent completes the three first actions from
 /// the onboard output and the core skill alone, and the inviter's daemon
@@ -233,10 +183,23 @@ async fn agent_usability_first_actions_from_onboard_and_skill() {
     }
 }
 
+/// Drain an exited child's output pipe into `bytes`. This is called only
+/// after `wait()` returned, so the pipe sits at EOF and the read cannot
+/// block.
+async fn read_child_pipe(pipe: &mut Option<impl AsyncRead + Unpin>, bytes: &mut Vec<u8>) {
+    if let Some(pipe) = pipe.as_mut() {
+        pipe.read_to_end(bytes)
+            .await
+            .unwrap_or_else(|e| panic!("read the CLI child's output pipe: {e}"));
+    }
+}
+
 /// Run the inviter's `x0x onboard --card-file <path>` against the
 /// inviter's daemon and return the recipe stdout. A nonzero exit, a hang
 /// past `ONBOARD_TIMEOUT`, or a missing card file is a fixture fault:
-/// panic with the captured stderr, never an agent failure.
+/// panic with the captured stderr, never an agent failure. The hang path
+/// kills AND reaps the CLI child before panicking, so the test process
+/// leaves no killed-but-unreaped child behind.
 async fn run_inviter_onboard(inviter: &cluster::AgentInstance, card_path: &Path) -> String {
     const ONBOARD_TIMEOUT: Duration = Duration::from_secs(60);
     // Format strings capture identifiers only; hoist the field access.
@@ -252,22 +215,47 @@ async fn run_inviter_onboard(inviter: &cluster::AgentInstance, card_path: &Path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // A dropped wait future (timeout) must not leave a hung CLI alive.
+        // Belt and braces for a panic that drops the handle mid-wait; the
+        // timeout branch below kills AND reaps explicitly.
         .kill_on_drop(true);
-    let child = command
+    let mut child = command
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {} onboard: {e}", env!("CARGO_BIN_EXE_x0x")));
-    let output = tokio::time::timeout(ONBOARD_TIMEOUT, child.wait_with_output())
-        .await
-        .unwrap_or_else(|_| {
+    // The pipes come out of the child before waiting, so `wait()` keeps
+    // borrowing the handle and the timeout branch can still kill and reap
+    // through it. Both outputs are far below pipe capacity, so the child
+    // cannot block on a full pipe while it is waited on.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    // The awaited result is bound before the match, so the `child.wait()`
+    // borrow inside the timeout future is over once an arm runs.
+    let outcome = tokio::time::timeout(ONBOARD_TIMEOUT, child.wait()).await;
+    let status = match outcome {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => panic!("wait for `x0x onboard`: {e}"),
+        Err(_) => {
+            child
+                .kill()
+                .await
+                .unwrap_or_else(|e| panic!("kill the hung `x0x onboard`: {e}"));
+            let reaped = child
+                .wait()
+                .await
+                .unwrap_or_else(|e| panic!("reap the killed `x0x onboard`: {e}"));
             panic!(
-                "`x0x onboard` did not finish within {ONBOARD_TIMEOUT:?} against {inviter_api_addr}"
-            )
-        })
-        .unwrap_or_else(|e| panic!("wait for `x0x onboard`: {e}"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+                "`x0x onboard` did not finish within {ONBOARD_TIMEOUT:?} against \
+                 {inviter_api_addr} (killed and reaped, exit: {reaped})"
+            );
+        }
+    };
+    // The child has exited, so both pipes sit at EOF and drain at once.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    read_child_pipe(&mut stdout_pipe, &mut stdout).await;
+    read_child_pipe(&mut stderr_pipe, &mut stderr).await;
+    let stderr = String::from_utf8_lossy(&stderr);
     assert!(
-        output.status.success(),
+        status.success(),
         "inviter `x0x onboard` failed (fixture fault, not an agent failure); stderr: {stderr}"
     );
     assert!(
@@ -275,7 +263,7 @@ async fn run_inviter_onboard(inviter: &cluster::AgentInstance, card_path: &Path)
         "`x0x onboard` exited 0 but wrote no card file at {}; stderr: {stderr}",
         card_path.display()
     );
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    String::from_utf8_lossy(&stdout).into_owned()
 }
 
 /// Consume an inviter-side response or declare a fixture fault. The
@@ -339,17 +327,282 @@ async fn member_state(
     })
 }
 
+// ── Fast no-daemon half ─────────────────────────────────────────────────────
+
+/// Inviter identity served by the stub API below: a 64-hex agent id and
+/// a card link that pass `x0x onboard`'s validation (the id must be 64
+/// hex chars; the link must start `x0x://agent/` and carry only
+/// alphanumerics or `:` `/` `-` `_`).
+const STUB_INVITER_AGENT_ID: &str =
+    "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
+const STUB_INVITER_CARD_LINK: &str = "x0x://agent/eyJhZ2VudF9pZCI6ImFiMTIifQ";
+
+/// Render the onboard recipe through the REAL shipped CLI binary: this is
+/// the actual renderer output (`recipe_text()` in
+/// src/cli/commands/onboard.rs reached through the shipped binary), so
+/// removing instructions from the shipped recipe turns the doc-surface
+/// test red instead of scoring a hand-copied sample. A loopback stub
+/// serves only the two GETs `x0x onboard` makes, binds `127.0.0.1:0`
+/// only, and is inert: no x0xd runs and nothing joins any network. A
+/// nonzero exit, a hang past `ONBOARD_TIMEOUT`, or a missing card file
+/// is a fixture fault, never an agent failure.
+async fn real_onboard_recipe() -> String {
+    const ONBOARD_TIMEOUT: Duration = Duration::from_secs(60);
+    let card_dir = tempfile::tempdir().expect("create temp dir for onboard card");
+    let card_path = card_dir.path().join("x0x-invite-card.txt");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the loopback stub API listener");
+    let port = listener
+        .local_addr()
+        .expect("read the stub listener's local address")
+        .port();
+    let stub = tokio::spawn(serve_onboard_requests(listener));
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_x0x"));
+    command
+        .arg("--api")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("onboard")
+        .arg("--card-file")
+        .arg(&card_path)
+        .env("X0X_API_TOKEN", "stub-token")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Belt and braces for a panic that drops the handle mid-wait; the
+        // timeout branch below kills AND reaps explicitly.
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {} onboard: {e}", env!("CARGO_BIN_EXE_x0x")));
+    // The pipes come out of the child before waiting, so `wait()` keeps
+    // borrowing the handle and the timeout branch can still kill and reap
+    // through it.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    // The awaited result is bound before the match, so the `child.wait()`
+    // borrow inside the timeout future is over once an arm runs.
+    let outcome = tokio::time::timeout(ONBOARD_TIMEOUT, child.wait()).await;
+    let status = match outcome {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => panic!("wait for `x0x onboard`: {e}"),
+        Err(_) => {
+            child
+                .kill()
+                .await
+                .unwrap_or_else(|e| panic!("kill the hung `x0x onboard`: {e}"));
+            let reaped = child
+                .wait()
+                .await
+                .unwrap_or_else(|e| panic!("reap the killed `x0x onboard`: {e}"));
+            panic!(
+                "`x0x onboard` did not finish within {ONBOARD_TIMEOUT:?} against the stub at \
+                 127.0.0.1:{port} (killed and reaped, exit: {reaped})"
+            );
+        }
+    };
+    // The CLI has exited, so the stub's work is done.
+    stub.abort();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    // The child has exited, so both pipes sit at EOF and drain at once.
+    read_child_pipe(&mut stdout_pipe, &mut stdout).await;
+    read_child_pipe(&mut stderr_pipe, &mut stderr).await;
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        status.success(),
+        "`x0x onboard` against the stub failed (fixture fault, not an agent failure); stderr: \
+         {stderr}"
+    );
+    assert!(
+        card_path.is_file(),
+        "`x0x onboard` exited 0 but wrote no card file at {}; stderr: {stderr}",
+        card_path.display()
+    );
+    String::from_utf8_lossy(&stdout).into_owned()
+}
+
+/// Serve the stub API: one connection at a time, forever — the caller
+/// aborts this task once the CLI has exited. An accept error ends the
+/// task; the CLI then fails its health probe and the test fails as a
+/// fixture fault instead of hanging.
+async fn serve_onboard_requests(listener: tokio::net::TcpListener) {
+    loop {
+        let Ok((mut stream, _peer)) = listener.accept().await else {
+            return;
+        };
+        // A connection that errors mid-request is closed and forgotten;
+        // the accept loop keeps serving.
+        let _ = serve_one_onboard_request(&mut stream).await;
+    }
+}
+
+/// Answer exactly one request. The head is read to its `\r\n\r\n`
+/// terminator (these requests carry no body) and only the request line is
+/// looked at; the response closes the connection.
+async fn serve_one_onboard_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..n]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    let path = head.split(' ').nth(1).unwrap_or_default();
+    let (status, body) = match path {
+        "/health" => ("200 OK", serde_json::json!({ "ok": true }).to_string()),
+        "/agent/card" => (
+            "200 OK",
+            serde_json::json!({
+                "card": { "agent_id": STUB_INVITER_AGENT_ID },
+                "link": STUB_INVITER_CARD_LINK
+            })
+            .to_string(),
+        ),
+        _ => ("404 Not Found", serde_json::json!({}).to_string()),
+    };
+    let content_length = body.len();
+    let response = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {content_length}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}"
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+/// The core SKILL.md, verbatim: the fast tests score the shipped bytes,
+/// not a copy.
+fn core_skill_text() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/SKILL.md"))
+        .expect("read SKILL.md")
+}
+
 /// Fast doc-presence check, no daemons: the decision tree in
-/// `scripted_agent` must find every fact it needs in the onboard recipe
-/// and the core SKILL.md. A doc regression then fails the ordinary test
-/// suite even outside the daemon job.
-#[test]
-fn agent_usability_docs_surface_the_first_actions() {
-    let skill = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/SKILL.md"))
-        .expect("read SKILL.md");
-    let missing = scripted_agent::check_doc_surface(ONBOARD_RECIPE_SAMPLE, &skill);
+/// `scripted_agent` must find every fact it needs in the REAL recipe the
+/// shipped CLI renders plus the core SKILL.md. A doc regression then
+/// fails the ordinary test suite even outside the daemon job.
+#[tokio::test]
+async fn agent_usability_docs_surface_the_first_actions() {
+    let recipe = real_onboard_recipe().await;
+    let skill = core_skill_text();
+    let missing = scripted_agent::check_doc_surface(&recipe, &skill);
     assert!(
         missing.is_empty(),
         "core docs no longer surface: {missing:?}"
+    );
+}
+
+/// Negative control from the review: changing the documented join method
+/// (POST mutated to DELETE on the join line only — the invite line keeps
+/// its POST) must surface as a named missing fact, not pass silently.
+#[tokio::test]
+async fn doc_surface_names_a_changed_join_method() {
+    let recipe = real_onboard_recipe().await;
+    let skill = core_skill_text();
+    let mutated = skill.replacen(
+        "-X POST \"http://$API/groups/join\"",
+        "-X DELETE \"http://$API/groups/join\"",
+        1,
+    );
+    // A silent no-op mutation would make this control worthless.
+    assert_ne!(
+        mutated, skill,
+        "the join-method mutation did not apply to SKILL.md as shipped"
+    );
+    let missing = scripted_agent::check_doc_surface(&recipe, &mutated);
+    assert!(
+        missing
+            .iter()
+            .any(|gap| gap.contains("the group-join endpoint (`POST /groups/join`)")),
+        "a changed join method must surface as the named join-endpoint fact; missing: {missing:?}"
+    );
+}
+
+/// Negative control from the review: replacing the documented identity
+/// command with one that does not exist must surface as a named missing
+/// fact, not pass silently.
+#[tokio::test]
+async fn doc_surface_names_a_nonexistent_identity_command() {
+    let recipe = real_onboard_recipe().await;
+    let skill = core_skill_text();
+    let mutated = skill.replacen(
+        "`x0x agent` prints your `agent_id`",
+        "`x0x identity-show` prints your `agent_id`",
+        1,
+    );
+    // A silent no-op mutation would make this control worthless.
+    assert_ne!(
+        mutated, skill,
+        "the identity-command mutation did not apply to SKILL.md as shipped"
+    );
+    let missing = scripted_agent::check_doc_surface(&recipe, &mutated);
+    assert!(
+        missing
+            .iter()
+            .any(|gap| gap.contains("`x0x agent` prints the caller's agent_id")),
+        "a nonexistent identity command must surface as the named identity fact; missing: \
+         {missing:?}"
+    );
+}
+
+/// Timeout discipline proof from the review: when a CLI call passes its
+/// deadline, `run_cli` must kill AND reap the child. The script ignores
+/// its arguments and sleeps 300 s, so only the deadline can end the call.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_cli_deadline_kills_and_reaps_the_child() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("create temp dir for the hang script");
+    let hang = dir.path().join("hang.sh");
+    std::fs::write(&hang, "#!/bin/sh\nsleep 300\n").expect("write the hang script");
+    std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755))
+        .expect("make the hang script executable");
+    let ctx = DocContext {
+        onboard_text: String::new(),
+        skill_text: String::new(),
+        inviter_card: String::new(),
+        my_api_addr: "127.0.0.1:1".into(),
+        my_api_token: "unused".into(),
+        cli_bin: hang,
+        inviter_group: InviterGroup {
+            group_id: String::new(),
+            invite: String::new(),
+        },
+    };
+    let started = Instant::now();
+    let out = scripted_agent::run_cli(&ctx, &["health"], Duration::from_secs(1)).await;
+    assert!(
+        !out.exit_ok,
+        "a hung CLI call must fold its deadline into a failed outcome"
+    );
+    let Some(pid) = out.pid else {
+        panic!("run_cli must report the OS pid of the child it spawned");
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "run_cli must not wait out the 300 s script; elapsed {:?} against a 1 s deadline",
+        started.elapsed()
+    );
+    // `kill -0` succeeds for a live process AND for a killed-but-unreaped
+    // zombie, so its failure proves the child was both killed and reaped:
+    // a plain drop would leave a live process; kill without reap would
+    // leave a zombie.
+    let pid_string = pid.to_string();
+    let probe = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(&pid_string)
+        .status()
+        .expect("run the `kill -0` probe");
+    assert!(
+        !probe.success(),
+        "`kill -0 {pid_string}` still succeeds: the hung child was neither fully killed nor \
+         reaped by run_cli's deadline path"
     );
 }

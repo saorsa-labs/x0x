@@ -10,11 +10,17 @@
 //! Doc-presence discipline is structural, not vibes: every command, flag,
 //! endpoint, header, error code and remediation the tree executes is first
 //! located verbatim in those texts through the [`FACTS`] table (see
-//! [`require`] and [`locate`]). A fact that cannot be located fails its
-//! step by name; that failure is the eval working, so no step papers over
-//! a gap with product knowledge. [`check_doc_surface`] runs the same
-//! table against the texts without executing anything, so a SKILL.md
-//! regression fails CI on its own.
+//! [`require`] and [`locate`]). Each needle states the COMPLETE command
+//! shape — the curl line with its `-X` method for REST facts, the
+//! `x0x ...` command words for CLI facts — and the tree DERIVES what it
+//! executes from the located needle ([`needle_rest`], [`needle_argv`]),
+//! so no step runs a second, hard-coded copy of a documented command. A
+//! doc that changes a documented method or swaps a command for one that
+//! does not exist therefore fails its step by name before anything runs;
+//! that failure is the eval working, so no step papers over a gap with
+//! product knowledge. [`check_doc_surface`] runs the same table against
+//! the texts without executing anything, so a SKILL.md regression fails
+//! CI on its own.
 //!
 //! The tree is deterministic: fixed payloads ([`DM_PAYLOAD`],
 //! [`SCRATCH_VALUE`]), fixed retry counts and intervals, no randomness.
@@ -34,11 +40,13 @@
 //! guessing.
 
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use base64::Engine;
 use reqwest::Method;
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 
 /// Fixed DM payload (step `send-dm`).
 pub const DM_PAYLOAD: &str = "hello from agent-usability-eval";
@@ -51,11 +59,24 @@ const OK_SIGNAL: &str = "ok: true";
 /// `agent_id` is `active`").
 const MEMBER_STATE_ACTIVE: &str = "active";
 
-/// Scratch store names, taken from the skill's own example so the command
-/// the tree runs is the command the docs show.
-const SCRATCH_STORE_NAME: &str = "scratch";
-const SCRATCH_TOPIC: &str = "scratch-pad";
-const SCRATCH_KEY: &str = "note";
+// Fact names the tree also derives executable command shapes from. Shared
+// consts keep the FACTS entries and the step lookups pointing at the same
+// fact, so a renamed fact fails loudly instead of silently skipping its
+// check.
+const FACT_HEALTH_CMD: &str = "a health-check CLI command (`x0x health`)";
+const FACT_IDENTITY_CMD: &str = "`x0x agent` prints the caller's agent_id";
+const FACT_DIRECT_SEND_CMD: &str =
+    "the direct-send CLI form (`x0x direct send <agent_id> \"hello\"`)";
+const FACT_STORE_CREATE_CMD: &str =
+    "the store-create CLI form (`x0x store create scratch scratch-pad`)";
+const FACT_JOIN_ENDPOINT: &str = "the group-join endpoint (`POST /groups/join`)";
+const FACT_MEMBERS_ENDPOINT: &str = "the group members endpoint (`GET /groups/<gid>/members`)";
+const FACT_STORE_PUT_ENDPOINT: &str = "the scratch put endpoint (`PUT /stores/scratch-pad/note`)";
+const FACT_STORE_READBACK_ENDPOINT: &str =
+    "the scratch readback endpoint (`GET /stores/scratch-pad/note`)";
+/// The one fact a step locates individually (to cite where the
+/// `--no-durable-ack` fallback was found).
+const FACT_NO_DURABLE_ACK: &str = "the documented non-durable resend flag (`--no-durable-ack`)";
 
 // Fixed budgets: identical on every run.
 const HEALTH_CALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -171,15 +192,11 @@ struct DocFact {
     needle: &'static str,
 }
 
-/// The one fact a step locates individually (to cite where the
-/// `--no-durable-ack` fallback was found).
-const FACT_NO_DURABLE_ACK: &str = "the documented non-durable resend flag (`--no-durable-ack`)";
-
 const FACTS: &[DocFact] = &[
     // health
     DocFact {
         step: "health",
-        fact: "a health-check CLI command (`x0x health`)",
+        fact: FACT_HEALTH_CMD,
         source: DocSource::Skill,
         needle: "x0x health",
     },
@@ -198,9 +215,12 @@ const FACTS: &[DocFact] = &[
     // identity
     DocFact {
         step: "identity",
-        fact: "`x0x agent` prints the caller's agent_id",
+        fact: FACT_IDENTITY_CMD,
+        // The needle pins the command itself, not just the promise: a doc
+        // that renames the command makes this fact a named gap before the
+        // step runs anything.
         source: DocSource::Skill,
-        needle: "prints your `agent_id`",
+        needle: "`x0x agent` prints your `agent_id`",
     },
     // import-inviter-card (which of the three recipe forms is present is
     // checked by the step itself, not by this always-required set)
@@ -213,7 +233,7 @@ const FACTS: &[DocFact] = &[
     // send-dm
     DocFact {
         step: "send-dm",
-        fact: "the direct-send CLI form (`x0x direct send <agent_id> \"hello\"`)",
+        fact: FACT_DIRECT_SEND_CMD,
         source: DocSource::Skill,
         needle: "x0x direct send <agent_id> \"hello\"",
     },
@@ -256,9 +276,12 @@ const FACTS: &[DocFact] = &[
     // join-group
     DocFact {
         step: "join-group",
-        fact: "the group-join endpoint (`POST /groups/join`)",
+        // The needle is the complete curl line with its method: a doc that
+        // changes the documented method (say POST to DELETE) makes this
+        // fact a named gap before the step executes anything.
+        fact: FACT_JOIN_ENDPOINT,
         source: DocSource::Skill,
-        needle: "/groups/join",
+        needle: "curl -X POST \"http://$API/groups/join\"",
     },
     DocFact {
         step: "join-group",
@@ -280,9 +303,11 @@ const FACTS: &[DocFact] = &[
     },
     DocFact {
         step: "join-group",
-        fact: "the group members endpoint (`GET /groups/<gid>/members`)",
+        // Plain `curl "URL"` (no `-X`) is the documented GET shape; the
+        // needle pins it so a rewritten method breaks the fact by name.
+        fact: FACT_MEMBERS_ENDPOINT,
         source: DocSource::Skill,
-        needle: "/groups/<gid>/members",
+        needle: "curl \"http://$API/groups/<gid>/members\"",
     },
     DocFact {
         step: "join-group",
@@ -293,13 +318,13 @@ const FACTS: &[DocFact] = &[
     // scratch-write
     DocFact {
         step: "scratch-write",
-        fact: "the store-create CLI form (`x0x store create scratch scratch-pad`)",
+        fact: FACT_STORE_CREATE_CMD,
         source: DocSource::Skill,
         needle: "x0x store create scratch scratch-pad",
     },
     DocFact {
         step: "scratch-write",
-        fact: "the scratch put endpoint (`PUT /stores/scratch-pad/note`)",
+        fact: FACT_STORE_PUT_ENDPOINT,
         source: DocSource::Skill,
         needle: "curl -X PUT \"http://$API/stores/scratch-pad/note\"",
     },
@@ -317,7 +342,7 @@ const FACTS: &[DocFact] = &[
     },
     DocFact {
         step: "scratch-write",
-        fact: "the scratch readback endpoint (`GET /stores/scratch-pad/note`)",
+        fact: FACT_STORE_READBACK_ENDPOINT,
         source: DocSource::Skill,
         needle: "curl \"http://$API/stores/scratch-pad/note\"",
     },
@@ -335,6 +360,12 @@ const IMPORT_FILE_FORM: &str = "x0x agent import \"$(cat '";
 const IMPORT_INLINE_FORM: &str = "x0x agent import '";
 const IMPORT_LOOKUP_FORM: &str = "x0x contacts add ";
 const IMPORT_FORMS: [&str; 3] = [IMPORT_FILE_FORM, IMPORT_INLINE_FORM, IMPORT_LOOKUP_FORM];
+/// The lookup recipe's discovery command line (`x0x agents find <id>`).
+const IMPORT_FIND_FORM: &str = "x0x agents find ";
+/// The recipe's note permitting repeated `x0x agents find` (discovery
+/// takes minutes); it extends the attempt budget but is not the command
+/// source.
+const IMPORT_FIND_NOTE: &str = "repeat `x0x agents find`";
 
 /// Fail with a named gap when `needle` is absent from `haystack`.
 ///
@@ -349,16 +380,21 @@ fn require<'a>(haystack: &'a str, needle: &str, fact: &str) -> Result<&'a str, S
     }
 }
 
+/// The FACTS entry named `name`. Panics on an unknown name — a code bug
+/// in this module, never an agent-action failure.
+fn fact_named(name: &str) -> &'static DocFact {
+    FACTS
+        .iter()
+        .find(|f| f.fact == name)
+        .expect("doc-fact name must exist in FACTS; keep step lookups in sync")
+}
+
 /// Locate fact `name` in the supplied texts through [`FACTS`].
 ///
 /// Returns where the needle was found (for the step's detail line) or the
-/// named-gap error. Panics only on an unknown fact name — a code bug in
-/// this module, never an agent-action failure.
+/// named-gap error.
 fn locate(onboard: &str, skill: &str, name: &str) -> Result<&'static str, String> {
-    let fact = FACTS
-        .iter()
-        .find(|f| f.fact == name)
-        .expect("doc-fact name must exist in FACTS; keep step lookups in sync");
+    let fact = fact_named(name);
     match fact.source {
         DocSource::Skill => require(skill, fact.needle, name).map(|_| "SKILL.md"),
         DocSource::Onboard => require(onboard, fact.needle, name).map(|_| "the onboard recipe"),
@@ -367,6 +403,80 @@ fn locate(onboard: &str, skill: &str, name: &str) -> Result<&'static str, String
             Err(_) => require(skill, fact.needle, name).map(|_| "SKILL.md"),
         },
     }
+}
+
+/// The argv (without the `x0x` program word) that a command needle
+/// prescribes, so the tree executes the command shape the texts state
+/// instead of a second, hard-coded copy. The leading command is the
+/// first backticked `x0x ...` span when the needle carries one, else the
+/// needle's leading bare words; derivation stops at the first operand
+/// marker (`<...>`, a quote, a `$` form) so callers append their own
+/// concrete operands. Panics on a needle with no `x0x` command — a
+/// FACTS-table bug, never an agent outcome.
+fn needle_argv(needle: &'static str) -> Vec<&'static str> {
+    let command = match needle.split('`').nth(1) {
+        Some(backticked) => backticked,
+        None => {
+            let cut = needle
+                .find(|c: char| ['<', '"', '\'', '$'].contains(&c))
+                .unwrap_or(needle.len());
+            needle[..cut].trim_end()
+        }
+    };
+    let words: Vec<&str> = command.split_whitespace().collect();
+    assert!(
+        words.first() == Some(&"x0x"),
+        "harness bug: doc-fact needle must lead with an `x0x` command: {needle}"
+    );
+    words[1..].to_vec()
+}
+
+/// The HTTP method and URL path that a REST fact's curl-line needle
+/// prescribes: an `-X <METHOD>` word states the method, a plain
+/// `curl "URL"` line is a GET. The path keeps the doc's placeholders
+/// (for example `<gid>`); the caller substitutes the concrete value.
+/// Panics on a needle that is not such a curl line — a FACTS-table bug,
+/// never an agent outcome.
+fn needle_rest(needle: &'static str) -> (Method, &'static str) {
+    let url = needle
+        .split('"')
+        .nth(1)
+        .unwrap_or_else(|| panic!("harness bug: REST needle must quote its URL: {needle}"));
+    let path = url.strip_prefix("http://$API").unwrap_or_else(|| {
+        panic!("harness bug: REST needle URL must start with http://$API: {needle}")
+    });
+    let method = match needle.find("-X ") {
+        Some(at) => {
+            let word = needle[at + 3..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| panic!("harness bug: a method word must follow `-X`: {needle}"));
+            Method::from_bytes(word.as_bytes()).unwrap_or_else(|_| {
+                panic!("harness bug: documented `-X` method must be valid HTTP: {needle}")
+            })
+        }
+        None => Method::GET,
+    };
+    (method, path)
+}
+
+/// Locate `fact` and derive the CLI argv its needle prescribes. The
+/// locate runs first, so a doc that swapped the command for a
+/// nonexistent one fails the step by name before anything executes.
+fn located_cli_argv(onboard: &str, skill: &str, fact: &str) -> Result<Vec<&'static str>, String> {
+    let entry = fact_named(fact);
+    locate(onboard, skill, fact)?;
+    Ok(needle_argv(entry.needle))
+}
+
+/// Locate `fact` and derive the REST method and path its needle
+/// prescribes. Same rule: the complete curl-line needle (method
+/// included) must be present first, so a doc that changed the
+/// documented method fails the step by name.
+fn located_rest(onboard: &str, skill: &str, fact: &str) -> Result<(Method, &'static str), String> {
+    let entry = fact_named(fact);
+    locate(onboard, skill, fact)?;
+    Ok(needle_rest(entry.needle))
 }
 
 /// Locate every fact registered for `step`, failing on the first miss.
@@ -402,11 +512,13 @@ pub fn check_doc_surface(onboard_text: &str, skill_text: &str) -> Vec<String> {
 
 // ── Execution helpers ──────────────────────────────────────────────────────
 
-/// Result of one CLI call: exit status folded to a bool plus the combined
-/// stdout and stderr (error paths print the typed code on stderr).
-struct CliOutcome {
-    exit_ok: bool,
-    output: String,
+/// Result of one CLI call: exit status folded to a bool, the combined
+/// stdout and stderr (error paths print the typed code on stderr), and
+/// the child's OS pid so tests can prove the deadline discipline.
+pub struct CliOutcome {
+    pub exit_ok: bool,
+    pub output: String,
+    pub pid: Option<u32>,
 }
 
 /// Run the `x0x` CLI against the fresh agent's own daemon, composing the
@@ -415,33 +527,85 @@ struct CliOutcome {
 /// The recipe's bare commands assume default-instance discovery; this
 /// daemon is not the default instance, and one call that omitted the form
 /// reached the machine's default daemon and was refused 401 with this
-/// daemon's token. A timeout or a non-zero exit is an outcome, not a
-/// panic; only a spawn failure (missing binary) is a harness fault.
-async fn run_cli(ctx: &DocContext, args: &[&str], timeout: Duration) -> CliOutcome {
+/// daemon's token. When the deadline passes, the child is killed AND
+/// reaped (a kill alone would leave a zombie holding the pid), so no
+/// process outlives its budget to overlap later steps or retries. A
+/// timeout or a non-zero exit is an outcome, not a panic; only a spawn
+/// failure (missing binary) is a harness fault.
+pub async fn run_cli(ctx: &DocContext, args: &[&str], timeout: Duration) -> CliOutcome {
     let mut cmd = tokio::process::Command::new(&ctx.cli_bin);
     cmd.arg("--api")
         .arg(&ctx.my_api_addr)
         .args(args)
-        .env("X0X_API_TOKEN", &ctx.my_api_token);
+        .env("X0X_API_TOKEN", &ctx.my_api_token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Backstop for panic paths; the timeout branch below kills and
+        // reaps explicitly.
+        .kill_on_drop(true);
     let printed = format!("x0x --api <addr> {}", args.join(" "));
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(out)) => {
-            let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
-            output.push('\n');
-            output.push_str(&String::from_utf8_lossy(&out.stderr));
-            CliOutcome {
-                exit_ok: out.status.success(),
-                output,
-            }
-        }
-        Ok(Err(error)) => panic!(
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => panic!(
             "harness fault: cannot run {} ({error})",
             ctx.cli_bin.display()
         ),
-        Err(_) => CliOutcome {
-            exit_ok: false,
-            output: format!("timed out after {timeout:?} running `{printed}`"),
-        },
+    };
+    let pid = child.id();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    // Drain both pipes while waiting, so a chatty child cannot block on a
+    // full pipe, and keep the Child handle so a timeout can still reach it.
+    let collected = async {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        // join! yields in argument order: stdout read, stderr read, exit
+        // status. The read results drop; a failed read leaves the partial
+        // buffer, which is all the detail line needs.
+        let (_, _, status) = tokio::join!(
+            async {
+                match stdout_pipe.as_mut() {
+                    Some(pipe) => pipe.read_to_end(&mut stdout).await,
+                    None => Ok(0),
+                }
+            },
+            async {
+                match stderr_pipe.as_mut() {
+                    Some(pipe) => pipe.read_to_end(&mut stderr).await,
+                    None => Ok(0),
+                }
+            },
+            child.wait(),
+        );
+        (status, stdout, stderr)
+    };
+    match tokio::time::timeout(timeout, collected).await {
+        Ok((Ok(status), stdout, stderr)) => {
+            let mut output = String::from_utf8_lossy(&stdout).into_owned();
+            output.push('\n');
+            output.push_str(&String::from_utf8_lossy(&stderr));
+            CliOutcome {
+                exit_ok: status.success(),
+                output,
+                pid,
+            }
+        }
+        Ok((Err(error), ..)) => panic!("harness fault: waiting for `{printed}` failed ({error})"),
+        Err(_) => {
+            // The deadline passed: kill, then reap. Nothing of the child
+            // outlives this call.
+            let _ = child.start_kill();
+            let reaped = child.wait().await;
+            CliOutcome {
+                exit_ok: false,
+                output: format!(
+                    "timed out after {timeout:?} running `{printed}`; killed and reaped the \
+                     child (pid {pid:?}, wait status {reaped:?})"
+                ),
+                pid,
+            }
+        }
     }
 }
 
@@ -589,20 +753,25 @@ pub async fn run(ctx: DocContext) -> ScoreCard {
 }
 
 /// Step `health`: the doc-located targeting form (`--api` + env
-/// `X0X_API_TOKEN`), then `x0x health` must exit 0 with the documented
-/// `ok: true` signal.
+/// `X0X_API_TOKEN`), then the doc-derived health command must exit 0
+/// with the documented `ok: true` signal.
 async fn step_health(ctx: &DocContext) -> StepResult {
     const STEP: &str = "health";
     if let Err(gap) = require_step_facts(&ctx.onboard_text, &ctx.skill_text, STEP) {
         return fail(STEP, gap);
     }
-    let out = run_cli(ctx, &["health"], HEALTH_CALL_TIMEOUT).await;
+    let argv = match located_cli_argv(&ctx.onboard_text, &ctx.skill_text, FACT_HEALTH_CMD) {
+        Ok(argv) => argv,
+        Err(gap) => return fail(STEP, gap),
+    };
+    let out = run_cli(ctx, &argv, HEALTH_CALL_TIMEOUT).await;
     if out.exit_ok && out.output.contains(OK_SIGNAL) {
         pass(
             STEP,
             format!(
-                "`x0x --api <addr> health` with X0X_API_TOKEN in the environment exited 0 and \
-                 printed the documented `{OK_SIGNAL}` signal"
+                "`x0x --api <addr> {}` with X0X_API_TOKEN in the environment exited 0 and \
+                 printed the documented `{OK_SIGNAL}` signal",
+                argv.join(" ")
             ),
         )
     } else {
@@ -618,20 +787,26 @@ async fn step_health(ctx: &DocContext) -> StepResult {
     }
 }
 
-/// Step `identity`: run `x0x agent`, parse the own 64-hex agent_id (needed
-/// by `join-group`). Returns the parsed id on success.
+/// Step `identity`: run the doc-derived identity command, parse the own
+/// 64-hex agent_id (needed by `join-group`). Returns the parsed id on
+/// success.
 async fn step_identity(ctx: &DocContext) -> (StepResult, Option<String>) {
     const STEP: &str = "identity";
     if let Err(gap) = require_step_facts(&ctx.onboard_text, &ctx.skill_text, STEP) {
         return (fail(STEP, gap), None);
     }
-    let out = run_cli(ctx, &["agent"], CLI_CALL_TIMEOUT).await;
+    let argv = match located_cli_argv(&ctx.onboard_text, &ctx.skill_text, FACT_IDENTITY_CMD) {
+        Ok(argv) => argv,
+        Err(gap) => return (fail(STEP, gap), None),
+    };
+    let out = run_cli(ctx, &argv, CLI_CALL_TIMEOUT).await;
     let parsed = hex64_after(&out.output, "agent_id").map(String::from);
     if out.exit_ok && parsed.is_some() {
         let detail = format!(
-            "parsed own agent_id {} (64-hex) from `x0x agent` output",
+            "parsed own agent_id {} (64-hex) from `x0x {}` output",
             // The guard above makes the empty default unreachable.
-            parsed.as_deref().unwrap_or_default()
+            parsed.as_deref().unwrap_or_default(),
+            argv.join(" ")
         );
         return (pass(STEP, detail), parsed);
     }
@@ -639,9 +814,10 @@ async fn step_identity(ctx: &DocContext) -> (StepResult, Option<String>) {
         fail(
             STEP,
             format!(
-                "could not parse a 64-hex agent_id from `x0x agent` output (exit ok: {}); \
+                "could not parse a 64-hex agent_id from `x0x {}` output (exit ok: {}); \
                  SKILL.md documents that the command prints the agent_id but not the output \
                  format; output: {}",
+                argv.join(" "),
                 out.exit_ok,
                 excerpt(&out.output)
             ),
@@ -678,12 +854,13 @@ async fn step_import_inviter_card(ctx: &DocContext) -> StepResult {
         } else {
             IMPORT_INLINE_FORM
         };
-        let out = run_cli(
-            ctx,
-            &["agent", "import", card, "--trust", "known"],
-            CLI_CALL_TIMEOUT,
-        )
-        .await;
+        // The subcommand words come from the located form; the card
+        // contents and the (separately located) `--trust known` flag are
+        // the operands.
+        let mut argv: Vec<&str> = needle_argv(form).into_iter().collect();
+        argv.push(card);
+        argv.extend(["--trust", "known"]);
+        let out = run_cli(ctx, &argv, CLI_CALL_TIMEOUT).await;
         return if out.exit_ok {
             pass(
                 STEP,
@@ -715,11 +892,20 @@ async fn step_import_inviter_card(ctx: &DocContext) -> StepResult {
                     .to_string(),
             );
         };
-        // The recipe note permits repeating `x0x agents find` (discovery
-        // takes minutes); retries run only when that note is present.
+        // The lookup recipe states the find command itself; the retry note
+        // (checked after it) only extends the attempt budget.
+        if !onboard.contains(IMPORT_FIND_FORM) {
+            return fail(
+                STEP,
+                "requires information not present in the onboard output or core skill: the \
+                 lookup form's `x0x agents find` command"
+                    .to_string(),
+            );
+        }
+        let find_argv = needle_argv(IMPORT_FIND_FORM);
         let retries = if require(
             onboard,
-            "repeat `x0x agents find`",
+            IMPORT_FIND_NOTE,
             "the documented retry rule for `x0x agents find`",
         )
         .is_ok()
@@ -731,12 +917,9 @@ async fn step_import_inviter_card(ctx: &DocContext) -> StepResult {
         let mut find_ok = false;
         let mut find_output = String::new();
         for attempt in 1..=retries {
-            let out = run_cli(
-                ctx,
-                &["agents", "find", inviter.as_str()],
-                FIND_CALL_TIMEOUT,
-            )
-            .await;
+            let mut argv: Vec<&str> = find_argv.clone();
+            argv.push(inviter.as_str());
+            let out = run_cli(ctx, &argv, FIND_CALL_TIMEOUT).await;
             if out.exit_ok {
                 find_ok = true;
                 break;
@@ -756,20 +939,10 @@ async fn step_import_inviter_card(ctx: &DocContext) -> StepResult {
                 ),
             );
         }
-        let out = run_cli(
-            ctx,
-            &[
-                "contacts",
-                "add",
-                inviter.as_str(),
-                "--trust",
-                "known",
-                "--label",
-                "inviter",
-            ],
-            CLI_CALL_TIMEOUT,
-        )
-        .await;
+        let mut contacts_argv: Vec<&str> = needle_argv(IMPORT_LOOKUP_FORM).into_iter().collect();
+        contacts_argv.push(inviter.as_str());
+        contacts_argv.extend(["--trust", "known", "--label", "inviter"]);
+        let out = run_cli(ctx, &contacts_argv, CLI_CALL_TIMEOUT).await;
         return if out.exit_ok {
             pass(
                 STEP,
@@ -796,12 +969,13 @@ async fn step_import_inviter_card(ctx: &DocContext) -> StepResult {
     )
 }
 
-/// Step `send-dm`: doc-located `x0x direct send <inviter> "<payload>"`.
-/// Documented remediation only: patience for the 409 (fixed retries in
-/// the fixed budget), then the `--no-durable-ack` fallback, and for the
-/// 404 the recipe's remedy (card import) is already `import-inviter-card`,
-/// so a 404 that never clears fails by name. Required success signal:
-/// exit 0 plus `ok: true` in the output.
+/// Step `send-dm`: the doc-derived `x0x direct send` form with the
+/// inviter id and the fixed payload as operands. Documented remediation
+/// only: patience for the 409 (fixed retries in the fixed budget), then
+/// the `--no-durable-ack` fallback, and for the 404 the recipe's remedy
+/// (card import) is already `import-inviter-card`, so a 404 that never
+/// clears fails by name. Required success signal: exit 0 plus `ok: true`
+/// in the output.
 async fn step_send_dm(ctx: &DocContext) -> StepResult {
     const STEP: &str = "send-dm";
     if let Err(gap) = require_step_facts(&ctx.onboard_text, &ctx.skill_text, STEP) {
@@ -815,17 +989,22 @@ async fn step_send_dm(ctx: &DocContext) -> StepResult {
                 .to_string(),
         );
     };
+    let send_argv: Vec<&str> =
+        match located_cli_argv(&ctx.onboard_text, &ctx.skill_text, FACT_DIRECT_SEND_CMD) {
+            Ok(argv) => {
+                let mut argv: Vec<&str> = argv.into_iter().collect();
+                argv.push(inviter.as_str());
+                argv.push(DM_PAYLOAD);
+                argv
+            }
+            Err(gap) => return fail(STEP, gap),
+        };
     let mut attempts = 0u32;
     let mut last = String::new();
     let deadline = tokio::time::Instant::now() + DM_TOTAL_BUDGET;
     while attempts < DM_RETRY_MAX {
         attempts += 1;
-        let out = run_cli(
-            ctx,
-            &["direct", "send", inviter.as_str(), DM_PAYLOAD],
-            DM_SEND_CALL_TIMEOUT,
-        )
-        .await;
+        let out = run_cli(ctx, &send_argv, DM_SEND_CALL_TIMEOUT).await;
         if out.exit_ok && out.output.contains(OK_SIGNAL) {
             return pass(
                 STEP,
@@ -858,18 +1037,9 @@ async fn step_send_dm(ctx: &DocContext) -> StepResult {
         // The texts must name the CLI flag spelling before it is used.
         return match locate(&ctx.onboard_text, &ctx.skill_text, FACT_NO_DURABLE_ACK) {
             Ok(found_in) => {
-                let out = run_cli(
-                    ctx,
-                    &[
-                        "direct",
-                        "send",
-                        inviter.as_str(),
-                        DM_PAYLOAD,
-                        "--no-durable-ack",
-                    ],
-                    DM_SEND_CALL_TIMEOUT,
-                )
-                .await;
+                let mut argv: Vec<&str> = send_argv.clone();
+                argv.push("--no-durable-ack");
+                let out = run_cli(ctx, &argv, DM_SEND_CALL_TIMEOUT).await;
                 if out.exit_ok && out.output.contains(OK_SIGNAL) {
                     pass(
                         STEP,
@@ -904,8 +1074,11 @@ async fn step_send_dm(ctx: &DocContext) -> StepResult {
     )
 }
 
-/// Step `join-group`: POST /groups/join with the invite body, then poll
-/// GET /groups/<gid>/members until this agent's entry is `active`.
+/// Step `join-group`: the doc-derived join call (`POST /groups/join`
+/// today — method and path both come from the located curl line) with
+/// the invite body, then the doc-derived members call (GET
+/// `/groups/<gid>/members` with `<gid>` substituted) until this agent's
+/// entry is `active`.
 async fn step_join_group(ctx: &DocContext, my_agent_id: Option<&str>) -> StepResult {
     const STEP: &str = "join-group";
     if let Err(gap) = require_step_facts(&ctx.onboard_text, &ctx.skill_text, STEP) {
@@ -919,10 +1092,15 @@ async fn step_join_group(ctx: &DocContext, my_agent_id: Option<&str>) -> StepRes
                 .to_string(),
         );
     };
+    let (join_method, join_path) =
+        match located_rest(&ctx.onboard_text, &ctx.skill_text, FACT_JOIN_ENDPOINT) {
+            Ok(rest) => rest,
+            Err(gap) => return fail(STEP, gap),
+        };
     let join = rest(
         ctx,
-        Method::POST,
-        "/groups/join",
+        join_method.clone(),
+        join_path,
         Some(json!({ "invite": ctx.inviter_group.invite })),
     )
     .await;
@@ -930,17 +1108,23 @@ async fn step_join_group(ctx: &DocContext, my_agent_id: Option<&str>) -> StepRes
         return fail(
             STEP,
             format!(
-                "POST /groups/join returned HTTP {} (body: {})",
+                "`{} {join_path}` returned HTTP {} (body: {})",
+                join_method,
                 join.status,
                 excerpt(&join.body)
             ),
         );
     }
-    let members_path = format!("/groups/{}/members", ctx.inviter_group.group_id);
+    let (members_method, members_path_doc) =
+        match located_rest(&ctx.onboard_text, &ctx.skill_text, FACT_MEMBERS_ENDPOINT) {
+            Ok(rest) => rest,
+            Err(gap) => return fail(STEP, gap),
+        };
+    let members_path = members_path_doc.replace("<gid>", &ctx.inviter_group.group_id);
     let deadline = tokio::time::Instant::now() + MEMBERS_POLL_BUDGET;
     let mut last_observed = String::from("no members entry for this agent yet");
     loop {
-        let members = rest(ctx, Method::GET, &members_path, None).await;
+        let members = rest(ctx, members_method.clone(), &members_path, None).await;
         let seated = if members.ok {
             member_state(&members.body, my_id)
         } else {
@@ -951,10 +1135,10 @@ async fn step_join_group(ctx: &DocContext, my_agent_id: Option<&str>) -> StepRes
                 return pass(
                     STEP,
                     format!(
-                        "POST /groups/join returned HTTP {}; GET /groups/<gid>/members \
-                             then listed this agent ({my_id}) with the documented \
-                             `{MEMBER_STATE_ACTIVE}` state",
-                        join.status
+                        "`{} {join_path}` returned HTTP {}; `{} {members_path}` then listed \
+                             this agent ({my_id}) with the documented `{MEMBER_STATE_ACTIVE}` \
+                             state",
+                        join_method, join.status, members_method
                     ),
                 );
             }
@@ -968,33 +1152,35 @@ async fn step_join_group(ctx: &DocContext, my_agent_id: Option<&str>) -> StepRes
     fail(
         STEP,
         format!(
-            "joined (POST /groups/join returned HTTP {}) but the member list never showed \
+            "joined (`{} {join_path}` returned HTTP {}) but the member list never showed \
              this agent with the documented `{MEMBER_STATE_ACTIVE}` state within the ~60 s \
              poll budget (last observed: {last_observed})",
-            join.status
+            join_method, join.status
         ),
     )
 }
 
-/// Step `scratch-write`: create the store via the CLI, PUT the fixed value
-/// via REST, then GET the readback and decode it. Success = the readback
-/// decodes to exactly [`SCRATCH_VALUE`].
+/// Step `scratch-write`: create the store via the doc-derived CLI
+/// command, PUT the fixed value via the doc-derived path and method,
+/// then GET the readback and decode it. Success = the readback decodes
+/// to exactly [`SCRATCH_VALUE`].
 async fn step_scratch_write(ctx: &DocContext) -> StepResult {
     const STEP: &str = "scratch-write";
     if let Err(gap) = require_step_facts(&ctx.onboard_text, &ctx.skill_text, STEP) {
         return fail(STEP, gap);
     }
-    let create = run_cli(
-        ctx,
-        &["store", "create", SCRATCH_STORE_NAME, SCRATCH_TOPIC],
-        CLI_CALL_TIMEOUT,
-    )
-    .await;
+    let create_argv =
+        match located_cli_argv(&ctx.onboard_text, &ctx.skill_text, FACT_STORE_CREATE_CMD) {
+            Ok(argv) => argv,
+            Err(gap) => return fail(STEP, gap),
+        };
+    let create = run_cli(ctx, &create_argv, CLI_CALL_TIMEOUT).await;
     if !create.exit_ok {
         return fail(
             STEP,
             format!(
-                "`x0x store create {SCRATCH_STORE_NAME} {SCRATCH_TOPIC}` failed; output: {}",
+                "`x0x {}` failed; output: {}",
+                create_argv.join(" "),
                 excerpt(&create.output)
             ),
         );
@@ -1002,11 +1188,15 @@ async fn step_scratch_write(ctx: &DocContext) -> StepResult {
     // Standard alphabet, unwrapped: SKILL.md warns GNU/BSD base64 wrap
     // long lines (`tr -d '\n'`); a wrapped value breaks the JSON body.
     let value_b64 = base64::engine::general_purpose::STANDARD.encode(SCRATCH_VALUE.as_bytes());
-    let key_path = format!("/stores/{SCRATCH_TOPIC}/{SCRATCH_KEY}");
+    let (put_method, put_path) =
+        match located_rest(&ctx.onboard_text, &ctx.skill_text, FACT_STORE_PUT_ENDPOINT) {
+            Ok(rest) => rest,
+            Err(gap) => return fail(STEP, gap),
+        };
     let put = rest(
         ctx,
-        Method::PUT,
-        &key_path,
+        put_method.clone(),
+        put_path,
         Some(json!({ "value": value_b64, "content_type": "text/plain" })),
     )
     .await;
@@ -1014,18 +1204,28 @@ async fn step_scratch_write(ctx: &DocContext) -> StepResult {
         return fail(
             STEP,
             format!(
-                "PUT {key_path} returned HTTP {} (body: {})",
+                "`{} {put_path}` returned HTTP {} (body: {})",
+                put_method,
                 put.status,
                 excerpt(&put.body)
             ),
         );
     }
-    let get = rest(ctx, Method::GET, &key_path, None).await;
+    let (get_method, get_path) = match located_rest(
+        &ctx.onboard_text,
+        &ctx.skill_text,
+        FACT_STORE_READBACK_ENDPOINT,
+    ) {
+        Ok(rest) => rest,
+        Err(gap) => return fail(STEP, gap),
+    };
+    let get = rest(ctx, get_method.clone(), get_path, None).await;
     if !get.ok {
         return fail(
             STEP,
             format!(
-                "GET {key_path} readback returned HTTP {} (body: {})",
+                "`{} {get_path}` readback returned HTTP {} (body: {})",
+                get_method,
                 get.status,
                 excerpt(&get.body)
             ),
@@ -1035,15 +1235,15 @@ async fn step_scratch_write(ctx: &DocContext) -> StepResult {
         Some(bytes) if bytes == SCRATCH_VALUE.as_bytes() => pass(
             STEP,
             format!(
-                "store created via CLI (exit 0); PUT {key_path} returned HTTP {}; GET readback \
-                 decoded to exactly the scratch value ({SCRATCH_VALUE:?})",
-                put.status
+                "store created via CLI (exit 0); `{} {put_path}` returned HTTP {}; `{} \
+                 {get_path}` readback decoded to exactly the scratch value ({SCRATCH_VALUE:?})",
+                put_method, put.status, get_method
             ),
         ),
         Some(other) => fail(
             STEP,
             format!(
-                "GET readback decoded to {:?}, expected {SCRATCH_VALUE:?}",
+                "readback decoded to {:?}, expected {SCRATCH_VALUE:?}",
                 String::from_utf8_lossy(&other)
             ),
         ),

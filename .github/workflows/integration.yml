@@ -145,7 +145,7 @@ jobs:
         run: |
           mkdir -p .deps
           git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
-          git clone --depth 1 https://github.com/saorsa-gossip .deps/saorsa-gossip || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
           ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
