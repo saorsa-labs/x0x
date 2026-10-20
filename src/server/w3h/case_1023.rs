@@ -40,33 +40,67 @@
 //!   again after A's restart (A's discovery cache is in memory, so A must
 //!   learn O's announce again from an online node).
 //! - t1: the drop is lifted, then O and every X device go offline (in the
-//!   control, one X device stays online). A restarts on its own
+//!   one-holder control, one X device stays online). A restarts on its own
 //!   directories and dials J. J announces again, and the case waits until
 //!   A verifies J's machine binding: A drops an unverified join message
 //!   before its seal (run 39371831602). Evidence: after the restart A is
 //!   still an admin and every eligible holder (an active member that
-//!   holds the bytes) is offline. In the red test A's digest-only seats
-//!   are the same and A holds no bytes for them. In the control the online
+//!   holds the bytes) is offline. In the two offline tests A's
+//!   digest-only seats are the same and A holds no bytes for them. In the
+//!   control the online
 //!   holder can answer A before t2 (run 39380658640: A held 1 of 1
 //!   missing digests). That is the behaviour that the control proves. So
 //!   the control requires only that A's digest-only seats are a subset of
 //!   the seats before the restart, and that A's bytes are for digests that
 //!   the online holder holds.
-//! - t2: A mints J's invite and J redeems it. Desired (ADR 0111 S5,
-//!   fetch by hash from any holder): A seals and J becomes Active. On
-//!   `main`, A's seal refuses with `OwnerCertMemberPending` naming exactly
-//!   A's digest-only seats. A's seal-time fetch has no online holder to
-//!   answer it, so the refusal repeats until the join budget expires.
+//! - t2: A mints J's invite and J redeems it. In the control, the case
+//!   waits up to 180 s for J to become Active. With every holder offline,
+//!   ADR 0088 (§1 L3, §2 item 8) says the fetch waits until one holder is
+//!   online. The wait is not terminal. It stays retryable, and its state is
+//!   typed, visible and names what it waits for. ADR 0111 §8 gives the
+//!   states: the authority reports `evidence_pending` for each missing
+//!   digest, and a capable joiner shows `awaiting_evidence` with the same
+//!   digests. The joiner's attempt does not end at its 120 s poll deadline
+//!   (D64). So the case polls every 5 s for 150 s (`HOLDER_GAP`). It scans
+//!   `/groups/{gid}` at A for the typed wait, and `/groups/{gid}` and
+//!   `/groups/{gid}/join-status` at J. It reads A's roster from
+//!   `/groups/{gid}/members` but does not scan it, because it lists seat
+//!   digests. One body shows a typed wait when it contains the state name
+//!   and names every missing digest (as hex or base64). An S5
+//!   implementation must expose the typed states on one of the scanned
+//!   routes. Evidence (red test only): J is not admitted during the gap,
+//!   and A holds none of the missing bytes at its end. On `main`, A's seal refuses
+//!   with `OwnerCertMemberPending` naming exactly A's digest-only seats,
+//!   A and J show no typed state, and J's attempt ends `timed_out` at
+//!   120 s.
+//! - After the gap (red test only, ADR 0111 H3): the X device that holds
+//!   every missing certificate comes back and A dials it. If J's attempt
+//!   is still pending, the attempt must resume by itself. Otherwise J
+//!   redeems the same invite again. A must hold every missing certificate
+//!   within 60 s, and J must become Active within 120 s.
 //!
-//! Two tests share the scenario:
-//! - `w3h_1023_red_baseline_restart_all_holders_offline_join_stays_pending`:
-//!   every eligible holder is offline. RED on `main`. The cause is the
-//!   `OwnerCertMemberPending` refusal above.
+//! Three tests share the scenario:
+//! - `w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes`:
+//!   every eligible holder is offline, then one returns. FINAL
+//!   `typed_retryable_wait_then_j_active_after_holder_returns` needs A's
+//!   typed `evidence_pending`, J's typed `awaiting_evidence`, no end of J's
+//!   attempt during the gap, A's bytes within 60 s of the return and J
+//!   Active after it. RED on `main`. The cause is the
+//!   `OwnerCertMemberPending` refusal above, with no typed wait at A or J.
 //! - `w3h_1023_restart_one_holder_online_admits`: the control. One X
 //!   device that holds every missing certificate stays online after A's
 //!   restart. A gets the bytes from it and J is admitted. GREEN. The
-//!   restart and the setup are the same in both tests, so only the offline
+//!   restart and the setup are the same in all tests, so only the offline
 //!   holders make the red case red.
+//! - `w3h_1023_control_holders_never_return_fail_closed`: every holder
+//!   stays offline for 330 s (`NEVER_WINDOW`, the span of the red test).
+//!   FINAL `fail_closed_never_admitted_never_silently_dropped`: J is never
+//!   admitted and A never holds any of the missing bytes (both fail FINAL,
+//!   not INFRA, in this test), and at every poll J's
+//!   join-status shows a pending attempt or a typed outcome (`timed_out`,
+//!   or a refusal). ADR 0088 L4 keeps the wait fail-closed. GREEN on
+//!   `main` (pending, then `timed_out` at 120 s) and GREEN under a correct
+//!   S5 (pending throughout).
 
 #![cfg(test)]
 
@@ -88,17 +122,47 @@ const JOIN_BUDGET: Duration = Duration::from_secs(180);
 const SETTLE: Duration = Duration::from_secs(10);
 const SEAL_REFUSAL: &str = "failed to seal authoritative add";
 const PENDING_CAUSE: &str = "pending certificate resolution";
-const FINAL: &str = "j_active_within_180s_after_a_restart";
+/// How often the case reads the wait states of A and J.
+const POLL: Duration = secs(5);
+/// How long every holder stays offline after J's join: past J's 120 s
+/// join-result poll deadline (ADR 0111 §8, D64).
+const HOLDER_GAP: Duration = secs(150);
+/// ADR 0111 H3: A holds the certificates within 60 s of the holder's start.
+const RETURN_FETCH: Duration = secs(60);
+/// How long J has to become Active after A holds the certificates.
+const RETURN_ADMIT: Duration = secs(120);
+/// The never-return control covers the same span as the red test.
+const NEVER_WINDOW: Duration = HOLDER_GAP
+    .saturating_add(RETURN_FETCH)
+    .saturating_add(RETURN_ADMIT);
+/// J's `join_state` while its attempt waits for the authority.
+const JOIN_PENDING: &str = "pending_authority_commit";
 /// The #946 answer domain (`seat_cert_fetch::GROUP_CERT_FETCH_RESPONSE_DOMAIN`).
 /// It leads the pubsub payload in clear.
 const FETCH_RESPONSE_DOMAIN: &[u8] = b"x0x/group-cert-fetch-response-v1\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
-    /// O and every X device are offline after A's restart.
-    AllHoldersOffline,
+    /// O and every X device are offline after A's restart. After
+    /// `HOLDER_GAP` the X device that holds every missing certificate
+    /// comes back.
+    HolderReturns,
     /// One X device that holds every missing certificate stays online.
     OneHolderOnline,
+    /// O and every X device are offline after A's restart and stay
+    /// offline.
+    HoldersNeverReturn,
+}
+
+impl Arm {
+    /// The name of this arm's desired-behaviour assertion.
+    fn final_name(self) -> &'static str {
+        match self {
+            Arm::HolderReturns => "typed_retryable_wait_then_j_active_after_holder_returns",
+            Arm::OneHolderOnline => "j_active_within_180s_after_a_restart",
+            Arm::HoldersNeverReturn => "fail_closed_never_admitted_never_silently_dropped",
+        }
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -601,6 +665,263 @@ fn refused_members(text: &str) -> Option<Vec<String>> {
     Some(members)
 }
 
+/// The forms in which a read route can name `digest`. The S5 encoding is
+/// not fixed, so lowercase hex, uppercase hex and each base64 alphabet of
+/// the 32 bytes count.
+fn digest_forms(digest: &str) -> Vec<String> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+    let mut forms = vec![digest.to_ascii_lowercase(), digest.to_ascii_uppercase()];
+    if let Some(bytes) = parse_digest(digest) {
+        for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+            forms.push(engine.encode(bytes));
+        }
+    }
+    forms
+}
+
+/// Whether `body` shows the typed state `marker` and names every digest.
+fn names_every(body: &serde_json::Value, marker: &str, digests: &[String]) -> bool {
+    let text = body.to_string();
+    text.contains(marker)
+        && digests
+            .iter()
+            .all(|digest| digest_forms(digest).iter().any(|form| text.contains(form)))
+}
+
+/// One read of the wait states of A and J during the holder gap.
+struct Snapshot {
+    /// A shows `evidence_pending` naming every missing digest.
+    a_typed: bool,
+    /// J shows `awaiting_evidence` naming every missing digest.
+    j_typed: bool,
+    a_lists_j: bool,
+    j_active: bool,
+    /// J's `join_state`; `None` when the join-status body has none.
+    join_state: Option<String>,
+    /// J's join-status answered 404: the local stub is gone.
+    stub_gone: bool,
+    /// J's `last_join_outcome`, with its reason when it has one.
+    outcome: Option<String>,
+}
+
+/// Read the group routes at A and J once. A 404 counts as "nothing
+/// shown"; a failed request is an error.
+async fn snapshot(sim: &Sim, gid: &str, digests: &[String]) -> Result<Snapshot> {
+    let j_hex = sim.agent_hex("J")?;
+    // A's typed wait is read from `/groups/{gid}` only: the members body
+    // lists seat digests, so a marker elsewhere in it would match falsely.
+    let (_, group) = sim
+        .request("A", Method::GET, &format!("/groups/{gid}"), None)
+        .await?;
+    let a_typed = names_every(&group, "evidence_pending", digests);
+    let (status, members) = sim
+        .request("A", Method::GET, &format!("/groups/{gid}/members"), None)
+        .await?;
+    ensure!(
+        status.is_success(),
+        "A GET /groups/{gid}/members: {status} {members}"
+    );
+    let a_lists_j = members["members"]
+        .as_array()
+        .with_context(|| format!("A GET /groups/{gid}/members: no members array: {members}"))?
+        .iter()
+        .any(|row| {
+            row["agent_id"]
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&j_hex))
+        });
+    let (status, group) = sim
+        .request("J", Method::GET, &format!("/groups/{gid}"), None)
+        .await?;
+    let j_active = status.is_success() && group["membership_state"] == "active";
+    let (status, join) = sim
+        .request(
+            "J",
+            Method::GET,
+            &format!("/groups/{gid}/join-status"),
+            None,
+        )
+        .await?;
+    let last = &join["last_join_outcome"];
+    let outcome = last["outcome"]
+        .as_str()
+        .map(|outcome| match last["reason"].as_str() {
+            Some(reason) => format!("{outcome} ({reason})"),
+            None => outcome.to_string(),
+        });
+    Ok(Snapshot {
+        a_typed,
+        j_typed: names_every(&group, "awaiting_evidence", digests)
+            || names_every(&join, "awaiting_evidence", digests),
+        a_lists_j,
+        j_active,
+        join_state: join["join_state"].as_str().map(str::to_string),
+        stub_gone: status == StatusCode::NOT_FOUND,
+        outcome,
+    })
+}
+
+/// What the polls saw, as times since J's join call.
+#[derive(Default)]
+struct WaitWindow {
+    polls: usize,
+    a_typed_at: Option<Duration>,
+    j_typed_at: Option<Duration>,
+    /// The first poll at which J's attempt had ended, and how.
+    j_ended: Option<(Duration, String)>,
+    /// The first poll at which A listed J or J was active.
+    admitted: Option<(Duration, String)>,
+    /// The first poll at which J showed neither a pending attempt nor a
+    /// typed outcome.
+    silent_drop: Option<(Duration, String)>,
+    /// The first poll at which A held any missing digest, and how many.
+    a_held: Option<(Duration, usize)>,
+    /// At the last poll, J's attempt was pending with no outcome.
+    j_pending_now: bool,
+    /// J's state at each change.
+    timeline: Vec<(Duration, String)>,
+}
+
+impl WaitWindow {
+    fn record(&mut self, since: Duration, snap: &Snapshot) {
+        self.polls += 1;
+        if snap.a_typed {
+            self.a_typed_at.get_or_insert(since);
+        }
+        if snap.j_typed {
+            self.j_typed_at.get_or_insert(since);
+        }
+        if (snap.a_lists_j || snap.j_active) && self.admitted.is_none() {
+            self.admitted = Some((
+                since,
+                format!("A lists J: {}; J active: {}", snap.a_lists_j, snap.j_active),
+            ));
+        }
+        // A correct S5 joiner may report its typed wait as the join state
+        // itself (ADR 0111 §8), so that state also counts as pending.
+        let pending = snap.j_typed
+            || snap
+                .join_state
+                .as_deref()
+                .is_some_and(|state| state == JOIN_PENDING || state.contains("awaiting_evidence"));
+        self.j_pending_now = pending && snap.outcome.is_none();
+        let state = format!(
+            "join_state={} outcome={}{}",
+            match (&snap.join_state, snap.stub_gone) {
+                (Some(state), _) => state.as_str(),
+                (None, true) => "stub gone (404)",
+                (None, false) => "none",
+            },
+            snap.outcome.as_deref().unwrap_or("none"),
+            if snap.j_active { " active" } else { "" }
+        );
+        if !snap.j_active {
+            if self.j_ended.is_none() && (snap.outcome.is_some() || !pending) {
+                self.j_ended = Some((since, state.clone()));
+            }
+            if self.silent_drop.is_none() && !pending && snap.outcome.is_none() {
+                self.silent_drop = Some((since, state.clone()));
+            }
+        }
+        if self.timeline.last().map(|(_, last)| last) != Some(&state) {
+            self.timeline.push((since, state));
+        }
+    }
+
+    /// Poll every `POLL` until `until` has passed since `joined_at`.
+    async fn poll_until(
+        &mut self,
+        sim: &Sim,
+        gid: &str,
+        digests: &[String],
+        joined_at: Duration,
+        until: Duration,
+    ) -> Result<()> {
+        loop {
+            let since = sim.fabric().now().saturating_sub(joined_at);
+            let snap = sim
+                .within(
+                    &format!("read the wait states at t2+{}s", since.as_secs()),
+                    secs(10),
+                    snapshot(sim, gid, digests),
+                )
+                .await??;
+            self.record(since, &snap);
+            let (_, held) = held_digests(sim, "A", gid, digests).await?;
+            if !held.is_empty() && self.a_held.is_none() {
+                self.a_held = Some((since, held.len()));
+            }
+            if since >= until {
+                return Ok(());
+            }
+            sim.within(
+                "wait for the next poll",
+                POLL + secs(1),
+                tokio::time::sleep(POLL),
+            )
+            .await?;
+        }
+    }
+
+    fn timeline(&self) -> String {
+        self.timeline
+            .iter()
+            .map(|(since, state)| format!("t2+{}s {state}", since.as_secs()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn at_text(at: Option<Duration>) -> String {
+    at.map_or("never".to_string(), |at| format!("t2+{}s", at.as_secs()))
+}
+
+/// A dials `label` directly. A's bootstrap peer is O, which is offline.
+async fn a_dials(sim: &Sim, label: &str) -> Result<()> {
+    let network = sim
+        .state("A")?
+        .agent
+        .network()
+        .cloned()
+        .context("A has no network")?;
+    let addr = super::sim_addr(sim.node_index(label)?)?;
+    sim.within(
+        &format!("A dials {label}"),
+        secs(10),
+        network.connect_addr(addr),
+    )
+    .await?
+    .map_err(|error| anyhow!("A could not dial {label}: {error}"))?;
+    Ok(())
+}
+
+/// A's seal refusal for THIS group and THIS joiner, at or after J's first
+/// verified request, naming exactly `want` (A's digest-only seats).
+fn seal_refusal(
+    sim: &Sim,
+    gid: &str,
+    want: &[String],
+    first_request: Option<Duration>,
+) -> Result<Option<String>> {
+    let j_hex = sim.agent_hex("J")?;
+    let j_tokens = [
+        crate::logging::LogHexId::agent(j_hex.as_str()).to_string(),
+        crate::logging::LogHexId::agent(j_hex.to_uppercase().as_str()).to_string(),
+    ];
+    Ok(sim
+        .logs_containing(&[SEAL_REFUSAL, PENDING_CAUSE, &format!("group {gid}")])
+        .into_iter()
+        .filter(|log| {
+            j_tokens
+                .iter()
+                .any(|token| log.text.contains(&format!("member={token}")))
+        })
+        .filter(|log| first_request.is_some_and(|first| log.at >= first))
+        .find(|log| refused_members(&log.text).as_deref() == Some(want))
+        .map(|log| log.text))
+}
+
 async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     // t0: O's owner-certified group G with X1–X3. A and J start after the
@@ -748,11 +1069,17 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             .get(label)
             .is_some_and(|(active, held)| *active && held.len() == missing.len())
     });
-    let stays_online = match arm {
-        Arm::AllHoldersOffline => None,
-        Arm::OneHolderOnline => Some(
+    // The control keeps this holder online; the red test brings it back
+    // after the gap.
+    let full_holder = match arm {
+        Arm::OneHolderOnline | Arm::HolderReturns => Some(
             full_holder.context("INFRA: no X device holds every certificate that A is missing")?,
         ),
+        Arm::HoldersNeverReturn => None,
+    };
+    let stays_online = match arm {
+        Arm::OneHolderOnline => full_holder,
+        Arm::HolderReturns | Arm::HoldersNeverReturn => None,
     };
 
     // t1: the setup drop ends, then the holders go offline (no await in
@@ -779,23 +1106,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .context("A is not on the fabric after its restart")?;
     // A's bootstrap peer is O, which is offline: A dials J (and the online
     // holder) itself.
-    let network = sim
-        .state("A")?
-        .agent
-        .network()
-        .cloned()
-        .context("A has no network")?;
     let mut dial = vec!["J"];
     dial.extend(stays_online);
     for label in dial {
-        let addr = super::sim_addr(sim.node_index(label)?)?;
-        sim.within(
-            &format!("A dials {label}"),
-            secs(10),
-            network.connect_addr(addr),
-        )
-        .await?
-        .map_err(|error| anyhow!("A could not dial {label}: {error}"))?;
+        a_dials(sim, label).await?;
     }
     // A's discovery cache is in memory, so after its restart A cannot
     // verify J's AgentId->MachineId binding until J announces again. An
@@ -841,7 +1155,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // exact seats; the control requires a subset of them.
     let after = seat_view(sim, "A", &home.gid).await?;
     let same_seats = match arm {
-        Arm::AllHoldersOffline => after.digest_only == before.digest_only,
+        Arm::HolderReturns | Arm::HoldersNeverReturn => after.digest_only == before.digest_only,
         Arm::OneHolderOnline => after
             .digest_only
             .iter()
@@ -857,7 +1171,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             after.digest_only.keys().collect::<Vec<_>>(),
             before.digest_only.len(),
             match arm {
-                Arm::AllHoldersOffline => "must be equal",
+                Arm::HolderReturns | Arm::HoldersNeverReturn => "must be equal",
                 Arm::OneHolderOnline => "must be a subset",
             }
         ),
@@ -911,14 +1225,18 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
     let o_offline = !online(sim, "O")?;
     let holders_ok = match arm {
-        Arm::AllHoldersOffline => o_offline && online_holders.is_empty() && offline_holders > 0,
+        Arm::HolderReturns | Arm::HoldersNeverReturn => {
+            o_offline && online_holders.is_empty() && offline_holders > 0
+        }
         Arm::OneHolderOnline => {
             o_offline && online_holders == stays_online.into_iter().collect::<Vec<_>>()
         }
     };
     receipt.evidence(
         match arm {
-            Arm::AllHoldersOffline => "creator_and_every_eligible_holder_offline",
+            Arm::HolderReturns | Arm::HoldersNeverReturn => {
+                "creator_and_every_eligible_holder_offline"
+            }
             Arm::OneHolderOnline => "creator_offline_and_exactly_one_eligible_holder_online",
         },
         holders_ok,
@@ -933,7 +1251,19 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .mark_indexed("t2: J redeems A's invite after A's restart");
     let (watcher, received) = watch_join_requests(sim, &home.gid)?;
     join(sim, "J", &home, &link).await?;
-    let j_admitted = admitted(sim, "A", "J", &home.gid, JOIN_BUDGET).await?;
+    let joined_at = sim.fabric().now();
+    let mut window = WaitWindow::default();
+    let j_admitted = match arm {
+        Arm::OneHolderOnline => admitted(sim, "A", "J", &home.gid, JOIN_BUDGET).await?,
+        Arm::HolderReturns | Arm::HoldersNeverReturn => {
+            // Every holder is offline: the wait must be typed and must not
+            // end at J's 120 s poll deadline (ADR 0111 §8, D64).
+            window
+                .poll_until(sim, &home.gid, &missing, joined_at, HOLDER_GAP)
+                .await?;
+            false
+        }
+    };
     drop(watcher);
     let received = std::mem::take(
         &mut *received
@@ -979,47 +1309,281 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         ),
         at(sim),
     );
-    if !j_admitted {
-        // The cause: A's seal refusal for THIS group and THIS joiner, after
-        // J's request reached A, naming exactly A's digest-only seats.
-        let j_hex = sim.agent_hex("J")?;
-        let j_tokens = [
-            crate::logging::LogHexId::agent(j_hex.as_str()).to_string(),
-            crate::logging::LogHexId::agent(j_hex.to_uppercase().as_str()).to_string(),
-        ];
-        let mut want: Vec<String> = before.digest_only.keys().cloned().collect();
-        want.sort();
-        let refusal = sim
-            .logs_containing(&[SEAL_REFUSAL, PENDING_CAUSE, &format!("group {}", home.gid)])
-            .into_iter()
-            .filter(|log| {
-                j_tokens
-                    .iter()
-                    .any(|token| log.text.contains(&format!("member={token}")))
-            })
-            .filter(|log| first_request.is_some_and(|first| log.at >= first))
-            .find(|log| refused_members(&log.text).as_ref() == Some(&want));
-        receipt.cause(
-            "OwnerCertMemberPending{members=A's digest-only seats} from A's seal of J's add",
-            refusal.as_ref().map(|log| log.text.clone()),
-            refusal.is_some(),
-            at(sim),
-        );
-        let a_rows = roster(sim, "A", &home.gid).await.unwrap_or_default();
-        let j_state = membership_state(sim, "J", &home.gid).await.ok().flatten();
-        sim.fabric().mark(format!(
-            "observed: A lists {} members, J membership_state={j_state:?}",
-            a_rows.len()
-        ));
-    }
+    let mut want: Vec<String> = before.digest_only.keys().cloned().collect();
+    want.sort();
     receipt.note(format!(
         "arm={arm:?}; #946 answers dropped toward A during setup: {}; digest-only seats \
          at A: {}",
         answers.dropped(),
         missing.len()
     ));
-    receipt.finish(FINAL, j_admitted, at(sim));
+    let passed = match arm {
+        Arm::OneHolderOnline => {
+            if !j_admitted {
+                // The cause: A's seal refusal for THIS group and THIS joiner,
+                // after J's request reached A, naming exactly A's digest-only
+                // seats.
+                let refusal = seal_refusal(sim, &home.gid, &want, first_request)?;
+                receipt.cause(
+                    "OwnerCertMemberPending{members=A's digest-only seats} from A's seal of J's add",
+                    refusal.clone(),
+                    refusal.is_some(),
+                    at(sim),
+                );
+                let a_rows = roster(sim, "A", &home.gid).await.unwrap_or_default();
+                let j_state = membership_state(sim, "J", &home.gid).await.ok().flatten();
+                sim.fabric().mark(format!(
+                    "observed: A lists {} members, J membership_state={j_state:?}",
+                    a_rows.len()
+                ));
+            }
+            j_admitted
+        }
+        Arm::HolderReturns => {
+            // Preconditions of the red arm: with every holder offline,
+            // nothing can admit J or give A the bytes. Otherwise the
+            // scenario broke.
+            let gap_admitted = window.admitted.clone();
+            receipt.evidence(
+                "j_not_admitted_while_every_holder_offline",
+                gap_admitted.is_none(),
+                match &gap_admitted {
+                    Some((since, how)) => format!("at t2+{}s: {how}", since.as_secs()),
+                    None => format!(
+                        "{} polls over {}s: A never lists J and J is never active",
+                        window.polls,
+                        HOLDER_GAP.as_secs()
+                    ),
+                },
+                at(sim),
+            );
+            let (_, gap_held) = held_digests(sim, "A", &home.gid, &missing).await?;
+            receipt.evidence(
+                "a_holds_none_of_the_missing_bytes_while_every_holder_offline",
+                gap_held.is_empty(),
+                format!(
+                    "after the gap A holds {} of {} missing digests",
+                    gap_held.len(),
+                    missing.len()
+                ),
+                at(sim),
+            );
+            ensure!(
+                gap_admitted.is_none() && gap_held.is_empty(),
+                "INFRA: with every holder offline, J was admitted ({gap_admitted:?}) or A \
+                 holds {} missing digests",
+                gap_held.len()
+            );
+            let refusal = seal_refusal(sim, &home.gid, &want, first_request)?;
+            let holder = full_holder
+                .context("INFRA: no X device holds every certificate that A is missing")?;
+            holder_returns(
+                sim,
+                receipt,
+                Returning {
+                    gid: &home.gid,
+                    home: &home,
+                    link: &link,
+                    holder,
+                    missing: &missing,
+                    joined_at,
+                    refusal,
+                },
+                &window,
+            )
+            .await?
+        }
+        // In the fail-closed control an admission or bytes at A are the
+        // defect, so they fail FINAL; they are not INFRA.
+        Arm::HoldersNeverReturn => {
+            never_return(sim, receipt, &home.gid, &missing, joined_at, &mut window).await?
+        }
+    };
+    receipt.finish(arm.final_name(), passed, at(sim));
     Ok(())
+}
+
+/// What the red arm needs after the gap.
+struct Returning<'a> {
+    gid: &'a str,
+    home: &'a HomeIds,
+    link: &'a str,
+    /// The X device that holds every missing certificate.
+    holder: &'static str,
+    missing: &'a [String],
+    joined_at: Duration,
+    /// A's seal refusal naming exactly its digest-only seats, if logged.
+    refusal: Option<String>,
+}
+
+/// ADR 0111 H3 after the gap: the holder comes back, J retries, A must
+/// hold the bytes within 60 s and J must become Active. Returns FINAL.
+async fn holder_returns(
+    sim: &Sim,
+    receipt: &mut Receipt,
+    ret: Returning<'_>,
+    window: &WaitWindow,
+) -> Result<bool> {
+    let at = |sim: &Sim| sim.fabric().now().as_micros();
+    let since_join = |sim: &Sim| sim.fabric().now().saturating_sub(ret.joined_at).as_secs();
+    sim.set_online(ret.holder, true)?;
+    sim.fabric()
+        .mark(format!("holder {} returns after the gap", ret.holder));
+    let returned_at = sim.fabric().now();
+    a_dials(sim, ret.holder).await?;
+    // H3 step 3: J retries. A pending attempt must resume by itself, so
+    // the case re-POSTs only when J's attempt has ended. A failed re-POST
+    // is product behaviour, not INFRA.
+    if window.j_pending_now {
+        receipt.note("J's attempt is still pending after the gap: no new join call");
+    } else {
+        let (status, body) = sim
+            .api(
+                "J",
+                Method::POST,
+                "/groups/join",
+                Some(json!({
+                    "invite": ret.link,
+                    "display_name": "J",
+                    "mode": "home",
+                    "expected_owner_user_id": ret.home.owner_user_id,
+                })),
+            )
+            .await?;
+        receipt.note(format!(
+            "J's attempt had ended; J redeems the same invite again at t2+{}s: {status} {body}",
+            since_join(sim)
+        ));
+    }
+    // ADR 0111 H3: within 60 s of the holder's start, A holds the bytes.
+    let deadline = returned_at.saturating_add(RETURN_FETCH);
+    let a_holds = loop {
+        let (_, held) = held_digests(sim, "A", ret.gid, ret.missing).await?;
+        if held.len() == ret.missing.len() {
+            break Some(sim.fabric().now().saturating_sub(returned_at));
+        }
+        if sim.fabric().now() >= deadline {
+            break None;
+        }
+        sim.within(
+            "wait for A to fetch the certificates",
+            secs(2),
+            tokio::time::sleep(secs(1)),
+        )
+        .await?;
+    };
+    let j_active = admitted(sim, "A", "J", ret.gid, RETURN_ADMIT).await?;
+    let ended_in_gap = window.j_ended.clone();
+    let parts = [
+        (
+            "a_typed_evidence_pending_seen",
+            window.a_typed_at.is_some(),
+            format!("first at {}", at_text(window.a_typed_at)),
+        ),
+        (
+            "j_typed_awaiting_evidence_seen",
+            window.j_typed_at.is_some(),
+            format!("first at {}", at_text(window.j_typed_at)),
+        ),
+        (
+            "j_attempt_did_not_end_during_the_gap",
+            ended_in_gap.is_none(),
+            match &ended_in_gap {
+                Some((since, how)) => format!("ended at t2+{}s: {how}", since.as_secs()),
+                None => "pending throughout".to_string(),
+            },
+        ),
+        (
+            "a_holds_within_60s",
+            a_holds.is_some(),
+            a_holds.map_or(
+                "A did not hold every missing digest within 60 s".to_string(),
+                |took| {
+                    format!(
+                        "A held every missing digest {}s after the return",
+                        took.as_secs()
+                    )
+                },
+            ),
+        ),
+        (
+            "j_admitted_after_return",
+            j_active,
+            format!(
+                "J Active and listed by A within {}s: {j_active}",
+                RETURN_ADMIT.as_secs()
+            ),
+        ),
+    ];
+    for (name, ok, detail) in &parts {
+        receipt.note(format!("final component {name}: {ok} ({detail})"));
+    }
+    receipt.note(format!("J's states during the gap: {}", window.timeline()));
+    let passed = parts.iter().all(|(_, ok, _)| *ok);
+    if !passed {
+        let typed_absent = window.a_typed_at.is_none() && window.j_typed_at.is_none();
+        let summary = format!(
+            "J's attempt end: {}; A held the bytes after the return: {}; J active after \
+             the return: {j_active}",
+            match &ended_in_gap {
+                Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
+                None => "none during the gap".to_string(),
+            },
+            a_holds.map_or("no".to_string(), |took| format!(
+                "yes, after {}s",
+                took.as_secs()
+            )),
+        );
+        receipt.cause(
+            "every holder offline: A's seal waits on OwnerCertMemberPending{A's digest-only \
+             seats}, but A shows no typed evidence_pending and J's attempt shows no \
+             awaiting_evidence naming them",
+            Some(format!(
+                "{}; {summary}",
+                ret.refusal
+                    .as_deref()
+                    .unwrap_or("no matching seal refusal logged")
+            )),
+            ret.refusal.is_some() && typed_absent,
+            at(sim),
+        );
+    }
+    Ok(passed)
+}
+
+/// The fail-closed control: every holder stays offline for
+/// `NEVER_WINDOW`. Returns FINAL.
+async fn never_return(
+    sim: &Sim,
+    receipt: &mut Receipt,
+    gid: &str,
+    missing: &[String],
+    joined_at: Duration,
+    window: &mut WaitWindow,
+) -> Result<bool> {
+    window
+        .poll_until(sim, gid, missing, joined_at, NEVER_WINDOW)
+        .await?;
+    let (_, held) = held_digests(sim, "A", gid, missing).await?;
+    receipt.note(format!(
+        "{} polls over {}s; J admitted: {:?}; J silently dropped: {:?}; A first held \
+         bytes: {:?}; A holds {} of {} missing digests at the end; A typed wait first at \
+         {}; J typed wait first at {}",
+        window.polls,
+        NEVER_WINDOW.as_secs(),
+        window.admitted,
+        window.silent_drop,
+        window.a_held,
+        held.len(),
+        missing.len(),
+        at_text(window.a_typed_at),
+        at_text(window.j_typed_at)
+    ));
+    receipt.note(format!("J's states: {}", window.timeline()));
+    Ok(window.admitted.is_none()
+        && window.a_held.is_none()
+        && held.is_empty()
+        && window.silent_drop.is_none())
 }
 
 /// Run the scenario once and return its emitted receipt. Any error before
@@ -1032,6 +1596,16 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
          the holders go offline, so A keeps the seats its seat event omitted \
          digest-only (ADR 0111 H3: the harness makes the admin's seat digest-only)",
     );
+    receipt.note(format!(
+        "arm {arm:?}, FINAL {}: with every holder offline the case polls A \
+         (/groups/{{gid}}) and J (/groups/{{gid}}, /join-status) every {}s \
+         for {}s; a typed wait is evidence_pending at A and awaiting_evidence at J, \
+         each naming every missing digest (ADR 0088 §1 L3, §2 item 8; ADR 0111 §8, \
+         H3). The holder returns after the gap in the red test only",
+        arm.final_name(),
+        POLL.as_secs(),
+        HOLDER_GAP.as_secs()
+    ));
     receipt.note(
         "sim byte streams (EvidenceV1 hello, SyncV1 owner sync) are in-memory \
          pipes with zero latency and no QUIC flow control (W3-H S4)",
@@ -1048,7 +1622,7 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
         Err(error) => receipt.infra(format!("sim: {error:#}"), 0),
     }
     if receipt.verdict().is_none() || receipt.has_infra() {
-        receipt.reclassify(FINAL);
+        receipt.reclassify(arm.final_name());
     }
     receipt.emit();
     receipt
@@ -1069,11 +1643,11 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1023_red_baseline_restart_all_holders_offline_join_stays_pending() -> Result<()> {
+async fn w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes() -> Result<()> {
     expect(
-        "w3h_1023_red_baseline_restart_all_holders_offline_join_stays_pending",
+        "w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes",
         0x1023_0001,
-        Arm::AllHoldersOffline,
+        Arm::HolderReturns,
         Verdict::Red,
     )
     .await
@@ -1089,6 +1663,21 @@ async fn w3h_1023_restart_one_holder_online_admits() -> Result<()> {
         "w3h_1023_restart_one_holder_online_admits",
         0x1023_0002,
         Arm::OneHolderOnline,
+        Verdict::Green,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1023_control_holders_never_return_fail_closed() -> Result<()> {
+    expect(
+        "w3h_1023_control_holders_never_return_fail_closed",
+        0x1023_0003,
+        Arm::HoldersNeverReturn,
         Verdict::Green,
     )
     .await
