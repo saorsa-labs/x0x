@@ -104,6 +104,42 @@
 //!   refusal may come before the return: J shows no `refused` outcome, and
 //!   A records no `certificate_evidence_unavailable` refusal for G.
 //!
+//! Strict reads. Every HTTP answer that the case reads goes through
+//! one pure parse function per route, which unit tests call:
+//! `parse_created`, `parse_invite`, `parse_join_answer` (each join call,
+//! the re-join after the return included), `parse_announce`,
+//! `parse_roster`, `parse_membership` and `parse_join_status`. The case
+//! does not use the lenient helpers of `home.rs` (`membership_state`,
+//! `roster`) for any read that feeds a verdict. The parse needs the
+//! status and body that the handler really sends. It also needs the
+//! group id of the path. A 404 must be the handler's exact not-found
+//! body (no other keys). A missing field, a wrong type, a wrong group id
+//! or a value outside the closed set is an error, so the run is INFRA.
+//! Such an answer is never "not active", "not admitted" or "nothing
+//! shown", and it cannot keep the expected RED. A typed-state object
+//! (tagged or keyed with the state name) must name at least one
+//! well-formed digest, or it is an error too. In-process reads (seats,
+//! bytes, verdicts, bindings, refusal counters) return an error when G
+//! or a node is missing, never "none".
+//!
+//! Timing at observation. Every "within" bound uses one helper
+//! (`timed_wait`): the setup seats (180 s), O's announces (60 s), J's
+//! binding (30 s), A's restart verdict for O (60 s), J Active in the
+//! control (180 s), A's bytes after the return (60 s) and J Active
+//! after the return (120 s). The observation time is the time at which
+//! the satisfying read FINISHED, from the wait's start (`observed_at`).
+//! This is the conservative end: a read that started inside the bound
+//! but finished after it is `Late`. `classify` gives `Met` only at or
+//! under the bound, and `component_passes` passes only `Met`. So no
+//! component takes evidence first and checks its deadline later. No
+//! read starts after the bound (`may_read`), so a wait overruns its
+//! bound by one read at most. `LATE_SLACK` is only a hard cap for a read
+//! that hangs (INFRA). Each poll of the gap records when it started and
+//! when it finished. The lower bounds (minute 12, the 900 s window and
+//! `SETTLE`) use the conservative end too: a span reaches its bound only
+//! when its last poll STARTED at or after the bound (`span_reached`). The
+//! rules that count polls "after" an instant also use the poll start.
+//!
 //! Three tests share the scenario:
 //! - `w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes`:
 //!   every eligible holder is offline, then one returns. FINAL
@@ -131,8 +167,7 @@
 
 #![cfg(test)]
 
-use super::control::invite;
-use super::home::{membership_state, roster, HomeIds};
+use super::home::HomeIds;
 use super::receipt::{Receipt, Verdict};
 use super::*;
 use crate::identity::{AgentId, UserKeypair};
@@ -169,6 +204,7 @@ const RETURN_ADMIT: Duration = secs(120);
 const NEVER_WINDOW: Duration = HOLDER_GAP
     .saturating_add(RETURN_FETCH)
     .saturating_add(RETURN_ADMIT);
+const _: () = assert!(NEVER_WINDOW.as_secs() > HOLDER_GAP.as_secs());
 /// J's `join_state` while its attempt waits for the authority.
 const JOIN_PENDING: &str = "pending_authority_commit";
 /// The authority's typed wait for a missing digest (ADR 0111 §8).
@@ -178,6 +214,19 @@ const AWAITING_EVIDENCE: &str = "awaiting_evidence";
 /// The #946 answer domain (`seat_cert_fetch::GROUP_CERT_FETCH_RESPONSE_DOMAIN`).
 /// It leads the pubsub payload in clear.
 const FETCH_RESPONSE_DOMAIN: &[u8] = b"x0x/group-cert-fetch-response-v1\0";
+/// The hard cap of a bounded wait past its bound. No read starts after
+/// the bound (`may_read`); the cap only lets a read that started inside
+/// the bound finish, so that it is reported as `Late`, and it stops a
+/// read that hangs (INFRA).
+const LATE_SLACK: Duration = secs(10);
+/// How long O's consented announces have, in total, until A verifies O.
+const O_ANNOUNCE_BOUND: Duration = secs(60);
+/// How often O repeats its consented announce, as a heartbeat would.
+const O_ANNOUNCE_EVERY: Duration = secs(10);
+/// How long A has to verify an announced machine binding.
+const VERIFY_BOUND: Duration = secs(30);
+/// How long A has to verify O again after A's restart.
+const RESTART_CLEAN_BOUND: Duration = secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
@@ -332,6 +381,51 @@ async fn seat_view(sim: &Sim, label: &str, gid: &str) -> Result<SeatView> {
     .await?
 }
 
+/// Post-condition of the shared certify helpers (`home.rs`): `label`
+/// runs with a valid agent certificate for its own agent, signed by
+/// `owner`.
+fn certified_by(sim: &Sim, label: &str, owner: &UserKeypair) -> Result<()> {
+    let state = sim.state(label)?;
+    let cert = state
+        .agent
+        .identity()
+        .agent_certificate()
+        .cloned()
+        .with_context(|| format!("INFRA: {label} has no agent certificate"))?;
+    cert.verify()
+        .with_context(|| format!("INFRA: {label}'s agent certificate does not verify"))?;
+    ensure!(
+        cert.user_id()? == owner.user_id() && cert.agent_id()? == state.agent.agent_id(),
+        "INFRA: {label}'s agent certificate is not the owner's certificate for its agent"
+    );
+    Ok(())
+}
+
+/// Post-condition of `promote_admin` (`home.rs`): the strict roster of
+/// each observer lists `member` as an active admin.
+async fn admin_everywhere(sim: &Sim, gid: &str, member: &str, observers: &[&str]) -> Result<()> {
+    let member_hex = sim.agent_hex(member)?;
+    let path = format!("/groups/{gid}/members");
+    for observer in observers {
+        let (status, body) = sim
+            .within(
+                &format!("read {observer}'s roster"),
+                secs(10),
+                get_object(sim, observer, &path),
+            )
+            .await??;
+        let rows =
+            parse_roster(gid, status, &body).with_context(|| format!("{observer} GET {path}"))?;
+        ensure!(
+            rows.iter().any(|row| row.agent_id == member_hex
+                && row.role == crate::groups::GroupRole::Admin
+                && row.state == crate::groups::GroupMemberState::Active),
+            "INFRA: {observer} does not list {member} as an active admin: {rows:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Whether `label` is an eligible holder of each digest: an active member
 /// of G that holds bytes for it, on the matching seat or in its
 /// durable announce cache. The result lists the digests it holds. A node
@@ -370,15 +464,16 @@ async fn held_digests(
         };
         let mut held = Vec::new();
         for digest in digests {
-            let cached = match parse_digest(&digest) {
-                Some(bytes) => state
-                    .agent
-                    .announce_blob_cache
-                    .find_by_cert_digest(&bytes)
-                    .await
-                    .is_some(),
-                None => false,
-            };
+            // The case read every digest from A's own seats: one that does
+            // not decode is an error, not "not held".
+            let bytes =
+                parse_digest(&digest).with_context(|| format!("bad seat digest {digest}"))?;
+            let cached = state
+                .agent
+                .announce_blob_cache
+                .find_by_cert_digest(&bytes)
+                .await
+                .is_some();
             if cached || on_seats.contains(&digest.to_ascii_lowercase()) {
                 held.push(digest);
             }
@@ -444,98 +539,271 @@ fn join_message_kind(payload: &[u8], gid: &str, joiner: &AgentId) -> Option<&'st
 /// certificate sidecar takes the 8 MiB budget and is not trimmed below 32
 /// certificates.
 async fn create_owner_certified(sim: &Sim, label: &str, owner_user_id: &str) -> Result<String> {
-    let (status, created) = sim
-        .api(
-            label,
-            Method::POST,
-            "/groups",
-            Some(json!({
-                "name": "w3h 1023",
-                "display_name": label,
-                "policy": {
-                    "discoverability": "listed_to_contacts",
-                    "admission": {"owner_certified": owner_user_id},
-                    "confidentiality": "mls_encrypted",
-                    "read_access": "members_only",
-                    "write_access": "members_only",
-                },
-            })),
-        )
-        .await?;
-    ensure!(
-        status.is_success() && created["ok"] == true,
-        "create owner-certified group: {status} {created}"
-    );
-    Ok(created["group_id"]
-        .as_str()
-        .context("create response has no group_id")?
-        .to_string())
+    let body = json!({
+        "name": "w3h 1023",
+        "display_name": label,
+        "policy": {
+            "discoverability": "listed_to_contacts",
+            "admission": {"owner_certified": owner_user_id},
+            "confidentiality": "mls_encrypted",
+            "read_access": "members_only",
+            "write_access": "members_only",
+        },
+    });
+    let (status, created) = post_object(sim, label, "/groups", body).await?;
+    parse_created(status, &created).context("create owner-certified group")
 }
 
-/// `joiner` redeems `link`. An owner-certified invite needs the pinned
-/// owner mode (`mode: home`) for any group, not only the Home.
+/// `inviter` mints an unaddressed invite to `gid`.
+async fn invite(sim: &Sim, inviter: &str, gid: &str) -> Result<String> {
+    let path = format!("/groups/{gid}/invite");
+    let (status, body) = post_object(sim, inviter, &path, json!({})).await?;
+    parse_invite(gid, status, &body).with_context(|| format!("{inviter} POST {path}"))
+}
+
+/// The body of `POST /groups/join` for `joiner`. An owner-certified
+/// invite needs the pinned owner mode (`mode: home`) for any group, not
+/// only the Home.
+fn join_body(joiner: &str, group: &HomeIds, link: &str) -> serde_json::Value {
+    json!({
+        "invite": link,
+        "display_name": joiner,
+        "mode": "home",
+        "expected_owner_user_id": group.owner_user_id,
+    })
+}
+
+/// `joiner` redeems `link` during the setup or at t2. Only the handler's
+/// success shape, with a fresh-join `join_state`, is accepted. A refusal
+/// or any other answer is an error.
 async fn join(sim: &Sim, joiner: &str, group: &HomeIds, link: &str) -> Result<()> {
-    let (status, joined) = sim
-        .api(
-            joiner,
-            Method::POST,
-            "/groups/join",
-            Some(json!({
-                "invite": link,
-                "display_name": joiner,
-                "mode": "home",
-                "expected_owner_user_id": group.owner_user_id,
-            })),
-        )
-        .await?;
+    let (status, body) =
+        post_object(sim, joiner, "/groups/join", join_body(joiner, group, link)).await?;
+    let answer = parse_join_answer(&group.gid, status, &body)
+        .with_context(|| format!("{joiner} POST /groups/join"))?;
     ensure!(
-        status.is_success() && joined["ok"] != false,
-        "{joiner} join: {status} {joined}"
+        matches!(
+            answer,
+            JoinAnswer::Accepted {
+                join_state: Membership::PendingAuthorityCommit | Membership::Active,
+                ..
+            }
+        ),
+        "{joiner} join: {}",
+        answer.text()
     );
     Ok(())
 }
 
-/// Whether, within `budget`, `authority` lists `member` in `gid` and
-/// `member` reports itself `active`. "Not admitted" is a verdict only when
-/// every read completed and succeeded; a failed or hanging read is INFRA.
+/// `label` announces (`POST /announce`) and the handler answers with its
+/// exact success body.
+async fn announce(sim: &Sim, label: &str, include_user_identity: bool) -> Result<()> {
+    let body = if include_user_identity {
+        json!({"include_user_identity": true, "human_consent": true})
+    } else {
+        json!({})
+    };
+    let (status, answer) = post_object(sim, label, "/announce", body).await?;
+    parse_announce(status, &answer, include_user_identity)
+        .with_context(|| format!("{label} POST /announce"))
+}
+
+/// Whether a strict roster read lists `member_hex`.
+fn lists(gid: &str, member_hex: &str, status: StatusCode, body: &Object) -> Result<bool> {
+    Ok(parse_roster(gid, status, body)?
+        .iter()
+        .any(|row| row.agent_id.eq_ignore_ascii_case(member_hex)))
+}
+
+/// Whether a strict `/groups/{gid}` read says `active`. The handler's
+/// exact 404 means "no group here", so not active. Any other answer is an
+/// error.
+fn is_active(gid: &str, status: StatusCode, body: &Object) -> Result<bool> {
+    Ok(parse_membership(gid, status, body)? == Some(Membership::Active))
+}
+
+/// One strict read of whether `authority` lists `member` and `member`
+/// says it is `active`.
+async fn read_admitted(
+    sim: &Sim,
+    authority: &str,
+    member: &str,
+    gid: &str,
+    member_hex: &str,
+) -> Result<bool> {
+    let path = format!("/groups/{gid}/members");
+    let (status, body) = get_object(sim, authority, &path).await?;
+    if !lists(gid, member_hex, status, &body).with_context(|| format!("{authority} GET {path}"))? {
+        return Ok(false);
+    }
+    let path = format!("/groups/{gid}");
+    let (status, body) = get_object(sim, member, &path).await?;
+    is_active(gid, status, &body).with_context(|| format!("{member} GET {path}"))
+}
+
+/// When, after `start`, `authority` lists `member` in `gid` and `member`
+/// reports itself `active`, against `bound`. "Not admitted" is a verdict
+/// only when every read completed and succeeded; a failed, malformed or
+/// hanging read is INFRA.
 async fn admitted(
     sim: &Sim,
     authority: &str,
     member: &str,
     gid: &str,
-    budget: Duration,
-) -> Result<bool> {
+    start: Duration,
+    bound: Duration,
+) -> Result<Deadline> {
     let member_hex = sim.agent_hex(member)?;
     let what = format!("{member} seated on {authority} and locally");
-    let mut seen = Observations::default();
-    let ready = sim
-        .until(&what, budget, async |s: &Sim| {
-            let Some(rows) = seen.observe(roster(s, authority, gid)).await else {
-                return true;
-            };
-            if !rows.iter().any(|(id, _)| *id == member_hex) {
-                return false;
+    let timed = timed_wait(sim, &what, start, bound, None, async |s: &Sim| {
+        read_admitted(s, authority, member, gid, &member_hex)
+            .await
+            .map(|done| (done, ()))
+    })
+    .await?;
+    Ok(timed.deadline)
+}
+
+/// When an awaited observation was made, against its bound. Each time is
+/// read on the fabric clock right after the read that made the
+/// observation, and is measured from the wait's start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deadline {
+    /// Seen `at` after the start, within the bound.
+    Met { at: Duration },
+    /// Seen `at` after the start, past the bound.
+    Late { at: Duration },
+    /// Not seen in the `waited` time after the start.
+    Never { waited: Duration },
+}
+
+/// Classify one observation time. `Met` if and only if `at <= bound`.
+fn classify(at: Option<Duration>, waited: Duration, bound: Duration) -> Deadline {
+    match at {
+        Some(at) if at <= bound => Deadline::Met { at },
+        Some(at) => Deadline::Late { at },
+        None => Deadline::Never { waited },
+    }
+}
+
+/// The decision of each bounded component: it passes only on `Met`
+/// within `bound`. A late or missing observation fails.
+fn component_passes(deadline: Deadline, bound: Duration) -> bool {
+    matches!(deadline, Deadline::Met { at } if at <= bound)
+}
+
+/// A duration as seconds with millisecond precision.
+fn ms_text(time: Duration) -> String {
+    format!("{:.3}s", time.as_secs_f64())
+}
+
+impl Deadline {
+    fn text(self, bound: Duration) -> String {
+        match self {
+            Self::Met { at } => format!("met at {} (bound {}s)", ms_text(at), bound.as_secs()),
+            Self::Late { at } => format!("LATE at {} (bound {}s)", ms_text(at), bound.as_secs()),
+            Self::Never { waited } => {
+                format!("never in {} (bound {}s)", ms_text(waited), bound.as_secs())
             }
-            // An unknown membership_state is a failed read, not "not active".
-            let read = async {
-                membership_state(s, member, gid)
-                    .await?
-                    .as_deref()
-                    .map(Membership::parse)
-                    .transpose()
-            };
-            let Some(state) = seen.observe(read).await else {
+        }
+    }
+}
+
+/// The result of one timed wait.
+struct Timed<T> {
+    deadline: Deadline,
+    /// The value of the last read that completed.
+    last: Option<T>,
+}
+
+/// Whether a timed wait may start one more read: the first read always
+/// starts, and no read starts after the bound. So a wait overruns its
+/// bound by at most one read, and the schedule does not grow.
+fn may_read(reads: usize, elapsed: Duration, bound: Duration) -> bool {
+    reads == 0 || elapsed <= bound
+}
+
+/// The observation time of a read that satisfied its condition: the time
+/// the read FINISHED, measured from the wait's start. For a "within"
+/// bound this is the conservative end: a read that started before the
+/// bound and finished after it is `Late`, so its evidence fails.
+fn observed_at(start: Duration, read_finished: Duration) -> Duration {
+    read_finished.saturating_sub(start)
+}
+
+/// How a timed wait ended: INFRA unless every read completed and
+/// succeeded, else the classified observation time. A wait that stopped
+/// with no observation must have passed its bound (`Never`).
+fn settle(
+    ended: Result<()>,
+    seen: &Observations,
+    what: &str,
+    at: Option<Duration>,
+    waited: Duration,
+    bound: Duration,
+) -> Result<Deadline> {
+    match ended {
+        Ok(()) if !seen.failed() => {
+            ensure!(
+                at.is_some() || waited > bound,
+                "INFRA: {what}: the wait ended with no observation at {}, inside its {}s bound",
+                ms_text(waited),
+                bound.as_secs()
+            );
+        }
+        // A failed read stopped the wait: `verify` names it.
+        Ok(()) => seen.verify(what)?,
+        Err(error) if expired(&error) => seen.verify(what)?,
+        Err(error) => return Err(error),
+    }
+    Ok(classify(at, waited, bound))
+}
+
+/// The one timed wait of the case. It polls `read` (strict reads only)
+/// until it reports the condition or the bound passes (`may_read`), or
+/// for at most `cadence` in this call. The observation time is the time
+/// the satisfying read finished (`observed_at`), measured from `start`,
+/// and `classify` decides `Met` or `Late` from it. So evidence seen after
+/// its bound fails. `bound + LATE_SLACK` is only a hard cap for a read
+/// that hangs. A failed read, or a read still running at the cap, is
+/// INFRA (`Observations`). At least one read is made.
+async fn timed_wait<T>(
+    sim: &Sim,
+    what: &str,
+    start: Duration,
+    bound: Duration,
+    cadence: Option<Duration>,
+    mut read: impl AsyncFnMut(&Sim) -> Result<(bool, T)>,
+) -> Result<Timed<T>> {
+    let end = start.saturating_add(bound).saturating_add(LATE_SLACK);
+    let mut budget = end.saturating_sub(sim.fabric().now());
+    if let Some(cadence) = cadence {
+        budget = budget.min(cadence);
+    }
+    let budget = budget.max(secs(1));
+    let mut seen = Observations::default();
+    let mut at = None;
+    let mut last = None;
+    let mut reads = 0usize;
+    let ended = sim
+        .until(what, budget, async |s: &Sim| {
+            if !may_read(reads, s.fabric().now().saturating_sub(start), bound) {
+                return true;
+            }
+            reads += 1;
+            let Some((done, value)) = seen.observe(read(s)).await else {
                 return true;
             };
-            state == Some(Membership::Active)
+            last = Some(value);
+            if done {
+                at = Some(observed_at(start, s.fabric().now()));
+            }
+            done
         })
         .await;
-    match ready {
-        Ok(()) if !seen.failed() => Ok(true),
-        Ok(()) => seen.verify(&what).map(|()| false),
-        Err(error) if expired(&error) => seen.verify(&what).map(|()| false),
-        Err(error) => Err(error),
-    }
+    let waited = sim.fabric().now().saturating_sub(start);
+    let deadline = settle(ended, &seen, what, at, waited, bound)?;
+    Ok(Timed { deadline, last })
 }
 
 /// Whether `observer` verifies `subject`'s AgentId->MachineId binding now
@@ -555,39 +823,21 @@ async fn binding_verified(sim: &Sim, observer: &str, subject: &str) -> Result<bo
     .await
 }
 
-/// `subject` re-announces (`POST /announce`); whether `observer` then
-/// verifies `subject`'s machine binding within 30 s. A failed read is an
-/// error, not "not verified".
-async fn announce_and_wait_verified(sim: &Sim, subject: &str, observer: &str) -> Result<bool> {
-    let (status, body) = sim
-        .api(subject, Method::POST, "/announce", Some(json!({})))
-        .await?;
-    ensure!(status.is_success(), "{subject} announce: {status} {body}");
+/// `subject` re-announces (`POST /announce`); when `observer` then
+/// verifies `subject`'s machine binding, measured from the end of the
+/// announce call against `VERIFY_BOUND`. A failed read is INFRA, not "not
+/// verified".
+async fn announce_and_wait_verified(sim: &Sim, subject: &str, observer: &str) -> Result<Deadline> {
+    announce(sim, subject, false).await?;
     let what = format!("{observer} verifies {subject}'s binding");
-    let mut verified = false;
-    let mut failure = None;
-    let waited = sim
-        .until(&what, secs(30), async |s: &Sim| {
-            match binding_verified(s, observer, subject).await {
-                Ok(now) => {
-                    verified = now;
-                    now
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    true
-                }
-            }
-        })
-        .await;
-    if let Some(error) = failure {
-        return Err(error.context(format!("INFRA: reading whether {what}")));
-    }
-    match waited {
-        Ok(()) => Ok(verified),
-        Err(error) if expired(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
+    let start = sim.fabric().now();
+    let timed = timed_wait(sim, &what, start, VERIFY_BOUND, None, async |s: &Sim| {
+        binding_verified(s, observer, subject)
+            .await
+            .map(|now| (now, ()))
+    })
+    .await?;
+    Ok(timed.deadline)
 }
 
 /// Watch A's DM layer for J's join `fetch_request` for `gid`, from now on.
@@ -682,42 +932,28 @@ async fn a_status_of(
     .await?
 }
 
-/// Whether, within `budget`, A's verdict for `label` becomes `Clean`.
-/// The result also gives A's last verdict for `label`.
+/// When, after `start`, A's verdict for `label` becomes `Clean`, against
+/// `bound`; this call polls for at most `cadence` (if set). The result
+/// also gives A's last verdict for `label`. A failed read is INFRA.
 async fn until_a_clean(
     sim: &Sim,
     gid: &str,
     label: &str,
-    budget: Duration,
-) -> Result<(bool, Option<crate::groups::owner_cert::MemberCertStatus>)> {
+    start: Duration,
+    bound: Duration,
+    cadence: Option<Duration>,
+) -> Result<(
+    Deadline,
+    Option<crate::groups::owner_cert::MemberCertStatus>,
+)> {
     use crate::groups::owner_cert::MemberCertStatus;
-    let mut last = None;
-    let mut failure = None;
-    let waited = sim
-        .until(
-            &format!("A verifies {label}'s certificate"),
-            budget,
-            async |s: &Sim| match a_status_of(s, gid, label).await {
-                Ok(status) => {
-                    let clean = status == Some(MemberCertStatus::Clean);
-                    last = status;
-                    clean
-                }
-                Err(error) => {
-                    failure = Some(error);
-                    true
-                }
-            },
-        )
-        .await;
-    if let Some(error) = failure {
-        return Err(error.context(format!("INFRA: reading A's verdict for {label}")));
-    }
-    match waited {
-        Ok(()) => Ok((last == Some(MemberCertStatus::Clean), last)),
-        Err(error) if expired(&error) => Ok((false, last)),
-        Err(error) => Err(error),
-    }
+    let what = format!("A verifies {label}'s certificate");
+    let timed = timed_wait(sim, &what, start, bound, cadence, async |s: &Sim| {
+        let status = a_status_of(s, gid, label).await?;
+        Ok((status == Some(MemberCertStatus::Clean), status))
+    })
+    .await?;
+    Ok((timed.deadline, timed.last.flatten()))
 }
 
 /// The member list of a `pending certificate resolution` refusal, as hex.
@@ -753,28 +989,44 @@ fn decode_digest(text: &str) -> Option<[u8; 32]> {
 }
 
 /// The digests that one typed object names in its own `digest` and
-/// `digests` fields. `None` when it names none, or when one field has the
-/// wrong type or a digest does not decode: such an object is not a typed
-/// state.
-fn own_digests(object: &serde_json::Map<String, serde_json::Value>) -> Option<BTreeSet<[u8; 32]>> {
+/// `digests` fields. A typed object must name at least one digest, each
+/// field must have its type (a string, an array of strings) and each
+/// digest must decode. Any other typed object is an error, never "not
+/// typed": a malformed typed state is INFRA, so it cannot count as
+/// absence and keep the expected RED.
+fn own_digests(object: &Object) -> Result<BTreeSet<[u8; 32]>> {
+    let decode = |value: &serde_json::Value| -> Result<[u8; 32]> {
+        let text = value
+            .as_str()
+            .with_context(|| format!("typed digest is not a string: {value}"))?;
+        decode_digest(text).with_context(|| format!("typed digest does not decode: {text:?}"))
+    };
     let mut digests = BTreeSet::new();
     if let Some(one) = object.get("digest") {
-        digests.insert(decode_digest(one.as_str()?)?);
+        digests.insert(decode(one)?);
     }
     if let Some(many) = object.get("digests") {
-        for digest in many.as_array()? {
-            digests.insert(decode_digest(digest.as_str()?)?);
+        let many = many
+            .as_array()
+            .with_context(|| format!("typed digests is not an array: {many}"))?;
+        for digest in many {
+            digests.insert(decode(digest)?);
         }
     }
-    (!digests.is_empty()).then_some(digests)
+    ensure!(
+        !digests.is_empty(),
+        "typed object names no digest: {object:?}"
+    );
+    Ok(digests)
 }
 
 /// The digest set of each typed `state` object in `body`. A typed object
 /// has a tag field (`TAG_KEYS`) whose value is exactly `state`, or it is
-/// the value of a `state` key (externally tagged). Its digests are its
-/// own `digest`/`digests` fields. Subtrees under `SKIPPED_KEYS` are not
-/// read.
-fn typed_digest_sets(body: &serde_json::Value, state: &str) -> Vec<BTreeSet<[u8; 32]>> {
+/// the object value of a `state` key (externally tagged). Its digests are
+/// its own `digest`/`digests` fields. Subtrees under `SKIPPED_KEYS` are
+/// not read. A typed object with malformed digests is an error; a `state`
+/// key whose value is not an object is an error too.
+fn typed_digest_sets(body: &serde_json::Value, state: &str) -> Result<Vec<BTreeSet<[u8; 32]>>> {
     let mut found = Vec::new();
     let mut stack = vec![body];
     while let Some(value) = stack.pop() {
@@ -784,10 +1036,12 @@ fn typed_digest_sets(body: &serde_json::Value, state: &str) -> Vec<BTreeSet<[u8;
                     .iter()
                     .any(|key| object.get(*key).and_then(|tag| tag.as_str()) == Some(state));
                 if tagged {
-                    found.extend(own_digests(object));
+                    found.push(own_digests(object)?);
                 }
-                if let Some(serde_json::Value::Object(inner)) = object.get(state) {
-                    found.extend(own_digests(inner));
+                match object.get(state) {
+                    None => {}
+                    Some(serde_json::Value::Object(inner)) => found.push(own_digests(inner)?),
+                    Some(other) => bail!("typed key {state} is not an object: {other}"),
                 }
                 stack.extend(
                     object
@@ -800,7 +1054,7 @@ fn typed_digest_sets(body: &serde_json::Value, state: &str) -> Vec<BTreeSet<[u8;
             _ => {}
         }
     }
-    found
+    Ok(found)
 }
 
 /// The missing digests as bytes. A digest that does not decode is an
@@ -813,16 +1067,20 @@ fn digest_set(digests: &[String]) -> Result<BTreeSet<[u8; 32]>> {
 }
 
 /// Whether the typed `state` objects in `body` together name exactly
-/// `want` (the authority reports one object per missing digest).
-fn shows_all(body: &serde_json::Value, state: &str, want: &BTreeSet<[u8; 32]>) -> bool {
-    let sets = typed_digest_sets(body, state);
-    !sets.is_empty() && sets.into_iter().flatten().collect::<BTreeSet<_>>() == *want
+/// `want` (the authority reports one object per missing digest). A
+/// malformed typed object is an error.
+fn shows_all(body: &serde_json::Value, state: &str, want: &BTreeSet<[u8; 32]>) -> Result<bool> {
+    let sets = typed_digest_sets(body, state)?;
+    Ok(!sets.is_empty() && sets.into_iter().flatten().collect::<BTreeSet<_>>() == *want)
 }
 
 /// Whether one typed `state` object in `body` names exactly `want` (the
-/// joiner reports one wait naming every digest).
-fn shows_one(body: &serde_json::Value, state: &str, want: &BTreeSet<[u8; 32]>) -> bool {
-    typed_digest_sets(body, state).iter().any(|set| set == want)
+/// joiner reports one wait naming every digest). A malformed typed object
+/// is an error.
+fn shows_one(body: &serde_json::Value, state: &str, want: &BTreeSet<[u8; 32]>) -> Result<bool> {
+    Ok(typed_digest_sets(body, state)?
+        .iter()
+        .any(|set| set == want))
 }
 
 /// J's `join_state` on a 200 join-status body. The set is closed: any
@@ -906,6 +1164,15 @@ impl Membership {
             other => bail!("unsupported membership_state {other:?}"),
         }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Pending => "pending",
+            Self::PendingAuthorityCommit => JOIN_PENDING,
+            Self::NotMember => "not_member",
+        }
+    }
 }
 
 /// J's `last_join_outcome`.
@@ -951,13 +1218,12 @@ struct Snapshot {
     a_terminal: u64,
 }
 
+/// A JSON object body.
+type Object = serde_json::Map<String, serde_json::Value>;
+
 /// GET `path` at `label`: the status and the body, which must be a JSON
-/// object.
-async fn get_object(
-    sim: &Sim,
-    label: &str,
-    path: &str,
-) -> Result<(StatusCode, serde_json::Map<String, serde_json::Value>)> {
+/// object. No barrier: callers run it inside one.
+async fn get_object(sim: &Sim, label: &str, path: &str) -> Result<(StatusCode, Object)> {
     let (status, body) = sim.request(label, Method::GET, path, None).await?;
     match body {
         serde_json::Value::Object(object) => Ok((status, object)),
@@ -965,29 +1231,285 @@ async fn get_object(
     }
 }
 
-fn str_field<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Option<&'a str> {
+/// POST `body` to `path` at `label`, in its own barrier (`Sim::api`): the
+/// status and the answer, which must be a JSON object. A body that is not
+/// JSON (`Sim::api` gives `Null`) is an error too.
+async fn post_object(
+    sim: &Sim,
+    label: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<(StatusCode, Object)> {
+    let (status, answer) = sim.api(label, Method::POST, path, Some(body)).await?;
+    match answer {
+        serde_json::Value::Object(object) => Ok((status, object)),
+        other => bail!("{label} POST {path}: {status}: body is not an object: {other}"),
+    }
+}
+
+fn str_field<'a>(object: &'a Object, key: &str) -> Option<&'a str> {
     object.get(key).and_then(serde_json::Value::as_str)
 }
 
-/// The `last_join_outcome` of a join-status body: absent or null, or an
-/// object with a known `outcome`, a `reason` that is null or a string,
-/// and a `finished_at_ms` that is a non-negative integer. Any other shape
-/// or value is an error.
-fn join_outcome(body: &serde_json::Map<String, serde_json::Value>) -> Result<Option<JoinOutcome>> {
+/// Whether `body` has exactly the keys `keys`, and no other key.
+fn has_exact_keys(body: &Object, keys: &[&str]) -> bool {
+    body.len() == keys.len() && keys.iter().all(|key| body.contains_key(*key))
+}
+
+/// Whether `ok` is exactly the boolean `want`.
+fn ok_is(body: &Object, want: bool) -> bool {
+    body.get("ok") == Some(&serde_json::Value::Bool(want))
+}
+
+/// Whether `text` is 64 hex digits (a 32-byte id).
+fn is_id_hex(text: &str) -> bool {
+    text.len() == 64 && parse_digest(text).is_some()
+}
+
+/// The handler's 404 for an unknown group: `not_found("group not found")`
+/// (`server/mod.rs:3600`, through `api_error` at `server/mod.rs:3572`),
+/// that is, exactly `{"ok": false, "error": "group not found"}`.
+/// `get_named_group` (`routes/named_groups.rs:16649`) and
+/// `get_named_group_members` (`routes/named_groups.rs:16993`) send it.
+fn is_group_not_found(body: &Object) -> bool {
+    has_exact_keys(body, &["ok", "error"])
+        && ok_is(body, false)
+        && str_field(body, "error") == Some("group not found")
+}
+
+/// One row of `GET /groups/{gid}/members` (`named_group_member_values`,
+/// `routes/named_groups.rs:2393`).
+#[derive(Debug, PartialEq, Eq)]
+struct RosterRow {
+    /// Lowercase hex of the 32-byte agent id.
+    agent_id: String,
+    /// `GroupRole`, serde `snake_case`: a closed set.
+    role: crate::groups::GroupRole,
+    /// `GroupMemberState`, serde `snake_case`: a closed set.
+    state: crate::groups::GroupMemberState,
+}
+
+/// One roster row: an object with a 64-hex `agent_id` and a `role` and
+/// `state` from their closed serde sets. Extra keys are allowed (the
+/// handler also sends `display_name`, `joined_at` and `added_by`).
+fn parse_roster_row(row: &serde_json::Value) -> Result<RosterRow> {
+    let row = row
+        .as_object()
+        .with_context(|| format!("roster row is not an object: {row}"))?;
+    let agent_id =
+        str_field(row, "agent_id").with_context(|| format!("row has no agent_id: {row:?}"))?;
+    ensure!(
+        is_id_hex(agent_id),
+        "agent_id is not 64 hex digits: {agent_id:?}"
+    );
+    let closed = |key: &str| {
+        row.get(key)
+            .cloned()
+            .with_context(|| format!("row has no {key}: {row:?}"))
+    };
+    let role = serde_json::from_value(closed("role")?)
+        .with_context(|| format!("unsupported role: {row:?}"))?;
+    let state = serde_json::from_value(closed("state")?)
+        .with_context(|| format!("unsupported member state: {row:?}"))?;
+    Ok(RosterRow {
+        agent_id: agent_id.to_ascii_lowercase(),
+        role,
+        state,
+    })
+}
+
+/// Parse `GET /groups/{gid}/members` (`get_named_group_members`,
+/// `routes/named_groups.rs:16985`): only 200 with `ok: true`, the path's
+/// `group_id`, a `members` array of valid rows and a `member_count` equal
+/// to its length. Any other status (the 404 included: the case reads the
+/// roster only where G exists), shape or value is an error.
+fn parse_roster(gid: &str, status: StatusCode, body: &Object) -> Result<Vec<RosterRow>> {
+    ensure!(
+        status == StatusCode::OK && ok_is(body, true) && str_field(body, "group_id") == Some(gid),
+        "{status} {body:?}"
+    );
+    let members = body
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .with_context(|| format!("no members array: {body:?}"))?;
+    ensure!(
+        body.get("member_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            == Some(members.len()),
+        "member_count does not match the members array: {body:?}"
+    );
+    members.iter().map(parse_roster_row).collect()
+}
+
+/// Parse `POST /groups` (`create_named_group`,
+/// `routes/named_groups.rs:16501`): 201 with `ok: true`, a 64-hex
+/// `group_id` and the effective `policy` echoed as an object (the
+/// ADR-0038 downgrade check). Extra keys are allowed (`name`,
+/// `chat_topic`). The result is the group id.
+fn parse_created(status: StatusCode, body: &Object) -> Result<String> {
+    ensure!(
+        status == StatusCode::CREATED && ok_is(body, true),
+        "{status} {body:?}"
+    );
+    let gid = str_field(body, "group_id").with_context(|| format!("no group_id: {body:?}"))?;
+    ensure!(is_id_hex(gid), "group_id is not 64 hex digits: {gid:?}");
+    ensure!(
+        body.get("policy").is_some_and(serde_json::Value::is_object),
+        "no policy echo: {body:?}"
+    );
+    Ok(gid.to_string())
+}
+
+/// Parse `POST /groups/{gid}/invite` (`create_group_invite`,
+/// `routes/named_groups.rs:19553`): 200 with `ok: true`, the `group_id`
+/// and a non-empty `invite_link` string. Extra keys are allowed
+/// (`group_name`, `expires_at`). The result is the link.
+fn parse_invite(gid: &str, status: StatusCode, body: &Object) -> Result<String> {
+    ensure!(
+        status == StatusCode::OK && ok_is(body, true) && str_field(body, "group_id") == Some(gid),
+        "{status} {body:?}"
+    );
+    let link = str_field(body, "invite_link")
+        .filter(|link| !link.is_empty())
+        .with_context(|| format!("no invite_link: {body:?}"))?;
+    Ok(link.to_string())
+}
+
+/// Parse `POST /announce` (`announce_identity`,
+/// `routes/identity.rs:306`): 200 with exactly `{"ok": true,
+/// "include_user_identity": <the requested flag>}`. The object is small
+/// and fixed, so no other key is allowed.
+fn parse_announce(status: StatusCode, body: &Object, include_user_identity: bool) -> Result<()> {
+    ensure!(
+        status == StatusCode::OK
+            && has_exact_keys(body, &["ok", "include_user_identity"])
+            && ok_is(body, true)
+            && body.get("include_user_identity")
+                == Some(&serde_json::Value::Bool(include_user_identity)),
+        "{status} {body:?}"
+    );
+    Ok(())
+}
+
+/// The statuses at which `join_group_via_invite` refuses with its
+/// `api_error` body: 400 (`bad_request`), 403 (`forbidden`), 409
+/// (`refuse_invite`, `join_already_pending`, a withdrawn group,
+/// `JoinFailed`, fork-quarantined with a `reason`), 500 and 503.
+const JOIN_REFUSAL_STATUSES: &[StatusCode] = &[
+    StatusCode::BAD_REQUEST,
+    StatusCode::FORBIDDEN,
+    StatusCode::CONFLICT,
+    StatusCode::INTERNAL_SERVER_ERROR,
+    StatusCode::SERVICE_UNAVAILABLE,
+];
+
+/// The answer of `POST /groups/join` (`join_group_via_invite`,
+/// `routes/named_groups.rs:20381`). The set is closed: any other answer
+/// is an error.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinAnswer {
+    /// 200 with `ok: true`, the `group_id` and a `join_state` from the
+    /// closed membership set: a fresh join (`routes/named_groups.rs:21597`,
+    /// no `already_joined`), a duplicate (`:20864`) or a re-arm
+    /// (`:20368`), both with a boolean `already_joined`. Extra keys are
+    /// allowed (`group_name`, `chat_topic`).
+    Accepted {
+        join_state: Membership,
+        already_joined: Option<bool>,
+    },
+    /// At a status in `JOIN_REFUSAL_STATUSES`, exactly `{"ok": false,
+    /// "error": <text>}` (`api_error`), or with a `reason` string as well
+    /// (`api_error_with_reason`).
+    Refused {
+        status: StatusCode,
+        error: String,
+        reason: Option<String>,
+    },
+}
+
+impl JoinAnswer {
+    fn text(&self) -> String {
+        match self {
+            Self::Accepted {
+                join_state,
+                already_joined,
+            } => format!(
+                "accepted (join_state={}, already_joined={already_joined:?})",
+                join_state.name()
+            ),
+            Self::Refused {
+                status,
+                error,
+                reason,
+            } => format!("refused ({status}: {error:?}, reason={reason:?})"),
+        }
+    }
+}
+
+/// Parse a `POST /groups/join` answer for `gid` into its closed set.
+fn parse_join_answer(gid: &str, status: StatusCode, body: &Object) -> Result<JoinAnswer> {
+    if status == StatusCode::OK {
+        ensure!(
+            ok_is(body, true) && str_field(body, "group_id") == Some(gid),
+            "{status} {body:?}"
+        );
+        let join_state = Membership::parse(
+            str_field(body, "join_state").with_context(|| format!("no join_state: {body:?}"))?,
+        )?;
+        let already_joined = match body.get("already_joined") {
+            None => None,
+            Some(serde_json::Value::Bool(joined)) => Some(*joined),
+            Some(other) => bail!("already_joined is not a bool: {other}"),
+        };
+        return Ok(JoinAnswer::Accepted {
+            join_state,
+            already_joined,
+        });
+    }
+    ensure!(JOIN_REFUSAL_STATUSES.contains(&status), "{status} {body:?}");
+    let reason = match body.get("reason") {
+        None => None,
+        Some(serde_json::Value::String(reason)) => Some(reason.clone()),
+        Some(other) => bail!("reason is not a string: {other}"),
+    };
+    let keys: &[&str] = if reason.is_some() {
+        &["ok", "error", "reason"]
+    } else {
+        &["ok", "error"]
+    };
+    ensure!(
+        has_exact_keys(body, keys) && ok_is(body, false),
+        "{status} {body:?}"
+    );
+    let error = str_field(body, "error").with_context(|| format!("no error text: {body:?}"))?;
+    Ok(JoinAnswer::Refused {
+        status,
+        error: error.to_string(),
+        reason,
+    })
+}
+
+/// The `last_join_outcome` of a join-status body: null, or an object
+/// with a known `outcome`, a `reason` that is null or a string, and a
+/// `finished_at_ms` that is a non-negative integer. The handler always
+/// sends the key and the three fields (`join_status_body`,
+/// `routes/named_groups.rs:16617`). A missing key or field, or any other
+/// shape or value, is an error.
+fn join_outcome(body: &Object) -> Result<Option<JoinOutcome>> {
     let last = match body.get("last_join_outcome") {
-        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Null) => return Ok(None),
         Some(serde_json::Value::Object(last)) => last,
+        None => bail!("no last_join_outcome: {body:?}"),
         Some(other) => bail!("last_join_outcome is not an object: {other}"),
     };
     let outcome = str_field(last, "outcome")
         .with_context(|| format!("last_join_outcome has no outcome: {last:?}"))?;
     let kind = OutcomeKind::parse(outcome)?;
     let reason = match last.get("reason") {
-        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(reason)) => Some(reason.clone()),
+        None => bail!("last_join_outcome has no reason: {last:?}"),
         Some(other) => bail!("reason is not a string: {other}"),
     };
     ensure!(
@@ -998,14 +1520,13 @@ fn join_outcome(body: &serde_json::Map<String, serde_json::Value>) -> Result<Opt
     Ok(Some(JoinOutcome { kind, reason }))
 }
 
-/// Parse J's `/groups/{gid}/join-status` answer. 200 needs a known
-/// `join_state`. 404 needs the handler's `group_not_found` body with no
-/// `join_state`. Both need a valid `last_join_outcome`. Any other status,
-/// shape or value is an error.
-fn parse_join_status(
-    status: StatusCode,
-    body: &serde_json::Map<String, serde_json::Value>,
-) -> Result<JoinStatus> {
+/// Parse J's `/groups/{gid}/join-status` answer (`join_status_body`,
+/// `routes/named_groups.rs:16566`). 200 needs a known `join_state`; extra
+/// keys are allowed there, because S5 may add its typed wait. 404 needs
+/// the handler's body with exactly the keys `error` (`group_not_found`)
+/// and `last_join_outcome`. Both need a valid `last_join_outcome`. Any
+/// other status, shape or value is an error.
+fn parse_join_status(status: StatusCode, body: &Object) -> Result<JoinStatus> {
     let join_state = if status == StatusCode::OK {
         let text =
             str_field(body, "join_state").with_context(|| format!("no join_state: {body:?}"))?;
@@ -1013,8 +1534,8 @@ fn parse_join_status(
     } else {
         ensure!(
             status == StatusCode::NOT_FOUND
-                && str_field(body, "error") == Some("group_not_found")
-                && !body.contains_key("join_state"),
+                && has_exact_keys(body, &["error", "last_join_outcome"])
+                && str_field(body, "error") == Some("group_not_found"),
             "{status} {body:?}"
         );
         None
@@ -1025,27 +1546,24 @@ fn parse_join_status(
     })
 }
 
-/// Parse J's `/groups/{gid}` answer: 200 for `gid` with a known
-/// `membership_state`, or the handler's 404 `group not found` body
-/// (`None`). Any other status, shape or value is an error.
-fn parse_membership(
-    gid: &str,
-    status: StatusCode,
-    body: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<Membership>> {
+/// Parse a `/groups/{gid}` answer (`get_named_group`,
+/// `routes/named_groups.rs:16638`): 200 with `ok: true`, `group_id` equal
+/// to `gid` and a known `membership_state` (extra keys are allowed: the
+/// full body has many, and S5 may add typed fields), or the handler's
+/// exact 404 body (`is_group_not_found`, `None`). Any other status
+/// (a 403 included), shape or value is an error, never "not active".
+fn parse_membership(gid: &str, status: StatusCode, body: &Object) -> Result<Option<Membership>> {
     if status == StatusCode::OK {
         ensure!(
-            str_field(body, "group_id") == Some(gid),
-            "wrong group: {body:?}"
+            ok_is(body, true) && str_field(body, "group_id") == Some(gid),
+            "wrong group or no ok: {body:?}"
         );
         let text = str_field(body, "membership_state")
             .with_context(|| format!("no membership_state: {body:?}"))?;
         return Membership::parse(text).map(Some);
     }
     ensure!(
-        status == StatusCode::NOT_FOUND
-            && body.get("ok") == Some(&serde_json::Value::Bool(false))
-            && str_field(body, "error") == Some("group not found"),
+        status == StatusCode::NOT_FOUND && is_group_not_found(body),
         "{status} {body:?}"
     );
     Ok(None)
@@ -1058,9 +1576,13 @@ async fn a_terminal_refusals(sim: &Sim, gid: &str) -> Result<u64> {
     let gid = gid.to_string();
     sim.at_instant("read A's #946 terminal refusals for G", async move {
         let groups = a.named_groups.read().await;
-        let (key, _) = crate::server::resolve_group_entry_locked(&groups, &gid)
+        let (key, info) = crate::server::resolve_group_entry_locked(&groups, &gid)
             .context("A has no entry for G")?;
-        let key = key.to_string();
+        let names = [
+            key.to_string(),
+            gid.clone(),
+            info.stable_group_id().to_string(),
+        ];
         let snapshot = a.groups_diagnostics.snapshot(
             &groups,
             &std::collections::HashSet::new(),
@@ -1068,10 +1590,17 @@ async fn a_terminal_refusals(sim: &Sim, gid: &str) -> Result<u64> {
             &std::collections::HashMap::new(),
             a.groups_config.mandate_grace_days,
         );
-        Ok(snapshot
+        let rows: Vec<_> = snapshot
             .groups
             .iter()
-            .filter(|row| row.group_id == key || row.group_id == gid)
+            .filter(|row| names.contains(&row.group_id))
+            .collect();
+        // The snapshot has one row per group: no row for G is an error,
+        // not "no refusal".
+        ensure!(!rows.is_empty(), "A's diagnostics have no row for G");
+        // A reason with no count yet is zero refusals.
+        Ok(rows
+            .iter()
             .map(|row| {
                 row.counters
                     .invites_refused_reasons
@@ -1092,16 +1621,21 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
     let j_hex = sim.agent_hex("J")?;
     let group_path = format!("/groups/{gid}");
     let status_path = format!("/groups/{gid}/join-status");
+    let members_path = format!("/groups/{gid}/members");
+    // A is the authority: its group read must be a 200 for G.
     let (status, a_group) = get_object(sim, "A", &group_path).await?;
     ensure!(
-        status == StatusCode::OK && str_field(&a_group, "group_id") == Some(gid),
+        status == StatusCode::OK
+            && parse_membership(gid, status, &a_group)
+                .with_context(|| format!("A GET {group_path}"))?
+                .is_some(),
         "A GET {group_path}: {status} {a_group:?}"
     );
-    let a_typed = shows_all(&serde_json::Value::Object(a_group), EVIDENCE_PENDING, want);
-    let a_lists_j = roster(sim, "A", gid)
-        .await?
-        .iter()
-        .any(|(id, _)| id.eq_ignore_ascii_case(&j_hex));
+    let a_typed = shows_all(&serde_json::Value::Object(a_group), EVIDENCE_PENDING, want)
+        .with_context(|| format!("A GET {group_path}: typed {EVIDENCE_PENDING}"))?;
+    let (status, a_roster) = get_object(sim, "A", &members_path).await?;
+    let a_lists_j =
+        lists(gid, &j_hex, status, &a_roster).with_context(|| format!("A GET {members_path}"))?;
     let (status, j_group) = get_object(sim, "J", &group_path).await?;
     let j_membership =
         parse_membership(gid, status, &j_group).with_context(|| format!("J GET {group_path}"))?;
@@ -1112,10 +1646,16 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
     } = parse_join_status(status, &join).with_context(|| format!("J GET {status_path}"))?;
     let j_group = serde_json::Value::Object(j_group);
     let join = serde_json::Value::Object(join);
+    // Both bodies are parsed, so a malformed typed object in either one is
+    // INFRA.
+    let j_group_typed = shows_one(&j_group, AWAITING_EVIDENCE, want)
+        .with_context(|| format!("J GET {group_path}: typed {AWAITING_EVIDENCE}"))?;
+    let j_status_typed = shows_one(&join, AWAITING_EVIDENCE, want)
+        .with_context(|| format!("J GET {status_path}: typed {AWAITING_EVIDENCE}"))?;
+    let j_typed = j_group_typed || j_status_typed;
     Ok(Snapshot {
         a_typed,
-        j_typed: shows_one(&j_group, AWAITING_EVIDENCE, want)
-            || shows_one(&join, AWAITING_EVIDENCE, want),
+        j_typed,
         a_lists_j,
         j_active: j_membership == Some(Membership::Active),
         join_state,
@@ -1128,8 +1668,12 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
 /// The typed wait states that one poll saw.
 #[derive(Clone, Copy, Debug)]
 struct PollRecord {
-    /// The poll's time since J's join call.
-    since: Duration,
+    /// When the poll's first read started, as time since J's join call.
+    /// Every "after" rule and every lower bound uses this time.
+    started: Duration,
+    /// When the poll's last read finished, as time since J's join call.
+    /// The reads may advance virtual time inside the poll's barrier.
+    finished: Duration,
     /// A showed typed `evidence_pending` naming exactly the missing set.
     a_typed: bool,
     /// J showed typed `awaiting_evidence` naming exactly the missing set.
@@ -1170,25 +1714,26 @@ impl Visibility {
     }
 }
 
-/// Whether `pick` holds at EVERY poll strictly after `after`. There must
-/// be at least one such poll.
+/// Whether `pick` holds at EVERY poll that STARTED strictly after
+/// `after`. A poll that started before `after` does not count, even if it
+/// finished after it. There must be at least one such poll.
 fn continuous_from(
     polls: &[PollRecord],
     after: Duration,
     pick: impl Fn(&PollRecord) -> bool,
 ) -> Visibility {
-    let checked: Vec<&PollRecord> = polls.iter().filter(|poll| poll.since > after).collect();
+    let checked: Vec<&PollRecord> = polls.iter().filter(|poll| poll.started > after).collect();
     let Some(first) = checked.first() else {
         return Visibility::NoPolls { after };
     };
     match checked.iter().enumerate().find(|(_, poll)| !pick(poll)) {
         Some((seen, poll)) => Visibility::AbsentAt {
-            at: poll.since,
+            at: poll.started,
             seen,
         },
         None => Visibility::Every {
             polls: checked.len(),
-            from: first.since,
+            from: first.started,
         },
     }
 }
@@ -1209,8 +1754,17 @@ fn a_typed_visibility(polls: &[PollRecord], a_wait_began: Option<Duration>) -> V
 fn j_typed_visibility(polls: &[PollRecord]) -> Visibility {
     match polls.iter().find(|poll| poll.a_typed) {
         None => Visibility::NoStart("A never showed its typed wait"),
-        Some(first) => continuous_from(polls, first.since, |poll| poll.j_typed),
+        Some(first) => continuous_from(polls, first.started, |poll| poll.j_typed),
     }
+}
+
+/// Whether a span of polls reached `bound`: its last poll STARTED at or
+/// after `bound` (a poll that started before it does not count, even if
+/// it finished after it), and `now` (time since J's join call) is at or
+/// after `bound` too. The minute-12 return and the never-return window
+/// both use it.
+fn span_reached(last_started: Option<Duration>, now: Duration, bound: Duration) -> bool {
+    last_started.is_some_and(|last| last >= bound) && now >= bound
 }
 
 /// What the polls saw, as times since J's join call.
@@ -1226,7 +1780,8 @@ struct WaitWindow {
     /// The first poll at which J showed neither a pending attempt nor a
     /// typed outcome.
     silent_drop: Option<(Duration, String)>,
-    /// The first poll at which A held any missing digest, and how many.
+    /// The first read at which A held any missing digest, and how many.
+    /// The time is that read's own instant, since J's join call.
     a_held: Option<(Duration, usize)>,
     /// The first poll at which J showed a `refused` outcome or A had
     /// recorded the #946 terminal refusal for G, and what it showed.
@@ -1242,25 +1797,28 @@ impl WaitWindow {
         self.records.len()
     }
 
-    /// The time of the last poll.
+    /// When the last poll started.
     fn last_poll(&self) -> Option<Duration> {
-        self.records.last().map(|poll| poll.since)
+        self.records.last().map(|poll| poll.started)
     }
 
-    /// The first poll at which `pick` held.
+    /// The start of the first poll at which `pick` held.
     fn first(&self, pick: impl Fn(&PollRecord) -> bool) -> Option<Duration> {
         self.records
             .iter()
             .find(|poll| pick(poll))
-            .map(|poll| poll.since)
+            .map(|poll| poll.started)
     }
 
-    fn record(&mut self, since: Duration, snap: &Snapshot) {
+    /// Record one poll. The events below are named by the poll's start.
+    fn record(&mut self, started: Duration, finished: Duration, snap: &Snapshot) {
         self.records.push(PollRecord {
-            since,
+            started,
+            finished,
             a_typed: snap.a_typed,
             j_typed: snap.j_typed,
         });
+        let since = started;
         let j_refused = snap
             .outcome
             .as_ref()
@@ -1331,24 +1889,31 @@ impl WaitWindow {
         until: Duration,
     ) -> Result<()> {
         let want = digest_set(digests)?;
+        let since = |sim: &Sim| sim.fabric().now().saturating_sub(joined_at);
         loop {
-            let since = sim.fabric().now().saturating_sub(joined_at);
+            let started = since(sim);
             let snap = sim
                 .within(
-                    &format!("read the wait states at t2+{}s", since.as_secs()),
+                    &format!("read the wait states at t2+{}s", started.as_secs()),
                     secs(10),
                     snapshot(sim, gid, &want),
                 )
                 .await?
                 .with_context(|| {
-                    format!("INFRA: reading the wait states at t2+{}s", since.as_secs())
+                    format!(
+                        "INFRA: reading the wait states at t2+{}s",
+                        started.as_secs()
+                    )
                 })?;
-            self.record(since, &snap);
+            let finished = since(sim);
+            self.record(started, finished, &snap);
             let (_, held) = held_digests(sim, "A", gid, digests).await?;
+            let held_at = since(sim);
             if !held.is_empty() && self.a_held.is_none() {
-                self.a_held = Some((since, held.len()));
+                self.a_held = Some((held_at, held.len()));
             }
-            if since >= until {
+            // The span ends with the first poll that STARTED at `until`.
+            if started >= until {
                 return Ok(());
             }
             sim.within(
@@ -1358,6 +1923,17 @@ impl WaitWindow {
             )
             .await?;
         }
+    }
+
+    /// The last poll's span, for the receipt.
+    fn last_span(&self) -> String {
+        self.records.last().map_or("no poll".to_string(), |poll| {
+            format!(
+                "last poll t2+{}..{}",
+                ms_text(poll.started),
+                ms_text(poll.finished)
+            )
+        })
     }
 
     fn timeline(&self) -> String {
@@ -1425,9 +2001,19 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // A starts.
     let owner = UserKeypair::generate()?;
     let owner_home = sim.start_owner_device("O", &owner).await?;
+    // Post-conditions of the shared helpers, from in-process state.
+    ensure!(
+        owner_home
+            .owner_user_id
+            .eq_ignore_ascii_case(&hex::encode(owner.user_id().0)),
+        "INFRA: O's Home owner {} is not the owner key",
+        owner_home.owner_user_id
+    );
+    certified_by(sim, "O", &owner)?;
     for member in MEMBERS {
         sim.certify_owner_device("O", member, &owner, &owner_home)
             .await?;
+        certified_by(sim, member, &owner)?;
     }
     let group = HomeIds {
         gid: create_owner_certified(sim, "O", &owner_home.owner_user_id).await?,
@@ -1436,70 +2022,102 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     for member in MEMBERS {
         let link = invite(sim, "O", &group.gid).await?;
         join(sim, member, &group, &link).await?;
+        let start = sim.fabric().now();
+        let seated = admitted(sim, "O", member, &group.gid, start, JOIN_BUDGET).await?;
         ensure!(
-            admitted(sim, "O", member, &group.gid, JOIN_BUDGET).await?,
-            "setup: O could not seat {member}"
+            component_passes(seated, JOIN_BUDGET),
+            "setup: O could not seat {member}: {}",
+            seated.text(JOIN_BUDGET)
         );
     }
     let answers = AnswerDrop::install(sim, &["A", "J"], MEMBERS)?;
     for device in ["A", "J"] {
         sim.certify_owner_device("O", device, &owner, &owner_home)
             .await?;
+        certified_by(sim, device, &owner)?;
     }
     let link = invite(sim, "O", &group.gid).await?;
     join(sim, "A", &group, &link).await?;
+    let start = sim.fabric().now();
+    let seated = admitted(sim, "O", "A", &group.gid, start, JOIN_BUDGET).await?;
     ensure!(
-        admitted(sim, "O", "A", &group.gid, JOIN_BUDGET).await?,
-        "setup: O could not seat A"
+        component_passes(seated, JOIN_BUDGET),
+        "setup: O could not seat A: {}",
+        seated.text(JOIN_BUDGET)
     );
     let mut observers = vec!["A"];
     observers.extend_from_slice(MEMBERS);
     sim.promote_admin("O", "A", &group, &observers).await?;
+    // Post-condition of `promote_admin`: every observer's strict roster
+    // lists A as an active admin.
+    admin_everywhere(sim, &group.gid, "A", &observers).await?;
     let home = group;
+    // SETTLE is a lower bound: the measured sleep must reach it.
+    let settle_from = sim.fabric().now();
     sim.within(
         "A's seat settles",
         SETTLE + secs(1),
         tokio::time::sleep(SETTLE),
     )
     .await?;
+    let settled = sim.fabric().now().saturating_sub(settle_from);
+    ensure!(
+        settled >= SETTLE,
+        "INFRA: A's seat settled for {}, under {}s",
+        ms_text(settled),
+        SETTLE.as_secs()
+    );
     // O announces with consent (the #1143 workaround): A's seat for O has
     // no certificate, so only O's consented announce gives A O's
     // certificate. Without it, every seal of J's add refuses naming O.
     // A fetches the certificate blob once per announce, and only the
     // next announce retries a failed fetch. The drop toward A can lose
     // that blob, so O repeats the announce every 10 s, as a heartbeat
-    // would (run 39384499206).
+    // would (run 39384499206). The 60 s total is measured on the fabric
+    // clock from before the first announce.
     let mut announces = 0_u32;
-    let mut waited = Duration::ZERO;
-    let (o_clean, o_status) = loop {
-        let (status, body) = sim
-            .api(
-                "O",
-                Method::POST,
-                "/announce",
-                Some(json!({"include_user_identity": true, "human_consent": true})),
-            )
-            .await?;
-        ensure!(status.is_success(), "O announce: {status} {body}");
+    let o_start = sim.fabric().now();
+    let (o_wait, o_status) = loop {
+        announce(sim, "O", true).await?;
         announces += 1;
-        let (clean, last) = until_a_clean(sim, &home.gid, "O", secs(10)).await?;
-        waited += secs(10);
-        if clean || waited >= secs(60) {
-            break (clean, last);
+        let (deadline, last) = until_a_clean(
+            sim,
+            &home.gid,
+            "O",
+            o_start,
+            O_ANNOUNCE_BOUND,
+            Some(O_ANNOUNCE_EVERY),
+        )
+        .await?;
+        // `Met` or `Late` ends the loop. So does the bound: no announce
+        // or read starts after it (`may_read`).
+        let elapsed = sim.fabric().now().saturating_sub(o_start);
+        if !matches!(deadline, Deadline::Never { .. }) || elapsed > O_ANNOUNCE_BOUND {
+            break (deadline, last);
         }
     };
+    let o_clean = component_passes(o_wait, O_ANNOUNCE_BOUND);
     receipt.evidence(
         "a_verifies_creator_certificate_from_its_consented_announce",
         o_clean,
-        format!("after {announces} consented announces from O, A's verdict for O: {o_status:?}"),
+        format!(
+            "after {announces} consented announces from O, A's verdict for O: {o_status:?} \
+             ({})",
+            o_wait.text(O_ANNOUNCE_BOUND)
+        ),
         at(sim),
     );
     ensure!(
         o_clean,
         "INFRA: A did not verify O's certificate after O's consented announce \
-         (verdict {o_status:?})"
+         (verdict {o_status:?}, {})",
+        o_wait.text(O_ANNOUNCE_BOUND)
     );
     let before = seat_view(sim, "A", &home.gid).await?;
+    ensure!(
+        before.admin,
+        "INFRA: A is not an active admin of G after its promotion"
+    );
     let missing: Vec<String> = before.digest_only.values().cloned().collect();
     let owner_hex = sim.agent_hex("O")?;
     receipt.evidence(
@@ -1527,20 +2145,21 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         sim.at_instant("read J's announce cache", async move {
             let mut held = 0usize;
             for digest in &digests {
-                if let Some(bytes) = parse_digest(digest) {
-                    if j.agent
-                        .announce_blob_cache
-                        .find_by_cert_digest(&bytes)
-                        .await
-                        .is_some()
-                    {
-                        held += 1;
-                    }
+                // A digest that does not decode is an error, not "not held".
+                let bytes =
+                    parse_digest(digest).with_context(|| format!("bad seat digest {digest}"))?;
+                if j.agent
+                    .announce_blob_cache
+                    .find_by_cert_digest(&bytes)
+                    .await
+                    .is_some()
+                {
+                    held += 1;
                 }
             }
-            held
+            Ok::<_, anyhow::Error>(held)
         })
-        .await?
+        .await??
     };
     receipt.evidence(
         "j_holds_none_of_the_missing_certificates",
@@ -1616,32 +2235,42 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // verified=false, in both arms). J re-announces, as a joiner that
     // comes online after A's restart does at its start, and the case
     // waits until A verifies J's binding (`case_1207.rs` does the same).
-    let j_verified = announce_and_wait_verified(sim, "J", "A").await?;
+    let j_binding = announce_and_wait_verified(sim, "J", "A").await?;
+    let j_verified = component_passes(j_binding, VERIFY_BOUND);
     receipt.evidence(
         "a_verifies_j_binding_after_its_restart",
         j_verified,
-        format!("after J's re-announce, A verifies J's machine binding: {j_verified}"),
+        format!(
+            "after J's re-announce, A verifies J's machine binding: {}",
+            j_binding.text(VERIFY_BOUND)
+        ),
         at(sim),
     );
     ensure!(
         j_verified,
-        "INFRA: A never verified J's machine binding after A's restart"
+        "INFRA: A did not verify J's machine binding after A's restart ({})",
+        j_binding.text(VERIFY_BOUND)
     );
     // A's discovery cache is in memory, so A lost O's consented announce in
     // the restart. A must learn it again from an online node, or every
     // seal of J's add refuses naming O.
     let o_wait_from = sim.fabric().now();
-    let (o_clean, o_status) = until_a_clean(sim, &home.gid, "O", secs(60)).await?;
-    let o_took = sim.fabric().now().saturating_sub(o_wait_from);
+    let (o_wait, o_status) =
+        until_a_clean(sim, &home.gid, "O", o_wait_from, RESTART_CLEAN_BOUND, None).await?;
+    let o_clean = component_passes(o_wait, RESTART_CLEAN_BOUND);
     receipt.evidence(
         "a_verifies_creator_certificate_after_its_restart",
         o_clean,
-        format!("A's verdict for O after its restart: {o_status:?} (after {o_took:?})"),
+        format!(
+            "A's verdict for O after its restart: {o_status:?} ({})",
+            o_wait.text(RESTART_CLEAN_BOUND)
+        ),
         at(sim),
     );
     ensure!(
         o_clean,
-        "INFRA: A did not verify O's certificate after A's restart (verdict {o_status:?})"
+        "INFRA: A did not verify O's certificate after A's restart (verdict {o_status:?}, {})",
+        o_wait.text(RESTART_CLEAN_BOUND)
     );
     receipt.setup_done(at(sim));
 
@@ -1755,17 +2384,21 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     join(sim, "J", &home, &link).await?;
     let joined_at = sim.fabric().now();
     let mut window = WaitWindow::default();
-    let j_admitted = match arm {
-        Arm::OneHolderOnline => admitted(sim, "A", "J", &home.gid, JOIN_BUDGET).await?,
+    // The control's JOIN_BUDGET is measured from the end of J's join call.
+    let j_admission = match arm {
+        Arm::OneHolderOnline => {
+            Some(admitted(sim, "A", "J", &home.gid, joined_at, JOIN_BUDGET).await?)
+        }
         Arm::HolderReturns | Arm::HoldersNeverReturn => {
             // Every holder is offline: the wait must be typed and must not
             // end at J's 120 s poll deadline (ADR 0111 §8, D64).
             window
                 .poll_until(sim, &home.gid, &missing, joined_at, HOLDER_GAP)
                 .await?;
-            false
+            None
         }
     };
+    let j_admitted = j_admission.is_some_and(|deadline| component_passes(deadline, JOIN_BUDGET));
     drop(watcher);
     let received = std::mem::take(
         &mut *received
@@ -1821,6 +2454,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     ));
     let passed = match arm {
         Arm::OneHolderOnline => {
+            if let Some(deadline) = j_admission {
+                receipt.note(format!(
+                    "J Active and listed by A after J's join call: {}",
+                    deadline.text(JOIN_BUDGET)
+                ));
+            }
             if !j_admitted {
                 // The cause: A's seal refusal for THIS group and THIS joiner,
                 // after J's request reached A, naming exactly A's digest-only
@@ -1832,11 +2471,31 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     refusal.is_some(),
                     at(sim),
                 );
-                let a_rows = roster(sim, "A", &home.gid).await?;
-                let j_state = membership_state(sim, "J", &home.gid).await?;
+                // Strict diagnostic reads: a malformed answer is INFRA.
+                let members_path = format!("/groups/{}/members", home.gid);
+                let group_path = format!("/groups/{}", home.gid);
+                let (status, body) = sim
+                    .within(
+                        "read A's roster",
+                        secs(10),
+                        get_object(sim, "A", &members_path),
+                    )
+                    .await??;
+                let a_rows = parse_roster(&home.gid, status, &body)
+                    .with_context(|| format!("A GET {members_path}"))?;
+                let (status, body) = sim
+                    .within(
+                        "read J's membership",
+                        secs(10),
+                        get_object(sim, "J", &group_path),
+                    )
+                    .await??;
+                let j_state = parse_membership(&home.gid, status, &body)
+                    .with_context(|| format!("J GET {group_path}"))?;
                 sim.fabric().mark(format!(
-                    "observed: A lists {} members, J membership_state={j_state:?}",
-                    a_rows.len()
+                    "observed: A lists {} members, J membership_state={}",
+                    a_rows.len(),
+                    j_state.map_or("none (404)", Membership::name)
                 ));
             }
             j_admitted
@@ -1934,12 +2593,14 @@ async fn holder_returns(
     let since_join = |sim: &Sim| sim.fabric().now().saturating_sub(ret.joined_at).as_secs();
     // ADR 0111 H3: the holder returns at minute 12, after the 10-minute
     // terminal refusal, and never before.
+    // The last poll must have STARTED at or after the gap.
     let gap = sim.fabric().now().saturating_sub(ret.joined_at);
     ensure!(
-        window.last_poll().is_some_and(|last| last >= HOLDER_GAP) && gap >= HOLDER_GAP,
-        "INFRA: the holder would return at t2+{}s (last poll {}), before the {}s gap",
-        gap.as_secs(),
+        span_reached(window.last_poll(), gap, HOLDER_GAP),
+        "INFRA: the holder would return at t2+{} (last poll started {}; {}), before the {}s gap",
+        ms_text(gap),
         at_text(window.last_poll()),
+        window.last_span(),
         HOLDER_GAP.as_secs()
     );
     // The last read before the return: A's #946 terminal refusals for G.
@@ -1950,47 +2611,42 @@ async fn holder_returns(
     let returned_at = sim.fabric().now();
     a_dials(sim, ret.holder).await?;
     // H3 step 3: J retries. A pending attempt must resume by itself, so
-    // the case re-POSTs only when J's attempt has ended. A failed re-POST
-    // is product behaviour, not INFRA.
+    // the case re-POSTs only when J's attempt has ended. A typed refusal
+    // of the re-POST is product behaviour, not INFRA; any answer outside
+    // the closed set is INFRA (`parse_join_answer`).
     if window.j_pending_now {
         receipt.note("J's attempt is still pending after the gap: no new join call");
     } else {
-        let (status, body) = sim
-            .api(
-                "J",
-                Method::POST,
-                "/groups/join",
-                Some(json!({
-                    "invite": ret.link,
-                    "display_name": "J",
-                    "mode": "home",
-                    "expected_owner_user_id": ret.home.owner_user_id,
-                })),
-            )
-            .await?;
+        let (status, body) =
+            post_object(sim, "J", "/groups/join", join_body("J", ret.home, ret.link)).await?;
+        let answer = parse_join_answer(ret.gid, status, &body)
+            .context("J POST /groups/join after the return")?;
         receipt.note(format!(
-            "J's attempt had ended; J redeems the same invite again at t2+{}s: {status} {body}",
-            since_join(sim)
+            "J's attempt had ended; J redeems the same invite again at t2+{}s: {}",
+            since_join(sim),
+            answer.text()
         ));
     }
     // ADR 0111 H3: within 60 s of the holder's start, A holds the bytes.
-    let deadline = returned_at.saturating_add(RETURN_FETCH);
-    let a_holds = loop {
-        let (_, held) = held_digests(sim, "A", ret.gid, ret.missing).await?;
-        if held.len() == ret.missing.len() {
-            break Some(sim.fabric().now().saturating_sub(returned_at));
-        }
-        if sim.fabric().now() >= deadline {
-            break None;
-        }
-        sim.within(
-            "wait for A to fetch the certificates",
-            secs(2),
-            tokio::time::sleep(secs(1)),
-        )
-        .await?;
-    };
-    let j_active = admitted(sim, "A", "J", ret.gid, RETURN_ADMIT).await?;
+    // The time is that of the read that saw every byte (`timed_wait`), so
+    // bytes seen after the bound fail the component.
+    let a_holds = timed_wait(
+        sim,
+        "A holds every missing certificate",
+        returned_at,
+        RETURN_FETCH,
+        None,
+        async |s: &Sim| {
+            let (_, held) = held_digests(s, "A", ret.gid, ret.missing).await?;
+            Ok((held.len() == ret.missing.len(), held.len()))
+        },
+    )
+    .await?;
+    let a_holds_ok = component_passes(a_holds.deadline, RETURN_FETCH);
+    // J has RETURN_ADMIT from the end of A's fetch wait.
+    let admit_from = sim.fabric().now();
+    let j_active = admitted(sim, "A", "J", ret.gid, admit_from, RETURN_ADMIT).await?;
+    let j_active_ok = component_passes(j_active, RETURN_ADMIT);
     let ended_in_gap = window.j_ended.clone();
     // ADR 0111 H3: each typed wait stays visible at every poll, through
     // the last gap poll. Seen once is not enough.
@@ -2030,23 +2686,22 @@ async fn holder_returns(
         ),
         (
             "a_holds_within_60s",
-            a_holds.is_some(),
-            a_holds.map_or(
-                "A did not hold every missing digest within 60 s".to_string(),
-                |took| {
-                    format!(
-                        "A held every missing digest {}s after the return",
-                        took.as_secs()
-                    )
-                },
+            a_holds_ok,
+            format!(
+                "A holds every missing digest after the holder's start: {} (last read: {} of {})",
+                a_holds.deadline.text(RETURN_FETCH),
+                a_holds
+                    .last
+                    .map_or("none".to_string(), |held| held.to_string()),
+                ret.missing.len()
             ),
         ),
         (
             "j_admitted_after_return",
-            j_active,
+            j_active_ok,
             format!(
-                "J Active and listed by A within {}s: {j_active}",
-                RETURN_ADMIT.as_secs()
+                "J Active and listed by A after A's fetch wait: {}",
+                j_active.text(RETURN_ADMIT)
             ),
         ),
     ];
@@ -2060,7 +2715,7 @@ async fn holder_returns(
         let typed_absent = window.first(|poll| poll.a_typed || poll.j_typed).is_none();
         let summary = format!(
             "J's attempt end: {}; terminal refusal: {}; A held the bytes after the return: \
-             {}; J active after the return: {j_active}",
+             {}; J active after the return: {}",
             match &ended_in_gap {
                 Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
                 None => "none during the gap".to_string(),
@@ -2069,10 +2724,8 @@ async fn holder_returns(
                 Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
                 None => "none before the return".to_string(),
             },
-            a_holds.map_or("no".to_string(), |took| format!(
-                "yes, after {}s",
-                took.as_secs()
-            )),
+            a_holds.deadline.text(RETURN_FETCH),
+            j_active.text(RETURN_ADMIT),
         );
         receipt.cause(
             "every holder offline: A's seal waits on OwnerCertMemberPending{A's digest-only \
@@ -2104,12 +2757,14 @@ async fn never_return(
     window
         .poll_until(sim, gid, missing, joined_at, NEVER_WINDOW)
         .await?;
+    // The window is a lower bound: the last poll must have STARTED at or
+    // after it (`span_reached`), as for the minute-12 return.
+    let now = sim.fabric().now().saturating_sub(joined_at);
     ensure!(
-        window
-            .last_poll()
-            .is_some_and(|last| last >= NEVER_WINDOW && last > HOLDER_GAP),
-        "INFRA: the never-return polls ended at {}, before {}s",
+        span_reached(window.last_poll(), now, NEVER_WINDOW),
+        "INFRA: the never-return polls ended at {} ({}), before {}s",
         at_text(window.last_poll()),
+        window.last_span(),
         NEVER_WINDOW.as_secs()
     );
     let (_, held) = held_digests(sim, "A", gid, missing).await?;
@@ -2271,22 +2926,29 @@ fn w3h_1023_typed_state_name_in_error_text_does_not_match() {
         "error": format!("evidence_pending for {one} and {two}"),
         "message": {"state": "evidence_pending", "digests": [one, two]},
     });
-    assert!(!shows_all(&body, EVIDENCE_PENDING, &want));
-    assert!(!shows_one(&body, EVIDENCE_PENDING, &want));
+    assert!(!shows_all(&body, EVIDENCE_PENDING, &want).unwrap());
+    assert!(!shows_one(&body, EVIDENCE_PENDING, &want).unwrap());
 }
 
 #[test]
 fn w3h_1023_typed_digest_in_unrelated_field_does_not_match() {
     let (one, two, want) = typed_fixture();
-    // The state tag and the digests are in different objects.
+    // No tagged object: the digests sit in roster rows. Not typed.
+    let untagged = json!({
+        "members": [{"agent_id": "aa", "certificate_digest": one, "digest_of": two}],
+    });
+    assert!(!shows_all(&untagged, EVIDENCE_PENDING, &want).unwrap());
+    assert!(!shows_one(&untagged, AWAITING_EVIDENCE, &want).unwrap());
+    // A tagged object whose own digest fields are malformed or absent is
+    // INFRA, never "not typed": the digests elsewhere do not count.
     let body = json!({
         "status": "evidence_pending",
         "members": [{"agent_id": "aa", "certificate_digest": one, "digest_of": two}],
         "wait": {"state": "awaiting_evidence"},
         "digests": "not an array",
     });
-    assert!(!shows_all(&body, EVIDENCE_PENDING, &want));
-    assert!(!shows_one(&body, AWAITING_EVIDENCE, &want));
+    assert!(shows_all(&body, EVIDENCE_PENDING, &want).is_err());
+    assert!(shows_one(&body, AWAITING_EVIDENCE, &want).is_err());
 }
 
 #[test]
@@ -2305,11 +2967,11 @@ fn w3h_1023_typed_tagged_node_with_exact_digests_matches() {
             {"state": "evidence_pending", "kind": "certificate", "digest": b64(&two)},
         ],
     });
-    assert!(shows_all(&authority, EVIDENCE_PENDING, &want));
+    assert!(shows_all(&authority, EVIDENCE_PENDING, &want).unwrap());
     // The joiner: one wait that names every digest.
     let joiner =
         json!({"join_state": "awaiting_evidence", "digests": [b64(&one), two], "since": 1});
-    assert!(shows_one(&joiner, AWAITING_EVIDENCE, &want));
+    assert!(shows_one(&joiner, AWAITING_EVIDENCE, &want).unwrap());
 }
 
 #[test]
@@ -2317,22 +2979,23 @@ fn w3h_1023_typed_wrong_or_partial_digest_set_does_not_match() {
     let (one, two, want) = typed_fixture();
     let other = hex::encode([0x33_u8; 32]);
     let partial = json!({"state": "evidence_pending", "digest": one});
-    assert!(!shows_all(&partial, EVIDENCE_PENDING, &want));
+    assert!(!shows_all(&partial, EVIDENCE_PENDING, &want).unwrap());
     let extra = json!([
         {"state": "evidence_pending", "digest": one},
         {"state": "evidence_pending", "digest": two},
         {"state": "evidence_pending", "digest": other},
     ]);
-    assert!(!shows_all(&extra, EVIDENCE_PENDING, &want));
+    assert!(!shows_all(&extra, EVIDENCE_PENDING, &want).unwrap());
     let split = json!([
         {"join_state": "awaiting_evidence", "digests": [one]},
         {"join_state": "awaiting_evidence", "digests": [two]},
     ]);
-    assert!(!shows_one(&split, AWAITING_EVIDENCE, &want));
+    assert!(!shows_one(&split, AWAITING_EVIDENCE, &want).unwrap());
     let undecodable = json!({"state": "awaiting_evidence", "digests": [one, two, "zz"]});
-    assert!(!shows_one(&undecodable, AWAITING_EVIDENCE, &want));
+    // An undecodable digest in a typed object is INFRA.
+    assert!(shows_one(&undecodable, AWAITING_EVIDENCE, &want).is_err());
     let wrong_state = json!({"state": "evidence_pendingx", "digests": [one, two]});
-    assert!(!shows_one(&wrong_state, EVIDENCE_PENDING, &want));
+    assert!(!shows_one(&wrong_state, EVIDENCE_PENDING, &want).unwrap());
 }
 
 #[test]
@@ -2342,9 +3005,9 @@ fn w3h_1023_typed_externally_tagged_form_matches() {
         "last_join_outcome": null,
         "attempt": {"awaiting_evidence": {"digests": [one, two], "since": 7}},
     });
-    assert!(shows_one(&body, AWAITING_EVIDENCE, &want));
+    assert!(shows_one(&body, AWAITING_EVIDENCE, &want).unwrap());
     let authority = json!({"evidence_pending": {"digest": one}, "more": [{"evidence_pending": {"digest": two}}]});
-    assert!(shows_all(&authority, EVIDENCE_PENDING, &want));
+    assert!(shows_all(&authority, EVIDENCE_PENDING, &want).unwrap());
 }
 
 /// Poll records every 5 s from t2+5s: `a` and `j` give the typed flags of
@@ -2355,7 +3018,8 @@ fn polls(a: &[bool], j: &[bool]) -> Vec<PollRecord> {
         .zip(j)
         .enumerate()
         .map(|(index, (&a_typed, &j_typed))| PollRecord {
-            since: secs(5 * (index as u64 + 1)),
+            started: secs(5 * (index as u64 + 1)),
+            finished: secs(5 * (index as u64 + 1)) + Duration::from_millis(300),
             a_typed,
             j_typed,
         })
@@ -2603,10 +3267,11 @@ fn w3h_1023_silent_drop_idle_with_no_outcome_fails_closed() {
     let mut window = WaitWindow::default();
     window.record(
         secs(5),
+        secs(6),
         &snap(Some(JoinState::PendingAuthorityCommit), None),
     );
     assert!(window.silent_drop.is_none() && window.j_pending_now);
-    window.record(secs(10), &snap(Some(JoinState::Idle), None));
+    window.record(secs(10), secs(11), &snap(Some(JoinState::Idle), None));
     assert_eq!(
         window.silent_drop.as_ref().map(|(at, _)| *at),
         Some(secs(10))
@@ -2614,9 +3279,307 @@ fn w3h_1023_silent_drop_idle_with_no_outcome_fails_closed() {
     assert!(!window.j_pending_now);
     // A typed outcome is not a silent drop; a seated one is an admission.
     let mut window = WaitWindow::default();
-    window.record(secs(5), &snap(None, Some(OutcomeKind::TimedOut)));
+    window.record(secs(5), secs(6), &snap(None, Some(OutcomeKind::TimedOut)));
     assert!(window.silent_drop.is_none() && window.admitted.is_none());
-    window.record(secs(10), &snap(None, Some(OutcomeKind::Seated)));
+    window.record(secs(10), secs(11), &snap(None, Some(OutcomeKind::Seated)));
     assert_eq!(window.admitted.as_ref().map(|(at, _)| *at), Some(secs(10)));
     assert_eq!(window.polls(), 2);
+}
+
+/// The late-arrival controls of one "within" bound, through the same pure
+/// functions that `timed_wait` and every bounded component use.
+#[cfg(test)]
+fn assert_within_bound(bound: Duration) {
+    let ms = Duration::from_millis;
+    let start = secs(1000);
+    let decide = |read_finished: Duration| {
+        let at = observed_at(start, read_finished);
+        component_passes(classify(Some(at), at, bound), bound)
+    };
+    // Exactly at and just under the bound: PASS.
+    assert!(decide(start + bound), "{bound:?}: at the bound");
+    assert!(decide(start + bound - ms(1)), "{bound:?}: just under");
+    // Just past the bound: FAIL.
+    assert!(!decide(start + bound + ms(1)), "{bound:?}: just past");
+    assert!(!decide(start + bound + LATE_SLACK), "{bound:?}: at the cap");
+    // A read that started inside the bound but finished after it: the
+    // finish time counts, so the evidence is late and FAILS.
+    let read_started = start + bound - ms(500);
+    assert!(may_read(1, read_started - start, bound));
+    assert!(
+        !decide(start + bound + ms(500)),
+        "{bound:?}: straddling read"
+    );
+    assert_eq!(
+        classify(
+            Some(observed_at(start, start + bound + ms(500))),
+            bound,
+            bound
+        ),
+        Deadline::Late {
+            at: bound + ms(500)
+        }
+    );
+    // No read starts after the bound; the first read always starts.
+    assert!(may_read(3, bound, bound));
+    assert!(!may_read(3, bound + ms(1), bound));
+    assert!(may_read(0, bound + secs(100), bound));
+    // Not seen: FAIL. A `Met` past the bound never passes either.
+    assert!(!component_passes(
+        classify(None, bound + ms(1), bound),
+        bound
+    ));
+    assert!(!component_passes(
+        Deadline::Met { at: bound + ms(1) },
+        bound
+    ));
+}
+
+#[test]
+fn w3h_1023_deadline_a_holds_within_60s_late_arrival_fails() {
+    assert_eq!(RETURN_FETCH, secs(60));
+    assert_within_bound(RETURN_FETCH);
+}
+
+#[test]
+fn w3h_1023_deadline_j_active_late_arrival_fails() {
+    // After the return (RETURN_ADMIT) and in the control (JOIN_BUDGET).
+    assert_within_bound(RETURN_ADMIT);
+    assert_within_bound(JOIN_BUDGET);
+}
+
+#[test]
+fn w3h_1023_deadline_setup_bounds_late_arrival_fails() {
+    for bound in [O_ANNOUNCE_BOUND, VERIFY_BOUND, RESTART_CLEAN_BOUND] {
+        assert_within_bound(bound);
+    }
+}
+
+#[test]
+fn w3h_1023_settle_needs_an_observation_or_a_passed_bound() {
+    let seen = Observations::default();
+    let bound = RETURN_FETCH;
+    // The wait stopped inside its bound with no observation: INFRA.
+    assert!(settle(Ok(()), &seen, "w", None, bound, bound).is_err());
+    // It stopped because the bound passed: `Never`, a failed component.
+    let never = settle(Ok(()), &seen, "w", None, bound + secs(1), bound).unwrap();
+    assert_eq!(
+        never,
+        Deadline::Never {
+            waited: bound + secs(1)
+        }
+    );
+    assert!(!component_passes(never, bound));
+    // A late observation settles as `Late` and fails.
+    let late = settle(
+        Ok(()),
+        &seen,
+        "w",
+        Some(bound + secs(1)),
+        bound + secs(1),
+        bound,
+    )
+    .unwrap();
+    assert!(!component_passes(late, bound));
+    // Any error that is not the budget is passed on.
+    assert!(settle(
+        Err(anyhow!("boom")),
+        &seen,
+        "w",
+        Some(secs(1)),
+        secs(1),
+        bound
+    )
+    .is_err());
+}
+
+#[test]
+fn w3h_1023_span_lower_bounds_use_the_poll_start() {
+    let ms = Duration::from_millis;
+    for bound in [HOLDER_GAP, NEVER_WINDOW] {
+        // The last poll started before the bound and finished after it:
+        // not reached.
+        assert!(!span_reached(Some(bound - ms(1)), bound + secs(5), bound));
+        assert!(span_reached(Some(bound), bound, bound));
+        assert!(span_reached(Some(bound + ms(1)), bound + secs(1), bound));
+        assert!(!span_reached(Some(bound), bound - ms(1), bound));
+        assert!(!span_reached(None, bound + secs(1), bound));
+    }
+    // A poll fixture: the poll that straddles 720 s does not reach it.
+    let mut window = WaitWindow::default();
+    let pending = snap(Some(JoinState::PendingAuthorityCommit), None);
+    window.record(HOLDER_GAP - ms(200), HOLDER_GAP + secs(2), &pending);
+    assert!(!span_reached(
+        window.last_poll(),
+        HOLDER_GAP + secs(3),
+        HOLDER_GAP
+    ));
+    window.record(HOLDER_GAP + secs(5), HOLDER_GAP + secs(6), &pending);
+    assert!(span_reached(
+        window.last_poll(),
+        HOLDER_GAP + secs(6),
+        HOLDER_GAP
+    ));
+}
+
+#[test]
+fn w3h_1023_admitted_membership_parse_rejects_malformed() {
+    let gid = "g";
+    // The well-formed answers.
+    let active = object(json!({"ok": true, "group_id": gid, "membership_state": "active"}));
+    assert!(is_active(gid, StatusCode::OK, &active).unwrap());
+    let pending = object(json!({"ok": true, "group_id": gid, "membership_state": "pending"}));
+    assert!(!is_active(gid, StatusCode::OK, &pending).unwrap());
+    // The handler's exact 404 is "no group here", so not a member.
+    let not_found = object(json!({"ok": false, "error": "group not found"}));
+    assert!(!is_active(gid, StatusCode::NOT_FOUND, &not_found).unwrap());
+    assert_eq!(
+        parse_membership(gid, StatusCode::NOT_FOUND, &not_found).unwrap(),
+        None
+    );
+    // Every malformed answer is an error (INFRA), never `Ok(false)`.
+    let malformed: Vec<(&str, StatusCode, serde_json::Value)> = vec![
+        (
+            "missing membership_state",
+            StatusCode::OK,
+            json!({"ok": true, "group_id": gid}),
+        ),
+        (
+            "non-string membership_state",
+            StatusCode::OK,
+            json!({"ok": true, "group_id": gid, "membership_state": 1}),
+        ),
+        (
+            "null membership_state",
+            StatusCode::OK,
+            json!({"ok": true, "group_id": gid, "membership_state": null}),
+        ),
+        (
+            "unknown membership_state",
+            StatusCode::OK,
+            json!({"ok": true, "group_id": gid, "membership_state": "activated"}),
+        ),
+        (
+            "wrong group_id",
+            StatusCode::OK,
+            json!({"ok": true, "group_id": "h", "membership_state": "active"}),
+        ),
+        (
+            "no group_id",
+            StatusCode::OK,
+            json!({"ok": true, "membership_state": "active"}),
+        ),
+        (
+            "ok false on 200",
+            StatusCode::OK,
+            json!({"ok": false, "group_id": gid, "membership_state": "active"}),
+        ),
+        (
+            "404 with an arbitrary body",
+            StatusCode::NOT_FOUND,
+            json!({"error": "not here"}),
+        ),
+        (
+            "404 with an extra key",
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "group not found", "hint": "x"}),
+        ),
+        (
+            "404 with other error text",
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "route not found"}),
+        ),
+        (
+            "500",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"ok": false, "error": "group not found"}),
+        ),
+        (
+            "403",
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "error": "forbidden"}),
+        ),
+    ];
+    for (name, status, body) in malformed {
+        let body = object(body);
+        assert!(is_active(gid, status, &body).is_err(), "{name}");
+        assert!(parse_membership(gid, status, &body).is_err(), "{name}");
+    }
+    // The roster half of `read_admitted`: a 404 or a wrong group is an
+    // error, never "not listed".
+    let member = hex::encode([0xaa_u8; 32]);
+    let roster = |status, body| lists(gid, &member, status, &object(body));
+    let row = json!({"agent_id": member, "role": "member", "state": "active"});
+    assert!(roster(
+        StatusCode::OK,
+        json!({"ok": true, "group_id": gid, "members": [row], "member_count": 1})
+    )
+    .unwrap());
+    assert!(!roster(
+        StatusCode::OK,
+        json!({"ok": true, "group_id": gid, "members": [], "member_count": 0})
+    )
+    .unwrap());
+    assert!(roster(
+        StatusCode::NOT_FOUND,
+        json!({"ok": false, "error": "group not found"})
+    )
+    .is_err());
+    assert!(roster(
+        StatusCode::OK,
+        json!({"ok": true, "group_id": "h", "members": [], "member_count": 0})
+    )
+    .is_err());
+    assert!(roster(
+        StatusCode::OK,
+        json!({"ok": true, "group_id": gid, "members": [{"agent_id": member, "role": "boss", "state": "active"}], "member_count": 1})
+    )
+    .is_err());
+    assert!(roster(
+        StatusCode::OK,
+        json!({"ok": true, "group_id": gid, "members": [], "member_count": 2})
+    )
+    .is_err());
+}
+
+#[test]
+fn w3h_1023_join_answer_closed_set() {
+    let gid = "g";
+    let accepted =
+        object(json!({"ok": true, "group_id": gid, "join_state": "pending_authority_commit"}));
+    assert_eq!(
+        parse_join_answer(gid, StatusCode::OK, &accepted).unwrap(),
+        JoinAnswer::Accepted {
+            join_state: Membership::PendingAuthorityCommit,
+            already_joined: None
+        }
+    );
+    let refused = object(json!({"ok": false, "error": "no"}));
+    assert!(matches!(
+        parse_join_answer(gid, StatusCode::CONFLICT, &refused).unwrap(),
+        JoinAnswer::Refused { .. }
+    ));
+    for (status, body) in [
+        (
+            StatusCode::OK,
+            json!({"ok": true, "group_id": "h", "join_state": "active"}),
+        ),
+        (
+            StatusCode::OK,
+            json!({"ok": true, "group_id": gid, "join_state": "weird"}),
+        ),
+        (StatusCode::OK, json!({"ok": true, "group_id": gid})),
+        (StatusCode::NOT_FOUND, json!({"ok": false, "error": "no"})),
+        (
+            StatusCode::CONFLICT,
+            json!({"ok": false, "error": "no", "extra": 1}),
+        ),
+        (StatusCode::CONFLICT, json!({"ok": false, "error": 7})),
+    ] {
+        let body = object(body);
+        assert!(
+            parse_join_answer(gid, status, &body).is_err(),
+            "{status} {body:?}"
+        );
+    }
 }
