@@ -564,6 +564,8 @@ jobs:
           --expect w3h_1357_red_s4_fallback_rank_manual=RED
           --require w3h_1357_control_s4_manual_remove_without_obligation
           --expect w3h_1357_control_s4_manual_remove_without_obligation=GREEN
+          --require w3h_1357_red_s4_idle_revocation_one_admin_home
+          --expect w3h_1357_red_s4_idle_revocation_one_admin_home=RED
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
