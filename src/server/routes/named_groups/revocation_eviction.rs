@@ -1,35 +1,109 @@
 //! ADR 0110 (slice S4 of ADR 0088): the daemon side of revocation
 //! eviction, designated first.
 //!
-//! The pure model (rows, phases, typed waits, designation, timing) lives in
-//! [`x0x::groups::eviction`]. This module owns:
+//! The pure model (rows, phases, typed waits, designation, timing, file
+//! codecs) lives in [`x0x::groups::eviction`]. This module owns:
 //!
 //! - §1 intake: it drains the queue that the revocation choke point in
 //!   `lib.rs` feeds after `verify_and_insert` returns `Ok(true)` (and the
 //!   startup load), and it scans the loaded rosters for self-leave and
 //!   certificate-expiry triggers. Each trigger becomes an obligation keyed
 //!   by (stable group ID, target agent ID).
+//! - §2: designation, ranked fallback and the typed waits, and the queue
+//!   for a non-designated manual remove, ban or seal before its fallback
+//!   time ([`s4_manual_request_gate`]).
+//! - §3: the commit through the existing signed removal path, with the
+//!   `.evjournal` prepare barrier before it and the `.evs` sidecar barrier
+//!   after it, and restart resume.
+//! - §5: the `revocation-evictions.evs` sidecar and the per-group
+//!   `.evjournal` journals, with the ADR 0108 §5a quarantine and rebuild.
 //! - Completion: a row completes only when the verified roster and crypto
 //!   state exclude the target.
 //!
 //! The revocation-set lock is always released before this module takes a
-//! group or persistence lock (§1).
+//! group or persistence lock (§1). The S4 state lock is never held across
+//! a call into a route handler.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use tokio::time::Instant;
 
 use crate as x0x;
 use crate::server::state::AppState;
 use x0x::groups::eviction::{
-    EvictionKey, EvictionTrigger, IntakeOutcome, ObligationStore, RowBudget, S4Timing,
-    TerminationCause, VerifiedAgentRevocation,
+    self as s4, CommitPermission, EvJournalV1, EvictionKey, EvictionTrigger, EvsBodyV1,
+    IntakeOutcome, ObligationRow, ObligationStore, Phase, RowAction, RowBudget, RowContext,
+    S4Timing, SidecarDecodeError, SidecarState, TerminationCause, VerifiedAgentRevocation,
+    WaitingCause, WaitingState,
 };
-use x0x::groups::{GroupInfo, GroupMemberState};
+use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 /// The worker's idle re-check interval. Budgets and expiry checks run at
 /// least this often; intake wakes the worker at once.
 const S4_WORKER_TICK: Duration = Duration::from_secs(1);
+
+/// After a failed commit attempt the worker retries no sooner than this.
+const S4_COMMIT_RETRY: Duration = Duration::from_secs(5);
+
+/// A manual request that §2 queued instead of rekeying early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum ManualRequestKind {
+    /// `DELETE /groups/:id/members/:agent_id`.
+    Remove,
+    /// `POST /groups/:id/ban/:agent_id`.
+    Ban,
+    /// `POST /groups/:id/state/seal` that would evict the target.
+    Seal,
+}
+
+impl ManualRequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Remove => "remove",
+            Self::Ban => "ban",
+            Self::Seal => "seal",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueuedManual {
+    kind: ManualRequestKind,
+    queued_at_unix_ms: u64,
+}
+
+/// The ADR 0108 §5a state of the `.evs` file, with its detail.
+#[derive(Debug, Clone)]
+struct SidecarStatus {
+    state: SidecarState,
+    /// `cause` for `sidecar_unavailable`, `version` for
+    /// `sidecar_newer_format`, `step` for `sidecar_quarantine_failed`.
+    detail: Option<String>,
+}
+
+impl Default for SidecarStatus {
+    fn default() -> Self {
+        Self {
+            state: SidecarState::Ok,
+            detail: None,
+        }
+    }
+}
+
+/// The last evaluation of an open row.
+#[derive(Debug, Clone)]
+struct StoredEvaluation {
+    permission: Option<CommitPermission>,
+    action: RowAction,
+    stable_group_key: String,
+}
 
 /// S4 runtime state held on [`AppState`].
 pub(in crate::server) struct S4Runtime {
@@ -38,7 +112,11 @@ pub(in crate::server) struct S4Runtime {
     pub(in crate::server) timing: S4Timing,
     /// Random per-process boot identity (§2, §5).
     boot_id: [u8; 16],
+    /// When this process started counting (restart sync wait, §2).
+    boot_instant: Instant,
     inner: tokio::sync::Mutex<S4Inner>,
+    /// ADR 0108 §5a writer lock for `revocation-evictions.evs`.
+    evs_writer: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -48,6 +126,28 @@ struct S4Inner {
     budgets: HashMap<EvictionKey, RowBudget>,
     /// The revocation-set generation at the last full reconciliation.
     reconciled_generation: Option<u64>,
+    /// The `.evs` file was read (or found absent) at startup.
+    loaded: bool,
+    sidecar: SidecarStatus,
+    /// `rebuilt_from` of the current `.evs` (ADR 0108 §5a).
+    rebuilt_from: Vec<[u8; 16]>,
+    /// A rebuild is running: rows show `rebuilding_obligation_store`.
+    rebuilding: bool,
+    /// The `.evs` file exists on disk.
+    file_exists: bool,
+    /// The store changed since the last durable write.
+    dirty: bool,
+    /// Rows whose latest material change is not durable yet.
+    not_durable: BTreeSet<EvictionKey>,
+    /// §2: manual requests queued while this node waits for its rank.
+    queued_manual: HashMap<EvictionKey, Vec<QueuedManual>>,
+    /// The earliest next commit attempt per row.
+    next_attempt: HashMap<EvictionKey, Instant>,
+    /// A typed wait set by the last commit attempt (for example a missing
+    /// KeyPackage); cleared when the evaluation changes.
+    attempt_wait: HashMap<EvictionKey, WaitingState>,
+    /// The last evaluation per open row.
+    evaluations: HashMap<EvictionKey, StoredEvaluation>,
 }
 
 impl Default for S4Runtime {
@@ -64,26 +164,51 @@ impl S4Runtime {
         Self {
             timing,
             boot_id,
+            boot_instant: Instant::now(),
             inner: tokio::sync::Mutex::new(S4Inner::default()),
+            evs_writer: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// §2 restart rule: no S4 seal before this replica completed a current
+    /// catch-up round. This tree has no explicit "catch-up round complete"
+    /// signal, so the bounded restart sync wait from process start stands
+    /// in for it (D73).
+    fn head_synced(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.boot_instant) >= self.timing.restart_sync_wait
     }
 }
 
+/// ADR 0094 host-commit gate (§5). S4 creates or materially writes its
+/// files only after host commit. This tree has no ADR 0094 upgrade-trial
+/// state machine yet, so every boot runs outside a trial and the gate is
+/// open; the ADR's follow-up "clarify the host-commit gate when M2 is
+/// absent" covers this. `waiting_for_host_commit` is shown when the gate
+/// is closed.
+fn host_commit_gate_open(_state: &AppState) -> bool {
+    true
+}
+
+// ─── Worker ────────────────────────────────────────────────────────────────
+
 /// The S4 worker. Runs until the task is aborted at shutdown.
 pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppState>) {
-    if x0x::groups::eviction::S4_TIMING_PENDING_MEASUREMENT {
+    if s4::S4_TIMING_PENDING_MEASUREMENT {
         let timing = state.revocation_evictions.timing;
         tracing::info!(
-            designated_window_ms = timing.designated_window.as_millis() as u64,
-            completion_bound_ms = timing.completion_bound.as_millis() as u64,
-            fallback_stagger_ms = timing.fallback_stagger.as_millis() as u64,
-            restart_sync_wait_ms = timing.restart_sync_wait.as_millis() as u64,
+            designated_window_ms = s4::duration_ms(timing.designated_window),
+            completion_bound_ms = s4::duration_ms(timing.completion_bound),
+            fallback_stagger_ms = s4::duration_ms(timing.fallback_stagger),
+            restart_sync_wait_ms = s4::duration_ms(timing.restart_sync_wait),
             "ADR 0110 S4 timing values are provisional (pending the W3-H measurement)"
         );
     }
+    load_persisted_obligations(&state).await;
     let notify = state.agent.s4_revocation_intake().notified();
     loop {
         revocation_eviction_pass(&state).await;
+        persist_obligations(&state).await;
+        drive_exclusions(&state).await;
         tokio::select! {
             () = notify.notified() => {}
             () = tokio::time::sleep(S4_WORKER_TICK) => {}
@@ -91,14 +216,18 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
     }
 }
 
-/// One worker pass: intake, scan, reconcile.
+/// One worker pass: intake, scan, reconcile, evaluate. It never commits.
 pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     let revocations = collect_verified_agent_revocations(state).await;
     let groups = snapshot_groups(state).await;
     let leaves = snapshot_retained_leaves(state, &groups).await;
+    let revoked_admins = revoked_admins_in(state, &groups).await;
     let now_unix_ms = now_unix_ms();
     let now_unix = now_unix_ms / 1000;
+    let local = *state.agent.agent_id().as_bytes();
     let runtime = &state.revocation_evictions;
+    let now = Instant::now();
+    let head_synced = runtime.head_synced(now);
     let mut inner = runtime.inner.lock().await;
     let boot_id = runtime.boot_id;
     let mut created = Vec::new();
@@ -107,17 +236,25 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             inner
                 .store
                 .intake(&key, trigger, incarnation.as_deref(), now_unix_ms, boot_id);
+        if outcome.changed() {
+            inner.dirty = true;
+            inner.not_durable.insert(key.clone());
+        }
         if matches!(outcome, IntakeOutcome::Created | IntakeOutcome::Reopened) {
             created.push(key);
         }
     }
-    let now = Instant::now();
     for key in created {
         inner
             .budgets
             .insert(key, RowBudget::resume(Duration::ZERO, now));
     }
-    reconcile_completion(&mut inner.store, &groups, &leaves, now_unix_ms);
+    if reconcile_completion(&mut inner.store, &groups, &leaves, now_unix_ms) {
+        inner.dirty = true;
+    }
+    if inner.store.apply_retention(now_unix_ms) {
+        inner.dirty = true;
+    }
     // Rows loaded from an earlier boot resume their saved budget.
     let rows: Vec<(EvictionKey, u64)> = inner
         .store
@@ -125,19 +262,106 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .filter(|row| row.phase.is_open())
         .map(|row| (row.key(), row.elapsed_budget_ms))
         .collect();
-    for (key, saved_ms) in rows {
+    for (key, saved_ms) in &rows {
         inner
             .budgets
-            .entry(key)
-            .or_insert_with(|| RowBudget::resume(Duration::from_millis(saved_ms), now));
+            .entry(key.clone())
+            .or_insert_with(|| RowBudget::resume(Duration::from_millis(*saved_ms), now));
     }
-    let open: std::collections::BTreeSet<EvictionKey> = inner
-        .store
-        .rows()
-        .filter(|row| row.phase.is_open())
-        .map(|row| row.key())
-        .collect();
+    let open: BTreeSet<EvictionKey> = rows.into_iter().map(|(key, _)| key).collect();
     inner.budgets.retain(|key, _| open.contains(key));
+    inner.queued_manual.retain(|key, _| open.contains(key));
+    inner.next_attempt.retain(|key, _| open.contains(key));
+    inner.attempt_wait.retain(|key, _| open.contains(key));
+    inner.not_durable.retain(|key| open.contains(key));
+    inner.evaluations.clear();
+    let gate_open = host_commit_gate_open(state);
+    let memory_only = !inner.sidecar.state.writable();
+    let by_stable: HashMap<&str, (&String, &GroupInfo)> = groups
+        .iter()
+        .map(|(key, info)| (info.stable_group_id(), (key, info)))
+        .collect();
+    for key in open {
+        let Some((group_key, info)) = by_stable.get(key.stable_group_id.as_str()) else {
+            continue;
+        };
+        let Some(row) = inner.store.get(&key).cloned() else {
+            continue;
+        };
+        let elapsed = inner
+            .budgets
+            .get(&key)
+            .map_or(Duration::ZERO, |budget| budget.elapsed(now));
+        let active_admins = active_admins_of(info);
+        let target_hex = hex::encode(key.target);
+        let target_seated = info
+            .members_v2
+            .get(&target_hex)
+            .is_some_and(|member| is_seated(member.state));
+        // §5 memory-only durability: every trigger S4 derives today is
+        // durable elsewhere (the revocation store, the verified chain or a
+        // committed certificate), so a memory-only sidecar does not hold
+        // the seal. A failed write of a writable sidecar does.
+        let durable = memory_only || !inner.not_durable.contains(&key);
+        let ctx = RowContext {
+            local,
+            active_admins: &active_admins,
+            revoked_admins: &revoked_admins,
+            quarantined: info.fork_quarantine.is_some(),
+            target_seated,
+            elapsed,
+            head_synced,
+            durable,
+            now_unix,
+            local_certificate_expired: local_certificate_expired(info, &local, now_unix),
+        };
+        let mut evaluation = s4::evaluate_row(&row, &ctx, &runtime.timing);
+        if inner.rebuilding {
+            evaluation.waiting = Some(WaitingState::cause(WaitingCause::RebuildingObligationStore));
+            evaluation.action = RowAction::None;
+        } else if !gate_open {
+            evaluation.waiting = Some(WaitingState::cause(WaitingCause::WaitingForHostCommit));
+            evaluation.action = RowAction::None;
+        } else if evaluation.action != RowAction::None {
+            if let Some(wait) = inner.attempt_wait.get(&key) {
+                evaluation.waiting = Some(wait.clone());
+            }
+        } else {
+            inner.attempt_wait.remove(&key);
+        }
+        let designation = evaluation.designation.clone();
+        let changed_designation = designation.as_ref().is_some_and(|designation| {
+            row.designated != Some(designation.designated) || row.ranks != designation.ranks
+        });
+        if let Some(row) = inner.store.get_mut(&key) {
+            row.elapsed_budget_ms = s4::duration_ms(elapsed);
+            row.boot_id = boot_id;
+            if let Some(designation) = &designation {
+                row.designated = Some(designation.designated);
+                row.ranks = designation.ranks.clone();
+            }
+        }
+        if changed_designation {
+            inner.dirty = true;
+        }
+        inner.store.set_waiting(&key, evaluation.waiting.clone());
+        inner.evaluations.insert(
+            key,
+            StoredEvaluation {
+                permission: evaluation.permission,
+                action: evaluation.action,
+                stable_group_key: (*group_key).clone(),
+            },
+        );
+    }
+    if inner.rebuilding {
+        // The rebuild source (§5) is the revocation store, the verified
+        // chain and the committed certificates; this pass re-derived every
+        // derivable row from them, so the rebuild is done.
+        inner.rebuilding = false;
+        inner.dirty = true;
+    }
+    inner.loaded = true;
 }
 
 /// Drain the intake queue and, when needed, rescan the whole revocation
@@ -178,23 +402,60 @@ async fn collect_verified_agent_revocations(state: &AppState) -> Vec<VerifiedAge
     items
 }
 
-async fn snapshot_groups(state: &AppState) -> Vec<GroupInfo> {
+/// Every group with its roster map key. Withdrawn groups are kept so
+/// that their rows terminate (`group_deleted`).
+async fn snapshot_groups(state: &AppState) -> Vec<(String, GroupInfo)> {
     state
         .named_groups
         .read()
         .await
-        .values()
-        .filter(|info| !info.withdrawn)
-        .cloned()
+        .iter()
+        .map(|(key, info)| (key.clone(), info.clone()))
         .collect()
 }
+
+/// The admins of every group that hold a verified Agent-subject
+/// revocation. Takes the revocation-set read lock alone.
+async fn revoked_admins_in(state: &AppState, groups: &[(String, GroupInfo)]) -> BTreeSet<[u8; 32]> {
+    let admins: BTreeSet<[u8; 32]> = groups
+        .iter()
+        .flat_map(|(_, info)| active_admins_of(info))
+        .collect();
+    let revocation_set = state.agent.revocation_set();
+    let set = revocation_set.read().await;
+    admins
+        .into_iter()
+        .filter(|id| set.is_agent_revoked(&x0x::identity::AgentId(*id)))
+        .collect()
+}
+
+/// Admin-or-higher Active seats (legacy `Owner` is Admin-equivalent).
+fn active_admins_of(info: &GroupInfo) -> Vec<[u8; 32]> {
+    info.active_members()
+        .filter(|member| member.role.at_least(GroupRole::Admin))
+        .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
+        .map(|agent| *agent.as_bytes())
+        .collect()
+}
+
+/// §1a: an admin whose own selected certificate is expired on its clock
+/// may not seal.
+fn local_certificate_expired(info: &GroupInfo, local: &[u8; 32], now_unix: u64) -> bool {
+    if !owner_certified(info) {
+        return false;
+    }
+    info.members_v2
+        .get(&hex::encode(local))
+        .and_then(selected_certificate_expiry)
+        .is_some_and(|(_, not_after)| s4::own_expiry_trigger_due(not_after, now_unix))
+}
+
+/// The agents with a leaf in one tree, and the tree epoch.
+type TrackedLeaves = (Vec<[u8; 32]>, u64);
 
 /// Retained TreeKEM leaves per stable group ID: the agent IDs whose leaf
 /// is still in this node's ratchet tree, with the tree epoch. A group whose
 /// tree is busy is skipped for this pass (`None`), never read as empty.
-/// The agents with a leaf in one tree, and the tree epoch.
-type TrackedLeaves = (Vec<[u8; 32]>, u64);
-
 #[derive(Default)]
 struct RetainedLeaves {
     by_group: HashMap<String, Option<TrackedLeaves>>,
@@ -221,16 +482,20 @@ impl RetainedLeaves {
     }
 }
 
-async fn snapshot_retained_leaves(state: &AppState, groups: &[GroupInfo]) -> RetainedLeaves {
+async fn snapshot_retained_leaves(
+    state: &AppState,
+    groups: &[(String, GroupInfo)],
+) -> RetainedLeaves {
     let mut leaves = RetainedLeaves::default();
     let trees = state.treekem_groups.read().await;
-    for info in groups {
-        if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+    for (key, info) in groups {
+        if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem || info.withdrawn {
             continue;
         }
         let stable = info.stable_group_id().to_string();
         let tree = trees
-            .get(&info.mls_group_id)
+            .get(key)
+            .or_else(|| trees.get(&info.mls_group_id))
             .or_else(|| trees.get(&stable))
             .cloned();
         let Some(tree) = tree else {
@@ -268,7 +533,7 @@ fn owner_certified(info: &GroupInfo) -> bool {
 /// §1 and §1a: the triggers this pass observes, with the target's current
 /// incarnation (its KeyPackage hash).
 fn derive_triggers(
-    groups: &[GroupInfo],
+    groups: &[(String, GroupInfo)],
     leaves: &RetainedLeaves,
     revocations: &[VerifiedAgentRevocation],
     now_unix: u64,
@@ -278,7 +543,10 @@ fn derive_triggers(
     for item in revocations {
         revoked_by_target.entry(item.target).or_default().push(item);
     }
-    for info in groups {
+    for (_, info) in groups {
+        if info.withdrawn {
+            continue;
+        }
         let stable = info.stable_group_id();
         for member in info.members_v2.values() {
             let Ok(agent) = super::parse_agent_id_hex(&member.agent_id) else {
@@ -321,7 +589,7 @@ fn derive_triggers(
             // an OwnerCertified group, on this node's own clock + τ.
             if member.state == GroupMemberState::Active && owner_certified(info) {
                 if let Some((digest, not_after)) = selected_certificate_expiry(member) {
-                    if x0x::groups::eviction::own_expiry_trigger_due(not_after, now_unix) {
+                    if s4::own_expiry_trigger_due(not_after, now_unix) {
                         out.push((
                             EvictionKey::new(stable, target),
                             EvictionTrigger::CertificateExpiry {
@@ -357,30 +625,36 @@ fn selected_certificate_expiry(member: &x0x::groups::GroupMember) -> Option<(Str
 
 /// Re-derive completion from the verified roster and crypto state (§1,
 /// D128). A row completes only when the target holds no seat and, in a
-/// TreeKEM group, no retained leaf. A group that is withdrawn or deleted
-/// terminates its rows; a group this node no longer holds ends local
-/// retention.
+/// TreeKEM group, no retained leaf. A withdrawn group terminates its rows
+/// (`group_deleted`); a group this node no longer holds ends local
+/// retention. Returns whether the store changed.
 fn reconcile_completion(
     store: &mut ObligationStore,
-    groups: &[GroupInfo],
+    groups: &[(String, GroupInfo)],
     leaves: &RetainedLeaves,
     now_unix_ms: u64,
-) {
+) -> bool {
     let by_stable: HashMap<&str, &GroupInfo> = groups
         .iter()
-        .map(|info| (info.stable_group_id(), info))
+        .map(|(_, info)| (info.stable_group_id(), info))
         .collect();
     let open: Vec<EvictionKey> = store
         .rows()
         .filter(|row| row.phase.is_open())
-        .map(|row| row.key())
+        .map(ObligationRow::key)
         .collect();
-    let mut gone_groups = std::collections::BTreeSet::new();
+    let mut changed = false;
+    let mut gone_groups = BTreeSet::new();
+    let mut withdrawn_groups = BTreeSet::new();
     for key in open {
         let Some(info) = by_stable.get(key.stable_group_id.as_str()) else {
             gone_groups.insert(key.stable_group_id.clone());
             continue;
         };
+        if info.withdrawn {
+            withdrawn_groups.insert(key.stable_group_id.clone());
+            continue;
+        }
         let target_hex = hex::encode(key.target);
         let member = info.members_v2.get(&target_hex);
         let seated = member.is_some_and(|member| is_seated(member.state));
@@ -398,13 +672,11 @@ fn reconcile_completion(
                         member.certificate.is_some(),
                         |(digest, not_after)| {
                             !expired.contains_key(&digest)
-                                && !x0x::groups::eviction::own_expiry_trigger_due(
-                                    not_after, now_unix,
-                                )
+                                && !s4::own_expiry_trigger_due(not_after, now_unix)
                         },
                     );
                     if renewed {
-                        store.terminate(&key, TerminationCause::CertificateValid);
+                        changed |= store.terminate(&key, TerminationCause::CertificateValid);
                     }
                 }
             }
@@ -419,16 +691,787 @@ fn reconcile_completion(
                 continue;
             }
         }
-        store.complete(
+        changed |= store.complete(
             &key,
             Some(info.state_hash.clone()),
             leaves.epoch(stable).or(Some(info.secret_epoch)),
             now_unix_ms,
         );
     }
-    for stable in gone_groups {
-        store.forget_group(&stable);
+    for stable in withdrawn_groups {
+        changed |= store.terminate_group(&stable) > 0;
     }
+    for stable in gone_groups {
+        changed |= store.forget_group(&stable) > 0;
+    }
+    changed
+}
+
+// ─── §2 manual-request queue ───────────────────────────────────────────────
+
+/// §2 amendment to ADR 0016 §6: a non-designated admin that asks to
+/// remove, ban or seal an S4 target before its ranked fallback time queues
+/// and hands off the request and gets `waiting_for_designated_admin`; it
+/// must not rekey that target early. Returns the `202` response to send,
+/// or `None` when the request may proceed (no open obligation, or this
+/// node is designated or past its fallback time).
+pub(in crate::server) async fn s4_manual_request_gate(
+    state: &Arc<AppState>,
+    group_key: &str,
+    target_hex: &str,
+    kind: ManualRequestKind,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let target = super::parse_agent_id_hex(target_hex).ok()?;
+    let stable = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_key).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_key)
+        })?;
+        info.stable_group_id().to_string()
+    };
+    // Bring intake up to date first, so a request that races the worker
+    // still sees a just-verified revocation.
+    revocation_eviction_pass(state).await;
+    let key = EvictionKey::new(stable.clone(), *target.as_bytes());
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    let row = inner.store.get(&key)?;
+    if !row.phase.is_open() {
+        return None;
+    }
+    let evaluation = inner.evaluations.get(&key)?;
+    let CommitPermission::Wait {
+        designated,
+        remaining,
+    } = evaluation.permission.clone()?
+    else {
+        return None;
+    };
+    let rank = row
+        .ranks
+        .iter()
+        .position(|id| id == state.agent.agent_id().as_bytes())
+        .map(|index| index.saturating_add(1));
+    let now_ms = now_unix_ms();
+    inner
+        .queued_manual
+        .entry(key)
+        .or_default()
+        .push(QueuedManual {
+            kind,
+            queued_at_unix_ms: now_ms,
+        });
+    drop(inner);
+    let designated_hex = hex::encode(designated);
+    Some((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "ok": true,
+            "queued": true,
+            "status": WaitingCause::WaitingForDesignatedAdmin.as_str(),
+            "group_id": stable,
+            "target": target_hex.to_ascii_lowercase(),
+            "request": kind.as_str(),
+            "waiting": {
+                "cause": WaitingCause::WaitingForDesignatedAdmin.as_str(),
+                "designated_admin": designated_hex,
+                "detail": "rank",
+                "local_rank": rank,
+                "remaining_ms": s4::duration_ms(remaining),
+                "fallback_at_unix_ms": now_ms.saturating_add(s4::duration_ms(remaining)),
+            },
+        })),
+    ))
+}
+
+/// §2: an explicit seal in an `OwnerCertified` group would evict a pending
+/// S4 target as a side effect (ADR-0038 seal-time re-check). Before this
+/// node's fallback time it defers the seal. Returns the `202` response, or
+/// `None` when the seal may proceed.
+pub(in crate::server) async fn s4_seal_request_gate(
+    state: &Arc<AppState>,
+    group_key: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let (stable, seated_targets) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_key).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_key)
+        })?;
+        if !owner_certified(info) {
+            return None;
+        }
+        let seated: Vec<String> = info
+            .members_v2
+            .values()
+            .filter(|member| is_seated(member.state))
+            .map(|member| member.agent_id.clone())
+            .collect();
+        (info.stable_group_id().to_string(), seated)
+    };
+    let pending: Vec<String> = {
+        revocation_eviction_pass(state).await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .store
+            .open_rows_for_group(&stable)
+            .map(|row| hex::encode(row.target))
+            .filter(|target| seated_targets.iter().any(|seated| seated == target))
+            .collect()
+    };
+    for target in pending {
+        if let Some(resp) =
+            s4_manual_request_gate(state, group_key, &target, ManualRequestKind::Seal).await
+        {
+            return Some(resp);
+        }
+    }
+    None
+}
+
+// ─── §3 commit ─────────────────────────────────────────────────────────────
+
+/// Run every commit the last evaluation allows (§3). Each runs through the
+/// existing signed removal path, which takes the membership lock and
+/// re-reads the head under it before it seals.
+async fn drive_exclusions(state: &Arc<AppState>) {
+    let now = Instant::now();
+    let candidates: Vec<(EvictionKey, String, RowAction)> = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .evaluations
+            .iter()
+            .filter(|(key, evaluation)| {
+                evaluation.action != RowAction::None
+                    && inner
+                        .store
+                        .get(key)
+                        .is_some_and(|row| row.phase == Phase::Pending)
+                    && inner.next_attempt.get(*key).is_none_or(|at| *at <= now)
+            })
+            .map(|(key, evaluation)| {
+                (
+                    key.clone(),
+                    evaluation.stable_group_key.clone(),
+                    evaluation.action,
+                )
+            })
+            .collect()
+    };
+    for (key, group_key, action) in candidates {
+        match action {
+            RowAction::CommitRemoval { rank } => {
+                commit_removal(state, &key, &group_key, rank).await;
+            }
+            RowAction::SelfLeaveRekey { rank } => {
+                // The responsive self-leave rekey (#1113, PR #1337) already
+                // runs the crypto exclusion of a self-leaver's retained
+                // leaf through its own durable outbox; S4 schedules it and
+                // completes the row from the chain.
+                tracing::debug!(
+                    group_id = %super::LogHexId::group(&group_key),
+                    rank,
+                    "ADR 0110 S4: scheduling the responsive self-leave rekey"
+                );
+                super::schedule_self_leave_rekey_if_idle(state, &group_key).await;
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .next_attempt
+                    .insert(key, Instant::now() + S4_COMMIT_RETRY);
+            }
+            RowAction::None => {}
+        }
+    }
+}
+
+async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &str, rank: usize) {
+    let target_hex = hex::encode(key.target);
+    // §5 transaction order: fsync a prepared `.evjournal` with the
+    // evidence and the parent head, then run the unchanged legacy
+    // roster/crypto transaction, then fsync the reconciled `.evs`.
+    let journal = {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        let Some(row) = inner.store.get_mut(key) else {
+            return;
+        };
+        let (parent_head, next_revision) = {
+            let groups = state.named_groups.read().await;
+            match groups.get(group_key) {
+                Some(info) => (
+                    info.state_hash.clone(),
+                    info.state_revision.saturating_add(1),
+                ),
+                None => return,
+            }
+        };
+        row.phase = Phase::Prepared;
+        row.parent_head = Some(parent_head.clone());
+        inner.dirty = true;
+        let row = inner.store.get(key).cloned();
+        row.map(|row| prepared_journal(&row, parent_head, next_revision))
+    };
+    let Some(journal) = journal else {
+        return;
+    };
+    let journal_path = evjournal_path(state, &key.stable_group_id);
+    let journal_written = write_evjournal(&journal_path, &journal).await;
+    let evs_durable = persist_obligations(state).await;
+    if !journal_written || !evs_durable {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if let Some(row) = inner.store.get_mut(key) {
+            row.phase = Phase::Pending;
+            row.parent_head = None;
+        }
+        inner.not_durable.insert(key.clone());
+        inner
+            .next_attempt
+            .insert(key.clone(), Instant::now() + S4_COMMIT_RETRY);
+        drop(inner);
+        remove_file_durably(&journal_path).await;
+        return;
+    }
+    tracing::info!(
+        group_id = %super::LogHexId::group(group_key),
+        target = %super::LogHexId::agent(&target_hex),
+        rank,
+        "ADR 0110 S4: excluding a revoked or expired member"
+    );
+    let response = super::remove_named_group_member(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_key.to_string(), target_hex.clone())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body: serde_json::Value = match axum::body::to_bytes(response.into_body(), 1 << 20).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    };
+    {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if status == StatusCode::OK {
+            if let Some(row) = inner.store.get_mut(key) {
+                row.phase = Phase::CommittedDeliveryPending;
+                row.result_epoch = body.get("epoch").and_then(serde_json::Value::as_u64);
+            }
+            inner.attempt_wait.remove(key);
+            inner.queued_manual.remove(key);
+        } else {
+            if let Some(row) = inner.store.get_mut(key) {
+                row.phase = Phase::Pending;
+                row.parent_head = None;
+            }
+            let error = body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if error == "member_key_package_pending" {
+                // §3: a miss never counts as an absent leaf; the existing
+                // member-keyed catch-up was requested by the removal path.
+                inner.attempt_wait.insert(
+                    key.clone(),
+                    WaitingState::cause(WaitingCause::WaitingForMemberKeyPackage),
+                );
+            } else if status != StatusCode::NOT_FOUND {
+                tracing::warn!(
+                    group_id = %super::LogHexId::group(group_key),
+                    target = %super::LogHexId::agent(&target_hex),
+                    %status,
+                    error,
+                    "ADR 0110 S4: exclusion attempt refused; retrying"
+                );
+            }
+            inner
+                .next_attempt
+                .insert(key.clone(), Instant::now() + S4_COMMIT_RETRY);
+        }
+        inner.dirty = true;
+    }
+    // The legacy transaction is durable (or refused): reconcile the `.evs`
+    // and only then retire the S4 journal.
+    persist_obligations(state).await;
+    remove_file_durably(&journal_path).await;
+}
+
+fn prepared_journal(row: &ObligationRow, parent_head: String, next_revision: u64) -> EvJournalV1 {
+    let mut txid = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
+    let mut evidence: Vec<[u8; 32]> = row.revocation_hashes.iter().copied().collect();
+    evidence.extend(
+        row.self_leave_commits
+            .iter()
+            .chain(row.expired_certificates.keys())
+            .map(|text| *blake3::hash(text.as_bytes()).as_bytes()),
+    );
+    EvJournalV1 {
+        txid,
+        stable_group_id: row.stable_group_id.clone(),
+        target: row.target,
+        parent_head,
+        next_revision,
+        result_epoch: None,
+        evidence,
+        // The legacy removal path builds and publishes the exact event
+        // inside its own transaction; S4 never republishes it.
+        outgoing_event: Vec::new(),
+    }
+}
+
+// ─── §5 persistence ────────────────────────────────────────────────────────
+
+fn evs_path(state: &AppState) -> PathBuf {
+    state.data_dir.join(s4::EVS_FILE_NAME)
+}
+
+/// `<data_dir>/treekem/<stable-group-id>.evjournal`. A stable ID that is
+/// not a plain file stem is hashed so it can never escape the directory.
+fn evjournal_path(state: &AppState, stable_group_id: &str) -> PathBuf {
+    let stem_ok = !stable_group_id.is_empty()
+        && stable_group_id.len() <= 128
+        && stable_group_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let stem = if stem_ok {
+        stable_group_id.to_string()
+    } else {
+        hex::encode(blake3::hash(stable_group_id.as_bytes()).as_bytes())
+    };
+    state
+        .treekem_dir
+        .join(format!("{stem}.{}", s4::EVJOURNAL_EXTENSION))
+}
+
+/// Write the `.evs` sidecar when the store changed (§5). Returns whether
+/// the store is durable afterwards (memory-only counts as durable for
+/// evidence held elsewhere).
+async fn persist_obligations(state: &AppState) -> bool {
+    let runtime = &state.revocation_evictions;
+    let _writer = runtime.evs_writer.lock().await;
+    let (bytes, covered) = {
+        let mut inner = runtime.inner.lock().await;
+        if !inner.dirty {
+            return inner.not_durable.is_empty();
+        }
+        if !inner.sidecar.state.writable() {
+            // Memory-only (ADR 0108 §5a): never rewrite a newer or
+            // unreadable file.
+            inner.dirty = false;
+            return true;
+        }
+        if !host_commit_gate_open(state) {
+            return false;
+        }
+        if inner.store.is_empty() && !inner.file_exists {
+            // Created lazily on the first verified trigger persist.
+            inner.dirty = false;
+            return true;
+        }
+        let body = EvsBodyV1 {
+            rebuilt_from: inner.rebuilt_from.clone(),
+            rows: inner.store.to_rows(),
+        };
+        match s4::encode_evs(&body) {
+            Ok(bytes) => (bytes, inner.not_durable.clone()),
+            Err(error) => {
+                tracing::error!(%error, "ADR 0110 S4: cannot encode the obligation sidecar");
+                return false;
+            }
+        }
+    };
+    let path = evs_path(state);
+    let result = write_bytes_durably(&path, &bytes, None).await;
+    let mut inner = runtime.inner.lock().await;
+    match result {
+        Ok(()) => {
+            inner.file_exists = true;
+            inner.dirty = false;
+            inner.not_durable.retain(|key| !covered.contains(key));
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "ADR 0110 S4: obligation sidecar write failed (waiting_for_durable_intake)"
+            );
+            false
+        }
+    }
+}
+
+/// Temp write, fsync, atomic rename and directory fsync (§5).
+async fn write_bytes_durably(
+    path: &FsPath,
+    bytes: &[u8],
+    temp_txid: Option<&[u8; 16]>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("s4");
+    let suffix = match temp_txid {
+        Some(txid) => hex::encode(txid),
+        None => {
+            let mut random = [0u8; 8];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random);
+            hex::encode(random)
+        }
+    };
+    let temp = path.with_file_name(format!("{file_name}.tmp-{suffix}"));
+    let write = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp, path).await
+    };
+    if let Err(error) = write.await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error);
+    }
+    sync_dir_of(path).await
+}
+
+async fn sync_dir_of(path: &FsPath) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || super::sync_parent_dir_for_path(&path))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+async fn write_evjournal(path: &FsPath, journal: &EvJournalV1) -> bool {
+    let bytes = match s4::encode_evjournal(journal) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::error!(%error, "ADR 0110 S4: cannot encode the prepare journal");
+            return false;
+        }
+    };
+    match write_bytes_durably(path, &bytes, None).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "ADR 0110 S4: prepare journal write failed");
+            false
+        }
+    }
+}
+
+async fn remove_file_durably(path: &FsPath) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {
+            if let Err(error) = sync_dir_of(path).await {
+                tracing::warn!(%error, path = %path.display(), "ADR 0110 S4: directory fsync after journal retire failed");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "ADR 0110 S4: cannot retire the prepare journal");
+        }
+    }
+}
+
+/// ADR 0108 §5a steps 1 to 3: move a damaged file aside under its pending
+/// name, fsync the directory and verify the copy. Returns the `txid` and
+/// the pending path, or the failed step.
+async fn quarantine_file(path: &FsPath, bytes: &[u8]) -> Result<([u8; 16], PathBuf), &'static str> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("rename")?;
+    let mut txid = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
+    let pending = path.with_file_name(s4::quarantine_pending_name(file_name, &txid, bytes));
+    tokio::fs::rename(path, &pending)
+        .await
+        .map_err(|_| "rename")?;
+    sync_dir_of(path).await.map_err(|_| "fsync")?;
+    let copy = tokio::fs::read(&pending).await.map_err(|_| "verify")?;
+    if s4::quarantine_hash_hex(&copy) != s4::quarantine_hash_hex(bytes) {
+        return Err("verify");
+    }
+    Ok((txid, pending))
+}
+
+/// ADR 0108 §5a step 5: mark a pending copy as history.
+async fn finalize_quarantine(pending: &FsPath) -> bool {
+    let Some(name) = pending.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(history) = s4::quarantine_history_name(name) else {
+        return false;
+    };
+    let history = pending.with_file_name(history);
+    if tokio::fs::rename(pending, &history).await.is_err() {
+        return false;
+    }
+    sync_dir_of(&history).await.is_ok()
+}
+
+/// ADR 0108 §5a resume: the verified pending copies of `file` (set `V`) in
+/// `txid` order. A copy that fails verification stays pending.
+async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bool) {
+    let Some(dir) = path.parent() else {
+        return (Vec::new(), false);
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return (Vec::new(), false);
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return (Vec::new(), false);
+    };
+    let mut found = Vec::new();
+    let mut failed = false;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some((txid, h)) = s4::parse_quarantine_pending_name(file_name, name) else {
+            continue;
+        };
+        match tokio::fs::read(entry.path()).await {
+            Ok(copy) if s4::quarantine_hash_hex(&copy) == h => found.push((txid, entry.path())),
+            _ => failed = true,
+        }
+    }
+    found.sort_by_key(|entry| entry.0);
+    (found, failed)
+}
+
+/// Load the `.evs` sidecar and reconcile leftover `.evjournal` files at
+/// worker start (§5). Never touches legacy files.
+async fn load_persisted_obligations(state: &AppState) {
+    let runtime = &state.revocation_evictions;
+    let _writer = runtime.evs_writer.lock().await;
+    let path = evs_path(state);
+    let (pending, verify_failed) = match sync_dir_of(&path).await {
+        Ok(()) => verified_pending_copies(&path).await,
+        Err(_) => (Vec::new(), true),
+    };
+    let mut sidecar = SidecarStatus::default();
+    let mut store = ObligationStore::new();
+    let mut rebuilt_from = Vec::new();
+    let mut rebuilding = false;
+    let mut file_exists = false;
+    let mut covered: Vec<([u8; 16], PathBuf)> = Vec::new();
+    let mut finalize: Vec<PathBuf> = Vec::new();
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => match s4::decode_evs(&bytes) {
+            Ok(body) => {
+                store = ObligationStore::from_rows(body.rows);
+                rebuilt_from = body.rebuilt_from;
+                file_exists = true;
+                finalize.extend(pending.into_iter().map(|(_, copy)| copy));
+            }
+            Err(SidecarDecodeError::NewerFormat(version)) => {
+                sidecar.state = SidecarState::SidecarNewerFormat;
+                sidecar.detail = Some(format!("version {version}"));
+            }
+            Err(SidecarDecodeError::Damaged(reason)) => {
+                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged obligation sidecar; quarantining (ADR 0108 §5a)");
+                covered = pending;
+                match quarantine_file(&path, &bytes).await {
+                    Ok(entry) => covered.push(entry),
+                    Err(step) => {
+                        sidecar.state = SidecarState::SidecarQuarantineFailed;
+                        sidecar.detail = Some(format!("step {step}"));
+                    }
+                }
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            covered = pending;
+        }
+        Err(_) => {
+            sidecar.state = SidecarState::SidecarUnavailable;
+            sidecar.detail = Some("cause read_error".to_string());
+        }
+    }
+    if verify_failed && sidecar.state == SidecarState::Ok && covered.is_empty() && !file_exists {
+        sidecar.state = SidecarState::SidecarQuarantineFailed;
+        sidecar.detail = Some("step verify".to_string());
+    }
+    if !covered.is_empty() && sidecar.state == SidecarState::Ok {
+        // ADR 0108 §5a step 4: one empty replacement that covers `V`; the
+        // next pass refills it from the rebuild source (§5).
+        covered.sort_by_key(|entry| entry.0);
+        let txids: Vec<[u8; 16]> = covered.iter().map(|(txid, _)| *txid).collect();
+        let body = EvsBodyV1 {
+            rebuilt_from: txids.clone(),
+            rows: Vec::new(),
+        };
+        let written = match (s4::encode_evs(&body), txids.first()) {
+            (Ok(bytes), Some(first)) => write_bytes_durably(&path, &bytes, Some(first))
+                .await
+                .is_ok(),
+            _ => false,
+        };
+        if written {
+            sidecar.state = SidecarState::Rebuilt;
+            rebuilt_from = txids;
+            rebuilding = true;
+            file_exists = true;
+            finalize.extend(covered.into_iter().map(|(_, copy)| copy));
+        } else {
+            sidecar.state = SidecarState::SidecarQuarantineFailed;
+            sidecar.detail = Some("step replace".to_string());
+        }
+    }
+    for copy in finalize {
+        if !finalize_quarantine(&copy).await {
+            tracing::warn!(path = %copy.display(), "ADR 0110 S4: cannot finalize a quarantined copy");
+        }
+    }
+    // Speculative preparation never survives a restart on its own (§5).
+    let journals = reconcile_evjournals(state).await;
+    for row in store.to_rows() {
+        if row.phase == Phase::Prepared && !journals.contains(&row.key()) {
+            if let Some(stored) = store.get_mut(&row.key()) {
+                stored.phase = Phase::Pending;
+                stored.parent_head = None;
+            }
+        }
+    }
+    for key in &journals {
+        if let Some(stored) = store.get_mut(key) {
+            if stored.phase == Phase::Prepared {
+                // An unchanged parent with no legacy commit evidence returns
+                // to pending; a landed commit is recognised from the chain
+                // by the next reconciliation.
+                stored.phase = Phase::Pending;
+                stored.parent_head = None;
+            }
+        }
+    }
+    let mut inner = runtime.inner.lock().await;
+    inner.store = store;
+    inner.sidecar = sidecar;
+    inner.rebuilt_from = rebuilt_from;
+    inner.rebuilding = rebuilding;
+    inner.file_exists = file_exists;
+    inner.dirty = !journals.is_empty();
+}
+
+/// Read every `.evjournal` in the TreeKEM directory, classify it, and
+/// retire it (§5). Damaged journals are quarantined with no replacement
+/// (ADR 0110 §5 "a missing journal is the normal state"). Returns the keys
+/// of the prepared transitions found.
+async fn reconcile_evjournals(state: &AppState) -> BTreeSet<EvictionKey> {
+    let mut keys = BTreeSet::new();
+    let Ok(mut entries) = tokio::fs::read_dir(&state.treekem_dir).await else {
+        return keys;
+    };
+    let mut paths = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some(s4::EVJOURNAL_EXTENSION) {
+            paths.push(path);
+        }
+    }
+    for path in paths {
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        match s4::decode_evjournal(&bytes) {
+            Ok(journal) => {
+                keys.insert(EvictionKey::new(journal.stable_group_id, journal.target));
+                remove_file_durably(&path).await;
+            }
+            Err(SidecarDecodeError::NewerFormat(_)) => {}
+            Err(SidecarDecodeError::Damaged(reason)) => {
+                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged prepare journal; quarantining (ADR 0108 §5a)");
+                match quarantine_file(&path, &bytes).await {
+                    Ok((_, pending)) => {
+                        finalize_quarantine(&pending).await;
+                    }
+                    Err(step) => {
+                        tracing::warn!(step, path = %path.display(), "ADR 0110 S4: prepare journal quarantine failed");
+                    }
+                }
+            }
+        }
+    }
+    keys
+}
+
+// ─── Public status (D64) ───────────────────────────────────────────────────
+
+fn waiting_json(waiting: &WaitingState) -> serde_json::Value {
+    let named: Vec<String> = waiting.named.iter().map(hex::encode).collect();
+    let designated = (waiting.cause == WaitingCause::WaitingForDesignatedAdmin
+        || waiting.cause == WaitingCause::LocalCommitterIneligible)
+        .then(|| named.first().cloned())
+        .flatten();
+    serde_json::json!({
+        "cause": waiting.cause.as_str(),
+        "named": named,
+        "designated_admin": designated,
+        "detail": waiting.designated_detail,
+        "remaining_ms": waiting.remaining_ms,
+    })
+}
+
+/// The S4 rows of one group for `GET /groups/:id` (`revocation_evictions`)
+/// and the sidecar state (`revocation_eviction_store`).
+pub(in crate::server) async fn group_status_json(
+    state: &AppState,
+    info: &GroupInfo,
+) -> (serde_json::Value, serde_json::Value) {
+    let stable = info.stable_group_id();
+    let inner = state.revocation_evictions.inner.lock().await;
+    let rows: Vec<serde_json::Value> = inner
+        .store
+        .rows_for_group(stable)
+        .map(|row| {
+            let key = row.key();
+            let queued: Vec<serde_json::Value> = inner
+                .queued_manual
+                .get(&key)
+                .map(|requests| {
+                    requests
+                        .iter()
+                        .map(|request| {
+                            serde_json::json!({
+                                "request": request.kind.as_str(),
+                                "queued_at_unix_ms": request.queued_at_unix_ms,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "target": hex::encode(row.target),
+                "phase": row.phase.as_str(),
+                "triggers": row.trigger_kinds(),
+                "termination_cause": row.termination.map(TerminationCause::as_str),
+                "designated_admin": row.designated.map(hex::encode),
+                "fallback_ranks": row.ranks.iter().map(hex::encode).collect::<Vec<_>>(),
+                "waiting": row.waiting.as_ref().map(waiting_json),
+                "queued_requests": queued,
+                "observed_at_unix_ms": row.observed_at_unix_ms,
+                "result_head": row.result_head,
+                "result_epoch": row.result_epoch,
+            })
+        })
+        .collect();
+    let store = serde_json::json!({
+        "state": inner.sidecar.state,
+        "file": s4::EVS_FILE_NAME,
+        "detail": inner.sidecar.detail,
+        "rebuilt_from": inner.rebuilt_from.iter().map(hex::encode).collect::<Vec<_>>(),
+    });
+    (serde_json::Value::Array(rows), store)
 }
 
 fn now_unix_ms() -> u64 {
@@ -455,5 +1498,49 @@ mod tests {
         leaves.by_group.insert("g".into(), None);
         assert_eq!(leaves.tracks("g", &[1; 32]), None);
         assert!(!leaves.known("g"));
+    }
+
+    #[tokio::test]
+    async fn durable_write_replaces_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(s4::EVS_FILE_NAME);
+        write_bytes_durably(&path, b"one", None)
+            .await
+            .expect("write one");
+        write_bytes_durably(&path, b"two", None)
+            .await
+            .expect("write two");
+        assert_eq!(tokio::fs::read(&path).await.expect("read"), b"two");
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[tokio::test]
+    async fn quarantine_moves_damage_aside_and_finalizes_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(s4::EVS_FILE_NAME);
+        tokio::fs::write(&path, b"X0XEVICT1").await.expect("seed");
+        let (txid, pending) = quarantine_file(&path, b"X0XEVICT1")
+            .await
+            .expect("quarantine");
+        assert!(!path.exists());
+        let (copies, failed) = verified_pending_copies(&path).await;
+        assert!(!failed);
+        assert_eq!(copies, vec![(txid, pending.clone())]);
+        assert!(finalize_quarantine(&pending).await);
+        assert!(!pending.exists());
+        let history = std::fs::read_dir(dir.path())
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("revocation-evictions.evs.q-") && !name.ends_with(".pending")
+            })
+            .count();
+        assert_eq!(history, 1);
     }
 }

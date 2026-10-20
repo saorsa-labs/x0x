@@ -71,12 +71,16 @@ pub struct S4Timing {
 }
 
 impl S4Timing {
-    /// PENDING MEASUREMENT placeholder for W.
-    pub const PENDING_DESIGNATED_WINDOW: Duration = Duration::from_secs(30);
-    /// PENDING MEASUREMENT placeholder for the completion bound.
+    /// PENDING MEASUREMENT placeholder for W. It equals the W3-H case's
+    /// `S4_W_PLACEHOLDER` (60 s), so the harness and the product share one
+    /// provisional value until the measured number replaces both.
+    pub const PENDING_DESIGNATED_WINDOW: Duration = Duration::from_secs(60);
+    /// PENDING MEASUREMENT placeholder for the completion bound (the W3-H
+    /// case's `S4_COMPLETION_BOUND_PLACEHOLDER`, 120 s).
     pub const PENDING_COMPLETION_BOUND: Duration = Duration::from_secs(120);
-    /// PENDING MEASUREMENT placeholder for Δ.
-    pub const PENDING_FALLBACK_STAGGER: Duration = Duration::from_secs(10);
+    /// PENDING MEASUREMENT placeholder for Δ (the W3-H case's
+    /// `S4_DELTA_PLACEHOLDER`, 30 s).
+    pub const PENDING_FALLBACK_STAGGER: Duration = Duration::from_secs(30);
     /// PENDING MEASUREMENT placeholder for the restart sync wait (the
     /// provisional D73 range is 10 s to 30 s; the top of the range is used).
     pub const PENDING_RESTART_SYNC_WAIT: Duration = Duration::from_secs(30);
@@ -958,25 +962,204 @@ pub fn admin_availability(
     }
 }
 
+// ─── Row evaluation (§1a, §2, §3, §4) ──────────────────────────────────────
+
+/// The inputs that decide what this node does for one open row. The
+/// daemon fills it from the current committed roster under one snapshot.
+#[derive(Debug, Clone)]
+pub struct RowContext<'a> {
+    /// This node's agent ID.
+    pub local: [u8; 32],
+    /// Admin-or-higher Active seats on the current roster (legacy `Owner`
+    /// is Admin-equivalent).
+    pub active_admins: &'a [[u8; 32]],
+    /// The admins among them that hold a verified Agent-subject
+    /// revocation.
+    pub revoked_admins: &'a BTreeSet<[u8; 32]>,
+    /// The group holds an ADR 0064 fork-quarantine marker.
+    pub quarantined: bool,
+    /// The target still holds an Active or Pending seat.
+    pub target_seated: bool,
+    /// Elapsed monotonic budget since T_obs.
+    pub elapsed: Duration,
+    /// This replica completed a current catch-up round (or the bounded
+    /// restart sync wait).
+    pub head_synced: bool,
+    /// The row's latest material change is durable (or its evidence is
+    /// durable elsewhere while the sidecar runs memory-only).
+    pub durable: bool,
+    /// This node's wall clock (Unix seconds).
+    pub now_unix: u64,
+    /// This node's own selected certificate is expired on its clock
+    /// (`OwnerCertified` groups only).
+    pub local_certificate_expired: bool,
+}
+
+/// What the worker does for a row after evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAction {
+    /// Nothing now.
+    None,
+    /// Remove the seated target with the ordinary signed `MemberRemoved`
+    /// (and its TreeKEM removal or GSS rotation) (§3).
+    CommitRemoval {
+        /// 0 for the designated admin, r ≥ 1 for a fallback rank.
+        rank: usize,
+    },
+    /// The target already left the roster and keeps a leaf: run the
+    /// responsive self-leave rekey (§2 amendment to ADR 0016 §6).
+    SelfLeaveRekey {
+        /// 0 for the designated admin, r ≥ 1 for a fallback rank.
+        rank: usize,
+    },
+}
+
+/// The evaluation of one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowEvaluation {
+    /// The typed wait to show (D64), `None` when the node acts.
+    pub waiting: Option<WaitingState>,
+    /// What the worker does.
+    pub action: RowAction,
+    /// The designation, when an eligible admin exists.
+    pub designation: Option<Designation>,
+    /// This node's commit permission, when an eligible admin exists.
+    pub permission: Option<CommitPermission>,
+}
+
+impl RowEvaluation {
+    fn wait(waiting: WaitingState) -> Self {
+        Self {
+            waiting: Some(waiting),
+            action: RowAction::None,
+            designation: None,
+            permission: None,
+        }
+    }
+}
+
+/// The earliest raw `not_after` among an expiry-only row's certificates.
+#[must_use]
+pub fn expiry_wait_not_after(row: &ObligationRow) -> Option<u64> {
+    if !row.expiry_only() {
+        return None;
+    }
+    row.expired_certificates.values().copied().min()
+}
+
+/// Decide the typed state and the action of one open row (§2, §4).
+#[must_use]
+pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing) -> RowEvaluation {
+    if ctx.quarantined {
+        return RowEvaluation::wait(WaitingState::cause(WaitingCause::WaitingForForkResolution));
+    }
+    let availability = admin_availability(
+        ctx.active_admins,
+        &row.target,
+        |id| ctx.revoked_admins.contains(id),
+        |_| false,
+    );
+    let designation = match availability {
+        AdminAvailability::AllRevoked { revoked_admins } => {
+            let mut waiting = WaitingState::cause(WaitingCause::WaitingForEligibleAdminRevocation);
+            waiting.named = revoked_admins;
+            return RowEvaluation::wait(waiting);
+        }
+        AdminAvailability::NoActiveAdmin => {
+            return RowEvaluation::wait(WaitingState::cause(WaitingCause::WaitingForActiveAdmin));
+        }
+        AdminAvailability::Eligible(designation) => designation,
+    };
+    let permission = commit_permission(&ctx.local, &designation, ctx.elapsed, timing);
+    let named_designated = |cause: WaitingCause| {
+        let mut waiting = WaitingState::cause(cause);
+        waiting.named = vec![designation.designated];
+        waiting
+    };
+    let (waiting, action) = match &permission {
+        CommitPermission::NotEligible => {
+            let local_is_admin = ctx.active_admins.contains(&ctx.local);
+            let cause = if local_is_admin {
+                WaitingCause::LocalCommitterIneligible
+            } else {
+                WaitingCause::WaitingForDesignatedAdmin
+            };
+            (Some(named_designated(cause)), RowAction::None)
+        }
+        CommitPermission::Wait { remaining, .. } => {
+            let mut waiting = named_designated(WaitingCause::WaitingForDesignatedAdmin);
+            waiting.designated_detail = Some(DesignatedWaitDetail::Rank);
+            waiting.remaining_ms = Some(duration_ms(*remaining));
+            (Some(waiting), RowAction::None)
+        }
+        CommitPermission::Designated | CommitPermission::Fallback { .. } => {
+            let rank = match permission {
+                CommitPermission::Fallback { rank } => rank,
+                _ => 0,
+            };
+            if ctx.local_certificate_expired {
+                (
+                    Some(named_designated(WaitingCause::LocalCommitterIneligible)),
+                    RowAction::None,
+                )
+            } else if !ctx.durable {
+                (
+                    Some(WaitingState::cause(WaitingCause::WaitingForDurableIntake)),
+                    RowAction::None,
+                )
+            } else if !ctx.head_synced {
+                (
+                    Some(WaitingState::cause(WaitingCause::WaitingForHeadSync)),
+                    RowAction::None,
+                )
+            } else if let Some(not_after) = expiry_wait_not_after(row)
+                .filter(|not_after| !raw_expiry_passed(*not_after, ctx.now_unix))
+            {
+                // §1a: the pre-seal re-check found the clock no longer past
+                // the raw `not_after`; the row waits, no budget renews.
+                let mut waiting = WaitingState::cause(WaitingCause::WaitingForCertificateExpiry);
+                waiting.remaining_ms = Some(
+                    not_after
+                        .saturating_sub(ctx.now_unix)
+                        .saturating_add(1)
+                        .saturating_mul(1000),
+                );
+                (Some(waiting), RowAction::None)
+            } else if ctx.target_seated {
+                (None, RowAction::CommitRemoval { rank })
+            } else {
+                (None, RowAction::SelfLeaveRekey { rank })
+            }
+        }
+    };
+    RowEvaluation {
+        waiting,
+        action,
+        designation: Some(designation),
+        permission: Some(permission),
+    }
+}
+
 // ─── Monotonic budget (§2) ─────────────────────────────────────────────────
 
 /// The elapsed budget of one row on this boot.
 ///
 /// `consumed_before_boot` is the budget persisted by an earlier boot; the
-/// in-boot part runs on the monotonic clock, so a wall-clock change or a
-/// rollback never renews W.
+/// in-boot part runs on the monotonic clock (`tokio::time::Instant`, so a
+/// paused test clock drives it too), so a wall-clock change or a rollback
+/// never renews W.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowBudget {
     /// Budget consumed by earlier boots.
     pub consumed_before_boot: Duration,
     /// The monotonic instant at which this boot started counting.
-    pub counting_since: std::time::Instant,
+    pub counting_since: tokio::time::Instant,
 }
 
 impl RowBudget {
     /// Start counting now with `consumed_before_boot` already used.
     #[must_use]
-    pub fn resume(consumed_before_boot: Duration, now: std::time::Instant) -> Self {
+    pub fn resume(consumed_before_boot: Duration, now: tokio::time::Instant) -> Self {
         Self {
             consumed_before_boot,
             counting_since: now,
@@ -985,7 +1168,7 @@ impl RowBudget {
 
     /// The elapsed budget at `now`.
     #[must_use]
-    pub fn elapsed(&self, now: std::time::Instant) -> Duration {
+    pub fn elapsed(&self, now: tokio::time::Instant) -> Duration {
         self.consumed_before_boot
             .saturating_add(now.saturating_duration_since(self.counting_since))
     }
@@ -1113,6 +1296,229 @@ impl RevocationIntake {
     #[must_use]
     pub fn notified(&self) -> std::sync::Arc<tokio::sync::Notify> {
         std::sync::Arc::clone(&self.notify)
+    }
+}
+
+// ─── Persistence (§5) ──────────────────────────────────────────────────────
+
+/// File name of the S4 obligation sidecar in `<data_dir>`.
+pub const EVS_FILE_NAME: &str = "revocation-evictions.evs";
+/// Extension of the per-group S4 journal in `<data_dir>/treekem/`.
+pub const EVJOURNAL_EXTENSION: &str = "evjournal";
+/// The `.evs` family prefix, reserved for this path forever.
+pub const EVS_PREFIX: &[u8] = b"X0XEVICT";
+/// The `.evjournal` family prefix, reserved for this path forever.
+pub const EVJOURNAL_PREFIX: &[u8] = b"X0XEVJ";
+/// The `.evs` v1 header (10 bytes).
+pub const EVS_HEADER_V1: &[u8; 10] = b"X0XEVICT1\0";
+/// The `.evjournal` v1 header (8 bytes).
+pub const EVJOURNAL_HEADER_V1: &[u8; 8] = b"X0XEVJ1\0";
+/// The highest layout version this binary reads, for both files.
+pub const SIDECAR_MAX_SUPPORTED_VERSION: u8 = 1;
+
+/// Why an S4 file could not be used (ADR 0108 §5a classification).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarDecodeError {
+    /// The file is damaged; S4 quarantines it and rebuilds.
+    Damaged(&'static str),
+    /// The file has a newer layout; this binary never rewrites it.
+    NewerFormat(u8),
+}
+
+impl std::fmt::Display for SidecarDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Damaged(reason) => write!(f, "damaged S4 file: {reason}"),
+            Self::NewerFormat(version) => write!(f, "newer S4 file layout v{version}"),
+        }
+    }
+}
+
+impl std::error::Error for SidecarDecodeError {}
+
+/// The frozen v1 `.evs` body. It begins with `rebuilt_from`, the §5a
+/// `txid` list.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EvsBodyV1 {
+    /// Transaction IDs of the §5a rebuilds this file came from.
+    pub rebuilt_from: Vec<[u8; 16]>,
+    /// The obligation rows.
+    pub rows: Vec<ObligationRow>,
+}
+
+/// The frozen v1 `.evjournal` body: one prepared S4 transition (§5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvJournalV1 {
+    /// Transaction ID.
+    pub txid: [u8; 16],
+    /// Stable group ID.
+    pub stable_group_id: String,
+    /// Target agent ID.
+    pub target: [u8; 32],
+    /// The parent head the transition extends.
+    pub parent_head: String,
+    /// The roster revision after the transition.
+    pub next_revision: u64,
+    /// The epoch after the transition, when the plane has one.
+    pub result_epoch: Option<u64>,
+    /// Trigger hashes that authorize the transition.
+    pub evidence: Vec<[u8; 32]>,
+    /// The exact outgoing event (empty until the legacy commit made it).
+    pub outgoing_event: Vec<u8>,
+}
+
+/// Split and check a `<prefix><digit>\0` header. Returns the version and
+/// the body.
+fn split_header<'a>(bytes: &'a [u8], prefix: &[u8]) -> Result<(u8, &'a [u8]), SidecarDecodeError> {
+    let header_len = prefix.len() + 2;
+    let Some(found_prefix) = bytes.get(..prefix.len()) else {
+        if prefix.starts_with(bytes) && !bytes.is_empty() {
+            return Err(SidecarDecodeError::Damaged("truncated_header"));
+        }
+        return Err(SidecarDecodeError::Damaged("missing_prefix"));
+    };
+    if found_prefix != prefix {
+        return Err(SidecarDecodeError::Damaged("missing_prefix"));
+    }
+    let (Some(&version_byte), Some(&terminator), Some(body)) = (
+        bytes.get(prefix.len()),
+        bytes.get(prefix.len() + 1),
+        bytes.get(header_len..),
+    ) else {
+        return Err(SidecarDecodeError::Damaged("truncated_header"));
+    };
+    if !(b'1'..=b'9').contains(&version_byte) {
+        return Err(SidecarDecodeError::Damaged("bad_version"));
+    }
+    if terminator != 0 {
+        return Err(SidecarDecodeError::Damaged("missing_nul"));
+    }
+    let version = version_byte - b'0';
+    if version > SIDECAR_MAX_SUPPORTED_VERSION {
+        return Err(SidecarDecodeError::NewerFormat(version));
+    }
+    Ok((version, body))
+}
+
+/// The ADR 0108 §5a pending-copy name of a quarantined file:
+/// `<file>.q-<txid>-<h>.pending`, where `h` is the first 16 bytes of
+/// BLAKE3 over the bytes read at classification.
+#[must_use]
+pub fn quarantine_pending_name(file_name: &str, txid: &[u8; 16], bytes: &[u8]) -> String {
+    format!(
+        "{file_name}.q-{}-{}.pending",
+        hex::encode(txid),
+        quarantine_hash_hex(bytes)
+    )
+}
+
+/// The ADR 0108 §5a history name: the pending name without `.pending`.
+#[must_use]
+pub fn quarantine_history_name(pending_name: &str) -> Option<&str> {
+    pending_name.strip_suffix(".pending")
+}
+
+/// Hex of the first 16 bytes of BLAKE3 over `bytes` (ADR 0108 §5a `h`).
+#[must_use]
+pub fn quarantine_hash_hex(bytes: &[u8]) -> String {
+    let digest = blake3::hash(bytes);
+    let short = digest.as_bytes().get(..16).unwrap_or_default();
+    hex::encode(short)
+}
+
+/// Parse `<file>.q-<txid>-<h>.pending` into `(txid, h)`.
+#[must_use]
+pub fn parse_quarantine_pending_name(
+    file_name: &str,
+    candidate: &str,
+) -> Option<([u8; 16], String)> {
+    let rest = candidate
+        .strip_prefix(file_name)?
+        .strip_prefix(".q-")?
+        .strip_suffix(".pending")?;
+    let (txid_hex, h) = rest.split_once('-')?;
+    let mut txid = [0u8; 16];
+    hex::decode_to_slice(txid_hex, &mut txid).ok()?;
+    if h.len() != 32 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((txid, h.to_string()))
+}
+
+/// Decode a postcard body that must be consumed exactly.
+fn decode_exact<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, SidecarDecodeError> {
+    let (value, rest) = postcard::take_from_bytes::<T>(body)
+        .map_err(|_| SidecarDecodeError::Damaged("body_decode"))?;
+    if !rest.is_empty() {
+        return Err(SidecarDecodeError::Damaged("trailing_bytes"));
+    }
+    Ok(value)
+}
+
+/// Encode the `.evs` sidecar.
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub fn encode_evs(body: &EvsBodyV1) -> Result<Vec<u8>, postcard::Error> {
+    let mut out = EVS_HEADER_V1.to_vec();
+    out.extend(postcard::to_stdvec(body)?);
+    Ok(out)
+}
+
+/// Decode the `.evs` sidecar.
+///
+/// # Errors
+///
+/// Returns the §5a classification of a file that cannot be used.
+pub fn decode_evs(bytes: &[u8]) -> Result<EvsBodyV1, SidecarDecodeError> {
+    let (_, body) = split_header(bytes, EVS_PREFIX)?;
+    decode_exact(body)
+}
+
+/// Encode one `.evjournal`.
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub fn encode_evjournal(journal: &EvJournalV1) -> Result<Vec<u8>, postcard::Error> {
+    let mut out = EVJOURNAL_HEADER_V1.to_vec();
+    out.extend(postcard::to_stdvec(journal)?);
+    Ok(out)
+}
+
+/// Decode one `.evjournal`.
+///
+/// # Errors
+///
+/// Returns the §5a classification of a file that cannot be used.
+pub fn decode_evjournal(bytes: &[u8]) -> Result<EvJournalV1, SidecarDecodeError> {
+    let (_, body) = split_header(bytes, EVJOURNAL_PREFIX)?;
+    decode_exact(body)
+}
+
+/// The S4 file states shown on status (ADR 0108 §5a generic states).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidecarState {
+    /// The file is absent or decoded; writes are durable.
+    Ok,
+    /// The file is damaged and was quarantined; S4 rebuilt it.
+    Rebuilt,
+    /// The file could not be read; S4 runs memory-only.
+    SidecarUnavailable,
+    /// The file has a newer layout; S4 runs memory-only and never rewrites
+    /// it.
+    SidecarNewerFormat,
+    /// Quarantine failed; S4 runs memory-only.
+    SidecarQuarantineFailed,
+}
+
+impl SidecarState {
+    /// Whether S4 may write the file.
+    #[must_use]
+    pub fn writable(self) -> bool {
+        matches!(self, Self::Ok | Self::Rebuilt)
     }
 }
 
@@ -1329,7 +1735,7 @@ mod tests {
 
     #[test]
     fn budget_survives_restart_and_shortens_only() {
-        let now = std::time::Instant::now();
+        let now = tokio::time::Instant::now();
         let mut budget = RowBudget::resume(Duration::from_secs(4), now);
         assert_eq!(budget.elapsed(now), Duration::from_secs(4));
         budget.shorten(Duration::from_secs(1));
@@ -1389,5 +1795,270 @@ mod tests {
         assert_eq!(items[0].target, *kp.agent_id().as_bytes());
         assert!(!items[0].from_startup_load);
         assert!(items[1].from_startup_load);
+    }
+
+    fn sample_row() -> ObligationRow {
+        let mut store = ObligationStore::new();
+        store.intake(&key(4), revocation(7), Some("kp"), 11, [2; 16]);
+        store.get(&key(4)).expect("row").clone()
+    }
+
+    #[test]
+    fn evs_round_trips_and_rejects_trailing_bytes() {
+        let body = EvsBodyV1 {
+            rebuilt_from: vec![[1; 16]],
+            rows: vec![sample_row()],
+        };
+        let bytes = encode_evs(&body).expect("encode");
+        assert_eq!(&bytes[..10], EVS_HEADER_V1);
+        assert_eq!(decode_evs(&bytes).expect("decode"), body);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_evs(&trailing),
+            Err(SidecarDecodeError::Damaged("trailing_bytes"))
+        );
+    }
+
+    #[test]
+    fn evs_header_damage_forms_are_classified() {
+        let bytes = encode_evs(&EvsBodyV1::default()).expect("encode");
+        assert_eq!(
+            decode_evs(b"garbage-file"),
+            Err(SidecarDecodeError::Damaged("missing_prefix"))
+        );
+        assert_eq!(
+            decode_evs(&bytes[..9]),
+            Err(SidecarDecodeError::Damaged("truncated_header"))
+        );
+        assert_eq!(
+            decode_evs(b"X0XEV"),
+            Err(SidecarDecodeError::Damaged("truncated_header"))
+        );
+        let mut zero = bytes.clone();
+        zero[8] = b'0';
+        assert_eq!(
+            decode_evs(&zero),
+            Err(SidecarDecodeError::Damaged("bad_version"))
+        );
+        let mut letter = bytes.clone();
+        letter[8] = b'x';
+        assert_eq!(
+            decode_evs(&letter),
+            Err(SidecarDecodeError::Damaged("bad_version"))
+        );
+        let mut no_nul = bytes.clone();
+        no_nul[9] = b' ';
+        assert_eq!(
+            decode_evs(&no_nul),
+            Err(SidecarDecodeError::Damaged("missing_nul"))
+        );
+        let mut newer = bytes;
+        newer[8] = b'2';
+        assert_eq!(decode_evs(&newer), Err(SidecarDecodeError::NewerFormat(2)));
+    }
+
+    #[test]
+    fn evjournal_round_trips_with_its_own_header() {
+        let journal = EvJournalV1 {
+            txid: [9; 16],
+            stable_group_id: "g".into(),
+            target: [3; 32],
+            parent_head: "head".into(),
+            next_revision: 5,
+            result_epoch: Some(2),
+            evidence: vec![[4; 32]],
+            outgoing_event: vec![1, 2, 3],
+        };
+        let bytes = encode_evjournal(&journal).expect("encode");
+        assert_eq!(&bytes[..8], EVJOURNAL_HEADER_V1);
+        assert_eq!(decode_evjournal(&bytes).expect("decode"), journal);
+        assert_eq!(
+            decode_evjournal(&bytes[..7]),
+            Err(SidecarDecodeError::Damaged("truncated_header"))
+        );
+        // A `.evs` file is not a journal.
+        let evs = encode_evs(&EvsBodyV1::default()).expect("encode");
+        assert_eq!(
+            decode_evjournal(&evs),
+            Err(SidecarDecodeError::Damaged("missing_prefix"))
+        );
+        let mut no_nul = bytes.clone();
+        no_nul[7] = b'x';
+        assert_eq!(
+            decode_evjournal(&no_nul),
+            Err(SidecarDecodeError::Damaged("missing_nul"))
+        );
+        let mut newer = bytes;
+        newer[6] = b'2';
+        assert_eq!(
+            decode_evjournal(&newer),
+            Err(SidecarDecodeError::NewerFormat(2))
+        );
+    }
+
+    fn ctx<'a>(
+        local: u8,
+        admins: &'a [[u8; 32]],
+        revoked: &'a BTreeSet<[u8; 32]>,
+        elapsed: Duration,
+    ) -> RowContext<'a> {
+        RowContext {
+            local: id(local),
+            active_admins: admins,
+            revoked_admins: revoked,
+            quarantined: false,
+            target_seated: true,
+            elapsed,
+            head_synced: true,
+            durable: true,
+            now_unix: 1_000,
+            local_certificate_expired: false,
+        }
+    }
+
+    #[test]
+    fn evaluate_row_designated_commits_and_rank_waits_naming_designated() {
+        let timing = S4Timing::default();
+        let row = sample_row();
+        let admins = [id(1), id(2), id(3)];
+        let none = BTreeSet::new();
+        let designated = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(designated.action, RowAction::CommitRemoval { rank: 0 });
+        assert_eq!(designated.waiting, None);
+
+        let early = evaluate_row(
+            &row,
+            &ctx(2, &admins, &none, Duration::from_secs(1)),
+            &timing,
+        );
+        assert_eq!(early.action, RowAction::None);
+        let waiting = early.waiting.expect("typed wait");
+        assert_eq!(waiting.cause, WaitingCause::WaitingForDesignatedAdmin);
+        assert_eq!(waiting.named, vec![id(1)]);
+        assert_eq!(waiting.designated_detail, Some(DesignatedWaitDetail::Rank));
+        assert!(waiting.remaining_ms.is_some());
+
+        let fallback = evaluate_row(
+            &row,
+            &ctx(2, &admins, &none, timing.designated_window),
+            &timing,
+        );
+        assert_eq!(fallback.action, RowAction::CommitRemoval { rank: 1 });
+        let rank_two = evaluate_row(
+            &row,
+            &ctx(3, &admins, &none, timing.designated_window),
+            &timing,
+        );
+        assert_eq!(rank_two.action, RowAction::None);
+
+        // A non-admin observer sees the designated admin named.
+        let observer = evaluate_row(&row, &ctx(8, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            observer.waiting.map(|w| (w.cause, w.named)),
+            Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(1)]))
+        );
+    }
+
+    #[test]
+    fn evaluate_row_typed_blocks() {
+        let timing = S4Timing::default();
+        let row = sample_row();
+        let admins = [id(1)];
+        let none = BTreeSet::new();
+        let mut unsynced = ctx(1, &admins, &none, Duration::ZERO);
+        unsynced.head_synced = false;
+        assert_eq!(
+            evaluate_row(&row, &unsynced, &timing)
+                .waiting
+                .map(|w| w.cause),
+            Some(WaitingCause::WaitingForHeadSync)
+        );
+        let mut not_durable = ctx(1, &admins, &none, Duration::ZERO);
+        not_durable.durable = false;
+        assert_eq!(
+            evaluate_row(&row, &not_durable, &timing)
+                .waiting
+                .map(|w| w.cause),
+            Some(WaitingCause::WaitingForDurableIntake)
+        );
+        let mut forked = ctx(1, &admins, &none, Duration::ZERO);
+        forked.quarantined = true;
+        assert_eq!(
+            evaluate_row(&row, &forked, &timing)
+                .waiting
+                .map(|w| w.cause),
+            Some(WaitingCause::WaitingForForkResolution)
+        );
+        let revoked: BTreeSet<[u8; 32]> = [id(1)].into_iter().collect();
+        let all_revoked = evaluate_row(&row, &ctx(5, &admins, &revoked, Duration::ZERO), &timing);
+        assert_eq!(
+            all_revoked.waiting.map(|w| (w.cause, w.named)),
+            Some((WaitingCause::WaitingForEligibleAdminRevocation, vec![id(1)]))
+        );
+        assert_eq!(
+            evaluate_row(&row, &ctx(5, &[], &none, Duration::ZERO), &timing)
+                .waiting
+                .map(|w| w.cause),
+            Some(WaitingCause::WaitingForActiveAdmin)
+        );
+        let mut expired_self = ctx(1, &admins, &none, Duration::ZERO);
+        expired_self.local_certificate_expired = true;
+        assert_eq!(
+            evaluate_row(&row, &expired_self, &timing)
+                .waiting
+                .map(|w| w.cause),
+            Some(WaitingCause::LocalCommitterIneligible)
+        );
+        let mut left = ctx(1, &admins, &none, Duration::ZERO);
+        left.target_seated = false;
+        assert_eq!(
+            evaluate_row(&row, &left, &timing).action,
+            RowAction::SelfLeaveRekey { rank: 0 }
+        );
+    }
+
+    #[test]
+    fn evaluate_row_expiry_rechecks_raw_not_after() {
+        let timing = S4Timing::default();
+        let mut store = ObligationStore::new();
+        store.intake(
+            &key(4),
+            EvictionTrigger::CertificateExpiry {
+                certificate_digest: "d".into(),
+                not_after: 2_000,
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        let row = store.get(&key(4)).expect("row").clone();
+        let admins = [id(1)];
+        let none = BTreeSet::new();
+        let early = evaluate_row(&row, &ctx(1, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            early.waiting.map(|w| w.cause),
+            Some(WaitingCause::WaitingForCertificateExpiry)
+        );
+        let mut later = ctx(1, &admins, &none, Duration::ZERO);
+        later.now_unix = 2_001;
+        assert_eq!(
+            evaluate_row(&row, &later, &timing).action,
+            RowAction::CommitRemoval { rank: 0 }
+        );
+    }
+
+    #[test]
+    fn quarantine_names_round_trip() {
+        let pending = quarantine_pending_name(EVS_FILE_NAME, &[7; 16], b"damaged");
+        let (txid, h) =
+            parse_quarantine_pending_name(EVS_FILE_NAME, &pending).expect("parse pending");
+        assert_eq!(txid, [7; 16]);
+        assert_eq!(h, quarantine_hash_hex(b"damaged"));
+        assert_eq!(
+            quarantine_history_name(&pending).map(|n| n.ends_with(&h)),
+            Some(true)
+        );
+        assert!(parse_quarantine_pending_name(EVS_FILE_NAME, "other.q-00-11.pending").is_none());
     }
 }

@@ -16681,6 +16681,9 @@ pub(in crate::server) async fn get_named_group(
     // retained owner-cert-pending joins whose evidence may have landed.
     retry_pending_owner_cert_joins(&state, Some(&id)).await;
     let members = named_group_member_values(&info);
+    // ADR 0110 (D64): the S4 obligations and their typed waits.
+    let (revocation_evictions, revocation_eviction_store) =
+        revocation_eviction::group_status_json(&state, &info).await;
 
     (
         StatusCode::OK,
@@ -16688,6 +16691,8 @@ pub(in crate::server) async fn get_named_group(
             "ok": true,
             "group_id": info.mls_group_id,
             "membership_state": membership_state,
+            "revocation_evictions": revocation_evictions,
+            "revocation_eviction_store": revocation_eviction_store,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
@@ -22237,6 +22242,18 @@ pub(in crate::server) async fn remove_named_group_member(
             "self-removal is a leave; use DELETE /groups/:id",
         );
     }
+    // ADR 0110 §2: a non-designated admin queues a remove of an S4 target
+    // before its fallback time (`waiting_for_designated_admin`).
+    if let Some(resp) = revocation_eviction::s4_manual_request_gate(
+        &state,
+        &id,
+        &agent_id_hex,
+        revocation_eviction::ManualRequestKind::Remove,
+    )
+    .await
+    {
+        return resp;
+    }
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
@@ -26833,6 +26850,11 @@ pub(in crate::server) async fn seal_group_state(
             return resp;
         }
     }
+    // ADR 0110 §2: a seal that would evict a pending S4 target before
+    // this node's fallback time is deferred (`waiting_for_designated_admin`).
+    if let Some(resp) = revocation_eviction::s4_seal_request_gate(&state, &id).await {
+        return resp;
+    }
     // ADR-0038: for an OwnerCertified group the explicit seal is the
     // re-verification point — evict failing members WITH the full rekey
     // (GSS rotation + survivor envelopes), then return that commit. Other
@@ -29108,6 +29130,18 @@ pub(in crate::server) async fn ban_group_member(
     Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
+    // ADR 0110 §2: a non-designated admin queues a ban of an S4 target
+    // before its fallback time (`waiting_for_designated_admin`).
+    if let Some(resp) = revocation_eviction::s4_manual_request_gate(
+        &state,
+        &id,
+        &agent_id_hex,
+        revocation_eviction::ManualRequestKind::Ban,
+    )
+    .await
+    {
         return resp;
     }
     // #946 C3: a banned member's refusal window ends.
