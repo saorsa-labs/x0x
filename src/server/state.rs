@@ -599,9 +599,9 @@ pub(super) struct DaemonUpdateConfig {
     #[serde(default = "default_true")]
     pub(super) enabled: bool,
 
-    /// Maximum rollout window in minutes. Default: 0 (immediate — no delay).
-    /// Set to a positive value (e.g. 1440 for 24h) to spread upgrades across
-    /// the fleet using a deterministic hash of the node MachineId.
+    /// Maximum rollout window in minutes. Default: 60 (D183).
+    /// The calculator uses the MachineId and release version to select a
+    /// deterministic delay below this window.
     #[serde(default = "default_rollout_window_minutes")]
     pub(super) rollout_window_minutes: u64,
 
@@ -640,7 +640,7 @@ impl Default for DaemonUpdateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            rollout_window_minutes: 0,
+            rollout_window_minutes: default_rollout_window_minutes(),
             stop_on_upgrade: true,
             fallback_check_interval_minutes: 2880,
             repo: default_update_repo(),
@@ -655,7 +655,7 @@ fn default_true() -> bool {
 }
 
 fn default_rollout_window_minutes() -> u64 {
-    0
+    60
 }
 
 fn default_fallback_check_interval_minutes() -> u64 {

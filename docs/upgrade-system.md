@@ -12,7 +12,21 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 - **`restart.rs`**: the #261 restart transaction — supervision classification (`RestartMode`), the `upgrade-handoff.json` intent record, the detached handoff helper, and the loud `UPGRADE_FAILED` artifact.
 - **`journal.rs`**: private M2 record formats, bounded readers and record barriers. Unknown, corrupt or pending M2 records block apply and preserve recovery material. Reading a record does not authorize recovery.
 - **`probe.rs` / `probe_retry.rs`**: candidate execution checks, install-scoped release holds and bounded interrupted retries before replacement.
-- **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
+- **`rollout.rs`**: Deterministic delay calculator salted with the MachineId and release version.
+
+### Rollout defaults and delay bounds (M2 S2b)
+
+The compiled daemon configuration defaults to a 60-minute rollout window
+(D183). An omitted update section or window has the same default. The
+calculator selects a whole-second delay strictly below a positive window,
+using the leading 64 bits of the hash and integer arithmetic. It preserves
+the zero-window calculator behavior. A minute value too large to represent
+in whole seconds uses `u64::MAX` seconds as the effective bound.
+
+This first S2b slice fixes the default and calculation. The running apply
+triggers still need durable first-receipt waits, the fleet minimum policy and
+the complete host participant gate. A configured window alone does not yet
+prove that an apply waits.
 
 ### Candidate execution probes (M2 S2d)
 
@@ -133,6 +147,37 @@ Use this procedure to investigate and resolve the condition:
    Unknown or M2 records require their supported repair procedure. After
    repair, check the configured roots, running versions and `/health` upgrade
    reason before deliberately enabling apply again.
+
+### Dormant pair transaction (M2 S2e)
+
+The private pair engine is implemented and tested, but no live apply path calls
+it yet. Activation requires the S2c host inventory and S3a acknowledged flush.
+The current apply path still uses its existing single-binary replacement flow.
+Do not infer pair rollback or launcher protection from this dormant module.
+
+The engine checks a verified release plan and durable passing probes under the
+existing daemon and managed-CLI install locks. It checks the installed hashes
+again before mutation. It copies each old binary beside its target, using that
+binary's prior version and a transaction ID in the backup name. It keeps every
+referenced backup and reserves the copy/restore space plus 1 GiB per filesystem.
+
+Each daemon and CLI swap has separate intent, file and progress barriers. A
+healthy OLD process can restore both members after a failed swap. Restoration
+copies the backup and retains the original rollback bytes. A separate writer
+cannot start another transaction while the first remains unresolved.
+
+Private records use `<daemon>.upgrade-pair.json` and
+`<daemon>.upgrade-pair.pending`. Resolved predecessor records are retained under
+their transaction IDs. Every archive retry repeats its durability barriers.
+Unknown or corrupt records and uncertain barriers preserve all evidence and
+refuse pair actions. These records alone do not authorize process recovery,
+child start, host commit or a storage-format change.
+
+A split CLI remains untouched and is reported with a reinstall hint. Signed
+SKILL content is copied to a transaction-specific staging file. The active
+SKILL remains unchanged. A later installer must enforce the applicable gate:
+host commit on protected paths, or matching candidate bytes and stable local
+health on unprotected paths under D195. It must retain the prior guide.
 
 ## Restart ownership is resolved before mutation (ADR-0061, #493)
 
