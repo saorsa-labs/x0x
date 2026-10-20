@@ -572,13 +572,13 @@
       "from": "docs/adr/0109-ownerless-attestation-self-recovery.md",
       "to": "docs/adr-archive/0109-ownerless-attestation-self-recovery.md",
       "link": "../adr-archive/0109-ownerless-attestation-self-recovery.md",
-      "sha256": "043cdd780c440567dff143da8c3cc11c99868455d5a5713946f8479ead9d1fa7"
+      "sha256": "2f9d45a2f5f589989187431d9048bd50e0469c82d6d24d64fcdd55fc1b92a3b1"
     },
     {
       "from": "docs/adr/0110-revocation-eviction-designated-first.md",
       "to": "docs/adr-archive/0110-revocation-eviction-designated-first.md",
       "link": "../adr-archive/0110-revocation-eviction-designated-first.md",
-      "sha256": "6c5efbc95b8490f07953e4affa4a8c4bfc41ba26579ba28929732d08abfbd9a2"
+      "sha256": "b5040723d1f83ac8dd805ae226ab29585b681bbf8552cc680be536af7fbea44a"
     },
     {
       "from": "docs/adr/0111-evidence-size-k-and-fetch-by-hash.md",

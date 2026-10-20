@@ -87,8 +87,9 @@ D63 keeps separate numbered slice acceptance in this order:
 S8(a); S8(b) also waits for S4. The bindings are S1=0106, S2=0108, S3=0109,
 S4=0110, S5=0111, S6=0112, S7=0113, S8(a)=0107, and S8(b)=0114.
 D57 accepted 0107; D58 accepted 0088 with its conditional supersessions;
-D178 accepted 0108. Those acceptances do not waive the slice-code harness gate.
-Slices 0109–0114 continue through numbered acceptance (D199).
+D178 accepted 0108. On 20 Oct 2026 David accepted 0110 (S4, option B) and
+0109 (S3) together. Those acceptances do not waive the slice-code harness gate.
+Slices 0111–0114 continue through numbered acceptance (D199).
 
 ## Validation
 
