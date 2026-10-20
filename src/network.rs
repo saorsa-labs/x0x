@@ -491,38 +491,157 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// MTU caveat: UDP/443 mitigates port throttling/DPI but does not raise a
 /// path's MTU. A path that cannot carry QUIC's 1200-byte Initial cannot run
 /// QUIC on any port.
-pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
+///
+/// ## Seed identity pinning (issue #1112)
+///
+/// Each row can pin the seed's expected PeerIds (`expected_peer_ids`). A
+/// join dial that a pinned address answers with a PeerId outside the pin
+/// set is a failed hint: dropped, never a trust anchor (see `seed_pin_check`
+/// and the join dial in `Agent::connect_peers_parallel_tracked`). An empty
+/// pin set keeps trust-on-first-use for that hint, exactly as before #1112.
+/// The pin set is per address, never per host: the two listeners on one
+/// host are separate `x0xd` instances with separate machine keys, and a key
+/// rotation pins old and new PeerIds together for the overlap window. The
+/// rotation policy lives in `docs/trust-and-connectivity.md`.
+pub const DEFAULT_BOOTSTRAP_PEERS: &[SeedPeer] = &[
     // ── UDP/443 (preferred; traverses WARP / full-tunnel VPN / CGNAT / DPI) ──
-    // IPv4
-    "142.93.199.50:443",   // NYC
-    "147.182.234.192:443", // SFO
-    "65.21.157.229:443",   // Helsinki
-    "116.203.101.172:443", // Nuremberg
-    "152.42.210.67:443",   // Singapore
-    "170.64.176.102:443",  // Sydney
+    // IPv4. Issue #1112: no production PeerId is pinned yet — the only
+    // repo-held captures are six months stale, and a stale pin would drop
+    // the hint for every client. Pinning is a deliberate operator change
+    // (replace `seed(...)` with a `SeedPeer` literal that carries pins).
+    seed("142.93.199.50:443"),   // NYC
+    seed("147.182.234.192:443"), // SFO
+    seed("65.21.157.229:443"),   // Helsinki
+    seed("116.203.101.172:443"), // Nuremberg
+    seed("152.42.210.67:443"),   // Singapore
+    seed("170.64.176.102:443"),  // Sydney
     // IPv6
-    "[2604:a880:400:d1:0:3:7db3:f001]:443", // NYC
-    "[2604:a880:4:1d0:0:1:6ba1:f000]:443",  // SFO
-    "[2a01:4f9:c012:684b::1]:443",          // Helsinki
-    "[2a01:4f8:1c1a:31e6::1]:443",          // Nuremberg
-    "[2400:6180:0:d2:0:2:d30b:d000]:443",   // Singapore
-    "[2400:6180:10:200::ba69:b000]:443",    // Sydney
+    seed("[2604:a880:400:d1:0:3:7db3:f001]:443"), // NYC
+    seed("[2604:a880:4:1d0:0:1:6ba1:f000]:443"),  // SFO
+    seed("[2a01:4f9:c012:684b::1]:443"),          // Helsinki
+    seed("[2a01:4f8:1c1a:31e6::1]:443"),          // Nuremberg
+    seed("[2400:6180:0:d2:0:2:d30b:d000]:443"),   // Singapore
+    seed("[2400:6180:10:200::ba69:b000]:443"),    // Sydney
     // ── UDP/5483 (original; backward-compatible with pre-ADR-0011 clients) ──
     // IPv4
-    "142.93.199.50:5483",   // NYC
-    "147.182.234.192:5483", // SFO
-    "65.21.157.229:5483",   // Helsinki
-    "116.203.101.172:5483", // Nuremberg
-    "152.42.210.67:5483",   // Singapore
-    "170.64.176.102:5483",  // Sydney
+    seed("142.93.199.50:5483"),   // NYC
+    seed("147.182.234.192:5483"), // SFO
+    seed("65.21.157.229:5483"),   // Helsinki
+    seed("116.203.101.172:5483"), // Nuremberg
+    seed("152.42.210.67:5483"),   // Singapore
+    seed("170.64.176.102:5483"),  // Sydney
     // IPv6
-    "[2604:a880:400:d1:0:3:7db3:f001]:5483", // NYC
-    "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",  // SFO
-    "[2a01:4f9:c012:684b::1]:5483",          // Helsinki
-    "[2a01:4f8:1c1a:31e6::1]:5483",          // Nuremberg
-    "[2400:6180:0:d2:0:2:d30b:d000]:5483",   // Singapore
-    "[2400:6180:10:200::ba69:b000]:5483",    // Sydney
+    seed("[2604:a880:400:d1:0:3:7db3:f001]:5483"), // NYC
+    seed("[2604:a880:4:1d0:0:1:6ba1:f000]:5483"),  // SFO
+    seed("[2a01:4f9:c012:684b::1]:5483"),          // Helsinki
+    seed("[2a01:4f8:1c1a:31e6::1]:5483"),          // Nuremberg
+    seed("[2400:6180:0:d2:0:2:d30b:d000]:5483"),   // Singapore
+    seed("[2400:6180:10:200::ba69:b000]:5483"),    // Sydney
 ];
+
+/// One compiled-in bootstrap seed hint (issue #1112).
+///
+/// `addr` is the exact `"ip:port"` string that shipped before the pin
+/// column existed. `expected_peer_ids` is the seed's pinned machine
+/// identity set: a join dial that this address answers with a PeerId
+/// outside the set is a failed hint — dropped, never a trust anchor. An
+/// empty set keeps trust-on-first-use for the hint, as before #1112. A key
+/// rotation pins the old and the new PeerId together for the overlap
+/// window, so the pin is a set, not a single id.
+///
+/// `Deref<Target = str>` exposes the address string, so every existing
+/// `DEFAULT_BOOTSTRAP_PEERS` consumer (`.parse::<SocketAddr>()`) keeps
+/// compiling unchanged; the address string is the seed row's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SeedPeer {
+    /// Seed socket address, byte-identical to the pre-#1112 seed rows.
+    pub addr: &'static str,
+    /// Pinned expected PeerIds for `addr`; empty = TOFU hint.
+    pub expected_peer_ids: &'static [[u8; 32]],
+}
+
+/// Unpinned seed row constructor for the DEFAULT_BOOTSTRAP_PEERS table.
+///
+/// A pinned row is written as an explicit `SeedPeer` literal instead, so
+/// the pin stays visible at the row (issue #1112).
+const fn seed(addr: &'static str) -> SeedPeer {
+    SeedPeer {
+        addr,
+        expected_peer_ids: &[],
+    }
+}
+
+impl std::ops::Deref for SeedPeer {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.addr
+    }
+}
+
+impl std::fmt::Display for SeedPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.addr)
+    }
+}
+
+/// Verdict for one answered dial against a seed pin (issue #1112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeedPinVerdict {
+    /// The address has no pin: the answered identity stands (TOFU).
+    Unpinned,
+    /// The answer is inside the pin set.
+    Match([u8; 32]),
+    /// The answer is outside the pin set: a failed hint. The join path
+    /// drops it and continues with the other hints.
+    Mismatch { answered: [u8; 32] },
+}
+
+/// Decide one answered dial against one address's pin set.
+///
+/// Pure, so the hint-drop decision is unit-testable without a dial
+/// (issue #1112 acceptance). David's 20 Oct 2026 ruling: a mismatch is a
+/// failed hint, hint dropped — never a trust anchor. An empty set pins
+/// nothing (TOFU).
+pub(crate) fn seed_pin_check(expected: &[[u8; 32]], answered: [u8; 32]) -> SeedPinVerdict {
+    if expected.is_empty() {
+        SeedPinVerdict::Unpinned
+    } else if expected.contains(&answered) {
+        SeedPinVerdict::Match(answered)
+    } else {
+        SeedPinVerdict::Mismatch { answered }
+    }
+}
+
+/// The pin set for `addr` within `seeds`; empty when the row is unpinned
+/// or the address is not a seed row.
+fn pinned_peer_ids_in(seeds: &[SeedPeer], addr: SocketAddr) -> &'static [[u8; 32]] {
+    seeds
+        .iter()
+        .find(|seed| {
+            seed.addr
+                .parse::<SocketAddr>()
+                .is_ok_and(|seed_addr| seed_addr == addr)
+        })
+        .map_or(&[], |seed| seed.expected_peer_ids)
+}
+
+/// The compiled-in pin set for a dial address. Empty = TOFU hint
+/// (issue #1112).
+#[must_use]
+pub fn pinned_seed_peer_ids(addr: SocketAddr) -> &'static [[u8; 32]] {
+    pinned_peer_ids_in(DEFAULT_BOOTSTRAP_PEERS, addr)
+}
+
+/// `dial_bootstrap`'s pinned-set rule: an empty set pins nothing (TOFU,
+/// the x0xd default); a non-empty set admits only member identities.
+/// Issue #1112 reuses these semantics for the per-address join pins.
+fn bootstrap_pin_set_allows(
+    pinned: &std::collections::HashSet<[u8; 32]>,
+    answered: [u8; 32],
+) -> bool {
+    pinned.is_empty() || pinned.contains(&answered)
+}
 
 /// x0x network node configuration.
 ///
@@ -7132,9 +7251,9 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .map_err(|e| anyhow::anyhow!("bootstrap dial failed: {}", e))?;
 
         // Reject bootstrap peers not in the pinned set (when configured).
-        if !self.config.pinned_bootstrap_peers.is_empty()
-            && !self.config.pinned_bootstrap_peers.contains(&ant_peer_id.0)
-        {
+        // `bootstrap_pin_set_allows` carries the set semantics the join
+        // path's per-address pins reuse (issue #1112).
+        if !bootstrap_pin_set_allows(&self.config.pinned_bootstrap_peers, ant_peer_id.0) {
             warn!(
                 "SECURITY: Bootstrap peer at {} has unexpected ID {:?} — not in pinned set",
                 addr, ant_peer_id
@@ -9910,6 +10029,136 @@ mod tests {
             peer.parse::<SocketAddr>()
                 .unwrap_or_else(|_| panic!("Bootstrap peer '{}' is not a valid SocketAddr", peer));
         }
+    }
+
+    // ── Issue #1112: seed PeerId pinning ────────────────────────────────────
+
+    #[test]
+    fn issue1112_seed_list_content_is_unchanged() {
+        // #1112: the `SeedPeer` restructure carries a pin set per row
+        // and must not change the production seed list. These are the exact
+        // 24 address strings that shipped before the pin column existed
+        // (ADR-0011: 6 hosts x {443, 5483} x {IPv4, IPv6}).
+        const EXPECTED: &[&str] = &[
+            "142.93.199.50:443",
+            "147.182.234.192:443",
+            "65.21.157.229:443",
+            "116.203.101.172:443",
+            "152.42.210.67:443",
+            "170.64.176.102:443",
+            "[2604:a880:400:d1:0:3:7db3:f001]:443",
+            "[2604:a880:4:1d0:0:1:6ba1:f000]:443",
+            "[2a01:4f9:c012:684b::1]:443",
+            "[2a01:4f8:1c1a:31e6::1]:443",
+            "[2400:6180:0:d2:0:2:d30b:d000]:443",
+            "[2400:6180:10:200::ba69:b000]:443",
+            "142.93.199.50:5483",
+            "147.182.234.192:5483",
+            "65.21.157.229:5483",
+            "116.203.101.172:5483",
+            "152.42.210.67:5483",
+            "170.64.176.102:5483",
+            "[2604:a880:400:d1:0:3:7db3:f001]:5483",
+            "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",
+            "[2a01:4f9:c012:684b::1]:5483",
+            "[2a01:4f8:1c1a:31e6::1]:5483",
+            "[2400:6180:0:d2:0:2:d30b:d000]:5483",
+            "[2400:6180:10:200::ba69:b000]:5483",
+        ];
+        let addrs: Vec<&str> = DEFAULT_BOOTSTRAP_PEERS.iter().map(|seed| &**seed).collect();
+        assert_eq!(addrs, EXPECTED);
+        // No production PeerId is pinned yet: the repo's only captures are
+        // six months stale (see docs/trust-and-connectivity.md). Unpinned
+        // rows keep trust-on-first-use, exactly as before #1112.
+        assert!(
+            DEFAULT_BOOTSTRAP_PEERS
+                .iter()
+                .all(|seed| seed.expected_peer_ids.is_empty()),
+            "production pins must be a deliberate operator change"
+        );
+    }
+
+    #[test]
+    fn issue1112_seed_pin_check_drops_a_mismatched_answer() {
+        // Acceptance (#1112): a seed address answering with an unexpected
+        // PeerId is not treated as a bootstrap peer. `Mismatch` is the
+        // verdict the join path turns into a dropped hint.
+        let old_key = [0x11; 32];
+        let new_key = [0x12; 32];
+        let answered = [0x22; 32];
+        // A rotation pins old and new together for the overlap window
+        // (docs/trust-and-connectivity.md); both are accepted.
+        let overlap_pin = [old_key, new_key];
+        assert_eq!(
+            seed_pin_check(&overlap_pin, old_key),
+            SeedPinVerdict::Match(old_key)
+        );
+        assert_eq!(
+            seed_pin_check(&overlap_pin, new_key),
+            SeedPinVerdict::Match(new_key)
+        );
+        // An answer outside the pin set is a failed hint: dropped.
+        assert_eq!(
+            seed_pin_check(&overlap_pin, answered),
+            SeedPinVerdict::Mismatch { answered }
+        );
+        // No pin: trust-on-first-use, behaviour unchanged.
+        assert_eq!(seed_pin_check(&[], answered), SeedPinVerdict::Unpinned);
+    }
+
+    #[test]
+    fn issue1112_pinned_lookup_resolves_only_pinned_seed_rows() {
+        const PIN: [[u8; 32]; 1] = [[0x33; 32]];
+        const ROTATION_PINS: [[u8; 32]; 2] = [[0x33; 32], [0x34; 32]];
+        let table = [
+            SeedPeer {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &PIN,
+            },
+            SeedPeer {
+                addr: "198.51.100.8:5483",
+                expected_peer_ids: &ROTATION_PINS,
+            },
+            seed("198.51.100.9:5483"),
+        ];
+        // A pinned row resolves to its pin set, old and new together.
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.7:5483".parse().unwrap()),
+            &PIN[..]
+        );
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.8:5483".parse().unwrap()),
+            &ROTATION_PINS[..]
+        );
+        // An unpinned row and an unknown address resolve to an empty pin
+        // set (TOFU).
+        const NO_PINS: [[u8; 32]; 0] = [];
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.9:5483".parse().unwrap()),
+            &NO_PINS[..]
+        );
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.10:5483".parse().unwrap()),
+            &NO_PINS[..]
+        );
+        // The production table ships unpinned (see the list-content test).
+        let first_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
+        assert!(pinned_seed_peer_ids(first_seed).is_empty());
+    }
+
+    #[test]
+    fn issue1112_bootstrap_pin_set_membership_semantics() {
+        // dial_bootstrap's pinned-set path (#16), reused by the join-path
+        // pinning (#1112): an empty set pins nothing; a non-empty set
+        // admits only member identities.
+        let mut set = std::collections::HashSet::new();
+        assert!(
+            bootstrap_pin_set_allows(&set, [0x44; 32]),
+            "empty pinned set = trust-on-first-use (x0xd default)"
+        );
+        set.insert([0x44; 32]);
+        assert!(bootstrap_pin_set_allows(&set, [0x44; 32]));
+        assert!(!bootstrap_pin_set_allows(&set, [0x55; 32]));
     }
 
     #[tokio::test]

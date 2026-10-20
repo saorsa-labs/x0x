@@ -91,6 +91,51 @@ The coordination path uses explicit peer-ID-based NAT traversal via `connect_pee
 
 Successful connections enrich the bootstrap cache via `add_from_connection()`.
 
+## Seed identity pinning (issue #1112)
+
+`DEFAULT_BOOTSTRAP_PEERS` (`src/network.rs`) carries one `SeedPeer` row per
+seed address, with an `expected_peer_ids` pin set. The join dial
+(`Agent::connect_peers_parallel_tracked`) checks each answered dial against
+the pin set for that address:
+
+- **Empty pin set**: trust-on-first-use, exactly as before #1112. Every
+  production row ships unpinned today.
+- **Answer inside the pin set**: the hint is accepted.
+- **Answer outside the pin set**: the hint has failed. The answered identity
+  is disconnected with a `PolicyRejection` tombstone (nothing redials the
+  wrong identity), the hint is dropped, and the join continues with the
+  other hints. A mismatch is never a trust anchor and never a hard join
+  failure.
+
+The pin set is per address, never per host: the UDP/443 and UDP/5483
+listeners on one seed host are separate `x0xd` instances with separate
+machine keys (`.deployment/deploy-443.sh`), so each address needs its own
+pin.
+
+Why no production row is pinned yet: the repo holds PeerId captures for the
+six `:5483` seed listeners only (git history, `proofs/v0.19.0-validation-*`
+sustained-watch diagnostics of 2026-04-23, cross-confirmed by the May 2026
+soak captures), and they are six months old. A pin that no longer matches a
+live seed key would silently drop that seed for every client. Pinning is a
+deliberate operator change, made when the live fleet keys are verified.
+
+### Seed key rotation policy
+
+A seed rotates its machine key as follows:
+
+1. **Rotate**: the operator generates the new key on the seed host and
+   brings the new listener up under it.
+2. **Overlap**: the next release pins both the old and the new PeerId on
+   that address row. The pin is a set (`expected_peer_ids`), so both
+   identities are accepted for the window; clients on the overlap release
+   accept either.
+3. **Expire**: after the window closes (the slowest supported client
+   release cycle, minimum one minor release), the old PeerId is removed
+   from the pin set. An old identity answering after expiry is a failed
+   hint — dropped like any other mismatch.
+4. **Unpinned seeds** remain trust-on-first-use hints throughout; rotation
+   of an unpinned seed needs no release at all.
+
 ## Enhanced Announcements (`lib.rs`, `network.rs`)
 
 `IdentityAnnouncement` and `DiscoveredAgent` carry four optional NAT fields:

@@ -5474,9 +5474,10 @@ fn deserialize_machine_announcement(
 
 /// Compute coordinator / relay hint lists for an announcement.
 ///
-/// Collects machine IDs of currently-connected peers that the machine cache
-/// marks as coordinator- or relay-capable. Deduplicated, capped to
-/// `MAX_COORDINATOR_HINTS` each, and returned in stable order.
+/// Delegates the choice to [`select_capability_hints`] (#1112): hints name
+/// only machines the local node is connected to and whose discovery-cache
+/// entry carries operator evidence — never a self-asserted capability
+/// flag.
 ///
 /// Used to populate `reachable_via` / `relay_candidates` on outgoing
 /// announcements so that remote peers have concrete targets to dial when
@@ -5489,10 +5490,6 @@ async fn collect_coordinator_hints(
     own_machine_id: identity::MachineId,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
-    /// Upper bound on hint list length. Keeps the signed payload small and
-    /// avoids amplifying gossip if we accumulate many peers.
-    const MAX_COORDINATOR_HINTS: usize = 8;
-
     let connected = network.connected_peers().await;
     if connected.is_empty() {
         // ADR-0035 metering: the announce wanted coordinator/relay hints
@@ -5500,11 +5497,41 @@ async fn collect_coordinator_hints(
         selection_skew.record(SelectionChoice::NoneAvailable);
         return (Vec::new(), Vec::new());
     }
-
     // ADR-0035 metering: classify every hint this announce is about to
     // advertise — the supply-side choice skew.
     let bootstrap_ips = bootstrap_ip_set();
     let cache = machine_cache.read().await;
+    select_capability_hints(
+        &connected,
+        &cache,
+        own_machine_id,
+        &bootstrap_ips,
+        selection_skew,
+    )
+}
+
+/// #1112: the coordinator / relay hint selection, as a pure function.
+///
+/// The self-asserted `is_relay` / `is_coordinator` fields of a machine's
+/// announcement are not selection evidence (David's 20 Oct 2026 ruling:
+/// ignore them). A hint names a machine only when the local node is
+/// connected to it and its signed announcement addresses place it on a
+/// compiled-in operator seed IP — the operator fleet runs coordinator and
+/// relay roles by deployment (`.deployment/bootstrap-*.toml`), so location
+/// on an operator address is deployment-derived evidence, not peer
+/// self-report. Hints are deduplicated, capped to `MAX_COORDINATOR_HINTS`
+/// each, and returned in stable order. The announcer never hints itself.
+fn select_capability_hints(
+    connected: &[ant_quic::PeerId],
+    cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
+    own_machine_id: identity::MachineId,
+    bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
+    selection_skew: &SelectionSkew,
+) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
+    /// Upper bound on hint list length. Keeps the signed payload small and
+    /// avoids amplifying gossip if we accumulate many peers.
+    const MAX_COORDINATOR_HINTS: usize = 8;
+
     let mut reachable_via: Vec<identity::MachineId> = Vec::new();
     let mut relay_candidates: Vec<identity::MachineId> = Vec::new();
 
@@ -5516,18 +5543,21 @@ async fn collect_coordinator_hints(
         let Some(entry) = cache.get(&mid) else {
             continue;
         };
-        if entry.is_coordinator == Some(true)
-            && !reachable_via.contains(&mid)
-            && reachable_via.len() < MAX_COORDINATOR_HINTS
-        {
-            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
+        // #1112: operator-host evidence replaces the self-asserted
+        // is_coordinator / is_relay checks this loop used before.
+        let on_operator_host = entry
+            .addresses
+            .iter()
+            .any(|addr| bootstrap_ips.contains(&addr.ip()));
+        if !on_operator_host {
+            continue;
+        }
+        if !reachable_via.contains(&mid) && reachable_via.len() < MAX_COORDINATOR_HINTS {
+            selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             reachable_via.push(mid);
         }
-        if entry.is_relay == Some(true)
-            && !relay_candidates.contains(&mid)
-            && relay_candidates.len() < MAX_COORDINATOR_HINTS
-        {
-            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
+        if !relay_candidates.contains(&mid) && relay_candidates.len() < MAX_COORDINATOR_HINTS {
+            selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             relay_candidates.push(mid);
         }
     }
@@ -7756,13 +7786,17 @@ impl Agent {
             if candidate.machine_id == target.machine_id || candidate.machine_id.0 == [0u8; 32] {
                 continue;
             }
+            // #1112: the machine cache's is_relay / is_coordinator fields
+            // are the peer's own announcement claims, so they no longer set
+            // assist-capability hints. The addresses are still useful as
+            // dial hints for the peer-authenticated ladder.
             merge_helper_hint(
                 &mut helper_hints,
                 ant_quic::PeerId(candidate.machine_id.0),
                 "machine_discovery_cache",
                 candidate.addresses.iter().copied(),
-                candidate.is_coordinator == Some(true),
-                candidate.is_relay == Some(true),
+                false,
+                false,
             );
         }
 
@@ -15427,6 +15461,37 @@ impl Agent {
                     };
                     match dialled {
                         Ok(Ok(peer_id)) => {
+                            // #1112: seed pinning on the join path. A seed
+                            // address that answers with a PeerId outside its
+                            // pin set is a failed hint, not a trust anchor:
+                            // drop it (with a PolicyRejection tombstone so
+                            // nothing redials the wrong identity) and let the
+                            // other hints carry the join. An unpinned address
+                            // keeps trust-on-first-use, as before.
+                            let pins = network::pinned_seed_peer_ids(addr);
+                            if let network::SeedPinVerdict::Mismatch { .. } =
+                                network::seed_pin_check(pins, peer_id.0)
+                            {
+                                let expected = pins
+                                    .iter()
+                                    .map(|pin| network::hex_prefix(pin, 8))
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                tracing::info!(
+                                    target: "x0x::connect",
+                                    %addr,
+                                    answered = %network::hex_prefix(&peer_id.0, 8),
+                                    expected,
+                                    "seed pin mismatch: dropping bootstrap hint (issue #1112)"
+                                );
+                                let _ = net
+                                    .disconnect_with_reason(
+                                        &peer_id,
+                                        network::DisconnectReason::PolicyRejection,
+                                    )
+                                    .await;
+                                return Err(addr);
+                            }
                             tracing::info!("Connected to peer: {}", addr);
                             Ok((addr, peer_id))
                         }
@@ -40314,6 +40379,115 @@ mod peer_connected_handler_integration_tests {
         assert_eq!(back.placement_digests, unsigned.placement_digests);
         assert_eq!(back.machine_kem_public_key, unsigned.machine_kem_public_key);
         assert_eq!(back.move_protocol, unsigned.move_protocol);
+    }
+
+    mod issue1112_capability_hint_tests {
+        use super::*;
+
+        // ── Issue #1112: relay/coordinator hints from evidence, not self-report ──
+
+        fn issue1112_machine(
+            machine_id: identity::MachineId,
+            addresses: &[std::net::SocketAddr],
+            is_relay: Option<bool>,
+            is_coordinator: Option<bool>,
+        ) -> DiscoveredMachine {
+            DiscoveredMachine {
+                machine_id,
+                addresses: addresses.to_vec(),
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: vec![1],
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay,
+                is_coordinator,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn issue1112_self_asserted_relay_flag_alone_is_not_a_hint() {
+            // Acceptance (#1112): a peer that self-announces is_relay (or
+            // is_coordinator) without other evidence is not preferred as a
+            // relay/coordinator hint. The peer sits off every operator seed IP;
+            // only its own announcement makes the claim.
+            let mut cache = std::collections::HashMap::new();
+            let liar = identity::MachineId([0x11; 32]);
+            cache.insert(
+                liar,
+                issue1112_machine(
+                    liar,
+                    &["203.0.113.10:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[ant_quic::PeerId([0x11; 32])],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &skew,
+            );
+            assert!(
+                relays.is_empty(),
+                "a self-asserted is_relay must not become a relay hint"
+            );
+            assert!(
+                coordinators.is_empty(),
+                "a self-asserted is_coordinator must not become a coordinator hint"
+            );
+        }
+
+        #[test]
+        fn issue1112_operator_seed_host_is_a_hint_without_self_assertion() {
+            // Evidence side of #1112: a connected machine whose signed
+            // announcement addresses place it on a compiled-in operator seed IP
+            // is a coordinator and relay hint even with no self-asserted flags
+            // — the operator fleet runs both roles by deployment. The announcer
+            // never hints itself.
+            let seed_host = identity::MachineId([0x22; 32]);
+            let own = identity::MachineId([0x99; 32]);
+            let mut cache = std::collections::HashMap::new();
+            cache.insert(
+                seed_host,
+                issue1112_machine(
+                    seed_host,
+                    &["142.93.199.50:5483".parse().unwrap()],
+                    None,
+                    None,
+                ),
+            );
+            cache.insert(
+                own,
+                issue1112_machine(own, &["142.93.199.50:443".parse().unwrap()], None, None),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[
+                    ant_quic::PeerId([0x22; 32]),
+                    ant_quic::PeerId([0x99; 32]),
+                    ant_quic::PeerId([0x22; 32]),
+                ],
+                &cache,
+                own,
+                &bootstrap_ip_set(),
+                &skew,
+            );
+            assert_eq!(coordinators, vec![seed_host]);
+            assert_eq!(relays, vec![seed_host]);
+            // One bootstrap-classified choice per hint list, none for the
+            // self-entry.
+            assert_eq!(skew.snapshot().chosen_bootstrap, 2);
+            assert_eq!(skew.snapshot().chosen_non_bootstrap, 0);
+        }
     }
 }
 
