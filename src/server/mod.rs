@@ -1850,6 +1850,7 @@ pub async fn serve_with_options(
         // (health commit) and the graceful-shutdown hook (bounded cancel).
         let gossip_api_addr = state.api_address;
         let gossip_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
+        let gossip_shutdown_watch = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             run_gossip_update_listener(
                 agent_for_gossip,
@@ -1858,7 +1859,7 @@ pub async fn serve_with_options(
                 upgrade_apply_lock,
                 self_published_for_gossip,
                 gossip_api_addr,
-                gossip_shutdown,
+                (gossip_shutdown, gossip_shutdown_watch),
             )
             .await;
         }));
@@ -1901,6 +1902,7 @@ pub async fn serve_with_options(
         let self_published_for_poll = Arc::clone(&self_published_release_manifests);
         let poll_api_addr = state.api_address;
         let poll_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
+        let poll_shutdown_watch = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             run_fallback_github_poll(
                 agent_for_poll,
@@ -1909,7 +1911,7 @@ pub async fn serve_with_options(
                 upgrade_apply_lock,
                 self_published_for_poll,
                 poll_api_addr,
-                poll_shutdown,
+                (poll_shutdown, poll_shutdown_watch),
             )
             .await;
         }));

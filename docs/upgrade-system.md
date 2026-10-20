@@ -11,7 +11,59 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 
 - **`restart.rs`**: the #261 restart transaction — supervision classification (`RestartMode`), the `upgrade-handoff.json` intent record, the detached handoff helper, and the loud `UPGRADE_FAILED` artifact.
 - **`journal.rs`**: private M2 record formats, bounded readers and record barriers. Unknown, corrupt or pending M2 records block apply and preserve recovery material. Reading a record does not authorize recovery.
+- **`probe.rs` / `probe_retry.rs`**: candidate execution checks, install-scoped release holds and bounded interrupted retries before replacement.
 - **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
+
+### Candidate execution probes (M2 S2d)
+
+Both packaged binaries accept `--upgrade-probe` as their first argument.
+The command prints JSON with the compiled `version` and `platform`, then exits.
+It runs before profiling and normal application initialization. It reads no
+configuration, takes no application lock, opens no store or socket, creates
+no identity, runs no artifact sweep and increments no boot counter.
+
+On Unix, automatic apply probes both extracted binaries before either
+installed binary changes. This includes the packaged CLI when the installed
+CLI is outside the managed install. A missing packaged executable refuses
+the apply. Each staged file and its parent directory must complete their
+sync barriers before either child starts. The child uses the captured working
+directory and environment and inherits the old process's service account.
+The check requires exit zero and the exact release version and platform.
+It limits each execution to 90 seconds, bounds output and kills and reaps a
+failed or timed-out child. A passing probe proves execution in that context;
+it does not prove later health or a successful pair transaction.
+
+The canonical installed daemon has a private adjacent record, normally
+`x0xd.upgrade-probe.json`. Different instance data roots share this install
+record and its lock. A loader error, nonzero exit, malformed response,
+version/platform mismatch or changed candidate bytes holds that release.
+Another archive for the same version cannot bypass the hold. A newer release
+can clear a known failed-release hold; it cannot clear recovery-failed or
+unknown state.
+
+A durably recorded timeout or host fault permits at most three fresh retry
+transactions, after 30, 60 and 120 minutes. Retry timers release the apply
+mutex, observe daemon shutdown and reread the record before each attempt.
+HTTP apply returns its refusal without waiting through this backoff. Normal
+startup discovery can resume a pending wait after it verifies the release
+manifest again. Boot identity and monotonic time prevent a wall-clock change
+or daemon restart from shortening the recorded wait.
+
+Before a terminal record write, a durable
+`x0xd.upgrade-probe.json.pending` marker retains the prior record. It is removed
+only after the outcome's record barrier succeeds. A retained marker, an
+unknown/corrupt record, or a `running` record without a durable outcome refuses
+further apply, including a newer release. The last case cannot distinguish a
+lost failed-hold write from an interrupted probe, so it requires manual
+inspection instead of an automatic retry. Preserve both files and their
+hashes, investigate the storage fault and use a supported repair procedure;
+do not delete the marker or edit a phase to bypass the refusal. The configured
+binary still starts normally.
+
+Managed Windows apply remains refused by the restart planner. Unmanaged
+Windows keeps its released legacy apply behavior and does not claim these
+Unix M2 durability/probe guarantees. The inert flag works on both binaries
+on Windows as well.
 
 ### Binary replacement (`mod.rs`)
 
@@ -367,7 +419,10 @@ no gossip, binds nothing, and takes no instance lock.
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
 
-Both apply paths back off versions that fail to apply: a failed version is recorded and skipped for 30 minutes before retrying (a newer release supersedes the skip immediately). This prevents a release that can never apply in a given environment from re-downloading and re-extracting on every gossip receipt.
+Gossip and polling retain a 30-minute in-memory backoff for other apply errors.
+Unix candidate-probe failures additionally use the durable release holds and
+interrupted retry policy above. An expired in-memory backoff cannot bypass a
+durable hold.
 
 `x0xd --skip-update-check` disables self-update for that process invocation. It
 suppresses the startup GitHub check, gossip-delivered apply, manifest broadcast,
