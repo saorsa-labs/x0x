@@ -683,6 +683,9 @@ impl crate::Agent {
     /// sync service has loaded its store; without it nothing is
     /// owner-trusted.
     pub fn install_owner_device_store(&self, store: Arc<OwnerSyncStore>) {
+        // ADR-0074 §4: enrollment/unenrollment must wake the forward reauth
+        // loop so owner-admitted streams close within the event bound.
+        store.set_device_change_notify(std::sync::Arc::clone(&self.stream_reauth));
         self.owner_trust.install_device_store(store);
     }
 
