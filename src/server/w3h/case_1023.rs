@@ -116,7 +116,13 @@
 //! body (no other keys). A missing field, a wrong type, a wrong group id
 //! or a value outside the closed set is an error, so the run is INFRA.
 //! Such an answer is never "not active", "not admitted" or "nothing
-//! shown", and it cannot keep the expected RED. A typed-state object
+//! shown", and it cannot keep the expected RED. The roster also lists
+//! pending, removed and banned rows. Only an Active row for J counts as
+//! admission. A pending, removed or banned row is "not admitted". A row
+//! with an unknown `state` is an error, so the run is INFRA. Admission
+//! after a wait (`read_admitted`) needs both reads: an Active row at
+//! the authority and `active` at the member. Both bodies are parsed
+//! every time. A typed-state object
 //! (tagged or keyed with the state name) must name at least one
 //! well-formed digest, or it is an error too. In-process reads (seats,
 //! bytes, verdicts, bindings, refusal counters) return an error when G
@@ -608,11 +614,15 @@ async fn announce(sim: &Sim, label: &str, include_user_identity: bool) -> Result
         .with_context(|| format!("{label} POST /announce"))
 }
 
-/// Whether a strict roster read lists `member_hex`.
-fn lists(gid: &str, member_hex: &str, status: StatusCode, body: &Object) -> Result<bool> {
-    Ok(parse_roster(gid, status, body)?
-        .iter()
-        .any(|row| row.agent_id.eq_ignore_ascii_case(member_hex)))
+/// Whether a strict roster read seats `member_hex` as an Active member.
+/// The roster also lists pending, removed and banned rows; such a row is
+/// "not admitted". A row with an unknown state fails the parse, so it is
+/// an error (INFRA).
+fn seats_active(gid: &str, member_hex: &str, status: StatusCode, body: &Object) -> Result<bool> {
+    Ok(parse_roster(gid, status, body)?.iter().any(|row| {
+        row.agent_id.eq_ignore_ascii_case(member_hex)
+            && row.state == crate::groups::GroupMemberState::Active
+    }))
 }
 
 /// Whether a strict `/groups/{gid}` read says `active`. The handler's
@@ -622,8 +632,26 @@ fn is_active(gid: &str, status: StatusCode, body: &Object) -> Result<bool> {
     Ok(parse_membership(gid, status, body)? == Some(Membership::Active))
 }
 
-/// One strict read of whether `authority` lists `member` and `member`
-/// says it is `active`.
+/// Admission from two strict reads: the authority's roster seats
+/// `member_hex` Active, and the member's `/groups/{gid}` says `active`.
+/// Both bodies are parsed, so a malformed answer is an error even when
+/// the roster row is not Active.
+fn admission(
+    gid: &str,
+    member_hex: &str,
+    roster_status: StatusCode,
+    roster_body: &Object,
+    group_status: StatusCode,
+    group_body: &Object,
+) -> Result<bool> {
+    let seated =
+        seats_active(gid, member_hex, roster_status, roster_body).context("authority roster")?;
+    let active = is_active(gid, group_status, group_body).context("member group")?;
+    Ok(seated && active)
+}
+
+/// One strict read of whether `authority` seats `member` Active and
+/// `member` says it is `active`. Both routes are read every time.
 async fn read_admitted(
     sim: &Sim,
     authority: &str,
@@ -631,18 +659,23 @@ async fn read_admitted(
     gid: &str,
     member_hex: &str,
 ) -> Result<bool> {
-    let path = format!("/groups/{gid}/members");
-    let (status, body) = get_object(sim, authority, &path).await?;
-    if !lists(gid, member_hex, status, &body).with_context(|| format!("{authority} GET {path}"))? {
-        return Ok(false);
-    }
-    let path = format!("/groups/{gid}");
-    let (status, body) = get_object(sim, member, &path).await?;
-    is_active(gid, status, &body).with_context(|| format!("{member} GET {path}"))
+    let roster_path = format!("/groups/{gid}/members");
+    let (roster_status, roster_body) = get_object(sim, authority, &roster_path).await?;
+    let group_path = format!("/groups/{gid}");
+    let (group_status, group_body) = get_object(sim, member, &group_path).await?;
+    admission(
+        gid,
+        member_hex,
+        roster_status,
+        &roster_body,
+        group_status,
+        &group_body,
+    )
+    .with_context(|| format!("{authority} GET {roster_path}, {member} GET {group_path}"))
 }
 
-/// When, after `start`, `authority` lists `member` in `gid` and `member`
-/// reports itself `active`, against `bound`. "Not admitted" is a verdict
+/// When, after `start`, `authority` seats `member` Active in `gid` and
+/// `member` reports itself `active`, against `bound`. "Not admitted" is a verdict
 /// only when every read completed and succeeded; a failed, malformed or
 /// hanging read is INFRA.
 async fn admitted(
@@ -1206,7 +1239,9 @@ struct Snapshot {
     a_typed: bool,
     /// J shows `awaiting_evidence` naming exactly the missing digests.
     j_typed: bool,
-    a_lists_j: bool,
+    /// A's strict roster has an Active row for J. A pending, removed or
+    /// banned row is not admission.
+    a_seats_j_active: bool,
     j_active: bool,
     /// J's `join_state`; `None` when join-status answered 404.
     join_state: Option<JoinState>,
@@ -1634,8 +1669,8 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
     let a_typed = shows_all(&serde_json::Value::Object(a_group), EVIDENCE_PENDING, want)
         .with_context(|| format!("A GET {group_path}: typed {EVIDENCE_PENDING}"))?;
     let (status, a_roster) = get_object(sim, "A", &members_path).await?;
-    let a_lists_j =
-        lists(gid, &j_hex, status, &a_roster).with_context(|| format!("A GET {members_path}"))?;
+    let a_seats_j_active = seats_active(gid, &j_hex, status, &a_roster)
+        .with_context(|| format!("A GET {members_path}"))?;
     let (status, j_group) = get_object(sim, "J", &group_path).await?;
     let j_membership =
         parse_membership(gid, status, &j_group).with_context(|| format!("J GET {group_path}"))?;
@@ -1656,7 +1691,7 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
     Ok(Snapshot {
         a_typed,
         j_typed,
-        a_lists_j,
+        a_seats_j_active,
         j_active: j_membership == Some(Membership::Active),
         join_state,
         stub_gone: status == StatusCode::NOT_FOUND,
@@ -1838,12 +1873,12 @@ impl WaitWindow {
             .outcome
             .as_ref()
             .is_some_and(|outcome| outcome.kind == OutcomeKind::Seated);
-        if (snap.a_lists_j || snap.j_active || j_seated) && self.admitted.is_none() {
+        if (snap.a_seats_j_active || snap.j_active || j_seated) && self.admitted.is_none() {
             self.admitted = Some((
                 since,
                 format!(
-                    "A lists J: {}; J active: {}; J outcome seated: {j_seated}",
-                    snap.a_lists_j, snap.j_active
+                    "A seats J active: {}; J active: {}; J outcome seated: {j_seated}",
+                    snap.a_seats_j_active, snap.j_active
                 ),
             ));
         }
@@ -2492,8 +2527,18 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     .await??;
                 let j_state = parse_membership(&home.gid, status, &body)
                     .with_context(|| format!("J GET {group_path}"))?;
+                let j_hex = sim.agent_hex("J")?;
+                let a_active = a_rows
+                    .iter()
+                    .filter(|row| row.state == crate::groups::GroupMemberState::Active)
+                    .count();
+                let j_row = a_rows
+                    .iter()
+                    .find(|row| row.agent_id.eq_ignore_ascii_case(&j_hex))
+                    .map_or("none".to_string(), |row| format!("{:?}", row.state));
                 sim.fabric().mark(format!(
-                    "observed: A lists {} members, J membership_state={}",
+                    "observed: A roster: {} rows, {a_active} active, J row state={j_row}, \
+                     J membership_state={}",
                     a_rows.len(),
                     j_state.map_or("none (404)", Membership::name)
                 ));
@@ -2511,7 +2556,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 match &gap_admitted {
                     Some((since, how)) => format!("at t2+{}s: {how}", since.as_secs()),
                     None => format!(
-                        "{} polls over {}s: A never lists J and J is never active",
+                        "{} polls over {}s: A never seats J active and J is never active",
                         window.polls(),
                         HOLDER_GAP.as_secs()
                     ),
@@ -3253,7 +3298,7 @@ fn snap(join_state: Option<JoinState>, outcome: Option<OutcomeKind>) -> Snapshot
     Snapshot {
         a_typed: false,
         j_typed: false,
-        a_lists_j: false,
+        a_seats_j_active: false,
         j_active: false,
         join_state,
         stub_gone: join_state.is_none(),
@@ -3508,7 +3553,7 @@ fn w3h_1023_admitted_membership_parse_rejects_malformed() {
     // The roster half of `read_admitted`: a 404 or a wrong group is an
     // error, never "not listed".
     let member = hex::encode([0xaa_u8; 32]);
-    let roster = |status, body| lists(gid, &member, status, &object(body));
+    let roster = |status, body| seats_active(gid, &member, status, &object(body));
     let row = json!({"agent_id": member, "role": "member", "state": "active"});
     assert!(roster(
         StatusCode::OK,
@@ -3540,6 +3585,74 @@ fn w3h_1023_admitted_membership_parse_rejects_malformed() {
         json!({"ok": true, "group_id": gid, "members": [], "member_count": 2})
     )
     .is_err());
+    // Only an Active row is admission. Pending, removed and banned rows
+    // are "not admitted", not an error.
+    for state in ["pending", "removed", "banned"] {
+        let row = json!({"agent_id": member, "role": "member", "state": state});
+        assert!(
+            !roster(
+                StatusCode::OK,
+                json!({"ok": true, "group_id": gid, "members": [row], "member_count": 1})
+            )
+            .unwrap(),
+            "{state}"
+        );
+    }
+    // An unknown state is outside the closed set: INFRA.
+    let frozen = json!({"agent_id": member, "role": "member", "state": "frozen"});
+    assert!(roster(
+        StatusCode::OK,
+        json!({"ok": true, "group_id": gid, "members": [frozen], "member_count": 1})
+    )
+    .is_err());
+    // An unrelated pending row does not hide the member's Active row.
+    let other =
+        json!({"agent_id": hex::encode([0xbb_u8; 32]), "role": "member", "state": "pending"});
+    let active = json!({"agent_id": member, "role": "member", "state": "active"});
+    assert!(roster(
+        StatusCode::OK,
+        json!({"ok": true, "group_id": gid, "members": [other, active], "member_count": 2})
+    )
+    .unwrap());
+}
+
+#[test]
+fn w3h_1023_admission_requires_active_row() {
+    let gid = "g";
+    let member = hex::encode([0xaa_u8; 32]);
+    let roster_with = |state: &str| {
+        object(json!({
+            "ok": true,
+            "group_id": gid,
+            "members": [{"agent_id": member, "role": "member", "state": state}],
+            "member_count": 1
+        }))
+    };
+    let active = object(json!({"ok": true, "group_id": gid, "membership_state": "active"}));
+    let gone = object(json!({"ok": false, "error": "group not found"}));
+    let ok = StatusCode::OK;
+    // A non-Active authority row is not admission, even when J says active.
+    for state in ["pending", "banned"] {
+        assert!(
+            !admission(gid, &member, ok, &roster_with(state), ok, &active).unwrap(),
+            "{state}"
+        );
+    }
+    // An Active row and an active member is admission.
+    assert!(admission(gid, &member, ok, &roster_with("active"), ok, &active).unwrap());
+    // An Active row and a member 404 (no group there) is not admission.
+    assert!(!admission(
+        gid,
+        &member,
+        ok,
+        &roster_with("active"),
+        StatusCode::NOT_FOUND,
+        &gone
+    )
+    .unwrap());
+    // A malformed member body is INFRA, even when the row is not Active.
+    let malformed = object(json!({"ok": true, "group_id": gid, "membership_state": "weird"}));
+    assert!(admission(gid, &member, ok, &roster_with("pending"), ok, &malformed).is_err());
 }
 
 #[test]
