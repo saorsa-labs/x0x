@@ -30,13 +30,33 @@ type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + 
 async fn inspect_probe_admission(
     install: PathBuf,
     version: String,
-    staged: bool,
+    staging: Option<(super::staging_runtime::Gate, restart::RestartPlan)>,
 ) -> Result<super::probe::Admission, UpgradeError> {
+    if let Some((gate, plan)) = staging {
+        return run_owned_blocking(move |caller_alive| {
+            let _lock = super::acquire_host_upgrade_lock(&install)?;
+            let check_custody = || {
+                if caller_alive.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(UpgradeError::Other(
+                        "staging probe admission cancelled before record I/O".into(),
+                    ))
+                }
+            };
+            check_custody()?;
+            ensure_canonical_install(&install)?;
+            // Selection or refusal evidence can change after the first gate
+            // releases its lock. Recheck before probe inspection can write.
+            gate.check_apply_policy(&install, &plan)?;
+            check_custody()?;
+            super::probe::inspect_admission(&install, &version)
+                .map_err(|error| UpgradeError::Other(error.to_string()))
+        })
+        .await;
+    }
     tokio::task::spawn_blocking(move || {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
-        if staged {
-            ensure_canonical_install(&install)?;
-        }
         super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))
     })
@@ -810,7 +830,9 @@ impl AutoApplyUpgrader {
         if let super::probe::Admission::Waiting { retry_after } = inspect_probe_admission(
             target_path.clone(),
             manifest.version.clone(),
-            self.staging.is_some(),
+            self.staging
+                .clone()
+                .map(|gate| (gate, restart_plan.clone())),
         )
         .await?
         {
