@@ -266,6 +266,20 @@ jobs:
           mkdir -m 700 "${artifact}"
           test ! -e "${artifact}/proof.json"
 
+      - name: Sample signing-path build resources
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          nohup bash -c '
+            while true; do
+              date -u
+              free -m
+              df -h / "$RUNNER_TEMP"
+              sleep 30
+            done
+          ' >>"${artifact}/resources.log" 2>&1 </dev/null &
+          echo "$!" >"${artifact}/resources.pid"
+
       - name: Run exact ignored 100k signing-path test
         id: signing_test
         shell: bash
@@ -287,6 +301,18 @@ jobs:
           fi
           python3 -B scripts/ci/validate-703-signing-proof.py \
             "${RUNNER_TEMP}/issue703-signing-test/proof.json"
+
+      - name: Print signing-path resource samples
+        if: always()
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          if [[ -f "${artifact}/resources.pid" ]]; then
+            kill "$(cat "${artifact}/resources.pid")" 2>/dev/null || true
+          fi
+          if [[ -f "${artifact}/resources.log" ]]; then
+            tail -n 120 "${artifact}/resources.log"
+          fi
 
       - name: Upload signing-path acceptance custody
         if: always()
