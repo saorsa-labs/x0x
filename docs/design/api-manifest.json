@@ -444,7 +444,7 @@
     {
       "category": "identity",
       "cli_name": "owner placement",
-      "description": "Derived placement ledger (lazy mint + \u22651-Roaming Home invariant)",
+      "description": "Derived placement ledger (lazy mint + ≥1-Roaming Home invariant)",
       "method": "GET",
       "path": "/owner/placement",
       "request": {

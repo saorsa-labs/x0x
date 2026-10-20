@@ -604,6 +604,7 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/ws/direct", ws_direct_endpoint),
     covered!(Get, "/ws/sessions", daemon_api_ws_sessions),
     covered!(Get, "/gui", gui_html_contains_brand),
+    covered!(Post, "/gui/show", registry_lists_gui_show),
     // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
     covered!(Post, "/forwards", daemon_api_forwards_add_disabled),
     covered!(Get, "/forwards", daemon_api_forwards_list),
@@ -691,6 +692,11 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/grants.rs",
         include_str!("../src/server/routes/grants.rs"),
+    ),
+    // ADR 0083 slice 1: POST /gui/show coverage lives in the route lib tests.
+    (
+        "src/server/routes/gui_show.rs",
+        include_str!("../src/server/routes/gui_show.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",
@@ -1099,6 +1105,10 @@ fn route_set_matches_registry() {
             String::from("GET"),
             String::from("/.well-known/agent-card.json"),
         ),
+        // Origin-banner control (ADR 0083 §5). The embedded GUI sends
+        // `gui.block` on the session WebSocket; this loopback route is not
+        // a CLI command.
+        (String::from("POST"), String::from("/gui/show/block")),
     ]
     .into_iter()
     .collect();
@@ -1159,6 +1169,7 @@ fn categories_are_valid() {
         "history",
         "acl",
         "grants",
+        "gui",
     ];
 
     for ep in ENDPOINTS {
