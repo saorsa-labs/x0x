@@ -6,6 +6,8 @@
 //! support.
 
 pub mod apply;
+#[cfg(unix)]
+mod inventory_commands;
 pub(crate) mod journal;
 pub mod manifest;
 pub mod monitor;

@@ -214,3 +214,11 @@ fn push_word(words: &mut Vec<String>, word: String) -> io::Result<()> {
 fn refusal(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/upgrade_inventory_commands.rs"
+));
+#[cfg(test)]
+inventory_commands_regression_tests!();
