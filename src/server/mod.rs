@@ -89,7 +89,7 @@ use routes::{
     load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
     machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
+    owner_agents_issue, owner_agents_revoke, owner_machines, owner_riders_issue, owner_riders_list,
     owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
     presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust,
@@ -106,11 +106,11 @@ use routes::{
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
     update_contact, update_group_policy, update_member_role, update_named_group, update_profile,
-    update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
-    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    update_task, upgrade_diagnostics, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage,
+    ControlBlobState, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
+    PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
+    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, TreeKemCatchupRequest,
+    TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
     DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
@@ -2533,6 +2533,7 @@ pub async fn serve_with_options(
         .route("/home/rename", post(routes::home::rename_home))
         .route("/home/seat", post(routes::home::seat_home))
         .route("/owner/agents", get(owner_agents))
+        .route("/owner/machines", get(owner_machines))
         .route("/owner/agents/issue", post(owner_agents_issue))
         .route("/owner/agents/:id", delete(owner_agents_revoke))
         .route(
@@ -2757,6 +2758,7 @@ pub async fn serve_with_options(
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/state-sync", get(state_sync_diagnostics))
         .route("/diagnostics/transport", get(transport_diagnostics))
+        .route("/diagnostics/upgrade", get(upgrade_diagnostics))
         .route("/diagnostics/relay", get(relay_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))
         .route("/diagnostics/groups", get(groups_diagnostics))

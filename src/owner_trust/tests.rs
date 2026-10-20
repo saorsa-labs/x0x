@@ -9,6 +9,8 @@ use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
 use crate::key_move::MoveState;
 use crate::owner_sync::OwnerEnrollment;
 use crate::revocation::{RevocationRecord, RevokedSubject};
+use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+use std::time::Duration;
 
 /// How the fixture's machine is enrolled in the local owner device set.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1297,4 +1299,105 @@ async fn s3_enrolled_machine_gets_reserved_evidence_capacity_without_discovery()
     assert!(!related);
     assert!(limits.admit(stranger, related).is_none());
     drop(strangers);
+}
+
+/// WHY (Codex P2 on #1488): `grant_access` must read the injected clock after
+/// the contact-store lock, not before. A grant that expires while that
+/// read awaits a contended write lock must come back empty, not Allow.
+#[tokio::test]
+async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let owner = UserKeypair::generate().expect("owner keygen");
+    let local_agent = AgentKeypair::generate().expect("local agent").agent_id();
+    let remote_agent = AgentKeypair::generate().expect("remote agent").agent_id();
+    let remote_machine = MachineKeypair::generate()
+        .expect("remote machine")
+        .machine_id();
+
+    let bindings = AuthenticatedMachineBindings::default();
+    let t0 = 1_700_000_000u64;
+    crate::dm_inbox::record_authenticated_machine_binding(
+        &bindings,
+        remote_agent,
+        remote_machine,
+        t0,
+    )
+    .await;
+
+    let clock = Arc::new(AtomicU64::new(t0));
+    let clock_task = Arc::clone(&clock);
+    let trust = OwnerTrust::new(Some(owner.user_id()), bindings)
+        .with_clock(Arc::new(move || clock_task.load(Ordering::SeqCst)));
+    let grants = Arc::new(ShareGrantStore::in_memory(
+        local_agent,
+        Some(owner.user_id()),
+    ));
+    let expiry = t0 + 2;
+    let grant = ShareGrant::sign(
+        &owner,
+        [0xA1; 32],
+        Grantee::Agent(remote_agent),
+        vec![local_agent],
+        vec![ShareCap::Connect { ports: vec![22] }],
+        t0.saturating_sub(60),
+        expiry,
+    )
+    .expect("sign short-lived grant");
+    grants.accept(grant, t0).await.expect("accept grant");
+    trust.install_share_grant_store(grants);
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let contacts = Arc::new(RwLock::new(ContactStore::new(
+        dir.path().join("contacts.json"),
+    )));
+    let cache = Arc::new(RwLock::new(HashMap::new()));
+    let revocations = Arc::new(RwLock::new(RevocationSet::new()));
+
+    // Control: construction clock is still t0 after the contact read.
+    let live = trust
+        .grant_access_at(
+            &contacts,
+            &cache,
+            &revocations,
+            &remote_agent,
+            &remote_machine,
+            true,
+        )
+        .await;
+    assert!(
+        live.allows_connect_port(22),
+        "control: grant must admit Connect at T0"
+    );
+
+    // Hold the write lock so grant_access's contact read blocks until we
+    // advance the injected clock past expiry and release.
+    let held = contacts.write().await;
+    let trust_task = trust.clone();
+    let contacts_task = Arc::clone(&contacts);
+    let cache_task = Arc::clone(&cache);
+    let revocations_task = Arc::clone(&revocations);
+    let pending = tokio::spawn(async move {
+        trust_task
+            .grant_access(
+                &contacts_task,
+                &cache_task,
+                &revocations_task,
+                &remote_agent,
+                &remote_machine,
+            )
+            .await
+    });
+    // Let the spawned task park on the contact read before advancing time.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    clock.store(expiry + 1, Ordering::SeqCst);
+    drop(held);
+
+    let access = pending.await.expect("grant_access task");
+    assert!(
+        !access.allows_connect_port(22) && access.is_empty(),
+        "grant that expired during contact-lock wait must not admit: {access:?}"
+    );
 }

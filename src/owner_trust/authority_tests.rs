@@ -284,7 +284,7 @@ async fn cold_checks_and_live_bindings_skip_held_evidence() {
     let cold = f
         .agent
         .owner_trust
-        .authority_confirms_with(&f.recipient, &f.machine, true)
+        .authority_confirms_nonblocking(&f.recipient, &f.machine)
         .await;
     dm_inbox::record_authenticated_machine_binding(
         &f.agent.authenticated_machine_bindings,
@@ -303,5 +303,6 @@ async fn cold_checks_and_live_bindings_skip_held_evidence() {
     writer.join().unwrap();
     f.agent.try_shutdown().await.unwrap();
     assert_eq!(Arc::strong_count(f.agent.peer_evidence()), 1);
-    assert!(!cold && warm && skipped_held);
+    // Held store → try_confirms_pairing None → Busy (not Done(false)).
+    assert!(matches!(cold, crate::owner_trust::NonblockingEval::Busy) && warm && skipped_held);
 }
