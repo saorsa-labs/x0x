@@ -134,6 +134,37 @@ Use this procedure to investigate and resolve the condition:
    repair, check the configured roots, running versions and `/health` upgrade
    reason before deliberately enabling apply again.
 
+### Dormant pair transaction (M2 S2e)
+
+The private pair engine is implemented and tested, but no live apply path calls
+it yet. Activation requires the S2c host inventory and S3a acknowledged flush.
+The current apply path still uses its existing single-binary replacement flow.
+Do not infer pair rollback or launcher protection from this dormant module.
+
+The engine checks a verified release plan and durable passing probes under the
+existing daemon and managed-CLI install locks. It checks the installed hashes
+again before mutation. It copies each old binary beside its target, using that
+binary's prior version and a transaction ID in the backup name. It keeps every
+referenced backup and reserves the copy/restore space plus 1 GiB per filesystem.
+
+Each daemon and CLI swap has separate intent, file and progress barriers. A
+healthy OLD process can restore both members after a failed swap. Restoration
+copies the backup and retains the original rollback bytes. A separate writer
+cannot start another transaction while the first remains unresolved.
+
+Private records use `<daemon>.upgrade-pair.json` and
+`<daemon>.upgrade-pair.pending`. Resolved predecessor records are retained under
+their transaction IDs. Every archive retry repeats its durability barriers.
+Unknown or corrupt records and uncertain barriers preserve all evidence and
+refuse pair actions. These records alone do not authorize process recovery,
+child start, host commit or a storage-format change.
+
+A split CLI remains untouched and is reported with a reinstall hint. Signed
+SKILL content is copied to a transaction-specific staging file. The active
+SKILL remains unchanged. A later installer must enforce the applicable gate:
+host commit on protected paths, or matching candidate bytes and stable local
+health on unprotected paths under D195. It must retain the prior guide.
+
 ## Restart ownership is resolved before mutation (ADR-0061, #493)
 
 The daemon resolves and validates the whole restart contract **before it

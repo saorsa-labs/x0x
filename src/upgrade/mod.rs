@@ -9,6 +9,7 @@ pub mod apply;
 pub(crate) mod journal;
 pub mod manifest;
 pub mod monitor;
+pub(crate) mod pair;
 pub(crate) mod probe;
 pub(crate) mod probe_retry;
 pub mod restart;
