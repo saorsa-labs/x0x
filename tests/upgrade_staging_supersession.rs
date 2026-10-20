@@ -151,3 +151,381 @@ macro_rules! staging_supersession_regression_tests {
         }
     };
 }
+
+// Separately expanded inside upgrade::staging_selection after that real private
+// implementation is registered. This does not alter the startup RED above.
+#[allow(unused_macros)]
+macro_rules! staging_selection_core_regression_tests {
+    () => {
+        #[cfg(unix)]
+        mod staging_selection_regressions {
+            use super::*;
+            use std::{collections::BTreeMap, ffi::OsString, fs, time::Duration};
+
+            struct Fixture {
+                _dir: tempfile::TempDir,
+                request: StagingRequest,
+                _lock: fs::File,
+            }
+
+            impl Fixture {
+                fn new() -> Self {
+                    let evidence = std::env::var_os("X0X_UPGRADE_STAGING_EVIDENCE_DIR")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                                .join(".planning/upgrade-staging-fixtures")
+                        });
+                    fs::create_dir_all(&evidence).unwrap();
+                    let dir = tempfile::Builder::new()
+                        .prefix("selection-")
+                        .tempdir_in(evidence)
+                        .unwrap();
+                    let root = dir.path().canonicalize().unwrap();
+                    fs::write(root.join("x0xd"), b"owned selection install").unwrap();
+                    fs::create_dir(root.join("data")).unwrap();
+                    fs::create_dir(root.join("identity")).unwrap();
+                    let request = StagingRequest {
+                        install: root.join("x0xd"),
+                        data_root: root.join("data"),
+                        identity_root: root.join("identity"),
+                        machine_id: [42; 32],
+                        version: "1.2.3".into(),
+                        manifest_sha256: [3; 32],
+                        archive_sha256: [4; 32],
+                        window_minutes: 0,
+                    };
+                    let lock = crate::upgrade::acquire_host_upgrade_lock(&request.install).unwrap();
+                    Self {
+                        _dir: dir,
+                        request,
+                        _lock: lock,
+                    }
+                }
+            }
+
+            fn clock(ms: u64) -> ProbeClock {
+                ProbeClock {
+                    boot_id: "selection-fixture".into(),
+                    monotonic_ms: ms,
+                }
+            }
+
+            fn newer(request: &StagingRequest) -> StagingRequest {
+                let mut next = request.clone();
+                next.version = "1.2.4".into();
+                next.manifest_sha256 = [5; 32];
+                next.archive_sha256 = [6; 32];
+                next
+            }
+
+            fn steps() -> [BarrierStep; 4] {
+                [
+                    BarrierStep::Write,
+                    BarrierStep::FileSync,
+                    BarrierStep::Rename,
+                    BarrierStep::DirectorySync,
+                ]
+            }
+
+            fn bytes(request: &StagingRequest) -> BTreeMap<OsString, Vec<u8>> {
+                fs::read_dir(request.install.parent().unwrap())
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .filter(|entry| entry.path().is_file())
+                    .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+                    .collect()
+            }
+
+            fn refuses_without_writes(request: &StagingRequest) {
+                let before = bytes(request);
+                assert!(check_request(&request.clone()).is_err());
+                assert!(observe_selected(&request.clone(), &clock(1_000_000)).is_err());
+                assert_eq!(
+                    bytes(request),
+                    before,
+                    "fresh admission must preserve all owned record bytes"
+                );
+            }
+
+            #[test]
+            fn selection_fresh_reader_refuses_older_before_advancing_its_receipt() {
+                let mut fixture = Fixture::new();
+                fixture.request.window_minutes = 60;
+                let old = fixture.request.clone();
+                assert_eq!(
+                    observe_selected(&old, &clock(1000)).unwrap(),
+                    Decision::Waiting(Duration::from_secs(2532))
+                );
+                let old_path = staging::receipt_path(&old).unwrap();
+                let old_bytes = fs::read(&old_path).unwrap();
+                let next = newer(&old);
+                assert!(matches!(
+                    observe_selected(&next, &clock(1500)).unwrap(),
+                    Decision::Waiting(_)
+                ));
+                let selected = read_selection(&next).unwrap().unwrap();
+                assert_eq!(selected.release.version, "1.2.4");
+                assert_eq!(selected.release.manifest_sha256, [5; 32]);
+                assert_eq!(selected.release.archive_sha256, [6; 32]);
+                assert_eq!(selected.supersedes.unwrap().version, "1.2.3");
+                assert_eq!(
+                    selection_path(&old).unwrap(),
+                    selection_path(&next).unwrap()
+                );
+                assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+                // Reconstruct the request and reread files; no stored in-memory
+                // selection or process-local latch supplies refusal authority.
+                refuses_without_writes(&old);
+                assert_eq!(fs::read(old_path).unwrap(), old_bytes);
+                check_request(&next).unwrap();
+                observe_selected(&next, &clock(2000)).unwrap();
+                assert_eq!(
+                    staging::read_receipt(&next)
+                        .unwrap()
+                        .unwrap()
+                        .first_receipt_ms,
+                    1500
+                );
+            }
+
+            #[test]
+            fn selection_equal_precedence_version_strings_and_payloads_conflict() {
+                let mut fixture = Fixture::new();
+                fixture.request.version = "1.2.3+build.1".into();
+                observe_selected(&fixture.request, &clock(1000)).unwrap();
+                for field in ["version", "manifest", "archive"] {
+                    let mut conflict = fixture.request.clone();
+                    match field {
+                        "version" => conflict.version = "1.2.3+build.2".into(),
+                        "manifest" => conflict.manifest_sha256 = [9; 32],
+                        _ => conflict.archive_sha256 = [9; 32],
+                    }
+                    assert_eq!(
+                        selection_path(&conflict).unwrap(),
+                        selection_path(&fixture.request).unwrap()
+                    );
+                    refuses_without_writes(&conflict);
+                    if field == "version" {
+                        assert!(!staging::receipt_path(&conflict).unwrap().exists());
+                    }
+                }
+                assert_eq!(
+                    observe_selected(&fixture.request, &clock(2000)).unwrap(),
+                    Decision::Due
+                );
+            }
+
+            #[test]
+            fn selection_corrupt_unknown_or_unresolved_evidence_is_preserved() {
+                let fixture = Fixture::new();
+                let request = &fixture.request;
+                observe_selected(request, &clock(1000)).unwrap();
+                let path = selection_path(request).unwrap();
+                let valid = fs::read(&path).unwrap();
+                for field in [
+                    "torn",
+                    "schema_version",
+                    "record_kind",
+                    "extra",
+                    "install",
+                    "machine_id",
+                    "supersedes",
+                    "nested",
+                ] {
+                    let mut value: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+                    match field {
+                        "schema_version" => value[field] = serde_json::json!(99),
+                        "record_kind" => value[field] = serde_json::json!("unknown"),
+                        "install" => value[field] = serde_json::json!("/different/owned-install"),
+                        "machine_id" => value[field][0] = serde_json::json!(99),
+                        "supersedes" => value[field] = value["release"].clone(),
+                        "nested" => value["release"]["extra"] = serde_json::json!(true),
+                        _ => value[field] = serde_json::json!(true),
+                    }
+                    let corrupt = if field == "torn" {
+                        b"{torn".to_vec()
+                    } else {
+                        serde_json::to_vec(&value).unwrap()
+                    };
+                    fs::write(&path, &corrupt).unwrap();
+                    refuses_without_writes(request);
+                    assert_eq!(fs::read(&path).unwrap(), corrupt);
+                }
+                fs::write(&path, &valid).unwrap();
+                let pending = pending_path(request).unwrap();
+                for unresolved in [
+                    b"{torn".as_slice(),
+                    br#"{"schema_version":99,"record_kind":"rollout_selecting"}"#.as_slice(),
+                ] {
+                    fs::write(&pending, unresolved).unwrap();
+                    refuses_without_writes(request);
+                    refuses_without_writes(&newer(request));
+                    assert_eq!(fs::read(&pending).unwrap(), unresolved);
+                    assert_eq!(fs::read(&path).unwrap(), valid);
+                }
+                fs::remove_file(&pending).unwrap();
+                fs::create_dir(&pending).unwrap();
+                refuses_without_writes(request);
+                assert!(
+                    pending.is_dir(),
+                    "unreadable record shape must not be erased"
+                );
+            }
+
+            #[test]
+            fn selection_receipt_barriers_precede_intent_and_require_a_real_retry() {
+                for step in steps() {
+                    let fixture = Fixture::new();
+                    let old = &fixture.request;
+                    observe_selected(old, &clock(1000)).unwrap();
+                    let selected = fs::read(selection_path(old).unwrap()).unwrap();
+                    let retained = fs::read(staging::receipt_path(old).unwrap()).unwrap();
+                    let next = newer(old);
+                    for _ in 0..2 {
+                        assert!(observe_with_failure(
+                            &next,
+                            &clock(2000),
+                            SelectionFailure::ReceiptBarrier(step)
+                        )
+                        .is_err());
+                        assert_eq!(fs::read(selection_path(old).unwrap()).unwrap(), selected);
+                        assert!(!pending_path(old).unwrap().exists());
+                    }
+                    // Before selection intent, failed B did not supersede A.
+                    check_request(old).unwrap();
+                    assert_eq!(
+                        observe_selected(&next, &clock(2000)).unwrap(),
+                        Decision::Due
+                    );
+                    refuses_without_writes(old);
+                    assert_eq!(
+                        fs::read(staging::receipt_path(old).unwrap()).unwrap(),
+                        retained
+                    );
+                }
+            }
+
+            #[test]
+            fn selection_intent_failure_cuts_preserve_the_last_acknowledged_choice() {
+                for step in steps() {
+                    let fixture = Fixture::new();
+                    let old = &fixture.request;
+                    observe_selected(old, &clock(1000)).unwrap();
+                    let selected = fs::read(selection_path(old).unwrap()).unwrap();
+                    let next = newer(old);
+                    assert!(observe_with_failure(
+                        &next,
+                        &clock(2000),
+                        SelectionFailure::IntentBarrier(step)
+                    )
+                    .is_err());
+                    assert_eq!(fs::read(selection_path(old).unwrap()).unwrap(), selected);
+                    if matches!(step, BarrierStep::DirectorySync) {
+                        assert!(pending_path(old).unwrap().exists());
+                        refuses_without_writes(old);
+                        refuses_without_writes(&next);
+                    } else {
+                        assert!(!pending_path(old).unwrap().exists());
+                        check_request(old).unwrap();
+                        assert!(observe_with_failure(
+                            &next,
+                            &clock(2000),
+                            SelectionFailure::IntentBarrier(step)
+                        )
+                        .is_err());
+                        assert_eq!(
+                            observe_selected(&next, &clock(2000)).unwrap(),
+                            Decision::Due
+                        );
+                        refuses_without_writes(old);
+                    }
+                }
+            }
+
+            #[test]
+            fn selection_failed_latest_record_or_unlink_leaves_intent_for_fresh_readers() {
+                let failures = steps()
+                    .map(SelectionFailure::SelectionBarrier)
+                    .into_iter()
+                    .chain([SelectionFailure::RemoveIntent]);
+                for failure in failures {
+                    let fixture = Fixture::new();
+                    let old = &fixture.request;
+                    observe_selected(old, &clock(1000)).unwrap();
+                    let next = newer(old);
+                    assert!(observe_with_failure(&next, &clock(2000), failure).is_err());
+                    assert!(pending_path(old).unwrap().is_file());
+                    assert!(staging::read_receipt(&next).unwrap().is_some());
+                    let mut later = newer(&next);
+                    later.version = "1.2.5".into();
+                    for request in [old, &next, &later] {
+                        refuses_without_writes(request);
+                    }
+                }
+            }
+
+            #[test]
+            fn selection_absent_intent_after_failed_removal_sync_needs_both_barriers_again() {
+                let fixture = Fixture::new();
+                let old = &fixture.request;
+                observe_selected(old, &clock(1000)).unwrap();
+                let next = newer(old);
+                assert!(observe_with_failure(
+                    &next,
+                    &clock(2000),
+                    SelectionFailure::RemovalDirectorySync
+                )
+                .is_err());
+                assert!(!pending_path(old).unwrap().exists());
+                assert_eq!(
+                    read_selection(&next).unwrap().unwrap().release.version,
+                    "1.2.4"
+                );
+                refuses_without_writes(old);
+                for step in steps() {
+                    for failure in [
+                        SelectionFailure::ReceiptBarrier(step),
+                        SelectionFailure::SelectionBarrier(step),
+                    ] {
+                        assert!(observe_with_failure(&next, &clock(2000), failure).is_err());
+                        assert!(!pending_path(old).unwrap().exists());
+                        refuses_without_writes(old);
+                    }
+                }
+                assert_eq!(
+                    observe_selected(&next, &clock(2000)).unwrap(),
+                    Decision::Due
+                );
+                // A diagnostic parse or prior success cannot skip a later ACK.
+                assert!(observe_with_failure(
+                    &next,
+                    &clock(2000),
+                    SelectionFailure::SelectionBarrier(BarrierStep::DirectorySync)
+                )
+                .is_err());
+                assert_eq!(
+                    observe_selected(&next, &clock(2000)).unwrap(),
+                    Decision::Due
+                );
+            }
+
+            #[test]
+            fn selection_keeps_legacy_per_version_receipts_without_fabricating_prior_choice() {
+                let mut fixture = Fixture::new();
+                fixture.request.window_minutes = 60;
+                let old = &fixture.request;
+                staging::observe(old, &clock(1000)).unwrap();
+                let older_path = staging::receipt_path(old).unwrap();
+                let retained = fs::read(&older_path).unwrap();
+                assert!(!selection_path(old).unwrap().exists());
+                let next = newer(old);
+                observe_selected(&next, &clock(2000)).unwrap();
+                assert!(read_selection(&next).unwrap().unwrap().supersedes.is_none());
+                assert_eq!(fs::read(&older_path).unwrap(), retained);
+                refuses_without_writes(old);
+                assert_eq!(fs::read(older_path).unwrap(), retained);
+            }
+        }
+    };
+}
