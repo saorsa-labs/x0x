@@ -137,6 +137,17 @@ pub(crate) struct ProbeState {
     pub cli_sha256: Option<[u8; 32]>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Terminalization {
+    schema_version: u32,
+    record_kind: String,
+    install: PathBuf,
+    transaction_id: String,
+    /// Retain the exact prior record, including Running, across replacement.
+    previous_record: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Admission {
     Ready,
@@ -212,6 +223,8 @@ struct RunOptions {
     fail_write: Option<WriteFailure>,
     #[cfg(test)]
     fail_stage: Option<StageBarrierStep>,
+    #[cfg(test)]
+    fail_terminal_and_recovery: bool,
 }
 
 impl RunOptions {
@@ -258,6 +271,73 @@ pub(crate) fn state_path(install: &Path) -> io::Result<PathBuf> {
         .to_os_string();
     name.push(".upgrade-probe.json");
     Ok(canonical.with_file_name(name))
+}
+
+fn sidecar_path(state: &Path) -> PathBuf {
+    let mut name = state.as_os_str().to_os_string();
+    name.push(".pending");
+    PathBuf::from(name)
+}
+
+pub(crate) fn uncertainty_path(install: &Path) -> io::Result<PathBuf> {
+    state_path(install).map(|path| sidecar_path(&path))
+}
+
+fn decode_terminalization(bytes: &[u8]) -> io::Result<Terminalization> {
+    let marker: Terminalization = serde_json::from_slice(bytes).map_err(invalid)?;
+    let previous = decode_state(marker.previous_record.as_bytes())?;
+    if marker.schema_version != 1
+        || marker.record_kind != "probe_terminalizing"
+        || marker.install != previous.install
+        || marker.transaction_id != previous.transaction_id
+    {
+        return Err(invalid("invalid probe terminalization record"));
+    }
+    Ok(marker)
+}
+
+fn validate_terminalization(bytes: &[u8]) -> io::Result<()> {
+    decode_terminalization(bytes).map(|_| ())
+}
+
+fn begin_terminalization(path: &Path, state: &ProbeState) -> io::Result<PathBuf> {
+    let marker_path = sidecar_path(path);
+    match journal::read_auxiliary_record(&marker_path) {
+        Ok(_) => return Err(invalid("probe terminalization is already unresolved")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let previous_record =
+        String::from_utf8(journal::read_auxiliary_record(path)?).map_err(invalid)?;
+    let previous = decode_state(previous_record.as_bytes())?;
+    if previous.install != state.install || previous.transaction_id != state.transaction_id {
+        return Err(invalid("probe terminalization transaction changed"));
+    }
+    let marker = Terminalization {
+        schema_version: 1,
+        record_kind: "probe_terminalizing".into(),
+        install: state.install.clone(),
+        transaction_id: state.transaction_id.clone(),
+        previous_record,
+    };
+    journal::write_auxiliary_record(&marker_path, &marker, validate_terminalization)?;
+    Ok(marker_path)
+}
+
+fn finish_terminalization(path: &Path, state: &ProbeState) -> io::Result<()> {
+    let marker = decode_terminalization(&journal::read_auxiliary_record(path)?)?;
+    if marker.install != state.install || marker.transaction_id != state.transaction_id {
+        return Err(invalid("probe terminalization transaction changed"));
+    }
+    std::fs::remove_file(path)?;
+    // The terminal record barrier has already succeeded. Removal is only
+    // conservative bookkeeping: if a crash restores this marker, admission
+    // refuses. Its absence proves that the acknowledged record came first.
+    // A failed directory sync must not invent a failed HOLD barrier here.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(())
 }
 
 fn decode_state(bytes: &[u8]) -> io::Result<ProbeState> {
@@ -365,36 +445,96 @@ fn write_state(
     write: RecordWrite,
     options: Option<&RunOptions>,
 ) -> Result<(), ProbeRefusal> {
-    #[cfg(test)]
-    let result = match options.and_then(|options| options.fail_write) {
-        Some(failure) if failure.phase == write => {
-            journal::write_auxiliary_record_with_failure(path, state, validate_state, failure.step)
+    let marker = if write == RecordWrite::Attempt {
+        None
+    } else {
+        match begin_terminalization(path, state) {
+            Ok(marker) => Some(marker),
+            Err(error) => {
+                latch(path);
+                // The prior Running record remains untouched. If no new
+                // marker became visible, Running still refuses fresh readers.
+                return Err(ProbeRefusal::RecoveryFailed {
+                    reason: format!("probe terminalization barrier failed: {error}"),
+                });
+            }
         }
-        _ => journal::write_auxiliary_record(path, state, validate_state),
+    };
+    #[cfg(test)]
+    let result = {
+        let failure = options.and_then(|options| {
+            if options.fail_terminal_and_recovery && write != RecordWrite::Attempt {
+                Some(journal::BarrierStep::DirectorySync)
+            } else {
+                options
+                    .fail_write
+                    .filter(|failure| failure.phase == write)
+                    .map(|failure| failure.step)
+            }
+        });
+        match failure {
+            Some(step) => {
+                journal::write_auxiliary_record_with_failure(path, state, validate_state, step)
+            }
+            None => journal::write_auxiliary_record(path, state, validate_state),
+        }
     };
     #[cfg(not(test))]
     let result = {
         let _ = options;
         journal::write_auxiliary_record(path, state, validate_state)
     };
-    result.map_err(|error| {
-        latch(path);
-        // A failed barrier authorizes no next step. Preserve the failed record
-        // and retain a recovery-failed fact if the filesystem permits a write.
-        let mut failed = state.clone();
-        failed.phase = ProbePhase::RecoveryFailed;
-        failed.cause = Some(if write == RecordWrite::Hold {
-            ProbeCause::HoldWriteFailed
-        } else {
-            ProbeCause::StateWriteFailed
-        });
-        failed.retry_remaining_ms = 0;
-        failed.retry_deadline_ms = 0;
-        let _ = journal::write_auxiliary_record(path, &failed, validate_state);
-        ProbeRefusal::RecoveryFailed {
-            reason: format!("probe record barrier failed: {error}"),
+    result.map_err(|error| record_write_failed(path, state, write, options, error))?;
+    if let Some(marker) = marker {
+        if let Err(error) = finish_terminalization(&marker, state) {
+            latch(path);
+            return Err(ProbeRefusal::RecoveryFailed {
+                reason: format!("probe terminalization cleanup failed: {error}"),
+            });
         }
-    })
+    }
+    Ok(())
+}
+
+fn record_write_failed(
+    path: &Path,
+    state: &ProbeState,
+    write: RecordWrite,
+    options: Option<&RunOptions>,
+    error: io::Error,
+) -> ProbeRefusal {
+    latch(path);
+    // Keep the sidecar even when the final record is visible after a failed
+    // directory sync. It preserves the prior bytes and blocks fresh readers
+    // if this best-effort recovery-failed write also fails.
+    let mut failed = state.clone();
+    failed.phase = ProbePhase::RecoveryFailed;
+    failed.cause = Some(if write == RecordWrite::Hold {
+        ProbeCause::HoldWriteFailed
+    } else {
+        ProbeCause::StateWriteFailed
+    });
+    failed.retry_remaining_ms = 0;
+    failed.retry_deadline_ms = 0;
+    #[cfg(test)]
+    if options.is_some_and(|options| options.fail_terminal_and_recovery) {
+        let _ = journal::write_auxiliary_record_with_failure(
+            path,
+            &failed,
+            validate_state,
+            journal::BarrierStep::FileSync,
+        );
+    } else {
+        let _ = journal::write_auxiliary_record(path, &failed, validate_state);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        let _ = journal::write_auxiliary_record(path, &failed, validate_state);
+    }
+    ProbeRefusal::RecoveryFailed {
+        reason: format!("probe record barrier failed: {error}"),
+    }
 }
 
 /// Caller holds the install lock. This pre-download check advances only a
@@ -421,6 +561,15 @@ fn inspect_admission_inner(
 ) -> Result<Admission, ProbeRefusal> {
     let requested = semver::Version::parse(version).map_err(recovery_error)?;
     let path = state_path(install).map_err(recovery_error)?;
+    match journal::read_auxiliary_record(&uncertainty_path(install).map_err(recovery_error)?) {
+        Ok(_) => {
+            return Err(ProbeRefusal::RecoveryFailed {
+                reason: "probe terminalization is unresolved; records preserved".into(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(recovery_error(error)),
+    }
     if is_latched(&path) {
         return Err(ProbeRefusal::RecoveryFailed {
             reason: "a probe record barrier failed in this process".into(),
@@ -531,6 +680,8 @@ pub(crate) fn run_before_swap(
         fail_write: None,
         #[cfg(test)]
         fail_stage: None,
+        #[cfg(test)]
+        fail_terminal_and_recovery: false,
     };
     run_before_swap_inner(request, caller_alive, &options)
 }
@@ -552,6 +703,7 @@ pub(crate) fn run_before_swap_with_options(
             live_clock: false,
             fail_write: options.fail_write,
             fail_stage: None,
+            fail_terminal_and_recovery: false,
         },
     )
 }
@@ -574,6 +726,29 @@ pub(crate) fn run_before_swap_with_stage_failure(
             live_clock: false,
             fail_write: options.fail_write,
             fail_stage: Some(step),
+            fail_terminal_and_recovery: false,
+        },
+    )
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn run_before_swap_with_terminal_failure(
+    request: &ProbeRequest,
+    caller_alive: &AtomicBool,
+    options: &ProbeOptions,
+) -> Result<ProbeReceipt, ProbeRefusal> {
+    run_before_swap_inner(
+        request,
+        caller_alive,
+        &RunOptions {
+            clock: options.clock.clone(),
+            started: Instant::now(),
+            timeout: options.timeout,
+            live_clock: false,
+            fail_write: options.fail_write,
+            fail_stage: None,
+            fail_terminal_and_recovery: true,
         },
     )
 }
