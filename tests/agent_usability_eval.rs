@@ -553,15 +553,18 @@ async fn doc_surface_names_a_nonexistent_identity_command() {
 }
 
 /// Timeout discipline proof from the review: when a CLI call passes its
-/// deadline, `run_cli` must kill AND reap the child. The script ignores
-/// its arguments and sleeps 300 s, so only the deadline can end the call.
+/// deadline, `run_cli` must kill AND reap the child. The script `exec`s
+/// into `sleep 300` (so the child pid IS the sleeper — a plain `sleep`
+/// would fork a grandchild that survives the shell's death and the probe
+/// below would say nothing about it) and ignores its arguments, so only
+/// the deadline can end the call.
 #[cfg(unix)]
 #[tokio::test]
 async fn run_cli_deadline_kills_and_reaps_the_child() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("create temp dir for the hang script");
     let hang = dir.path().join("hang.sh");
-    std::fs::write(&hang, "#!/bin/sh\nsleep 300\n").expect("write the hang script");
+    std::fs::write(&hang, "#!/bin/sh\nexec sleep 300\n").expect("write the hang script");
     std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755))
         .expect("make the hang script executable");
     let ctx = DocContext {
