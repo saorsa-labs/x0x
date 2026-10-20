@@ -44,6 +44,16 @@
 //!   [`SETTLE`]) and B stays `Removed`. On `main` the leave rekeys and the
 //!   revocation does nothing more; after S4 the revocation must not rekey
 //!   a second time.
+//! - `s4_restart_intake_prepare` (RED on `main`). Nodes A, B, C. At t = 0
+//!   B revokes its own agent; once A and C hold the record, A is
+//!   crash-stopped and restarted on the same dirs; 100 ms after the
+//!   restart B sends the revocation again (the duplicate trigger). A must
+//!   still hold the record. Desired: H within the completion bound from
+//!   the restart, with exactly one epoch step (no duplicate rekey). `main`
+//!   never schedules the work ([`CAUSE_RESTART`]). The ADR's other runs
+//!   (a crash after the prepared journal, before the legacy commit; a
+//!   failed first intake write showing `waiting_for_durable_intake`) need
+//!   S4's own durability barriers and are added with S4.
 //! - `s4_fallback_rank_manual` (RED on `main`). Nodes A, D, E, B, C, with
 //!   admins A < D < E by agent id (the case reassigns the pre-generated
 //!   keys of A, D and E so that this holds). A is held off the fabric
@@ -118,6 +128,9 @@ const CAUSE_SELF_LEAVE: &str =
 const CAUSE_LEAVE_THEN_REVOKE: &str = "B's leaf retained after a self-leave and a later \
                                        revocation: survivors remain at epoch e0 with the same \
                                        leaf count";
+const CAUSE_RESTART: &str = "no revocation eviction on main, before or after A's restart: A \
+                             still holds B's revocation after the crash, but every survivor \
+                             still lists B active, at epoch e0, with the same leaf count";
 const CAUSE_MANUAL: &str = "non-designated manual remove rekeys at once on main: D's remove of B \
                             returned success without waiting_for_designated_admin and a survivor \
                             left epoch e0 within EARLY_READ while the designated admin A was held";
@@ -184,6 +197,9 @@ struct Arm {
     holders: &'static [&'static str],
     hold: Hold,
     trigger: Trigger,
+    /// Crash A once it holds the trigger, restart it on the same dirs, and
+    /// send B's revocation again 100 ms after the restart.
+    restart_a: bool,
     /// D calls the public remove API on B after the trigger.
     manual: bool,
     check: Check,
@@ -202,6 +218,7 @@ const IDLE: Arm = Arm {
     holders: &["A", "C"],
     hold: Hold::Reachable,
     trigger: Trigger::SelfRevoke,
+    restart_a: false,
     manual: false,
     check: Check::Healthy,
     bound: S4_COMPLETION_BOUND_PLACEHOLDER,
@@ -227,6 +244,12 @@ const LEAVE_THEN_REVOKE: Arm = Arm {
     ..IDLE
 };
 
+const RESTART_INTAKE: Arm = Arm {
+    restart_a: true,
+    cause: CAUSE_RESTART,
+    ..IDLE
+};
+
 const MANUAL_DURING_WINDOW: Arm = Arm {
     labels: FIVE,
     home: false,
@@ -235,6 +258,7 @@ const MANUAL_DURING_WINDOW: Arm = Arm {
     holders: &["D", "E", "C"],
     hold: Hold::Offline,
     trigger: Trigger::SelfRevoke,
+    restart_a: false,
     manual: true,
     check: Check::ManualQueued,
     bound: FALLBACK_BOUND,
@@ -693,6 +717,17 @@ async fn held_by(
     Ok(held)
 }
 
+/// Whether `label` has a live fabric link to `other`.
+async fn connected_to(sim: &Sim, label: &str, other: &str) -> bool {
+    let (Ok(state), Ok(other)) = (sim.state(label), sim.peer(other)) else {
+        return false;
+    };
+    match state.agent.network() {
+        Some(network) => network.connected_peers().await.contains(&other),
+        None => false,
+    }
+}
+
 /// Every survivor at exactly `epoch`.
 fn all_at(views: &[(&str, Option<View>)], epoch: u64) -> bool {
     !views.is_empty()
@@ -784,7 +819,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let trigger = sim
         .fabric()
         .mark_indexed(format!("case: t=0 trigger {:?}", arm.trigger));
-    let started = sim.fabric().now();
+    let mut started = sim.fabric().now();
     match arm.trigger {
         Trigger::SelfRevoke => {
             let (status, body) = sim
@@ -841,6 +876,44 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
     if arm.trigger.revokes() {
         await_holders(sim, arm.holders, &b_hex).await?;
+    }
+
+    // Crash A after durable intake, restart it, then a duplicate trigger.
+    let mut duplicate: Option<String> = None;
+    if arm.restart_a {
+        sim.within("A's intake is durable", secs(2), async {
+            tokio::time::sleep(secs(1)).await;
+        })
+        .await?;
+        sim.stop("A", RestartMode::Crash).await?;
+        sim.start_again("A").await?;
+        sim.until("A and C reconnect", SETUP, async |s: &Sim| {
+            connected_to(s, "A", "C").await
+        })
+        .await?;
+        sim.within("the duplicate trigger's delay", secs(1), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        })
+        .await?;
+        let (status, body) = sim
+            .api(
+                "B",
+                Method::POST,
+                "/identity/revoke",
+                Some(json!({"agent_id": b_hex, "reason": "w3h-1357 duplicate"})),
+            )
+            .await?;
+        duplicate = Some(format!("{status} {body}"));
+        let held = held_by(sim, &["A"], &b_hex).await?;
+        receipt.evidence(
+            "a_holds_b_revocation_after_its_crash_and_restart",
+            held.iter().all(|(_, has)| *has),
+            format!("held {held:?}; duplicate trigger {duplicate:?}"),
+            at(sim),
+        );
+        // The bound runs from the restart (ADR 0110 "catch-up ... after
+        // restart").
+        started = sim.fabric().now();
     }
 
     // The non-designated manual request, then the early read.
@@ -928,8 +1001,8 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         Check::Healthy => h && data_plane && stays_removed,
     };
     receipt.note(format!(
-        "arm={arm:?} e0={e0} leaves0={leaves0}; H {}; manual={manual:?}; early: {}; \
-         end: {}; after: {}; {}",
+        "arm={arm:?} e0={e0} leaves0={leaves0}; H {}; manual={manual:?}; \
+         duplicate={duplicate:?}; early: {}; end: {}; after: {}; {}",
         reached.as_deref().unwrap_or("never reached"),
         describe_all(&early),
         describe_all(&end),
@@ -1138,6 +1211,23 @@ async fn w3h_1357_control_s4_self_leave_then_revocation() -> Result<()> {
         0x1357_0006,
         LEAVE_THEN_REVOKE,
         Verdict::Green,
+    )
+    .await
+}
+
+/// ADR 0110 `s4_restart_intake_prepare` (crash after durable intake, with
+/// a duplicate trigger): RED on `main` until S4 lands.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1357_red_s4_restart_intake_prepare() -> Result<()> {
+    expect(
+        "w3h_1357_red_s4_restart_intake_prepare",
+        0x1357_0007,
+        RESTART_INTAKE,
+        Verdict::Red,
     )
     .await
 }
