@@ -457,7 +457,16 @@ mod execution {
     #[test]
     fn an_unloadable_candidate_is_held_without_running_or_replacing_either_binary() {
         let fixture = ExecutionFixture::new();
-        std::fs::write(&fixture.request.daemon, b"\x7fELFnot-an-executable").unwrap();
+        // A malformed foreign image may reach an OS shell fallback. An
+        // absent shebang interpreter produces an actual loader spawn error
+        // on both Darwin and Linux, before any fixture body can run.
+        let missing_loader = fixture._scratch._root.path().join("missing-loader");
+        assert!(!missing_loader.exists());
+        std::fs::write(
+            &fixture.request.daemon,
+            format!("#!{}\nexit 0\n", missing_loader.display()),
+        )
+        .unwrap();
         let result = fixture.run(&ExecutionFixture::options(1_000));
         assert!(matches!(result, Err(ProbeRefusal::Failed { .. })));
         let state = probe::read_state(&fixture.request.install)
