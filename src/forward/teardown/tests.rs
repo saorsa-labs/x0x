@@ -1629,6 +1629,32 @@ async fn owner_evidence_reauth_fixture() -> (
     Arc<crate::peer_evidence::PeerEvidenceStore>,
     Arc<crate::peer_evidence::EvidenceRuntime>,
 ) {
+    owner_evidence_reauth_fixture_at(false).await
+}
+
+/// Same as [`owner_evidence_reauth_fixture`], but with an authenticated
+/// binding recorded and the discovery certificate stripped so reauth still
+/// needs the evidence store for the cert (Codex P2 / RC8 Busy path).
+async fn owner_evidence_bound_no_discovery_cert_reauth_fixture() -> (
+    World,
+    LiveStreamGuard,
+    Arc<crate::peer_evidence::PeerEvidenceStore>,
+    Arc<crate::peer_evidence::EvidenceRuntime>,
+) {
+    owner_evidence_reauth_fixture_at(true).await
+}
+
+/// `binding_present_no_discovery_cert`: record an authenticated binding and
+/// strip `agent_certificate` from discovery so owner trust still reads the
+/// cert from evidence. Otherwise clear bindings (RC7 no-binding Busy path).
+async fn owner_evidence_reauth_fixture_at(
+    binding_present_no_discovery_cert: bool,
+) -> (
+    World,
+    LiveStreamGuard,
+    Arc<crate::peer_evidence::PeerEvidenceStore>,
+    Arc<crate::peer_evidence::EvidenceRuntime>,
+) {
     use crate::announce_v3::IdentityAnnouncementV3;
     use crate::dm::DmCapabilities;
     use crate::dm_capability::{CapabilityAdvert, RegistryTrailer, REGISTRY_TRAILER_MAGIC};
@@ -1653,6 +1679,11 @@ async fn owner_evidence_reauth_fixture() -> (
         .write()
         .await
         .insert(peer, discovered(&agent_kp, machine, cert.clone()));
+    if binding_present_no_discovery_cert {
+        if let Some(entry) = w.cache.write().await.get_mut(&peer) {
+            entry.agent_certificate = None;
+        }
+    }
 
     let now_ms = w.base_secs.saturating_mul(1000);
     let record = {
@@ -1721,9 +1752,14 @@ async fn owner_evidence_reauth_fixture() -> (
         w.trust.clone(),
         Arc::clone(&w.revocations),
     ));
+    let store_dir = if binding_present_no_discovery_cert {
+        "evidence-owner-reauth-busy-bound"
+    } else {
+        "evidence-owner-reauth-busy"
+    };
     let store = Arc::new(
         PeerEvidenceStore::open(
-            &w.dir.path().join("evidence-owner-reauth-busy"),
+            &w.dir.path().join(store_dir),
             EvidenceConfig::default(),
             policy,
             now_ms,
@@ -1739,16 +1775,38 @@ async fn owner_evidence_reauth_fixture() -> (
     );
     w.trust.install_evidence(&evidence);
 
-    {
+    if binding_present_no_discovery_cert {
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &w.authenticated,
+            peer,
+            machine,
+            w.base_secs,
+        )
+        .await;
+        assert!(
+            w.cache
+                .read()
+                .await
+                .get(&peer)
+                .and_then(|e| e.agent_certificate.as_ref())
+                .is_none(),
+            "control: discovery must lack agent_certificate so cert comes from evidence"
+        );
+    } else {
         let mut bind = w.authenticated.write().await;
         // Keep change_notify installed (World wires ADR-0074 reauth wake).
         bind.clear_for_test();
     }
 
     let gate = w.inbound(peer, machine);
-    let authority = check_gate(&gate, &w.ctx())
-        .await
-        .expect("owner stream must admit on enrolled evidence without binding");
+    let authority =
+        check_gate(&gate, &w.ctx())
+            .await
+            .expect(if binding_present_no_discovery_cert {
+                "owner stream must admit with binding and evidence cert (no discovery cert)"
+            } else {
+                "owner stream must admit on enrolled evidence without binding"
+            });
     assert_eq!(authority, StreamAuthority::OwnerTrust);
     let stream = w.live.register(gate, authority);
     (w, stream, store, evidence)
@@ -1830,6 +1888,75 @@ async fn reauth_evidence_store_busy_through_deadline_tears_down() {
     w.kick.notify_waiters();
     // Tear-down lands on the deadline Instant; allow a little slack so
     // closes_within does not race the final Busy → reauth_deadline step.
+    closes_within(&stream, EVENT_BOUND + Duration::from_millis(250)).await;
+    assert!(
+        started.elapsed() <= EVENT_BOUND,
+        "busy-through-deadline teardown exceeded EVENT_BOUND ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 1);
+    assert_eq!(w.reasons().get("reauth_deadline"), Some(&1));
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+}
+
+/// Codex P2 / RC8: binding-confirmed pairing with no discovery certificate
+/// still consults evidence for the cert. Contention that clears inside the
+/// five-second budget must not tear down the stream.
+#[tokio::test(start_paused = true)]
+async fn reauth_bound_no_discovery_cert_evidence_busy_resolves_inside_budget_stream_survives() {
+    let (w, stream, store, _evidence) =
+        owner_evidence_bound_no_discovery_cert_reauth_fixture().await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "busy alone must not tear down before the deadline (binding + no discovery cert)"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "stream must survive after contention clears inside the budget"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+    assert!(w.reasons().is_empty());
+
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "post-release reauth must keep the still-authorized stream"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
+/// Codex P2 / RC8: binding present, discovery cert absent, evidence held
+/// through the deadline → tear down as `reauth_deadline` (not immediate deny).
+#[tokio::test(start_paused = true)]
+async fn reauth_bound_no_discovery_cert_evidence_busy_through_deadline_tears_down() {
+    let (w, stream, store, _evidence) =
+        owner_evidence_bound_no_discovery_cert_reauth_fixture().await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    let started = Instant::now();
+    w.kick.notify_waiters();
     closes_within(&stream, EVENT_BOUND + Duration::from_millis(250)).await;
     assert!(
         started.elapsed() <= EVENT_BOUND,

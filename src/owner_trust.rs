@@ -346,13 +346,13 @@ impl OwnerTrust {
         agent_id: &AgentId,
         machine_id: &MachineId,
     ) -> crate::share_grant::GrantAccess {
-        self.grant_access_at(
+        self.grant_access_at_inner(
             contact_store,
             discovery_cache,
             revocation_set,
             agent_id,
             machine_id,
-            unix_now_secs(),
+            None,
             true,
         )
         .await
@@ -375,6 +375,36 @@ impl OwnerTrust {
         now_unix: u64,
         allow_evidence_lookup: bool,
     ) -> crate::share_grant::GrantAccessEval {
+        self.grant_access_at_inner(
+            contact_store,
+            discovery_cache,
+            revocation_set,
+            agent_id,
+            machine_id,
+            Some(now_unix),
+            allow_evidence_lookup,
+        )
+        .await
+    }
+
+    /// Shared body for [`Self::grant_access`] / [`Self::grant_access_at`].
+    ///
+    /// `now_unix = None` means wall clock after the first contact-store
+    /// read. A grant that expires while that read awaits a contended write
+    /// lock must be judged at the later time; capturing the clock before
+    /// the await would still admit it. An explicit `Some` keeps reauth and
+    /// tests on a frozen clock.
+    #[allow(clippy::too_many_arguments)]
+    async fn grant_access_at_inner(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        now_unix: Option<u64>,
+        allow_evidence_lookup: bool,
+    ) -> crate::share_grant::GrantAccessEval {
         let Some(store) = self.share_grant_store() else {
             return crate::share_grant::GrantAccessEval::default();
         };
@@ -385,6 +415,9 @@ impl OwnerTrust {
                 machine_id,
             })
         };
+        // Wall clock after the contact-store await: Instant adjustment
+        // inside evaluate starts too late to cover this wait.
+        let now_unix = now_unix.unwrap_or_else(unix_now_secs);
         let rejected = |decision: TrustDecision| {
             matches!(
                 decision,

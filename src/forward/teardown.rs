@@ -400,16 +400,28 @@ enum ReauthCheck {
 
 /// Whether the local-authority path for `(agent, machine)` would consult
 /// evidence and the ready store is contended (`try_usable` → `Err`).
-/// Binding-confirmed pairs skip evidence, so a held store is not busy.
+///
+/// Binding confirmation covers machine pairing only. Owner trust and user
+/// grants still read the certificate from evidence when discovery has none,
+/// so a held store stays Busy in that case. Skip the probe only when both
+/// pairing is binding-confirmed and discovery already has the certificate.
 async fn reauth_evidence_busy(ctx: &ReauthCtx, agent: &AgentId, machine: &MachineId) -> bool {
-    let attested = ctx.authenticated_bindings.read().await.peek(agent);
-    let announced = ctx.announced_bindings.read().await.peek(agent);
-    if crate::identity_authority::confirms(*machine, announced, attested, || false) {
-        return false;
-    }
     let Some(runtime) = ctx.owner_trust.evidence() else {
         return false;
     };
+    let attested = ctx.authenticated_bindings.read().await.peek(agent);
+    let announced = ctx.announced_bindings.read().await.peek(agent);
+    let binding_ok = crate::identity_authority::confirms(*machine, announced, attested, || false);
+    let cert_in_discovery = {
+        let cache = ctx.discovery_cache.read().await;
+        cache
+            .get(agent)
+            .and_then(|e| e.agent_certificate.as_ref())
+            .is_some()
+    };
+    if binding_ok && cert_in_discovery {
+        return false;
+    }
     runtime.try_usable(*agent, *machine, (ctx.clock)()).is_err()
 }
 
