@@ -64,6 +64,23 @@
 //!   in the next [`EARLY_READ`], and the ranked fallback then reaches H
 //!   within W + Δ + the completion bound. `main` rekeys at once
 //!   ([`CAUSE_MANUAL`]).
+//! - `s4_designated_late_observation` (RED on `main`). Nodes A, D, E, B,
+//!   C with A < D < E. A stays reachable, but revocation-topic gossip
+//!   toward A is dropped until t = W/2, so D, E and C observe at t = 0 and
+//!   A only late (direct messages, the S4 hand-off, still reach A). B
+//!   revokes its own agent at t = 0. Desired: automatic healthy exclusion
+//!   (H) within W + Δ + the bound, with no sibling. `main` never acts
+//!   ([`CAUSE_LATE`]).
+//! - `s4_designated_late_observation`, stalled A (RED on `main`). As
+//!   above, but A is off the fabric for the whole run; D, the next rank,
+//!   must fall back after W and reach H. `main` never acts
+//!   ([`CAUSE_STALLED`]).
+//! - `s4_designated_late_observation`, no early sibling (control, GREEN on
+//!   `main`). The stalled-A run read at t = W/2: no survivor has rekeyed
+//!   or is quarantined, and B is still listed. Trivially true on `main`;
+//!   after S4 it proves D and E wait for W. The ADR's "E observes first
+//!   and hands off" skew variant needs S4's hand-off to stage and is added
+//!   with S4.
 //! - `s4_manual_remove_without_obligation` (control, GREEN on `main`). The
 //!   same five nodes, A held, but no revocation: D's manual remove of B is
 //!   not affected by S4, so it rekeys at once and reaches H.
@@ -121,6 +138,7 @@ const PROBE: &[u8] = b"w3h-1357 probe";
 const FINAL_H: &str = "survivors_exclude_b_cryptographically_once_within_the_bound";
 const FINAL_MANUAL: &str =
     "non_designated_manual_remove_queues_as_waiting_for_designated_admin_then_reaches_h";
+const FINAL_NO_EARLY: &str = "no_non_designated_admin_rekeys_before_half_w";
 const CAUSE_IDLE: &str = "no revocation eviction on main: after the bound every survivor still \
                           lists B active, at epoch e0, with the same leaf count";
 const CAUSE_SELF_LEAVE: &str =
@@ -131,6 +149,15 @@ const CAUSE_LEAVE_THEN_REVOKE: &str = "B's leaf retained after a self-leave and 
 const CAUSE_RESTART: &str = "no revocation eviction on main, before or after A's restart: A \
                              still holds B's revocation after the crash, but every survivor \
                              still lists B active, at epoch e0, with the same leaf count";
+const CAUSE_LATE: &str = "no revocation eviction on main: the designated admin A observes late \
+                          and no hand-off or fallback runs, so after W + \u{394} + the bound \
+                          every survivor still lists B active, at epoch e0, with the same leaf \
+                          count";
+const CAUSE_STALLED: &str = "no ranked fallback on main: with the designated admin A held, D and \
+                             E never act, so after W + \u{394} + the bound every survivor still \
+                             lists B active, at epoch e0, with the same leaf count";
+const CAUSE_EARLY_SIBLING: &str =
+    "a non-designated admin rekeyed before W/2 while the designated admin A was held";
 const CAUSE_MANUAL: &str = "non-designated manual remove rekeys at once on main: D's remove of B \
                             returned success without waiting_for_designated_admin and a survivor \
                             left epoch e0 within EARLY_READ while the designated admin A was held";
@@ -172,6 +199,9 @@ enum Hold {
     Reachable,
     /// A is off the fabric from before t = 0 to the end.
     Offline,
+    /// A stays reachable, but revocation-topic gossip toward A is dropped
+    /// until t = W/2: A observes late (direct messages still pass).
+    RevocationGossipUntilHalfW,
 }
 
 /// The desired-behaviour assertion.
@@ -181,6 +211,8 @@ enum Check {
     Healthy,
     /// D's manual request queues and nothing moves early; then H.
     ManualQueued,
+    /// At t = W/2 no survivor has rekeyed and none is quarantined.
+    NoEarlySibling,
 }
 
 /// One arm of the case.
@@ -274,6 +306,28 @@ const MANUAL_WITHOUT_OBLIGATION: Arm = Arm {
     ..MANUAL_DURING_WINDOW
 };
 
+const LATE_OBSERVATION: Arm = Arm {
+    survivors: &["A", "D", "E", "C"],
+    hold: Hold::RevocationGossipUntilHalfW,
+    manual: false,
+    check: Check::Healthy,
+    cause: CAUSE_LATE,
+    ..MANUAL_DURING_WINDOW
+};
+
+const STALLED_A_FALLBACK: Arm = Arm {
+    manual: false,
+    check: Check::Healthy,
+    cause: CAUSE_STALLED,
+    ..MANUAL_DURING_WINDOW
+};
+
+const NO_EARLY_SIBLING: Arm = Arm {
+    check: Check::NoEarlySibling,
+    cause: CAUSE_EARLY_SIBLING,
+    ..STALLED_A_FALLBACK
+};
+
 impl Arm {
     fn ranked_admins(self) -> bool {
         !self.promoted.is_empty()
@@ -283,6 +337,7 @@ impl Arm {
         match self.check {
             Check::ManualQueued => FINAL_MANUAL,
             Check::Healthy => FINAL_H,
+            Check::NoEarlySibling => FINAL_NO_EARLY,
         }
     }
 }
@@ -728,6 +783,55 @@ async fn connected_to(sim: &Sim, label: &str, other: &str) -> bool {
     }
 }
 
+/// Drops pubsub frames on the revocation topics toward one node while
+/// held, and counts them. Direct messages (an S4 hand-off) still pass.
+struct RevocationGossipBlock {
+    held: Arc<std::sync::atomic::AtomicBool>,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RevocationGossipBlock {
+    fn install(sim: &Sim, target: &str) -> Result<Self> {
+        use crate::network::sim::{Fault, LaneClass};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const MARKER: &[u8] = b"x0x.revocation.";
+        let machine = sim.peer(target)?.0;
+        let held = Arc::new(AtomicBool::new(true));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        sim.fabric().add_rule(move |write| {
+            let on_topic = write.lane.class == LaneClass::PubSub
+                && write
+                    .bytes
+                    .windows(MARKER.len())
+                    .any(|window| window == MARKER);
+            if rule_held.load(Ordering::SeqCst) && write.lane.dst == machine && on_topic {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        sim.fabric()
+            .mark(format!("fault: revocation gossip toward {target} withheld"));
+        Ok(Self { held, dropped })
+    }
+
+    fn held(&self) -> bool {
+        self.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self, sim: &Sim) {
+        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+        sim.fabric()
+            .mark("fault: revocation gossip withholding released at W/2");
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Every survivor at exactly `epoch`.
 fn all_at(views: &[(&str, Option<View>)], epoch: u64) -> bool {
     !views.is_empty()
@@ -814,6 +918,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             at(sim),
         );
     }
+
+    let gossip_block = (arm.hold == Hold::RevocationGossipUntilHalfW)
+        .then(|| RevocationGossipBlock::install(sim, "A"))
+        .transpose()?;
 
     // t = 0.
     let trigger = sim
@@ -936,6 +1044,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         early = views(sim, survivors, &group, &b).await?;
     }
 
+    if arm.check == Check::NoEarlySibling {
+        return no_early_sibling(sim, arm, receipt, &group, &b, &b_hex, e0, started).await;
+    }
+
     // H within the arm's bound, measured from t = 0.
     let bound = arm
         .bound
@@ -944,6 +1056,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let mut seen = Observations::default();
     let waited = sim
         .until("the survivors reach H", bound, async |s: &Sim| {
+            if let Some(block) = &gossip_block {
+                if block.held() && s.fabric().now().saturating_sub(started) >= S4_W_PLACEHOLDER / 2
+                {
+                    block.release(s);
+                }
+            }
             let Some(now) = seen.observe(views_now(s, survivors, &group, &b)).await else {
                 return true;
             };
@@ -965,6 +1083,22 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         }
     }
     seen.verify("the survivors reach H")?;
+    if let Some(block) = &gossip_block {
+        if block.held() {
+            block.release(sim);
+        }
+        // The late-observation fault fired: A's revocation gossip was
+        // withheld, so a RED verdict is not "A observed on time".
+        receipt.evidence(
+            "revocation_gossip_toward_a_withheld_until_half_w",
+            block.dropped() > 0,
+            format!(
+                "revocation-topic frames toward A dropped: {}",
+                block.dropped()
+            ),
+            at(sim),
+        );
+    }
     if reached.is_some() {
         sim.within("H settles", SETTLE + secs(2), async {
             tokio::time::sleep(SETTLE).await;
@@ -998,12 +1132,14 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let early_unmoved = all_at(&early, e0);
     let passed = match arm.check {
         Check::ManualQueued => queued_typed && early_unmoved && h && data_plane,
-        Check::Healthy => h && data_plane && stays_removed,
+        Check::Healthy | Check::NoEarlySibling => h && data_plane && stays_removed,
     };
     receipt.note(format!(
         "arm={arm:?} e0={e0} leaves0={leaves0}; H {}; manual={manual:?}; \
-         duplicate={duplicate:?}; early: {}; end: {}; after: {}; {}",
+         duplicate={duplicate:?}; gossip to A withheld={:?}; early: {}; end: {}; \
+         after: {}; {}",
         reached.as_deref().unwrap_or("never reached"),
+        gossip_block.as_ref().map(RevocationGossipBlock::dropped),
         describe_all(&early),
         describe_all(&end),
         c_after.1,
@@ -1062,7 +1198,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     ),
                 )
             }
-            Check::Healthy => (
+            Check::Healthy | Check::NoEarlySibling => (
                 retained(
                     &end,
                     e0,
@@ -1075,6 +1211,55 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         receipt.cause(arm.cause, Some(observed), ok, at(sim));
     }
     receipt.finish(arm.final_name(), passed, at(sim));
+    Ok(())
+}
+
+/// [`Check::NoEarlySibling`]: wait to t = W/2, then no survivor may have
+/// rekeyed or be quarantined, and B is still listed (only the designated
+/// admin, held, may act before W).
+#[allow(clippy::too_many_arguments)]
+async fn no_early_sibling(
+    sim: &Sim,
+    arm: Arm,
+    receipt: &mut Receipt,
+    group: &str,
+    b: &crate::identity::AgentId,
+    b_hex: &str,
+    e0: u64,
+    started: Duration,
+) -> Result<()> {
+    let at = |sim: &Sim| sim.fabric().now().as_micros();
+    let half_w = S4_W_PLACEHOLDER / 2;
+    let left = half_w.saturating_sub(sim.fabric().now().saturating_sub(started));
+    sim.within("wait to W/2", left + secs(2), async {
+        tokio::time::sleep(left).await;
+    })
+    .await?;
+    let now = views(sim, arm.survivors, group, b).await?;
+    let quiet = all_at(&now, e0)
+        && now.iter().all(|(_, seen)| {
+            seen.as_ref()
+                .is_some_and(|seen| seen.lists_b && !seen.quarantined)
+        });
+    receipt.note(format!(
+        "arm={arm:?} e0={e0}; at W/2: {}",
+        describe_all(&now)
+    ));
+    let held = held_by(sim, arm.holders, b_hex).await?;
+    receipt.request_delivered(
+        "holders_hold_b_revocation",
+        held.iter().all(|(_, has)| *has),
+        format!("revocation held {held:?}"),
+        at(sim),
+    );
+    if !quiet {
+        let moved = now.iter().any(|(_, seen)| {
+            seen.as_ref()
+                .is_some_and(|seen| seen.epoch.is_some_and(|epoch| epoch > e0))
+        });
+        receipt.cause(arm.cause, Some(describe_all(&now)), moved, at(sim));
+    }
+    receipt.finish(arm.final_name(), quiet, at(sim));
     Ok(())
 }
 
@@ -1228,6 +1413,57 @@ async fn w3h_1357_red_s4_restart_intake_prepare() -> Result<()> {
         0x1357_0007,
         RESTART_INTAKE,
         Verdict::Red,
+    )
+    .await
+}
+
+/// ADR 0110 `s4_designated_late_observation`: A observes late; automatic
+/// healthy exclusion. RED on `main` until S4 lands.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1357_red_s4_designated_late_observation() -> Result<()> {
+    expect(
+        "w3h_1357_red_s4_designated_late_observation",
+        0x1357_0008,
+        LATE_OBSERVATION,
+        Verdict::Red,
+    )
+    .await
+}
+
+/// ADR 0110 `s4_designated_late_observation`, A stalled past W + Δ:
+/// D's ranked fallback reaches H. RED on `main` until S4 lands.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1357_red_s4_designated_stalled_a_fallback() -> Result<()> {
+    expect(
+        "w3h_1357_red_s4_designated_stalled_a_fallback",
+        0x1357_0009,
+        STALLED_A_FALLBACK,
+        Verdict::Red,
+    )
+    .await
+}
+
+/// ADR 0110 `s4_designated_late_observation` safety control: with A held,
+/// no D/E sibling before W/2. GREEN on `main` and after S4.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1357_control_s4_designated_no_early_sibling() -> Result<()> {
+    expect(
+        "w3h_1357_control_s4_designated_no_early_sibling",
+        0x1357_000a,
+        NO_EARLY_SIBLING,
+        Verdict::Green,
     )
     .await
 }
