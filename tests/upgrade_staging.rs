@@ -69,6 +69,9 @@ macro_rules! staging_regression_tests {
             std::fs::create_dir(&data_dir).unwrap();
             std::fs::create_dir(&identity_dir).unwrap();
             let (mut runtime, shutdown_tx) = e2e_startup_runtime(&data_dir);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                data_dir.join("x0xd"),
+            );
             runtime.staging.identity_root = identity_dir.clone();
             runtime.staging.machine_id = [42; 32];
             let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -335,7 +338,10 @@ macro_rules! staging_runtime_regression_tests {
             async fn cancelled_receipt_worker(closed_watch: bool, existing: bool) {
                 use std::future::Future;
                 use std::sync::Arc;
-                let (_dir, request, lock) = fixture();
+                let (dir, request, lock) = fixture();
+                let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                    dir.path().canonicalize().unwrap().join("x0xd"),
+                );
                 if existing {
                     observe(&request, &clock("a", 1000)).unwrap();
                 }
