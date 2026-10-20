@@ -13,8 +13,10 @@
 //!   certificates inline only up to the DM budget
 //!   (`attach_roster_certificates_to_member_added`), so A keeps some X
 //!   seats digest-only. A asks the group for the omitted certificates
-//!   (#946). The harness drops every answer toward A until t1 (ADR 0111
-//!   H3: the harness makes the admin's seat digest-only). Evidence: A
+//!   (#946). Until t1 the harness drops every frame toward A that carries
+//!   an X certificate (other than A's own seat event) and every #946
+//!   answer (ADR 0111 H3: the harness makes the admin's seat
+//!   digest-only). Evidence: A
 //!   holds digest-only seats, and O and the X devices hold their bytes.
 //! - t1: O and every X device go offline. A restarts on its own
 //!   directories. Evidence: after the restart A is still an admin, its
@@ -75,22 +77,63 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// Drops the #946 certificate answers toward one node while held.
+/// While held, drops every frame toward `target` that carries an X
+/// device's certificate, except `target`'s own seat event, and every #946
+/// answer. Each X certificate is matched in the two forms that frames
+/// carry in clear: base64 of its bincode (`certificate_b64`, sidecars,
+/// replayed `MemberJoined`) and the raw bincode (identity announces).
+/// Byte streams are never touched. Run 39366636451 showed why the drop
+/// must be this wide: after A joined, each X's `MemberJoined` and
+/// `MemberAdded` were replayed to A on G's metadata topic and gave A
+/// every certificate that its own seat event had trimmed.
 struct AnswerDrop {
     held: Arc<AtomicBool>,
     dropped: Arc<AtomicUsize>,
 }
 
+/// A distinctive slice of each form of `cert`.
+fn cert_needles(cert: &crate::identity::AgentCertificate) -> Result<Vec<Vec<u8>>> {
+    use base64::Engine as _;
+    let raw = bincode::serialize(cert)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+    // Offset 2100 is inside the agent public key in both forms, so the
+    // owner's user key (the same in every certificate) is not matched.
+    Ok(vec![
+        raw.get(2100..2200).context("short certificate")?.to_vec(),
+        b64.as_bytes()
+            .get(2900..3000)
+            .context("short certificate")?
+            .to_vec(),
+    ])
+}
+
 impl AnswerDrop {
-    fn install(sim: &Sim, target: &str) -> Result<Self> {
+    fn install(sim: &Sim, target: &str, holders: &[&str]) -> Result<Self> {
         let machine = sim.ids(target)?.1 .0;
+        let own_seat = format!("\"agent_id\":\"{}\"", hex::encode(sim.ids(target)?.0 .0));
+        let mut needles = Vec::new();
+        for label in holders {
+            let cert = sim
+                .state(label)?
+                .agent
+                .identity()
+                .agent_certificate()
+                .cloned()
+                .with_context(|| format!("{label} has no agent certificate"))?;
+            needles.extend(cert_needles(&cert)?);
+        }
         let held = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
         let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
         sim.fabric().add_rule(move |write: &Write| {
+            let carries_cert = || {
+                !matches!(write.lane.class, crate::network::sim::LaneClass::Stream(_))
+                    && !contains(&write.bytes, own_seat.as_bytes())
+                    && needles.iter().any(|needle| contains(&write.bytes, needle))
+            };
             if rule_held.load(Ordering::SeqCst)
                 && write.lane.dst == machine
-                && contains(&write.bytes, FETCH_RESPONSE_DOMAIN)
+                && (contains(&write.bytes, FETCH_RESPONSE_DOMAIN) || carries_cert())
             {
                 rule_dropped.fetch_add(1, Ordering::SeqCst);
                 Fault::Drop
@@ -394,7 +437,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             "setup: O could not seat {member}"
         );
     }
-    let answers = AnswerDrop::install(sim, "A")?;
+    let answers = AnswerDrop::install(sim, "A", MEMBERS)?;
     for device in ["A", "J"] {
         sim.certify_owner_device("O", device, &owner, &owner_home)
             .await?;
@@ -635,8 +678,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
 async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note(
-        "setup fault: every #946 certificate answer toward A is dropped from A's start \
-         until the holders go offline, so A keeps the seats its seat event omitted \
+        "setup fault: every frame toward A that carries an X certificate (except A's own \
+         seat event) and every #946 answer is dropped from A's start until the holders go \
+         offline, so A keeps the seats its seat event omitted \
          digest-only (ADR 0111 H3: the harness makes the admin's seat digest-only)",
     );
     receipt.note(
