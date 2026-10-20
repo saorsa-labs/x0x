@@ -23,15 +23,15 @@ using the leading 64 bits of the hash and integer arithmetic. It preserves
 the zero-window calculator behavior. A minute value too large to represent
 in whole seconds uses `u64::MAX` seconds as the effective bound.
 
-The Unix startup update check records the first eligible release beside the
-canonical installed binary. The private `upgrade-rollout-<digest>.json`
+The Unix startup, gossip and fallback paths record the first eligible release
+beside the canonical installed binary. The private `upgrade-rollout-<digest>.json`
 receipt binds the actual data and identity roots, MachineId, release version,
 verified manifest digest and archive digest. Duplicate delivery, restart and
 later window changes retain the first choice. Monotonic elapsed time reduces
 the wait; a reboot keeps the last durable remainder and starts a new clock
 epoch. Wall-clock changes do not supply elapsed time.
 
-The startup task releases the apply mutex and install lock while waiting.
+Each waiting operation releases the apply mutex and install lock.
 It waits before writing release content or starting candidate probes, and
 rechecks the receipt and unresolved upgrade records under the install lock.
 Each observation requires a successful record barrier, including a receipt
@@ -39,10 +39,26 @@ that already says the delay is complete. Unknown or damaged records remain
 in place and refuse this apply; they do not block normal daemon startup.
 Shutdown or loss of the task cancels work before mutation admission.
 
-This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
-the fleet minimum, complete host inventory and transaction-bound guide
-installation remain separate M2 work. It does not claim that every apply
-path already honors the configured window.
+The compiled deployment inventory sets a minimum 60-minute window for a
+known or ambiguous production fleet install. An existing receipt below that
+minimum refuses apply and remains intact. Ordinary installs retain an
+explicit zero window. Only the compiled debug test key permits the fleet
+rehearsal exception.
+
+Selecting a newer eligible release requires a durable supersession record.
+An older waiter cannot then apply its release. The previous receipt remains
+intact; supersession does not delete it or reset the selected release's wait.
+
+Gossip and fallback discovery share one bounded pending release and continue
+to receive announcements during a wait. The worker drains a superseded
+operation before starting the newer release. Cancellation is checked after
+the install lock is acquired, before queued work can write records.
+An admitted replacement retains its restart continuation.
+
+HTTP waits, complete host inventory and transaction-bound guide installation
+remain separate M2 work. Shutdown closes background intake and withdraws
+pre-admission writes; it does not claim every blocking operation is reaped
+before shutdown returns.
 
 ### Candidate execution probes (M2 S2d)
 
@@ -74,8 +90,8 @@ unknown state.
 A durably recorded timeout or host fault permits at most three fresh retry
 transactions, after 30, 60 and 120 minutes. Retry timers release the apply
 mutex, observe daemon shutdown and reread the record before each attempt.
-HTTP apply returns its refusal without waiting through this backoff. Normal
-startup discovery can resume a pending wait after it verifies the release
+HTTP apply returns its refusal without waiting through this backoff. Startup
+and background discovery can resume a pending wait after verifying the release
 manifest again. Boot identity and monotonic time prevent a wall-clock change
 or daemon restart from shortening the recorded wait.
 
