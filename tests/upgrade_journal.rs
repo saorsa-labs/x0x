@@ -155,6 +155,26 @@ fn legacy_helper_refuses_other_record_kinds_and_preserves_bytes() {
     }
 }
 
+#[test]
+fn handoff_writer_refuses_to_overwrite_unknown_or_corrupt_records() {
+    for bytes in [
+        b"{\"from_version\":".as_slice(),
+        br#"{"schema_version":99,"record_kind":"legacy_handoff"}"#.as_slice(),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(HANDOFF_FILE_NAME);
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = legacy_handoff(dir.path(), "0.48.3").write(&path);
+
+        assert!(
+            result.is_err(),
+            "a writer must preserve the refused record for diagnosis"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
 fn assert_diagnostic_only(records: &journal::BootRecords) {
     assert!(
         records.configured_start_allowed(),
