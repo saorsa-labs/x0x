@@ -36,6 +36,59 @@ pub(crate) struct ArtifactPlan {
     pub candidate_sha256: [u8; 32],
 }
 
+/// Names match the released restart-plan modes. LauncherChild is reserved
+/// for S3; reading it does not establish a loaded launcher binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RestartOwner {
+    TransactionalHandoff,
+    SupervisedExit,
+    LauncherChild,
+}
+
+/// These fields match the existing launchd diagnostic record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaunchdBinding {
+    pub label: String,
+    pub domain: String,
+}
+
+/// These fields match the existing systemd diagnostic record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SystemdBinding {
+    pub unit: String,
+    pub user_manager: bool,
+    pub restart: String,
+    pub template_version: Option<u32>,
+}
+
+/// Captured launcher identity, distinct from the participant child identity.
+/// Stopped jobs may have no live launcher PID/start-time pair. A later
+/// coordinator must verify this binding against the actual loaded job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LauncherBinding {
+    pub executable: PathBuf,
+    pub argv: Vec<String>,
+    pub pid: Option<u32>,
+    pub process_start: Option<u64>,
+    pub boot_id: String,
+    /// The manager's launcher-exit policy is separate from child upgrade exit.
+    pub manager_exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestartBinding {
+    pub mode: RestartOwner,
+    pub supervised_exit_code: Option<i32>,
+    pub supervision_signal: Option<String>,
+    pub launchd_verified: Option<LaunchdBinding>,
+    pub systemd_verified: Option<SystemdBinding>,
+    pub launcher: Option<LauncherBinding>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Participant {
@@ -44,6 +97,10 @@ pub(crate) struct Participant {
     pub data_root: PathBuf,
     pub identity_root: PathBuf,
     pub argv: Vec<String>,
+    pub cwd: PathBuf,
+    /// Captured approved environment, not a new read of process state.
+    pub env: BTreeMap<String, String>,
+    pub restart: RestartBinding,
     pub old_pid: Option<u32>,
     pub process_start: Option<u64>,
     pub boot_id: String,
@@ -358,13 +415,15 @@ fn validate_journal(record: &JournalRecord) -> io::Result<()> {
         if !instances.insert(&participant.instance_id) {
             return Err(invalid("duplicate participant"));
         }
-        for path in [
-            &participant.executable,
+        absolute_path(&participant.executable)?;
+        for directory in [
             &participant.data_root,
             &participant.identity_root,
+            &participant.cwd,
         ] {
-            absolute_path(path)?;
+            absolute_directory(directory)?;
         }
+        validate_restart_binding(&participant.restart)?;
         if participant.executable != record.plan.daemon.target_path {
             return Err(invalid(
                 "participant executable differs from frozen install",
@@ -381,9 +440,46 @@ fn validate_journal(record: &JournalRecord) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_restart_binding(binding: &RestartBinding) -> io::Result<()> {
+    if let Some(signal) = &binding.supervision_signal {
+        nonempty(signal)?;
+    }
+    if let Some(launchd) = &binding.launchd_verified {
+        nonempty(&launchd.label)?;
+        nonempty(&launchd.domain)?;
+    }
+    if let Some(systemd) = &binding.systemd_verified {
+        nonempty(&systemd.unit)?;
+        nonempty(&systemd.restart)?;
+    }
+    if let Some(launcher) = &binding.launcher {
+        absolute_path(&launcher.executable)?;
+        nonempty(&launcher.boot_id)?;
+        if launcher.argv.is_empty()
+            || launcher.pid == Some(0)
+            || launcher.pid.is_some() != launcher.process_start.is_some()
+        {
+            return Err(invalid("launcher process identity is incomplete"));
+        }
+    }
+    // Optional observations remain optional for direct jobs. Complete loaded
+    // binding, ownership and policy checks belong to the future coordinator.
+    if binding.mode == RestartOwner::LauncherChild && binding.launcher.is_none() {
+        return Err(invalid("launcher-owned participant has no launcher record"));
+    }
+    Ok(())
+}
+
 fn absolute_path(path: &Path) -> io::Result<()> {
+    absolute_directory(path)?;
+    if path.file_name().is_none() {
+        return Err(invalid("record file path has no file name"));
+    }
+    Ok(())
+}
+
+fn absolute_directory(path: &Path) -> io::Result<()> {
     if !path.is_absolute()
-        || path.file_name().is_none()
         || path
             .components()
             .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
