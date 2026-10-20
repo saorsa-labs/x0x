@@ -507,6 +507,144 @@ async fn diag_a_member_joined_path(sim: &Sim, gid: &str) {
     }
 }
 
+// DIAG #1364 (do not merge): A's owner-cert verdict view of G, one line per
+// active member, plus whether J's announce cache holds A's digest-only
+// seat digests. Never fails; errors print as a W3H-DIAG line.
+async fn diag_a_verdict(sim: &Sim, gid: &str, tag: &str) {
+    let lines = match diag_a_verdict_lines(sim, gid, tag).await {
+        Ok(lines) => lines,
+        Err(error) => vec![format!("W3H-DIAG VERDICT {tag} failed: {error:#}")],
+    };
+    for line in lines {
+        eprintln!("{line}"); // DIAG #1364
+    }
+}
+
+// DIAG #1364 (do not merge)
+async fn diag_a_verdict_lines(sim: &Sim, gid: &str, tag: &str) -> Result<Vec<String>> {
+    let a = sim.state("A")?;
+    let j = sim.state("J").ok();
+    let labels: Vec<(String, String)> = LABELS
+        .iter()
+        .filter_map(|label| Some((sim.agent_hex(label).ok()?, (*label).to_string())))
+        .collect();
+    let gid = gid.to_string();
+    let tag = tag.to_string();
+    sim.at_instant("DIAG: A's owner-cert verdict view of G", async move {
+        let label_of = |hex: &str| {
+            labels
+                .iter()
+                .find(|(h, _)| h.eq_ignore_ascii_case(hex))
+                .map_or_else(|| "?".to_string(), |(_, l)| l.clone())
+        };
+        let hex8 = |hex: &str| hex.get(..8).unwrap_or(hex).to_string();
+        let info = {
+            let groups = a.named_groups.read().await;
+            let (_, info) = crate::server::resolve_group_entry_locked(&groups, &gid)
+                .context("A has no entry for G")?;
+            info.clone()
+        };
+        let local_hex = hex::encode(a.agent.agent_id().as_bytes());
+        let mut agents: Vec<String> = info.active_members().map(|m| m.agent_id.clone()).collect();
+        if !agents.iter().any(|x| x.eq_ignore_ascii_case(&local_hex)) {
+            agents.push(local_hex);
+        }
+        let with_digests: Vec<(String, Option<String>)> = agents
+            .into_iter()
+            .map(|agent| {
+                let digest = info
+                    .members_v2
+                    .get(&agent)
+                    .and_then(|seat| seat.certificate_digest.clone());
+                (agent, digest)
+            })
+            .collect();
+        let evidence = crate::server::routes::named_groups::owner_cert_evidence_for_with_digests(
+            &a,
+            &with_digests,
+        )
+        .await;
+        let anonymous = crate::announce_v3::anonymous_cert_digest();
+        let home_scope = info.is_home_scope();
+        let mut clone = info.clone();
+        let per_member = clone.owner_cert_verdict(&evidence).per_member;
+        let mut lines = Vec::new();
+        let mut digest_only = Vec::new();
+        for seat in info.active_members() {
+            let hex = seat.agent_id.as_str();
+            let label = label_of(hex);
+            let cert = seat.certificate.as_ref();
+            let digest = seat.certificate_digest.as_ref();
+            let digest_matches = match (cert, digest) {
+                (Some(cert), Some(digest)) => {
+                    crate::groups::owner_cert::certificate_digest_hex(cert)
+                        .eq_ignore_ascii_case(digest)
+                }
+                _ => false,
+            };
+            if cert.is_none() {
+                if let Some(digest) = digest {
+                    digest_only.push((label.clone(), digest.clone()));
+                }
+            }
+            let status = per_member
+                .get(hex)
+                .map_or_else(|| "absent".to_string(), |status| format!("{status:?}"));
+            let announced = evidence.digest_for(hex);
+            let announced_hex8 =
+                announced.map_or_else(|| "none".to_string(), |bytes| hex8(&hex::encode(bytes)));
+            let announced_is_anonymous = announced == Some(anonymous);
+            let announced_eq_embedded = match (announced, cert) {
+                (Some(announced), Some(cert)) => {
+                    announced
+                        == crate::announce_v3::cert_digest(
+                            &cert.user_id().ok(),
+                            &Some(cert.clone()),
+                        )
+                }
+                _ => false,
+            };
+            let a_cache_holds = match digest.and_then(|d| parse_digest(d)) {
+                Some(bytes) => a
+                    .agent
+                    .announce_blob_cache
+                    .find_by_cert_digest(&bytes)
+                    .await
+                    .is_some(),
+                None => false,
+            };
+            lines.push(format!(
+                "W3H-DIAG VERDICT {tag} member {label} {} has_cert={} has_digest={} \
+                 digest_matches_cert={digest_matches} status={status} evidence_cert={} \
+                 announced={announced_hex8} announced_is_anonymous={announced_is_anonymous} \
+                 announced_eq_embedded={announced_eq_embedded} anonymous_from_bound_machine={} \
+                 home_scope={home_scope} a_cache_holds_seat_digest={a_cache_holds} \
+                 certificate_missing_since_ms={:?}",
+                hex8(hex),
+                cert.is_some(),
+                digest.is_some(),
+                evidence.cert_for(hex).is_some(),
+                evidence.anonymous_from_bound_machine(hex),
+                seat.certificate_missing_since_ms,
+            ));
+        }
+        for (label, digest) in digest_only {
+            let holds = match (&j, parse_digest(&digest)) {
+                (Some(j), Some(bytes)) => j
+                    .agent
+                    .announce_blob_cache
+                    .find_by_cert_digest(&bytes)
+                    .await
+                    .is_some(),
+                _ => false,
+            };
+            lines.push(format!("W3H-DIAG VERDICT {tag} J-holds {label} {holds}"));
+        }
+        Ok(lines)
+    })
+    .await?
+}
+
 /// The member list of a `pending certificate resolution` refusal, as hex.
 fn refused_members(text: &str) -> Option<Vec<String>> {
     let start = text.find(PENDING_CAUSE)? + PENDING_CAUSE.len();
@@ -562,6 +700,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     )
     .await?;
     let before = seat_view(sim, "A", &home.gid).await?;
+    diag_a_verdict(sim, &home.gid, "before-restart").await; // DIAG #1364
     let missing: Vec<String> = before.digest_only.values().cloned().collect();
     let owner_hex = sim.agent_hex("O")?;
     receipt.evidence(
@@ -663,6 +802,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         "INFRA: A never verified J's machine binding after A's restart"
     );
     receipt.setup_done(at(sim));
+    diag_a_verdict(sim, &home.gid, "after-restart").await; // DIAG #1364
 
     let after = seat_view(sim, "A", &home.gid).await?;
     receipt.evidence(
@@ -731,6 +871,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let (watcher, received) = watch_join_requests(sim, &home.gid)?;
     join(sim, "J", &home, &link).await?;
     let j_admitted = admitted(sim, "A", "J", &home.gid, JOIN_BUDGET).await?;
+    if j_admitted {
+        diag_a_verdict(sim, &home.gid, "end-admitted").await; // DIAG #1364
+    }
     drop(watcher);
     let received = std::mem::take(
         &mut *received
@@ -809,6 +952,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 eprintln!("W3H-DIAG @{}us {}", log.at.as_micros(), log.text);
             }
         }
+        diag_a_verdict(sim, &home.gid, "end").await; // DIAG #1364
         diag_a_member_joined_path(sim, &home.gid).await; // DIAG #1364
         let a_rows = roster(sim, "A", &home.gid).await.unwrap_or_default();
         let j_state = membership_state(sim, "J", &home.gid).await.ok().flatten();
