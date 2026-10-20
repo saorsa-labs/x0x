@@ -69,17 +69,31 @@
 //!   `/groups/{gid}/join-status` at J. It reads A's roster from
 //!   `/groups/{gid}/members`. Every read must answer with the expected
 //!   HTTP status and body shape; any other answer is INFRA, never a
-//!   verdict. A typed wait is a parsed JSON object, not a substring: an
-//!   object whose tag field (`state`, `status`, `cause`, `type`,
-//!   `join_state` or `wait`) is exactly the state name, or an object keyed
-//!   by the state name, with its own `digest` or `digests` field. Each
-//!   digest must decode to 32 bytes (hex or base64). Subtrees under
-//!   `error` and `message` are not read. A shows `evidence_pending` when
+//!   verdict. Each value that a verdict reads is a closed set (ADR 0025):
+//!   `join_state` is `pending_authority_commit`, `idle` or
+//!   `awaiting_evidence`; `last_join_outcome` is null, or an object whose
+//!   `outcome` is `refused`, `timed_out` or `seated` and whose
+//!   `finished_at_ms` is a non-negative integer; `membership_state` is
+//!   `active`, `pending`, `pending_authority_commit` or `not_member`. Any
+//!   other value is INFRA. A `seated` outcome ends J's attempt and counts
+//!   as an admission. A typed wait is a parsed JSON object, not a
+//!   substring: an object whose tag field (`state`, `status`, `cause`,
+//!   `type`, `join_state` or `wait`) is exactly the state name, or an
+//!   object keyed by the state name, with its own `digest` or `digests`
+//!   field. Each digest must decode to 32 bytes (hex or base64). Subtrees
+//!   under `error` and `message` are not read. A shows `evidence_pending` when
 //!   the digests of its typed objects are exactly the missing set. J shows
 //!   `awaiting_evidence` when one typed object names exactly the missing
 //!   set. An S5 implementation must expose the typed states on one of
-//!   these routes. Evidence (red test only): J is not admitted during the
-//!   gap, and A holds none of the missing bytes at its end. On `main`, A's
+//!   these routes. Each typed wait must stay visible; seen once is not
+//!   enough. A's wait begins at A's first verified join message from J.
+//!   A must show `evidence_pending` at every poll after that, through the
+//!   last gap poll. J must show `awaiting_evidence` at every poll after
+//!   the first poll at which A showed its typed wait, through the last gap
+//!   poll. Each rule needs at least one such poll. The receipt names the
+//!   first poll at which a typed wait was absent. Evidence (red test
+//!   only): J is not admitted during the gap, and A holds none of the
+//!   missing bytes at its end. On `main`, A's
 //!   seal refuses with `OwnerCertMemberPending` naming exactly A's
 //!   digest-only seats, and A and J show no typed state.
 //! - After the gap (red test only, ADR 0111 H3): the X device that holds
@@ -94,7 +108,8 @@
 //! - `w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes`:
 //!   every eligible holder is offline, then one returns. FINAL
 //!   `typed_retryable_wait_then_j_active_after_holder_returns` needs A's
-//!   typed `evidence_pending`, J's typed `awaiting_evidence`, no end of J's
+//!   typed `evidence_pending` and J's typed `awaiting_evidence`, each at
+//!   every poll of its span, no end of J's
 //!   attempt and no terminal refusal during the gap, A's bytes within 60 s
 //!   of the return and J Active after it. RED on `main`. The cause is the
 //!   `OwnerCertMemberPending` refusal above, with no typed wait at A or J.
@@ -501,10 +516,18 @@ async fn admitted(
             if !rows.iter().any(|(id, _)| *id == member_hex) {
                 return false;
             }
-            let Some(state) = seen.observe(membership_state(s, member, gid)).await else {
+            // An unknown membership_state is a failed read, not "not active".
+            let read = async {
+                membership_state(s, member, gid)
+                    .await?
+                    .as_deref()
+                    .map(Membership::parse)
+                    .transpose()
+            };
+            let Some(state) = seen.observe(read).await else {
                 return true;
             };
-            state.as_deref() == Some("active")
+            state == Some(Membership::Active)
         })
         .await;
     match ready {
@@ -802,19 +825,112 @@ fn shows_one(body: &serde_json::Value, state: &str, want: &BTreeSet<[u8; 32]>) -
     typed_digest_sets(body, state).iter().any(|set| set == want)
 }
 
+/// J's `join_state` on a 200 join-status body. The set is closed: any
+/// other value is an error, never a verdict (ADR 0025).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinState {
+    /// `main`: J's attempt waits for the authority.
+    PendingAuthorityCommit,
+    /// `main`: J has no pending attempt.
+    Idle,
+    /// S5: J's typed wait reported as the join state (ADR 0111 §8).
+    AwaitingEvidence,
+}
+
+impl JoinState {
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            JOIN_PENDING => Ok(Self::PendingAuthorityCommit),
+            "idle" => Ok(Self::Idle),
+            AWAITING_EVIDENCE => Ok(Self::AwaitingEvidence),
+            other => bail!("unsupported join_state {other:?}"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::PendingAuthorityCommit => JOIN_PENDING,
+            Self::Idle => "idle",
+            Self::AwaitingEvidence => AWAITING_EVIDENCE,
+        }
+    }
+}
+
+/// The `outcome` of J's `last_join_outcome`. The set is closed: any other
+/// value is an error. `main` records `refused` and `timed_out` only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutcomeKind {
+    Refused,
+    TimedOut,
+    /// Not recorded on `main`. It ends the attempt and claims admission.
+    Seated,
+}
+
+impl OutcomeKind {
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "refused" => Ok(Self::Refused),
+            "timed_out" => Ok(Self::TimedOut),
+            "seated" => Ok(Self::Seated),
+            other => bail!("unsupported last_join_outcome.outcome {other:?}"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::TimedOut => "timed_out",
+            Self::Seated => "seated",
+        }
+    }
+}
+
+/// J's `membership_state` on a 200 `/groups/{gid}` body
+/// (`local_join_membership_state`). The set is closed: any other value
+/// is an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Membership {
+    Active,
+    Pending,
+    PendingAuthorityCommit,
+    NotMember,
+}
+
+impl Membership {
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "active" => Ok(Self::Active),
+            "pending" => Ok(Self::Pending),
+            JOIN_PENDING => Ok(Self::PendingAuthorityCommit),
+            "not_member" => Ok(Self::NotMember),
+            other => bail!("unsupported membership_state {other:?}"),
+        }
+    }
+}
+
 /// J's `last_join_outcome`.
+#[derive(Debug)]
 struct JoinOutcome {
-    outcome: String,
+    kind: OutcomeKind,
+    /// Display only.
     reason: Option<String>,
 }
 
 impl JoinOutcome {
     fn text(&self) -> String {
         match &self.reason {
-            Some(reason) => format!("{} ({reason})", self.outcome),
-            None => self.outcome.clone(),
+            Some(reason) => format!("{} ({reason})", self.kind.name()),
+            None => self.kind.name().to_string(),
         }
     }
+}
+
+/// One parsed J join-status read.
+#[derive(Debug)]
+struct JoinStatus {
+    /// `None` when join-status answered 404 (the local stub is gone).
+    join_state: Option<JoinState>,
+    outcome: Option<JoinOutcome>,
 }
 
 /// One read of the wait states of A and J during the holder gap.
@@ -826,7 +942,7 @@ struct Snapshot {
     a_lists_j: bool,
     j_active: bool,
     /// J's `join_state`; `None` when join-status answered 404.
-    join_state: Option<String>,
+    join_state: Option<JoinState>,
     /// J's join-status answered 404: the local stub is gone.
     stub_gone: bool,
     /// J's `last_join_outcome`.
@@ -857,28 +973,82 @@ fn str_field<'a>(
 }
 
 /// The `last_join_outcome` of a join-status body: absent or null, or an
-/// object with a string `outcome` and an optional string `reason`. Any
-/// other shape is an error.
-fn join_outcome(
-    path: &str,
-    body: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<JoinOutcome>> {
+/// object with a known `outcome`, a `reason` that is null or a string,
+/// and a `finished_at_ms` that is a non-negative integer. Any other shape
+/// or value is an error.
+fn join_outcome(body: &serde_json::Map<String, serde_json::Value>) -> Result<Option<JoinOutcome>> {
     let last = match body.get("last_join_outcome") {
         None | Some(serde_json::Value::Null) => return Ok(None),
         Some(serde_json::Value::Object(last)) => last,
-        Some(other) => bail!("J GET {path}: last_join_outcome is not an object: {other}"),
+        Some(other) => bail!("last_join_outcome is not an object: {other}"),
     };
     let outcome = str_field(last, "outcome")
-        .with_context(|| format!("J GET {path}: last_join_outcome has no outcome: {last:?}"))?;
+        .with_context(|| format!("last_join_outcome has no outcome: {last:?}"))?;
+    let kind = OutcomeKind::parse(outcome)?;
     let reason = match last.get("reason") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(reason)) => Some(reason.clone()),
-        Some(other) => bail!("J GET {path}: reason is not a string: {other}"),
+        Some(other) => bail!("reason is not a string: {other}"),
     };
-    Ok(Some(JoinOutcome {
-        outcome: outcome.to_string(),
-        reason,
-    }))
+    ensure!(
+        last.get("finished_at_ms")
+            .is_some_and(serde_json::Value::is_u64),
+        "finished_at_ms is not a non-negative integer: {last:?}"
+    );
+    Ok(Some(JoinOutcome { kind, reason }))
+}
+
+/// Parse J's `/groups/{gid}/join-status` answer. 200 needs a known
+/// `join_state`. 404 needs the handler's `group_not_found` body with no
+/// `join_state`. Both need a valid `last_join_outcome`. Any other status,
+/// shape or value is an error.
+fn parse_join_status(
+    status: StatusCode,
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Result<JoinStatus> {
+    let join_state = if status == StatusCode::OK {
+        let text =
+            str_field(body, "join_state").with_context(|| format!("no join_state: {body:?}"))?;
+        Some(JoinState::parse(text)?)
+    } else {
+        ensure!(
+            status == StatusCode::NOT_FOUND
+                && str_field(body, "error") == Some("group_not_found")
+                && !body.contains_key("join_state"),
+            "{status} {body:?}"
+        );
+        None
+    };
+    Ok(JoinStatus {
+        join_state,
+        outcome: join_outcome(body)?,
+    })
+}
+
+/// Parse J's `/groups/{gid}` answer: 200 for `gid` with a known
+/// `membership_state`, or the handler's 404 `group not found` body
+/// (`None`). Any other status, shape or value is an error.
+fn parse_membership(
+    gid: &str,
+    status: StatusCode,
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<Membership>> {
+    if status == StatusCode::OK {
+        ensure!(
+            str_field(body, "group_id") == Some(gid),
+            "wrong group: {body:?}"
+        );
+        let text = str_field(body, "membership_state")
+            .with_context(|| format!("no membership_state: {body:?}"))?;
+        return Membership::parse(text).map(Some);
+    }
+    ensure!(
+        status == StatusCode::NOT_FOUND
+            && body.get("ok") == Some(&serde_json::Value::Bool(false))
+            && str_field(body, "error") == Some("group not found"),
+        "{status} {body:?}"
+    );
+    Ok(None)
 }
 
 /// How many #946 terminal refusals (`TERMINAL_REASON`) A recorded for G,
@@ -933,42 +1103,13 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
         .iter()
         .any(|(id, _)| id.eq_ignore_ascii_case(&j_hex));
     let (status, j_group) = get_object(sim, "J", &group_path).await?;
-    let j_membership = if status == StatusCode::OK {
-        ensure!(
-            str_field(&j_group, "group_id") == Some(gid),
-            "J GET {group_path}: wrong group: {j_group:?}"
-        );
-        Some(
-            str_field(&j_group, "membership_state")
-                .with_context(|| format!("J GET {group_path}: no membership_state: {j_group:?}"))?
-                .to_string(),
-        )
-    } else {
-        ensure!(
-            status == StatusCode::NOT_FOUND
-                && j_group.get("ok") == Some(&serde_json::Value::Bool(false))
-                && str_field(&j_group, "error") == Some("group not found"),
-            "J GET {group_path}: {status} {j_group:?}"
-        );
-        None
-    };
+    let j_membership =
+        parse_membership(gid, status, &j_group).with_context(|| format!("J GET {group_path}"))?;
     let (status, join) = get_object(sim, "J", &status_path).await?;
-    let join_state = if status == StatusCode::OK {
-        Some(
-            str_field(&join, "join_state")
-                .with_context(|| format!("J GET {status_path}: no join_state: {join:?}"))?
-                .to_string(),
-        )
-    } else {
-        ensure!(
-            status == StatusCode::NOT_FOUND
-                && str_field(&join, "error") == Some("group_not_found")
-                && !join.contains_key("join_state"),
-            "J GET {status_path}: {status} {join:?}"
-        );
-        None
-    };
-    let outcome = join_outcome(&status_path, &join)?;
+    let JoinStatus {
+        join_state,
+        outcome,
+    } = parse_join_status(status, &join).with_context(|| format!("J GET {status_path}"))?;
     let j_group = serde_json::Value::Object(j_group);
     let join = serde_json::Value::Object(join);
     Ok(Snapshot {
@@ -976,7 +1117,7 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
         j_typed: shows_one(&j_group, AWAITING_EVIDENCE, want)
             || shows_one(&join, AWAITING_EVIDENCE, want),
         a_lists_j,
-        j_active: j_membership.as_deref() == Some("active"),
+        j_active: j_membership == Some(Membership::Active),
         join_state,
         stub_gone: status == StatusCode::NOT_FOUND,
         outcome,
@@ -984,15 +1125,103 @@ async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Sna
     })
 }
 
+/// The typed wait states that one poll saw.
+#[derive(Clone, Copy, Debug)]
+struct PollRecord {
+    /// The poll's time since J's join call.
+    since: Duration,
+    /// A showed typed `evidence_pending` naming exactly the missing set.
+    a_typed: bool,
+    /// J showed typed `awaiting_evidence` naming exactly the missing set.
+    j_typed: bool,
+}
+
+/// Whether a typed wait stayed visible.
+#[derive(Debug, PartialEq, Eq)]
+enum Visibility {
+    /// Visible at each of `polls` polls, the first at `from`.
+    Every { polls: usize, from: Duration },
+    /// The wait never began, for this reason.
+    NoStart(&'static str),
+    /// No poll came after the start at `after`.
+    NoPolls { after: Duration },
+    /// Absent at the poll at `at`, after `seen` polls that showed it.
+    AbsentAt { at: Duration, seen: usize },
+}
+
+impl Visibility {
+    fn ok(&self) -> bool {
+        matches!(self, Self::Every { .. })
+    }
+
+    fn text(&self) -> String {
+        match self {
+            Self::Every { polls, from } => format!(
+                "visible at {polls} of {polls} polls from t2+{}s",
+                from.as_secs()
+            ),
+            Self::NoStart(why) => why.to_string(),
+            Self::NoPolls { after } => format!("no poll after t2+{}s", after.as_secs()),
+            Self::AbsentAt { at, seen } => format!(
+                "absent at t2+{}s, after {seen} polls that showed it",
+                at.as_secs()
+            ),
+        }
+    }
+}
+
+/// Whether `pick` holds at EVERY poll strictly after `after`. There must
+/// be at least one such poll.
+fn continuous_from(
+    polls: &[PollRecord],
+    after: Duration,
+    pick: impl Fn(&PollRecord) -> bool,
+) -> Visibility {
+    let checked: Vec<&PollRecord> = polls.iter().filter(|poll| poll.since > after).collect();
+    let Some(first) = checked.first() else {
+        return Visibility::NoPolls { after };
+    };
+    match checked.iter().enumerate().find(|(_, poll)| !pick(poll)) {
+        Some((seen, poll)) => Visibility::AbsentAt {
+            at: poll.since,
+            seen,
+        },
+        None => Visibility::Every {
+            polls: checked.len(),
+            from: first.since,
+        },
+    }
+}
+
+/// ADR 0111 H3 for A: A shows typed `evidence_pending` at every poll after
+/// its wait began (`a_wait_began`, A's first verified join message from
+/// J, as time since J's join call) through the last gap poll.
+fn a_typed_visibility(polls: &[PollRecord], a_wait_began: Option<Duration>) -> Visibility {
+    match a_wait_began {
+        None => Visibility::NoStart("A never received J's request"),
+        Some(began) => continuous_from(polls, began, |poll| poll.a_typed),
+    }
+}
+
+/// ADR 0111 H3 for J: J shows typed `awaiting_evidence` at every poll
+/// after the first poll at which A showed its typed wait, through the
+/// last gap poll.
+fn j_typed_visibility(polls: &[PollRecord]) -> Visibility {
+    match polls.iter().find(|poll| poll.a_typed) {
+        None => Visibility::NoStart("A never showed its typed wait"),
+        Some(first) => continuous_from(polls, first.since, |poll| poll.j_typed),
+    }
+}
+
 /// What the polls saw, as times since J's join call.
 #[derive(Default)]
 struct WaitWindow {
-    polls: usize,
-    a_typed_at: Option<Duration>,
-    j_typed_at: Option<Duration>,
+    /// Every poll, in order.
+    records: Vec<PollRecord>,
     /// The first poll at which J's attempt had ended, and how.
     j_ended: Option<(Duration, String)>,
-    /// The first poll at which A listed J or J was active.
+    /// The first poll at which A listed J, J was active, or J's outcome
+    /// was `seated`.
     admitted: Option<(Duration, String)>,
     /// The first poll at which J showed neither a pending attempt nor a
     /// typed outcome.
@@ -1004,20 +1233,38 @@ struct WaitWindow {
     terminal_refusal: Option<(Duration, String)>,
     /// At the last poll, J's attempt was pending with no outcome.
     j_pending_now: bool,
-    /// The time of the last poll.
-    last_poll: Option<Duration>,
     /// J's state at each change.
     timeline: Vec<(Duration, String)>,
 }
 
 impl WaitWindow {
+    fn polls(&self) -> usize {
+        self.records.len()
+    }
+
+    /// The time of the last poll.
+    fn last_poll(&self) -> Option<Duration> {
+        self.records.last().map(|poll| poll.since)
+    }
+
+    /// The first poll at which `pick` held.
+    fn first(&self, pick: impl Fn(&PollRecord) -> bool) -> Option<Duration> {
+        self.records
+            .iter()
+            .find(|poll| pick(poll))
+            .map(|poll| poll.since)
+    }
+
     fn record(&mut self, since: Duration, snap: &Snapshot) {
-        self.polls += 1;
-        self.last_poll = Some(since);
+        self.records.push(PollRecord {
+            since,
+            a_typed: snap.a_typed,
+            j_typed: snap.j_typed,
+        });
         let j_refused = snap
             .outcome
             .as_ref()
-            .filter(|outcome| outcome.outcome == "refused");
+            .filter(|outcome| outcome.kind == OutcomeKind::Refused);
         if self.terminal_refusal.is_none() && (j_refused.is_some() || snap.a_terminal > 0) {
             self.terminal_refusal = Some((
                 since,
@@ -1028,31 +1275,33 @@ impl WaitWindow {
                 ),
             ));
         }
-        if snap.a_typed {
-            self.a_typed_at.get_or_insert(since);
-        }
-        if snap.j_typed {
-            self.j_typed_at.get_or_insert(since);
-        }
-        if (snap.a_lists_j || snap.j_active) && self.admitted.is_none() {
+        // A `seated` outcome claims admission, as an Active J does.
+        let j_seated = snap
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Seated);
+        if (snap.a_lists_j || snap.j_active || j_seated) && self.admitted.is_none() {
             self.admitted = Some((
                 since,
-                format!("A lists J: {}; J active: {}", snap.a_lists_j, snap.j_active),
+                format!(
+                    "A lists J: {}; J active: {}; J outcome seated: {j_seated}",
+                    snap.a_lists_j, snap.j_active
+                ),
             ));
         }
         // A correct S5 joiner may report its typed wait as the join state
         // itself (ADR 0111 §8), so that state also counts as pending.
         let pending = snap.j_typed
             || matches!(
-                snap.join_state.as_deref(),
-                Some(JOIN_PENDING | AWAITING_EVIDENCE)
+                snap.join_state,
+                Some(JoinState::PendingAuthorityCommit | JoinState::AwaitingEvidence)
             );
         self.j_pending_now = pending && snap.outcome.is_none();
         let outcome = snap.outcome.as_ref().map(JoinOutcome::text);
         let state = format!(
             "join_state={} outcome={}{}",
-            match (&snap.join_state, snap.stub_gone) {
-                (Some(state), _) => state.as_str(),
+            match (snap.join_state, snap.stub_gone) {
+                (Some(state), _) => state.name(),
                 (None, true) => "stub gone (404)",
                 (None, false) => "none",
             },
@@ -1604,7 +1853,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     Some((since, how)) => format!("at t2+{}s: {how}", since.as_secs()),
                     None => format!(
                         "{} polls over {}s: A never lists J and J is never active",
-                        window.polls,
+                        window.polls(),
                         HOLDER_GAP.as_secs()
                     ),
                 },
@@ -1640,6 +1889,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     holder,
                     missing: &missing,
                     joined_at,
+                    a_wait_began: first_request.map(|at| at.saturating_sub(joined_at)),
                     refusal,
                 },
                 &window,
@@ -1665,6 +1915,9 @@ struct Returning<'a> {
     holder: &'static str,
     missing: &'a [String],
     joined_at: Duration,
+    /// When A's wait began: its first verified join message from J, as
+    /// time since J's join call. `None` when A received none.
+    a_wait_began: Option<Duration>,
     /// A's seal refusal naming exactly its digest-only seats, if logged.
     refusal: Option<String>,
 }
@@ -1683,10 +1936,10 @@ async fn holder_returns(
     // terminal refusal, and never before.
     let gap = sim.fabric().now().saturating_sub(ret.joined_at);
     ensure!(
-        window.last_poll.is_some_and(|last| last >= HOLDER_GAP) && gap >= HOLDER_GAP,
+        window.last_poll().is_some_and(|last| last >= HOLDER_GAP) && gap >= HOLDER_GAP,
         "INFRA: the holder would return at t2+{}s (last poll {}), before the {}s gap",
         gap.as_secs(),
-        at_text(window.last_poll),
+        at_text(window.last_poll()),
         HOLDER_GAP.as_secs()
     );
     // The last read before the return: A's #946 terminal refusals for G.
@@ -1739,16 +1992,20 @@ async fn holder_returns(
     };
     let j_active = admitted(sim, "A", "J", ret.gid, RETURN_ADMIT).await?;
     let ended_in_gap = window.j_ended.clone();
+    // ADR 0111 H3: each typed wait stays visible at every poll, through
+    // the last gap poll. Seen once is not enough.
+    let a_visible = a_typed_visibility(&window.records, ret.a_wait_began);
+    let j_visible = j_typed_visibility(&window.records);
     let parts = [
         (
-            "a_typed_evidence_pending_seen",
-            window.a_typed_at.is_some(),
-            format!("first at {}", at_text(window.a_typed_at)),
+            "a_typed_evidence_pending_every_poll",
+            a_visible.ok(),
+            a_visible.text(),
         ),
         (
-            "j_typed_awaiting_evidence_seen",
-            window.j_typed_at.is_some(),
-            format!("first at {}", at_text(window.j_typed_at)),
+            "j_typed_awaiting_evidence_every_poll",
+            j_visible.ok(),
+            j_visible.text(),
         ),
         (
             "j_attempt_did_not_end_during_the_gap",
@@ -1766,7 +2023,7 @@ async fn holder_returns(
                 None => format!(
                     "none in {} polls over {}s; A {TERMINAL_REASON} refusals for G at the \
                      return: {terminal_before_return}",
-                    window.polls,
+                    window.polls(),
                     HOLDER_GAP.as_secs()
                 ),
             },
@@ -1799,7 +2056,8 @@ async fn holder_returns(
     receipt.note(format!("J's states during the gap: {}", window.timeline()));
     let passed = parts.iter().all(|(_, ok, _)| *ok);
     if !passed {
-        let typed_absent = window.a_typed_at.is_none() && window.j_typed_at.is_none();
+        // The cause on `main`: no poll showed either typed wait.
+        let typed_absent = window.first(|poll| poll.a_typed || poll.j_typed).is_none();
         let summary = format!(
             "J's attempt end: {}; terminal refusal: {}; A held the bytes after the return: \
              {}; J active after the return: {j_active}",
@@ -1848,10 +2106,10 @@ async fn never_return(
         .await?;
     ensure!(
         window
-            .last_poll
+            .last_poll()
             .is_some_and(|last| last >= NEVER_WINDOW && last > HOLDER_GAP),
         "INFRA: the never-return polls ended at {}, before {}s",
-        at_text(window.last_poll),
+        at_text(window.last_poll()),
         NEVER_WINDOW.as_secs()
     );
     let (_, held) = held_digests(sim, "A", gid, missing).await?;
@@ -1859,15 +2117,15 @@ async fn never_return(
         "{} polls over {}s; J admitted: {:?}; J silently dropped: {:?}; A first held \
          bytes: {:?}; A holds {} of {} missing digests at the end; A typed wait first at \
          {}; J typed wait first at {}; first terminal refusal (fail-closed, allowed): {:?}",
-        window.polls,
+        window.polls(),
         NEVER_WINDOW.as_secs(),
         window.admitted,
         window.silent_drop,
         window.a_held,
         held.len(),
         missing.len(),
-        at_text(window.a_typed_at),
-        at_text(window.j_typed_at),
+        at_text(window.first(|poll| poll.a_typed)),
+        at_text(window.first(|poll| poll.j_typed)),
         window.terminal_refusal
     ));
     receipt.note(format!("J's states: {}", window.timeline()));
@@ -1892,11 +2150,14 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
          (/groups/{{gid}}, /members, #946 refusal counter) and J (/groups/{{gid}}, \
          /join-status) every {}s for {}s (the red test, ADR 0111 H3 minute 12, past \
          the {}s terminal refusal) or {}s (the never-return control). Every read must \
-         answer with its route's status and body shape, or the run is INFRA. A typed \
-         wait is a parsed object tagged evidence_pending at A or awaiting_evidence at \
-         J whose own digest/digests fields name exactly the missing digests (ADR 0088 \
-         §1 L3, §2 item 8; ADR 0111 §8, H3). The holder returns after the gap in the \
-         red test only",
+         answer with its route's status and body shape, and join_state, \
+         last_join_outcome and membership_state must be known values, or the run is \
+         INFRA. A typed wait is a parsed object tagged evidence_pending at A or \
+         awaiting_evidence at J whose own digest/digests fields name exactly the \
+         missing digests (ADR 0088 §1 L3, §2 item 8; ADR 0111 §8, H3). A's typed wait \
+         must show at every poll after A's first verified join message from J, and \
+         J's at every poll after A's first typed poll, through the last gap poll. The \
+         holder returns after the gap in the red test only",
         arm.final_name(),
         POLL.as_secs(),
         HOLDER_GAP.as_secs(),
@@ -2084,4 +2345,278 @@ fn w3h_1023_typed_externally_tagged_form_matches() {
     assert!(shows_one(&body, AWAITING_EVIDENCE, &want));
     let authority = json!({"evidence_pending": {"digest": one}, "more": [{"evidence_pending": {"digest": two}}]});
     assert!(shows_all(&authority, EVIDENCE_PENDING, &want));
+}
+
+/// Poll records every 5 s from t2+5s: `a` and `j` give the typed flags of
+/// each poll.
+#[cfg(test)]
+fn polls(a: &[bool], j: &[bool]) -> Vec<PollRecord> {
+    a.iter()
+        .zip(j)
+        .enumerate()
+        .map(|(index, (&a_typed, &j_typed))| PollRecord {
+            since: secs(5 * (index as u64 + 1)),
+            a_typed,
+            j_typed,
+        })
+        .collect()
+}
+
+#[test]
+fn w3h_1023_cont_typed_at_every_poll_passes() {
+    // A's wait begins at t2+2s; A shows its typed wait from the first poll
+    // after that, J from the poll after A's first.
+    let records = polls(&[true; 6], &[false, true, true, true, true, true]);
+    assert_eq!(
+        a_typed_visibility(&records, Some(secs(2))),
+        Visibility::Every {
+            polls: 6,
+            from: secs(5)
+        }
+    );
+    assert_eq!(
+        j_typed_visibility(&records),
+        Visibility::Every {
+            polls: 5,
+            from: secs(10)
+        }
+    );
+}
+
+#[test]
+fn w3h_1023_disappearance_of_a_for_one_poll_fails() {
+    let records = polls(
+        &[true, true, false, true, true],
+        &[false, true, true, true, true],
+    );
+    assert_eq!(
+        a_typed_visibility(&records, Some(secs(2))),
+        Visibility::AbsentAt {
+            at: secs(15),
+            seen: 2
+        }
+    );
+    assert!(j_typed_visibility(&records).ok());
+}
+
+#[test]
+fn w3h_1023_disappearance_of_j_for_one_poll_fails() {
+    // J's join_state stays pending_authority_commit throughout; that does
+    // not stand in for J's typed wait.
+    let records = polls(&[true; 5], &[false, true, true, false, true]);
+    assert!(a_typed_visibility(&records, Some(secs(2))).ok());
+    assert_eq!(
+        j_typed_visibility(&records),
+        Visibility::AbsentAt {
+            at: secs(20),
+            seen: 2
+        }
+    );
+}
+
+#[test]
+fn w3h_1023_reviewer_seen_once_then_gone_fails_both() {
+    let records = polls(&[false, true, false, false], &[false, true, false, false]);
+    assert_eq!(
+        a_typed_visibility(&records, Some(secs(2))),
+        Visibility::AbsentAt {
+            at: secs(5),
+            seen: 0
+        }
+    );
+    // A first showed its wait at t2+10s; J is absent at the next poll.
+    assert_eq!(
+        j_typed_visibility(&records),
+        Visibility::AbsentAt {
+            at: secs(15),
+            seen: 0
+        }
+    );
+}
+
+#[test]
+fn w3h_1023_late_start_of_a_fails() {
+    // A's wait began at t2+2s, but A shows it only from t2+15s.
+    let records = polls(
+        &[false, false, true, true, true],
+        &[false, false, false, true, true],
+    );
+    assert_eq!(
+        a_typed_visibility(&records, Some(secs(2))),
+        Visibility::AbsentAt {
+            at: secs(5),
+            seen: 0
+        }
+    );
+}
+
+#[test]
+fn w3h_1023_cont_no_start_or_no_polls_fails() {
+    let records = polls(&[true; 3], &[true; 3]);
+    assert!(matches!(
+        a_typed_visibility(&records, None),
+        Visibility::NoStart(_)
+    ));
+    assert_eq!(
+        a_typed_visibility(&records, Some(secs(15))),
+        Visibility::NoPolls { after: secs(15) }
+    );
+    // A never typed: J fails as well.
+    let records = polls(&[false; 3], &[true; 3]);
+    assert!(matches!(
+        j_typed_visibility(&records),
+        Visibility::NoStart(_)
+    ));
+    // A typed only at the last poll: no J poll is after it.
+    let records = polls(&[false, false, true], &[true; 3]);
+    assert_eq!(
+        j_typed_visibility(&records),
+        Visibility::NoPolls { after: secs(15) }
+    );
+}
+
+#[cfg(test)]
+fn object(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(object) => object,
+        other => panic!("not an object: {other}"),
+    }
+}
+
+#[test]
+fn w3h_1023_closed_join_status_rejects_unknown_outcome() {
+    let body = object(json!({
+        "join_state": "idle",
+        "last_join_outcome": {"outcome": "garbage", "reason": null, "finished_at_ms": 1},
+    }));
+    assert!(parse_join_status(StatusCode::OK, &body).is_err());
+    let gone = object(json!({
+        "error": "group_not_found",
+        "last_join_outcome": {"outcome": "garbage", "reason": null, "finished_at_ms": 1},
+    }));
+    assert!(parse_join_status(StatusCode::NOT_FOUND, &gone).is_err());
+}
+
+#[test]
+fn w3h_1023_closed_join_status_rejects_unknown_join_state() {
+    let body = object(json!({"join_state": "weird", "last_join_outcome": null}));
+    assert!(parse_join_status(StatusCode::OK, &body).is_err());
+    let missing = object(json!({"last_join_outcome": null}));
+    assert!(parse_join_status(StatusCode::OK, &missing).is_err());
+}
+
+#[test]
+fn w3h_1023_closed_join_status_rejects_bad_finished_at_ms() {
+    for finished in [json!("1"), json!(-1), json!(1.5), json!(null)] {
+        let body = object(json!({
+            "join_state": "idle",
+            "last_join_outcome": {"outcome": "refused", "reason": null, "finished_at_ms": finished},
+        }));
+        assert!(
+            parse_join_status(StatusCode::OK, &body).is_err(),
+            "{body:?}"
+        );
+    }
+    let missing = object(json!({
+        "join_state": "idle",
+        "last_join_outcome": {"outcome": "refused", "reason": null},
+    }));
+    assert!(parse_join_status(StatusCode::OK, &missing).is_err());
+}
+
+#[test]
+fn w3h_1023_closed_join_status_parses_known_values() {
+    for (text, state) in [
+        (
+            "pending_authority_commit",
+            JoinState::PendingAuthorityCommit,
+        ),
+        ("idle", JoinState::Idle),
+        ("awaiting_evidence", JoinState::AwaitingEvidence),
+    ] {
+        let body = object(json!({"join_state": text, "last_join_outcome": null}));
+        let parsed = parse_join_status(StatusCode::OK, &body).unwrap();
+        assert_eq!(parsed.join_state, Some(state));
+        assert!(parsed.outcome.is_none());
+    }
+    for (text, kind) in [
+        ("refused", OutcomeKind::Refused),
+        ("timed_out", OutcomeKind::TimedOut),
+        ("seated", OutcomeKind::Seated),
+    ] {
+        let body = object(json!({
+            "error": "group_not_found",
+            "last_join_outcome": {"outcome": text, "reason": TERMINAL_REASON, "finished_at_ms": 7},
+        }));
+        let parsed = parse_join_status(StatusCode::NOT_FOUND, &body).unwrap();
+        assert_eq!(parsed.join_state, None);
+        assert_eq!(parsed.outcome.map(|outcome| outcome.kind), Some(kind));
+    }
+    let teapot = object(json!({"join_state": "idle"}));
+    assert!(parse_join_status(StatusCode::IM_A_TEAPOT, &teapot).is_err());
+}
+
+#[test]
+fn w3h_1023_closed_membership_state() {
+    for (text, state) in [
+        ("active", Membership::Active),
+        ("pending", Membership::Pending),
+        (
+            "pending_authority_commit",
+            Membership::PendingAuthorityCommit,
+        ),
+        ("not_member", Membership::NotMember),
+    ] {
+        let body = object(json!({"ok": true, "group_id": "g", "membership_state": text}));
+        assert_eq!(
+            parse_membership("g", StatusCode::OK, &body).unwrap(),
+            Some(state)
+        );
+    }
+    let weird = object(json!({"ok": true, "group_id": "g", "membership_state": "weird"}));
+    assert!(parse_membership("g", StatusCode::OK, &weird).is_err());
+    let wrong = object(json!({"ok": true, "group_id": "h", "membership_state": "active"}));
+    assert!(parse_membership("g", StatusCode::OK, &wrong).is_err());
+    let gone = object(json!({"ok": false, "error": "group not found"}));
+    assert_eq!(
+        parse_membership("g", StatusCode::NOT_FOUND, &gone).unwrap(),
+        None
+    );
+}
+
+#[cfg(test)]
+fn snap(join_state: Option<JoinState>, outcome: Option<OutcomeKind>) -> Snapshot {
+    Snapshot {
+        a_typed: false,
+        j_typed: false,
+        a_lists_j: false,
+        j_active: false,
+        join_state,
+        stub_gone: join_state.is_none(),
+        outcome: outcome.map(|kind| JoinOutcome { kind, reason: None }),
+        a_terminal: 0,
+    }
+}
+
+#[test]
+fn w3h_1023_silent_drop_idle_with_no_outcome_fails_closed() {
+    let mut window = WaitWindow::default();
+    window.record(
+        secs(5),
+        &snap(Some(JoinState::PendingAuthorityCommit), None),
+    );
+    assert!(window.silent_drop.is_none() && window.j_pending_now);
+    window.record(secs(10), &snap(Some(JoinState::Idle), None));
+    assert_eq!(
+        window.silent_drop.as_ref().map(|(at, _)| *at),
+        Some(secs(10))
+    );
+    assert!(!window.j_pending_now);
+    // A typed outcome is not a silent drop; a seated one is an admission.
+    let mut window = WaitWindow::default();
+    window.record(secs(5), &snap(None, Some(OutcomeKind::TimedOut)));
+    assert!(window.silent_drop.is_none() && window.admitted.is_none());
+    window.record(secs(10), &snap(None, Some(OutcomeKind::Seated)));
+    assert_eq!(window.admitted.as_ref().map(|(at, _)| *at), Some(secs(10)));
+    assert_eq!(window.polls(), 2);
 }
