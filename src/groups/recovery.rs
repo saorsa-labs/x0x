@@ -706,8 +706,10 @@ impl ReseatBasis {
 }
 
 /// Is the commit at `(revision, state_hash)` on `info`'s own chain a
-/// removal (not a ban) of `subject_hex`? The commit's retained roster has
-/// the subject Removed, and the previous retained roster had it seated.
+/// removal (not a ban) of `subject_hex`? The retained roster projection
+/// keeps Active and Banned seats only, so the subject is absent from the
+/// commit's projection and Active in its parent's retained projection, and
+/// it is not banned now.
 #[must_use]
 pub fn removal_commit_on_chain(
     info: &GroupInfo,
@@ -722,21 +724,37 @@ pub fn removal_commit_on_chain(
     else {
         return false;
     };
-    let removed_here = entry
-        .roster
-        .get(subject_hex)
-        .is_some_and(|member| member.state == GroupMemberState::Removed);
+    let removed_here = !entry.roster.contains_key(subject_hex);
     let seated_before = info
         .commit_log
         .iter()
-        .find(|prior| prior.commit.revision.saturating_add(1) == revision)
-        .is_none_or(|prior| {
+        .find(|prior| {
+            prior.commit.revision.saturating_add(1) == revision
+                && entry.commit.prev_state_hash.as_deref() == Some(prior.commit.state_hash.as_str())
+        })
+        .is_some_and(|prior| {
             prior
                 .roster
                 .get(subject_hex)
                 .is_some_and(|member| member.state == GroupMemberState::Active)
         });
     removed_here && seated_before && !info.is_banned(subject_hex)
+}
+
+/// The role `subject_hex` held in the parent of its removal commit (§3a
+/// check 7), when that parent is retained.
+#[must_use]
+pub fn role_before_removal(
+    info: &GroupInfo,
+    subject_hex: &str,
+    revision: u64,
+) -> Option<GroupRole> {
+    info.commit_log
+        .iter()
+        .find(|prior| prior.commit.revision.saturating_add(1) == revision)
+        .and_then(|prior| prior.roster.get(subject_hex))
+        .filter(|member| member.state == GroupMemberState::Active)
+        .map(|member| member.role)
 }
 
 // ─── §3 The re-seat authorisation ──────────────────────────────────────────
@@ -1032,6 +1050,318 @@ pub fn decode_message(payload: &[u8]) -> Result<GroupRecoveryMessageV1, Recovery
     Ok(message)
 }
 
+// ─── §4 The S3 sidecar ─────────────────────────────────────────────────────
+
+/// The sidecar directory under the data directory (§4).
+pub const GROUP_RECOVERY_DIR: &str = "group-recovery";
+
+/// The sidecar file extension (§4). S3 loads state only from names that end
+/// exactly in `.grecov`.
+pub const GROUP_RECOVERY_EXTENSION: &str = "grecov";
+
+/// The header family prefix (§4).
+pub const GROUP_RECOVERY_FAMILY: &[u8] = b"X0GRCV";
+
+/// The version-1 header: the family prefix, `1` and a NUL terminator.
+pub const GROUP_RECOVERY_HEADER_V1: &[u8] = b"X0GRCV1\0";
+
+/// The highest sidecar version this binary reads.
+pub const GROUP_RECOVERY_MAX_SUPPORTED_VERSION: u8 = b'1';
+
+/// Why a sidecar file is not loaded (ADR 0108 §5a classes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupRecoveryDecodeError {
+    /// Damage: a missing prefix, a truncated header, a bad version byte, a
+    /// bad terminator, or a version-1 body that does not decode or has
+    /// trailing bytes.
+    Damaged(&'static str),
+    /// A valid header of a higher version (the version byte).
+    NewerFormat(u8),
+}
+
+impl std::fmt::Display for GroupRecoveryDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Damaged(cause) => write!(f, "damaged: {cause}"),
+            Self::NewerFormat(version) => write!(f, "newer format version {}", *version as char),
+        }
+    }
+}
+
+impl std::error::Error for GroupRecoveryDecodeError {}
+
+/// The phase of a subject's re-seat (§3 steps 1 to 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReseatPhase {
+    /// The journal is durable; the staged join runs.
+    Staging,
+    /// The staged record is Active with keys; the swap is due.
+    Swapping,
+}
+
+impl ReseatPhase {
+    /// The typed phase name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Swapping => "swapping",
+        }
+    }
+}
+
+/// The subject's re-seat journal (§3 step 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReseatJournalV1 {
+    /// The verified authorisation.
+    pub authorisation: ReseatAuthorisation,
+    /// The re-seat invite link.
+    pub invite: String,
+    /// BLAKE3 of the full live record (JSON) at journal time.
+    pub record_digest: [u8; 32],
+    /// The journal phase.
+    pub phase: ReseatPhase,
+    /// The live record (JSON) the re-seat replaces; restored on failure.
+    pub live_record: Vec<u8>,
+    /// The live record's TreeKEM snapshot, when it had one.
+    pub live_tree: Option<Vec<u8>>,
+    /// When the journal was written (unix ms).
+    pub started_at_ms: u64,
+}
+
+/// One re-seat authorisation an admin issued (§3; issuer only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedReseatV1 {
+    /// The signed authorisation.
+    pub authorisation: ReseatAuthorisation,
+    /// The minted invite link.
+    pub invite: String,
+    /// When it was issued (unix ms).
+    pub issued_at_ms: u64,
+}
+
+/// One retired record (§3 step 3, §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredRecordV1 {
+    /// Why it was retired (`reseat`).
+    pub cause: String,
+    /// When (unix ms).
+    pub retired_at_ms: u64,
+    /// The retired record (JSON).
+    pub record: Vec<u8>,
+}
+
+/// The S3 sidecar body (§4). Embedded `GroupInfo` records and events are
+/// JSON documents carried as bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRecoveryV1 {
+    /// Incremented by every transition.
+    pub generation: u64,
+    /// ADR 0108 §5a: the `txid`s of the files this one replaced.
+    pub rebuilt_from: Vec<[u8; 16]>,
+    /// The kept served chain (JSON `RetainedCommit`s).
+    pub served_chain: Vec<Vec<u8>>,
+    /// The active ATA.
+    pub active_ata: Option<AdminTerminalAttestation>,
+    /// The queued terminal (JSON metadata event).
+    pub queued_terminal: Option<Vec<u8>>,
+    /// The authoritative record behind an S3 placeholder (JSON).
+    pub authoritative_record: Option<Vec<u8>>,
+    /// The subject's re-seat journal.
+    pub reseat_journal: Option<ReseatJournalV1>,
+    /// The staging record (JSON).
+    pub staging_record: Option<Vec<u8>>,
+    /// The re-seat authorisations this node issued.
+    pub issued_reseats: Vec<IssuedReseatV1>,
+    /// Retired records, newest last, at most [`RETIRED_RECORDS_CAP`].
+    pub retired: Vec<RetiredRecordV1>,
+}
+
+impl GroupRecoveryV1 {
+    /// Nothing is stored: the file may be removed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.served_chain.is_empty()
+            && self.active_ata.is_none()
+            && self.queued_terminal.is_none()
+            && self.authoritative_record.is_none()
+            && self.reseat_journal.is_none()
+            && self.staging_record.is_none()
+            && self.issued_reseats.is_empty()
+            && self.retired.is_empty()
+    }
+
+    /// Keep a retired record, dropping the oldest past the cap.
+    pub fn retire(&mut self, record: RetiredRecordV1) {
+        self.retired.push(record);
+        let excess = self.retired.len().saturating_sub(RETIRED_RECORDS_CAP);
+        self.retired.drain(..excess);
+    }
+}
+
+/// Encode a sidecar file.
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub fn encode_sidecar(body: &GroupRecoveryV1) -> Result<Vec<u8>, postcard::Error> {
+    let mut out = GROUP_RECOVERY_HEADER_V1.to_vec();
+    out.extend(postcard::to_stdvec(body)?);
+    Ok(out)
+}
+
+/// Decode and classify a sidecar file (§4 header layout).
+///
+/// # Errors
+///
+/// The ADR 0108 §5a class.
+pub fn decode_sidecar(bytes: &[u8]) -> Result<GroupRecoveryV1, GroupRecoveryDecodeError> {
+    let family = GROUP_RECOVERY_FAMILY.len();
+    let Some(prefix) = bytes.get(..family) else {
+        return Err(
+            if !bytes.is_empty() && GROUP_RECOVERY_FAMILY.starts_with(bytes) {
+                GroupRecoveryDecodeError::Damaged("truncated_header")
+            } else {
+                GroupRecoveryDecodeError::Damaged("missing_prefix")
+            },
+        );
+    };
+    if prefix != GROUP_RECOVERY_FAMILY {
+        return Err(GroupRecoveryDecodeError::Damaged("missing_prefix"));
+    }
+    let (Some(&version), Some(&terminator), Some(body)) = (
+        bytes.get(family),
+        bytes.get(family + 1),
+        bytes.get(family + 2..),
+    ) else {
+        return Err(GroupRecoveryDecodeError::Damaged("truncated_header"));
+    };
+    if !(b'1'..=b'~').contains(&version) {
+        return Err(GroupRecoveryDecodeError::Damaged("bad_version"));
+    }
+    if terminator != 0 {
+        return Err(GroupRecoveryDecodeError::Damaged("missing_nul"));
+    }
+    if version > GROUP_RECOVERY_MAX_SUPPORTED_VERSION {
+        return Err(GroupRecoveryDecodeError::NewerFormat(version));
+    }
+    let (value, rest) = postcard::take_from_bytes::<GroupRecoveryV1>(body)
+        .map_err(|_| GroupRecoveryDecodeError::Damaged("body_decode"))?;
+    if !rest.is_empty() {
+        return Err(GroupRecoveryDecodeError::Damaged("trailing_bytes"));
+    }
+    Ok(value)
+}
+
+/// The sidecar file name of a group: its stable ID, sanitised, plus the
+/// extension. A stable ID with characters outside `[0-9A-Za-z_-]` is
+/// hashed.
+#[must_use]
+pub fn sidecar_file_name(stable_group_id: &str) -> String {
+    let clean = !stable_group_id.is_empty()
+        && stable_group_id.len() <= 128
+        && stable_group_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    let stem = if clean {
+        stable_group_id.to_string()
+    } else {
+        blake3::hash(stable_group_id.as_bytes())
+            .to_hex()
+            .to_string()
+    };
+    format!("{stem}.{GROUP_RECOVERY_EXTENSION}")
+}
+
+// ─── §2 Pre-Welcome link apply (rule (b)) ──────────────────────────────────
+
+/// The TreeKEM epoch a commit's security binding names
+/// (`treekem:epoch=<n>[:...]`), if any.
+#[must_use]
+pub fn treekem_epoch_of(commit: &crate::groups::state_commit::GroupStateCommit) -> Option<u64> {
+    let binding = commit.security_binding.as_deref()?;
+    let rest = binding.strip_prefix("treekem:epoch=")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Rule (b) (§2, D82): apply one served-chain link state-only on a
+/// pre-Welcome node. The caller has checked the whole served chain with
+/// `validate_alternate_chain` from this node's head, and that the link is
+/// the next hash of an armed attested sequence. This applies every
+/// `validate_apply` check against the current record, refuses a policy
+/// change and a GSS security-binding change, and takes no tree and no
+/// epoch: the TreeKEM commit is skipped.
+///
+/// # Errors
+///
+/// The refusal reason.
+pub fn apply_link_state_only(
+    current: &GroupInfo,
+    link: &crate::groups::state_commit::RetainedCommit,
+) -> Result<GroupInfo, &'static str> {
+    use crate::groups::state_commit as sc;
+    let commit = &link.commit;
+    if commit.prev_state_hash.as_deref() != Some(current.state_hash.as_str()) {
+        return Err("link does not chain from the node's head");
+    }
+    let ctx = sc::ApplyContext {
+        current_state_hash: &current.state_hash,
+        current_revision: current.state_revision,
+        current_withdrawn: current.withdrawn,
+        members_v2: &current.members_v2,
+        group_id: current.stable_group_id(),
+    };
+    sc::validate_apply(&ctx, commit, sc::ActionKind::AdminOrHigher)
+        .map_err(|_| "link fails validate_apply")?;
+    if commit.policy_hash != crate::groups::compute_policy_hash(&current.policy) {
+        return Err("link changes the policy hash");
+    }
+    if current.secure_plane != crate::mls::SecureGroupPlane::TreeKem
+        && commit.security_binding != current.security_binding
+    {
+        return Err("link changes a GSS security binding");
+    }
+    let Some(meta) = link.meta.as_ref() else {
+        return Err("link has no sealed metadata");
+    };
+    if sc::roster_root_of_projection(&link.roster) != commit.roster_root {
+        return Err("link roster does not re-derive its signed root");
+    }
+    let mut next = current.clone();
+    next.apply_reconstructed_roster(&link.roster);
+    next.finalize_adopted_commit_reconstructed(commit, meta, &[])
+        .map_err(|_| "link does not re-derive its signed state hash")?;
+    Ok(next)
+}
+
+/// §2 provisional signer: the promotion path inside the served chain.
+/// Returns the number of leading links (a prefix of the ATA's own
+/// sequence) that end at the first link whose roster makes the signer an
+/// Active admin. The caller has walked `chain` with
+/// `validate_alternate_chain`, which checks every committer against its
+/// predecessor roster. `None` when no such prefix exists, or the walked
+/// hashes differ from the ATA's prefix.
+#[must_use]
+pub fn promotion_prefix(
+    ata: &AdminTerminalAttestation,
+    chain: &[crate::groups::state_commit::RetainedCommit],
+) -> Option<usize> {
+    let signer = &ata.fields.attested_by;
+    for (index, link) in chain.iter().enumerate() {
+        if ata.fields.sequence.get(index) != Some(&link.commit.state_hash) {
+            return None;
+        }
+        let admin = link.roster.get(signer).is_some_and(|member| {
+            member.state == GroupMemberState::Active && member.role.at_least(GroupRole::Admin)
+        });
+        if admin {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,5 +1549,176 @@ mod tests {
         assert_eq!(request_backoff(1), Duration::from_secs(120));
         assert_eq!(request_backoff(6), Duration::from_secs(3600));
         assert_eq!(request_backoff(40), Duration::from_secs(3600));
+    }
+
+    fn signed_group(admin: &AgentKeypair) -> GroupInfo {
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            "d".to_string(),
+            admin.agent_id(),
+            "ab".repeat(16),
+        );
+        for (id, by) in [("m1", true), ("m2", true)] {
+            let hex_id = id.repeat(32);
+            info.add_member(
+                hex_id,
+                GroupRole::Member,
+                by.then(|| hex::encode(admin.agent_id().as_bytes())),
+                None,
+            );
+        }
+        info.seal_commit(admin, 1_000).expect("seal");
+        info
+    }
+
+    #[test]
+    fn chain_position_names_behind_on_chain_forked_and_newer() {
+        let admin = keypair();
+        let mut info = signed_group(&admin);
+        let base_revision = info.state_revision;
+        let base_hash = info.state_hash.clone();
+        info.remove_member(&"m2".repeat(32), None);
+        info.seal_commit(&admin, 2_000).expect("seal removal");
+        info.name = "renamed".to_string();
+        info.seal_commit(&admin, 3_000).expect("seal rename");
+        match chain_position(&info, base_revision, &base_hash) {
+            ChainPosition::Behind {
+                sequence,
+                terminal_revision,
+            } => {
+                assert_eq!(sequence.len(), 2);
+                assert_eq!(sequence.last(), Some(&info.state_hash));
+                assert_eq!(terminal_revision, info.state_revision);
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+        assert_eq!(
+            chain_position(&info, info.state_revision, &info.state_hash),
+            ChainPosition::OnChain
+        );
+        assert_eq!(
+            chain_position(&info, info.state_revision, "sibling"),
+            ChainPosition::NotOnChain
+        );
+        assert_eq!(
+            chain_position(&info, base_revision, "sibling"),
+            ChainPosition::NotOnChain
+        );
+        assert_eq!(
+            chain_position(&info, info.state_revision + 1, "ahead"),
+            ChainPosition::AttesterBehind
+        );
+    }
+
+    #[test]
+    fn served_links_apply_state_only_in_order() {
+        let admin = keypair();
+        let mut info = signed_group(&admin);
+        let base = info.clone();
+        let m2 = "m2".repeat(32);
+        info.remove_member(&m2, None);
+        info.seal_commit(&admin, 2_000).expect("seal removal");
+        info.name = "renamed".to_string();
+        info.seal_commit(&admin, 3_000).expect("seal rename");
+        let links: Vec<_> = info
+            .commit_log
+            .iter()
+            .filter(|entry| entry.commit.revision > base.state_revision)
+            .cloned()
+            .collect();
+        assert_eq!(links.len(), 2);
+        assert!(apply_link_state_only(&base, &links[1]).is_err());
+        let first = apply_link_state_only(&base, &links[0]).expect("removal link");
+        assert!(!first.has_active_member(&m2));
+        let second = apply_link_state_only(&first, &links[1]).expect("rename link");
+        assert_eq!(second.state_hash, info.state_hash);
+        assert_eq!(second.name, "renamed");
+        assert!(removal_commit_on_chain(
+            &info,
+            &m2,
+            links[0].commit.revision,
+            &links[0].commit.state_hash
+        ));
+        assert!(!removal_commit_on_chain(
+            &info,
+            &"m1".repeat(32),
+            links[0].commit.revision,
+            &links[0].commit.state_hash
+        ));
+    }
+
+    #[test]
+    fn link_changing_the_policy_is_refused() {
+        let admin = keypair();
+        let mut info = signed_group(&admin);
+        let base = info.clone();
+        info.policy.read_access = crate::groups::policy::GroupReadAccess::Public;
+        info.seal_commit(&admin, 2_000).expect("seal policy");
+        let link = info
+            .commit_log
+            .iter()
+            .find(|entry| entry.commit.revision == info.state_revision)
+            .cloned()
+            .expect("link");
+        assert_eq!(
+            apply_link_state_only(&base, &link).map(|_| ()),
+            Err("link changes the policy hash")
+        );
+    }
+
+    #[test]
+    fn sidecar_round_trips_and_classifies_damage() {
+        let body = GroupRecoveryV1 {
+            generation: 3,
+            queued_terminal: Some(b"{}".to_vec()),
+            ..GroupRecoveryV1::default()
+        };
+        let bytes = encode_sidecar(&body).expect("encode");
+        assert!(bytes.starts_with(GROUP_RECOVERY_HEADER_V1));
+        assert_eq!(decode_sidecar(&bytes), Ok(body));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_sidecar(&trailing),
+            Err(GroupRecoveryDecodeError::Damaged("trailing_bytes"))
+        );
+        assert_eq!(
+            decode_sidecar(b"X0GRC"),
+            Err(GroupRecoveryDecodeError::Damaged("truncated_header"))
+        );
+        assert_eq!(
+            decode_sidecar(b"nope"),
+            Err(GroupRecoveryDecodeError::Damaged("missing_prefix"))
+        );
+        assert_eq!(
+            decode_sidecar(b"X0GRCV0\0"),
+            Err(GroupRecoveryDecodeError::Damaged("bad_version"))
+        );
+        assert_eq!(
+            decode_sidecar(b"X0GRCV1x"),
+            Err(GroupRecoveryDecodeError::Damaged("missing_nul"))
+        );
+        assert_eq!(
+            decode_sidecar(b"X0GRCV2\0rest"),
+            Err(GroupRecoveryDecodeError::NewerFormat(b'2'))
+        );
+        assert_eq!(sidecar_file_name("abc-1"), "abc-1.grecov");
+        assert!(sidecar_file_name("../x").ends_with(".grecov"));
+        assert!(!sidecar_file_name("../x").contains('/'));
+    }
+
+    #[test]
+    fn treekem_epoch_parses_both_binding_forms() {
+        let admin = keypair();
+        let mut info = signed_group(&admin);
+        info.security_binding = Some("treekem:epoch=7:commit=ab".to_string());
+        let commit = info.seal_commit(&admin, 2_000).expect("seal");
+        assert_eq!(treekem_epoch_of(&commit), Some(7));
+        info.security_binding = Some("treekem:epoch=9".to_string());
+        let commit = info.seal_commit(&admin, 3_000).expect("seal");
+        assert_eq!(treekem_epoch_of(&commit), Some(9));
+        info.security_binding = Some("gss:epoch=2".to_string());
+        let commit = info.seal_commit(&admin, 4_000).expect("seal");
+        assert_eq!(treekem_epoch_of(&commit), None);
     }
 }
