@@ -56,7 +56,7 @@ use crate::identity::{AgentId, AgentKeypair, MachineId};
 use crate::streams::{PeerStream, StreamProtocol};
 use crate::trust::TrustDecision;
 
-pub mod teardown;
+pub(crate) mod teardown;
 
 // Import the ant-quic stream halves under stable names for the bridge helper,
 // plus the ML-DSA-65 sign/verify primitives for ForwardV2 attestation.
@@ -858,14 +858,16 @@ impl ForwardDiagnostics {
         *reasons.entry(reason).or_insert(0) += 1;
     }
     /// Live streams torn down because their authority is gone.
+    #[cfg(test)]
     #[must_use]
-    pub fn torn_down_reauth(&self) -> u64 {
+    pub(crate) fn torn_down_reauth(&self) -> u64 {
         self.torn_down_reauth.load(Ordering::Relaxed)
     }
     /// `torn_down_reauth` by reason (`revoked`, `trust_rejected`,
     /// `target_not_allowed`, ...).
+    #[cfg(test)]
     #[must_use]
-    pub fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
+    pub(crate) fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
         self.torn_down_reasons
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -921,6 +923,9 @@ pub(crate) struct InboundCtx {
     /// ADR-0074 §4 registry of live forward streams (re-checked on every
     /// authority change; see [`teardown`]).
     pub live: Arc<teardown::LiveStreams>,
+    /// Wake the open-stream reauth loop after early registration so a
+    /// revocation that landed in the admit→register gap is applied promptly.
+    pub reauth: Arc<tokio::sync::Notify>,
 }
 
 /// Drive the inbound half of a forward: read the header, run the connect
@@ -1145,31 +1150,48 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
         return;
     }
 
-    // Connect the local loopback target with a bounded timeout.
-    let local = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
-        Ok(Ok(tcp)) => tcp,
-        Ok(Err(e)) => {
-            ctx.fwd_diag.record_connect_failed();
-            tracing::info!(
-                target: "x0x::forward",
-                peer = %hex::encode(peer.as_bytes()),
-                target = %target,
-                error = %e,
-                "inbound forward: local connect failed"
-            );
-            return;
-        }
-        Err(_) => {
-            ctx.fwd_diag.record_connect_failed();
-            tracing::info!(
-                target: "x0x::forward",
-                peer = %hex::encode(peer.as_bytes()),
-                target = %target,
-                "inbound forward: local connect timed out"
-            );
-            return;
-        }
+    // ADR-0074 §4: register before the connect/response window so a
+    // revocation in that gap is visible to the reauth loop (≤5 s), not only
+    // after the 30 s sweep. Kick a pass now; abort if already cancelled.
+    let live = ctx.live.register(gate, authority);
+    ctx.reauth.notify_one();
+    if live.token().is_cancelled() {
+        return;
+    }
+
+    // Connect the local loopback target with a bounded timeout; abort early
+    // if reauth tears the registration down while we wait.
+    let local = tokio::select! {
+        biased;
+        _ = live.token().cancelled() => return,
+        result = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)) => match result {
+            Ok(Ok(tcp)) => tcp,
+            Ok(Err(e)) => {
+                ctx.fwd_diag.record_connect_failed();
+                tracing::info!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(peer.as_bytes()),
+                    target = %target,
+                    error = %e,
+                    "inbound forward: local connect failed"
+                );
+                return;
+            }
+            Err(_) => {
+                ctx.fwd_diag.record_connect_failed();
+                tracing::info!(
+                    target: "x0x::forward",
+                    peer = %hex::encode(peer.as_bytes()),
+                    target = %target,
+                    "inbound forward: local connect timed out"
+                );
+                return;
+            }
+        },
     };
+    if live.token().is_cancelled() {
+        return;
+    }
 
     // Signal connected, then bridge. The connect-allow counter records that
     // the gate admitted this flow.
@@ -1182,10 +1204,9 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
     {
         return;
     }
-    // ADR-0074 §4: register the bridged stream with the gate inputs and the
-    // authority it was admitted under, so a revocation, trust drop, grant
-    // expiry or ACL reload can tear it down while it is still open.
-    let live = ctx.live.register(gate, authority);
+    if live.token().is_cancelled() {
+        return;
+    }
     let (send, recv) = stream.into_split();
     bridge(local, send, recv, live.token()).await;
 }
@@ -1243,7 +1264,11 @@ async fn bridge(
         teardown::bridge_io(&mut tcp_read, &mut tcp_write, &mut recv, &mut send, cancel).await;
     if torn_down {
         teardown::reset_quic(&mut send, &mut recv);
+        // Linger 0 + forget the write half so drop does not send FIN first
+        // (OwnedWriteHalf::drop calls shutdown(Write) unless forgotten). The
+        // read-half drop then closes the socket with RST (ADR-0074 §4).
         teardown::reset_tcp(&tcp_write);
+        tcp_write.forget();
     }
 }
 
@@ -1690,6 +1715,7 @@ impl ForwardService {
                 require_attestation: this.require_attestation,
                 owner_trust: this.agent.owner_trust().clone(),
                 live: Arc::clone(&this.live),
+                reauth: this.agent.stream_reauth_signal(),
             };
             handle_inbound(stream, &inbound_ctx).await;
         });
@@ -1905,6 +1931,19 @@ async fn try_outbound_v2(
             return OutboundOutcome::PeerRejectedV2(tcp);
         }
     };
+    // ADR-0074 §4: register before the header/response window so a trust
+    // loss while waiting still hits the ≤5 s bound.
+    let guard = live.register(
+        teardown::StreamGate::Outbound {
+            peer_agent: *peer_agent,
+            machine: stream.peer(),
+        },
+        teardown::StreamAuthority::PeerTrust,
+    );
+    agent.stream_reauth_signal().notify_one();
+    if guard.token().is_cancelled() {
+        return OutboundOutcome::Done;
+    }
 
     // ADR-0043 AgentSigningGate (review r2 C2): the V2 attestation is an
     // agent-key signature — a quiesced/quarantined machine produces none.
@@ -1958,7 +1997,7 @@ async fn try_outbound_v2(
         );
         return OutboundOutcome::Done;
     }
-    finish_outbound(stream, resp, peer_agent, tcp, live).await;
+    finish_outbound(stream, resp, peer_agent, tcp, guard).await;
     OutboundOutcome::Done
 }
 
@@ -1987,6 +2026,17 @@ async fn drive_outbound_v1(
             return;
         }
     };
+    let guard = live.register(
+        teardown::StreamGate::Outbound {
+            peer_agent: *peer_agent,
+            machine: stream.peer(),
+        },
+        teardown::StreamAuthority::PeerTrust,
+    );
+    agent.stream_reauth_signal().notify_one();
+    if guard.token().is_cancelled() {
+        return;
+    }
     let header = ForwardHeader {
         target_host: target_host.to_string(),
         target_port,
@@ -2004,30 +2054,26 @@ async fn drive_outbound_v1(
         );
         return;
     }
-    finish_outbound(stream, resp, peer_agent, tcp, live).await;
+    finish_outbound(stream, resp, peer_agent, tcp, guard).await;
 }
 
 /// Shared tail: interpret the connect-response byte and bridge on `connected`.
 ///
-/// ADR-0074 §4 ("both ends enforce"): a connected stream is registered with
-/// the peer trust it was opened under, so the opener also tears it down
-/// once the peer is revoked, blocked or no longer trusted.
+/// ADR-0074 §4 ("both ends enforce"): the stream was registered as soon as
+/// the peer stream opened (before the header/response window), so a trust
+/// loss during that window still tears it down within the 5 s bound.
 async fn finish_outbound(
     stream: PeerStream,
     resp: [u8; 1],
     peer_agent: &AgentId,
     tcp: TcpStream,
-    live: &Arc<teardown::LiveStreams>,
+    guard: teardown::LiveStreamGuard,
 ) {
+    if guard.token().is_cancelled() {
+        return;
+    }
     match response_connected(resp[0]) {
         Some(true) => {
-            let guard = live.register(
-                teardown::StreamGate::Outbound {
-                    peer_agent: *peer_agent,
-                    machine: stream.peer(),
-                },
-                teardown::StreamAuthority::PeerTrust,
-            );
             let (send, recv) = stream.into_split();
             bridge(tcp, send, recv, guard.token()).await;
         }

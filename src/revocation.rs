@@ -681,7 +681,7 @@ impl RevocationSet {
 
     /// Wake `notify` on every future change to the set (ADR-0074 §4 open-
     /// stream re-check). Replaces any previously installed notifier.
-    pub fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+    pub(crate) fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
         self.change_notify = Some(notify);
     }
 

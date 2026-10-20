@@ -59,21 +59,21 @@ use crate::trust::TrustDecision;
 /// plus [`REAUTH_MIN_SPACING`] and a pass stays inside the 35 s grant-expiry
 /// bound. Only time-driven triggers rely on it; every other trigger is an
 /// event.
-pub const REAUTH_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const REAUTH_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Minimum gap between two passes, so a burst of events (a revocation
 /// flood, many contact writes) costs one pass per gap rather than one per
 /// event.
-pub const REAUTH_MIN_SPACING: Duration = Duration::from_millis(250);
+pub(crate) const REAUTH_MIN_SPACING: Duration = Duration::from_millis(250);
 
 /// QUIC application error code sent when a live stream is torn down
-/// because its authority is gone.
-pub const REAUTH_RESET_CODE: u32 = 0x5244;
+/// because its authority is gone. Peers observe this reset code on the wire.
+pub(crate) const REAUTH_RESET_CODE: u32 = 0x5244;
 
 /// The authority a live stream holds (ADR-0074 §4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "principal", rename_all = "snake_case")]
-pub enum StreamAuthority {
+pub(crate) enum StreamAuthority {
     /// Outbound: the peer cleared the identity gate (contact or owner trust)
     /// when the stream was opened.
     PeerTrust,
@@ -146,21 +146,21 @@ pub(crate) enum StreamGate {
     },
 }
 
-/// One live stream as `GET /streams` reports it.
+/// Internal snapshot of one live stream for reauth/debug (not an HTTP API).
 #[derive(Debug, Clone, Serialize)]
-#[allow(dead_code)] // Internal snapshot; not exposed on GET /streams (lane rule).
-pub struct LiveStreamView {
+#[allow(dead_code)] // Reserved for diagnostics; no route exposes it yet.
+pub(crate) struct LiveStreamView {
     /// `inbound` or `outbound`.
-    pub direction: &'static str,
+    pub(crate) direction: &'static str,
     /// The peer agent (hex): the attested opener, or the outbound target.
     /// `None` for a legacy inbound stream, which is authorized per machine.
-    pub peer_agent: Option<String>,
+    pub(crate) peer_agent: Option<String>,
     /// The peer machine (hex).
-    pub peer_machine: String,
+    pub(crate) peer_machine: String,
     /// The local loopback target, for inbound streams.
-    pub target: Option<String>,
+    pub(crate) target: Option<String>,
     /// The authority the stream currently holds.
-    pub authority: StreamAuthority,
+    pub(crate) authority: StreamAuthority,
 }
 
 struct LiveEntry {
@@ -266,8 +266,8 @@ impl LiveStreams {
         true
     }
 
-    /// Snapshot for `GET /streams`.
-    #[allow(dead_code)] // Internal snapshot; not exposed on GET /streams (lane rule).
+    /// Snapshot of live streams for internal reauth/debug (no HTTP route).
+    #[allow(dead_code)] // Reserved for diagnostics; no route exposes it yet.
     pub(crate) fn views(&self) -> Vec<LiveStreamView> {
         let mut views: Vec<(u64, LiveStreamView)> = self
             .lock()

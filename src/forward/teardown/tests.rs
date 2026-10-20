@@ -380,7 +380,12 @@ async fn get_mut_edit_closes_within_5s() {
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(!stream.token().is_cancelled());
 
-    w.contacts.write().await.get_mut(&w.b1).unwrap().trust_level = TrustLevel::Blocked;
+    w.contacts
+        .write()
+        .await
+        .get_mut_tracked(&w.b1)
+        .unwrap()
+        .trust_level = TrustLevel::Blocked;
     closes_within(&stream, EVENT_BOUND).await;
 }
 
@@ -623,6 +628,38 @@ async fn bridge_stops_on_teardown_and_ends_normally_otherwise() {
     .await
     .expect("bridge did not end when both sides closed");
     assert!(!torn_down);
+}
+
+/// WHY: ADR-0074 §4 requires the local TCP socket to reset (RST), not finish
+/// with a clean FIN that makes a truncated response look complete. Tokio's
+/// `OwnedWriteHalf` would otherwise `shutdown(Write)` on drop after
+/// `set_linger(0)`; `forget()` avoids that FIN-before-RST race.
+#[tokio::test]
+async fn reset_tcp_with_forgotten_write_half_yields_connection_reset() {
+    use std::io::ErrorKind;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+
+    let (read, write) = server.into_split();
+    reset_tcp(&write);
+    write.forget();
+    drop(read);
+
+    let mut buf = [0u8; 8];
+    match client.read(&mut buf).await {
+        Ok(0) => panic!("got clean EOF (FIN); expected ConnectionReset from linger-0 close"),
+        Ok(n) => panic!("unexpected {n} bytes from reset peer"),
+        Err(err) => assert_eq!(
+            err.kind(),
+            ErrorKind::ConnectionReset,
+            "expected ConnectionReset, got {err:?}"
+        ),
+    }
 }
 
 /// WHY: a stream that ends on its own leaves the registry, so it is never

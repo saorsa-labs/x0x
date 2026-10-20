@@ -887,7 +887,7 @@ pub struct CommitOutcome {
 
 impl OwnerSyncStore {
     /// Wake `notify` on every future change to the device set (ADR-0074 §4).
-    pub fn set_device_change_notify(&self, notify: std::sync::Arc<tokio::sync::Notify>) {
+    pub(crate) fn set_device_change_notify(&self, notify: std::sync::Arc<tokio::sync::Notify>) {
         *self
             .device_change_notify
             .lock()

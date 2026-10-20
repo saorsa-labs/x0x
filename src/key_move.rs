@@ -1321,7 +1321,7 @@ pub struct MoveState {
 
 impl MoveState {
     /// Wake `notify` whenever a placement record is cached (ADR-0074 §4).
-    pub fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+    pub(crate) fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
         self.change_notify = Some(notify);
     }
 

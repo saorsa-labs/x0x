@@ -229,10 +229,13 @@ pub struct ContactStore {
     change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
-/// Mutable handle to one contact ([`ContactStore::get_mut`]). Signals the
-/// store's change notifier when dropped.
+/// Mutable handle to one contact ([`ContactStore::get_mut_tracked`]).
+/// Signals the store's change notifier when dropped. Production mutators
+/// notify via [`ContactStore::save`]; this path covers in-memory edits
+/// (see `forward::teardown` tests).
 #[derive(Debug)]
-pub struct ContactMut<'a> {
+#[allow(dead_code)] // used from teardown tests; save() covers production wakes
+pub(crate) struct ContactMut<'a> {
     contact: &'a mut Contact,
     notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
@@ -406,9 +409,14 @@ impl ContactStore {
     }
 
     /// Get a mutable reference to a contact by agent ID.
-    /// The handle derefs to [`Contact`]. Dropping it signals a change
-    /// (ADR-0074 §4) so open streams re-check without waiting for `save`.
-    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
+    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<&mut Contact> {
+        self.contacts.get_mut(&agent_id.0)
+    }
+
+    /// Mutable contact handle that wakes the ADR-0074 §4 reauth notifier on
+    /// drop (in-memory edits that do not go through [`Self::save`]).
+    #[allow(dead_code)] // used from teardown tests; save() covers production wakes
+    pub(crate) fn get_mut_tracked(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
         let notify = self.change_notify.clone();
         self.contacts
             .get_mut(&agent_id.0)
@@ -417,7 +425,7 @@ impl ContactStore {
 
     /// Wake `notify` on every future change to the store (ADR-0074 §4
     /// open-stream re-check). Replaces any previously installed notifier.
-    pub fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+    pub(crate) fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
         self.change_notify = Some(notify);
     }
 

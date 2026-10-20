@@ -979,7 +979,7 @@ pub struct GrantAccess {
     pub connect_ports: BTreeSet<u16>,
     /// Ids of the ShareGrants that contributed a `Connect` capability
     /// (ADR-0074 §4 authority label for live forward streams).
-    pub connect_grant_ids: BTreeSet<[u8; 32]>,
+    pub(crate) connect_grant_ids: BTreeSet<[u8; 32]>,
     /// `GroupInvite`: groups may be seeded without a contact entry.
     pub group_invite: bool,
     /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).

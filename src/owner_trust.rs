@@ -358,7 +358,7 @@ impl OwnerTrust {
     }
 
     /// [`Self::grant_access`] with an explicit clock (ADR-0074 §4 re-check).
-    pub async fn grant_access_at(
+    pub(crate) async fn grant_access_at(
         &self,
         contact_store: &RwLock<ContactStore>,
         discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
