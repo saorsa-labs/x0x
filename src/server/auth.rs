@@ -314,6 +314,24 @@ fn session_refresh_refused(status: StatusCode, error: &str) -> Response {
 
 // ── Policy predicates ────────────────────────────────────────────────────
 
+/// Does the request carry a valid owner bearer — the durable API token or
+/// a live session token in the `Authorization` header?
+///
+/// This is exactly the token check [`authorize`] step (3) applies to
+/// authenticated routes. The `/health` detail gate (David's ruling of
+/// 20 Oct 2026 on the #1480 M2 question) reuses it, so "an authenticated
+/// caller" means the same thing on both surfaces and the two checks
+/// cannot drift. Rider tokens do not authenticate here: they are a
+/// scoped, deny-by-default principal, not the local owner.
+pub(in crate::server) fn has_valid_owner_bearer(
+    headers: &axum::http::HeaderMap,
+    api_token: &str,
+    sessions: &SessionStore,
+) -> bool {
+    extract_bearer(headers)
+        .is_some_and(|token| ct_eq(&token, api_token) || sessions.is_valid(&token, Instant::now()))
+}
+
 fn is_auth_exempt_path(path: &str) -> bool {
     path == "/health" || path.starts_with("/constitution")
 }
