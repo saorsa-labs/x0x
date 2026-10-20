@@ -743,6 +743,148 @@ impl Drop for FailDurableBeforeRenameGuard {
     }
 }
 
+/// Test-only pause at the durable rename, so a caller can be cancelled
+/// while the publish is still in progress. Path-scoped: other files in
+/// the same process rename normally.
+#[cfg(test)]
+struct DurableRenamePause {
+    path: std::path::PathBuf,
+    entered: bool,
+}
+
+#[cfg(test)]
+static DURABLE_RENAME_PAUSE_FOR_TESTING: std::sync::Mutex<Option<DurableRenamePause>> =
+    std::sync::Mutex::new(None);
+
+/// Arm the pause. Drop releases it, including after a panic.
+#[cfg(test)]
+pub(crate) struct DurableRenamePauseGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) fn arm_durable_rename_pause_for_testing(path: &Path) -> DurableRenamePauseGuard {
+    *DURABLE_RENAME_PAUSE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DurableRenamePause {
+        path: path.to_path_buf(),
+        entered: false,
+    });
+    DurableRenamePauseGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn durable_rename_pause_entered_for_testing(path: &Path) -> bool {
+    DURABLE_RENAME_PAUSE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|pause| pause.path == path && pause.entered)
+}
+
+#[cfg(test)]
+fn release_durable_rename_pause(path: &Path) {
+    let mut slot = DURABLE_RENAME_PAUSE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.as_ref().is_some_and(|pause| pause.path == path) {
+        *slot = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for DurableRenamePauseGuard {
+    fn drop(&mut self) {
+        release_durable_rename_pause(&self.path);
+    }
+}
+
+/// When `path` is armed, signal entry and wait until the guard is dropped.
+/// An unarmed path returns on the first poll, so the caller can rename in
+/// that same poll.
+#[cfg(test)]
+async fn pause_durable_rename_for_testing(path: &Path) {
+    {
+        let mut slot = DURABLE_RENAME_PAUSE_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pause) = slot.as_mut() else {
+            return;
+        };
+        if pause.path != path {
+            return;
+        }
+        pause.entered = true;
+    }
+    loop {
+        tokio::task::yield_now().await;
+        let slot = DURABLE_RENAME_PAUSE_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pause) = slot.as_ref() else {
+            return;
+        };
+        if pause.path != path {
+            return;
+        }
+    }
+}
+
+/// Rename that still publishes, and still runs `on_renamed`, when the
+/// caller is cancelled while the rename is in progress.
+///
+/// `tokio::fs::rename` waits on a blocking task. Dropping that wait does
+/// not stop the task, so the new name can appear after the callback and
+/// the caller's lock are already gone. This rename is synchronous, and
+/// its drop finishes the same publish and callback before it returns.
+struct DurableRename<F: FnOnce()> {
+    tmp: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    on_renamed: Option<F>,
+    pending: bool,
+}
+
+impl<F: FnOnce()> DurableRename<F> {
+    fn prepare(tmp: &Path, dest: &Path, on_renamed: F) -> Self {
+        Self {
+            tmp: tmp.to_path_buf(),
+            dest: dest.to_path_buf(),
+            on_renamed: Some(on_renamed),
+            pending: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.pending = false;
+        if let Some(callback) = self.on_renamed.take() {
+            callback();
+        }
+    }
+
+    fn abandon(&mut self) {
+        self.pending = false;
+        self.on_renamed.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for DurableRename<F> {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        if std::fs::rename(&self.tmp, &self.dest).is_ok() {
+            if let Some(callback) = self.on_renamed.take() {
+                callback();
+            }
+        } else {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 /// Crash-atomic durable write for secret bytes (review r3, PR #465 item 1):
 /// temp file (0600) → `sync_all` the file → atomic rename into place →
 /// `sync_all` the parent directory. Unlike [`write_private_bytes`], a power
@@ -790,6 +932,10 @@ pub async fn write_private_bytes_durable_typed(
 /// synchronously once the new bytes are visible (after rename, before
 /// parent-directory fsync). NameStore uses this so a cancelled await
 /// cannot skip installing in-memory state that already matches disk.
+///
+/// The rename itself is not a detached blocking task. Cancellation while
+/// it is in progress still publishes the file and still runs `on_renamed`
+/// before this future returns from drop.
 pub async fn write_private_bytes_durable_typed_after_rename(
     path: &Path,
     bytes: Vec<u8>,
@@ -1299,14 +1445,22 @@ async fn write_private_bytes_durable_guarded_after_rename(
         )));
     }
 
-    if let Err(err) = fs::rename(&tmp_path, path).await {
-        let _ = fs::remove_file(&tmp_path).await;
+    // Synchronous rename: a `tokio::fs::rename` await can be cancelled
+    // while the blocking rename still completes, which drops `on_renamed`
+    // and the caller's lock. Prepare first so drop publishes and installs
+    // memory if this future is cancelled at the test pause below.
+    let mut publication = DurableRename::prepare(&tmp_path, path, on_renamed);
+    #[cfg(test)]
+    pause_durable_rename_for_testing(path).await;
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        publication.abandon();
+        let _ = std::fs::remove_file(&tmp_path);
         return Err(DurableWriteError::BeforeRename(err));
     }
-
     // NEW bytes are visible — stage caller memory before parent-dir fsync
     // so cancellation cannot leave disk ahead of every in-memory copy.
-    on_renamed();
+    publication.finish();
+    drop(publication);
 
     sync_published_file(path).await
 }

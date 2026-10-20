@@ -177,19 +177,24 @@ fn is_reserved(label: &str) -> bool {
 }
 
 /// Announce `self_name` is a verified agent label only when the announce's
-/// machine id equals the authenticated QUIC binding for that agent.
+/// machine equals the authority-selected machine for that agent.
 ///
-/// V3 announces are machine-signed; without an authenticated machine match
-/// (or when auth is absent while a name is claimed) the label is treated as
-/// unverified and dropped. Used when gathering name candidates for an owner.
+/// V3 announces are machine-signed. The caller passes the machine from the
+/// ADR 0115 authority rules (announced binding, authenticated binding, or a
+/// usable ADR 0089 record). A mismatch, a missing authority machine, or the
+/// all-zero id drops the label. Used when gathering name candidates.
 #[must_use]
 pub fn verified_announce_self_name(
     announce_machine: MachineId,
-    authenticated_machine: Option<MachineId>,
+    authority_machine: Option<MachineId>,
     announce_self_name: Option<String>,
 ) -> Option<String> {
-    match (authenticated_machine, announce_self_name) {
-        (Some(auth), name) if auth == announce_machine && announce_machine.0 != [0u8; 32] => name,
+    match (authority_machine, announce_self_name) {
+        (Some(authority), name)
+            if authority == announce_machine && announce_machine.0 != [0u8; 32] =>
+        {
+            name
+        }
         _ => None,
     }
 }
@@ -821,12 +826,16 @@ impl NamesState {
 /// store; an unreadable or malformed file leaves the store holding nothing
 /// and refusing every name operation ([`NameError::Store`]), so pins are
 /// never silently lost and re-learned. All mutations are serialised under
-/// one lock held across the durable write. A failure before the rename
-/// leaves memory and disk on the old state; a failure after the rename
-/// keeps the new state in memory so it matches the advanced disk (issue
-/// #1101) and raises a pending-durability flag until a later write
+/// one lock held across the durable write, including a rename that is
+/// cancelled while the publish can still complete. A failure before the
+/// rename leaves memory and disk on the old state; a failure after the
+/// rename keeps the new state in memory so it matches the advanced disk
+/// (issue #1101) and raises a pending-durability flag until a later write
 /// confirms the parent-directory fsync — an identical retry must not ACK
-/// as [`BindOutcome::Unchanged`] while that flag is set.
+/// as [`BindOutcome::Unchanged`] while that flag is set. Cancellation
+/// after the bytes are visible installs that state before the lock is
+/// released, so a later write cannot replace the published binding with
+/// the stale copy.
 #[derive(Debug)]
 pub struct NameStore {
     path: Option<PathBuf>,
@@ -840,6 +849,37 @@ pub struct NameStore {
     /// under the lock so a cancelled persist await cannot lose the
     /// advanced disk state (Send-safe; no raw pointers in the future).
     install_slot: std::sync::Mutex<Option<NamesState>>,
+    /// Tasks blocked in [`Self::lock_state`], not the holder. The rename
+    /// cancellation test waits until a later write is queued on this lock.
+    #[cfg(test)]
+    lock_waiters: std::sync::atomic::AtomicUsize,
+}
+
+/// Holds the name-store lock until drop, and installs a staged publish
+/// into that lock before releasing it.
+struct HeldCommit<'a> {
+    guard: tokio::sync::MutexGuard<'a, NamesState>,
+    slot: &'a std::sync::Mutex<Option<NamesState>>,
+    pending: &'a std::sync::atomic::AtomicBool,
+    install_on_drop: bool,
+}
+
+impl HeldCommit<'_> {
+    fn drain(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            if let Some(next) = slot.take() {
+                *self.guard = next;
+            }
+        }
+    }
+}
+
+impl Drop for HeldCommit<'_> {
+    fn drop(&mut self) {
+        if self.install_on_drop {
+            self.drain();
+        }
+    }
 }
 
 impl NameStore {
@@ -852,6 +892,8 @@ impl NameStore {
             load_error: None,
             pending_durability: std::sync::atomic::AtomicBool::new(false),
             install_slot: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            lock_waiters: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -929,9 +971,21 @@ impl NameStore {
     }
 
     async fn lock_state(&self) -> tokio::sync::MutexGuard<'_, NamesState> {
+        #[cfg(test)]
+        self.lock_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut guard = self.state.lock().await;
+        #[cfg(test)]
+        self.lock_waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         self.drain_install_slot(&mut guard);
         guard
+    }
+
+    /// Tasks waiting to take the name-store lock. Test builds only.
+    #[cfg(test)]
+    fn state_lock_waiters(&self) -> usize {
+        self.lock_waiters.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Apply `mutate` to a copy, persist it, then commit.
@@ -949,13 +1003,18 @@ impl NameStore {
     ) -> Result<T, NameError> {
         use std::sync::atomic::Ordering;
         self.usable()?;
-        let mut guard = self.lock_state().await;
-        let mut next = guard.clone();
+        let mut held = HeldCommit {
+            guard: self.lock_state().await,
+            slot: &self.install_slot,
+            pending: &self.pending_durability,
+            install_on_drop: true,
+        };
+        let mut next = held.guard.clone();
         let (out, changed) = mutate(&mut next)?;
         if changed {
             let to_install = next.clone();
-            let slot = &self.install_slot;
-            let pending = &self.pending_durability;
+            let slot = held.slot;
+            let pending = held.pending;
             match self
                 .persist_with_install(&next, move || {
                     if let Ok(mut g) = slot.lock() {
@@ -966,43 +1025,51 @@ impl NameStore {
                 .await
             {
                 Ok(()) => {
-                    self.drain_install_slot(&mut guard);
-                    self.pending_durability.store(false, Ordering::Release);
+                    held.drain();
+                    held.pending.store(false, Ordering::Release);
+                    held.install_on_drop = false;
                 }
                 Err(e) if e.crossed_rename() => {
-                    self.drain_install_slot(&mut guard);
+                    held.drain();
+                    held.install_on_drop = false;
                     return Err(NameError::Store(format!(
                         "applied, but durability is not confirmed (directory fsync failed): \
                          {e}; the change is in effect"
                     )));
                 }
                 Err(e) => {
-                    let _ = self.install_slot.lock().map(|mut s| s.take());
+                    let _ = held.slot.lock().map(|mut s| s.take());
+                    held.install_on_drop = false;
                     return Err(NameError::Store(format!("write {e}")));
                 }
             }
-        } else if self.pending_durability.load(Ordering::Acquire) {
-            let pending = &self.pending_durability;
-            let held = (*guard).clone();
+        } else if held.pending.load(Ordering::Acquire) {
+            let pending = held.pending;
+            let snapshot = held.guard.clone();
             match self
-                .persist_with_install(&held, || {
+                .persist_with_install(&snapshot, || {
                     pending.store(true, Ordering::Release);
                 })
                 .await
             {
                 Ok(()) => {
-                    self.pending_durability.store(false, Ordering::Release);
+                    held.pending.store(false, Ordering::Release);
+                    held.install_on_drop = false;
                 }
                 Err(e) if e.crossed_rename() => {
+                    held.install_on_drop = false;
                     return Err(NameError::Store(format!(
                         "applied, but durability is not confirmed (directory fsync failed): \
                          {e}; the change is in effect"
                     )));
                 }
                 Err(e) => {
+                    held.install_on_drop = false;
                     return Err(NameError::Store(format!("write {e}")));
                 }
             }
+        } else {
+            held.install_on_drop = false;
         }
         Ok(out)
     }
@@ -1292,9 +1359,11 @@ impl crate::Agent {
     }
 
     /// Gather the candidates for `owner` from local state only: the
-    /// discovery cache (certificates, self-names), authenticated machine
-    /// bindings, the revocation set, the ADR-0041 device set (`devices`,
-    /// for the local owner) and received share grants (other owners).
+    /// discovery cache (certificates, self-names), the ADR 0115 authority
+    /// machine (announced binding, authenticated binding, or usable ADR
+    /// 0089 evidence), the revocation set, the ADR-0041 device set
+    /// (`devices`, for the local owner) and received share grants (other
+    /// owners).
     pub async fn name_candidates(
         &self,
         names: &NameStore,
@@ -1317,16 +1386,17 @@ impl crate::Agent {
         };
         let mut observed = Vec::with_capacity(entries.len() + 1);
         for entry in entries {
-            let machine_id = crate::dm_inbox::authenticated_machine_binding(
-                &self.authenticated_machine_bindings,
-                &entry.agent_id,
-            )
-            .await;
+            // ADR 0115 §2. Class B may be authenticated only by usable ADR
+            // 0089 evidence, which does not fill `authenticated_machine_bindings`.
+            // After restart that cache is empty; the authority machine still
+            // names the peer, so the label and shared-machine host stay.
+            let machine_id = self
+                .authorized_routing_machine(&entry.agent_id, Some(entry.machine_id))
+                .await;
             // V3 `self_name` is machine-signed only. Trust it as a label
-            // solely when the announce's machine matches this agent's
-            // authenticated binding; otherwise a foreign machine can
-            // re-announce a real certified agent under another label
-            // (Claude #1494 e338df79 P2).
+            // solely when the announce's machine is the authority machine;
+            // otherwise a foreign machine can re-announce a real certified
+            // agent under another label (Claude #1494 e338df79 P2).
             let self_name =
                 verified_announce_self_name(entry.machine_id, machine_id, entry.self_name);
             observed.push(ObservedAgent {

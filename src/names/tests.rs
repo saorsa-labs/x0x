@@ -490,7 +490,7 @@ fn shared_machine_name_resolves_only_while_granted() {
 }
 
 /// WHY (Claude #1494 e338df79 P2): announce `self_name` is verified only
-/// when announce machine == authenticated binding.
+/// when the announce machine equals the authority-selected machine.
 #[test]
 fn verified_announce_self_name_requires_authenticated_machine_match() {
     let announce = MachineId([1; 32]);
@@ -960,4 +960,317 @@ async fn commit_after_rename_failure_keeps_binding_and_reload_agrees() {
     let disk = reloaded.owner("bob").await.unwrap().expect("disk has bob");
     assert_eq!(disk.user_id, owner);
     assert_eq!(disk, mem);
+}
+
+/// WHY (PR #1494 RC4): cancellation during the rename must not drop the
+/// publish. The name lock stays held until memory matches the file a
+/// blocking rename can still finish, so a later write cannot replace the
+/// published binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_during_rename_keeps_pin_for_later_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let store = std::sync::Arc::new(NameStore::load(path.clone()).await);
+    assert!(store.load_error().is_none());
+    let bob = UserId([9; 32]);
+    let ada = UserId([3; 32]);
+    let pause = crate::storage::arm_durable_rename_pause_for_testing(&path);
+
+    let writer_store = std::sync::Arc::clone(&store);
+    let writer = tokio::spawn(async move {
+        writer_store
+            .bind_owner("bob", bob, BindSource::Manual, NOW)
+            .await
+    });
+    let start = std::time::Instant::now();
+    while !crate::storage::durable_rename_pause_entered_for_testing(&path) {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("rename did not reach the cancellation point");
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let later_store = std::sync::Arc::clone(&store);
+    let later = tokio::spawn(async move {
+        later_store
+            .bind_owner("ada", ada, BindSource::Manual, NOW)
+            .await
+    });
+    let start = std::time::Instant::now();
+    while store.state_lock_waiters() == 0 {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("later write did not queue on the name lock");
+        }
+        tokio::task::yield_now().await;
+    }
+
+    writer.abort();
+    let aborted = writer.await.expect_err("the rename task must be cancelled");
+    assert!(aborted.is_cancelled());
+    drop(pause);
+
+    let ada_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), later)
+        .await
+        .expect("later write finished")
+        .expect("later write task")
+        .expect("later write");
+    assert_eq!(ada_outcome, BindOutcome::Inserted);
+    assert_eq!(
+        store
+            .owner("bob")
+            .await
+            .unwrap()
+            .expect("memory kept bob")
+            .user_id,
+        bob
+    );
+    assert_eq!(store.owner("ada").await.unwrap().expect("ada").user_id, ada);
+
+    let reloaded = NameStore::load(path).await;
+    assert!(
+        reloaded.load_error().is_none(),
+        "{:?}",
+        reloaded.load_error()
+    );
+    assert_eq!(
+        reloaded
+            .owner("bob")
+            .await
+            .unwrap()
+            .expect("disk kept bob")
+            .user_id,
+        bob,
+        "a later write must not replace the published binding"
+    );
+    assert_eq!(
+        reloaded
+            .owner("ada")
+            .await
+            .unwrap()
+            .expect("disk has ada")
+            .user_id,
+        ada
+    );
+}
+
+fn discovered_named(
+    agent_id: AgentId,
+    machine: MachineId,
+    owner: UserId,
+    cert: AgentCertificate,
+    label: &str,
+) -> crate::DiscoveredAgent {
+    crate::DiscoveredAgent {
+        agent_id,
+        machine_id: machine,
+        user_id: Some(owner),
+        addresses: Vec::new(),
+        announced_at: 0,
+        last_seen: 0,
+        machine_public_key: Vec::new(),
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        cert_not_after: None,
+        agent_certificate: Some(cert),
+        cert_digest: None,
+        agent_public_key: Vec::new(),
+        self_name: Some(label.to_string()),
+    }
+}
+
+/// WHY (PR #1494 RC4): a class-B peer authenticated only by usable ADR 0089
+/// evidence never fills `authenticated_machine_bindings`. After restart the
+/// accepted announcement must still resolve its label and shared machine.
+#[tokio::test]
+async fn evidence_backed_peer_resolves_name_without_authenticated_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut local = crate::Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_user_key_path(dir.path().join("user.key"))
+        .with_identity_dir(dir.path())
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_peer_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    assert!(local.network.is_none());
+
+    let bob = user();
+    let real_kp = agent();
+    let spoof_kp = agent();
+    let real_machine_kp = crate::identity::MachineKeypair::generate().unwrap();
+    let spoof_machine = MachineId([5; 32]);
+    let real_machine = real_machine_kp.machine_id();
+    let real_cert = AgentCertificate::issue(&bob, &real_kp).unwrap();
+    let spoof_cert = AgentCertificate::issue(&bob, &spoof_kp).unwrap();
+    let now_ms = crate::dm_capability::now_unix_ms();
+    let now = now_ms / 1000;
+
+    let policy = std::sync::Arc::new(crate::peer_evidence::RuntimePolicy::new(
+        local.agent_id(),
+        local.owner_trust.clone(),
+        std::sync::Arc::clone(&local.revocation_set),
+    ));
+    let real_id = real_kp.agent_id();
+    policy.set_groups(std::sync::Arc::new(move |candidate| {
+        Some(candidate == real_id)
+    }));
+    let evidence = std::sync::Arc::new(
+        crate::peer_evidence::PeerEvidenceStore::open(
+            dir.path(),
+            Default::default(),
+            policy,
+            now_ms,
+        )
+        .unwrap(),
+    );
+    let v2 = crate::IdentityAnnouncement {
+        self_name: Some("studio".to_string()),
+        agent_id: real_id,
+        machine_id: real_machine,
+        user_id: Some(bob.user_id()),
+        agent_certificate: Some(real_cert.clone()),
+        machine_public_key: real_machine_kp.public_key().as_bytes().to_vec(),
+        machine_signature: vec![],
+        addresses: vec![],
+        announced_at: now,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+        agent_public_key: real_kp.public_key().as_bytes().to_vec(),
+    };
+    let mut announcement = crate::announce_v3::IdentityAnnouncementV3::build_from_v2(
+        &v2,
+        real_machine_kp.secret_key(),
+        0,
+    )
+    .unwrap();
+    announcement
+        .sign_v3_1(real_machine_kp.secret_key())
+        .unwrap();
+    let kem = crate::groups::kem_envelope::AgentKemKeypair::generate().unwrap();
+    let mut advert = crate::dm_capability::CapabilityAdvert {
+        protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+        agent_id: real_id.0,
+        machine_id: real_machine.0,
+        created_at_unix_ms: now_ms,
+        capabilities: crate::dm::DmCapabilities {
+            gossip_inbox: true,
+            kem_public_key: kem.public_bytes,
+            ..crate::dm::DmCapabilities::pending()
+        },
+        signature: vec![],
+    };
+    advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        real_kp.secret_key(),
+        &advert.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    evidence
+        .ingest(
+            crate::peer_evidence::EvidenceRecordV1 {
+                announcement: crate::announce_v3::serialize_v3_1(&announcement).unwrap(),
+                advert: postcard::to_stdvec(&advert).unwrap(),
+                certificate: None,
+                relation: crate::peer_evidence::GROUP,
+                stored_at_ms: now_ms,
+            },
+            crate::peer_evidence::IngestSource::Gossip,
+            now_ms,
+        )
+        .unwrap();
+    let (runtime, ready) = crate::peer_evidence::EvidenceRuntime::loading_store_for_test(
+        std::sync::Arc::clone(&evidence),
+    );
+    ready.cancel();
+    let mut caps = crate::dm_capability::CapabilityStore::new();
+    caps.evidence = runtime;
+    local.capability_store = std::sync::Arc::new(caps);
+    local.owner_trust.install_evidence(local.peer_evidence());
+    assert!(
+        local
+            .peer_evidence()
+            .usable(real_id, real_machine, now_ms)
+            .is_some(),
+        "the ADR 0089 record must be usable"
+    );
+    assert!(local
+        .authenticated_machine_bindings
+        .read()
+        .await
+        .peek(&real_id)
+        .is_none());
+    assert!(local
+        .announced_machine_bindings
+        .read()
+        .await
+        .peek(&real_id)
+        .is_none());
+
+    local.identity_discovery_cache.write().await.insert(
+        real_id,
+        discovered_named(real_id, real_machine, bob.user_id(), real_cert, "studio"),
+    );
+    local.identity_discovery_cache.write().await.insert(
+        spoof_kp.agent_id(),
+        discovered_named(
+            spoof_kp.agent_id(),
+            spoof_machine,
+            bob.user_id(),
+            spoof_cert,
+            "studio",
+        ),
+    );
+
+    let names = NameStore::in_memory();
+    names
+        .bind_owner("bob", bob.user_id(), BindSource::Manual, now)
+        .await
+        .unwrap();
+    let grant = ShareGrant::sign(
+        &bob,
+        [7; 32],
+        Grantee::Agent(local.agent_id()),
+        vec![real_id],
+        vec![ShareCap::Connect { ports: vec![22] }],
+        now.saturating_sub(10),
+        now + 3600,
+    )
+    .unwrap();
+    let grants = std::sync::Arc::new(crate::share_grant::ShareGrantStore::in_memory(
+        local.agent_id(),
+        local.user_id(),
+    ));
+    grants.accept(grant, now).await.unwrap();
+    local.install_share_grant_store(grants);
+
+    let resolved = local
+        .resolve_name(&names, None, &name("studio.bob"))
+        .await
+        .expect("evidence-backed label");
+    assert_eq!(resolved.agent_id, Some(real_id));
+
+    let labelled = local
+        .label_shared_machine(&names, &name("machine:box.bob"), real_machine)
+        .await
+        .expect("shared machine uses the evidence machine");
+    assert_eq!(labelled, BindOutcome::Inserted);
+    let machine = local
+        .resolve_name(&names, None, &name("machine:box.bob"))
+        .await
+        .expect("shared machine name");
+    assert_eq!(machine.machine_id, Some(real_machine));
+    assert_eq!(machine.agent_id, Some(real_id));
+    local.shutdown().await;
 }
