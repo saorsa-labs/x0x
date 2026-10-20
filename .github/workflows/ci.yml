@@ -590,6 +590,8 @@ jobs:
           --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
           --expect w3h_1356_red_s3_forked_node_shows_reseat_required=RED
+          --require w3h_1356_control_s3_forked_node_not_auto_recovered
+          --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
