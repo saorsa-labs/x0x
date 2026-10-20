@@ -38,6 +38,12 @@
 //!   self-leave, so this is GREEN on `main`. After S4 the same rekey runs
 //!   through ADR 0110's designated-first path (§"responsive rekey after
 //!   self-leave"), so it must stay GREEN.
+//! - `s4_self_leave_crypto_only`, revocation after the leave (control,
+//!   GREEN on `main`). As above; once A and C hold the leave, B revokes
+//!   its own agent. Desired: one exclusion (exactly e0 + 1 after
+//!   [`SETTLE`]) and B stays `Removed`. On `main` the leave rekeys and the
+//!   revocation does nothing more; after S4 the revocation must not rekey
+//!   a second time.
 //! - `s4_fallback_rank_manual` (RED on `main`). Nodes A, D, E, B, C, with
 //!   admins A < D < E by agent id (the case reassigns the pre-generated
 //!   keys of A, D and E so that this holds). A is held off the fabric
@@ -109,6 +115,9 @@ const CAUSE_IDLE: &str = "no revocation eviction on main: after the bound every 
                           lists B active, at epoch e0, with the same leaf count";
 const CAUSE_SELF_LEAVE: &str =
     "B's leaf retained after self-leave: survivors remain at epoch e0 with the same leaf count";
+const CAUSE_LEAVE_THEN_REVOKE: &str = "B's leaf retained after a self-leave and a later \
+                                       revocation: survivors remain at epoch e0 with the same \
+                                       leaf count";
 const CAUSE_MANUAL: &str = "non-designated manual remove rekeys at once on main: D's remove of B \
                             returned success without waiting_for_designated_admin and a survivor \
                             left epoch e0 within EARLY_READ while the designated admin A was held";
@@ -124,13 +133,22 @@ enum Trigger {
     OwnerRevoke,
     /// B leaves (`DELETE /groups/:id`).
     Leave,
+    /// B leaves; once A and C hold the leave, B revokes its own agent.
+    LeaveThenRevoke,
     /// Nothing; only the manual request follows.
     Nothing,
 }
 
 impl Trigger {
     fn revokes(self) -> bool {
-        matches!(self, Self::SelfRevoke | Self::OwnerRevoke)
+        matches!(
+            self,
+            Self::SelfRevoke | Self::OwnerRevoke | Self::LeaveThenRevoke
+        )
+    }
+
+    fn leaves(self) -> bool {
+        matches!(self, Self::Leave | Self::LeaveThenRevoke)
     }
 }
 
@@ -200,6 +218,12 @@ const SELF_LEAVE: Arm = Arm {
     holders: &[],
     trigger: Trigger::Leave,
     cause: CAUSE_SELF_LEAVE,
+    ..IDLE
+};
+
+const LEAVE_THEN_REVOKE: Arm = Arm {
+    trigger: Trigger::LeaveThenRevoke,
+    cause: CAUSE_LEAVE_THEN_REVOKE,
     ..IDLE
 };
 
@@ -784,13 +808,36 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 .await?;
             ensure!(status.is_success(), "A issuer-revokes B: {status} {body}");
         }
-        Trigger::Leave => {
+        Trigger::Leave | Trigger::LeaveThenRevoke => {
             let (status, body) = sim
                 .api("B", Method::DELETE, &format!("/groups/{group}"), None)
                 .await?;
             ensure!(status.is_success(), "B leaves: {status} {body}");
         }
         Trigger::Nothing => {}
+    }
+    if arm.trigger == Trigger::LeaveThenRevoke {
+        // The revocation arrives after the leave (ADR 0110 "repeat
+        // revocation arriving after that leave").
+        sim.until("A and C hold B's leave", SETUP, async |s: &Sim| {
+            views_now(s, survivors, &group, &b).await.is_ok_and(|now| {
+                now.iter()
+                    .all(|(_, seen)| seen.as_ref().is_some_and(|seen| !seen.lists_b))
+            })
+        })
+        .await?;
+        let (status, body) = sim
+            .api(
+                "B",
+                Method::POST,
+                "/identity/revoke",
+                Some(json!({"agent_id": b_hex, "reason": "w3h-1357"})),
+            )
+            .await?;
+        ensure!(
+            status.is_success(),
+            "B self-revokes after leaving: {status} {body}"
+        );
     }
     if arm.trigger.revokes() {
         await_holders(sim, arm.holders, &b_hex).await?;
@@ -865,6 +912,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         Err(error) => ((false, error.clone()), (false, error)),
     };
     let data_plane = c_after.0 && !b_after.0;
+    // A leaver stays Removed on every survivor: no ban, no re-admission.
+    let stays_removed = !arm.trigger.leaves()
+        || end.iter().all(|(_, seen)| {
+            seen.as_ref()
+                .is_some_and(|seen| seen.b_state.as_deref() == Some("Removed"))
+        });
 
     let queued_typed = manual.as_ref().is_some_and(|(_, body)| {
         body.contains("waiting_for_designated_admin") && body.to_ascii_lowercase().contains(&a_hex)
@@ -872,7 +925,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let early_unmoved = all_at(&early, e0);
     let passed = match arm.check {
         Check::ManualQueued => queued_typed && early_unmoved && h && data_plane,
-        Check::Healthy => h && data_plane,
+        Check::Healthy => h && data_plane && stays_removed,
     };
     receipt.note(format!(
         "arm={arm:?} e0={e0} leaves0={leaves0}; H {}; manual={manual:?}; early: {}; \
@@ -889,7 +942,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .as_ref()
         .is_some_and(|(status, _)| status.is_success());
     let (delivered_name, delivered, delivered_detail) = match arm.trigger {
-        Trigger::SelfRevoke | Trigger::OwnerRevoke => {
+        Trigger::SelfRevoke | Trigger::OwnerRevoke | Trigger::LeaveThenRevoke => {
             let held = held_by(sim, arm.holders, &b_hex).await?;
             let all = held.iter().all(|(_, has)| *has);
             (
@@ -937,7 +990,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 )
             }
             Check::Healthy => (
-                retained(&end, e0, leaves0, arm.trigger.revokes()),
+                retained(
+                    &end,
+                    e0,
+                    leaves0,
+                    arm.trigger.revokes() && !arm.trigger.leaves(),
+                ),
                 describe_all(&end),
             ),
         };
@@ -1060,6 +1118,25 @@ async fn w3h_1357_control_s4_manual_remove_without_obligation() -> Result<()> {
         "w3h_1357_control_s4_manual_remove_without_obligation",
         0x1357_0004,
         MANUAL_WITHOUT_OBLIGATION,
+        Verdict::Green,
+    )
+    .await
+}
+
+/// ADR 0110 `s4_self_leave_crypto_only`, repeated with B's revocation
+/// arriving after the leave: one exclusion, B stays Removed. GREEN on
+/// `main` (#1337 rekeys at the leave; the revocation adds nothing) and
+/// after S4 (the revocation must not rekey again).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1357_control_s4_self_leave_then_revocation() -> Result<()> {
+    expect(
+        "w3h_1357_control_s4_self_leave_then_revocation",
+        0x1357_0006,
+        LEAVE_THEN_REVOKE,
         Verdict::Green,
     )
     .await
