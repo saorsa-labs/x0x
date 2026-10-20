@@ -58,6 +58,58 @@ macro_rules! inventory_accounts_regression_tests {
             }
 
             #[test]
+            fn inventory_accounts_refuse_unicode_normalized_policy_keys() {
+                for database in ["passwd", "group", "initgroups"] {
+                    let other = match database {
+                        "passwd" => "group: files\n",
+                        "group" => "passwd: files\n",
+                        _ => "passwd: files\ngroup: files\n",
+                    };
+                    for space in ['\u{a0}', '\u{2003}', '\u{202f}', '\u{3000}'] {
+                        for policy in [format!("{other}{space}{database}: files\n"), format!("{other}{database}{space}: files\n")] {
+                            assert!(AccountTable::parse(policy.as_bytes(), PASSWD, GROUP).is_err(), "{policy:?}");
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn inventory_accounts_refuse_unicode_normalized_source_names() {
+                for database in ["passwd", "group", "initgroups"] {
+                    let other = match database {
+                        "passwd" => "group: files\n",
+                        "group" => "passwd: files\n",
+                        _ => "passwd: files\ngroup: files\n",
+                    };
+                    for space in ['\u{a0}', '\u{2003}', '\u{202f}', '\u{3000}'] {
+                        for policy in [format!("{other}{database}: {space}files\n"), format!("{other}{database}: files{space}\n")] {
+                            assert!(AccountTable::parse(policy.as_bytes(), PASSWD, GROUP).is_err(), "{policy:?}");
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn inventory_accounts_accept_explicit_c_whitespace_in_policy() {
+                let policy = b" \t\x0bpasswd \x0c: \rfiles\x0b\n\x0cgroup\t:\x0bfiles \r\n";
+                let parsed = AccountTable::parse(policy, PASSWD, GROUP).unwrap();
+                assert_eq!(parsed.by_uid(12345).unwrap(), table().by_uid(12345).unwrap());
+            }
+
+            #[test]
+            fn inventory_accounts_preserve_unicode_data_and_ignored_comments() {
+                let passwd = std::str::from_utf8(PASSWD).unwrap().replace("fixture:/owned/alice", "Alíce\u{a0}:/owned/équipe\u{a0}");
+                let policy = "# données\u{a0}\npasswd: files # privé\u{2003}\ngroup: files # groupe\u{3000}\n";
+                let group = format!("{}# membres\u{202f}\n", std::str::from_utf8(GROUP).unwrap());
+                let base = AccountTable::parse(POLICY, passwd.as_bytes(), GROUP).unwrap();
+                let changed = AccountTable::parse(policy.as_bytes(), passwd.as_bytes(), group.as_bytes()).unwrap();
+                assert_eq!(changed.by_uid(12345).unwrap().home, Path::new("/owned/équipe\u{a0}"));
+                assert_eq!(base.by_uid(12345).unwrap(), changed.by_uid(12345).unwrap());
+                assert_eq!(changed.resolve_group("fixture", 0).unwrap(), 23456);
+                assert_ne!(base.digest, changed.digest);
+            }
+
+            #[test]
             fn inventory_accounts_refuse_missing_duplicate_or_ambiguous_policy() {
                 for policy in [
                     "group: files\n", "passwd: files\n", "",
