@@ -126,6 +126,36 @@ jobs:
       - name: Run bound-port forwarding regression
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --run-ignored ignored-only --no-tests=fail -E 'test(=forward::tests::port_zero_forwards_are_listed_and_removed_by_bound_address)'
 
+  # Agent-usability eval (#1174): a fresh agent driven only by `x0x onboard`
+  # output plus the core SKILL.md must send a DM, join a group and write a
+  # scratch KV value, and the inviter's daemon must hold proof the actions
+  # landed. A doc or API-surface regression fails the job by name. The fast
+  # no-daemon half (doc-surface check) also runs in the ordinary Test Suite.
+  agent-usability:
+    name: Agent usability eval (#1174)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 1200
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+      - name: Run agent-usability eval (onboard output + core skill only)
+        run: bash scripts/ci/nextest-isolated.sh --all-features --test agent_usability_eval -- --run-ignored ignored-only --no-tests=fail
+
   # Tailnet (ADR-0074 slice 0): the ignored loopback stream/forward suites
   # (7 in tailnet_streams_integration + 1 in forward_v2_attestation_e2e
   # + 2 in forward_half_close_e2e, the #961 FIN/denial proofs).

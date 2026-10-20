@@ -71,6 +71,7 @@ tokens, ciphertexts, invites or log text. Pure-python tests:
 
 | File | Tests |
 |------|-------|
+| `agent_usability_eval.rs` | #1174 agent-usability eval: a deterministic scripted agent driven only by `x0x onboard` output + the core SKILL.md sends a DM, joins a group, writes a scratch KV value on a two-daemon hermetic pair. Daemon-backed, `#[ignore]`; the fast doc-surface half runs un-ignored |
 | `identity_integration.rs` | Three-layer identity, keypair management, certificates |
 | `identity_unification_test.rs` | machine_id == ant-quic PeerId, announcement key derivation |
 | `trust_evaluation_test.rs` | TrustEvaluator decisions, machine pinning, ContactStore mutations |
