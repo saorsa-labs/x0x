@@ -84,6 +84,13 @@ pub async fn owner_agents(client: &DaemonClient) -> Result<()> {
     client.run_get("/owner/agents").await
 }
 
+/// `x0x owner machines` — GET /owner/machines (the M1 machine census over
+/// owner-sync: enrolled devices, last-sync status, and this machine's
+/// version/policy digest, #1383).
+pub async fn owner_machines(client: &DaemonClient) -> Result<()> {
+    client.run_get("/owner/machines").await
+}
+
 /// `x0x announce` — POST /announce
 pub async fn announce(client: &DaemonClient, include_user: bool, consent: bool) -> Result<()> {
     client.ensure_running().await?;
