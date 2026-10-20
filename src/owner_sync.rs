@@ -6467,4 +6467,239 @@ mod issue_1055_tests {
         );
         let _ = peer_task.await;
     }
+    /// WHY (#1055 RC2, review of RC1): the tombstone write guard ended
+    /// before the device row was removed; an enroll that slipped into that
+    /// gap inserted a newer enrollment that the removal then deleted
+    /// WITHOUT the tombstone covering its timestamp — replaying that
+    /// enrollment restored admission. The guard must be held through the
+    /// removal. Deterministic: the test parks the removal on the devices
+    /// write lock, then waits for the park itself (a queued devices writer
+    /// makes a fresh `try_read` fail — the tokio lock is write-preferring)
+    /// and proves the tombstone lock is still held at that point. The park
+    /// is strictly after the durable tombstone write, so code that dropped
+    /// the tombstone guard when the persist returned (the RC1 shape) has
+    /// released it by then — no timing window at all.
+    #[tokio::test]
+    async fn unenroll_holds_the_tombstone_lock_through_the_removal() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+
+        // Park the removal on a devices READ guard: the floor's read
+        // completes (read-read shares), the tombstone becomes durable, and
+        // the removal's devices WRITE then parks behind the guard.
+        let devices_guard = store.devices.read().await;
+        let removal_store = Arc::clone(&store);
+        let removal = tokio::spawn(async move { removal_store.unenroll(&peer).await });
+
+        // The durable tombstone is the RC1 release point: once the file
+        // exists, the old code had already dropped the tombstone lock.
+        let tombstone_file = dir.path().join(SYNC_DIR).join(TOMBSTONES_FILE);
+        for _ in 0..1_000 {
+            if tombstone_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            tombstone_file.exists(),
+            "the tombstone must be durable first"
+        );
+        // Wait for the PARK, not the file: the removal's devices WRITE is
+        // queued only after the tombstone persist returned, which is
+        // strictly after any code shape that dropped the tombstone guard
+        // with the persist. The queued writer makes this fresh read fail
+        // (write-preferring); the test's own read guard above cannot —
+        // readers coexist.
+        let mut writer_queued = false;
+        for _ in 0..1_000 {
+            if store.devices.try_read().is_err() {
+                writer_queued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            writer_queued,
+            "the removal must reach (and park on) the devices write"
+        );
+
+        // The serialization under test: the tombstone lock is STILL held
+        // while the removal is parked, so no enroll can slip into the gap.
+        assert!(
+            store.unenroll_tombstones.try_read().is_err(),
+            "the tombstone lock must be held through the removal"
+        );
+
+        drop(devices_guard);
+        assert!(removal.await.expect("removal task").expect("delete"));
+        let replay = store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { .. })),
+            "replay of the deleted enrollment must stay refused, got {replay:?}"
+        );
+    }
+
+    /// WHY (#1055 RC2, review of RC1): the session commit validated
+    /// admission BEFORE waiting for the records write lock, and revocation
+    /// writers take no lock the commit holds — a machine revocation that
+    /// landed while the commit waited behind another commit was missed,
+    /// and the batch committed after the peer was revoked. The commit now
+    /// validates after acquiring the records lock and holds the revocation
+    /// read guard across the mutation. Deterministic: the commit is parked
+    /// first on its admission read (empty revocation set, so the check
+    /// passes) and then on the records write; the revocation lands between
+    /// the two parks, its ordering proven by the lock handoffs themselves.
+    #[tokio::test]
+    async fn session_commit_refuses_batch_when_revocation_lands_during_lock_wait() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer_kp = crate::identity::MachineKeypair::generate().expect("machine keygen");
+        let peer = peer_kp.machine_id();
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let inbound = sign_names("from-peer", "peer-value", clock(1, 1, 2), &owner);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local vector arrives as pages, then VectorEnd.
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // One owner-signed record, then Done: the batch this session
+            // will try to commit.
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: vec![inbound],
+                },
+            )
+            .await?;
+            write_frame(&mut c_send, &SyncFrame::Done).await?;
+            // The local side's own (empty) records and Done follow.
+            let _ = read_frame(&mut c_recv).await;
+            let _ = read_frame(&mut c_recv).await;
+            Ok::<(), SyncError>(())
+        });
+
+        let pending = negotiate_sync_session(
+            &mut s_send,
+            &mut s_recv,
+            &store,
+            Some(revocations.as_ref()),
+            &owner,
+            &local,
+            &peer,
+        )
+        .await
+        .expect("negotiate");
+
+        // Park the commit twice: its admission read waits behind the
+        // revocation write (the set is still empty, so the check passes
+        // once released), and the commit itself then waits behind the
+        // records write.
+        let records_guard = store.records.write().await;
+        let revocation_write = revocations.write().await;
+        let commit_store = Arc::clone(&store);
+        let commit_revocations = Arc::clone(&revocations);
+        let commit_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let commit_peer = peer;
+        let commit = tokio::spawn(async move {
+            let commit_owner_id = commit_owner.user_id();
+            let admission = SessionAdmission {
+                store: &commit_store,
+                revocations: Some(commit_revocations.as_ref()),
+                owner: &commit_owner_id,
+                peer: &commit_peer,
+            };
+            commit_store
+                .commit_session_batch(pending.verified, &admission)
+                .await
+        });
+        // Releasing the revocation write lets the commit's check read the
+        // EMPTY set; the settle lets that early check (a ~1 ms ML-DSA
+        // verification plus the set read) finish before the revocation
+        // lands — on the fixed head the check cannot even start until the
+        // records lock is granted, so the settle only orders the OLD
+        // code's pre-records check. Reacquiring the write then proves no
+        // reader holds the set.
+        drop(revocation_write);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut revocation_write = revocations.write().await;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(peer),
+            peer_kp.public_key(),
+            peer_kp.secret_key(),
+            now_secs,
+            None,
+        )
+        .expect("sign machine revocation");
+        revocation_write
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+        drop(revocation_write);
+        // Let the commit proceed: it must refuse under the held locks.
+        drop(records_guard);
+
+        let result = commit.await.expect("commit task");
+        assert!(
+            matches!(result, Err(SyncError::MachineRevoked { .. })),
+            "a revocation that lands during the commit's lock wait must stop the commit, got {result:?}"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "a refused session commit stores nothing"
+        );
+        let _ = peer_task.await;
+    }
 }

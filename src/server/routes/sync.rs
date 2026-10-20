@@ -1058,4 +1058,73 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "malformed id: {body:?}");
         Ok(())
     }
+    /// WHY (#1055 RC2, review of RC1): a tombstoned enroll is a REFUSAL the
+    /// caller can correct, not a storage failure — the route must answer
+    /// `409 enrollment_tombstoned`, never `500 failed to persist`. The
+    /// tombstone is seeded far in the machine's future (enroll with a
+    /// far-future `enrolled_at_ms`, then DELETE it) so ANY enrollment the
+    /// route can sign now predates it — deterministic, no clock race.
+    #[tokio::test]
+    async fn enroll_refuses_a_tombstoned_machine_with_409() -> anyhow::Result<()> {
+        use crate::server::rider_auth::ActorContext;
+        use tower::ServiceExt;
+        const OWNER: ActorContext = ActorContext::Owner { durable: true };
+
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x53; 32]).await?;
+        let app = axum::Router::new()
+            .route("/sync/devices/enroll", axum::routing::post(enroll_device))
+            .with_state(Arc::clone(&state));
+        let sync = state.owner_sync.as_ref().expect("owned state wires sync");
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+        // A peer machine, deleted after a far-future enrollment: the RC1
+        // tombstone floor (max with the deleted enrollment's OWN timestamp)
+        // puts the tombstone far beyond `now`.
+        let peer = crate::identity::MachineId([0x53; 32]);
+        sync.store()
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(
+                    peer,
+                    &owner_kp,
+                    u64::MAX / 2,
+                    None,
+                )
+                .expect("sign far-future enrollment"),
+            )
+            .await
+            .expect("seed enrollment");
+        assert!(
+            sync.store().unenroll(&peer).await.expect("delete"),
+            "seeding the tombstone"
+        );
+
+        let (status, body) = response_json(
+            app.oneshot(
+                axum::http::Request::post("/sync/devices/enroll")
+                    .header("content-type", "application/json")
+                    .extension(OWNER)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "machine_id": hex::encode(peer.0) }).to_string(),
+                    ))?,
+            )
+            .await?,
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a tombstoned enroll is a refusal (409), not a storage failure: {body:?}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("enrollment_tombstoned")),
+            "the refusal must name its cause: {body:?}"
+        );
+        Ok(())
+    }
 }
