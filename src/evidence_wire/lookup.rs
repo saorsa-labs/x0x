@@ -805,6 +805,8 @@ mod tests {
         peer_evidence::{PeerEvidenceStore, RuntimePolicy},
     };
 
+    mod background;
+
     #[tokio::test]
     async fn s4_relay_ingress_cannot_seed_host_hints_or_spawn_lookup() {
         let runtime = Arc::new(EvidenceRuntime::default());
@@ -857,6 +859,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runtime.lookup_hints.machines(agent), vec![machine]);
+        assert_eq!(runtime.shutdown_workers().await, 0);
     }
 
     #[tokio::test]
@@ -932,6 +935,7 @@ mod tests {
         .expect("another peer must be delivered while Lookup is unanswered");
         drop(tx);
         listener.await.unwrap();
+        assert_eq!(runtime.shutdown_workers().await, 0);
     }
 
     #[tokio::test]
@@ -975,10 +979,18 @@ mod tests {
         // not first acquired when those jobs eventually get polled.
         assert_eq!(runtime.wire_limits.lookups.available_permits(), 0);
         assert_eq!(runtime.diagnostics()["evidence_lookup_skipped"], 113);
-        tokio::task::yield_now().await;
-        assert_eq!(started.load(Ordering::Relaxed), 16);
+        // Background reads run on blocking workers. A Tokio yield alone
+        // cannot prove that those workers have reached the responder.
+        let all_started = tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::Relaxed) != 16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
         release.cancel();
         sender.await.unwrap();
+        assert_eq!(runtime.shutdown_workers().await, 0);
+        assert!(all_started.is_ok(), "admitted Lookups did not start");
         tokio::time::timeout(Duration::from_millis(500), async {
             while runtime.wire_limits.lookups.available_permits() != 16 {
                 tokio::task::yield_now().await;
@@ -1049,6 +1061,7 @@ mod tests {
             later.0,
             "a later frame uses the stored, reverified evidence"
         );
+        assert_eq!(runtime.shutdown_workers().await, 0);
     }
 
     struct Node {
