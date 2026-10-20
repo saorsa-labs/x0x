@@ -765,6 +765,59 @@ async fn pin_mismatch_is_refused_and_the_pin_is_kept() {
     assert_eq!(repinned.agent_id, Some(AgentId([2; 32])));
 }
 
+/// WHY: a bare name keeps the kind inferred at first pin (ADR 0074).
+/// Dropping machine M and introducing agent A with the same label must
+/// refuse with `pin_mismatch` and must not mint `agent:studio.me`.
+#[tokio::test]
+async fn bare_name_keeps_inferred_kind_across_a_kind_change() {
+    let store = NameStore::in_memory();
+    let owner = UserId([5; 32]);
+    let machine = Candidates {
+        agents: vec![],
+        machines: vec![verified_machine(3, "studio")],
+    };
+    let first = resolve_with(&store, &name("studio.me"), owner, &machine, NOW)
+        .await
+        .unwrap();
+    assert_eq!(first.name, "machine:studio.me");
+    assert_eq!(first.kind, NameKind::Machine);
+    assert!(first.newly_pinned);
+
+    // The agent does not reopen kind selection while the machine pin stands.
+    let both = Candidates {
+        agents: vec![verified_agent(7, "studio")],
+        machines: vec![verified_machine(3, "studio")],
+    };
+    let still = resolve_with(&store, &name("studio.me"), owner, &both, NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(still.kind, NameKind::Machine);
+    assert_eq!(still.machine_id, Some(MachineId([3; 32])));
+    assert!(!still.newly_pinned);
+
+    let agent = Candidates {
+        agents: vec![verified_agent(7, "studio")],
+        machines: vec![],
+    };
+    let err = resolve_with(&store, &name("studio.me"), owner, &agent, NOW + 2)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        NameError::PinMismatch {
+            name: "machine:studio.me".into(),
+            pinned: hex::encode([3u8; 32]),
+            current: hex::encode([7u8; 32]),
+        }
+    );
+    assert!(
+        store.get_pin("agent:studio.me").await.unwrap().is_none(),
+        "a kind change must not write a second pin"
+    );
+    let pin = store.get_pin("machine:studio.me").await.unwrap().unwrap();
+    assert_eq!((pin.id, pin.owner), ([3; 32], owner));
+}
+
 /// WHY: owner petnames are frozen at first bind; rebinding to another key
 /// is refused until the owner removes the label (which drops its pins).
 #[tokio::test]

@@ -21,7 +21,9 @@
 //!   labels them explicitly ([`crate::Agent::label_shared_machine`]).
 //! - Every successful resolution is **pinned at first use** (TOFU): the
 //!   canonical name records the id it resolved to, and a later resolution to
-//!   a different id fails loud with [`NameError::PinMismatch`]. Nothing
+//!   a different id fails loud with [`NameError::PinMismatch`]. A bare name
+//!   keeps the kind of that pin. A resolution that would select the other
+//!   kind is the same mismatch and does not write a second pin. Nothing
 //!   silently rebinds; the owner re-pins by removing the pin.
 //!
 //! Resolution is local, makes no network query and adds **no trust**: it
@@ -1292,8 +1294,63 @@ pub async fn resolve_with(
     resolve_with_options(store, name, owner, candidates, now_unix, false).await
 }
 
+/// The pin a bare name already has, when exactly one kind is pinned.
+///
+/// Both kinds pinned is [`NameError::AmbiguousKind`]: the bare label no
+/// longer has one inferred kind.
+async fn bare_name_pin(
+    store: &NameStore,
+    name: &NameRef,
+) -> Result<Option<(NameKind, NamePin)>, NameError> {
+    let agent = store.get_pin(&name.canonical(NameKind::Agent)).await?;
+    let machine = store.get_pin(&name.canonical(NameKind::Machine)).await?;
+    match (agent, machine) {
+        (Some(pin), None) => Ok(Some((NameKind::Agent, pin))),
+        (None, Some(pin)) => Ok(Some((NameKind::Machine, pin))),
+        (Some(_), Some(_)) => Err(NameError::AmbiguousKind(name.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The inferred kind no longer has a verified candidate.
+fn inferred_kind_missed(err: &NameError) -> bool {
+    matches!(
+        err,
+        NameError::UnknownName(_) | NameError::UnverifiedOwner(_)
+    )
+}
+
+/// A bare name whose inferred kind missed, while another kind resolves.
+///
+/// That is a rebind of the pinned identity ([`NameError::PinMismatch`]),
+/// not a new pin of the other kind.
+fn bare_kind_rebind(
+    name: &NameRef,
+    owner: UserId,
+    candidates: &Candidates,
+    preserved: Option<(NameKind, NamePin)>,
+    err: &NameError,
+) -> Option<NameError> {
+    let (kind, pin) = preserved?;
+    if !inferred_kind_missed(err) {
+        return None;
+    }
+    let other = select(name, candidates).ok()?;
+    if other.kind == kind && other.id == pin.id && pin.owner == owner {
+        return None;
+    }
+    Some(NameError::PinMismatch {
+        name: name.canonical(kind),
+        pinned: hex::encode(pin.id),
+        current: hex::encode(other.id),
+    })
+}
+
 /// Like [`resolve_with`], but when `agent_only` is set, refuse a machine
 /// selection **before** pinning (forwards until ADR-0074 slice 2).
+///
+/// A bare name keeps the kind of an existing pin. Selecting the other kind
+/// is [`NameError::PinMismatch`] and writes no second pin.
 ///
 /// # Errors
 /// Any [`select`] error, [`NameError::MachineTargetUnsupported`], or
@@ -1306,7 +1363,19 @@ pub async fn resolve_with_options(
     now_unix: u64,
     agent_only: bool,
 ) -> Result<Resolved, NameError> {
-    let selection = select(name, candidates)?;
+    // A bare name keeps the kind inferred at first pin (ADR 0074). A later
+    // candidate of the other kind must not mint a second pin key.
+    let preserved = if name.kind.is_none() {
+        bare_name_pin(store, name).await?
+    } else {
+        None
+    };
+    let mut select_name = name.clone();
+    if let Some((kind, _)) = preserved {
+        select_name.kind = Some(kind);
+    }
+    let selection = select(&select_name, candidates)
+        .map_err(|err| bare_kind_rebind(name, owner, candidates, preserved, &err).unwrap_or(err))?;
     if agent_only && selection.kind != NameKind::Agent {
         return Err(machine_forward_refusal(name));
     }
