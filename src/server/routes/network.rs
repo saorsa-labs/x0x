@@ -1293,9 +1293,19 @@ mod participation_diagnostics_tests {
 
         // #1384: the D35 policy fields ship as explicit nulls — "set by
         // David later" is the published state — and stay out of the
-        // preimage (fleet policy, not per-machine policy).
-        assert!(body["minimum_supported_version"].is_null());
-        assert!(body["support_window"].is_null());
+        // preimage (fleet policy, not per-machine policy). The get()==Null
+        // form distinguishes a present null from an absent key: removing
+        // either field from the handler fails this test.
+        assert_eq!(
+            body.get("minimum_supported_version"),
+            Some(&serde_json::Value::Null),
+            "minimum_supported_version must be present and null"
+        );
+        assert_eq!(
+            body.get("support_window"),
+            Some(&serde_json::Value::Null),
+            "support_window must be present and null"
+        );
         assert!(
             !input.contains("minimum_supported_version"),
             "fleet policy must not churn the per-machine digest"
