@@ -568,6 +568,8 @@ jobs:
           --expect w3h_1357_red_s4_idle_revocation_one_admin_home=RED
           --require w3h_1357_control_s4_self_leave_then_revocation
           --expect w3h_1357_control_s4_self_leave_then_revocation=GREEN
+          --require w3h_1357_red_s4_restart_intake_prepare
+          --expect w3h_1357_red_s4_restart_intake_prepare=RED
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
