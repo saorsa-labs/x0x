@@ -176,6 +176,24 @@ fn is_reserved(label: &str) -> bool {
     RESERVED_LABELS.contains(&label)
 }
 
+/// Announce `self_name` is a verified agent label only when the announce's
+/// machine id equals the authenticated QUIC binding for that agent.
+///
+/// V3 announces are machine-signed; without an authenticated machine match
+/// (or when auth is absent while a name is claimed) the label is treated as
+/// unverified and dropped. Used by [`Agent::name_candidates`].
+#[must_use]
+pub fn verified_announce_self_name(
+    announce_machine: MachineId,
+    authenticated_machine: Option<MachineId>,
+    announce_self_name: Option<String>,
+) -> Option<String> {
+    match (authenticated_machine, announce_self_name) {
+        (Some(auth), name) if auth == announce_machine && announce_machine.0 != [0u8; 32] => name,
+        _ => None,
+    }
+}
+
 /// Map a free-form display name (announced self-name, synced
 /// `machine_name`, card `owner_name`) to the label it answers to.
 ///
@@ -346,8 +364,13 @@ pub fn require_agent_target(resolved: &Resolved, name: &NameRef) -> Result<Agent
 pub struct AgentCandidate {
     /// The agent.
     pub agent_id: AgentId,
-    /// The label its announced self-name answers to.
-    pub label: String,
+    /// The label its announced self-name answers to, when DNS-compatible.
+    ///
+    /// `None` when the agent has no display name or a name that cannot
+    /// become a DNS label (Unicode, reserved, …). Such agents never match
+    /// an agent name, but their verified machine binding still supports
+    /// shared-machine (and sole-agent) resolution.
+    pub label: Option<String>,
     /// Its authenticated machine, if known.
     pub machine_id: Option<MachineId>,
     /// Valid, unexpired, unrevoked certificate chaining to the owner.
@@ -409,9 +432,9 @@ pub fn agent_candidates(
         if agent.announced_user != Some(*owner) && cert_user != Some(*owner) {
             continue;
         }
-        let Some(label) = agent.self_name.as_deref().and_then(label_from_display) else {
-            continue;
-        };
+        // Agent-label matching needs a DNS-compatible self-name; machine
+        // eligibility (shared / sole-agent) uses verified binding only.
+        let label = agent.self_name.as_deref().and_then(label_from_display);
         let verified = agent.certificate.as_ref().is_some_and(|cert| {
             crate::owner_trust::certificate_chains_to_owner(
                 owner,
@@ -557,7 +580,7 @@ pub fn select(name: &NameRef, candidates: &Candidates) -> Result<Selection, Name
         candidates
             .agents
             .iter()
-            .filter(|a| a.verified && a.label == name.label)
+            .filter(|a| a.verified && a.label.as_deref() == Some(name.label.as_str()))
             .map(|a| (a.agent_id.0, a))
             .collect()
     } else {
@@ -608,7 +631,7 @@ pub fn select(name: &NameRef, candidates: &Candidates) -> Result<Selection, Name
         && candidates
             .agents
             .iter()
-            .any(|a| !a.verified && a.label == name.label))
+            .any(|a| !a.verified && a.label.as_deref() == Some(name.label.as_str())))
         || (want_machine
             && candidates
                 .machines
@@ -801,12 +824,22 @@ impl NamesState {
 /// one lock held across the durable write. A failure before the rename
 /// leaves memory and disk on the old state; a failure after the rename
 /// keeps the new state in memory so it matches the advanced disk (issue
-/// #1101).
+/// #1101) and raises a pending-durability flag until a later write
+/// confirms the parent-directory fsync — an identical retry must not ACK
+/// as [`BindOutcome::Unchanged`] while that flag is set.
 #[derive(Debug)]
 pub struct NameStore {
     path: Option<PathBuf>,
     state: tokio::sync::Mutex<NamesState>,
     load_error: Option<String>,
+    /// Set when a write crossed the rename but parent-dir fsync failed.
+    /// Cleared only by a successful durable persist. While set, `commit`
+    /// re-attempts the write even when the mutate is a no-op.
+    pending_durability: std::sync::atomic::AtomicBool,
+    /// Staged by the post-rename callback; drained into [`Self::state`]
+    /// under the lock so a cancelled persist await cannot lose the
+    /// advanced disk state (Send-safe; no raw pointers in the future).
+    install_slot: std::sync::Mutex<Option<NamesState>>,
 }
 
 impl NameStore {
@@ -817,6 +850,8 @@ impl NameStore {
             path: None,
             state: tokio::sync::Mutex::new(NamesState::default()),
             load_error: None,
+            pending_durability: std::sync::atomic::AtomicBool::new(false),
+            install_slot: std::sync::Mutex::new(None),
         }
     }
 
@@ -864,13 +899,15 @@ impl NameStore {
         }
     }
 
-    /// Write `state` atomically (mode 0600). The error says which half of
-    /// the durable write failed (issue #1101): `BeforeRename` leaves the
-    /// old file in place (callers keep old memory); `AfterRename` means
-    /// the new file is already there (callers install the mutation and
-    /// still report failure).
-    async fn persist(&self, state: &NamesState) -> Result<(), crate::storage::DurableWriteError> {
+    /// Write `state` atomically (mode 0600). `on_renamed` runs when the
+    /// new bytes are visible (after rename, before parent-dir fsync).
+    async fn persist_with_install(
+        &self,
+        state: &NamesState,
+        on_renamed: impl FnOnce(),
+    ) -> Result<(), crate::storage::DurableWriteError> {
         let Some(path) = &self.path else {
+            on_renamed();
             return Ok(());
         };
         let bytes = serde_json::to_vec_pretty(&state.to_file()).map_err(|e| {
@@ -878,35 +915,85 @@ impl NameStore {
                 "encode: {e}"
             )))
         })?;
-        crate::storage::write_private_bytes_durable_typed(path, bytes)
+        crate::storage::write_private_bytes_durable_typed_after_rename(path, bytes, on_renamed)
             .await
             .map_err(|e| e.with_path(path))
+    }
+
+    fn drain_install_slot(&self, guard: &mut NamesState) {
+        if let Ok(mut slot) = self.install_slot.lock() {
+            if let Some(next) = slot.take() {
+                *guard = next;
+            }
+        }
+    }
+
+    async fn lock_state(&self) -> tokio::sync::MutexGuard<'_, NamesState> {
+        let mut guard = self.state.lock().await;
+        self.drain_install_slot(&mut guard);
+        guard
     }
 
     /// Apply `mutate` to a copy, persist it, then commit.
     ///
     /// Success installs the new state. `BeforeRename` keeps the old memory
-    /// (disk unchanged). `AfterRename` installs the new state so memory
-    /// matches the advanced disk, then still returns [`NameError::Store`]
-    /// — durability is unconfirmed.
+    /// (disk unchanged). `AfterRename` stages the new state in
+    /// [`Self::install_slot`] inside the rename callback (cancel-safe),
+    /// drains it into the lock, marks durability pending, then still
+    /// returns [`NameError::Store`]. A later identical mutate (`changed =
+    /// false`) retries the write while pending — it must not ACK as
+    /// success until a parent-directory fsync succeeds.
     async fn commit<T>(
         &self,
         mutate: impl FnOnce(&mut NamesState) -> Result<(T, bool), NameError>,
     ) -> Result<T, NameError> {
+        use std::sync::atomic::Ordering;
         self.usable()?;
-        let mut guard = self.state.lock().await;
+        let mut guard = self.lock_state().await;
         let mut next = guard.clone();
         let (out, changed) = mutate(&mut next)?;
         if changed {
-            match self.persist(&next).await {
+            let to_install = next.clone();
+            let slot = &self.install_slot;
+            let pending = &self.pending_durability;
+            match self
+                .persist_with_install(&next, move || {
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(to_install);
+                    }
+                    pending.store(true, Ordering::Release);
+                })
+                .await
+            {
                 Ok(()) => {
-                    *guard = next;
+                    self.drain_install_slot(&mut guard);
+                    self.pending_durability.store(false, Ordering::Release);
                 }
                 Err(e) if e.crossed_rename() => {
-                    // Issue #1101: the rename already happened — the new
-                    // binding IS in `names.json`. Keep it (memory matches
-                    // the advanced disk) and still report failure.
-                    *guard = next;
+                    self.drain_install_slot(&mut guard);
+                    return Err(NameError::Store(format!(
+                        "applied, but durability is not confirmed (directory fsync failed): \
+                         {e}; the change is in effect"
+                    )));
+                }
+                Err(e) => {
+                    let _ = self.install_slot.lock().map(|mut s| s.take());
+                    return Err(NameError::Store(format!("write {e}")));
+                }
+            }
+        } else if self.pending_durability.load(Ordering::Acquire) {
+            let pending = &self.pending_durability;
+            let held = (*guard).clone();
+            match self
+                .persist_with_install(&held, || {
+                    pending.store(true, Ordering::Release);
+                })
+                .await
+            {
+                Ok(()) => {
+                    self.pending_durability.store(false, Ordering::Release);
+                }
+                Err(e) if e.crossed_rename() => {
                     return Err(NameError::Store(format!(
                         "applied, but durability is not confirmed (directory fsync failed): \
                          {e}; the change is in effect"
@@ -926,7 +1013,7 @@ impl NameStore {
     /// [`NameError::Store`] when the store is not usable.
     pub async fn owner(&self, label: &str) -> Result<Option<OwnerBinding>, NameError> {
         self.usable()?;
-        Ok(self.state.lock().await.owners.get(label).copied())
+        Ok(self.lock_state().await.owners.get(label).copied())
     }
 
     /// The label bound to `user`, if any.
@@ -936,8 +1023,7 @@ impl NameStore {
     pub async fn label_for(&self, user: &UserId) -> Result<Option<String>, NameError> {
         self.usable()?;
         Ok(self
-            .state
-            .lock()
+            .lock_state()
             .await
             .owners
             .iter()
@@ -995,6 +1081,7 @@ impl NameStore {
     /// # Errors
     /// [`NameError::Store`].
     pub async fn unbind_owner(&self, label: &str) -> Result<bool, NameError> {
+        validate_label(label)?;
         let suffix = format!(".{label}");
         self.commit(|state| {
             if state.owners.remove(label).is_none() {
@@ -1069,7 +1156,7 @@ impl NameStore {
     /// [`NameError::Store`].
     pub async fn get_pin(&self, key: &str) -> Result<Option<NamePin>, NameError> {
         self.usable()?;
-        Ok(self.state.lock().await.pins.get(key).copied())
+        Ok(self.lock_state().await.pins.get(key).copied())
     }
 
     /// Machine labels pinned under `owner_label`: `(label, machine)`.
@@ -1081,7 +1168,7 @@ impl NameStore {
         owner_label: &str,
     ) -> Result<Vec<(String, MachineId)>, NameError> {
         self.usable()?;
-        let state = self.state.lock().await;
+        let state = self.lock_state().await;
         Ok(state
             .pins
             .iter()
@@ -1101,7 +1188,7 @@ impl NameStore {
         &self,
     ) -> Result<(BTreeMap<String, OwnerBinding>, BTreeMap<String, NamePin>), NameError> {
         self.usable()?;
-        let state = self.state.lock().await;
+        let state = self.lock_state().await;
         Ok((state.owners.clone(), state.pins.clone()))
     }
 }
@@ -1135,7 +1222,27 @@ pub async fn resolve_with(
     candidates: &Candidates,
     now_unix: u64,
 ) -> Result<Resolved, NameError> {
+    resolve_with_options(store, name, owner, candidates, now_unix, false).await
+}
+
+/// Like [`resolve_with`], but when `agent_only` is set, refuse a machine
+/// selection **before** pinning (forwards until ADR-0074 slice 2).
+///
+/// # Errors
+/// Any [`select`] error, [`NameError::MachineTargetUnsupported`], or
+/// `PinMismatch` / `Store` from the pin.
+pub async fn resolve_with_options(
+    store: &NameStore,
+    name: &NameRef,
+    owner: UserId,
+    candidates: &Candidates,
+    now_unix: u64,
+    agent_only: bool,
+) -> Result<Resolved, NameError> {
     let selection = select(name, candidates)?;
+    if agent_only && selection.kind != NameKind::Agent {
+        return Err(machine_forward_refusal(name));
+    }
     let key = name.canonical(selection.kind);
     let outcome = store
         .pin(&key, owner, selection.id, BindSource::FirstUse, now_unix)
@@ -1215,11 +1322,18 @@ impl crate::Agent {
                 &entry.agent_id,
             )
             .await;
+            // V3 `self_name` is machine-signed only. Trust it as a label
+            // solely when the announce's machine matches this agent's
+            // authenticated binding; otherwise a foreign machine can
+            // re-announce a real certified agent under another label
+            // (Claude #1494 e338df79 P2).
+            let self_name =
+                verified_announce_self_name(entry.machine_id, machine_id, entry.self_name);
             observed.push(ObservedAgent {
                 agent_id: entry.agent_id,
                 announced_user: entry.user_id,
                 certificate: entry.agent_certificate,
-                self_name: entry.self_name,
+                self_name,
                 machine_id,
                 revoked: false,
             });
@@ -1314,11 +1428,35 @@ impl crate::Agent {
         devices: Option<&crate::owner_sync::OwnerSyncStore>,
         name: &NameRef,
     ) -> Result<Resolved, NameError> {
+        self.resolve_name_opts(names, devices, name, false).await
+    }
+
+    /// Resolve for `POST /forwards`: refuse a machine target before pinning
+    /// so a refused forward does not write `names.json`.
+    ///
+    /// # Errors
+    /// Any [`NameError`], including [`NameError::MachineTargetUnsupported`].
+    pub async fn resolve_name_for_forward(
+        &self,
+        names: &NameStore,
+        devices: Option<&crate::owner_sync::OwnerSyncStore>,
+        name: &NameRef,
+    ) -> Result<Resolved, NameError> {
+        self.resolve_name_opts(names, devices, name, true).await
+    }
+
+    async fn resolve_name_opts(
+        &self,
+        names: &NameStore,
+        devices: Option<&crate::owner_sync::OwnerSyncStore>,
+        name: &NameRef,
+        agent_only: bool,
+    ) -> Result<Resolved, NameError> {
         let owner = self.name_owner(names, &name.owner).await?;
         let candidates = self
             .name_candidates(names, &name.owner, &owner, devices)
             .await?;
-        resolve_with(names, name, owner, &candidates, unix_now_secs()).await
+        resolve_with_options(names, name, owner, &candidates, unix_now_secs(), agent_only).await
     }
 
     /// Label a shared machine: `machine:<label>.<owner>` → `machine`, for a

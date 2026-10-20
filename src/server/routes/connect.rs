@@ -91,7 +91,9 @@ pub(in crate::server) async fn forward_add(
     let (peer_agent_bytes, name) = match peer {
         PeerRef::Hex(id) => (id, None),
         PeerRef::Name(name) => {
-            let resolved = match super::names::resolve(&state, &name).await {
+            // Agent-only resolve: check kind before pinning so a bare
+            // label that lands on a machine does not write names.json.
+            let resolved = match super::names::resolve_for_forward(&state, &name).await {
                 Ok(resolved) => resolved,
                 Err(e) => return super::names::name_error(&e),
             };
