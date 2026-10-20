@@ -220,6 +220,8 @@ opt-level = 3
 # opt-level 3, which took the CI workspace test build from ~20 to ~57 minutes.
 [profile.signing-acceptance]
 inherits = "test"
+# Keep file/line backtraces without full debug information's build memory cost.
+debug = "line-tables-only"
 
 [profile.signing-acceptance.package.x0x]
 opt-level = 3
