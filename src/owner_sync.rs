@@ -1426,39 +1426,41 @@ impl OwnerSyncStore {
         let _removal_gate = self.canonical_home_gate.write().await;
         // Tombstone FIRST (#1055): a crash between the two writes leaves
         // the machine blocked (fail closed) instead of re-admittable from
-        // a stale enrollment. The tombstone write lock is held across the
-        // whole removal, serializing against `enroll` (which holds the
-        // read lock across its insert) — see `unenroll_tombstones`.
-        {
-            let mut tombstones = self.unenroll_tombstones.write().await;
-            let enrollment_at = self
-                .devices
-                .read()
-                .await
-                .get(&machine.0)
-                .map_or(0, |enrollment| enrollment.enrolled_at_ms);
-            let deleted_at = now_unix_ms().max(enrollment_at);
-            let previous = tombstones.get(&machine.0).copied();
-            if previous.is_none_or(|old| old < deleted_at) {
-                tombstones.insert(machine.0, deleted_at);
-                if let Err(e) = self.persist_tombstones(&tombstones).await {
-                    if matches!(e, SyncError::Poisoned(_)) {
-                        // Disk already holds the tombstone: keep it and poison.
-                        drop(tombstones);
-                        self.poison(e.to_string());
-                        return Err(e);
-                    }
-                    // Pre-rename failure: roll back to the unchanged disk.
-                    match previous {
-                        Some(old) => {
-                            tombstones.insert(machine.0, old);
-                        }
-                        None => {
-                            tombstones.remove(&machine.0);
-                        }
-                    }
+        // a stale enrollment. RC2: the tombstone write lock is held through
+        // the removal AND its persistence — an `enroll` that slipped into
+        // the gap after the tombstone write would otherwise insert a newer
+        // enrollment that this removal deletes WITHOUT the tombstone
+        // covering its timestamp, and replaying that enrollment would
+        // restore admission. Holding the lock here serializes `enroll`
+        // (which holds the read lock across its insert) for the whole
+        // removal — see `unenroll_tombstones`.
+        let mut tombstones = self.unenroll_tombstones.write().await;
+        let enrollment_at = self
+            .devices
+            .read()
+            .await
+            .get(&machine.0)
+            .map_or(0, |enrollment| enrollment.enrolled_at_ms);
+        let deleted_at = now_unix_ms().max(enrollment_at);
+        let previous = tombstones.get(&machine.0).copied();
+        if previous.is_none_or(|old| old < deleted_at) {
+            tombstones.insert(machine.0, deleted_at);
+            if let Err(e) = self.persist_tombstones(&tombstones).await {
+                if matches!(e, SyncError::Poisoned(_)) {
+                    // Disk already holds the tombstone: keep it and poison.
+                    self.poison(e.to_string());
                     return Err(e);
                 }
+                // Pre-rename failure: roll back to the unchanged disk.
+                match previous {
+                    Some(old) => {
+                        tombstones.insert(machine.0, old);
+                    }
+                    None => {
+                        tombstones.remove(&machine.0);
+                    }
+                }
+                return Err(e);
             }
         }
         let mut devices = self.devices.write().await;
@@ -1480,6 +1482,7 @@ impl OwnerSyncStore {
             verified.remove(&machine.0);
         }
         drop(devices);
+        drop(tombstones);
         self.kick();
         Ok(true)
     }
@@ -1567,8 +1570,13 @@ impl OwnerSyncStore {
     /// in front of a commit — a HomePointer batch can wait behind a seat
     /// mint — so the delivering peer's admission is re-checked under the
     /// gate, which `unenroll` also takes first: a removal either finishes
-    /// before this commit's check, or is fully visible to it. Fail-closed,
-    /// with nothing committed.
+    /// before this commit's check, or is fully visible to it. RC2: the
+    /// check runs AFTER the records lock too (a revocation, expiry or
+    /// delete that lands while this commit waited for the records lock is
+    /// seen), and the revocation read guard is HELD across the mutation —
+    /// a concurrent revocation either precedes the check (commit refused,
+    /// nothing stored) or follows the commit (applies after it cleanly).
+    /// Fail-closed.
     async fn commit_session_batch(
         &self,
         batch: Vec<VersionedRecord>,
@@ -1583,8 +1591,11 @@ impl OwnerSyncStore {
         // re-validates against every delete or revocation that landed while
         // it waited.
         let _canonical_gate = self.canonical_home_gate.write().await;
-        admission.still_admissible().await?;
-        self.commit_batch_locked(batch, admission.owner).await
+        let records = self.records.write().await;
+        admission.enrollment_current().await?;
+        let _revocations = admission.revocations_checked().await?;
+        self.commit_records_locked(records, batch, admission.owner)
+            .await
     }
 
     /// [`Self::commit_batch`]'s body under the records lock; the caller
@@ -1595,7 +1606,22 @@ impl OwnerSyncStore {
         batch: Vec<VersionedRecord>,
         owner: &UserId,
     ) -> Result<CommitOutcome, SyncError> {
-        let mut records = self.records.write().await;
+        let records = self.records.write().await;
+        self.commit_records_locked(records, batch, owner).await
+    }
+
+    /// The commit body under a HELD records write guard. The guard is
+    /// consumed here exactly as an owned local would be (the success and
+    /// poison paths release it before `kick`/`poison`).
+    async fn commit_records_locked(
+        &self,
+        mut records: tokio::sync::RwLockWriteGuard<
+            '_,
+            BTreeMap<(SyncKind, String), VersionedRecord>,
+        >,
+        batch: Vec<VersionedRecord>,
+        owner: &UserId,
+    ) -> Result<CommitOutcome, SyncError> {
         // (kind, key) → the value held BEFORE this batch first touched it.
         let mut touched: BTreeMap<(SyncKind, String), Option<VersionedRecord>> = BTreeMap::new();
         let mut outcome = CommitOutcome::default();
@@ -2705,20 +2731,42 @@ impl SessionAdmission<'_> {
     /// Enrollment covers signature, expiry currency AND the #1055
     /// tombstone (via [`OwnerSyncStore::is_enrolled`]).
     async fn still_admissible(&self) -> Result<(), SyncError> {
+        self.enrollment_current().await?;
+        self.revocations_checked().await.map(|_| ())
+    }
+
+    /// The enrollment half of [`Self::still_admissible`].
+    async fn enrollment_current(&self) -> Result<(), SyncError> {
         if !self.store.is_enrolled(self.peer, self.owner).await {
             return Err(SyncError::NotEnrolled {
                 machine: self.peer.0,
             });
         }
-        if let Some(revocations) = self.revocations {
-            let revoked = revocations.read().await;
-            if revoked.revocation_resync_required() || revoked.is_machine_revoked(self.peer) {
-                return Err(SyncError::MachineRevoked {
-                    machine: self.peer.0,
-                });
+        Ok(())
+    }
+
+    /// The revocation half of [`Self::still_admissible`], returning the
+    /// read guard so a session commit can HOLD it across its mutation
+    /// (#1055 RC2): a revocation that lands concurrently either precedes
+    /// this check (the commit is refused) or waits for the guard and
+    /// applies after the commit — never between the check and the
+    /// mutation.
+    async fn revocations_checked(
+        &self,
+    ) -> Result<Option<tokio::sync::RwLockReadGuard<'_, crate::revocation::RevocationSet>>, SyncError>
+    {
+        match self.revocations {
+            None => Ok(None),
+            Some(revocations) => {
+                let revoked = revocations.read().await;
+                if revoked.revocation_resync_required() || revoked.is_machine_revoked(self.peer) {
+                    return Err(SyncError::MachineRevoked {
+                        machine: self.peer.0,
+                    });
+                }
+                Ok(Some(revoked))
             }
         }
-        Ok(())
     }
 }
 
@@ -3026,10 +3074,23 @@ impl OwnerSyncService {
             .ok_or_else(|| ("no_owner_key", "no owner key".to_string()))?;
         let owner_id = owner_kp.user_id();
         let local_machine = self.agent.machine_id();
-        if !self.store.is_enrolled(machine, &owner_id).await {
+        // Same rule as the acceptor's `inbound_session_admissible`
+        // (#1055 RC2): a revoked machine, or one under a pending
+        // revocation resync, costs no session — refuse before dialing.
+        if !inbound_session_admissible(
+            &self.store,
+            &self.agent.revocation_set(),
+            machine,
+            &owner_id,
+        )
+        .await
+        {
             return Err((
                 "not_enrolled",
-                format!("machine {} is not enrolled", hex::encode(machine.0)),
+                format!(
+                    "machine {} is not enrolled or is revoked",
+                    hex::encode(machine.0)
+                ),
             ));
         }
         // Resolve the deterministic first agent on the target machine —
@@ -6467,6 +6528,7 @@ mod issue_1055_tests {
         );
         let _ = peer_task.await;
     }
+
     /// WHY (#1055 RC2, review of RC1): the tombstone write guard ended
     /// before the device row was removed; an enroll that slipped into that
     /// gap inserted a newer enrollment that the removal then deleted

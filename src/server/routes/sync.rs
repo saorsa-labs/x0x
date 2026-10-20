@@ -424,6 +424,15 @@ pub(in crate::server) async fn enroll_device(
     let machine_hex = hex::encode(enrollment.machine_id);
     if let Err(e) = sync.store().enroll(enrollment).await {
         // Never report success on a swallowed write (review R2 finding 2).
+        // #1055 RC2: a tombstoned enrollment is a REFUSAL the caller can
+        // correct (re-enroll with a later enrolled_at), not a storage
+        // failure — 409, not 500.
+        if matches!(e, crate::owner_sync::SyncError::EnrollmentTombstoned { .. }) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "enrollment_tombstoned: the machine was unenrolled; a re-enroll needs a freshly issued enrollment with a later enrolled_at",
+            );
+        }
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("failed to persist enrollment: {e}"),
@@ -456,8 +465,11 @@ pub(in crate::server) struct UnenrollData {
 
 /// DELETE /sync/devices/:machine_id — remove a machine from the owner
 /// device set (owner-gated). The very next inbound SyncV1 stream from that
-/// machine is refused at the enrollment gate; existing streams are not
-/// torn down mid-flight (per-accept gating, ADR-0022 posture).
+/// machine is refused, and a live session from it stops at its next
+/// admission re-check (phase or page boundary, or before its commit —
+/// #1055). The DELETE also writes a durable unenroll tombstone — including
+/// on the not-enrolled (`404`) path — that refuses any later enroll,
+/// restore or replay at or before the delete time.
 pub(in crate::server) async fn unenroll_device(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -1058,6 +1070,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "malformed id: {body:?}");
         Ok(())
     }
+
     /// WHY (#1055 RC2, review of RC1): a tombstoned enroll is a REFUSAL the
     /// caller can correct, not a storage failure — the route must answer
     /// `409 enrollment_tombstoned`, never `500 failed to persist`. The
@@ -1087,13 +1100,8 @@ mod tests {
         let peer = crate::identity::MachineId([0x53; 32]);
         sync.store()
             .enroll(
-                crate::owner_sync::OwnerEnrollment::sign(
-                    peer,
-                    &owner_kp,
-                    u64::MAX / 2,
-                    None,
-                )
-                .expect("sign far-future enrollment"),
+                crate::owner_sync::OwnerEnrollment::sign(peer, owner_kp, u64::MAX / 2, None)
+                    .expect("sign far-future enrollment"),
             )
             .await
             .expect("seed enrollment");
