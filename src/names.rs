@@ -8,9 +8,10 @@
 //! accepted.
 //!
 //! - **Owner label → `UserId`** is a local petname in [`NameStore`], never a
-//!   network claim. It is bound when a signed contact card carrying an
-//!   `owner_name` is imported, or explicitly by the local owner, and is
-//!   frozen at first bind: rebinding a label to a different key fails with
+//!   network claim. A signed contact card binds its `owner_name` only when
+//!   that contact is Known or Trusted. Unknown and Blocked stay unbound.
+//!   The local owner can still bind a label explicitly. A label is frozen
+//!   at first bind: rebinding it to a different key fails with
 //!   [`NameError::PinMismatch`] until the owner removes the label.
 //! - **Agent label** matches the announced self-name of an agent whose
 //!   valid, unexpired, unrevoked `AgentCertificate` chains to that owner.
@@ -859,6 +860,9 @@ pub struct NameStore {
     /// cancellation test waits until a later write is queued on this lock.
     #[cfg(test)]
     lock_waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// One-shot pause before the next pin commit. Taken by the resolver.
+    #[cfg(test)]
+    pin_gate: std::sync::Mutex<Option<std::sync::Arc<PinInterleave>>>,
 }
 
 fn install_staged(slot: &std::sync::Mutex<Option<NamesState>>, guard: &mut NamesState) {
@@ -867,6 +871,16 @@ fn install_staged(slot: &std::sync::Mutex<Option<NamesState>>, guard: &mut Names
             *guard = next;
         }
     }
+}
+
+/// Test seam. Resolution waits here after it has read an owner and before
+/// the pin commit, so a test can unbind in that window.
+#[cfg(test)]
+#[derive(Debug)]
+struct PinInterleave {
+    entered: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
 }
 
 /// Holds the name-store lock until drop, and installs a staged publish
@@ -904,6 +918,51 @@ impl NameStore {
             install_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             lock_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            pin_gate: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Pause the next pin commit until the test sets the gate's release flag.
+    #[cfg(test)]
+    fn arm_pin_interleave(&self) -> std::sync::Arc<PinInterleave> {
+        let gate = std::sync::Arc::new(PinInterleave {
+            entered: std::sync::atomic::AtomicBool::new(false),
+            release: std::sync::atomic::AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+        });
+        *self
+            .pin_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::clone(&gate));
+        gate
+    }
+
+    /// If a test armed the pin gate, signal entry and wait for release.
+    ///
+    /// The wait is before the name lock, so `unbind_owner` can finish and
+    /// the following commit can see that the owner is gone.
+    #[cfg(test)]
+    async fn wait_pin_interleave(&self) {
+        let gate = self
+            .pin_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(gate) = gate else {
+            return;
+        };
+        gate.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        gate.wake.notify_waiters();
+        loop {
+            let notified = gate.wake.notified();
+            tokio::pin!(notified);
+            if gate.release.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            notified.await;
         }
     }
 
@@ -1343,6 +1402,23 @@ pub async fn resolve_with(
     resolve_with_options(store, name, owner, candidates, now_unix, false).await
 }
 
+/// Refuse a pin when petname `label` is not bound to `owner`.
+///
+/// `me` has no petname row. This runs inside the pin commit, under the same
+/// lock as `unbind_owner`, so a concurrent unbind cannot leave a pin for an
+/// owner that is no longer bound.
+fn require_bound_owner(state: &NamesState, label: &str, owner: UserId) -> Result<(), NameError> {
+    if label == LOCAL_OWNER_LABEL {
+        return Ok(());
+    }
+    match state.owners.get(label) {
+        Some(binding) if binding.user_id == owner => Ok(()),
+        _ => Err(NameError::UnknownName(format!(
+            "owner label {label:?} is not bound to this user"
+        ))),
+    }
+}
+
 /// Insert `key` or refuse an existing pin that names a different id or owner.
 fn install_pin(
     state: &mut NamesState,
@@ -1434,6 +1510,8 @@ fn pin_bare_locked(
 /// even when a pin exists. `PinMismatch` is only when the single remaining
 /// candidate's kind differs from the one existing pin. The kind check and
 /// the insert share one commit, so two bare resolves cannot pin both kinds.
+/// That same commit rechecks the owner petname. A concurrent unbind that
+/// wins the lock leaves no pin.
 ///
 /// # Errors
 /// Any [`select`] error, [`NameError::MachineTargetUnsupported`], or
@@ -1449,19 +1527,35 @@ pub async fn resolve_with_options(
     // Both verified kinds refuse here, pin or not. `select` does not
     // consult the store, so a pin cannot hide the collision.
     let selection = select(name, candidates)?;
+    // After the owner was read, before the pin lock. A test unbinds here.
+    #[cfg(test)]
+    store.wait_pin_interleave().await;
     let outcome = if name.kind.is_none() {
-        let name = name.clone();
+        let pinned_name = name.clone();
+        let owner_label = pinned_name.owner.clone();
         store
             .commit(move |state| {
-                pin_bare_locked(state, &name, owner, selection, agent_only, now_unix)
+                require_bound_owner(state, &owner_label, owner)?;
+                pin_bare_locked(state, &pinned_name, owner, selection, agent_only, now_unix)
             })
             .await?
     } else if agent_only && selection.kind != NameKind::Agent {
         return Err(machine_forward_refusal(name));
     } else {
         let key = name.canonical(selection.kind);
+        let owner_label = name.owner.clone();
         store
-            .pin(&key, owner, selection.id, BindSource::FirstUse, now_unix)
+            .commit(move |state| {
+                require_bound_owner(state, &owner_label, owner)?;
+                install_pin(
+                    state,
+                    key,
+                    owner,
+                    selection.id,
+                    BindSource::FirstUse,
+                    now_unix,
+                )
+            })
             .await?
     };
     Ok(Resolved {

@@ -405,10 +405,8 @@ async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// WHY: ADR-0074 §1 binds a petname from a signed card. Held ADR 0079 must
-/// not leave an Unknown contact unbound.
-#[tokio::test]
-async fn unknown_trust_signed_card_import_binds_owner_petname() -> anyhow::Result<()> {
+/// Import a certified card at `trust_level` and assert the petname is absent.
+async fn assert_card_import_writes_no_owner_label(trust_level: &str) -> anyhow::Result<()> {
     let (state, _dir) =
         crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
     let app = names_router(Arc::clone(&state));
@@ -420,18 +418,34 @@ async fn unknown_trust_signed_card_import_binds_owner_petname() -> anyhow::Resul
         &app,
         "POST",
         "/agent/card/import",
-        serde_json::json!({ "card": link, "trust_level": "unknown" }),
+        serde_json::json!({ "card": link, "trust_level": trust_level }),
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(json["owner_label"]["label"], "bob-smith", "{json}");
-    assert_eq!(json["owner_label"]["status"], "bound", "{json}");
-    assert_eq!(
-        state.names.owner("bob-smith").await?.map(|b| b.user_id),
-        Some(bob.user_id()),
-        "Unknown stores the petname"
+    assert!(
+        json["owner_label"].is_null(),
+        "{trust_level} import must return null: {json}"
+    );
+    let (owners, pins) = state.names.snapshot().await?;
+    assert!(
+        owners.is_empty() && pins.is_empty(),
+        "{trust_level} import must write nothing: owners={owners:?} pins={pins:?}"
     );
     Ok(())
+}
+
+/// WHY: card-import binding is Known or Trusted only. An Unknown card
+/// returns null and writes no petname.
+#[tokio::test]
+async fn unknown_card_import_returns_null_and_writes_nothing() -> anyhow::Result<()> {
+    assert_card_import_writes_no_owner_label("unknown").await
+}
+
+/// WHY: a Blocked contact's card must not freeze an owner label. The
+/// import returns null and writes nothing.
+#[tokio::test]
+async fn blocked_card_import_returns_null_and_writes_nothing() -> anyhow::Result<()> {
+    assert_card_import_writes_no_owner_label("blocked").await
 }
 
 /// WHY (PR #1494 RC6): a card-import retry must not report `existing` while
