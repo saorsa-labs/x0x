@@ -326,6 +326,32 @@ mod execution {
             assert_eq!(std::fs::read(&self.installed_cli).unwrap(), OLD_CLI);
         }
 
+        fn assert_fresh_process_refuses(&self) {
+            let path = probe::state_path(&self.request.install).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            // Execute only the inert reader below. A new process has no copy
+            // of the writer's process-local recovery latch.
+            let mut command = self._scratch.command(&std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "execution::fresh_admission_reader_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("X0X_PROBE_FRESH_READ_INSTALL", &self.request.install);
+            let output = run_inert(command);
+            assert!(
+                output.status.success(),
+                "fresh process accepted unresolved probe evidence:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("fresh probe reader refused both versions"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+
         fn assert_child_reaped(pid: u32) {
             let pid = i32::try_from(pid).unwrap();
             // Each PID comes from this fixture's child, whose execution has
@@ -555,40 +581,60 @@ mod execution {
     }
 
     #[test]
-    fn an_abandoned_running_record_becomes_an_interruption_before_any_new_probe() {
+    fn unresolved_running_evidence_refuses_same_and_newer_releases_across_restart() {
         let fixture = ExecutionFixture::new();
         fixture.run(&ExecutionFixture::options(1_000)).unwrap();
         let mut state = probe::read_state(&fixture.request.install)
             .unwrap()
             .unwrap();
-        // Model a process/host exit after the Running record barrier and
-        // before the result barrier. No child is left alive by this fixture.
+        // The same durable bytes can survive a host exit, or both a failed
+        // hold write and failed recovery record write. Without a terminal
+        // result, admission cannot safely infer Interrupted. No child remains.
         state.phase = ProbePhase::Running;
         state.cause = None;
         state.daemon_sha256 = None;
         state.cli_sha256 = None;
-        std::fs::write(
-            probe::state_path(&fixture.request.install).unwrap(),
-            serde_json::to_vec(&state).unwrap(),
-        )
-        .unwrap();
+        let path = probe::state_path(&fixture.request.install).unwrap();
+        let unresolved = serde_json::to_vec(&state).unwrap();
+        std::fs::write(&path, &unresolved).unwrap();
         let launches = fixture.launched_pids();
-        assert!(matches!(
-            probe::inspect_admission_at(
-                &fixture.request.install,
-                CANDIDATE_VERSION,
-                &ExecutionFixture::options(2_000).clock
-            ),
-            Ok(Admission::Waiting { .. })
-        ));
-        let recovered = probe::read_state(&fixture.request.install)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(recovered.phase, ProbePhase::InterruptedWait));
-        assert_eq!(recovered.cause, Some(ProbeCause::AbandonedAttempt));
-        assert_eq!(recovered.retry_remaining_ms, 30 * 60 * 1_000);
+        for version in [CANDIDATE_VERSION, "9.9.10"] {
+            assert!(matches!(
+                probe::inspect_admission_at(
+                    &fixture.request.install,
+                    version,
+                    &ExecutionFixture::options(2_000).clock
+                ),
+                Err(ProbeRefusal::RecoveryFailed { .. })
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), unresolved);
+        }
+        fixture.assert_fresh_process_refuses();
         assert_eq!(fixture.launched_pids(), launches);
         fixture.assert_installed_pair_unchanged();
+    }
+
+    #[test]
+    #[ignore = "inert subprocess reader invoked with a private fixture path"]
+    fn fresh_admission_reader_fixture() {
+        let Some(install) = std::env::var_os("X0X_PROBE_FRESH_READ_INSTALL") else {
+            return;
+        };
+        let install = PathBuf::from(install);
+        let path = probe::state_path(&install).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let clock = ProbeClock {
+            boot_id: "fresh-reader-boot".to_owned(),
+            monotonic_ms: 3_000,
+        };
+        for version in [CANDIDATE_VERSION, "9.9.10"] {
+            assert!(matches!(
+                probe::inspect_admission_at(&install, version, &clock),
+                Err(ProbeRefusal::RecoveryFailed { .. })
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        println!("fresh probe reader refused both versions");
     }
 
     #[test]
@@ -718,6 +764,11 @@ mod execution {
                 }
                 for pid in fixture.launched_pids() {
                     ExecutionFixture::assert_child_reaped(pid);
+                }
+                if matches!(phase, RecordWrite::Outcome | RecordWrite::Hold)
+                    && matches!(step, journal::BarrierStep::FileSync)
+                {
+                    fixture.assert_fresh_process_refuses();
                 }
                 fixture.assert_installed_pair_unchanged();
             }
