@@ -2278,6 +2278,10 @@ where
     let to_ship = store.records_for_peer(&peer_vector).await;
     summary.shipped = to_ship.len();
     write_paged_records(send, &to_ship, &admission).await?;
+    // Last outbound boundary (#1055 RC3): a delete or revocation that
+    // lands while the FINAL record page was blocked must stop Done too —
+    // Done ends the peer's records stage and lets it commit the batch.
+    admission.still_admissible().await?;
     write_frame(send, &SyncFrame::Done).await?;
     // Done ends the application frames; FIN ends the transport send half.
     // An unfinished ant-quic SendStream resets on drop, so the peer can
@@ -6338,16 +6342,26 @@ mod issue_1055_tests {
                     other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
                 }
             }
-            // Empty peer vector: the local side must ship all 64 records.
+            // Empty peer vector: the local side must ship all 64 records
+            // (4 pages of 16).
             write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // Read the FIRST record page before pausing: this proves the
+            // records stage actually started, so the delete below cannot
+            // land before the pre-ship check and let every assertion pass
+            // trivially (review RC3 finding 2).
+            match read_frame(&mut c_recv).await? {
+                SyncFrame::Records { .. } => {}
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            }
             vector_sent.send(()).ok();
-            // Stop reading: the local writer fills the duplex buffer and
-            // blocks inside the records stage.
+            // Stop reading: the local writer blocks inside the SECOND
+            // page's write (the duplex buffer stays full).
             let _ = read_go.await;
-            // Resume: count what now arrives. Fail-closed behavior: the
-            // in-flight page completes, then the stream aborts — no Done.
-            // The old behavior ships every remaining page and Done.
-            let mut records_frames = 0usize;
+            // Resume: count what now arrives. With the page-boundary
+            // checks, the in-flight second page completes and the stream
+            // aborts at the next boundary — no Done. Without the checks,
+            // every remaining page and Done arrives.
+            let mut records_frames = 1usize;
             let mut saw_done = false;
             loop {
                 match read_frame(&mut c_recv).await {
@@ -6411,8 +6425,169 @@ mod issue_1055_tests {
             "no Done may be shipped after the delete (peer saw {records_frames} record pages)"
         );
         assert!(
-            records_frames <= 1,
-            "at most the in-flight page may arrive after the delete, got {records_frames}"
+            records_frames <= 2,
+            "at most the delivered first page plus the in-flight page may arrive after the delete, got {records_frames}"
+        );
+    }
+
+    /// Splices one already-read byte back in front of a reader, so a test
+    /// can peek a single raw byte and then keep using `read_frame`.
+    struct UnreadByte<R> {
+        saved: Option<u8>,
+        inner: R,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for UnreadByte<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(byte) = self.saved.take() {
+                buf.put_slice(&[byte]);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    /// WHY (#1055 RC3, review finding 1): admission was re-checked at
+    /// every page boundary but not between the LAST record page and Done.
+    /// A delete that landed while the final page's write was blocked let
+    /// the sender ship Done anyway — Done ends the peer's records stage
+    /// and lets it commit the batch. Done now follows one more admission
+    /// check. Deterministic: the batch is ONE page (two records, ~13 KiB
+    /// against a 4 KiB duplex buffer), and the peer reads ONE RAW BYTE of
+    /// that page — proving the page's admission check has passed and its
+    /// write has started. Because the peer then reads nothing, the write
+    /// can never complete: the writer is parked inside the FINAL page
+    /// when the delete lands, and the byte is spliced back so framing
+    /// stays intact afterwards.
+    #[tokio::test]
+    async fn done_is_never_sent_when_removal_lands_during_the_last_page() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        // Two records: ONE page (~13 KiB — a record embeds the owner key
+        // and signature), far beyond the duplex buffer.
+        let batch: Vec<VersionedRecord> = (0..2)
+            .map(|i| {
+                sign_names(
+                    &format!("page-{i}"),
+                    &format!("v{i}"),
+                    clock(1, i, 1),
+                    &owner,
+                )
+            })
+            .collect();
+        store.commit_batch(batch, &owner_id).await.expect("seed");
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let (last_page_blocked, peer_paused) = tokio::sync::oneshot::channel::<()>();
+        let (release_reader, read_go) = tokio::sync::oneshot::channel::<()>();
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // One RAW byte of the single record page: the page's write
+            // has provably started (its admission check has passed) and
+            // cannot complete while this peer reads nothing.
+            let mut one = [0u8; 1];
+            tokio::io::AsyncReadExt::read(&mut c_recv, &mut one)
+                .await
+                .map_err(|e| SyncError::Io(format!("peek one byte: {e}")))?;
+            let mut c_recv = UnreadByte {
+                saved: Some(one[0]),
+                inner: c_recv,
+            };
+            last_page_blocked.send(()).ok();
+            let _ = read_go.await;
+            // Resume: the in-flight final page may complete, but Done must
+            // never arrive — the pre-Done admission check aborts first.
+            let mut saw_done = false;
+            loop {
+                match read_frame(&mut c_recv).await {
+                    Ok(SyncFrame::Done) => {
+                        saw_done = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            Ok::<bool, SyncError>(saw_done)
+        });
+
+        let session_store = Arc::clone(&store);
+        let session_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let session = tokio::spawn(async move {
+            run_sync_session_with_recheck(
+                SESSION_TIMEOUT,
+                &mut s_send,
+                &mut s_recv,
+                &session_store,
+                None,
+                &session_owner,
+                &local,
+                &peer,
+                |_| {},
+            )
+            .await
+        });
+
+        peer_paused.await.expect("peer stopped reading");
+        // The owner's DELETE lands while the final page write is blocked.
+        assert!(store.unenroll(&peer).await.expect("delete"));
+        release_reader.send(()).ok();
+
+        let result = session.await.expect("session task");
+        assert!(
+            matches!(result, Err(SyncError::NotEnrolled { .. })),
+            "a removal during the final page must abort the session, got {result:?}"
+        );
+        let saw_done = peer_task.await.expect("peer task").expect("peer protocol");
+        assert!(
+            !saw_done,
+            "Done must not be sent after a removal that lands during the final page"
         );
     }
 
