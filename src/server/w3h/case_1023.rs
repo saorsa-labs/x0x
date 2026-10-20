@@ -261,6 +261,8 @@ struct RequestSeen {
     position: usize,
     at: Duration,
     verified: bool,
+    /// `member_joined` or `fetch_request`.
+    kind: &'static str,
 }
 
 /// Aborts the watcher when the scenario ends, however it ends.
@@ -272,14 +274,21 @@ impl Drop for Watcher {
     }
 }
 
-/// Whether a DM payload is J's join message for `gid`: its `MemberJoined`
-/// or its JoinResult `fetch_request`, each naming J as the member.
-fn fetch_request_body(payload: &[u8], gid: &str, joiner: &AgentId) -> bool {
-    serde_json::from_slice::<serde_json::Value>(payload).is_ok_and(|body| {
-        (body["type"] == "fetch_request" || body["event"] == "member_joined")
-            && body["group_id"] == gid
-            && body["member_agent_id"] == hex::encode(joiner.as_bytes())
-    })
+/// The kind of a DM payload that is J's join message for `gid`: its
+/// `MemberJoined` or its JoinResult `fetch_request`, each naming J as the
+/// member. `None` for any other payload.
+fn join_message_kind(payload: &[u8], gid: &str, joiner: &AgentId) -> Option<&'static str> {
+    let body = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
+    if body["group_id"] != gid || body["member_agent_id"] != hex::encode(joiner.as_bytes()) {
+        return None;
+    }
+    if body["event"] == "member_joined" {
+        Some("member_joined")
+    } else if body["type"] == "fetch_request" {
+        Some("fetch_request")
+    } else {
+        None
+    }
 }
 
 /// Create O's owner-certified group on the GSS plane: `MlsEncrypted`
@@ -430,11 +439,14 @@ fn watch_join_requests(
     let gid = gid.to_string();
     let task = tokio::spawn(async move {
         while let Some(msg) = inbox.recv().await {
-            if msg.sender != joiner || !fetch_request_body(&msg.payload, &gid, &joiner) {
+            if msg.sender != joiner {
                 continue;
             }
+            let Some(kind) = join_message_kind(&msg.payload, &gid, &joiner) else {
+                continue;
+            };
             let position = fabric.mark_indexed(format!(
-                "A's DM layer received J's join fetch_request (verified={})",
+                "A's DM layer received J's join {kind} (verified={})",
                 msg.verified
             ));
             sink.lock()
@@ -443,10 +455,56 @@ fn watch_join_requests(
                     position,
                     at: fabric.now(),
                     verified: msg.verified,
+                    kind,
                 });
         }
     });
     Ok((Watcher(task), seen))
+}
+
+// DIAG #1364 (do not merge): A's MemberJoined-path counters for G, and
+// whether A resolves the gid that J's events name (the watcher matched
+// only events whose `group_id` is `gid`) by the inner apply's rule: map
+// key or stable id (`named_groups.rs:12693`), not the MLS id.
+async fn diag_a_member_joined_path(sim: &Sim, gid: &str) {
+    let resolves = match sim.state("A") {
+        Ok(state) => {
+            let gid = gid.to_string();
+            sim.at_instant("DIAG: A resolves G", async move {
+                let groups = state.named_groups.read().await;
+                let by_key = groups.contains_key(&gid);
+                let by_stable = groups.values().any(|info| info.stable_group_id() == gid);
+                let keys: Vec<String> = groups.keys().cloned().collect();
+                format!("by_key={by_key} by_stable_id={by_stable} a_keys={keys:?}")
+            })
+            .await
+            .unwrap_or_else(|error| format!("read failed: {error:#}"))
+        }
+        Err(error) => format!("no state: {error:#}"),
+    };
+    eprintln!("W3H-DIAG A resolves J's event gid {gid}: {resolves}"); // DIAG #1364
+    let rows = match sim.api("A", Method::GET, "/diagnostics/groups", None).await {
+        Ok((_, body)) => body["groups"].as_array().cloned().unwrap_or_default(),
+        Err(error) => {
+            eprintln!("W3H-DIAG A GET /diagnostics/groups failed: {error:#}"); // DIAG #1364
+            Vec::new()
+        }
+    };
+    for row in rows {
+        eprintln!(
+            "W3H-DIAG A counters group_id={} member_joined_events_applied={} \
+             rejected_non_member_role(#14)={} rejected_owner_cert_pending(#17)={} \
+             rejected_invite_secret_unknown(#19)={} invites_refused_reasons(#14/#19)={} \
+             subscribed_metadata={}",
+            row["group_id"],
+            row["member_joined_events_applied"],
+            row["member_joined_events_rejected_non_member_role"],
+            row["member_joined_events_rejected_owner_cert_pending"],
+            row["member_joined_events_rejected_invite_secret_unknown"],
+            row["invites_refused_reasons"],
+            row["subscribed_metadata"],
+        ); // DIAG #1364
+    }
 }
 
 /// The member list of a `pending certificate resolution` refusal, as hex.
@@ -683,7 +741,23 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let first = received
         .iter()
         .find(|seen| seen.verified && seen.position > join_position);
-    let unverified = received.iter().filter(|seen| !seen.verified).count();
+    let count = |kind: &str, verified: bool| {
+        received
+            .iter()
+            .filter(|seen| seen.kind == kind && seen.verified == verified)
+            .count()
+    };
+    let by_kind = ["member_joined", "fetch_request"]
+        .iter()
+        .map(|kind| {
+            format!(
+                "{kind}: {} verified, {} unverified",
+                count(kind, true),
+                count(kind, false)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
     let first_request = first.map(|seen| seen.at);
     let direct_frames = sim
         .fabric()
@@ -694,10 +768,11 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         first.is_some(),
         format!(
             "{} join messages from J for this group reached A's DM layer after the \
-             join call (trace #{join_position}), {unverified} of them unverified; \
-             {direct_frames} frames J->A delivered; first verified at trace #{}",
+             join call (trace #{join_position}) ({by_kind}); {direct_frames} frames \
+             J->A delivered; first verified at trace #{} ({})",
             received.len(),
             first.map_or("none".to_string(), |seen| seen.position.to_string()),
+            first.map_or("none", |seen| seen.kind),
         ),
         at(sim),
     );
@@ -734,6 +809,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 eprintln!("W3H-DIAG @{}us {}", log.at.as_micros(), log.text);
             }
         }
+        diag_a_member_joined_path(sim, &home.gid).await; // DIAG #1364
         let a_rows = roster(sim, "A", &home.gid).await.unwrap_or_default();
         let j_state = membership_state(sim, "J", &home.gid).await.ok().flatten();
         sim.fabric().mark(format!(
