@@ -576,6 +576,8 @@ jobs:
           --expect w3h_1357_red_s4_designated_stalled_a_fallback=GREEN
           --require w3h_1357_control_s4_designated_no_early_sibling
           --expect w3h_1357_control_s4_designated_no_early_sibling=GREEN
+          --require w3h_1356_red_s3_aligned_stale_joiner_catches_up
+          --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=RED
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
