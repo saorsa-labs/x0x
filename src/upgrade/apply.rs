@@ -352,8 +352,9 @@ impl AutoApplyUpgrader {
     /// restart (~750 ms + shared planner) on a non-Tokio thread so cancel of
     /// the HTTP task (or runtime shutdown of async tasks) cannot leave
     /// installed bytes without a restart owner. Does not change public
-    /// [`Self::with_restart_on_success`] behaviour; CLI `--check-updates`
-    /// keeps `restart_on_success=false` without this flag and never restarts.
+    /// [`Self::with_restart_on_success`] behaviour: callers with both flags
+    /// false do not restart. The read-only `x0xd --check-updates` path never
+    /// enters this installer.
     pub(crate) fn with_http_deferred_restart(mut self, enable: bool) -> Self {
         self.http_deferred_restart = enable;
         self
@@ -592,7 +593,7 @@ impl AutoApplyUpgrader {
         // Restart ownership at admission (#1447 RC3/RC4):
         // - restart_on_success=true → immediate worker-owned trigger_restart
         // - http_deferred_restart=true → OS-thread deferred (~750 ms) owner
-        // - both false (CLI --check-updates) → no restart
+        // - both false → no restart (the report-only CLI does not apply)
         // Do not infer HTTP from RestartContext presence.
         let restart_plan_for_cont = restart_plan.clone();
         let version_for_cont = target_version.to_string();
@@ -2777,8 +2778,9 @@ mod tests {
         );
     }
 
-    /// RC4: CLI `--check-updates` shape (`restart_on_success=false` + context,
-    /// no HTTP deferred opt-in) must never arm a restart owner.
+    /// RC4: `restart_on_success=false` with a context and no HTTP deferred
+    /// opt-in must never arm a restart owner. This is a library configuration,
+    /// not the report-only `x0xd --check-updates` path.
     #[test]
     fn cli_false_with_context_does_not_arm_http_deferred_restart() {
         let upgrader = AutoApplyUpgrader::new("x0xd")
@@ -2791,7 +2793,7 @@ mod tests {
         assert!(!upgrader.restart_on_success);
         assert!(
             !upgrader.http_deferred_restart,
-            "CLI check-updates must not opt into HTTP deferred restart"
+            "restart-disabled callers must not opt into HTTP deferred restart"
         );
     }
 

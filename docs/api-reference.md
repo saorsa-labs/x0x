@@ -2592,13 +2592,19 @@ Run a command on **another** agent's machine. Disabled by default; every request
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
-| POST | `/upgrade/apply` | — (CLI does not call this) | Daemon applies the latest verified release manifest with transactional restart |
+| POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart |
 
-**The CLI only checks; it never installs.** `x0x upgrade --check` is a
-read-only check against GitHub and needs **no running daemon**. `x0x upgrade`,
-`--apply` and `--force` refuse installation (N2, v0.46.0): install with the
-authenticated daemon endpoint `POST /upgrade/apply` (or let the daemon's
-self-update apply it), over REST or the GUI. See
+**The serving daemon owns installation.** `x0x upgrade --apply` sends an
+authenticated `POST /upgrade/apply` through the normal daemon client, using
+the selected `--name` or `--api` and its bearer token. It does not install
+from the CLI process. Apply fails if no daemon is available.
+
+Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
+installation. `x0x upgrade --check` is a standalone GitHub release check and
+needs **no running daemon**. `--check` takes precedence over `--apply`;
+`--check --force` fetches the current manifest regardless of version.
+`--force` does not bypass any daemon apply check. `x0xd --check-updates` also
+reports only and does not install binaries or SKILL.md. See
 [docs/upgrade-system.md](upgrade-system.md).
 
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old

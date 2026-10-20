@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`x0xd --check-updates` now only reports update availability (#1370).**
+  It no longer installs updates. Operators whose scripts used this flag to
+  apply updates must switch to `x0x upgrade --apply` or authenticated
+  `POST /upgrade/apply`. The CLI sends the apply request to the serving
+  daemon, which remains the only writer. Bare `x0x upgrade` and `--force`
+  alone do not install updates.
+
 ### Tests and tooling
 
 - **The `delegation_spaces` binary joined the `quic-localhost` nextest group

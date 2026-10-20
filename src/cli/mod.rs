@@ -249,13 +249,19 @@ impl DaemonClient {
         if self.dump {
             return self.emit_dump("POST", path, None);
         }
-        let resp = self
+        let request = self
             .client
             .post(format!("{}{}", self.base_url, path))
-            .headers(self.auth_headers())
-            .send()
-            .await
-            .context("request failed")?;
+            .headers(self.auth_headers());
+        let request = if path == "/upgrade/apply" {
+            // The daemon checks the release, downloads the archive and signature
+            // (each download permits 120 s), then verifies and installs them.
+            // Leave time for that work without extending other CLI requests.
+            request.timeout(Duration::from_secs(10 * 60))
+        } else {
+            request
+        };
+        let resp = request.send().await.context("request failed")?;
         self.handle_response(resp).await
     }
 

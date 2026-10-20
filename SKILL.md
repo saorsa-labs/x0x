@@ -346,7 +346,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see [Operat
 | Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
 | Durable history | `/history*` | `x0x history scopes/list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — [Stores, files, and history](https://github.com/saorsa-labs/x0x/blob/main/docs/skill/stores.md) §4.10, §5.1) |
-| Self-update | daemon: `/upgrade(+/apply)` · CLI: read-only check | `x0x upgrade --check`; authenticated `POST /upgrade/apply` to install | GA |
+| Self-update | daemon: `/upgrade(+/apply)` · CLI: check or delegate apply | `x0x upgrade --check`; `x0x upgrade --apply` or authenticated `POST /upgrade/apply` to install through the daemon | GA |
 
 ---
 

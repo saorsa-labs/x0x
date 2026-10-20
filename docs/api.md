@@ -273,7 +273,7 @@ admin-equivalent for old groups but are not assignable.
 | Method | Path | CLI | Description |
 |---|---|---|---|
 | GET | `/upgrade` | — (`x0x upgrade --check` queries GitHub independently) | Check for updates |
-| POST | `/upgrade/apply` | — (the CLI refuses to install; call the route) | Apply latest verified release manifest |
+| POST | `/upgrade/apply` | `x0x upgrade --apply` | Apply latest verified release manifest |
 
 ## Tailnet port-forwarding
 
