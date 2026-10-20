@@ -29,7 +29,7 @@ macro_rules! upgrade_now_timeout_regression_tests {
                     assert_eq!(request.url().as_str(), format!("http://127.0.0.1:1{path}"));
                     assert_eq!(request.headers()[reqwest::header::AUTHORIZATION], "Bearer owned-builder-token");
                     assert!(request.body().is_none());
-                    assert_eq!(*request.timeout(), if upgrade { None } else { Some(Duration::from_secs(30)) });
+                    assert_eq!(request.timeout().copied(), if upgrade { None } else { Some(Duration::from_secs(30)) });
                     // None is only request metadata. The real transport control
                     // below proves the dedicated client has no inherited limit.
                 }
