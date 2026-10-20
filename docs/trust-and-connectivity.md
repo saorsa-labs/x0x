@@ -93,47 +93,85 @@ Successful connections enrich the bootstrap cache via `add_from_connection()`.
 
 ## Seed identity pinning (issue #1112)
 
-`DEFAULT_BOOTSTRAP_PEERS` (`src/network.rs`) carries one `SeedPeer` row per
-seed address, with an `expected_peer_ids` pin set. The join dial
+`SEED_PEER_ID_PINS` (`src/network.rs`) carries one `SeedPeerPin` row per
+pinned seed address, separate from the `DEFAULT_BOOTSTRAP_PEERS` address
+list (whose public type is unchanged). The join dial
 (`Agent::connect_peers_parallel_tracked`) checks each answered dial against
 the pin set for that address:
 
-- **Empty pin set**: trust-on-first-use, exactly as before #1112. Every
-  production row ships unpinned today.
+- **No pin row**: trust-on-first-use, exactly as before #1112. No
+  production address is pinned today.
 - **Answer inside the pin set**: the hint is accepted.
-- **Answer outside the pin set**: the hint has failed. The answered identity
-  is disconnected with a `PolicyRejection` tombstone (nothing redials the
-  wrong identity), the hint is dropped, and the join continues with the
-  other hints. A mismatch is never a trust anchor and never a hard join
-  failure.
+- **Answer outside the pin set**: the hint has failed — dropped, never a
+  trust anchor and never a hard join failure. If the dial itself created
+  the connection, it is closed with a `PolicyRejection` tombstone; a
+  connection that already existed before the dial is left standing (the
+  mismatched hint is dropped, not the legitimate peer).
 
 The pin set is per address, never per host: the UDP/443 and UDP/5483
 listeners on one seed host are separate `x0xd` instances with separate
 machine keys (`.deployment/deploy-443.sh`), so each address needs its own
 pin.
 
-Why no production row is pinned yet: the repo holds PeerId captures for the
-six `:5483` seed listeners only (git history, `proofs/v0.19.0-validation-*`
-sustained-watch diagnostics of 2026-04-23, cross-confirmed by the May 2026
-soak captures), and they are six months old. A pin that no longer matches a
-live seed key would silently drop that seed for every client. Pinning is a
-deliberate operator change, made when the live fleet keys are verified.
+**Enforcement scope (honest limits).** The pin gates the x0x join dial
+path: the answered PeerId is validated immediately on the dial's return,
+before any x0x-side bookkeeping, and a mismatched hint never joins. Two
+paths are NOT pin-gated: the `bootstrap_nodes` handed to ant-quic's own
+connection orchestration, and dials served from ant-quic's bootstrap cache.
+ant-quic performs its transport-level admission (pool insert, PeerConnected)
+inside `connect_addr`, before x0x sees the answered identity; a dial that
+refuses a mismatched identity at the handshake needs an ant-quic
+expected-peer API, which x0x cannot add from here.
+
+Why no production address is pinned yet: the repo holds PeerId captures
+for the six `:5483` seed listeners only (git history,
+`proofs/v0.19.0-validation-*` sustained-watch diagnostics of 2026-04-23,
+cross-confirmed by the May 2026 soak captures), and they are six months
+old. A pin that no longer matches a live seed key would silently drop that
+seed for every client. Pinning is a deliberate operator change, made when
+the live fleet keys are verified.
+
+### Capability hints use observed evidence, not announcements (#1112)
+
+The coordinator/relay hint lists on outgoing machine announcements
+(`select_capability_hints`, `src/lib.rs`) no longer read the self-asserted
+`is_relay`/`is_coordinator` flags as standalone evidence. A candidate must
+be connected over a DIRECT path, and the only address evidence is the one
+the local socket OBSERVED for that connection:
+
+- **Operator evidence**: the observed address is a compiled-in seed
+  address. A completed QUIC handshake with that source is deployment
+  evidence no announcement can forge; no capability flag is consulted.
+- **Community evidence**: the peer asserts the role flag AND one of its
+  announced addresses has the same IP as the observed connection address.
+  The flag is the claim; the observation confirms the claimant really is
+  reachable at the address it advertises. This keeps community relays
+  (ADR 0071 backbone), `--relay` nodes and private fleets
+  (`--no-hard-coded-bootstrap` with operator-configured peers) hinted.
+
+A forged seed address in an announcement buys nothing: eligibility keys on
+the OBSERVED address, never on announced ones. A relayed connection's
+observed address names the relay, not the peer, so relayed paths are never
+evidence.
 
 ### Seed key rotation policy
 
 A seed rotates its machine key as follows:
 
-1. **Rotate**: the operator generates the new key on the seed host and
-   brings the new listener up under it.
-2. **Overlap**: the next release pins both the old and the new PeerId on
-   that address row. The pin is a set (`expected_peer_ids`), so both
-   identities are accepted for the window; clients on the overlap release
-   accept either.
-3. **Expire**: after the window closes (the slowest supported client
-   release cycle, minimum one minor release), the old PeerId is removed
-   from the pin set. An old identity answering after expiry is a failed
-   hint — dropped like any other mismatch.
-4. **Unpinned seeds** remain trust-on-first-use hints throughout; rotation
+1. **Prepare**: the operator generates the new key on the seed host. The
+   listener still runs under the OLD key.
+2. **Overlap first**: the next release pins BOTH the old and the new
+   PeerId on that address row (the pin is a set). Clients must hold the
+   overlap release — accepting either identity — BEFORE the listener
+   switches: switching first would make every pinned client reject the
+   old-key address it still expects.
+3. **Switch**: after the overlap release has spread (the slowest supported
+   client release cycle, minimum one minor release), the seed's listener
+   moves to the new key. Overlap-release clients accept it.
+4. **Expire**: a later release removes the old PeerId from the pin set.
+   An old identity answering after expiry is a failed hint — dropped like
+   any other mismatch.
+5. **Unpinned seeds** remain trust-on-first-use hints throughout; rotation
    of an unpinned seed needs no release at all.
 
 ## Enhanced Announcements (`lib.rs`, `network.rs`)
