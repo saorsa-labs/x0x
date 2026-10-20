@@ -1,24 +1,27 @@
 //! W3-H case for #1023 (#1364): a restarted promoted admin cannot admit a
 //! new joiner while the creator and every eligible holder are offline.
 //!
-//! Nodes: O (owner device, Home creator), X1–X3 (Home members), A (the
-//! promoted admin) and J (the joiner). All are same-owner devices, set up
-//! through the public API as the live Home fixture does (`home.rs`).
+//! Nodes: O (owner device and group creator), X1–X3 (members), A (the
+//! promoted admin) and J (the joiner). All are same-owner devices,
+//! certified through the public API as the live Home fixture does
+//! (`home.rs`).
 //!
-//! - t0: O provisions the Home and seats X1–X3. A starts after the X
-//!   devices announced, so A never caches their announces. O seats A and
-//!   promotes A. A's seat event carries certificates inline only up to the
-//!   transport budget (`attach_roster_certificates_to_member_added`), so A
-//!   keeps some X seats digest-only. A asks the group for the omitted
-//!   certificates (#946); the harness drops every answer toward A while A
-//!   is seated. Evidence: A holds digest-only seats, and the holders of
-//!   their bytes are O and the X devices.
+//! - t0: O creates an owner-certified group G on the GSS plane, as the
+//!   in-process #1023 test does (`r19_cert_carry.rs`), and seats X1–X3.
+//!   A starts after the X devices announced, so A never caches their
+//!   announces. O seats A and promotes A. A's seat event carries
+//!   certificates inline only up to the DM budget
+//!   (`attach_roster_certificates_to_member_added`), so A keeps some X
+//!   seats digest-only. A asks the group for the omitted certificates
+//!   (#946). The harness drops every answer toward A until t1 (ADR 0111
+//!   H3: the harness makes the admin's seat digest-only). Evidence: A
+//!   holds digest-only seats, and O and the X devices hold their bytes.
 //! - t1: O and every X device go offline. A restarts on its own
 //!   directories. Evidence: after the restart A is still an admin, its
 //!   digest-only seats are the same, its durable announce cache has no
 //!   certificate for them, and every eligible holder (an active member that
 //!   holds the bytes) is offline.
-//! - t2: A mints J's seat invite and J redeems it. Desired (ADR 0111 S5,
+//! - t2: A mints J's invite and J redeems it. Desired (ADR 0111 S5,
 //!   fetch by hash from any holder): A seals and J becomes Active. On
 //!   `main`, A's seal refuses with `OwnerCertMemberPending` naming exactly
 //!   the digest-only seats. A's seal-time fetch has no online holder to
@@ -35,12 +38,14 @@
 
 #![cfg(test)]
 
-use super::home::{membership_state, roster};
+use super::control::{invite, join};
+use super::home::{membership_state, roster, HomeIds};
 use super::receipt::{Receipt, Verdict};
 use super::*;
 use crate::identity::{AgentId, UserKeypair};
 use crate::network::sim::{Fault, Write};
 use anyhow::ensure;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -105,7 +110,7 @@ impl AnswerDrop {
     }
 }
 
-/// A node's view of the Home: its own role, and its active seats that
+/// A node's view of G: its own role, and its active seats that
 /// carry a committed digest but no certificate bytes (agent hex → digest).
 struct SeatView {
     admin: bool,
@@ -117,10 +122,10 @@ async fn seat_view(sim: &Sim, label: &str, gid: &str) -> Result<SeatView> {
     let local = sim.agent_hex(label)?;
     let gid = gid.to_string();
     let label = label.to_string();
-    sim.at_instant(&format!("read {label}'s Home seats"), async move {
+    sim.at_instant(&format!("read {label}'s seats in G"), async move {
         let groups = state.named_groups.read().await;
         let (_, info) = crate::server::resolve_group_entry_locked(&groups, &gid)
-            .with_context(|| format!("{label} has no entry for the Home"))?;
+            .with_context(|| format!("{label} has no entry for G"))?;
         let admin = info
             .members_v2
             .get(&local)
@@ -140,7 +145,7 @@ async fn seat_view(sim: &Sim, label: &str, gid: &str) -> Result<SeatView> {
 }
 
 /// Whether `label` is an eligible holder of each digest: an active member
-/// of the Home that holds bytes for it, on the matching seat or in its
+/// of G that holds bytes for it, on the matching seat or in its
 /// durable announce cache. The result lists the digests it holds.
 async fn held_digests(
     sim: &Sim,
@@ -218,12 +223,85 @@ impl Drop for Watcher {
     }
 }
 
+/// Whether a DM payload is J's join message for `gid`: its `MemberJoined`
+/// or its JoinResult `fetch_request`, each naming J as the member.
 fn fetch_request_body(payload: &[u8], gid: &str, joiner: &AgentId) -> bool {
     serde_json::from_slice::<serde_json::Value>(payload).is_ok_and(|body| {
-        body["type"] == "fetch_request"
+        (body["type"] == "fetch_request" || body["event"] == "member_joined")
             && body["group_id"] == gid
             && body["member_agent_id"] == hex::encode(joiner.as_bytes())
     })
+}
+
+/// Create O's owner-certified group on the GSS plane: `MlsEncrypted`
+/// and `ListedToContacts` keep it off the TreeKEM plane (only Hidden
+/// encrypted groups are TreeKEM). This is the plane of the in-process
+/// #1023 test (`r19_cert_carry.rs`). A Home event cannot be used: its
+/// TreeKEM fields make the bare `MemberAdded` larger than one DM, so its
+/// certificate sidecar takes the 8 MiB budget and is not trimmed below 32
+/// certificates.
+async fn create_owner_certified(sim: &Sim, label: &str, owner_user_id: &str) -> Result<String> {
+    let (status, created) = sim
+        .api(
+            label,
+            Method::POST,
+            "/groups",
+            Some(json!({
+                "name": "w3h 1023",
+                "display_name": label,
+                "policy": {
+                    "discoverability": "listed_to_contacts",
+                    "admission": {"owner_certified": owner_user_id},
+                    "confidentiality": "mls_encrypted",
+                    "read_access": "members_only",
+                    "write_access": "members_only",
+                },
+            })),
+        )
+        .await?;
+    ensure!(
+        status.is_success() && created["ok"] == true,
+        "create owner-certified group: {status} {created}"
+    );
+    Ok(created["group_id"]
+        .as_str()
+        .context("create response has no group_id")?
+        .to_string())
+}
+
+/// Whether, within `budget`, `authority` lists `member` in `gid` and
+/// `member` reports itself `active`. "Not admitted" is a verdict only when
+/// every read completed and succeeded; a failed or hanging read is INFRA.
+async fn admitted(
+    sim: &Sim,
+    authority: &str,
+    member: &str,
+    gid: &str,
+    budget: Duration,
+) -> Result<bool> {
+    let member_hex = sim.agent_hex(member)?;
+    let what = format!("{member} seated on {authority} and locally");
+    let mut seen = Observations::default();
+    let ready = sim
+        .until(&what, budget, async |s: &Sim| {
+            let Some(rows) = seen.observe(roster(s, authority, gid)).await else {
+                return true;
+            };
+            if !rows.iter().any(|(id, _)| *id == member_hex) {
+                return false;
+            }
+            let Some(state) = seen.observe(membership_state(s, member, gid)).await else {
+                return true;
+            };
+            state.as_deref() == Some("active")
+        })
+        .await;
+    match ready {
+        Ok(()) if !seen.failed() => Ok(true),
+        Ok(()) => seen.verify(&what).map(|()| false),
+        Err(error) if expired(&error) => seen.verify(&what).map(|()| false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Watch A's DM layer for J's join `fetch_request` for `gid`, from now on.
@@ -272,31 +350,42 @@ fn refused_members(text: &str) -> Option<Vec<String>> {
 
 async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
-    // t0: the Home with O and X1–X3. A and J start after the X devices
-    // announced. The answer drop toward A is active from before A starts.
+    // t0: O's owner-certified group G with X1–X3. A and J start after the
+    // X devices announced. The answer drop toward A is active from before
+    // A starts.
     let owner = UserKeypair::generate()?;
-    let home = sim.start_owner_device("O", &owner).await?;
+    let owner_home = sim.start_owner_device("O", &owner).await?;
     for member in MEMBERS {
-        sim.certify_owner_device("O", member, &owner, &home).await?;
-        let invite = sim.home_seat("O", member, &home).await?;
+        sim.certify_owner_device("O", member, &owner, &owner_home)
+            .await?;
+    }
+    let group = HomeIds {
+        gid: create_owner_certified(sim, "O", &owner_home.owner_user_id).await?,
+        owner_user_id: owner_home.owner_user_id.clone(),
+    };
+    for member in MEMBERS {
+        let link = invite(sim, "O", &group.gid).await?;
+        join(sim, member, &link).await?;
         ensure!(
-            sim.join_home("O", member, &home, &invite, JOIN_BUDGET)
-                .await?,
+            admitted(sim, "O", member, &group.gid, JOIN_BUDGET).await?,
             "setup: O could not seat {member}"
         );
     }
     let answers = AnswerDrop::install(sim, "A")?;
     for device in ["A", "J"] {
-        sim.certify_owner_device("O", device, &owner, &home).await?;
+        sim.certify_owner_device("O", device, &owner, &owner_home)
+            .await?;
     }
-    let invite = sim.home_seat("O", "A", &home).await?;
+    let link = invite(sim, "O", &group.gid).await?;
+    join(sim, "A", &link).await?;
     ensure!(
-        sim.join_home("O", "A", &home, &invite, JOIN_BUDGET).await?,
+        admitted(sim, "O", "A", &group.gid, JOIN_BUDGET).await?,
         "setup: O could not seat A"
     );
     let mut observers = vec!["A"];
     observers.extend_from_slice(MEMBERS);
-    sim.promote_admin("O", "A", &home, &observers).await?;
+    sim.promote_admin("O", "A", &group, &observers).await?;
+    let home = group;
     sim.within(
         "A's seat settles",
         SETTLE + secs(1),
@@ -440,13 +529,14 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         at(sim),
     );
 
-    // t2: A mints J's seat invite and J redeems it.
-    let invite = sim.home_seat("A", "J", &home).await?;
+    // t2: A mints J's invite and J redeems it.
+    let link = invite(sim, "A", &home.gid).await?;
     let join_position = sim
         .fabric()
         .mark_indexed("t2: J redeems A's invite after A's restart");
     let (watcher, received) = watch_join_requests(sim, &home.gid)?;
-    let admitted = sim.join_home("A", "J", &home, &invite, JOIN_BUDGET).await?;
+    join(sim, "J", &link).await?;
+    let j_admitted = admitted(sim, "A", "J", &home.gid, JOIN_BUDGET).await?;
     drop(watcher);
     let received = std::mem::take(
         &mut *received
@@ -462,10 +552,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .delivered_writes_after(&sim.peer("J")?, &a_peer, join_position)
         .len();
     receipt.request_delivered(
-        "j_join_fetch_request_reached_a",
+        "j_join_request_reached_a",
         first.is_some(),
         format!(
-            "{} join fetch_requests from J for this group reached A's DM layer after the \
+            "{} join messages from J for this group reached A's DM layer after the \
              join call (trace #{join_position}); {direct_frames} frames J->A delivered; \
              first at trace #{} (verified={})",
             received.len(),
@@ -474,7 +564,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         ),
         at(sim),
     );
-    if !admitted {
+    if !j_admitted {
         // The cause: A's seal refusal for THIS group and THIS joiner, after
         // J's request reached A, naming exactly A's digest-only seats.
         let j_hex = sim.agent_hex("J")?;
@@ -513,7 +603,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         answers.dropped(),
         missing.len()
     ));
-    receipt.finish(FINAL, admitted, at(sim));
+    receipt.finish(FINAL, j_admitted, at(sim));
     Ok(())
 }
 
