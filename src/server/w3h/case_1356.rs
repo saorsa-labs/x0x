@@ -55,6 +55,20 @@
 //!   GREEN on the base and with S3). Desired: through the window X keeps
 //!   its marker and its fork head, and A and M1 do not change. No
 //!   attestation resolves a fork.
+//! - `s3_manual_reseat_recovers_forked_node` (§3, an ownerless H-S3-c with
+//!   a `Removal` basis as in H-S3-d8; RED on the base). After the window
+//!   A removes X (r+2) and calls `POST /groups/:id/members/:agent_id/reseat`
+//!   with a reason and basis `Removal(r+2)` ([`reseat_body`]). With no call
+//!   on X's API, X consumes the authorisation and is desired active at
+//!   A's state revision and TreeKEM epoch, unmarked, within
+//!   [`RESEAT_BOUND`]. The base ([`CAUSE_RESEAT`]): the route does not
+//!   exist (404) and X stays forked.
+//!
+//! The `recovery` object is read as `{"state": .., "cause": ..}` and the
+//! re-seat request body as [`reseat_body`]: the harness's reading of ADR
+//! 0109 §3 and §8, which name the fields but not their JSON. The S3 code
+//! sets the API (`docs/api-reference.md`); if it differs, the S3 PR
+//! aligns these two readers in this file.
 //!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
@@ -97,6 +111,14 @@ const FINAL_TYPED: &str = "x_shows_reseat_required_not_on_chain_and_stays_contai
 const CAUSE_TYPED: &str = "X stays marked on its fork, and GET /groups/:id on X has no \
                            recovery object in the whole window";
 const FINAL_NOT_AUTO: &str = "x_stays_marked_on_its_fork_and_a_m1_unchanged";
+/// PLACEHOLDER (ADR 0109 leaves it to measurement): from the admin's
+/// re-seat call to the subject's swap (§3: delivery, the staged join
+/// with ADR 0107's guards, the TreeKEM Welcome and the durable swap).
+const RESEAT_BOUND: Duration = Duration::from_secs(300);
+const RESEAT_REASON: &str = "w3h #1356: X forked off the main chain while partitioned";
+const FINAL_RESEAT: &str = "x_active_at_the_authority_revision_and_epoch_after_the_reseat";
+const CAUSE_RESEAT: &str = "the re-seat route POST /groups/:id/members/:agent_id/reseat is \
+                            absent (404) and X stays forked";
 const FINAL_BYSTANDERS: &str =
     "a_and_m1_never_marked_m1_at_the_seal_no_revision_past_it_recovery_unchanged";
 
@@ -110,6 +132,8 @@ enum Arm {
     ForkTyped,
     /// §3: no automatic recovery of a forked node.
     ForkNotAuto,
+    /// §3: the admin's manual re-seat recovers the forked node.
+    ForkReseat,
 }
 
 impl Arm {
@@ -118,7 +142,7 @@ impl Arm {
     }
 
     fn fork(self) -> bool {
-        matches!(self, Self::ForkTyped | Self::ForkNotAuto)
+        matches!(self, Self::ForkTyped | Self::ForkNotAuto | Self::ForkReseat)
     }
 }
 
@@ -636,6 +660,102 @@ impl OutboundHold {
     }
 }
 
+/// The §3 re-seat request: a non-empty reason and a `Removal` basis.
+fn reseat_body(removal: &View) -> Value {
+    json!({
+        "reason": RESEAT_REASON,
+        "basis": {
+            "kind": "removal",
+            "revision": removal.state_revision,
+            "state_hash": removal.state_hash,
+        },
+    })
+}
+
+/// A removes X, calls the re-seat route, and waits [`RESEAT_BOUND`] for X
+/// to be active at A's state and epoch. Returns whether it is.
+async fn reseat(sim: &Sim, group: &str, receipt: &mut Receipt) -> Result<bool> {
+    let x_hex = sim.agent_hex("X")?;
+    let (code, removed) = sim
+        .api(
+            "A",
+            Method::DELETE,
+            &format!("/groups/{group}/members/{x_hex}"),
+            None,
+        )
+        .await?;
+    ensure!(code.is_success(), "A removes X: {code} {removed}");
+    sim.until("A no longer lists X", SETUP, async |s: &Sim| {
+        view_now(s, "A", group)
+            .await
+            .is_ok_and(|a| !a.lists(&x_hex))
+    })
+    .await?;
+    let removal = view(sim, "A", group).await?;
+    let (code, answer) = sim
+        .api(
+            "A",
+            Method::POST,
+            &format!("/groups/{group}/members/{x_hex}/reseat"),
+            Some(reseat_body(&removal)),
+        )
+        .await?;
+    let mut seen = Observations::default();
+    let waited = sim
+        .until("X is re-seated", RESEAT_BOUND, async |s: &Sim| {
+            let Some(a) = seen.observe(view_now(s, "A", group)).await else {
+                return true;
+            };
+            let Some(x) = seen.observe(try_view_now(s, "X", group)).await else {
+                return true;
+            };
+            let Some(x_status) = seen.observe(status_now(s, "X", group)).await else {
+                return true;
+            };
+            let membership = x_status.as_ref().and_then(|st| st.membership.as_deref());
+            caught_up(x.as_ref(), &a, membership)
+        })
+        .await;
+    if let Err(error) = waited {
+        if !expired(&error) {
+            return Err(error);
+        }
+    }
+    seen.verify("X is re-seated")?;
+    let a = view(sim, "A", group).await?;
+    let x = sim
+        .at_instant("read X's group", try_view_now(sim, "X", group))
+        .await??;
+    let x_status = status(sim, "X", group).await?;
+    let membership = x_status.as_ref().and_then(|st| st.membership.clone());
+    let passed = caught_up(x.as_ref(), &a, membership.as_deref());
+    let x_text = x
+        .as_ref()
+        .map_or_else(|| "has no record".to_string(), View::describe);
+    let x_status_text = x_status
+        .as_ref()
+        .map_or_else(|| "404".to_string(), Status::describe);
+    let observed = format!(
+        "reseat {code} {answer}; removal at {} {}; at the end A {}; X {x_status_text}; X {x_text}",
+        removal.state_revision,
+        short(&removal.state_hash),
+        a.describe()
+    );
+    receipt.note(observed.clone());
+    if !passed {
+        let forked = x
+            .as_ref()
+            .is_some_and(|x| x.marker.is_some() && x.state_hash != a.state_hash);
+        receipt.cause(
+            CAUSE_RESEAT,
+            Some(observed),
+            code == StatusCode::NOT_FOUND && forked,
+            at(sim),
+        );
+    }
+    Ok(passed)
+}
+
 async fn rename(sim: &Sim, label: &str, group: &str, name: &str) -> Result<()> {
     let (code, body) = sim
         .api(
@@ -837,6 +957,7 @@ async fn fork_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
             (FINAL_TYPED, passed)
         }
         Arm::ForkNotAuto => (FINAL_NOT_AUTO, contained && x1.state_hash != a1.state_hash),
+        Arm::ForkReseat => (FINAL_RESEAT, reseat(sim, &group, receipt).await?),
         Arm::AlignedJoin | Arm::SkewBystanders => bail!("INFRA: {arm:?} is not a fork arm"),
     };
     receipt.finish(final_name, passed, at(sim));
@@ -851,6 +972,7 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
         Arm::SkewBystanders => (JOIN_LABELS, FINAL_BYSTANDERS),
         Arm::ForkTyped => (FORK_LABELS, FINAL_TYPED),
         Arm::ForkNotAuto => (FORK_LABELS, FINAL_NOT_AUTO),
+        Arm::ForkReseat => (FORK_LABELS, FINAL_RESEAT),
     };
     match Sim::start(case, seed, labels).await {
         Ok(mut sim) => {
@@ -945,6 +1067,22 @@ async fn w3h_1356_control_s3_forked_node_not_auto_recovered() -> Result<()> {
         0x1356_0004,
         Arm::ForkNotAuto,
         Verdict::Green,
+    )
+    .await
+}
+
+/// ADR 0109 §3: an admin's manual re-seat recovers a forked node.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1356_red_s3_manual_reseat_recovers_forked_node() -> Result<()> {
+    expect(
+        "w3h_1356_red_s3_manual_reseat_recovers_forked_node",
+        0x1356_0005,
+        Arm::ForkReseat,
+        Verdict::Red,
     )
     .await
 }
