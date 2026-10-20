@@ -31,6 +31,47 @@ macro_rules! inventory_commands_regression_tests {
             }
 
             #[test]
+            fn inventory_commands_do_not_split_nbsp_into_executable_authority() {
+                for command in [format!("{INSTALL}\u{a0}--name owned"), format!("{INSTALL}\u{a0}")] {
+                    let source = format!("[Service]\nExecStart={command}\n");
+                    assert!(parse_source("owned.service", source.as_bytes(), Path::new(INSTALL)).is_err(), "{source:?}");
+                }
+            }
+
+            #[test]
+            fn inventory_commands_preserve_source_nbsp_inside_and_after_arguments() {
+                for argument in ["left\u{a0}right", "trailing\u{a0}", "\u{a0}leading"] {
+                    let source = format!("[Service]\nExecStart={INSTALL} {argument}\n");
+                    let commands = parse_source("owned.service", source.as_bytes(), Path::new(INSTALL)).unwrap();
+                    assert_eq!(commands.len(), 1);
+                    assert_eq!(commands[0].command.argv, argv(&[INSTALL, argument]), "{source:?}");
+                }
+            }
+
+            #[test]
+            fn inventory_commands_do_not_trim_nbsp_into_source_or_property_authority() {
+                for source in [
+                    format!("\u{a0}[Service]\nExecStart={INSTALL}\n"),
+                    format!("[Service]\u{a0}\nExecStart={INSTALL}\n"),
+                    format!("[Service]\n\u{a0}ExecStart={INSTALL}\n"),
+                    format!("[Service]\nExecStart\u{a0}={INSTALL}\n"),
+                    format!("[Service]\nExecStart=\u{a0}{INSTALL}\n"),
+                ] {
+                    assert!(parse_source("owned.service", source.as_bytes(), Path::new(INSTALL)).is_err(), "{source:?}");
+                }
+            }
+
+            #[test]
+            fn inventory_commands_keep_already_decoded_syntax_bytes_literal() {
+                // This API receives argv, not unit-file source. Quotes, escapes,
+                // semicolons and Unicode spaces here must not be reinterpreted.
+                let expected = argv(&[INSTALL, "pre\"mid\"post", "\"quoted\"tail", "literal\\slash", "literal;semicolon", "left\u{a0}right", "trailing\u{a0}", ""]);
+                let command = parse_command(Path::new(INSTALL), &expected, Path::new(INSTALL)).unwrap();
+                assert_eq!(command.executable, Path::new(INSTALL));
+                assert_eq!(command.argv, expected);
+            }
+
+            #[test]
             fn inventory_commands_retain_all_exec_evidence_in_source_order() {
                 let properties = ["ExecStart", "ExecStartPre", "ExecStartPost", "ExecCondition", "ExecReload", "ExecStop", "ExecStopPost"];
                 let mut source = "[Service]\n".to_owned();
