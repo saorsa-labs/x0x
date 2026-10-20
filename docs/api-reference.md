@@ -2849,6 +2849,23 @@ does not appear in `x0x routes`. What ships today is **point-to-point
 |---|---|---|---|
 | GET | `/gui` | `x0x gui` | Open the embedded browser UI |
 | GET | `/gui/` | — | Alias for `/gui` |
+| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). |
+
+#### Example: local show
+
+```bash
+# Open or navigate the local GUI to the People view
+curl -s -X POST http://127.0.0.1:12700/gui/show \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"view":"people"}'
+# { "outcome": "opened", "machine_id": "<hex>", "request_id": "<hex>" }
+
+x0x show people
+x0x show groups/<group_id>/board
+```
+
+View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
 
 ## Error handling
 

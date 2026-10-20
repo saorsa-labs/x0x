@@ -217,6 +217,12 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .toast.error{border-left:3px solid var(--rd)}
 .toast.warning{border-left:3px solid var(--am)}
 .toast.info{border-left:3px solid var(--cy)}
+/* ADR 0083 origin banner — non-dismissable for 3s */
+#gui-show-banner{position:fixed;top:0;left:0;right:0;z-index:1100;display:none;align-items:center;justify-content:space-between;gap:var(--sp4);padding:10px 16px;background:var(--bg3);border-bottom:1px solid var(--cy);color:var(--tx);font-size:13px;box-shadow:0 4px 20px rgba(0,0,0,.45)}
+#gui-show-banner.visible{display:flex}
+#gui-show-banner .banner-text{flex:1;min-width:0}
+#gui-show-banner button{flex-shrink:0;border-color:var(--rd);color:var(--rd);font-size:12px;padding:6px 12px}
+#gui-show-banner button:disabled{opacity:.4;cursor:not-allowed;border-color:var(--bd);color:var(--tx3)}
 
 /* Modal */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);z-index:500;display:flex;align-items:center;justify-content:center;animation:fadeIn .2s}
@@ -570,6 +576,10 @@ tr:hover td{background:rgba(255,255,255,.01)}
 <body>
 <a href="#main" class="skip-link">Skip to content</a>
 <button id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')" aria-label="Toggle navigation">&#9776;</button>
+<div id="gui-show-banner" role="status" aria-live="polite">
+  <span class="banner-text" id="gui-show-banner-text"></span>
+  <button type="button" id="gui-show-banner-block" disabled>Stop shows from this agent</button>
+</div>
 
 <div id="app">
 
@@ -878,7 +888,40 @@ function handleWsMsg(m){
     onGossipMessage(m.topic,m.origin,b64d(m.payload));
     return;
   }
+  // ADR 0083: navigate in place + origin banner.
+  if(m.type==='gui.show'){
+    onGuiShow(m);
+    return;
+  }
   if(m.type==='error'){console.warn('ws error:',m.message||m)}
+}
+function onGuiShow(m){
+  const route=String(m.view||'').replace(/^#\/?/,'').replace(/^\//,'');
+  if(route){
+    const prev=location.hash;
+    location.hash='#/'+route;
+    if(location.hash===prev)applyHashRoute();
+  }
+  showGuiShowBanner(m.banner||'Opened by an agent', m.agent_id||'');
+}
+function showGuiShowBanner(text, agentId){
+  const bar=document.getElementById('gui-show-banner');
+  const label=document.getElementById('gui-show-banner-text');
+  const btn=document.getElementById('gui-show-banner-block');
+  if(!bar||!label||!btn)return;
+  label.textContent=text;
+  bar.classList.add('visible');
+  btn.disabled=true;
+  btn.onclick=null;
+  clearTimeout(showGuiShowBanner._t);
+  showGuiShowBanner._t=setTimeout(()=>{
+    btn.disabled=false;
+    btn.onclick=()=>{
+      if(agentId)wsSend({type:'gui.block',agent_id:agentId});
+      bar.classList.remove('visible');
+      toast('Future shows from this agent will be blocked','info');
+    };
+  },3000);
 }
 
 /* ═══════════════════════════════════════════════════════════════════

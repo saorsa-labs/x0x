@@ -24,6 +24,7 @@ pub mod network;
 pub mod onboard;
 pub mod presence;
 pub mod purge;
+pub mod show;
 pub mod store;
 pub mod tasks;
 pub mod upgrade;

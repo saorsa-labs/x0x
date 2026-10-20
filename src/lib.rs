@@ -224,6 +224,9 @@ pub mod api;
 /// CLI infrastructure and command implementations.
 pub mod cli;
 
+/// Embedded GUI shell, view grammar, and ADR 0083 show runtime.
+pub mod gui;
+
 /// HTTP/WebSocket server: axum router, handlers, and the daemon serving entrypoint.
 pub mod server;
 

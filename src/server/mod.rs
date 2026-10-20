@@ -494,6 +494,7 @@ pub async fn serve_with_options(
         exec_policy,
         connect_policy,
         self_update_enabled,
+        daemon_config_path,
     } = options;
     // `--skip-update-check` is process-scoped updater suppression. Compute one
     // effective capability before any updater path is considered, then use it
@@ -1248,6 +1249,12 @@ pub async fn serve_with_options(
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         acl_admin: Arc::clone(&acl_admin),
+        gui_show: {
+            let runtime =
+                x0x::gui::GuiShowRuntime::with_defaults(config.gui_show.clone(), &config.data_dir);
+            runtime.set_config_path(daemon_config_path);
+            runtime
+        },
         connect_diagnostics,
         forward_service,
         owner_sync,
@@ -2812,6 +2819,9 @@ pub async fn serve_with_options(
         // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
+        // ADR 0083 slice 1: local show (no remote target).
+        .route("/gui/show", post(routes::gui_show))
+        .route("/gui/show/block", post(routes::gui_show_block))
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))

@@ -134,6 +134,8 @@ pub(in crate::server) async fn acl_reload(
     if !actor.is_durable_owner() {
         return forbidden();
     }
+    // ADR 0083 §5: `[gui_show]` is re-read with the ACL floors.
+    state.gui_show.reload_from_disk();
     let report = state.acl_admin.reload().await;
     let status = if report.ok {
         StatusCode::OK

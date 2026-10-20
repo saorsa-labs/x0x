@@ -37,6 +37,11 @@ GET /direct/events
 # ── Self-hosted — GUI does not call its own mounting endpoint ──
 GET /gui
 
+# ── ADR 0083 show — agents/CLI trigger POST /gui/show; the GUI receives
+# the `gui.show` WS event and uses WS `gui.block` for the banner control.
+POST /gui/show
+POST /gui/show/block
+
 # ── Admin/daemon — intentionally absent from end-user GUI ──
 POST /shutdown
 

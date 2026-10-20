@@ -1781,6 +1781,17 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "websocket",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/gui/show",
+        cli_name: "show",
+        description: "Show a GUI view to the human (ADR 0083 local show)",
+        category: "gui",
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("view", true, "VIEW"),
+            RequestField::body_as("target_machine", false, "--on"),
+        ]),
+    },
     // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
     EndpointDef {
         method: Method::Post,

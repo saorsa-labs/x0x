@@ -422,6 +422,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         exec_policy,
         connect_policy,
         self_update_enabled,
+        daemon_config_path: config_path.as_ref().map(std::path::PathBuf::from),
     };
     let handle = x0x::server::serve_with_options(config, options).await?;
 

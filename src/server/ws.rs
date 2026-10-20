@@ -89,6 +89,17 @@ pub(super) struct WsSession {
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
 }
 
+/// Build a placeholder WS session for ADR 0083 navigate-in-place tests.
+#[cfg(test)]
+pub(super) fn test_ws_session(id: &str) -> WsSession {
+    WsSession {
+        id: id.to_string(),
+        subscribed_topics: HashSet::new(),
+        receives_direct: false,
+        topic_forwarders: HashMap::new(),
+    }
+}
+
 /// Shared state for a single gossip topic subscription shared across WS sessions.
 pub(super) struct SharedTopicState {
     /// Broadcast channel that all WS sessions for this topic tap.
@@ -196,6 +207,16 @@ enum WsOutbound {
     /// ADR-0073: a call lifecycle transition.
     #[serde(rename = "call.state")]
     CallState { call: serde_json::Value },
+    /// ADR 0083: navigate an open GUI tab to a validated view.
+    #[serde(rename = "gui.show")]
+    GuiShow {
+        view: String,
+        banner: String,
+        agent_id: String,
+        machine_id: String,
+        rider: bool,
+        request_id: String,
+    },
 }
 
 /// Client → Server WebSocket command.
@@ -218,6 +239,9 @@ enum WsInbound {
     SendDirect { agent_id: String, payload: String },
     #[serde(rename = "ping")]
     Ping,
+    /// ADR 0083: origin-banner "Stop shows from this agent".
+    #[serde(rename = "gui.block")]
+    GuiBlock { agent_id: String },
 }
 
 /// Backfill request carried on `Subscribe` (ADR-0023 §7).
@@ -1000,6 +1024,23 @@ async fn handle_ws_connection(
         &stats,
     );
 
+    // ADR 0083: deliver a pending origin banner when this tab was just opened
+    // by `POST /gui/show` (no live WS existed at show time).
+    if let Some(pending) = state.gui_show.take_pending(std::time::Instant::now()) {
+        feed_droppable(
+            &outbound_tx,
+            WsOutbound::GuiShow {
+                view: pending.view,
+                banner: pending.banner,
+                agent_id: pending.agent_id,
+                machine_id: pending.machine_id,
+                rider: pending.rider,
+                request_id: pending.request_id,
+            },
+            &stats,
+        );
+    }
+
     // Spawn writer task: outbound_rx → ws_tx. Races BOTH the frame arrival and
     // each socket send against the slow-consumer token — the writer may be
     // blocked in `ws_tx.send()` flushing to a stalled socket when the queue
@@ -1152,6 +1193,51 @@ async fn handle_ws_connection(
             let out = match event.event_type.as_str() {
                 "call.incoming" => WsOutbound::CallIncoming { call: event.data },
                 "call.state" => WsOutbound::CallState { call: event.data },
+                "gui.show" => {
+                    let view = event
+                        .data
+                        .get("view")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let banner = event
+                        .data
+                        .get("banner")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let agent_id = event
+                        .data
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let machine_id = event
+                        .data
+                        .get("machine_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let rider = event
+                        .data
+                        .get("rider")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let request_id = event
+                        .data
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    WsOutbound::GuiShow {
+                        view,
+                        banner,
+                        agent_id,
+                        machine_id,
+                        rider,
+                        request_id,
+                    }
+                }
                 _ => continue,
             };
             if !feed_critical(&call_tx, out, &call_stats, &call_slow_close, &call_counted) {
@@ -1787,6 +1873,17 @@ async fn handle_ws_command(
                     stats,
                 );
             }
+        }
+
+        WsInbound::GuiBlock { agent_id } => {
+            let aid = match parse_agent_id_hex(&agent_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    feed_droppable(tx, WsOutbound::Error { message: e }, stats);
+                    return;
+                }
+            };
+            state.gui_show.block_agent(&aid);
         }
     }
 }

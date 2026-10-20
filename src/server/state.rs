@@ -129,6 +129,9 @@ pub struct ServeOptions {
     /// never replace or restart the host application. Updater-owned manifest
     /// broadcast/listener side effects are gated with the install paths.
     pub self_update_enabled: bool,
+    /// Path of the daemon TOML that produced `DaemonConfig`, when known.
+    /// Used by ADR 0083 to re-read `[gui_show]` on `POST /acl/reload`.
+    pub daemon_config_path: Option<std::path::PathBuf>,
 }
 
 pub(super) const fn effective_self_update_enabled(
@@ -506,6 +509,10 @@ pub struct DaemonConfig {
     /// WebSocket session tuning (`[ws]` in TOML).
     #[serde(default)]
     pub ws: DaemonWsConfig,
+
+    /// ADR 0083 agent-initiated GUI show (`[gui_show]`).
+    #[serde(default)]
+    pub gui_show: x0x::gui::GuiShowConfig,
 }
 
 /// WebSocket session tuning (`[ws]` in the daemon TOML).
@@ -818,6 +825,7 @@ impl Default for DaemonConfig {
             network_id: None,
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
+            gui_show: x0x::gui::GuiShowConfig::default(),
         }
     }
 }
@@ -1305,6 +1313,8 @@ pub(super) struct AppState {
     /// ADR-0070 §3: API-managed connect/exec ACL entries over the TOML
     /// floor, and hot reload (`/acl/*`).
     pub(super) acl_admin: Arc<super::acl_admin::AclAdmin>,
+    /// ADR 0083: local GUI show runtime (`[gui_show]`, rate limit, opener).
+    pub(super) gui_show: x0x::gui::GuiShowRuntime,
     /// Connect-ACL allow/deny counters + policy summary for
     /// `/diagnostics/connect`. Counters reflect live forwards when connect is
     /// enabled (the forwarder calls `record_allowed`/`record_denied`) and read

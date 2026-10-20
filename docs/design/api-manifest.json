@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 203,
+  "endpoint_count": 204,
   "endpoints": [
     {
       "category": "status",
@@ -3207,6 +3207,30 @@
       "path": "/gui",
       "request": {
         "kind": "none"
+      }
+    },
+    {
+      "category": "gui",
+      "cli_name": "show",
+      "description": "Show a GUI view to the human (ADR 0083 local show)",
+      "method": "POST",
+      "path": "/gui/show",
+      "request": {
+        "fields": [
+          {
+            "cli": "VIEW",
+            "in": "body",
+            "name": "view",
+            "required": true
+          },
+          {
+            "cli": "--on",
+            "in": "body",
+            "name": "target_machine",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
