@@ -51,15 +51,11 @@ pub(in crate::server) async fn gui_show(
     let route = parsed.as_route();
 
     let agent_id = state.agent.agent_id();
-    // Slice 1's requester is this daemon's agent. `blocks_local_show` is
-    // false for that agent, so a banner block does not refuse later local
-    // `POST /gui/show`. The list still refuses a different sender (slice 3).
-    debug_assert!(
-        !state
-            .gui_show
-            .blocks_local_show(&agent_id, &state.agent.agent_id()),
-        "local shows from this daemon must not be refused by the block list"
-    );
+    // ADR 0083 §5: a blocked sender is refused. Slice 1's requester is this
+    // daemon's agent, and that agent is not exempt.
+    if state.gui_show.is_blocked(&agent_id) {
+        return json_outcome(GuiShowOutcome::Refused, machine_id, request_id);
+    }
 
     let now = Instant::now();
     if !state.gui_show.try_rate_limit(&agent_id, now) {
@@ -95,12 +91,7 @@ pub(in crate::server) async fn gui_show(
     // The same token keys the pending banner so each opened window gets
     // its own show when it connects with `gui=1`.
     let session = state.sessions.issue(Instant::now());
-    let loopback = loopback_api_addr(state.api_address);
-    let url = format!(
-        "http://{}:{}/gui?token={session}#/{route}",
-        loopback.ip(),
-        loopback.port()
-    );
+    let url = show_loopback_url(state.api_address, &session, &route);
     if state.gui_show.open_url(&url) {
         state.gui_show.enqueue_pending(PendingGuiShow {
             view: route,
@@ -136,6 +127,15 @@ fn loopback_api_addr(addr: SocketAddr) -> SocketAddr {
     } else {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
     }
+}
+
+/// Browser URL for a fresh GUI session.
+///
+/// `SocketAddr`'s display form brackets an IPv6 host (`[::1]:port`). Formatting
+/// the IP and port separately emits `http://::1:port/`, which URL parsers reject.
+fn show_loopback_url(api: SocketAddr, session: &str, route: &str) -> String {
+    let addr = loopback_api_addr(api);
+    format!("http://{addr}/gui?token={session}#/{route}")
 }
 
 async fn resolve_banner_labels(state: &AppState) -> (String, String) {
@@ -357,21 +357,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocking_the_daemon_agent_does_not_refuse_local_show() -> anyhow::Result<()> {
+    async fn blocking_the_daemon_agent_refuses_local_show() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
-        install_capturing_opener(&state);
+        let cap = install_capturing_opener(&state);
         state.gui_show.block_agent(&state.agent.agent_id());
         let app = router(Arc::clone(&state));
         let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
         assert_eq!(status, StatusCode::OK);
-        assert_ne!(
+        assert_eq!(
             body["outcome"], "refused",
-            "a block of this daemon's agent must not disable local POST /gui/show: {body}"
+            "ADR 0083 §5 refuses a blocked sender, including this daemon's agent: {body}"
         );
         assert!(
-            body["outcome"] == "opened" || body["outcome"] == "navigated",
-            "{body}"
+            cap.urls.lock().unwrap().is_empty(),
+            "a blocked sender must not open a window"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ipv6_loopback_url_brackets_the_host() {
+        let addr: std::net::SocketAddr = "[::1]:12700".parse().expect("ipv6 loopback");
+        let url = show_loopback_url(addr, "sess", "people");
+        assert_eq!(url, "http://[::1]:12700/gui?token=sess#/people");
+        assert!(
+            !url.contains("http://::1:"),
+            "an unbracketed IPv6 URL does not parse: {url}"
+        );
+        let v4: std::net::SocketAddr = "127.0.0.1:12700".parse().expect("ipv4 loopback");
+        assert_eq!(
+            show_loopback_url(v4, "sess", "network"),
+            "http://127.0.0.1:12700/gui?token=sess#/network"
+        );
+    }
+
+    #[tokio::test]
+    async fn opener_failure_is_no_display() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        *cap.succeed.lock().expect("succeed flag") = false;
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "no_display", "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_gui_tab_does_not_suppress_opening_the_browser() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        {
+            let mut sessions = state.ws_sessions.write().await;
+            sessions.insert(
+                "hidden-gui".to_string(),
+                crate::server::ws::test_gui_ws_session("hidden-gui"),
+            );
+            sessions
+                .get_mut("hidden-gui")
+                .expect("session")
+                .set_visible_gui(false);
+        }
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["outcome"], "opened",
+            "a hidden tab is not a live GUI: {body}"
+        );
+        assert_eq!(cap.urls.lock().unwrap().len(), 1);
         Ok(())
     }
 

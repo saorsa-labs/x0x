@@ -84,8 +84,9 @@ pub(super) struct WsSession {
     subscribed_topics: HashSet<String>,
     /// Whether this session receives direct messages.
     receives_direct: bool,
-    /// ADR 0083: this socket is a visible GUI tab (`gui=1`), not an agent client.
-    visible_gui: bool,
+    /// ADR 0083: this socket is a visible GUI tab. `gui=1` sets the initial
+    /// value. `gui.visible` updates it when the tab is shown or hidden.
+    visible_gui: Arc<AtomicBool>,
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
     /// The drain owns the `JoinHandle`; this is only the abort handle.
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
@@ -109,15 +110,24 @@ fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
         id: id.to_string(),
         subscribed_topics: HashSet::new(),
         receives_direct: false,
-        visible_gui,
+        visible_gui: visible_gui_flag(visible_gui),
         topic_forwarders: HashMap::new(),
     }
 }
 
+fn visible_gui_flag(visible: bool) -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(visible))
+}
+
 impl WsSession {
-    /// Live visible GUI tab. Agent `/ws` and `/ws/direct` sockets are not.
+    /// Live visible GUI tab. A hidden tab and an agent socket are not.
     pub(super) fn is_visible_gui(&self) -> bool {
-        self.visible_gui
+        self.visible_gui.load(Ordering::Acquire)
+    }
+
+    /// The GUI tab reports `document.visibilityState`.
+    pub(super) fn set_visible_gui(&self, visible: bool) {
+        self.visible_gui.store(visible, Ordering::Release);
     }
 }
 
@@ -263,6 +273,10 @@ enum WsInbound {
     /// ADR 0083: origin-banner "Stop shows from this agent".
     #[serde(rename = "gui.block")]
     GuiBlock { agent_id: String },
+    /// ADR 0083: the GUI tab reports whether it is actually visible.
+    /// A hidden tab must stop counting as a live GUI.
+    #[serde(rename = "gui.visible")]
+    GuiVisible { visible: bool },
 }
 
 /// Backfill request carried on `Subscribe` (ADR-0023 §7).
@@ -1028,6 +1042,7 @@ async fn handle_ws_connection(
     use axum::extract::ws::Message;
     use futures::StreamExt as FutStreamExt;
 
+    let visible_gui = visible_gui_flag(visible_gui);
     let session_id = uuid::Uuid::new_v4().to_string();
     let (mut ws_tx, mut ws_rx) = socket.split();
     // WS1.1: bounded outbound queue (was the only unbounded channel in
@@ -1048,7 +1063,7 @@ async fn handle_ws_connection(
         id: session_id.clone(),
         subscribed_topics: HashSet::new(),
         receives_direct: direct_mode,
-        visible_gui,
+        visible_gui: Arc::clone(&visible_gui),
         topic_forwarders: HashMap::new(),
     };
     state
@@ -1073,7 +1088,7 @@ async fn handle_ws_connection(
     // ADR 0083: deliver this window's pending banner. Only a visible GUI
     // tab (`gui=1`) may take it, and only the session token minted into
     // that window's URL. An agent socket leaves every pending show queued.
-    if visible_gui {
+    if visible_gui.load(Ordering::Acquire) {
         if let Some(token) = session_token.as_deref() {
             if let Some(pending) = state
                 .gui_show
@@ -1237,6 +1252,7 @@ async fn handle_ws_connection(
     let call_slow_close = slow_close.clone();
     let call_counted = Arc::clone(&slow_close_counted);
     let mut call_rx = state.broadcast_tx.subscribe();
+    let show_visible = Arc::clone(&visible_gui);
     let Some(call_forwarder) = spawn_ws_task(&state, async move {
         loop {
             let event = match call_rx.recv().await {
@@ -1248,7 +1264,7 @@ async fn handle_ws_connection(
                 "call.incoming" => WsOutbound::CallIncoming { call: event.data },
                 "call.state" => WsOutbound::CallState { call: event.data },
                 "gui.show" => {
-                    if !visible_gui {
+                    if !show_visible.load(Ordering::Acquire) {
                         continue;
                     }
                     let view = event
@@ -1942,6 +1958,12 @@ async fn handle_ws_command(
             };
             state.gui_show.block_agent(&aid);
         }
+
+        WsInbound::GuiVisible { visible } => {
+            if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+                session.set_visible_gui(visible);
+            }
+        }
     }
 }
 
@@ -2290,7 +2312,7 @@ mod tests {
                 id: session_id.to_string(),
                 subscribed_topics: HashSet::new(),
                 receives_direct: false,
-                visible_gui: false,
+                visible_gui: visible_gui_flag(false),
                 topic_forwarders: HashMap::new(),
             },
         );

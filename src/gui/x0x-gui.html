@@ -709,11 +709,23 @@ function readSessionToken(){
 }
 let SESSION_TOKEN=readSessionToken();
 // Built per connect so a reconnect uses the current (refreshed) token.
+function guiTabVisible(){
+  return document.visibilityState==='visible';
+}
 function wsUrl(){
   const base=BASE.replace(/^http/,'ws')+'/ws/direct';
-  // gui=1 marks this socket as a visible GUI tab. Agent clients omit it.
-  if(SESSION_TOKEN)return base+'?token='+SESSION_TOKEN+'&gui=1';
-  return base+'?gui=1';
+  // gui=1 marks a visible GUI tab. A hidden tab omits it, so the daemon
+  // opens a browser instead of navigating a tab the human cannot see.
+  // Agent clients omit it too.
+  if(SESSION_TOKEN){
+    return guiTabVisible()
+      ? base+'?token='+SESSION_TOKEN+'&gui=1'
+      : base+'?token='+SESSION_TOKEN;
+  }
+  return guiTabVisible() ? base+'?gui=1' : base;
+}
+function advertiseGuiVisibility(){
+  wsSend({type:'gui.visible', visible: guiTabVisible()});
 }
 let ws=null;
 const wsSubs=new Set();
@@ -860,6 +872,7 @@ function wsConnect(){
   ws.onopen=async()=>{
     await refreshAgentIdentity();
     S.set('connected',true);
+    advertiseGuiVisibility();
     wsSubs.forEach(t=>wsSend({type:'subscribe',topics:[t]}));
   };
   ws.onclose=()=>{S.set('connected',false);setTimeout(wsConnect,3000)};
@@ -6308,7 +6321,10 @@ if(!applyHashRoute())renderView();
 renderSidebar();
 window.onhashchange=applyHashRoute;
 setInterval(maybeRefreshSession,30000);
-document.addEventListener('visibilitychange',maybeRefreshSession);
+document.addEventListener('visibilitychange',()=>{
+  maybeRefreshSession();
+  advertiseGuiVisibility();
+});
 
 setInterval(pollAll,5000);
 setInterval(()=>{pollContacts();pollGroups()},8000);

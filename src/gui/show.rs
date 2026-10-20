@@ -17,6 +17,11 @@ use super::rate_limit::GuiShowRateLimit;
 /// How long a pending banner waits for its GUI window to connect.
 const PENDING_FRESHNESS: Duration = Duration::from_secs(60);
 
+/// How long a platform opener may run before a missing successful exit is
+/// `no_display`. Spawn success is not a display: `xdg-open` can start and
+/// then exit nonzero on a headless host.
+const OPENER_WAIT: Duration = Duration::from_secs(2);
+
 /// Pending banner for one freshly opened GUI window (no live WS yet).
 ///
 /// Keyed by the session token minted into that window's URL, so two shows
@@ -113,28 +118,61 @@ pub struct PlatformOpener;
 
 impl ShowOpener for PlatformOpener {
     fn open(&self, url: &str) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            std::process::Command::new("open").arg(url).spawn().is_ok()
+        match platform_opener_spawn(url) {
+            Some(Ok(child)) => opener_displayed(child, OPENER_WAIT),
+            Some(Err(_)) | None => false,
         }
-        #[cfg(target_os = "linux")]
-        {
-            std::process::Command::new("xdg-open")
-                .arg(url)
-                .spawn()
-                .is_ok()
-        }
-        #[cfg(target_os = "windows")]
-        {
+    }
+}
+
+/// Start the platform opener. `None` means this OS has no opener.
+fn platform_opener_spawn(url: &str) -> Option<std::io::Result<std::process::Child>> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(std::process::Command::new("open").arg(url).spawn())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(std::process::Command::new("xdg-open").arg(url).spawn())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(
             std::process::Command::new("cmd")
                 .args(["/C", "start", url])
-                .spawn()
-                .is_ok()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        {
-            let _ = url;
-            false
+                .spawn(),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = url;
+        None
+    }
+}
+
+/// Wait until `child` exits, or until `bound` elapses.
+///
+/// The wait polls `try_wait`, so it does not block in the kernel. A nonzero
+/// exit is not a display. A child still running at `bound` is not a display
+/// either. The child is always reaped: a timeout kills it and waits, so it
+/// cannot stay a zombie.
+fn opener_displayed(mut child: std::process::Child, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.wait();
+                return false;
+            }
         }
     }
 }
@@ -253,15 +291,6 @@ impl GuiShowRuntime {
             .unwrap_or(false)
     }
 
-    /// Whether a local show from `requester` is refused by the block list.
-    ///
-    /// Slice 1 always requests as this daemon's own agent. The block list is
-    /// for a remote sender (slice 3). Blocking the daemon agent — the only
-    /// sender the slice 1 banner can name — does not refuse later local shows.
-    pub fn blocks_local_show(&self, requester: &AgentId, daemon_agent: &AgentId) -> bool {
-        requester != daemon_agent && self.is_blocked(requester)
-    }
-
     /// Add `agent` to the block list and persist.
     pub fn block_agent(&self, agent: &AgentId) {
         if let Ok(mut g) = self.blocked.lock() {
@@ -350,9 +379,9 @@ pub fn startup_config_path(explicit: Option<&Path>, default_path: &Path) -> Opti
 
 /// Whether a WebSocket query is a visible GUI tab, and its session token.
 ///
-/// The embedded GUI connects with `gui=1`. Agent clients on `/ws` and
-/// `/ws/direct` omit it, so they are not a live GUI and must not take a
-/// pending banner.
+/// The embedded GUI connects with `gui=1` only while the tab is visible.
+/// Agent clients on `/ws` and `/ws/direct` omit it, and a hidden tab omits it
+/// too, so they are not a live GUI and must not take a pending banner.
 pub fn parse_gui_ws_query(query: Option<&str>) -> (bool, Option<String>) {
     let Some(query) = query else {
         return (false, None);
@@ -446,21 +475,67 @@ mod tests {
     }
 
     #[test]
-    fn blocking_the_daemon_agent_does_not_refuse_local_shows() {
+    fn blocking_the_daemon_agent_refuses_local_shows() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rt = runtime(dir.path(), None);
         let daemon = AgentId([1u8; 32]);
-        let remote = AgentId([2u8; 32]);
         rt.block_agent(&daemon);
         assert!(
-            !rt.blocks_local_show(&daemon, &daemon),
-            "slice 1 local shows are this daemon's agent; the banner block list is for a remote sender and must not refuse them"
+            rt.is_blocked(&daemon),
+            "ADR 0083 §5 refuses a blocked sender, including this daemon's agent"
         );
-        rt.block_agent(&remote);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opener_that_fails_after_spawn_is_not_a_display() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.15; exit 1"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
         assert!(
-            rt.blocks_local_show(&remote, &daemon),
-            "a blocked remote sender is still refused"
+            !opener_displayed(child, Duration::from_secs(2)),
+            "a launcher that exits nonzero is no_display, even when spawn succeeded"
         );
+        assert!(!process_is_zombie(pid), "the failed opener must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opener_still_running_at_the_bound_is_reaped_and_not_a_display() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let started = Instant::now();
+        assert!(!opener_displayed(child, Duration::from_millis(200)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must stay inside its bound"
+        );
+        assert!(!process_is_zombie(pid), "a timed-out opener must be reaped");
+        let still = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        assert!(
+            !still.status.success(),
+            "a timed-out opener must not keep running: {}",
+            String::from_utf8_lossy(&still.stdout)
+        );
+    }
+
+    #[cfg(unix)]
+    fn process_is_zombie(pid: u32) -> bool {
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout).contains('Z')
     }
 
     #[test]
@@ -581,8 +656,63 @@ mod tests {
             "after the wait, Hide clears the banner without gui.block"
         );
         assert!(
-            html.contains("&gui=1") || html.contains("gui=1"),
-            "the GUI socket must tag itself so an agent /ws client is not a live tab"
+            html.contains("function guiTabVisible"),
+            "the GUI socket must advertise gui=1 only while the tab is visible"
         );
+    }
+
+    #[test]
+    fn hidden_tab_does_not_advertise_a_live_gui() {
+        let html = include_str!("x0x-gui.html");
+        let ws_url = fn_source(html, "function wsUrl()", "let ws=");
+        assert!(
+            ws_url.contains("guiTabVisible()"),
+            "wsUrl must read real visibility before it sends gui=1: {ws_url}"
+        );
+        assert!(
+            !ws_url.contains("return base+'?gui=1';"),
+            "a hidden tab must not be hard-coded as a live GUI: {ws_url}"
+        );
+        assert!(
+            !ws_url.contains("return base+'?token='+SESSION_TOKEN+'&gui=1';"),
+            "a tokenised socket must not always send gui=1: {ws_url}"
+        );
+        let advertise = fn_source(
+            html,
+            "function advertiseGuiVisibility()",
+            "function wsConnect()",
+        );
+        assert!(
+            advertise.contains("type:'gui.visible'") || advertise.contains("type: 'gui.visible'"),
+            "visibility changes must update the daemon: {advertise}"
+        );
+        assert!(
+            advertise.contains("guiTabVisible()"),
+            "the update must carry the real visibility: {advertise}"
+        );
+        let listener = html
+            .find("addEventListener('visibilitychange'")
+            .expect("visibility listener");
+        let listener_src = &html[listener..listener + 180];
+        assert!(
+            listener_src.contains("advertiseGuiVisibility"),
+            "hiding the tab must stop advertising a live GUI: {listener_src}"
+        );
+        let onopen = fn_source(html, "ws.onopen=async()", "ws.onclose");
+        assert!(
+            onopen.contains("advertiseGuiVisibility()"),
+            "a reconnect must report the visibility at open time: {onopen}"
+        );
+    }
+
+    fn fn_source<'a>(html: &'a str, start: &str, end: &str) -> &'a str {
+        let at = html
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"));
+        let rest = &html[at..];
+        let stop = rest
+            .find(end)
+            .unwrap_or_else(|| panic!("missing {end} after {start}"));
+        &rest[..stop]
     }
 }
