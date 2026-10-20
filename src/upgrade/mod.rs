@@ -6,6 +6,7 @@
 //! support.
 
 pub mod apply;
+pub(crate) mod journal;
 pub mod manifest;
 pub mod monitor;
 pub mod restart;
