@@ -212,6 +212,9 @@ mod execution {
     const CANDIDATE_VERSION: &str = "9.9.9";
     const OLD_DAEMON: &[u8] = b"installed daemon must remain unchanged";
     const OLD_CLI: &[u8] = b"installed CLI must remain unchanged";
+    // A loaded parallel test host can need hundreds of milliseconds merely
+    // to enter /bin/sh. Leave time to reach the intended hanging child state.
+    const HANGING_FIXTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
     struct ExecutionFixture {
         _scratch: ProbeFixture,
@@ -474,7 +477,7 @@ mod execution {
         let mut transaction_ids = std::collections::HashSet::new();
         for (attempt, wait_secs) in [(1, 30 * 60), (2, 60 * 60), (3, 120 * 60)] {
             let mut options = ExecutionFixture::options(clock_ms);
-            options.timeout = Duration::from_millis(100);
+            options.timeout = HANGING_FIXTURE_TIMEOUT;
             let result = fixture.run(&options);
             assert!(matches!(result, Err(ProbeRefusal::Interrupted { .. })));
             let state = probe::read_state(&fixture.request.install)
@@ -483,6 +486,7 @@ mod execution {
             assert!(matches!(state.phase, ProbePhase::InterruptedWait));
             assert_eq!(state.cause, Some(ProbeCause::Timeout));
             assert_eq!(state.attempt, attempt);
+            assert_eq!(fixture.launched_pids().len(), attempt as usize);
             assert!(
                 transaction_ids.insert(state.transaction_id),
                 "each retry must use a fresh transaction"
@@ -514,7 +518,7 @@ mod execution {
             fixture.assert_installed_pair_unchanged();
         }
         let mut options = ExecutionFixture::options(clock_ms);
-        options.timeout = Duration::from_millis(100);
+        options.timeout = HANGING_FIXTURE_TIMEOUT;
         assert!(fixture.run(&options).is_err());
         let state = probe::read_state(&fixture.request.install)
             .unwrap()
@@ -522,6 +526,7 @@ mod execution {
         assert!(matches!(state.phase, ProbePhase::FailedHold));
         assert_eq!(state.cause, Some(ProbeCause::RetriesExhausted));
         assert_eq!(state.attempt, 4);
+        assert_eq!(fixture.launched_pids().len(), 4);
         for pid in fixture.launched_pids() {
             ExecutionFixture::assert_child_reaped(pid);
         }
@@ -537,7 +542,7 @@ mod execution {
         let fixture = ExecutionFixture::new();
         fixture.write_script(&fixture.request.daemon, "while :; do :; done");
         let mut options = ExecutionFixture::options(1_000);
-        options.timeout = Duration::from_millis(100);
+        options.timeout = HANGING_FIXTURE_TIMEOUT;
         assert!(matches!(
             fixture.run(&options),
             Err(ProbeRefusal::Interrupted { .. })
@@ -806,20 +811,18 @@ mod execution {
         let fixture = ExecutionFixture::new();
         fixture.write_script(&fixture.request.daemon, "while :; do :; done");
         let alive = AtomicBool::new(true);
+        let mut options = ExecutionFixture::options(1_000);
+        options.timeout = Duration::from_secs(10);
         let result = std::thread::scope(|scope| {
             scope.spawn(|| {
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + Duration::from_secs(5);
                 while !fixture.launches.exists() {
                     assert!(Instant::now() < deadline, "candidate never started");
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 alive.store(false, Ordering::Release);
             });
-            probe::run_before_swap_with_options(
-                &fixture.request,
-                &alive,
-                &ExecutionFixture::options(1_000),
-            )
+            probe::run_before_swap_with_options(&fixture.request, &alive, &options)
         });
         assert!(matches!(result, Err(ProbeRefusal::Interrupted { .. })));
         let state = probe::read_state(&fixture.request.install)
@@ -948,10 +951,14 @@ mod execution {
         // does no I/O or networking; successful group cleanup terminates it.
         fixture.write_script(
             &fixture.request.daemon,
-            &format!("/bin/sleep 30 &\nprintf '%s\\n' '{response}'\nexit 0"),
+            &format!(
+                "/bin/sleep 30 &\n\
+                 printf '%s\\n' \"$!\" > \"$PROBE_TEST_LAUNCHES.descendant\"\n\
+                 printf '%s\\n' '{response}'\nexit 0"
+            ),
         );
         let mut options = ExecutionFixture::options(1_000);
-        options.timeout = Duration::from_millis(100);
+        options.timeout = HANGING_FIXTURE_TIMEOUT;
         let started = Instant::now();
         assert!(matches!(
             fixture.run(&options),
@@ -968,6 +975,9 @@ mod execution {
         assert_eq!(state.phase, ProbePhase::InterruptedWait);
         ExecutionFixture::assert_child_reaped(state.last_pid.unwrap());
         assert_eq!(fixture.launched_pids().len(), 1);
+        let descendant = std::fs::read_to_string(fixture.launches.with_extension("descendant"))
+            .expect("the fixture must spawn its pipe-holding descendant before timing out");
+        assert!(descendant.trim().parse::<u32>().unwrap() > 0);
         fixture.assert_installed_pair_unchanged();
     }
 
