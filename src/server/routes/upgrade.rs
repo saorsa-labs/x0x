@@ -612,6 +612,29 @@ pub(in crate::server) async fn broadcast_current_manifest(
     }
 }
 
+/// The shared background apply operation. Each caller retains its apply
+/// mutex through the complete result/backoff/retry handling below this call.
+async fn apply_background_release(
+    config: &DaemonUpdateConfig,
+    data_dir: &std::path::Path,
+    api_addr: SocketAddr,
+    shutdown: &Arc<dyn Fn() + Send + Sync>,
+    manifest: &ReleaseManifest,
+) -> (
+    AutoApplyUpgrader,
+    std::result::Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) {
+    let upgrader = AutoApplyUpgrader::new("x0xd")
+        .with_stop_on_upgrade(config.stop_on_upgrade)
+        .with_restart_context(listener_restart_context(
+            data_dir,
+            api_addr,
+            Arc::clone(shutdown),
+        ));
+    let result = upgrader.apply_upgrade_from_manifest(manifest).await;
+    (upgrader, result)
+}
+
 /// Gossip-based release subscription — the primary update mechanism for x0xd.
 ///
 /// When an upgrade attempt fails (e.g. hash mismatch), the failed version is
@@ -789,14 +812,9 @@ pub(in crate::server) async fn run_gossip_update_listener(
         );
 
         let _upgrade_guard = upgrade_apply_lock.lock().await;
-        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-            .with_stop_on_upgrade(config.stop_on_upgrade)
-            .with_restart_context(listener_restart_context(
-                &data_dir,
-                api_addr,
-                Arc::clone(&shutdown),
-            ));
-        match upgrader.apply_upgrade_from_manifest(&manifest).await {
+        let (upgrader, result) =
+            apply_background_release(&config, &data_dir, api_addr, &shutdown, &manifest).await;
+        match result {
             Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
                 tracing::info!(%version, "Successfully upgraded to version {version}");
             }
@@ -917,17 +935,15 @@ pub(in crate::server) async fn run_fallback_github_poll(
                 });
 
                 let _upgrade_guard = upgrade_apply_lock.lock().await;
-                let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-                    .with_stop_on_upgrade(config.stop_on_upgrade)
-                    .with_restart_context(listener_restart_context(
-                        &data_dir,
-                        api_addr,
-                        Arc::clone(&shutdown),
-                    ));
-                match upgrader
-                    .apply_upgrade_from_manifest(&verified.manifest)
-                    .await
-                {
+                let (upgrader, result) = apply_background_release(
+                    &config,
+                    &data_dir,
+                    api_addr,
+                    &shutdown,
+                    &verified.manifest,
+                )
+                .await;
+                match result {
                     Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
                         tracing::info!(%version, "Fallback upgrade successful");
                     }
