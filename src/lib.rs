@@ -15942,6 +15942,31 @@ impl Agent {
         self.s4_revocation_intake.clone()
     }
 
+    /// ADR 0110 §4: verify a signed revocation record carried by an
+    /// `EvictionHandoffV1` and insert it through the same verify, persist
+    /// and publish path as a gossip receipt, so it passes the §1 choke
+    /// point (and its S4 hook) after `verify_and_insert` returns
+    /// `Ok(true)`. Returns whether the local set holds the record
+    /// afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record fails signature or issuer-authority
+    /// verification.
+    pub async fn ingest_eviction_handoff_revocation(
+        &self,
+        record: revocation::RevocationRecord,
+        subject_cert: Option<&identity::AgentCertificate>,
+    ) -> error::Result<bool> {
+        let hash = record.record_hash();
+        if self.revocation_set.read().await.contains_hash(&hash) {
+            return Ok(true);
+        }
+        self.apply_and_publish_revocation(record, subject_cert)
+            .await?;
+        Ok(self.revocation_set.read().await.contains_hash(&hash))
+    }
+
     /// Return the shared revocation set.
     ///
     /// Callers that need to publish a new revocation record should call

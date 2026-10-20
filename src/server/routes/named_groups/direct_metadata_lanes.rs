@@ -124,6 +124,20 @@ pub(in crate::server) async fn run_direct_metadata_listener(
             msg = rx.recv() => msg,
         };
         let Some(msg) = msg else { break };
+        // ADR 0110 §4: an `EvictionHandoffV1` rides the same direct
+        // carrier; its receipt is verified off this loop.
+        if msg
+            .payload
+            .starts_with(x0x::groups::eviction::EVICTION_HANDOFF_PREFIX)
+        {
+            super::revocation_eviction::spawn_handoff_receipt(
+                &state,
+                msg.sender,
+                msg.verified,
+                msg.payload,
+            );
+            continue;
+        }
         let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
             continue; // not a named-group metadata event
         };

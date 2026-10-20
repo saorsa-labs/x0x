@@ -148,6 +148,11 @@ struct S4Inner {
     attempt_wait: HashMap<EvictionKey, WaitingState>,
     /// The last evaluation per open row.
     evaluations: HashMap<EvictionKey, StoredEvaluation>,
+    /// §4: rows whose first hand-off dispatch is due.
+    pending_dispatch: BTreeSet<EvictionKey>,
+    /// §4: admins whose current verified advert lacks
+    /// `eviction_handoff_v1`, per row (unsupported attempts).
+    unsupported_handoff: HashMap<EvictionKey, BTreeSet<[u8; 32]>>,
 }
 
 impl Default for S4Runtime {
@@ -208,6 +213,7 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
     loop {
         revocation_eviction_pass(&state).await;
         persist_obligations(&state).await;
+        dispatch_handoffs(&state).await;
         drive_exclusions(&state).await;
         tokio::select! {
             () = notify.notified() => {}
@@ -274,6 +280,10 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     inner.next_attempt.retain(|key, _| open.contains(key));
     inner.attempt_wait.retain(|key, _| open.contains(key));
     inner.not_durable.retain(|key| open.contains(key));
+    inner.pending_dispatch.retain(|key| open.contains(key));
+    inner
+        .unsupported_handoff
+        .retain(|key, _| open.contains(key));
     inner.evaluations.clear();
     let gate_open = host_commit_gate_open(state);
     let memory_only = !inner.sidecar.state.writable();
@@ -328,6 +338,31 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             }
         } else {
             inner.attempt_wait.remove(&key);
+        }
+        // §4: a hand-off to an unsupported designated admin waits for W
+        // with cause `designated_admin_unsupported`.
+        if let (Some(waiting), Some(designation)) =
+            (evaluation.waiting.as_mut(), evaluation.designation.as_ref())
+        {
+            let unsupported = inner
+                .unsupported_handoff
+                .get(&key)
+                .is_some_and(|ids| ids.contains(&designation.designated));
+            if unsupported && waiting.designated_detail == Some(s4::DesignatedWaitDetail::Rank) {
+                waiting.designated_detail =
+                    Some(s4::DesignatedWaitDetail::DesignatedAdminUnsupported);
+            }
+        }
+        // §2: each observing admin forwards the trigger evidence to every
+        // eligible admin once; the dispatch time is recorded before route
+        // resolution (T_obs).
+        let local_is_admin = active_admins.contains(&local) && key.target != local;
+        if local_is_admin && row.first_dispatch_unix_ms.is_none() {
+            if let Some(stored) = inner.store.get_mut(&key) {
+                stored.first_dispatch_unix_ms = Some(now_unix_ms);
+            }
+            inner.pending_dispatch.insert(key.clone());
+            inner.dirty = true;
         }
         let designation = evaluation.designation.clone();
         let changed_designation = designation.as_ref().is_some_and(|designation| {
@@ -982,6 +1017,215 @@ pub(in crate::server) async fn s4_no_eligible_admin_refusal(
         );
     }
     Some((status, Json(body)))
+}
+
+// ─── §4 EvictionHandoffV1 ──────────────────────────────────────────────────
+
+/// Send the first hand-off of every due row to every other eligible admin
+/// whose current verified advert sets `eviction_handoff_v1` (§2, §4). A
+/// known lacking advert is an unsupported attempt; an unknown advert sends
+/// nothing (ADR 0093: unknown support never implies support).
+async fn dispatch_handoffs(state: &Arc<AppState>) {
+    let due: Vec<(EvictionKey, ObligationRow)> = {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        let keys: Vec<EvictionKey> = std::mem::take(&mut inner.pending_dispatch)
+            .into_iter()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| inner.store.get(&key).cloned().map(|row| (key, row)))
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    let local = *state.agent.agent_id().as_bytes();
+    let capabilities = state.agent.capability_store();
+    for (key, row) in due {
+        let Some((recipients, handoff)) = build_handoff(state, &row).await else {
+            continue;
+        };
+        let payload = match s4::encode_handoff(&handoff) {
+            Ok(payload) if payload.len() <= x0x::dm::MAX_PAYLOAD_BYTES => payload,
+            // An oversized proof waits for the existing authorized evidence
+            // route (§4); the receiver's own observation still applies.
+            _ => continue,
+        };
+        let mut unsupported = BTreeSet::new();
+        for recipient in recipients
+            .into_iter()
+            .filter(|id| *id != local && *id != key.target)
+        {
+            let agent = x0x::identity::AgentId(recipient);
+            match capabilities.verified_registry_supports(
+                &agent,
+                x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
+            ) {
+                Some(true) => {
+                    let send_state = Arc::clone(state);
+                    let bytes = payload.clone();
+                    let _spawned = state.spawn_detached(async move {
+                        if let Err(error) = send_state.agent.send_direct(&agent, bytes).await {
+                            tracing::debug!(%error, "ADR 0110 S4: hand-off send failed");
+                        }
+                    });
+                }
+                Some(false) => {
+                    unsupported.insert(recipient);
+                }
+                None => {}
+            }
+        }
+        if !unsupported.is_empty() {
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .unsupported_handoff
+                .entry(key)
+                .or_default()
+                .extend(unsupported);
+        }
+    }
+}
+
+/// Build the hand-off body of one row and its recipients (the eligible
+/// admins of the current roster).
+async fn build_handoff(
+    state: &AppState,
+    row: &ObligationRow,
+) -> Option<(Vec<[u8; 32]>, s4::EvictionHandoffV1)> {
+    let groups = state.named_groups.read().await;
+    let info = groups
+        .values()
+        .find(|info| info.stable_group_id() == row.stable_group_id)?;
+    let recipients = active_admins_of(info);
+    let target_hex = hex::encode(row.target);
+    let expired_certificate = row.expired_certificates.keys().next().map(|digest| {
+        let certificate_bytes = info
+            .members_v2
+            .get(&target_hex)
+            .and_then(|member| member.certificate.as_ref())
+            .filter(|cert| x0x::groups::owner_cert::certificate_digest_hex(cert) == *digest)
+            .and_then(|cert| bincode::serialize(cert).ok());
+        s4::HandoffExpiredCertificate {
+            certificate_digest: digest.clone(),
+            certificate_bytes,
+        }
+    });
+    let handoff = s4::EvictionHandoffV1 {
+        stable_group_id: row.stable_group_id.clone(),
+        target: row.target,
+        observed_parent_head: info.state_hash.clone(),
+        revocation_records: row
+            .revocation_records
+            .values()
+            .take(s4::MAX_HANDOFF_REVOCATION_RECORDS)
+            .cloned()
+            .collect(),
+        self_leave_commit: row.self_leave_commits.iter().next().cloned(),
+        expired_certificate,
+        renewed_certificate: None,
+    };
+    handoff.has_evidence().then_some((recipients, handoff))
+}
+
+/// The direct-message listener hands every `X0XEVH1` payload here.
+pub(in crate::server) fn spawn_handoff_receipt(
+    state: &Arc<AppState>,
+    sender: x0x::identity::AgentId,
+    verified: bool,
+    payload: Vec<u8>,
+) {
+    if !verified {
+        // The carrier could not bind the claimed agent to its machine.
+        return;
+    }
+    let task_state = Arc::clone(state);
+    let _spawned = state.spawn_detached(async move {
+        receive_handoff(&task_state, sender, &payload).await;
+    });
+}
+
+/// Verify a hand-off independently (§4): the sender is an Active member
+/// of the group, this node is an Active admin, and every revocation record
+/// verifies through the §1 choke point. Only a verified trigger schedules
+/// work; the receipt time can only make T_obs earlier, never later.
+async fn receive_handoff(state: &Arc<AppState>, sender: x0x::identity::AgentId, payload: &[u8]) {
+    let handoff = match s4::decode_handoff(payload) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            tracing::debug!(?error, "ADR 0110 S4: hand-off refused at decode");
+            return;
+        }
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let sender_hex = hex::encode(sender.as_bytes());
+    let target_hex = hex::encode(handoff.target);
+    let target_cert = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups
+            .values()
+            .find(|info| info.stable_group_id() == handoff.stable_group_id && !info.withdrawn)
+        else {
+            return;
+        };
+        let local_admin = info
+            .active_members()
+            .any(|member| member.agent_id == local_hex && member.role.at_least(GroupRole::Admin));
+        let sender_member = info
+            .active_members()
+            .any(|member| member.agent_id == sender_hex);
+        if !local_admin || !sender_member {
+            return;
+        }
+        info.members_v2
+            .get(&target_hex)
+            .and_then(|member| member.certificate.clone())
+    };
+    let mut verified_any = false;
+    for bytes in &handoff.revocation_records {
+        let Ok(record) = bincode::deserialize::<x0x::revocation::RevocationRecord>(bytes) else {
+            continue;
+        };
+        let names_target = matches!(
+            &record.subject,
+            x0x::revocation::RevokedSubject::Agent(agent) if agent.as_bytes() == &handoff.target
+        );
+        if !names_target {
+            continue;
+        }
+        match state
+            .agent
+            .ingest_eviction_handoff_revocation(record, target_cert.as_ref())
+            .await
+        {
+            Ok(true) => verified_any = true,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!(%error, "ADR 0110 S4: hand-off revocation record refused");
+            }
+        }
+    }
+    // Self-leave and expiry evidence is re-derived from this node's own
+    // chain and clock (§1a: a hand-off never shortens another node's
+    // expiry budget); the pass below picks it up.
+    if verified_any || handoff.self_leave_commit.is_some() || handoff.expired_certificate.is_some()
+    {
+        revocation_eviction_pass(state).await;
+        let key = EvictionKey::new(handoff.stable_group_id, handoff.target);
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if let Some(row) = inner.store.get_mut(&key) {
+            let now_ms = now_unix_ms();
+            let earliest = row
+                .earliest_handoff_receipt_unix_ms
+                .map_or(now_ms, |seen| seen.min(now_ms));
+            if row.earliest_handoff_receipt_unix_ms != Some(earliest) {
+                row.earliest_handoff_receipt_unix_ms = Some(earliest);
+                inner.dirty = true;
+            }
+        }
+    }
 }
 
 // ─── §3 commit ─────────────────────────────────────────────────────────────

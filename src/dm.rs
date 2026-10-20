@@ -83,6 +83,18 @@ impl CapabilityRegistry {
     /// reject. Bit 3. Recorded in the accepted transient A10 decision.
     /// ADR 0093's bytes stay unchanged.
     pub const FILE_CONTROL_ACK_V1: u64 = 1 << 3;
+    /// ADR 0110 §4: understands typed `EvictionHandoffV1` (`X0XEVH1`) on
+    /// the direct-message carrier. Bit 4. Not in [`Self::current`] yet.
+    pub const EVICTION_HANDOFF_V1: u64 = 1 << 4;
+    /// ADR 0110 §4: understands signed `CryptoExclusionV1` (`X0XCE1`).
+    /// Bit 5. Not in [`Self::current`] yet.
+    pub const CRYPTO_EXCLUSION_V1: u64 = 1 << 5;
+    /// ADR 0110 §4a: understands signed `CertificateRebindV1` (`X0XCRB1`).
+    /// Bit 6. Not in [`Self::current`] yet.
+    pub const CERTIFICATE_REBIND_V1: u64 = 1 << 6;
+    /// ADR 0110 §4b(1): understands `OwnerRecoveryMandateV1` and
+    /// `OwnerRecoveryV1` (`X0XORC1`). Bit 7. Not in [`Self::current`] yet.
+    pub const OWNER_RECOVERY_V1: u64 = 1 << 7;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {

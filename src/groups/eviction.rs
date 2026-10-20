@@ -1497,6 +1497,101 @@ pub fn decode_evjournal(bytes: &[u8]) -> Result<EvJournalV1, SidecarDecodeError>
     decode_exact(body)
 }
 
+// ─── §4 EvictionHandoffV1 wire ─────────────────────────────────────────────
+
+/// Typed prefix of an `EvictionHandoffV1` direct message (§4).
+pub const EVICTION_HANDOFF_PREFIX: &[u8] = b"X0XEVH1";
+
+/// At most this many signed revocation records ride in one hand-off.
+pub const MAX_HANDOFF_REVOCATION_RECORDS: usize = 16;
+
+/// The target's expired committed certificate in a hand-off (§1a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffExpiredCertificate {
+    /// `owner_cert::certificate_digest_hex` of the committed certificate.
+    pub certificate_digest: String,
+    /// Its bytes (bincode `AgentCertificate`), when the sender holds them.
+    pub certificate_bytes: Option<Vec<u8>>,
+}
+
+/// The frozen v1 `EvictionHandoffV1` body (§4). It is advisory evidence:
+/// the receiver verifies every record and the current chain and authority
+/// on its own, deduplicates by the §1 key, and schedules only a verified
+/// trigger. It carries no key material. The direct-message carrier
+/// authenticates the sender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictionHandoffV1 {
+    /// Stable group ID.
+    pub stable_group_id: String,
+    /// Target agent ID.
+    pub target: [u8; 32],
+    /// The parent head the sender observed.
+    pub observed_parent_head: String,
+    /// Signed revocation records (bincode `RevocationRecord`).
+    pub revocation_records: Vec<Vec<u8>>,
+    /// The head of a verified self-leave on the sender's chain.
+    pub self_leave_commit: Option<String>,
+    /// The target's expired committed certificate.
+    pub expired_certificate: Option<HandoffExpiredCertificate>,
+    /// A renewed certificate for the target's seat, sent by the seat's own
+    /// agent after its self-rebind cutoff (§4a).
+    pub renewed_certificate: Option<Vec<u8>>,
+}
+
+impl EvictionHandoffV1 {
+    /// Whether the body carries at least one piece of evidence.
+    #[must_use]
+    pub fn has_evidence(&self) -> bool {
+        !self.revocation_records.is_empty()
+            || self.self_leave_commit.is_some()
+            || self.expired_certificate.is_some()
+            || self.renewed_certificate.is_some()
+    }
+}
+
+/// Why a hand-off was refused at decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffDecodeError {
+    /// Not an `X0XEVH1` payload.
+    WrongPrefix,
+    /// The body did not decode or was not consumed exactly.
+    Malformed,
+    /// The body carries no evidence or too many records.
+    OutOfBounds,
+}
+
+/// Encode a hand-off as a direct-message payload.
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub fn encode_handoff(handoff: &EvictionHandoffV1) -> Result<Vec<u8>, postcard::Error> {
+    let mut out = EVICTION_HANDOFF_PREFIX.to_vec();
+    out.extend(postcard::to_stdvec(handoff)?);
+    Ok(out)
+}
+
+/// Decode a hand-off payload with exact consumption.
+///
+/// # Errors
+///
+/// Returns why the payload is refused.
+pub fn decode_handoff(payload: &[u8]) -> Result<EvictionHandoffV1, HandoffDecodeError> {
+    let body = payload
+        .strip_prefix(EVICTION_HANDOFF_PREFIX)
+        .ok_or(HandoffDecodeError::WrongPrefix)?;
+    let (handoff, rest) = postcard::take_from_bytes::<EvictionHandoffV1>(body)
+        .map_err(|_| HandoffDecodeError::Malformed)?;
+    if !rest.is_empty() {
+        return Err(HandoffDecodeError::Malformed);
+    }
+    if !handoff.has_evidence() || handoff.revocation_records.len() > MAX_HANDOFF_REVOCATION_RECORDS
+    {
+        return Err(HandoffDecodeError::OutOfBounds);
+    }
+    Ok(handoff)
+}
+
 /// The S4 file states shown on status (ADR 0108 §5a generic states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2045,6 +2140,48 @@ mod tests {
         assert_eq!(
             evaluate_row(&row, &later, &timing).action,
             RowAction::CommitRemoval { rank: 0 }
+        );
+    }
+
+    #[test]
+    fn handoff_round_trips_with_exact_consumption() {
+        let handoff = EvictionHandoffV1 {
+            stable_group_id: "g".into(),
+            target: id(3),
+            observed_parent_head: "head".into(),
+            revocation_records: vec![vec![1, 2, 3]],
+            self_leave_commit: None,
+            expired_certificate: None,
+            renewed_certificate: None,
+        };
+        let bytes = encode_handoff(&handoff).expect("encode");
+        assert!(bytes.starts_with(EVICTION_HANDOFF_PREFIX));
+        assert_eq!(decode_handoff(&bytes), Ok(handoff.clone()));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_handoff(&trailing),
+            Err(HandoffDecodeError::Malformed)
+        );
+        assert_eq!(
+            decode_handoff(b"X0XCE1..."),
+            Err(HandoffDecodeError::WrongPrefix)
+        );
+        let empty = EvictionHandoffV1 {
+            revocation_records: Vec::new(),
+            ..handoff.clone()
+        };
+        assert_eq!(
+            decode_handoff(&encode_handoff(&empty).expect("encode")),
+            Err(HandoffDecodeError::OutOfBounds)
+        );
+        let crowded = EvictionHandoffV1 {
+            revocation_records: vec![vec![0]; MAX_HANDOFF_REVOCATION_RECORDS + 1],
+            ..handoff
+        };
+        assert_eq!(
+            decode_handoff(&encode_handoff(&crowded).expect("encode")),
+            Err(HandoffDecodeError::OutOfBounds)
         );
     }
 
