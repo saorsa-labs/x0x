@@ -183,6 +183,14 @@ impl S4Runtime {
     /// catch-up round. This tree has no explicit "catch-up round complete"
     /// signal, so the bounded restart sync wait from process start stands
     /// in for it (D73).
+    ///
+    /// The wait applies on every process start, including a first boot with
+    /// no saved `.evs`. ADR 0110 §2 (L191) requires a current catch-up round
+    /// before **every** seal, not only after a restart; L192 only adds that
+    /// a saved, expired budget does not waive it. A missing `.evs` does not
+    /// prove the local head is current: a node upgraded from a pre-S4
+    /// binary loads its saved groups with no `.evs`. Harness arms that
+    /// trigger within the wait therefore measure H from the wait's end.
     fn head_synced(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.boot_instant) >= self.timing.restart_sync_wait
     }

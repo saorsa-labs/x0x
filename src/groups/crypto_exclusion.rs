@@ -191,8 +191,8 @@ pub enum CryptoExclusionRefusal {
     HeadMismatch,
     /// The next revision is not exactly the parent revision + 1.
     RevisionMismatch,
-    /// The signer is not an Active admin on the parent roster, or is the
-    /// target.
+    /// The signer is not an Active admin on the parent roster, is the
+    /// target, or is revoked.
     ActorIneligible,
     /// The target is not Removed on the parent roster.
     TargetNotRemoved,
@@ -401,6 +401,12 @@ pub fn removal_proof_for(info: &GroupInfo, target_hex: &str) -> Option<[u8; 32]>
 /// and epoch, unchanged membership, the last-admin invariant and
 /// containment. `current_epoch` is this node's TreeKEM epoch.
 ///
+/// `is_actor_revoked` is this node's current agent-revocation set (§3
+/// enforcement point 4). The check is part of the acceptance rule, so no
+/// caller can accept a frame a revoked admin signed. A caller holds the
+/// group's membership lock and calls this immediately before it applies
+/// the commit (§3 L231).
+///
 /// The embedded commit must still pass the ordinary `validate_apply` and
 /// `finalize_applied_commit` checks (signature, parent-roster authority,
 /// prev-hash, revocation, fork); they recompute the post-state hash from
@@ -416,6 +422,7 @@ pub fn validate_against_parent(
     body: &CryptoExclusionBodyV1,
     parent: &GroupInfo,
     current_epoch: u64,
+    is_actor_revoked: impl Fn(&[u8; 32]) -> bool,
 ) -> Result<(), CryptoExclusionRefusal> {
     if body.stable_group_id != parent.stable_group_id()
         || body.commit.group_id != parent.stable_group_id()
@@ -439,6 +446,7 @@ pub fn validate_against_parent(
     let actor_hex = hex::encode(body.actor);
     let target_hex = hex::encode(body.target);
     if body.actor == body.target
+        || is_actor_revoked(&body.actor)
         || !parent.members_v2.get(&actor_hex).is_some_and(|member| {
             member.state == GroupMemberState::Active && member.role.at_least(GroupRole::Admin)
         })
@@ -571,7 +579,7 @@ mod tests {
         let decoded = decode_frame(&bytes).expect("decode");
         assert_eq!(decoded, frame);
         verify_signatures(&decoded).expect("signatures");
-        validate_against_parent(&decoded.body, &info, 3).expect("valid");
+        validate_against_parent(&decoded.body, &info, 3, |_| false).expect("valid");
     }
 
     #[test]
@@ -625,21 +633,21 @@ mod tests {
         let target = [9u8; 32];
         let info = treekem_group(&admin, target);
         let good = body_for(&info, &admin, target, 2);
-        assert!(validate_against_parent(&good, &info, 2).is_ok());
+        assert!(validate_against_parent(&good, &info, 2, |_| false).is_ok());
         assert_eq!(
-            validate_against_parent(&good, &info, 3),
+            validate_against_parent(&good, &info, 3, |_| false),
             Err(CryptoExclusionRefusal::EpochMismatch)
         );
         let mut stale = good.clone();
         stale.prior_head = "other".to_string();
         assert_eq!(
-            validate_against_parent(&stale, &info, 2),
+            validate_against_parent(&stale, &info, 2, |_| false),
             Err(CryptoExclusionRefusal::HeadMismatch)
         );
         let mut proof = good.clone();
         proof.removal_proof_hash = [0u8; 32];
         assert_eq!(
-            validate_against_parent(&proof, &info, 2),
+            validate_against_parent(&proof, &info, 2, |_| false),
             Err(CryptoExclusionRefusal::RemovalProofMismatch)
         );
         let mut leaf = good.clone();
@@ -651,13 +659,13 @@ mod tests {
             *leaf_key_package_hash = "other".to_string();
         }
         assert_eq!(
-            validate_against_parent(&leaf, &info, 2),
+            validate_against_parent(&leaf, &info, 2, |_| false),
             Err(CryptoExclusionRefusal::LeafMismatch)
         );
         let mut self_signed = good.clone();
         self_signed.actor = target;
         assert_eq!(
-            validate_against_parent(&self_signed, &info, 2),
+            validate_against_parent(&self_signed, &info, 2, |_| false),
             Err(CryptoExclusionRefusal::ActorIneligible)
         );
         let mut gss = good.clone();
@@ -665,15 +673,29 @@ mod tests {
             next_secret_epoch: 1,
         };
         assert_eq!(
-            validate_against_parent(&gss, &info, 2),
+            validate_against_parent(&gss, &info, 2, |_| false),
             Err(CryptoExclusionRefusal::CryptoPlaneUnsupported)
         );
         let mut quarantined = info.clone();
         quarantined.withdrawn = true;
         assert_eq!(
-            validate_against_parent(&good, &quarantined, 2),
+            validate_against_parent(&good, &quarantined, 2, |_| false),
             Err(CryptoExclusionRefusal::GroupContained)
         );
+    }
+
+    #[test]
+    fn revoked_actor_is_refused() {
+        let admin = keypair();
+        let target = [9u8; 32];
+        let info = treekem_group(&admin, target);
+        let good = body_for(&info, &admin, target, 2);
+        let actor = good.actor;
+        assert_eq!(
+            validate_against_parent(&good, &info, 2, |id| *id == actor),
+            Err(CryptoExclusionRefusal::ActorIneligible)
+        );
+        assert!(validate_against_parent(&good, &info, 2, |id| *id == target).is_ok());
     }
 
     #[test]
@@ -686,7 +708,7 @@ mod tests {
             member.state = GroupMemberState::Active;
         }
         assert_eq!(
-            validate_against_parent(&good, &info, 0),
+            validate_against_parent(&good, &info, 0, |_| false),
             Err(CryptoExclusionRefusal::TargetNotRemoved)
         );
     }

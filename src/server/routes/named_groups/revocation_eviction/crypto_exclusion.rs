@@ -670,26 +670,35 @@ fn spawn_send(state: &Arc<AppState>, key: EvictionKey, agent: AgentId, bytes: Ar
 
 // ─── Catch-up (§4) ─────────────────────────────────────────────────────────
 
+/// The per-exchange bound of one catch-up frame write.
+const CE_CATCHUP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Serve the frames this node holds for the group (any of `group_ids`) above
 /// `from_revision` to a catch-up requester, on the distinct gated carrier
 /// only. A requester without a current verified advert setting the bit
 /// gets nothing new: the frame never goes into a legacy-decoded catch-up
 /// page.
+///
+/// Each write uses ADR 0107's serving guard plus D60 (§3 L231): under the
+/// group's membership lock the requester must be an Active, unbanned,
+/// unrevoked member of a group that is not withdrawn or quarantined, with
+/// no machine or binding revocation, and the seam re-checks the same
+/// inputs immediately before the physical write.
 pub(in crate::server) async fn serve_catchup(
     state: &Arc<AppState>,
     requester: &AgentId,
     group_ids: &[String],
     from_revision: u64,
 ) {
-    let frames: Vec<Arc<Vec<u8>>> = {
+    let frames: Vec<(String, Arc<Vec<u8>>)> = {
         let inner = state.revocation_evictions.inner.lock().await;
         group_ids
             .iter()
-            .find_map(|id| inner.ce.log.get(id))
-            .map(|log| {
+            .find_map(|id| inner.ce.log.get(id).map(|log| (id, log)))
+            .map(|(id, log)| {
                 log.iter()
                     .filter(|entry| entry.next_revision > from_revision)
-                    .map(|entry| Arc::clone(&entry.bytes))
+                    .map(|entry| (id.clone(), Arc::clone(&entry.bytes)))
                     .collect()
             })
             .unwrap_or_default()
@@ -697,19 +706,74 @@ pub(in crate::server) async fn serve_catchup(
     if frames.is_empty() {
         return;
     }
-    let supported = state
-        .agent
-        .capability_store()
-        .verified_registry_supports(requester, x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1);
-    if supported != Some(true) || !write_allowed(state, requester).await {
-        return;
-    }
-    for bytes in frames {
-        if let Err(error) = state.agent.send_direct(requester, bytes.to_vec()).await {
-            tracing::debug!(%error, "ADR 0110 S4: crypto-only exclusion catch-up send failed");
-            return;
+    for (group_id, bytes) in frames {
+        let admission = catchup_admission(state, &group_id, requester);
+        let resolve_within = std::cmp::min(
+            x0x::dm::PINNED_RESOLUTION_WAIT,
+            CE_CATCHUP_EXCHANGE_TIMEOUT / 2,
+        );
+        let exchange = state.agent.send_direct_pinned_admitted(
+            requester,
+            bytes.as_slice(),
+            &admission,
+            resolve_within,
+        );
+        match tokio::time::timeout(CE_CATCHUP_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "ADR 0110 S4: crypto-only exclusion catch-up send refused or failed");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "ADR 0110 S4: crypto-only exclusion catch-up exchange deadline elapsed"
+                );
+                return;
+            }
         }
     }
+}
+
+/// The guarded-egress admission of one catch-up frame (§3 L231). The
+/// pre-phase holds the membership lock while it takes ADR 0107's serving
+/// check, the D60 machine/binding check and the capability gate; the seam
+/// re-takes the serving check synchronously before the write.
+fn catchup_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    requester: &AgentId,
+) -> x0x::dm::ArtifactAdmission {
+    use super::super as ng;
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let requester = *requester;
+    Arc::new(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        Box::pin(async move {
+            let requester_hex = hex::encode(requester.as_bytes());
+            let lock = ng::group_membership_lock_for_known_group(&state, &group_id).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = ng::join_artifact_serving_check(&state, &group_id, &requester_hex)
+                    .await
+                    .ok()?;
+                let supported = state.agent.capability_store().verified_registry_supports(
+                    &requester,
+                    x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+                );
+                if supported != Some(true) || !write_allowed(&state, &requester).await {
+                    return None;
+                }
+                evidence
+            };
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                ng::join_artifact_seam_refusal(&state, &group_id, &requester_hex, evidence)
+                    .is_none()
+            });
+            Some(seam)
+        })
+    })
 }
 
 // ─── Receive (§4 L249) ─────────────────────────────────────────────────────
@@ -725,8 +789,20 @@ pub(in crate::server) enum ReceiveOutcome {
     Behind,
     /// The frame was refused.
     Refused(ce::CryptoExclusionRefusal),
+    /// The frame was valid but this node could not persist the result (a
+    /// local fault). Nothing was installed; the frame is kept for retry and
+    /// is never counted as a sender defect.
+    LocalFailure,
     /// The group is unknown here, or the node is not a survivor.
     NotApplicable,
+}
+
+impl ReceiveOutcome {
+    /// The frame stays in the stash for a later retry: this node is behind
+    /// it, or a local fault stopped the install.
+    pub(in crate::server) fn is_retained(self) -> bool {
+        matches!(self, Self::Behind | Self::LocalFailure)
+    }
 }
 
 /// The direct-message listener hands every `X0XCE1` payload here.
@@ -742,7 +818,7 @@ pub(in crate::server) fn spawn_receipt(
     let task_state = Arc::clone(state);
     let _spawned = state.spawn_detached(async move {
         let outcome = receive(&task_state, sender, &payload).await;
-        if outcome == ReceiveOutcome::Behind {
+        if outcome.is_retained() {
             let mut inner = task_state.revocation_evictions.inner.lock().await;
             if inner.ce.stash.len() >= CE_STASH_CAP {
                 inner.ce.stash.remove(0);
@@ -756,7 +832,8 @@ pub(in crate::server) fn spawn_receipt(
     });
 }
 
-/// Retry every stashed frame; keep the ones still ahead of this node.
+/// Retry every stashed frame; keep the ones still ahead of this node or
+/// stopped by a local fault.
 pub(super) async fn retry_stash(state: &Arc<AppState>) {
     let stash = std::mem::take(&mut state.revocation_evictions.inner.lock().await.ce.stash);
     let now = Instant::now();
@@ -765,7 +842,10 @@ pub(super) async fn retry_stash(state: &Arc<AppState>) {
         if now.saturating_duration_since(frame.at) > CE_STASH_TTL {
             continue;
         }
-        if receive(state, frame.sender, &frame.bytes).await == ReceiveOutcome::Behind {
+        if receive(state, frame.sender, &frame.bytes)
+            .await
+            .is_retained()
+        {
             keep.push(frame);
         }
     }
@@ -837,7 +917,21 @@ pub(in crate::server) async fn receive(
     };
     let commit = body.commit.to_commit();
     let mut guard = tree.lock().await;
-    if let Err(refusal) = ce::validate_against_parent(&body, &info, guard.epoch()) {
+    // §3 L231: re-read the revocation set under the membership lock,
+    // immediately before the apply, so a revocation that landed since the
+    // early check above also refuses the frame.
+    let validated = {
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        if set.is_agent_revoked(&sender) {
+            Err(ce::CryptoExclusionRefusal::ActorIneligible)
+        } else {
+            ce::validate_against_parent(&body, &info, guard.epoch(), |actor| {
+                set.is_agent_revoked(&AgentId(*actor))
+            })
+        }
+    };
+    if let Err(refusal) = validated {
         drop(guard);
         if refusal == ce::CryptoExclusionRefusal::HeadMismatch {
             // A competing child of our head: let the shared apply hook
@@ -930,7 +1024,9 @@ pub(in crate::server) async fn receive(
         if !ng::self_leave_persist_left_epoch_installed(&error) {
             refuse(&mut guard, "crypto_exclusion_persist_failed");
             tracing::warn!(group_id = %LogHexId::group(&group_key), "ADR 0110 S4: crypto-only exclusion not installed: {error}");
-            return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::Malformed);
+            // A local storage fault, not a sender defect: keep the frame
+            // and try again.
+            return ReceiveOutcome::LocalFailure;
         }
     }
     drop(guard);
@@ -1051,6 +1147,18 @@ mod tests {
         assert_eq!(
             classify_saved_frame(&info, "p", "r"),
             SavedFrameState::Unknown
+        );
+    }
+
+    #[test]
+    fn local_failure_is_retained_and_is_not_a_refusal() {
+        assert!(ReceiveOutcome::LocalFailure.is_retained());
+        assert!(ReceiveOutcome::Behind.is_retained());
+        assert!(!ReceiveOutcome::Applied.is_retained());
+        assert!(!ReceiveOutcome::Duplicate.is_retained());
+        assert!(!ReceiveOutcome::NotApplicable.is_retained());
+        assert!(
+            !ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::ActorIneligible).is_retained()
         );
     }
 
