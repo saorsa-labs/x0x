@@ -11,7 +11,9 @@ macro_rules! upgrade_now_cli_regression_tests {
             fn upgrade_now_cli_accepts_only_an_explicit_apply_override() {
                 let matches = Cli::command()
                     .try_get_matches_from(["x0x", "upgrade", "--apply", "--now"])
-                    .unwrap_or_else(|error| panic!("David-approved apply override must parse: {error}"));
+                    .unwrap_or_else(|error| {
+                        panic!("David-approved apply override must parse: {error}")
+                    });
                 let upgrade = matches.subcommand_matches("upgrade").unwrap();
                 assert!(upgrade.get_flag("apply"));
                 assert!(upgrade.get_flag("now"));
@@ -26,8 +28,11 @@ macro_rules! upgrade_now_cli_regression_tests {
                     vec!["x0x", "upgrade", "--force", "--now"],
                 ] {
                     let error = Cli::command().try_get_matches_from(args).unwrap_err();
-                    assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument,
-                        "--now must be recognized but require the explicit --apply operation");
+                    assert_eq!(
+                        error.kind(),
+                        ErrorKind::MissingRequiredArgument,
+                        "--now must be recognized but require the explicit --apply operation"
+                    );
                 }
             }
 
@@ -65,8 +70,12 @@ macro_rules! upgrade_now_cli_regression_tests {
             #[test]
             fn upgrade_now_cli_registry_declares_the_optional_query_field() {
                 use x0x::api::{CliExpose, FieldLocation, RequestSpec, ENDPOINTS};
-                let endpoint = ENDPOINTS.iter().find(|endpoint|
-                    endpoint.path == "/upgrade/apply" && endpoint.method.to_string() == "POST").unwrap();
+                let endpoint = ENDPOINTS
+                    .iter()
+                    .find(|endpoint| {
+                        endpoint.path == "/upgrade/apply" && endpoint.method.to_string() == "POST"
+                    })
+                    .unwrap();
                 let RequestSpec::Fields(fields) = &endpoint.request else {
                     panic!("the approved now query must be registered, without a parity exception");
                 };
@@ -74,7 +83,10 @@ macro_rules! upgrade_now_cli_regression_tests {
                 assert_eq!(matches.len(), 1);
                 assert_eq!(matches[0].location, FieldLocation::Query);
                 assert!(!matches[0].required);
-                assert!(matches!(&matches[0].cli, CliExpose::Default | CliExpose::Token("--now")));
+                assert!(matches!(
+                    &matches[0].cli,
+                    CliExpose::Default | CliExpose::Token("--now")
+                ));
             }
         }
     };
