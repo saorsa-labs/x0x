@@ -177,6 +177,15 @@ jobs:
           name: test-results
           path: target/nextest/
 
+      # Cargo marks the x0x binary test=false. Select its real parser/registry
+      # controls explicitly after preserving the broad suite's results above.
+      - name: M2 CLI apply-now parser and registry controls
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        id: upgrade_now_cli
+        env:
+          X0X_ISOLATION_ROLE: m2-cli-now-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --all-features --bin x0x -- -E 'test(upgrade_now_cli_regressions)' --no-tests=fail
+
       # The workspace all-features lane exercises the debug seam. Also run the
       # committed H controls with the default production trust root in isolation.
       - name: M2 default-key and debug-signing controls
