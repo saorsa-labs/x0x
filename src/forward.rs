@@ -2055,7 +2055,21 @@ impl ForwardService {
         peer: &AgentId,
         target_port: u16,
     ) -> Result<PreparedSocksTunnel, PrepareSocksError> {
-        prepare_outbound_v2_for_socks(&self.agent, peer, "127.0.0.1", target_port, &self.live).await
+        // Same global outbound / per-peer caps as `add_forward`. The permit
+        // stays inside the returned tunnel until `bridge` finishes.
+        let Some(admission) = self.admit(*peer, false) else {
+            self.fwd_diag.record_over_cap();
+            return Err(PrepareSocksError::Failed);
+        };
+        prepare_outbound_v2_for_socks(
+            &self.agent,
+            peer,
+            "127.0.0.1",
+            target_port,
+            &self.live,
+            admission,
+        )
+        .await
     }
 }
 
@@ -2072,19 +2086,27 @@ pub enum PrepareSocksError {
 pub struct PreparedSocksTunnel {
     stream: PeerStream,
     guard: teardown::LiveStreamGuard,
+    /// Outbound admission. Held until [`Self::bridge`] returns.
+    admission: Admission,
 }
 
 impl PreparedSocksTunnel {
     /// Bridge `client` to the prepared peer stream until either side closes.
     pub async fn bridge(self, tcp: TcpStream) {
-        let PreparedSocksTunnel { stream, guard } = self;
+        let PreparedSocksTunnel {
+            stream,
+            guard,
+            admission,
+        } = self;
         if guard.token().is_cancelled() {
             let mut stream = stream;
             teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            drop(admission);
             return;
         }
         let (send, recv) = stream.into_split();
         bridge(tcp, send, recv, guard.token()).await;
+        drop(admission);
     }
 }
 
@@ -2096,22 +2118,95 @@ async fn prepare_outbound_v2_for_socks(
     target_host: &str,
     target_port: u16,
     live: &Arc<teardown::LiveStreams>,
+    admission: Admission,
 ) -> Result<PreparedSocksTunnel, PrepareSocksError> {
+    let ready =
+        match open_signed_forward_v2(agent, peer_agent, target_host, target_port, live).await {
+            Ok(ready) => ready,
+            Err(fail) => return Err(map_socks_v2_fail(fail, peer_agent)),
+        };
+    match response_connected(ready.response) {
+        Some(true) => Ok(PreparedSocksTunnel {
+            stream: ready.stream,
+            guard: ready.guard,
+            admission,
+        }),
+        Some(false) => {
+            // Peer denied — reset the QUIC halves; target got zero bytes.
+            let mut stream = ready.stream;
+            teardown::deny_pre_bridge(&mut stream, None);
+            drop(ready.guard);
+            Err(PrepareSocksError::Denied)
+        }
+        None => {
+            let mut stream = ready.stream;
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            Err(PrepareSocksError::Failed)
+        }
+    }
+}
+
+/// ForwardV2 stream that has a connect-response byte and is not yet bridged.
+struct V2Handshake {
+    stream: PeerStream,
+    guard: teardown::LiveStreamGuard,
+    response: u8,
+}
+
+/// Why [`open_signed_forward_v2`] stopped before a response byte.
+enum V2DriveFail {
+    /// `open_peer_stream` failed. No stream was opened.
+    Open(Box<NetworkError>),
+    /// A stream was opened. The caller resets or drops it.
+    AfterOpen(Box<V2AfterOpen>),
+}
+
+struct V2AfterOpen {
+    kind: V2AfterOpenKind,
+    stream: PeerStream,
+    guard: teardown::LiveStreamGuard,
+}
+
+enum V2AfterOpenKind {
+    Cancelled,
+    SigningGateRefused,
+    SignFailed(ForwardError),
+    WriteFailed,
+    ReadFailed(std::io::Error),
+}
+
+fn v2_after_open(
+    kind: V2AfterOpenKind,
+    stream: PeerStream,
+    guard: teardown::LiveStreamGuard,
+) -> V2DriveFail {
+    V2DriveFail::AfterOpen(Box::new(V2AfterOpen {
+        kind,
+        stream,
+        guard,
+    }))
+}
+
+/// Shared ForwardV2 open, sign, header write, and response read.
+///
+/// Does not bridge and does not reset the stream. [`try_outbound_v2`] and
+/// [`prepare_outbound_v2_for_socks`] map [`V2DriveFail`] on their own.
+async fn open_signed_forward_v2(
+    agent: &Arc<crate::Agent>,
+    peer_agent: &AgentId,
+    target_host: &str,
+    target_port: u16,
+    live: &Arc<teardown::LiveStreams>,
+) -> Result<V2Handshake, V2DriveFail> {
     let mut stream = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
         .await
     {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::info!(
-                target: "x0x::forward",
-                peer = %hex::encode(peer_agent.as_bytes()),
-                error = %e,
-                "socks prepare: could not open ForwardV2"
-            );
-            return Err(PrepareSocksError::Failed);
-        }
+        Ok(stream) => stream,
+        Err(error) => return Err(V2DriveFail::Open(Box::new(error))),
     };
+    // ADR-0074 §4: register before the header/response window so a trust
+    // loss while waiting still hits the ≤5 s bound.
     let guard = live.register(
         teardown::StreamGate::Outbound {
             peer_agent: *peer_agent,
@@ -2121,22 +2216,30 @@ async fn prepare_outbound_v2_for_socks(
     );
     agent.stream_reauth_signal().notify_one();
     if guard.token().is_cancelled() {
-        teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-        return Err(PrepareSocksError::Failed);
+        return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
     }
+
+    // ADR-0043: the V2 attestation is an agent-key signature. A
+    // quiesced/quarantined machine produces none. ADR-0074 §4 races the
+    // gate against reauth cancel so a stalled move-state lock cannot hold
+    // the stream past the 5 s bound.
     match wait_signing_gate_or_cancel(guard.token(), agent.signing_gate_allows(&agent.agent_id()))
         .await
     {
         Err(teardown::Cancelled) => {
-            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-            return Err(PrepareSocksError::Failed);
+            return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
         }
         Ok(false) => {
-            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-            return Err(PrepareSocksError::Failed);
+            return Err(v2_after_open(
+                V2AfterOpenKind::SigningGateRefused,
+                stream,
+                guard,
+            ));
         }
         Ok(true) => {}
     }
+    // The header carries the opener's public key so the verifier doesn't
+    // depend on announce propagation (#204 soak fix).
     let mut header = ForwardV2Header::new(
         target_host.to_string(),
         target_port,
@@ -2149,50 +2252,66 @@ async fn prepare_outbound_v2_for_socks(
             .to_vec(),
         stream.peer(),
     );
-    if header.sign(agent.identity().agent_keypair()).is_err() {
-        teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-        return Err(PrepareSocksError::Failed);
+    if let Err(error) = header.sign(agent.identity().agent_keypair()) {
+        return Err(v2_after_open(
+            V2AfterOpenKind::SignFailed(error),
+            stream,
+            guard,
+        ));
     }
     match teardown::wait_cancellable(guard.token(), write_header_v2(stream.send_mut(), &header))
         .await
     {
         Err(teardown::Cancelled) => {
-            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-            return Err(PrepareSocksError::Failed);
+            return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
         }
-        Ok(Err(_)) => {
-            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-            return Err(PrepareSocksError::Failed);
-        }
+        Ok(Err(_)) => return Err(v2_after_open(V2AfterOpenKind::WriteFailed, stream, guard)),
         Ok(Ok(())) => {}
     }
     let mut resp = [0u8; 1];
     match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
         Err(teardown::Cancelled) => {
-            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-            return Err(PrepareSocksError::Failed);
+            return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
         }
-        Ok(Err(_)) => {
-            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-            return Err(PrepareSocksError::Failed);
+        Ok(Err(error)) => {
+            return Err(v2_after_open(
+                V2AfterOpenKind::ReadFailed(std::io::Error::other(error)),
+                stream,
+                guard,
+            ));
         }
         Ok(Ok(())) => {}
     }
     if guard.token().is_cancelled() {
-        teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-        return Err(PrepareSocksError::Failed);
+        return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
     }
-    match response_connected(resp[0]) {
-        Some(true) => Ok(PreparedSocksTunnel { stream, guard }),
-        Some(false) => {
-            // Peer denied — reset the QUIC halves; target got zero bytes.
-            teardown::deny_pre_bridge(&mut stream, None);
-            drop(guard);
-            Err(PrepareSocksError::Denied)
+    Ok(V2Handshake {
+        stream,
+        guard,
+        response: resp[0],
+    })
+}
+
+/// SOCKS maps every open/sign/write/read/cancel failure to `Failed`.
+/// A `connected == false` byte is handled by the caller as `Denied`.
+fn map_socks_v2_fail(fail: V2DriveFail, peer_agent: &AgentId) -> PrepareSocksError {
+    match fail {
+        V2DriveFail::Open(error) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                error = %error,
+                "socks prepare: could not open ForwardV2"
+            );
+            PrepareSocksError::Failed
         }
-        None => {
+        V2DriveFail::AfterOpen(opened) => {
+            let V2AfterOpen {
+                mut stream, guard, ..
+            } = *opened;
             teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
-            Err(PrepareSocksError::Failed)
+            drop(guard);
+            PrepareSocksError::Failed
         }
     }
 }
@@ -2251,7 +2370,7 @@ enum OutboundOutcome {
 ///
 /// A stalled move-state lock must not keep the registered stream (and its
 /// TCP/permit) alive past reauth cancel — same pattern as the header write
-/// and response read that follow in [`try_outbound_v2`].
+/// and response read in [`open_signed_forward_v2`].
 pub(crate) async fn wait_signing_gate_or_cancel(
     cancel: &CancellationToken,
     gate: impl std::future::Future<Output = bool>,
@@ -2259,9 +2378,13 @@ pub(crate) async fn wait_signing_gate_or_cancel(
     teardown::wait_cancellable(cancel, gate).await
 }
 
-/// Attempt a `ForwardV2` outbound forward. Returns `PeerRejectedV2` only when
-/// the failure is specifically the peer not understanding the V2 protocol
-/// byte (the write to the opened stream fails immediately).
+/// Attempt a `ForwardV2` outbound forward.
+///
+/// Open, sign, write, and read go through [`open_signed_forward_v2`].
+/// [`map_outbound_v2_fail`] keeps the V1 fallback: open failure, a refused
+/// signing gate, a sign failure, and a header-write failure return the TCP.
+/// Cancel resets both halves and finishes. A response-read error closes the
+/// local TCP and does not fall back to V1.
 async fn try_outbound_v2(
     agent: &Arc<crate::Agent>,
     peer_agent: &AgentId,
@@ -2270,116 +2393,86 @@ async fn try_outbound_v2(
     tcp: TcpStream,
     live: &Arc<teardown::LiveStreams>,
 ) -> OutboundOutcome {
-    let mut stream = match agent
-        .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
+    match open_signed_forward_v2(agent, peer_agent, target_host, target_port, live).await {
+        Err(fail) => map_outbound_v2_fail(fail, tcp, peer_agent),
+        Ok(ready) => {
+            finish_outbound(ready.stream, [ready.response], peer_agent, tcp, ready.guard).await;
+            OutboundOutcome::Done
+        }
+    }
+}
+
+/// TCP-forward mapping. V1 fallback stays here: open, signing-gate refusal,
+/// sign failure, and header-write failure return the TCP. Cancel resets both
+/// halves and finishes. A response-read error closes the local TCP.
+fn map_outbound_v2_fail(
+    fail: V2DriveFail,
+    tcp: TcpStream,
+    peer_agent: &AgentId,
+) -> OutboundOutcome {
+    match fail {
+        V2DriveFail::Open(error) => {
             tracing::info!(
                 target: "x0x::forward",
                 peer = %hex::encode(peer_agent.as_bytes()),
-                error = %e,
+                error = %error,
                 "outbound forward v2: could not open peer stream"
             );
-            return OutboundOutcome::PeerRejectedV2(tcp);
+            OutboundOutcome::PeerRejectedV2(tcp)
         }
-    };
-    // ADR-0074 §4: register before the header/response window so a trust
-    // loss while waiting still hits the ≤5 s bound.
-    let guard = live.register(
-        teardown::StreamGate::Outbound {
-            peer_agent: *peer_agent,
-            machine: stream.peer(),
-        },
-        teardown::StreamAuthority::PeerTrust,
-    );
-    agent.stream_reauth_signal().notify_one();
-    if guard.token().is_cancelled() {
-        teardown::deny_pre_bridge(&mut stream, Some(&tcp));
-        return OutboundOutcome::Done;
+        V2DriveFail::AfterOpen(opened) => {
+            let V2AfterOpen {
+                kind,
+                mut stream,
+                guard,
+            } = *opened;
+            match kind {
+                V2AfterOpenKind::Cancelled => {
+                    teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+                    drop(guard);
+                    OutboundOutcome::Done
+                }
+                V2AfterOpenKind::SigningGateRefused => {
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer_agent.as_bytes()),
+                        "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
+                    );
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::PeerRejectedV2(tcp)
+                }
+                V2AfterOpenKind::SignFailed(error) => {
+                    tracing::warn!(
+                        target: "x0x::forward",
+                        error = %error,
+                        "outbound forward v2: failed to sign attestation — falling back to V1"
+                    );
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::PeerRejectedV2(tcp)
+                }
+                V2AfterOpenKind::WriteFailed => {
+                    // Header write failed: the peer likely reset after the
+                    // unknown V2 protocol byte. Return the TCP for V1.
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::PeerRejectedV2(tcp)
+                }
+                V2AfterOpenKind::ReadFailed(error) => {
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer_agent.as_bytes()),
+                        %error,
+                        "outbound forward v2: peer closed/reset before connect response — closing local TCP"
+                    );
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::Done
+                }
+            }
+        }
     }
-
-    // ADR-0043 AgentSigningGate (review r2 C2): the V2 attestation is an
-    // agent-key signature — a quiesced/quarantined machine produces none.
-    // Fail toward the V1 fallback exactly like a signing error would; the
-    // V1 path carries no agent signature (transport-machine context only,
-    // filtered receiver-side by B/P).
-    // ADR-0074 §4: race the gate against reauth cancel so a stalled
-    // move-state lock cannot hold sockets/permits past the 5 s bound.
-    match wait_signing_gate_or_cancel(guard.token(), agent.signing_gate_allows(&agent.agent_id()))
-        .await
-    {
-        Err(teardown::Cancelled) => {
-            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
-            return OutboundOutcome::Done;
-        }
-        Ok(false) => {
-            tracing::info!(
-                target: "x0x::forward",
-                peer = %hex::encode(peer_agent.as_bytes()),
-                "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
-            );
-            return OutboundOutcome::PeerRejectedV2(tcp);
-        }
-        Ok(true) => {}
-    }
-    // Build + sign the V2 header with the local agent keypair. The header
-    // carries the opener's public key so the verifier doesn't depend on
-    // announce propagation (#204 soak fix).
-    let mut header = ForwardV2Header::new(
-        target_host.to_string(),
-        target_port,
-        agent.agent_id(),
-        agent
-            .identity()
-            .agent_keypair()
-            .public_key()
-            .as_bytes()
-            .to_vec(),
-        stream.peer(),
-    );
-    if let Err(e) = header.sign(agent.identity().agent_keypair()) {
-        tracing::warn!(
-            target: "x0x::forward",
-            error = %e,
-            "outbound forward v2: failed to sign attestation — falling back to V1"
-        );
-        return OutboundOutcome::PeerRejectedV2(tcp);
-    }
-    // Write the V2 header. If this fails the peer likely reset the stream
-    // after reading the unknown V2 protocol byte (old software) — fall back.
-    // Cancel during the write resets both halves (ADR-0074 §4).
-    match teardown::wait_cancellable(guard.token(), write_header_v2(stream.send_mut(), &header))
-        .await
-    {
-        Err(teardown::Cancelled) => {
-            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
-            return OutboundOutcome::Done;
-        }
-        Ok(Err(_)) => return OutboundOutcome::PeerRejectedV2(tcp),
-        Ok(Ok(())) => {}
-    }
-    // Read the peer's connect-response byte.
-    let mut resp = [0u8; 1];
-    match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
-        Err(teardown::Cancelled) => {
-            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
-            return OutboundOutcome::Done;
-        }
-        Ok(Err(error)) => {
-            tracing::info!(
-                target: "x0x::forward",
-                peer = %hex::encode(peer_agent.as_bytes()),
-                %error,
-                "outbound forward v2: peer closed/reset before connect response — closing local TCP"
-            );
-            return OutboundOutcome::Done;
-        }
-        Ok(Ok(())) => {}
-    }
-    finish_outbound(stream, resp, peer_agent, tcp, guard).await;
-    OutboundOutcome::Done
 }
 
 /// Legacy `ForwardV1` outbound forward (no attestation). Used for pre-#204

@@ -18,8 +18,7 @@ mod service;
 pub use config::{SocksConfig, SocksConfigError};
 pub use forward_bridge::ForwardSocksConnector;
 pub use service::{
-    handle_stream_session, handle_tcp_client, SocksConnectError, SocksConnector, SocksService,
-    SocksTunnel,
+    handle_tcp_client, SocksConnectError, SocksConnector, SocksService, SocksTunnel,
 };
 
 #[cfg(test)]

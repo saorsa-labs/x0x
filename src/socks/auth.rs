@@ -9,6 +9,12 @@ use subtle::ConstantTimeEq;
 /// (#1482 loopback/auth behaviour stays untouched).
 #[must_use]
 pub(crate) fn token_eq(candidate: &str, api_token: &str) -> bool {
+    // An empty daemon token never matches, including an empty password.
+    // The candidate is not a reason to return early: a real token still
+    // runs the digest compare, so an empty password fails closed there.
+    if api_token.is_empty() {
+        return false;
+    }
     let ha = Sha256::digest(candidate.as_bytes());
     let hb = Sha256::digest(api_token.as_bytes());
     ha.ct_eq(&hb).into()

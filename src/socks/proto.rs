@@ -71,16 +71,17 @@ where
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
-    // Prefer USERNAME/PASSWORD. Offering only NO AUTH (or other methods)
-    // is refused with 0xFF before any CONNECT / stream opens (ADR-0074 Q7).
-    let offers_user_pass = methods.contains(&METHOD_USER_PASS);
-    let offers_only_no_auth = !offers_user_pass && methods.iter().all(|&m| m == METHOD_NO_AUTH);
-    if offers_user_pass {
+    // Prefer USERNAME/PASSWORD. Any offer that does not include it,
+    // including NO AUTH only, is refused with 0xFF before any CONNECT
+    // (ADR-0074 Q7).
+    if methods.contains(&METHOD_USER_PASS) {
         stream.write_all(&[VER, METHOD_USER_PASS]).await?;
         stream.flush().await?;
         Ok(true)
     } else {
-        let _ = offers_only_no_auth; // documented refusal path for NO AUTH
+        if methods.iter().all(|&method| method == METHOD_NO_AUTH) {
+            tracing::debug!(target: "x0x::socks", "refusing NO AUTH");
+        }
         stream.write_all(&[VER, METHOD_NO_ACCEPTABLE]).await?;
         stream.flush().await?;
         Ok(false)
@@ -103,8 +104,10 @@ where
     }
     let mut ulen = [0u8; 1];
     stream.read_exact(&mut ulen).await?;
-    let mut username = vec![0u8; ulen[0] as usize];
-    if !username.is_empty() {
+    // Username is ignored; the password is the API token.
+    let username_len = usize::from(ulen[0]);
+    if username_len > 0 {
+        let mut username = vec![0u8; username_len];
         stream.read_exact(&mut username).await?;
     }
     let mut plen = [0u8; 1];
@@ -113,7 +116,6 @@ where
     if !password.is_empty() {
         stream.read_exact(&mut password).await?;
     }
-    let _ = username; // username ignored; password is the API token
     let password =
         String::from_utf8(password).map_err(|_| ProtoError::Protocol("password not utf-8"))?;
     let ok = check_password(&password);
@@ -226,12 +228,9 @@ pub fn resolve_x0x_host(host: &str) -> Result<crate::identity::AgentId, u8> {
         return Err(REP_HOST_UNREACHABLE);
     }
     let label = host.trim_end_matches(".x0x");
+    // Empty (".x0x") and dotted names (studio.machine.me.x0x) are not a hex AgentId.
     if label.is_empty() || label.contains('.') {
-        // Multi-label names (studio.machine.me.x0x) need the names module.
-        // Until #1386 merges, only bare hex is resolvable here.
-        if label.contains('.') {
-            return Err(REP_HOST_UNREACHABLE);
-        }
+        return Err(REP_HOST_UNREACHABLE);
     }
     crate::exec::acl::parse_agent_id(label).map_err(|_| REP_HOST_UNREACHABLE)
 }

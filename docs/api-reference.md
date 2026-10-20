@@ -3142,7 +3142,26 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 | POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service |
 | GET | `/forwards` | `x0x forward list` | List registered forwards |
 | DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address |
-| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed counter + connect-ACL snapshot |
+| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `socks_denied`, and the connect-ACL snapshot |
+
+`socks_denied` counts SOCKS CONNECT replies of `0x02` (the peer connect gate denied the target). The field is `0` when the SOCKS listener is off.
+
+### Loopback SOCKS5 listener
+
+The `[socks]` table is daemon config. It is not a connect-ACL entry. Full rules are in [Daemon SOCKS listener](connect-acl.md#daemon-socks-listener).
+
+```toml
+[socks]
+listen = "127.0.0.1:1080"
+```
+
+`listen` must be a loopback address (`127.0.0.0/8` or `::1`). The config loader and the listener both refuse any other address. The listener stays off until `listen` is set.
+
+Clients must use RFC 1929 username/password. The password is the daemon API token. The username is ignored. `NO AUTH` is refused with `0xFF`. A wrong token, or an empty or absent token, is refused before any ForwardV2 stream opens.
+
+CONNECT is the only command. The target is `<64-hex-agent-id>.x0x:port`. A peer connect-gate denial is SOCKS `0x02`, and that target receives zero bytes.
+
+Owner connect-ACL entries may list an inclusive loopback port range. Pair and grant targets stay exact host:port. See [docs/connect-acl.md](connect-acl.md).
 
 ### `POST /forwards` request body
 

@@ -129,9 +129,15 @@ async fn finish_startup_error(
     agent: &x0x::Agent,
     shutdown_notify: &watch::Sender<bool>,
     forward_service: Option<&x0x::forward::ForwardService>,
+    socks: Option<&x0x::socks::SocksService>,
     background_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     primary: anyhow::Error,
 ) -> anyhow::Error {
+    // Release the SOCKS listen port before exec, forward, and agent teardown.
+    // A later startup error must not leave the accept loop holding the bind.
+    if let Some(socks) = socks {
+        socks.shutdown_and_wait().await;
+    }
     exec_service.shutdown().await;
     if let Some(forward_service) = forward_service {
         forward_service.shutdown();
@@ -993,6 +999,7 @@ pub async fn serve_with_options(
                     &agent,
                     &shutdown_notify,
                     None,
+                    None,
                     &mut startup_tasks,
                     primary,
                 )
@@ -1023,10 +1030,12 @@ pub async fn serve_with_options(
                 .await
                 {
                     Ok(svc) => {
-                        tracing::info!(
-                            listen = %config.socks.listen.expect("enabled ⇒ listen set"),
-                            "SOCKS5 listener started (ADR-0074 §3)"
-                        );
+                        if let Some(listen) = config.socks.listen {
+                            tracing::info!(
+                                listen = %listen,
+                                "SOCKS5 listener started (ADR-0074 §3)"
+                            );
+                        }
                         Some(svc)
                     }
                     Err(e) => {
@@ -1035,6 +1044,7 @@ pub async fn serve_with_options(
                             &agent,
                             &shutdown_notify,
                             forward_service.as_deref(),
+                            None,
                             &mut startup_tasks,
                             anyhow::anyhow!("failed to bind SOCKS5 listener: {e}"),
                         )
@@ -1075,6 +1085,7 @@ pub async fn serve_with_options(
                 &agent,
                 &shutdown_notify,
                 forward_service.as_deref(),
+                socks_service.as_ref(),
                 &mut startup_tasks,
                 primary,
             )
@@ -1101,6 +1112,7 @@ pub async fn serve_with_options(
                         &agent,
                         &shutdown_notify,
                         forward_service.as_deref(),
+                        socks_service.as_ref(),
                         &mut startup_tasks,
                         primary,
                     )
@@ -1337,6 +1349,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut startup_tasks,
             primary,
         )
@@ -1459,7 +1472,7 @@ pub async fn serve_with_options(
         std::sync::atomic::Ordering::Release,
     );
     let evidence_state = Arc::downgrade(&state);
-    agent.start_peer_evidence(
+    if let Err(error) = agent.start_peer_evidence(
         config.data_dir.clone(),
         config.evidence.clone(),
         Arc::new(move |peer| {
@@ -1475,7 +1488,19 @@ pub async fn serve_with_options(
                     && g.members_v2.get(&peer).is_some_and(|m| m.is_active())
             }))
         }),
-    )?;
+    ) {
+        let primary = anyhow::Error::new(error);
+        return Err(finish_startup_error(
+            &exec_service,
+            &agent,
+            &state.shutdown_notify,
+            state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
+            &mut bg_tasks,
+            primary,
+        )
+        .await);
+    }
 
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
@@ -1502,6 +1527,7 @@ pub async fn serve_with_options(
                 &agent,
                 &state.shutdown_notify,
                 state.forward_service.as_deref(),
+                state.socks_service.as_ref(),
                 &mut bg_tasks,
                 primary,
             )
@@ -1525,6 +1551,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1544,6 +1571,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1556,6 +1584,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1578,6 +1607,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1595,6 +1625,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -3006,7 +3037,9 @@ pub async fn serve_with_options(
             forwarder.shutdown();
         }
         if let Some(socks) = &state.socks_service {
-            socks.shutdown();
+            // Join the accept loop so the listen port is free before the
+            // process continues. Handshake sessions observe the same token.
+            socks.shutdown_and_wait().await;
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
         //    Agent's shutdown token and close its tracked-task registry NOW,
@@ -5758,6 +5791,93 @@ mod startup_update_check_tests {
             .await
             .expect("shutdown must complete despite the hung update check")
             .expect("clean shutdown");
+    }
+}
+
+#[cfg(test)]
+mod socks_startup_port_release_tests {
+    use std::time::Duration;
+
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+
+    /// A startup failure after the SOCKS listener binds must drop that
+    /// listener. The old path returned from `finish_startup_error` without
+    /// cancelling SOCKS, so the accept task kept the port.
+    #[tokio::test]
+    async fn startup_failure_after_socks_bind_releases_the_port() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("socks.startup-port-release".to_string()),
+            mdns_enabled: false,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        config.socks.listen = Some(
+            format!("127.0.0.1:{port}")
+                .parse()
+                .expect("loopback socks address"),
+        );
+
+        let profile_path = crate::profile::SelfProfile::path_in(&config.data_dir);
+        std::fs::create_dir_all(&config.data_dir).expect("data dir");
+        // `{}` parses as an empty profile. Non-JSON is what `load_from` rejects.
+        std::fs::write(&profile_path, b"not-json").expect("corrupt self-profile");
+
+        let acl = "\
+[connect]
+enabled = true
+
+[[connect.allow]]
+agent_id = \"abababababababababababababababababababababababababababababababab\"
+machine_id = \"abababababababababababababababababababababababababababababababab\"
+targets = [\"127.0.0.1:22\"]
+";
+        let connect_policy =
+            crate::connect::parse_connect_policy(std::path::Path::new("connect-acl.toml"), 0, acl)
+                .expect("minimal loopback connect acl");
+        let options = ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: false,
+            connect_policy,
+            ..ServeOptions::default()
+        };
+
+        let started =
+            tokio::time::timeout(Duration::from_secs(45), serve_with_options(config, options))
+                .await
+                .expect("startup failure must not hang");
+        let err = match started {
+            Err(err) => err,
+            Ok(_handle) => panic!("corrupt self-profile must fail startup"),
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("self-profile"),
+            "startup must fail at self-profile load after SOCKS bind, got: {chain}"
+        );
+
+        let rebound = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => return listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("SOCKS port must be free after startup failure");
+        drop(rebound);
     }
 }
 

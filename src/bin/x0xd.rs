@@ -1057,4 +1057,21 @@ mod tests {
             "a config without the new rules still loads"
         );
     }
+
+    /// ADR-0074 §3: a non-loopback `[socks] listen` refuses config load.
+    #[tokio::test]
+    async fn load_config_refuses_non_loopback_socks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().expect("utf-8 path").to_owned();
+        std::fs::write(&path, "[socks]\nlisten = \"0.0.0.0:1080\"\n").expect("write config");
+        let error = super::load_config(&path_str)
+            .await
+            .expect_err("non-loopback socks listen must refuse startup");
+        let message = format!("{error:#}").to_ascii_lowercase();
+        assert!(
+            message.contains("loopback"),
+            "refused for the wrong reason: {message}"
+        );
+    }
 }
