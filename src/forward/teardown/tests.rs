@@ -382,11 +382,11 @@ async fn trust_downgrade_closes_within_5s() {
     assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
 }
 
-/// WHY (Codex P2): the public `ContactStore::get_mut_notify` returns a
-/// Drop-notifying guard; setting `Blocked` and dropping the guard (no save)
-/// must wake reauth and close the stream within EVENT_BOUND (sweep off).
+/// WHY (Codex P2 / RC5): public `ContactStore::get_mut` must wake reauth;
+/// setting `Blocked` via `get_mut` (no save) must close the stream within
+/// EVENT_BOUND (sweep off).
 #[tokio::test(start_paused = true)]
-async fn get_mut_notify_edit_closes_within_5s() {
+async fn get_mut_edit_closes_within_5s() {
     let w = World::new().await;
     w.contacts
         .write()
@@ -398,12 +398,7 @@ async fn get_mut_notify_edit_closes_within_5s() {
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(!stream.token().is_cancelled());
 
-    w.contacts
-        .write()
-        .await
-        .get_mut_notify(&w.b1)
-        .unwrap()
-        .trust_level = TrustLevel::Blocked;
+    w.contacts.write().await.get_mut(&w.b1).unwrap().trust_level = TrustLevel::Blocked;
     closes_within(&stream, EVENT_BOUND).await;
 }
 
@@ -1396,6 +1391,104 @@ async fn kick_during_inflight_pass_deadline_from_event() {
     assert!(
         target.token().is_cancelled(),
         "mid-pass revocation must tear down within 5 s of that event (elapsed {:?})",
+        event_at.elapsed()
+    );
+    assert!(
+        event_at.elapsed() <= EVENT_BOUND,
+        "deadline-from-event exceeded EVENT_BOUND ({:?})",
+        event_at.elapsed()
+    );
+
+    let _ = release_tx.send(());
+    let _ = holder.await;
+}
+
+/// WHY (Codex P2 / RC5): cooldown must not push past event deadline.
+/// An event ~100 ms into a long (nearly [`REAUTH_PASS_BUDGET`]) pass leaves
+/// `pass_remainder + REAUTH_MIN_SPACING` > 5 s from the kick. Spacing must
+/// clip to the pending event deadline so teardown still lands in
+/// [`EVENT_BOUND`], not ~5.15 s.
+///
+/// The first kick often completes without blocking on the discovery-cache
+/// write lock (same as [`kick_during_inflight_pass_deadline_from_event`]'s
+/// first pass). The long stall is the *second* pass, which does block —
+/// matching that sibling's observed gate trace.
+#[tokio::test(start_paused = true)]
+async fn kick_late_in_long_pass_spacing_respects_event_deadline() {
+    let w = World::new().await;
+    w.contacts
+        .write()
+        .await
+        .set_trust(&w.b1, TrustLevel::Trusted);
+    w.set_policy_silently(w.acl(&[(w.b1, w.mb)], false, true));
+    let (decoy, _) = w.admit(w.inbound(w.b1, w.mb)).await;
+    let grant = w
+        .grant(0x63, Grantee::Agent(w.c1), w.base_secs + 3_600)
+        .await;
+
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let (release_tx, held_rx, holder) = hold_write(Arc::clone(&w.cache));
+    held_rx
+        .await
+        .expect("discovery-cache write holder must start");
+
+    // Priming kick: may complete immediately. Drain spacing so the next
+    // kick starts a fresh pass against the held cache write.
+    w.kick.notify_waiters();
+    tokio::task::yield_now().await;
+    tokio::time::advance(REAUTH_MIN_SPACING).await;
+    tokio::task::yield_now().await;
+
+    // Long stalled pass (cache write held).
+    let pass_at = Instant::now();
+    w.kick.notify_waiters();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(!decoy.token().is_cancelled());
+
+    let event_at = Instant::now();
+    let target = w.live.register(
+        w.inbound(w.c1, w.mc),
+        StreamAuthority::Grant {
+            grant_ids: vec![hex::encode(grant.grant_id)],
+        },
+    );
+    w.revoke_grant(&grant).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !decoy.token().is_cancelled() && !target.token().is_cancelled(),
+        "both streams must still be live while the stalled pass awaits its deadline"
+    );
+
+    let pass_remain = REAUTH_PASS_BUDGET.saturating_sub(pass_at.elapsed());
+    assert!(
+        pass_remain + REAUTH_MIN_SPACING > EVENT_BOUND.saturating_sub(event_at.elapsed()),
+        "scenario must be the Codex case where full spacing would overshoot"
+    );
+    tokio::time::advance(pass_remain).await;
+    tokio::task::yield_now().await;
+    assert!(
+        decoy.token().is_cancelled(),
+        "stalled pass must fail-close the decoy at its own deadline"
+    );
+
+    // Full 250 ms spacing would still be running; only the event remainder
+    // is left. Clipped cooldown must start the follow-up before EVENT_BOUND.
+    if !target.token().is_cancelled() {
+        let remain = EVENT_BOUND.saturating_sub(event_at.elapsed());
+        assert!(
+            !remain.is_zero(),
+            "event budget must remain after the stalled pass ends"
+        );
+        tokio::time::advance(remain).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        target.token().is_cancelled(),
+        "late mid-pass revoke must tear down within 5 s of that event (elapsed {:?}), not pass_remainder+spacing",
         event_at.elapsed()
     );
     assert!(

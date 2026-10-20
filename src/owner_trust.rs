@@ -545,7 +545,7 @@ impl OwnerTrust {
     /// scope; none is held across another lock or the enrollment check.
     ///
     /// Admission may block briefly on a ready evidence store. Reauth must
-    /// call [`Self::is_owner_trusted_with`] with `nonblocking_evidence`.
+    /// call `is_owner_trusted_with` with `nonblocking_evidence`.
     pub async fn is_owner_trusted(
         &self,
         discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
@@ -561,7 +561,7 @@ impl OwnerTrust {
     /// fallback uses [`EvidenceRuntime::try_usable`] so a contended store
     /// reads as no evidence (fail closed). Reauth needs this: ADR-0074 §4's
     /// five-second bound cannot interrupt a synchronous `usable()` wait.
-    pub async fn is_owner_trusted_with(
+    pub(crate) async fn is_owner_trusted_with(
         &self,
         discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
         revocation_set: &RwLock<RevocationSet>,
@@ -650,7 +650,7 @@ impl OwnerTrust {
 
     /// [`Self::evaluate_pair`]; with `nonblocking_evidence` owner-trust's
     /// evidence fallback never blocks (ADR-0074 §4 reauth).
-    pub async fn evaluate_pair_with(
+    pub(crate) async fn evaluate_pair_with(
         &self,
         contact_store: &RwLock<ContactStore>,
         discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,

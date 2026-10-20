@@ -970,7 +970,7 @@ fn unix_now_secs() -> u64 {
 /// daemon's own agent (ADR-0070 §2). The union over every matching grant.
 ///
 /// Public fields only — Connect grant ids used for ADR-0074 live-stream
-/// labels live on the crate-private [`GrantAccessEval`] wrapper so
+/// labels live on the crate-private `GrantAccessEval` wrapper so
 /// downstream `GrantAccess { ..Default::default() }` literals keep compiling.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GrantAccess {

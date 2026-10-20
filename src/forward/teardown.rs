@@ -13,16 +13,17 @@
 //!
 //! ## When a pass runs
 //!
-//! **On an event** (bound ≤5 s from the triggering event; a pass may start
-//! up to [`REAUTH_MIN_SPACING`] later, and its deadline is still
-//! `event_at + `[`REAUTH_PASS_BUDGET`]). The agent's re-check signal is
-//! woken by every change to a gate input:
+//! **On an event** (bound ≤5 s from the triggering event). After a pass,
+//! the loop waits up to [`REAUTH_MIN_SPACING`], clipped so a pending event's
+//! next pass still starts by `event_at + `[`REAUTH_PASS_BUDGET`]. Each pass's
+//! deadline is still `event_at + `[`REAUTH_PASS_BUDGET`]. The agent's
+//! re-check signal is woken by every change to a gate input:
 //!
 //! | Trigger | Where the event is raised |
 //! |---|---|
 //! | revocation (agent, machine, binding, grant; ADR-0018/0070 v3) | `RevocationSet` on every change |
 //! | ADR-0043 move (retired binding, placement record) | `RevocationSet` (tombstones), `MoveState::cache_placement` |
-//! | contact trust change, `Blocked`, machine pin | `ContactStore` on every persisted change, and on dropping a [`crate::contacts::ContactMut`] |
+//! | contact trust change, `Blocked`, machine pin | `ContactStore` on every persisted change, and on every [`crate::contacts::ContactStore::get_mut`] (wakes reauth) |
 //! | connect-ACL reload | [`crate::Agent::set_connect_policy`] |
 //! | owner enrollment added or removed | `OwnerSyncStore::enroll` / `unenroll` |
 //! | peer machine binding or certificate changed | the announcement ingest (`upsert_discovered_agent`) and the announce-blob certificate patch |
@@ -575,7 +576,9 @@ pub(crate) async fn reauth_pass(
 /// Each pass's deadline is measured from the earliest pending trigger
 /// (`event_at + `[`REAUTH_PASS_BUDGET`]), not from pass start. Kicks that
 /// arrive during an in-flight pass or the [`REAUTH_MIN_SPACING`] cooldown
-/// coalesce into the earliest pending `event_at` for the next pass.
+/// coalesce into the earliest pending `event_at` for the next pass. The
+/// post-pass cooldown is itself bounded by that pending deadline so spacing
+/// cannot push the follow-up past the five-second event bound.
 pub(crate) fn spawn_reauth_loop(
     live: Arc<LiveStreams>,
     ctx: ReauthCtx,
@@ -632,7 +635,15 @@ pub(crate) fn spawn_reauth_loop(
                 }
             }
             {
-                let spacing = tokio::time::sleep(REAUTH_MIN_SPACING);
+                // Bound cooldown by the earliest pending event deadline so
+                // pass_remainder + REAUTH_MIN_SPACING cannot exceed the
+                // ADR-0074 5 s bound measured from that event.
+                let now = tokio::time::Instant::now();
+                let spacing_deadline = pending_event
+                    .map(|event_at| event_at + REAUTH_PASS_BUDGET)
+                    .unwrap_or_else(|| now + REAUTH_MIN_SPACING);
+                let spacing_until = spacing_deadline.min(now + REAUTH_MIN_SPACING);
+                let spacing = tokio::time::sleep_until(spacing_until);
                 tokio::pin!(spacing);
                 loop {
                     tokio::select! {
