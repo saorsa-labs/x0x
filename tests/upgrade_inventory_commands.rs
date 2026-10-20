@@ -31,6 +31,25 @@ macro_rules! inventory_commands_regression_tests {
             }
 
             #[test]
+            fn inventory_commands_refuse_exec_outside_supported_service_section() {
+                assert!(parse_source("owned.service", b"[Unit]\nDescription=ordinary metadata\n", Path::new(INSTALL)).unwrap().is_empty());
+                let service = format!("[Unit]\nDescription=ordinary metadata\n[Service]\nExecStart={INSTALL} --name owned\n");
+                let commands = parse_source("owned.service", service.as_bytes(), Path::new(INSTALL)).unwrap();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].command.argv, argv(&[INSTALL, "--name", "owned"]));
+                // These four Socket lifecycle keys are actual v255 Exec
+                // commands. An unsupported section cannot imply their absence.
+                for property in ["ExecStartPre", "ExecStartPost", "ExecStopPre", "ExecStopPost"] {
+                    for name in ["owned.socket", "10-lifecycle.conf"] {
+                        for value in [INSTALL, "/owned/bin/helper", ""] {
+                            let source = format!("[Socket]\n{property}={value}\n");
+                            assert!(parse_source(name, source.as_bytes(), Path::new(INSTALL)).is_err(), "{name}: {source:?}");
+                        }
+                    }
+                }
+            }
+
+            #[test]
             fn inventory_commands_retain_exec_after_comment_line_boundaries() {
                 for separator in ["\n", "\r\n", "\r", "\n\r"] {
                     for comment in ["# owned comment", "; owned comment"] {
