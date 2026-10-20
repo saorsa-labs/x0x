@@ -670,13 +670,11 @@ fn split_cli_is_untouched_and_signed_skill_is_only_staged() {
         panic!("daemon-only managed transaction must swap");
     };
     assert!(receipt.cli_untouched);
-    assert!(
-        receipt
-            .cli_untouched_reason
-            .as_deref()
-            .unwrap()
-            .contains("package-managed")
-    );
+    assert!(receipt
+        .cli_untouched_reason
+        .as_deref()
+        .unwrap()
+        .contains("package-managed"));
     assert!(receipt.cli_backup.is_none());
     assert_eq!(
         std::fs::read(external_cli).unwrap(),
@@ -1201,8 +1199,8 @@ fn installed_hash_is_rechecked_after_preparation_without_overwriting_unrelated_b
 
 #[test]
 fn cancellation_after_first_rename_restores_the_pair_before_returning() {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     let fixture = PairFixture::new();
     let request = fixture.request(false);

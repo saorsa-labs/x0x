@@ -619,14 +619,15 @@ fn verify_inputs(request: &PairRequest) -> Result<(), PairError> {
             ));
         }
     }
-    if let Some(skill) = &request.skill
-        && digest_file(&skill.staged, MAX_SKILL_BYTES).map_err(invalid_plan)?
+    if let Some(skill) = &request.skill {
+        if digest_file(&skill.staged, MAX_SKILL_BYTES).map_err(invalid_plan)?
             != skill.candidate_sha256
-    {
-        return Err(refused(
-            PairRefusal::CandidateChanged,
-            "staged SKILL does not match the signed artifact hash",
-        ));
+        {
+            return Err(refused(
+                PairRefusal::CandidateChanged,
+                "staged SKILL does not match the signed artifact hash",
+            ));
+        }
     }
     Ok(())
 }
@@ -1062,10 +1063,15 @@ fn persist(record: &PairRecord, options: &RunOptions) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     #[cfg(test)]
-    if let Some((phase, step)) = options.record_failure
-        && phase == record.phase
-    {
-        return journal::write_auxiliary_record_with_failure(&path, record, validate_record, step);
+    if let Some((phase, step)) = options.record_failure {
+        if phase == record.phase {
+            return journal::write_auxiliary_record_with_failure(
+                &path,
+                record,
+                validate_record,
+                step,
+            );
+        }
     }
     let _ = options;
     journal::write_auxiliary_record(&path, record, validate_record)
