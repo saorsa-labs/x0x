@@ -5488,15 +5488,14 @@ mod tests {
             let _ = saw_header_tx.send(());
             let mut buf = [0u8; 1];
             // Timeout is failure: the opener must reset, not leave us blocked.
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                stream.recv_mut().read(&mut buf),
+            matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    stream.recv_mut().read(&mut buf),
+                )
+                .await,
+                Ok(Ok(0)) | Ok(Err(_))
             )
-            .await
-            {
-                Ok(Ok(0)) | Ok(Err(_)) => true,
-                _ => false,
-            }
         });
 
         let probe = TcpListener::bind("127.0.0.1:0").await.expect("socks probe");
