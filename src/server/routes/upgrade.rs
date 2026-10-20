@@ -734,6 +734,23 @@ impl BackgroundSubmit {
         Ok(SubmitOutcome::Accepted)
     }
 
+    // The fallback used to skip both broadcast and apply for a failed
+    // version. Keep that policy while sharing the bounded failure slot.
+    fn in_retry_backoff(&self, verified: &VerifiedRelease) -> bool {
+        let Ok(slot) = self.slot.lock() else {
+            return false;
+        };
+        !slot.pending
+            && slot.active.is_none()
+            && slot.latest.as_ref().is_some_and(|prior| {
+                prior.manifest.version == verified.manifest.version
+                    && prior.manifest_json == verified.manifest_json
+            })
+            && slot
+                .failed_at
+                .is_some_and(|failed| failed.elapsed() < Duration::from_secs(30 * 60))
+    }
+
     fn close(&self) {
         let mut slot = self
             .slot
@@ -896,6 +913,9 @@ async fn apply_background_release(
         permit.check()?;
         // A retry remains part of this release's owned future. Never detach a
         // timer after the listener has superseded its release or stopped.
+        #[cfg(unix)]
+        let install = runtime.staging.install.clone();
+        #[cfg(not(unix))]
         let install = x0x::upgrade::apply::current_binary_path()?.canonicalize()
             .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))?;
         let Some(_retry_owner) = x0x::upgrade::probe_retry::claim_retry(install, verified.manifest.version.clone()) else { return result; };
@@ -1145,6 +1165,12 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
                 continue;
             }
         };
+        if submit.in_retry_backoff(&verified) {
+            if let Err(error) = submit.submit(verified) {
+                tracing::warn!(%error, "Fallback release backoff could not be observed");
+            }
+            continue;
+        }
         self_published
             .lock()
             .await
