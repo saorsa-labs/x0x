@@ -765,9 +765,10 @@ async fn pin_mismatch_is_refused_and_the_pin_is_kept() {
     assert_eq!(repinned.agent_id, Some(AgentId([2; 32])));
 }
 
-/// WHY: a bare name keeps the kind inferred at first pin (ADR 0074).
-/// Dropping machine M and introducing agent A with the same label must
-/// refuse with `pin_mismatch` and must not mint `agent:studio.me`.
+/// WHY: ADR 0074 §1. When the pinned kind is gone and only the other kind
+/// remains, the bare name is `pin_mismatch` and must not mint a second pin.
+/// A pin does not win while both kinds are still present; that case is
+/// [`bare_name_is_ambiguous_kind_despite_an_existing_pin`].
 #[tokio::test]
 async fn bare_name_keeps_inferred_kind_across_a_kind_change() {
     let store = NameStore::in_memory();
@@ -783,23 +784,11 @@ async fn bare_name_keeps_inferred_kind_across_a_kind_change() {
     assert_eq!(first.kind, NameKind::Machine);
     assert!(first.newly_pinned);
 
-    // The agent does not reopen kind selection while the machine pin stands.
-    let both = Candidates {
-        agents: vec![verified_agent(7, "studio")],
-        machines: vec![verified_machine(3, "studio")],
-    };
-    let still = resolve_with(&store, &name("studio.me"), owner, &both, NOW + 1)
-        .await
-        .unwrap();
-    assert_eq!(still.kind, NameKind::Machine);
-    assert_eq!(still.machine_id, Some(MachineId([3; 32])));
-    assert!(!still.newly_pinned);
-
     let agent = Candidates {
         agents: vec![verified_agent(7, "studio")],
         machines: vec![],
     };
-    let err = resolve_with(&store, &name("studio.me"), owner, &agent, NOW + 2)
+    let err = resolve_with(&store, &name("studio.me"), owner, &agent, NOW + 1)
         .await
         .unwrap_err();
     assert_eq!(
@@ -816,6 +805,84 @@ async fn bare_name_keeps_inferred_kind_across_a_kind_change() {
     );
     let pin = store.get_pin("machine:studio.me").await.unwrap().unwrap();
     assert_eq!((pin.id, pin.owner), ([3; 32], owner));
+}
+
+/// WHY: ADR 0074 §1. A bare name that matches a verified agent and a
+/// verified machine is `AmbiguousKind` even when a pin already exists.
+#[tokio::test]
+async fn bare_name_is_ambiguous_kind_despite_an_existing_pin() {
+    let store = NameStore::in_memory();
+    let owner = UserId([5; 32]);
+    let machine = Candidates {
+        agents: vec![],
+        machines: vec![verified_machine(3, "studio")],
+    };
+    let first = resolve_with(&store, &name("studio.me"), owner, &machine, NOW)
+        .await
+        .unwrap();
+    assert_eq!(first.name, "machine:studio.me");
+    assert!(first.newly_pinned);
+
+    let both = Candidates {
+        agents: vec![verified_agent(7, "studio")],
+        machines: vec![verified_machine(3, "studio")],
+    };
+    let err = resolve_with(&store, &name("studio.me"), owner, &both, NOW + 1)
+        .await
+        .unwrap_err();
+    assert_eq!(err, NameError::AmbiguousKind("studio.me".into()));
+    assert!(
+        store.get_pin("agent:studio.me").await.unwrap().is_none(),
+        "ambiguity must not write the other kind"
+    );
+    let pin = store.get_pin("machine:studio.me").await.unwrap().unwrap();
+    assert_eq!((pin.id, pin.owner), ([3; 32], owner));
+
+    let prefixed = resolve_with(&store, &name("machine:studio.me"), owner, &both, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(prefixed.kind, NameKind::Machine);
+    assert!(!prefixed.newly_pinned);
+}
+
+/// WHY: two bare resolves that see different single-kind snapshots must
+/// not both insert. The kind check and the insert share one commit.
+#[tokio::test]
+async fn concurrent_bare_resolves_do_not_pin_both_kinds() {
+    let store = std::sync::Arc::new(NameStore::in_memory());
+    let owner = UserId([5; 32]);
+    let machine = Candidates {
+        agents: vec![],
+        machines: vec![verified_machine(3, "studio")],
+    };
+    let agent = Candidates {
+        agents: vec![verified_agent(7, "studio")],
+        machines: vec![],
+    };
+    let left_store = std::sync::Arc::clone(&store);
+    let left = tokio::spawn(async move {
+        resolve_with(&left_store, &name("studio.me"), owner, &machine, NOW).await
+    });
+    let right_store = std::sync::Arc::clone(&store);
+    let right = tokio::spawn(async move {
+        resolve_with(&right_store, &name("studio.me"), owner, &agent, NOW).await
+    });
+    let left = left.await.unwrap();
+    let right = right.await.unwrap();
+    let results = [left, right];
+    let pinned = results.iter().filter(|result| result.is_ok()).count();
+    let mismatched = results
+        .iter()
+        .filter(|result| matches!(result, Err(NameError::PinMismatch { .. })))
+        .count();
+    assert_eq!(pinned, 1, "{results:?}");
+    assert_eq!(mismatched, 1, "{results:?}");
+    let agent_pin = store.get_pin("agent:studio.me").await.unwrap();
+    let machine_pin = store.get_pin("machine:studio.me").await.unwrap();
+    assert!(
+        agent_pin.is_some() ^ machine_pin.is_some(),
+        "exactly one kind may be pinned: agent={agent_pin:?} machine={machine_pin:?}"
+    );
 }
 
 /// WHY: owner petnames are frozen at first bind; rebinding to another key
@@ -1013,6 +1080,79 @@ async fn commit_after_rename_failure_keeps_binding_and_reload_agrees() {
     let disk = reloaded.owner("bob").await.unwrap().expect("disk has bob");
     assert_eq!(disk.user_id, owner);
     assert_eq!(disk, mem);
+}
+
+/// WHY (PR #1494 RC6): the test above repairs durability before reload.
+/// A restart while the parent-directory fsync is still failing must keep
+/// `pending_durability` set, and an identical bind must not ACK until a
+/// later sync succeeds.
+#[tokio::test]
+async fn reload_keeps_pending_durability_until_directory_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let owner = UserId([9; 32]);
+    let store = NameStore::load(path.clone()).await;
+    assert!(store.load_error().is_none());
+
+    let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let outcome = store
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await;
+    assert!(
+        matches!(&outcome, Err(NameError::Store(msg)) if msg.contains("not confirmed")),
+        "post-rename failure must not ACK: {outcome:?}"
+    );
+    assert!(
+        store
+            .pending_durability
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the failed directory sync must stay pending"
+    );
+
+    let reloaded = NameStore::load(path.clone()).await;
+    assert!(
+        reloaded.load_error().is_none(),
+        "{:?}",
+        reloaded.load_error()
+    );
+    assert!(
+        reloaded
+            .pending_durability
+            .load(std::sync::atomic::Ordering::Acquire),
+        "reload must not forget an unconfirmed directory sync"
+    );
+    assert_eq!(
+        reloaded
+            .owner("bob")
+            .await
+            .unwrap()
+            .expect("disk has bob")
+            .user_id,
+        owner
+    );
+    let retry = reloaded
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await;
+    assert!(
+        matches!(&retry, Err(NameError::Store(msg)) if msg.contains("not confirmed")),
+        "identical bind after reload must not ACK Unchanged: {retry:?}"
+    );
+    assert!(reloaded
+        .pending_durability
+        .load(std::sync::atomic::Ordering::Acquire));
+
+    drop(seam);
+    let confirmed = reloaded
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await
+        .expect("durability retry after seam drop");
+    assert_eq!(confirmed, BindOutcome::Unchanged);
+    assert!(
+        !reloaded
+            .pending_durability
+            .load(std::sync::atomic::Ordering::Acquire),
+        "a confirmed directory sync clears the flag"
+    );
 }
 
 /// WHY (PR #1494 RC4): cancellation during the rename must not drop the

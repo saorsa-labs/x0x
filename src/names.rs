@@ -22,9 +22,11 @@
 //! - Every successful resolution is **pinned at first use** (TOFU): the
 //!   canonical name records the id it resolved to, and a later resolution to
 //!   a different id fails loud with [`NameError::PinMismatch`]. A bare name
-//!   keeps the kind of that pin. A resolution that would select the other
-//!   kind is the same mismatch and does not write a second pin. Nothing
-//!   silently rebinds; the owner re-pins by removing the pin.
+//!   that matches both an agent and a machine is [`NameError::AmbiguousKind`]
+//!   even when a pin already exists (ADR-0074 §1). `PinMismatch` applies only
+//!   when one pin exists and the single remaining candidate's kind differs
+//!   from that pin. That path writes no second pin. Nothing silently rebinds;
+//!   the owner re-pins by removing the pin.
 //!
 //! Resolution is local, makes no network query and adds **no trust**: it
 //! only maps a name to an id. The identity gate, the contact rules and the
@@ -836,8 +838,10 @@ impl NamesState {
 /// the rename leaves memory and disk on the old state; a failure after the
 /// rename keeps the new state in memory so it matches the advanced disk
 /// (issue #1101) and raises a pending-durability flag until a later write
-/// confirms the parent-directory fsync. An identical retry must not ACK as
-/// [`BindOutcome::Unchanged`] while that flag is set.
+/// confirms the parent-directory fsync. Load syncs a visible file and its
+/// directory. If that sync fails, the flag stays set across restart. An
+/// identical retry must not ACK as [`BindOutcome::Unchanged`] while that
+/// flag is set.
 #[derive(Debug)]
 pub struct NameStore {
     path: Option<PathBuf>,
@@ -925,7 +929,21 @@ impl NameStore {
             .map_err(|e| format!("decode {}: {e}", path.display()))
             .and_then(NamesState::from_file);
         match parsed {
-            Ok(state) => store.state = std::sync::Arc::new(tokio::sync::Mutex::new(state)),
+            Ok(state) => {
+                store.state = std::sync::Arc::new(tokio::sync::Mutex::new(state));
+                // A previous process may have published this file and then
+                // failed the parent-directory fsync. Confirm both syncs
+                // before any later identical bind may ACK.
+                if let Err(error) = crate::storage::confirm_published_durability(&path).await {
+                    tracing::warn!(
+                        "name store at {} is loaded but directory sync is not confirmed: {error}",
+                        path.display()
+                    );
+                    store
+                        .pending_durability
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
             Err(e) => {
                 tracing::warn!("name store unreadable, refusing name operations: {e}");
                 store.load_error = Some(e);
@@ -1232,32 +1250,8 @@ impl NameStore {
     ) -> Result<BindOutcome, NameError> {
         parse_pin_key(key)?;
         let key = key.to_string();
-        self.commit(move |state| {
-            if let Some(held) = state.pins.get(&key) {
-                if held.id != id || held.owner != owner {
-                    return Err(NameError::PinMismatch {
-                        name: key,
-                        pinned: hex::encode(held.id),
-                        current: hex::encode(id),
-                    });
-                }
-                return Ok((BindOutcome::Unchanged, false));
-            }
-            if state.pins.len() >= MAX_PINS {
-                return Err(NameError::Store("pin table is full".into()));
-            }
-            state.pins.insert(
-                key,
-                NamePin {
-                    id,
-                    owner,
-                    pinned_at: now_unix,
-                    source,
-                },
-            );
-            Ok((BindOutcome::Inserted, true))
-        })
-        .await
+        self.commit(move |state| install_pin(state, key, owner, id, source, now_unix))
+            .await
     }
 
     /// Remove the pin for canonical `key` (the owner's re-pin step).
@@ -1349,63 +1343,97 @@ pub async fn resolve_with(
     resolve_with_options(store, name, owner, candidates, now_unix, false).await
 }
 
-/// The pin a bare name already has, when exactly one kind is pinned.
-///
-/// Both kinds pinned is [`NameError::AmbiguousKind`]: the bare label no
-/// longer has one inferred kind.
-async fn bare_name_pin(
-    store: &NameStore,
-    name: &NameRef,
-) -> Result<Option<(NameKind, NamePin)>, NameError> {
-    let agent = store.get_pin(&name.canonical(NameKind::Agent)).await?;
-    let machine = store.get_pin(&name.canonical(NameKind::Machine)).await?;
-    match (agent, machine) {
-        (Some(pin), None) => Ok(Some((NameKind::Agent, pin))),
-        (None, Some(pin)) => Ok(Some((NameKind::Machine, pin))),
-        (Some(_), Some(_)) => Err(NameError::AmbiguousKind(name.to_string())),
-        (None, None) => Ok(None),
+/// Insert `key` or refuse an existing pin that names a different id or owner.
+fn install_pin(
+    state: &mut NamesState,
+    key: String,
+    owner: UserId,
+    id: [u8; 32],
+    source: BindSource,
+    now_unix: u64,
+) -> Result<(BindOutcome, bool), NameError> {
+    if let Some(held) = state.pins.get(&key) {
+        if held.id != id || held.owner != owner {
+            return Err(NameError::PinMismatch {
+                name: key,
+                pinned: hex::encode(held.id),
+                current: hex::encode(id),
+            });
+        }
+        return Ok((BindOutcome::Unchanged, false));
     }
+    if state.pins.len() >= MAX_PINS {
+        return Err(NameError::Store("pin table is full".into()));
+    }
+    state.pins.insert(
+        key,
+        NamePin {
+            id,
+            owner,
+            pinned_at: now_unix,
+            source,
+        },
+    );
+    Ok((BindOutcome::Inserted, true))
 }
 
-/// The inferred kind no longer has a verified candidate.
-fn inferred_kind_missed(err: &NameError) -> bool {
-    matches!(
-        err,
-        NameError::UnknownName(_) | NameError::UnverifiedOwner(_)
-    )
-}
-
-/// A bare name whose inferred kind missed, while another kind resolves.
+/// Check both bare-name pins and insert the selected kind under one lock.
 ///
-/// That is a rebind of the pinned identity ([`NameError::PinMismatch`]),
-/// not a new pin of the other kind.
-fn bare_kind_rebind(
+/// Both pins already stored is [`NameError::AmbiguousKind`]. One pin whose
+/// kind differs from `selection` is [`NameError::PinMismatch`] and writes
+/// nothing. No pin inserts `selection` unless `agent_only` refuses a machine.
+fn pin_bare_locked(
+    state: &mut NamesState,
     name: &NameRef,
     owner: UserId,
-    candidates: &Candidates,
-    preserved: Option<(NameKind, NamePin)>,
-    err: &NameError,
-) -> Option<NameError> {
-    let (kind, pin) = preserved?;
-    if !inferred_kind_missed(err) {
-        return None;
+    selection: Selection,
+    agent_only: bool,
+    now_unix: u64,
+) -> Result<(BindOutcome, bool), NameError> {
+    let agent_key = name.canonical(NameKind::Agent);
+    let machine_key = name.canonical(NameKind::Machine);
+    let held = match (
+        state.pins.get(&agent_key).copied(),
+        state.pins.get(&machine_key).copied(),
+    ) {
+        (Some(_), Some(_)) => return Err(NameError::AmbiguousKind(name.to_string())),
+        (Some(pin), None) => Some((NameKind::Agent, agent_key, pin)),
+        (None, Some(pin)) => Some((NameKind::Machine, machine_key, pin)),
+        (None, None) => None,
+    };
+    if let Some((pinned_kind, pinned_key, pin)) = held {
+        if selection.kind != pinned_kind || pin.id != selection.id || pin.owner != owner {
+            return Err(NameError::PinMismatch {
+                name: pinned_key,
+                pinned: hex::encode(pin.id),
+                current: hex::encode(selection.id),
+            });
+        }
+        if agent_only && selection.kind != NameKind::Agent {
+            return Err(machine_forward_refusal(name));
+        }
+        return Ok((BindOutcome::Unchanged, false));
     }
-    let other = select(name, candidates).ok()?;
-    if other.kind == kind && other.id == pin.id && pin.owner == owner {
-        return None;
+    if agent_only && selection.kind != NameKind::Agent {
+        return Err(machine_forward_refusal(name));
     }
-    Some(NameError::PinMismatch {
-        name: name.canonical(kind),
-        pinned: hex::encode(pin.id),
-        current: hex::encode(other.id),
-    })
+    install_pin(
+        state,
+        name.canonical(selection.kind),
+        owner,
+        selection.id,
+        BindSource::FirstUse,
+        now_unix,
+    )
 }
 
 /// Like [`resolve_with`], but when `agent_only` is set, refuse a machine
 /// selection **before** pinning (forwards until ADR-0074 slice 2).
 ///
-/// A bare name keeps the kind of an existing pin. Selecting the other kind
-/// is [`NameError::PinMismatch`] and writes no second pin.
+/// A bare name that matches both verified kinds is [`NameError::AmbiguousKind`]
+/// even when a pin exists. `PinMismatch` is only when the single remaining
+/// candidate's kind differs from the one existing pin. The kind check and
+/// the insert share one commit, so two bare resolves cannot pin both kinds.
 ///
 /// # Errors
 /// Any [`select`] error, [`NameError::MachineTargetUnsupported`], or
@@ -1418,28 +1446,26 @@ pub async fn resolve_with_options(
     now_unix: u64,
     agent_only: bool,
 ) -> Result<Resolved, NameError> {
-    // A bare name keeps the kind inferred at first pin (ADR 0074). A later
-    // candidate of the other kind must not mint a second pin key.
-    let preserved = if name.kind.is_none() {
-        bare_name_pin(store, name).await?
-    } else {
-        None
-    };
-    let mut select_name = name.clone();
-    if let Some((kind, _)) = preserved {
-        select_name.kind = Some(kind);
-    }
-    let selection = select(&select_name, candidates)
-        .map_err(|err| bare_kind_rebind(name, owner, candidates, preserved, &err).unwrap_or(err))?;
-    if agent_only && selection.kind != NameKind::Agent {
+    // Both verified kinds refuse here, pin or not. `select` does not
+    // consult the store, so a pin cannot hide the collision.
+    let selection = select(name, candidates)?;
+    let outcome = if name.kind.is_none() {
+        let name = name.clone();
+        store
+            .commit(move |state| {
+                pin_bare_locked(state, &name, owner, selection, agent_only, now_unix)
+            })
+            .await?
+    } else if agent_only && selection.kind != NameKind::Agent {
         return Err(machine_forward_refusal(name));
-    }
-    let key = name.canonical(selection.kind);
-    let outcome = store
-        .pin(&key, owner, selection.id, BindSource::FirstUse, now_unix)
-        .await?;
+    } else {
+        let key = name.canonical(selection.kind);
+        store
+            .pin(&key, owner, selection.id, BindSource::FirstUse, now_unix)
+            .await?
+    };
     Ok(Resolved {
-        name: key,
+        name: name.canonical(selection.kind),
         kind: selection.kind,
         owner,
         agent_id: selection.agent_id,

@@ -1508,6 +1508,18 @@ async fn sync_published_file(path: &Path) -> std::result::Result<(), DurableWrit
     Ok(())
 }
 
+/// Confirm that a file already visible at `path` is durable.
+///
+/// Fsync the file, then fsync its parent directory. [`DurableWriteError::AfterRename`]
+/// means the bytes are visible and the directory entry is not confirmed.
+/// Name-store load uses this so a restart after a failed parent-directory
+/// fsync does not clear the pending-durability flag.
+pub(crate) async fn confirm_published_durability(
+    path: &Path,
+) -> std::result::Result<(), DurableWriteError> {
+    sync_published_file(path).await
+}
+
 /// Write arbitrary secret bytes to `path` with the same protection x0x gives
 /// key material: an atomic write (temp file + rename) with Unix mode `0600`.
 ///

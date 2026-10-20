@@ -1108,7 +1108,7 @@ pub(in crate::server) async fn import_agent_card(
         .as_ref()
         .is_some_and(|axum::extract::Extension(a)| a.is_durable_owner());
     let owner_label = if durable {
-        super::names::bind_owner_from_card(&state, &card, effective_trust).await
+        super::names::bind_owner_from_card(&state, &card).await
     } else {
         serde_json::Value::Null
     };

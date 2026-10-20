@@ -405,11 +405,10 @@ async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// WHY: ADR-0079 contact gate — Unknown must not bind a petname from a
-/// signed, certified card. There is no suggestion store in this slice, so
-/// the import returns null and the label stays unbound.
+/// WHY: ADR-0074 §1 binds a petname from a signed card. Held ADR 0079 must
+/// not leave an Unknown contact unbound.
 #[tokio::test]
-async fn unknown_trust_signed_card_import_leaves_owner_unbound() -> anyhow::Result<()> {
+async fn unknown_trust_signed_card_import_binds_owner_petname() -> anyhow::Result<()> {
     let (state, _dir) =
         crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
     let app = names_router(Arc::clone(&state));
@@ -425,13 +424,70 @@ async fn unknown_trust_signed_card_import_leaves_owner_unbound() -> anyhow::Resu
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "{json}");
-    assert!(
-        json["owner_label"].is_null(),
-        "Unknown leaves the label unbound: {json}"
+    assert_eq!(json["owner_label"]["label"], "bob-smith", "{json}");
+    assert_eq!(json["owner_label"]["status"], "bound", "{json}");
+    assert_eq!(
+        state.names.owner("bob-smith").await?.map(|b| b.user_id),
+        Some(bob.user_id()),
+        "Unknown stores the petname"
     );
+    Ok(())
+}
+
+/// WHY (PR #1494 RC6): a card-import retry must not report `existing` while
+/// the post-rename directory fsync is still failing. The retry goes through
+/// `bind_owner`, so the storage error stays visible until sync succeeds.
+#[tokio::test]
+async fn card_import_retry_reports_fsync_error_until_durability_confirms() -> anyhow::Result<()> {
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let app = names_router(Arc::clone(&state));
+    let bob = crate::identity::UserKeypair::generate()?;
+    let (link, kp) = signed_card(&bob, "Bob Smith")?;
+    let cert = crate::identity::AgentCertificate::issue(&bob, &kp)?;
+    seed_agent_cert(&state, &kp, cert).await;
+    let path = x0x::names::NameStore::path_in(&state.data_dir);
+    let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let body = serde_json::json!({ "card": link, "trust_level": "known" });
+
+    let (status, json) = send(&app, "POST", "/agent/card/import", body.clone()).await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["owner_label"]["status"], "store_error", "{json}");
     assert!(
-        state.names.owner("bob-smith").await?.is_none(),
-        "Unknown must not store a petname"
+        json["owner_label"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not confirmed"),
+        "{json}"
+    );
+    assert_eq!(
+        state.names.owner("bob-smith").await?.map(|b| b.user_id),
+        Some(bob.user_id()),
+        "memory keeps the binding after the rename"
+    );
+
+    let (status, retry) = send(&app, "POST", "/agent/card/import", body.clone()).await?;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["owner_label"]["status"], "store_error", "{retry}");
+    assert_ne!(
+        retry["owner_label"]["status"], "existing",
+        "retry must not hide the fsync error: {retry}"
+    );
+
+    drop(seam);
+    let (status, confirmed) = send(&app, "POST", "/agent/card/import", body).await?;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert_eq!(
+        confirmed["owner_label"]["status"], "existing",
+        "{confirmed}"
+    );
+    assert_eq!(
+        confirmed["owner_label"]["label"], "bob-smith",
+        "{confirmed}"
+    );
+    assert_eq!(
+        state.names.owner("bob-smith").await?.map(|b| b.user_id),
+        Some(bob.user_id())
     );
     Ok(())
 }
