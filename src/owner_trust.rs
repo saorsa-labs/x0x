@@ -147,16 +147,32 @@ impl OwnerTrust {
             Some(store) => store.read().await.peek(agent),
             None => None,
         };
-        crate::identity_authority::confirms(*machine, announced, attested, || {
-            let now = crate::dm_capability::now_unix_ms();
-            self.evidence().is_some_and(|runtime| {
-                if nonblocking_evidence {
-                    runtime.try_confirms_pairing(*agent, *machine, now) == Some(true)
-                } else {
-                    runtime.confirms_pairing(*agent, *machine, now)
-                }
-            })
-        })
+        if crate::identity_authority::confirms(*machine, announced, attested, || false) {
+            return true;
+        }
+        if machine.0 == [0; 32] {
+            return false;
+        }
+        let Some(runtime) = self.evidence() else {
+            return false;
+        };
+        if nonblocking_evidence {
+            return runtime.try_confirms_pairing(
+                *agent,
+                *machine,
+                crate::dm_capability::now_unix_ms(),
+            ) == Some(true);
+        }
+        // #1239: ordinary raw resolution and known-recipient redial also
+        // reach this check. A synchronous evidence read here stalls Tokio's
+        // timers. Use the existing reader and default evidence budget; brief
+        // contention can still resolve. At expiry no evidence confirms the
+        // pairing, so each caller keeps its existing fallback or refusal.
+        let deadline = tokio::time::Instant::now() + crate::dm::dm_attempt_timeout(None);
+        runtime
+            .confirms_pairing_before(*agent, *machine, deadline)
+            .await
+            .unwrap_or(false)
     }
 
     /// [`Self::authority_confirms`] for synchronous seams: `None` while a
@@ -670,3 +686,6 @@ impl crate::Agent {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod authority_tests;
