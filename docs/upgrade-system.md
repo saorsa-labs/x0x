@@ -39,8 +39,14 @@ that already says the delay is complete. Unknown or damaged records remain
 in place and refuse this apply; they do not block normal daemon startup.
 Shutdown or loss of the task cancels work before mutation admission.
 
+The compiled deployment inventory sets a minimum 60-minute window for a
+known or ambiguous production fleet install. An existing receipt below that
+minimum refuses apply and remains intact. Ordinary installs retain an
+explicit zero window. Only the compiled debug test key permits the fleet
+rehearsal exception.
+
 This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
-the fleet minimum, complete host inventory and transaction-bound guide
+complete host inventory and transaction-bound guide
 installation remain separate M2 work. It does not claim that every apply
 path already honors the configured window.
 
