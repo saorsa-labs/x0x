@@ -107,8 +107,7 @@ struct StoredEvaluation {
 
 /// S4 runtime state held on [`AppState`].
 pub(in crate::server) struct S4Runtime {
-    /// The timing values (PENDING MEASUREMENT defaults, see
-    /// [`S4Timing`]).
+    /// The timing values (the measured defaults, see [`S4Timing`]).
     pub(in crate::server) timing: S4Timing,
     /// Random per-process boot identity (§2, §5).
     boot_id: [u8; 16],
@@ -198,16 +197,14 @@ fn host_commit_gate_open(_state: &AppState) -> bool {
 
 /// The S4 worker. Runs until the task is aborted at shutdown.
 pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppState>) {
-    if s4::S4_TIMING_PENDING_MEASUREMENT {
-        let timing = state.revocation_evictions.timing;
-        tracing::info!(
-            designated_window_ms = s4::duration_ms(timing.designated_window),
-            completion_bound_ms = s4::duration_ms(timing.completion_bound),
-            fallback_stagger_ms = s4::duration_ms(timing.fallback_stagger),
-            restart_sync_wait_ms = s4::duration_ms(timing.restart_sync_wait),
-            "ADR 0110 S4 timing values are provisional (pending the W3-H measurement)"
-        );
-    }
+    let timing = state.revocation_evictions.timing;
+    tracing::info!(
+        designated_window_ms = s4::duration_ms(timing.designated_window),
+        completion_bound_ms = s4::duration_ms(timing.completion_bound),
+        fallback_stagger_ms = s4::duration_ms(timing.fallback_stagger),
+        restart_sync_wait_ms = s4::duration_ms(timing.restart_sync_wait),
+        "ADR 0110 S4 timing values"
+    );
     load_persisted_obligations(&state).await;
     let notify = state.agent.s4_revocation_intake().notified();
     loop {

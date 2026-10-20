@@ -3,8 +3,8 @@
 //! This module holds the pure, I/O-free core of S4:
 //!
 //! - [`S4Timing`]: the measured timing values (W, completion bound, Δ and
-//!   the restart sync wait). The defaults are placeholders that wait for the
-//!   W3-H p99.9 numbers (D69, D73).
+//!   the restart sync wait), from the `s4_timing_measurement` p99.9
+//!   numbers recorded in the #1357 PR body (D69, D73).
 //! - The obligation model (§1): one row per (stable group ID, target agent
 //!   ID), with the set of verified trigger hashes, the phase (§5) and the
 //!   typed waiting cause (D64).
@@ -35,14 +35,6 @@ pub const MAX_COMPACT_RECORDS_PER_GROUP: usize = 4096;
 
 // ─── Timing (D69, D73) ─────────────────────────────────────────────────────
 
-/// Whether the [`S4Timing`] defaults are still the placeholders.
-///
-/// `true` until the lead replaces the defaults with the W3-H harness p99.9
-/// values (`s4_timing_measurement`) and David accepts them. The daemon logs
-/// this flag once at startup so an operator can see that the values are
-/// provisional.
-pub const S4_TIMING_PENDING_MEASUREMENT: bool = true;
-
 /// The S4 timing values. Every S4 budget reads them from here.
 ///
 /// ADR 0110 §2: W and the completion bound come from the W3-H p99.9 of
@@ -51,10 +43,11 @@ pub const S4_TIMING_PENDING_MEASUREMENT: bool = true;
 /// p99.9 seal-and-head-propagation time. The restart sync wait is at least
 /// the measured p99.9 head catch-up.
 ///
-/// **The defaults are PENDING MEASUREMENT** (see
-/// [`S4_TIMING_PENDING_MEASUREMENT`]). They are deliberately not the 2 s / 5 s
-/// values that D69 rejected. Replace them from the `s4_timing_measurement`
-/// numbers before the implementation PR is proposed for merge.
+/// The defaults are the `s4_timing_measurement` values (ADR 0110 option B,
+/// David 20 Oct 2026): 1.5 × the p99.9 sums of the contended loopback
+/// measurement plus a derived 375 ms RTT WAN term, rounded up to 1 s. The
+/// #1357 PR body records the samples and the arithmetic. They are not the
+/// 2 s / 5 s values that D69 rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct S4Timing {
     /// W: only the designated admin may start an exclusion before this
@@ -71,19 +64,17 @@ pub struct S4Timing {
 }
 
 impl S4Timing {
-    /// PENDING MEASUREMENT placeholder for W. It equals the W3-H case's
-    /// `S4_W_PLACEHOLDER` (60 s), so the harness and the product share one
-    /// provisional value until the measured number replaces both.
-    pub const PENDING_DESIGNATED_WINDOW: Duration = Duration::from_secs(60);
-    /// PENDING MEASUREMENT placeholder for the completion bound (the W3-H
-    /// case's `S4_COMPLETION_BOUND_PLACEHOLDER`, 120 s).
-    pub const PENDING_COMPLETION_BOUND: Duration = Duration::from_secs(120);
-    /// PENDING MEASUREMENT placeholder for Δ (the W3-H case's
-    /// `S4_DELTA_PLACEHOLDER`, 30 s).
-    pub const PENDING_FALLBACK_STAGGER: Duration = Duration::from_secs(30);
-    /// PENDING MEASUREMENT placeholder for the restart sync wait (the
-    /// provisional D73 range is 10 s to 30 s; the top of the range is used).
-    pub const PENDING_RESTART_SYNC_WAIT: Duration = Duration::from_secs(30);
+    /// W: 1.5 × (hand-off p99.9 + fsync p99.9 + seal-and-propagation),
+    /// 17.4 s, rounded up.
+    pub const DESIGNATED_WINDOW: Duration = Duration::from_secs(18);
+    /// The completion bound while the designated admin is reachable: the
+    /// same inputs as W.
+    pub const COMPLETION_BOUND: Duration = Duration::from_secs(18);
+    /// Δ: 1.5 × the seal-and-head-propagation p99.9, 10.8 s, rounded up.
+    pub const FALLBACK_STAGGER: Duration = Duration::from_secs(11);
+    /// The restart sync wait: 1.5 × the restart head catch-up p99.9,
+    /// 12.3 s, rounded up (inside D73's provisional 10 s to 30 s range).
+    pub const RESTART_SYNC_WAIT: Duration = Duration::from_secs(13);
 
     /// The earliest elapsed time since T_obs at which fallback rank `rank`
     /// may start. Rank 0 is the designated admin and may start at once.
@@ -101,10 +92,10 @@ impl S4Timing {
 impl Default for S4Timing {
     fn default() -> Self {
         Self {
-            designated_window: Self::PENDING_DESIGNATED_WINDOW,
-            completion_bound: Self::PENDING_COMPLETION_BOUND,
-            fallback_stagger: Self::PENDING_FALLBACK_STAGGER,
-            restart_sync_wait: Self::PENDING_RESTART_SYNC_WAIT,
+            designated_window: Self::DESIGNATED_WINDOW,
+            completion_bound: Self::COMPLETION_BOUND,
+            fallback_stagger: Self::FALLBACK_STAGGER,
+            restart_sync_wait: Self::RESTART_SYNC_WAIT,
         }
     }
 }
@@ -1637,9 +1628,11 @@ mod tests {
     }
 
     #[test]
-    fn timing_defaults_are_pending_and_not_rejected_values() {
+    fn timing_defaults_are_measured_and_not_rejected_values() {
         let timing = S4Timing::default();
-        const { assert!(S4_TIMING_PENDING_MEASUREMENT) };
+        assert_eq!(timing.designated_window, Duration::from_secs(18));
+        assert_eq!(timing.fallback_stagger, Duration::from_secs(11));
+        assert_eq!(timing.restart_sync_wait, Duration::from_secs(13));
         assert_ne!(timing.designated_window, Duration::from_secs(2));
         assert_ne!(timing.completion_bound, Duration::from_secs(5));
         assert_eq!(timing.fallback_offset(0), Duration::ZERO);
