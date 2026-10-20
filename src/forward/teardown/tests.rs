@@ -134,13 +134,18 @@ impl World {
             cache.insert(kp.agent_id(), discovered(kp, machine, cert));
         }
 
-        // Every contact-store, revocation-set and device-set change wakes the
-        // loop, as the agent wires them.
+        // Every contact-store, revocation-set, device-set, and machine-binding
+        // change wakes the loop, as the agent wires them.
         let kick = Arc::new(Notify::new());
         let mut contacts = ContactStore::new(dir.path().join("contacts.json"));
         contacts.set_change_notify(Arc::clone(&kick));
         let mut revocations = RevocationSet::new();
         revocations.set_change_notify(Arc::clone(&kick));
+        authenticated
+            .write()
+            .await
+            .set_change_notify(Arc::clone(&kick));
+        announced.write().await.set_change_notify(Arc::clone(&kick));
 
         let devices = Arc::new(OwnerSyncStore::load(dir.path()).await.unwrap());
         devices
@@ -356,6 +361,50 @@ async fn revoked_grant_closes_its_forward_within_5s() {
     assert_eq!(w.diag.torn_down_reauth(), 1);
     assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
     assert_eq!(w.live.len(), 0, "a torn-down stream leaves the registry");
+}
+
+/// WHY (Codex P2 / RC7): a DM-attestation binding write must wake stream
+/// reauth within the ADR-0074 5 s event bound with the periodic sweep off.
+///
+/// The production DM path (`dm_inbox` ~1612) calls
+/// [`crate::dm_inbox::record_authenticated_machine_binding`] after a valid
+/// origin attestation; the notify fires inside that shared writer (and every
+/// other cache mutator), so this test drives the same function rather than
+/// re-verifying a full DM envelope.
+#[tokio::test(start_paused = true)]
+async fn dm_attestation_binding_change_closes_grant_forward_within_5s() {
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], false, true));
+    let grant = w
+        .grant(0x21, Grantee::User(w.user_b.user_id()), w.base_secs + 3_600)
+        .await;
+    let (stream, authority) = w.admit(w.inbound(w.b1, w.mb)).await;
+    assert_eq!(
+        authority,
+        StreamAuthority::Grant {
+            grant_ids: vec![hex::encode(grant.grant_id)]
+        }
+    );
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!stream.token().is_cancelled());
+
+    // Portable move: fresher DM attestation binds b1 to a new machine. The
+    // inbound StreamGate still names mb; grant reauth fails the authenticated
+    // binding match and tears the stream down (same reason as grant revoke).
+    let moved = MachineId([0xB1; 32]);
+    crate::dm_inbox::record_authenticated_machine_binding(
+        &w.authenticated,
+        w.b1,
+        moved,
+        w.base_secs + 1,
+    )
+    .await;
+
+    closes_within(&stream, EVENT_BOUND).await;
+    assert_eq!(w.diag.torn_down_reauth(), 1);
+    assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
+    assert_eq!(w.live.len(), 0);
 }
 
 /// WHY: a contact downgrade to `Blocked` must close the peer's live forward
@@ -937,7 +986,8 @@ async fn evidence_admitted_stream_survives_reauth_without_bindings() {
     // No authenticated binding — grant authority rides on local usable evidence.
     {
         let mut bind = w.authenticated.write().await;
-        *bind = crate::dm_inbox::AuthenticatedMachineBindingCache::default();
+        // Keep change_notify installed (World wires ADR-0074 reauth wake).
+        bind.clear_for_test();
     }
 
     // Drive the same gate registration admission would after an
@@ -959,11 +1009,13 @@ async fn evidence_admitted_stream_survives_reauth_without_bindings() {
     assert_eq!(w.diag.torn_down_reauth(), 0);
 }
 
-/// WHY (Codex P1 / RC4): owner-trust can fall through to synchronous
-/// [`EvidenceRuntime::usable`] when the authenticated binding is missing.
-/// A held ready-store mutex then blocks the reauth task; `timeout_at` cannot
-/// interrupt that wait, so teardown misses ADR-0074 §4's five-second bound.
-/// Reauth must use `try_usable` (fail closed while busy) on that path.
+/// WHY (Codex P1 / RC4, updated RC7): owner-trust can fall through to
+/// evidence when the authenticated binding is missing. Reauth must use
+/// `try_usable` (never block on `usable`). A held ready-store is `Busy`,
+/// not an immediate deny: the pass retries until a fresh verdict or the
+/// five-second deadline. Holding the store through the full budget (and
+/// unenrolling so the loop is kicked) must still tear down by the deadline
+/// as `reauth_deadline` — no fresh verdict, fail closed.
 #[tokio::test(start_paused = true)]
 async fn owner_trust_reauth_tears_down_within_5s_while_evidence_store_held() {
     use crate::announce_v3::IdentityAnnouncementV3;
@@ -1079,7 +1131,8 @@ async fn owner_trust_reauth_tears_down_within_5s_while_evidence_store_held() {
     // Force owner-trust's evidence fallback (no authenticated binding).
     {
         let mut bind = w.authenticated.write().await;
-        *bind = crate::dm_inbox::AuthenticatedMachineBindingCache::default();
+        // Keep change_notify installed (World wires ADR-0074 reauth wake).
+        bind.clear_for_test();
     }
 
     let gate = w.inbound(peer, machine);
@@ -1111,13 +1164,18 @@ async fn owner_trust_reauth_tears_down_within_5s_while_evidence_store_held() {
 
     let started = Instant::now();
     assert!(w.devices.unenroll(&machine).await.unwrap());
-    closes_within(&stream, EVENT_BOUND).await;
+    // Tear-down lands on the deadline Instant; slack avoids racing the
+    // final Busy → reauth_deadline step against closes_within's bound.
+    closes_within(&stream, EVENT_BOUND + Duration::from_millis(250)).await;
     assert!(
-        started.elapsed() <= EVENT_BOUND,
+        started.elapsed() <= EVENT_BOUND + Duration::from_millis(250),
         "owner-trust reauth exceeded the five-second bound while the evidence store was held ({:?})",
         started.elapsed()
     );
-    assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
+    // Store stayed held: Busy retries until the deadline, then fail-closed
+    // with no fresh verdict (not an immediate trust_rejected).
+    assert_eq!(w.reasons().get("reauth_deadline"), Some(&1));
+    assert_eq!(w.diag.torn_down_reauth(), 1);
 
     let _ = release_tx.send(());
     let _ = holder.join();
@@ -1174,7 +1232,8 @@ async fn reauth_enforces_revocation_within_5s_despite_slow_evidence() {
     // Control: with bindings cleared, non-local grant eval sits in wait(0).
     {
         let mut bind = w.authenticated.write().await;
-        *bind = crate::dm_inbox::AuthenticatedMachineBindingCache::default();
+        // Keep change_notify installed (World wires ADR-0074 reauth wake).
+        bind.clear_for_test();
     }
     let blocked = tokio::spawn({
         let trust = w.trust.clone();
@@ -1557,4 +1616,229 @@ async fn kick_late_in_long_pass_spacing_respects_event_deadline() {
 
     let _ = release_tx.send(());
     let _ = holder.await;
+}
+
+/// Owner-trust stream admitted on enrolled evidence without an authenticated
+/// binding (RC7 busy/deadline fixtures). Returns the world, live stream, the
+/// ready evidence store (for `hold_state_for_testing`), and the live
+/// [`EvidenceRuntime`] Arc that OwnerTrust holds weakly — keep it alive for
+/// the test body or reauth sees no evidence and denies immediately.
+async fn owner_evidence_reauth_fixture() -> (
+    World,
+    LiveStreamGuard,
+    Arc<crate::peer_evidence::PeerEvidenceStore>,
+    Arc<crate::peer_evidence::EvidenceRuntime>,
+) {
+    use crate::announce_v3::IdentityAnnouncementV3;
+    use crate::dm::DmCapabilities;
+    use crate::dm_capability::{CapabilityAdvert, RegistryTrailer, REGISTRY_TRAILER_MAGIC};
+    use crate::peer_evidence::{
+        EvidenceConfig, EvidenceRecordV1, EvidenceRuntime, IngestSource, PeerEvidenceStore,
+        RuntimePolicy,
+    };
+
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], true, false));
+
+    let agent_kp = AgentKeypair::generate().unwrap();
+    let machine_kp = MachineKeypair::generate().unwrap();
+    let peer = agent_kp.agent_id();
+    let machine = machine_kp.machine_id();
+    let cert = AgentCertificate::issue(&w.owner_a, &agent_kp).unwrap();
+    w.devices
+        .enroll(OwnerEnrollment::sign(machine, &w.owner_a, w.base_secs * 1000, None).unwrap())
+        .await
+        .unwrap();
+    w.cache
+        .write()
+        .await
+        .insert(peer, discovered(&agent_kp, machine, cert.clone()));
+
+    let now_ms = w.base_secs.saturating_mul(1000);
+    let record = {
+        let v2 = crate::IdentityAnnouncement {
+            self_name: Some("owner evidence peer".into()),
+            agent_id: peer,
+            machine_id: machine,
+            user_id: None,
+            agent_certificate: None,
+            machine_public_key: machine_kp.public_key().as_bytes().to_vec(),
+            machine_signature: vec![],
+            addresses: vec![],
+            announced_at: now_ms / 1000,
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            agent_public_key: agent_kp.public_key().as_bytes().to_vec(),
+        };
+        let mut ann =
+            IdentityAnnouncementV3::build_from_v2(&v2, machine_kp.secret_key(), 0).unwrap();
+        ann.sign_v3_1(machine_kp.secret_key()).unwrap();
+        let mut caps = DmCapabilities::pending();
+        caps.kem_public_key = vec![42; 1184];
+        let mut advert = CapabilityAdvert {
+            protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+            agent_id: *peer.as_bytes(),
+            machine_id: *machine.as_bytes(),
+            created_at_unix_ms: now_ms,
+            capabilities: caps,
+            signature: vec![],
+        };
+        advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            agent_kp.secret_key(),
+            &advert.signed_bytes().unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        let mut trailer = RegistryTrailer {
+            registry: Default::default(),
+            signature: vec![],
+        };
+        trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            agent_kp.secret_key(),
+            &trailer.signed_bytes(&advert).unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        let mut bytes = postcard::to_stdvec(&advert).unwrap();
+        bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
+        bytes.extend(postcard::to_stdvec(&trailer).unwrap());
+        EvidenceRecordV1 {
+            announcement: crate::announce_v3::serialize_v3_1(&ann).unwrap(),
+            advert: bytes,
+            certificate: Some(cert.to_storage_bytes().unwrap()),
+            relation: crate::peer_evidence::ENROLLED,
+            stored_at_ms: now_ms,
+        }
+    };
+    let policy = Arc::new(RuntimePolicy::new(
+        w.a1,
+        w.trust.clone(),
+        Arc::clone(&w.revocations),
+    ));
+    let store = Arc::new(
+        PeerEvidenceStore::open(
+            &w.dir.path().join("evidence-owner-reauth-busy"),
+            EvidenceConfig::default(),
+            policy,
+            now_ms,
+        )
+        .unwrap(),
+    );
+    store.ingest(record, IngestSource::Hello, now_ms).unwrap();
+    let (evidence, ready) = EvidenceRuntime::loading_store_for_test(Arc::clone(&store));
+    ready.cancel();
+    assert!(
+        evidence.usable(peer, machine, now_ms).is_some(),
+        "control: enrolled evidence must be usable before admission"
+    );
+    w.trust.install_evidence(&evidence);
+
+    {
+        let mut bind = w.authenticated.write().await;
+        // Keep change_notify installed (World wires ADR-0074 reauth wake).
+        bind.clear_for_test();
+    }
+
+    let gate = w.inbound(peer, machine);
+    let authority = check_gate(&gate, &w.ctx())
+        .await
+        .expect("owner stream must admit on enrolled evidence without binding");
+    assert_eq!(authority, StreamAuthority::OwnerTrust);
+    let stream = w.live.register(gate, authority);
+    (w, stream, store, evidence)
+}
+
+fn hold_evidence_store(
+    store: Arc<crate::peer_evidence::PeerEvidenceStore>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = store.hold_state_for_testing();
+        let _ = held_tx.send(());
+        let _ = release_rx.recv();
+    });
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("evidence store lock holder must start");
+    (release_tx, holder)
+}
+
+/// RC7 engineer ruling: evidence-store contention that clears inside the
+/// five-second budget must not tear down a still-authorized stream.
+#[tokio::test(start_paused = true)]
+async fn reauth_evidence_store_busy_resolves_inside_budget_stream_survives() {
+    let (w, stream, store, _evidence) = owner_evidence_reauth_fixture().await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    // Kick without changing enrollments/grants/contacts — pure contention.
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "busy alone must not tear down before the deadline"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+    // Let Busy backoff complete and a fresh allow land inside the budget.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "stream must survive after contention clears inside the budget"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+    assert!(w.reasons().is_empty());
+
+    // A later kick with the store free must keep the stream (authority
+    // never changed). Stay well under the original event deadline.
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "post-release reauth must keep the still-authorized stream"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
+/// RC7 engineer ruling: evidence-store contention that never yields a fresh
+/// verdict before the deadline must tear down as `reauth_deadline`.
+#[tokio::test(start_paused = true)]
+async fn reauth_evidence_store_busy_through_deadline_tears_down() {
+    let (w, stream, store, _evidence) = owner_evidence_reauth_fixture().await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    let started = Instant::now();
+    // Kick without authority loss — hold through the full budget.
+    w.kick.notify_waiters();
+    // Tear-down lands on the deadline Instant; allow a little slack so
+    // closes_within does not race the final Busy → reauth_deadline step.
+    closes_within(&stream, EVENT_BOUND + Duration::from_millis(250)).await;
+    assert!(
+        started.elapsed() <= EVENT_BOUND,
+        "busy-through-deadline teardown exceeded EVENT_BOUND ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 1);
+    assert_eq!(w.reasons().get("reauth_deadline"), Some(&1));
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
 }

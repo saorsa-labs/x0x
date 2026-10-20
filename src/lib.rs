@@ -22128,18 +22128,24 @@ impl AgentBuilder {
 
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
-        let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
-            dm_inbox::AuthenticatedMachineBindingCache::default(),
-        ));
+        // ADR-0074 §4: authenticated + announced binding mutations wake
+        // stream reauth (DM attestation, announcements, cert-landed expiry).
+        let authenticated_machine_bindings = {
+            let mut cache = dm_inbox::AuthenticatedMachineBindingCache::default();
+            cache.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+            std::sync::Arc::new(tokio::sync::RwLock::new(cache))
+        };
         let owner_trust = owner_trust::OwnerTrust::new(
             identity.user_id(),
             std::sync::Arc::clone(&authenticated_machine_bindings),
         );
         // ADR 0115 §2: the announced-binding store is an
         // authority store for every OwnerTrust-held reader.
-        let announced_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
-            dm_inbox::AuthenticatedMachineBindingCache::default(),
-        ));
+        let announced_machine_bindings = {
+            let mut cache = dm_inbox::AuthenticatedMachineBindingCache::default();
+            cache.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+            std::sync::Arc::new(tokio::sync::RwLock::new(cache))
+        };
         owner_trust.install_announced_bindings(std::sync::Arc::clone(&announced_machine_bindings));
         if let Some(runtime) = gossip_runtime.as_ref() {
             // #1230: a bare agent must drop Blocked senders without a later

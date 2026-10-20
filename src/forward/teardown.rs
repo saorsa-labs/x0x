@@ -11,6 +11,11 @@
 //! re-check having to know which one fired. It also cannot widen anything:
 //! a stream survives only while its admission gate still passes.
 //!
+//! Local-authority re-checks use non-blocking evidence reads (`try_usable`).
+//! Lock contention is not an authority deny: the pass retries with a short
+//! backoff until a fresh allow/deny or the event deadline, then fail-closes
+//! as `reauth_deadline` (never keeps a stale allow past the budget).
+//!
 //! ## When a pass runs
 //!
 //! **On an event** (bound ≤5 s from the triggering event). After a pass,
@@ -26,7 +31,7 @@
 //! | contact trust change, `Blocked`, machine pin | `ContactStore` on every persisted change, and on every [`crate::contacts::ContactStore::get_mut`] (wakes reauth) |
 //! | connect-ACL reload | [`crate::Agent::set_connect_policy`] |
 //! | owner enrollment added or removed | `OwnerSyncStore::enroll` / `unenroll` |
-//! | peer machine binding or certificate changed | the announcement ingest (`upsert_discovered_agent`) and the announce-blob certificate patch |
+//! | peer machine binding or certificate changed | `AuthenticatedMachineBindingCache::set_change_notify` on every retained-machine / expiry / clear mutation (DM attestation `record_authenticated_machine_binding`, announcement ingest, cert-landed); discovery also kicks via `upsert_discovered_agent` |
 //!
 //! **On a sweep** every [`REAUTH_SWEEP_INTERVAL`] (30 s), for the
 //! triggers that are only the passage of time: grant expiry (bound ≤35 s),
@@ -73,6 +78,11 @@ pub(crate) const REAUTH_MIN_SPACING: Duration = Duration::from_millis(250);
 /// authority reads should finish well under this; the deadline fail-closes
 /// any stream still unchecked when it expires.
 pub(crate) const REAUTH_PASS_BUDGET: Duration = Duration::from_secs(5);
+
+/// Short pause between busy-store re-checks inside one pass. Contention
+/// alone must not tear down a live stream; the pass retries until a fresh
+/// verdict or [`REAUTH_PASS_BUDGET`] (engineer ruling RC7 / #1488).
+const REAUTH_BUSY_BACKOFF: Duration = Duration::from_millis(25);
 
 /// The authority a live stream holds (ADR-0074 §4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -379,21 +389,94 @@ fn denial_reason(denial: AuthzDenial) -> &'static str {
     }
 }
 
-/// Re-run `gate` against current state. `Ok` carries the authority the
-/// stream now holds; `Err` the teardown reason.
+/// One local-authority re-check outcome. `Busy` is lock contention on a
+/// store the non-blocking path needs — not an authority deny.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReauthCheck {
+    Allow(StreamAuthority),
+    Deny(&'static str),
+    Busy,
+}
+
+/// Whether the local-authority path for `(agent, machine)` would consult
+/// evidence and the ready store is contended (`try_usable` → `Err`).
+/// Binding-confirmed pairs skip evidence, so a held store is not busy.
+async fn reauth_evidence_busy(ctx: &ReauthCtx, agent: &AgentId, machine: &MachineId) -> bool {
+    let attested = ctx.authenticated_bindings.read().await.peek(agent);
+    let announced = ctx.announced_bindings.read().await.peek(agent);
+    if crate::identity_authority::confirms(*machine, announced, attested, || false) {
+        return false;
+    }
+    let Some(runtime) = ctx.owner_trust.evidence() else {
+        return false;
+    };
+    runtime.try_usable(*agent, *machine, (ctx.clock)()).is_err()
+}
+
+/// Agents whose evidence the gate may need under local-authority reauth.
+fn reauth_evidence_agents(gate: &StreamGate) -> Option<Vec<(AgentId, MachineId)>> {
+    match gate {
+        StreamGate::Outbound {
+            peer_agent,
+            machine,
+        }
+        | StreamGate::InboundAttested {
+            opener: peer_agent,
+            machine,
+            ..
+        } => Some(vec![(*peer_agent, *machine)]),
+        StreamGate::InboundLegacy { .. } => None,
+    }
+}
+
+/// Upgrade a deny to [`ReauthCheck::Busy`] when evidence contention alone
+/// can explain a fail-closed local read (no fresh authority verdict yet).
+async fn reauth_check_after_deny(
+    gate: &StreamGate,
+    ctx: &ReauthCtx,
+    reason: &'static str,
+) -> ReauthCheck {
+    if let Some(pairs) = reauth_evidence_agents(gate) {
+        for (agent, machine) in pairs {
+            if reauth_evidence_busy(ctx, &agent, &machine).await {
+                return ReauthCheck::Busy;
+            }
+        }
+    } else if let StreamGate::InboundLegacy { machine, .. } = gate {
+        // Legacy gates name a machine only; any co-resident agent whose
+        // evidence is contended blocks a fresh verdict for the machine.
+        let agents: Vec<AgentId> = {
+            let cache = ctx.discovery_cache.read().await;
+            cache
+                .values()
+                .filter(|a| a.machine_id == *machine)
+                .map(|a| a.agent_id)
+                .collect()
+        };
+        for agent in agents {
+            if reauth_evidence_busy(ctx, &agent, machine).await {
+                return ReauthCheck::Busy;
+            }
+        }
+    }
+    ReauthCheck::Deny(reason)
+}
+
+/// Re-run `gate` against current state once. Distinguishes authority deny
+/// from evidence-store lock contention.
 async fn reevaluate(
     gate: &StreamGate,
     ctx: &ReauthCtx,
     verify: &AttestationVerifyCtx,
     policy: &ConnectPolicy,
-) -> Result<StreamAuthority, &'static str> {
+) -> ReauthCheck {
     let now_secs = verify.now_ms / 1000;
     match gate {
         StreamGate::Outbound {
             peer_agent,
             machine,
         } => {
-            let resolved = crate::Agent::gate_peer_outbound_at(
+            let resolved = match crate::Agent::gate_peer_outbound_at(
                 &ctx.discovery_cache,
                 &ctx.contact_store,
                 &ctx.revocation_set,
@@ -406,11 +489,14 @@ async fn reevaluate(
                 true,
             )
             .await
-            .map_err(|e| network_reason(&e))?;
+            {
+                Ok(resolved) => resolved,
+                Err(e) => return reauth_check_after_deny(gate, ctx, network_reason(&e)).await,
+            };
             if resolved != *machine {
-                return Err("machine_changed");
+                return ReauthCheck::Deny("machine_changed");
             }
-            Ok(StreamAuthority::PeerTrust)
+            ReauthCheck::Allow(StreamAuthority::PeerTrust)
         }
         StreamGate::InboundAttested {
             opener,
@@ -421,7 +507,7 @@ async fn reevaluate(
             // the forwarder's gate for the attested opener — the same two
             // layers the stream cleared at admission.
             // ADR-0074 §4: same local-only bound as outbound / AttestationVerifyCtx.
-            crate::Agent::gate_peer_machine_inbound_at(
+            if let Err(e) = crate::Agent::gate_peer_machine_inbound_at(
                 &ctx.discovery_cache,
                 &ctx.contact_store,
                 &ctx.revocation_set,
@@ -433,13 +519,16 @@ async fn reevaluate(
                 true,
             )
             .await
-            .map_err(|e| network_reason(&e))?;
-            super::authorize_attested_opener(opener, machine, target, policy, verify)
-                .await
-                .map_err(denial_reason)
+            {
+                return reauth_check_after_deny(gate, ctx, network_reason(&e)).await;
+            }
+            match super::authorize_attested_opener(opener, machine, target, policy, verify).await {
+                Ok(authority) => ReauthCheck::Allow(authority),
+                Err(denial) => reauth_check_after_deny(gate, ctx, denial_reason(denial)).await,
+            }
         }
         StreamGate::InboundLegacy { machine, target } => {
-            let agents = crate::Agent::gate_peer_machine_inbound_at(
+            let agents = match crate::Agent::gate_peer_machine_inbound_at(
                 &ctx.discovery_cache,
                 &ctx.contact_store,
                 &ctx.revocation_set,
@@ -451,19 +540,54 @@ async fn reevaluate(
                 true,
             )
             .await
-            .map_err(|e| network_reason(&e))?;
+            {
+                Ok(agents) => agents,
+                Err(e) => return reauth_check_after_deny(gate, ctx, network_reason(&e)).await,
+            };
             for agent in &agents {
-                evaluate_connect_gate(
+                if let Err(reason) = evaluate_connect_gate(
                     true,
                     Some(TrustDecision::Accept),
                     policy,
                     agent,
                     machine,
                     target,
-                )
-                .map_err(connect_reason)?;
+                ) {
+                    return reauth_check_after_deny(gate, ctx, connect_reason(reason)).await;
+                }
             }
-            Ok(StreamAuthority::AclEntry)
+            ReauthCheck::Allow(StreamAuthority::AclEntry)
+        }
+    }
+}
+
+/// Re-check until a fresh allow/deny, or the pass deadline (busy → short
+/// backoff; never keep a stale allow past the deadline).
+async fn reevaluate_until(
+    gate: &StreamGate,
+    ctx: &ReauthCtx,
+    verify: &AttestationVerifyCtx,
+    policy: &ConnectPolicy,
+    deadline: tokio::time::Instant,
+) -> Result<StreamAuthority, &'static str> {
+    loop {
+        match reevaluate(gate, ctx, verify, policy).await {
+            ReauthCheck::Allow(authority) => return Ok(authority),
+            ReauthCheck::Deny(reason) => return Err(reason),
+            ReauthCheck::Busy => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err("reauth_deadline");
+                }
+                // No useful retry left inside the budget: fail closed now
+                // rather than sleeping onto the deadline Instant (races
+                // observers that use a strict EVENT_BOUND timeout).
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining <= REAUTH_BUSY_BACKOFF {
+                    return Err("reauth_deadline");
+                }
+                tokio::time::sleep(REAUTH_BUSY_BACKOFF).await;
+            }
         }
     }
 }
@@ -500,7 +624,12 @@ pub(crate) async fn check_gate(
     ctx: &ReauthCtx,
 ) -> Result<StreamAuthority, &'static str> {
     let (policy, verify) = pass_inputs(ctx);
-    reevaluate(gate, ctx, &verify, &policy).await
+    match reevaluate(gate, ctx, &verify, &policy).await {
+        ReauthCheck::Allow(authority) => Ok(authority),
+        ReauthCheck::Deny(reason) => Err(reason),
+        // Single-shot checks have no busy retry budget.
+        ReauthCheck::Busy => Err("evidence_busy"),
+    }
 }
 
 /// Keep the earliest pending reauth trigger time.
@@ -516,6 +645,9 @@ fn note_reauth_event(pending: &mut Option<tokio::time::Instant>, at: tokio::time
 /// are evaluated once per pass. `deadline` is the absolute fail-closed cut-off
 /// (normally the triggering event's time plus [`REAUTH_PASS_BUDGET`]); streams
 /// still unchecked when it expires are torn down.
+///
+/// Store lock contention (`Busy`) retries with [`REAUTH_BUSY_BACKOFF`] until
+/// a fresh allow/deny or the deadline — contention alone does not tear down.
 pub(crate) async fn reauth_pass(
     live: &LiveStreams,
     ctx: &ReauthCtx,
@@ -535,9 +667,12 @@ pub(crate) async fn reauth_pass(
             Some(verdict) => verdict.clone(),
             None if tokio::time::Instant::now() >= deadline => Err("reauth_deadline"),
             None => {
+                // timeout_at still covers a blocked await (e.g. discovery
+                // cache write held); Busy retries run inside and also stop
+                // at `deadline` without keeping a stale allow.
                 let verdict = match tokio::time::timeout_at(
                     deadline,
-                    reevaluate(&gate, ctx, &verify, &policy),
+                    reevaluate_until(&gate, ctx, &verify, &policy, deadline),
                 )
                 .await
                 {
