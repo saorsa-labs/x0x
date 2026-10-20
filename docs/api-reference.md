@@ -2640,6 +2640,16 @@ Remote machines' digests reach an owner only through a later approved
 announcement change; until then the owner-side census is
 `GET /owner/machines` (see [Device sync](#device-sync-adr-0041-tier-1)).
 
+**Minimum supported version and support window (#1384, D35).** The same
+response carries `minimum_supported_version` and `support_window`. Both ship
+as explicit `null` — by David's 20 Oct 2026 ruling the fields exist now and
+the VALUES are set by David later; `null` is the published state ("no fleet
+minimum published yet"), not a missing field. They are not part of the
+digest preimage: they are centrally published fleet policy, not per-machine
+policy, so they add nothing to a machine-to-machine census comparison. When
+David sets them, the change is a value substitution here and in the daemon —
+no wire or code-shape change.
+
 **The serving daemon owns installation.** `x0x upgrade --apply` sends an
 authenticated `POST /upgrade/apply` through the normal daemon client, using
 the selected `--name` or `--api` and its bearer token. It does not install
