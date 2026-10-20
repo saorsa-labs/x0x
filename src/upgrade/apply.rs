@@ -49,40 +49,37 @@ async fn probe_retry_delay_for_install(
     install: PathBuf,
     version: String,
 ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
-    probe_retry_delay_for_bound_install(install, version, false).await
-}
-
-#[cfg(unix)]
-async fn probe_retry_delay_for_bound_install(
-    install: PathBuf,
-    version: String,
-    staged: bool,
-) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
     tokio::task::spawn_blocking(move || {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
-        if staged {
-            ensure_canonical_install(&install)?;
-        }
-        let admission = super::probe::inspect_admission(&install, &version)
-            .map_err(|error| UpgradeError::Other(error.to_string()))?;
-        // Inspect and read under the same lock. An expired durable
-        // InterruptedWait is an immediate retry, not "no pending work".
-        let state = super::probe::read_state(&install)
-            .map_err(|error| UpgradeError::Other(error.to_string()))?;
-        Ok(state
-            .filter(|state| {
-                state.version == version && state.phase == super::probe::ProbePhase::InterruptedWait
-            })
-            .map(|state| super::probe_retry::RetryWait {
-                delay: match admission {
-                    super::probe::Admission::Ready => std::time::Duration::ZERO,
-                    super::probe::Admission::Waiting { retry_after } => retry_after,
-                },
-                transaction_id: state.transaction_id,
-            }))
+        probe_retry_state_under_lock(&install, &version)
     })
     .await
     .map_err(|error| UpgradeError::Other(format!("probe retry-state worker failed: {error}")))?
+}
+
+/// The caller holds the install lock and has completed any staging refusal
+/// checks. Inspection can acknowledge durable interrupted-wait clock progress.
+#[cfg(unix)]
+fn probe_retry_state_under_lock(
+    install: &Path,
+    version: &str,
+) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+    let admission = super::probe::inspect_admission(install, version)
+        .map_err(|error| UpgradeError::Other(error.to_string()))?;
+    // An expired durable InterruptedWait is an immediate retry, not absence.
+    let state = super::probe::read_state(install)
+        .map_err(|error| UpgradeError::Other(error.to_string()))?;
+    Ok(state
+        .filter(|state| {
+            state.version == version && state.phase == super::probe::ProbePhase::InterruptedWait
+        })
+        .map(|state| super::probe_retry::RetryWait {
+            delay: match admission {
+                super::probe::Admission::Ready => std::time::Duration::ZERO,
+                super::probe::Admission::Waiting { retry_after } => retry_after,
+            },
+            transaction_id: state.transaction_id,
+        }))
 }
 
 /// Recheck the carried canonical identity after waiting for its lock. Record
@@ -613,8 +610,37 @@ impl AutoApplyUpgrader {
         {
             let install = self.install_path()?;
             let version = version.to_owned();
-            if self.staging.is_some() {
-                probe_retry_delay_for_bound_install(install, version, true).await
+            if let Some(gate) = &self.staging {
+                if gate.request.version != version {
+                    return Err(UpgradeError::Other("staging retry release changed".into()));
+                }
+                let identity = restart::resolve_staging_identity(
+                    self.stop_on_upgrade,
+                    &install,
+                    self.restart_context.data_dir.as_deref(),
+                    self.restart_context.api_addr,
+                )
+                .await
+                .map_err(UpgradeError::from)?;
+                let gate = gate.clone();
+                run_owned_blocking(move |caller_alive| {
+                    let _lock = super::acquire_host_upgrade_lock(&install)?;
+                    let check_custody = || {
+                        if caller_alive.load(Ordering::Acquire) {
+                            Ok(())
+                        } else {
+                            Err(UpgradeError::Other(
+                                "staging retry cancelled before record I/O".into(),
+                            ))
+                        }
+                    };
+                    check_custody()?;
+                    ensure_canonical_install(&install)?;
+                    gate.check_retry_policy(&install, &identity)?;
+                    check_custody()?;
+                    probe_retry_state_under_lock(&install, &version)
+                })
+                .await
             } else {
                 probe_retry_delay_for_install(install, version).await
             }
