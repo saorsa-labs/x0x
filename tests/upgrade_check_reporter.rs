@@ -62,7 +62,7 @@ fn run_reporter_fixture(enabled: bool, skip: bool, prereleases: bool, outcome: &
         .output()
         .expect("execute production reporter decision");
     assert!(
-        output.status.success() == !(enabled && !skip && outcome == "error"),
+        output.status.success() != (enabled && !skip && outcome == "error"),
         "reporter execution failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
