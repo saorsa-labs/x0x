@@ -15,6 +15,9 @@ pub(crate) mod probe_retry;
 pub mod restart;
 pub mod rollout;
 pub mod signature;
+// Dormant receipt core; trigger admission is wired in the next slice.
+#[allow(dead_code)]
+pub(crate) mod staging;
 pub mod verification_probe;
 
 use std::fs::{File, OpenOptions};
