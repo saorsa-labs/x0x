@@ -44,12 +44,34 @@ use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use crate::DiscoveredAgent;
 
+/// Unix-seconds clock held by [`OwnerTrust`]. Injected at construction so
+/// grant/cert expiry cannot take a caller-supplied stamp (tests and production
+/// share one source). Distinct from `forward::teardown::Clock` (unix ms) to
+/// avoid a circular module edge.
+pub(crate) type TrustClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// System unix-seconds clock (0 if unreadable).
+#[must_use]
+pub(crate) fn system_trust_clock() -> TrustClock {
+    Arc::new(unix_now_secs)
+}
+
+/// Result of a nonblocking local-authority evaluation.
+///
+/// `Busy` means a `try_usable` evidence read was contended (`Err(())`). Gates
+/// surface this to teardown; bool APIs map it fail-closed to `false` / empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NonblockingEval<T> {
+    Done(T),
+    Busy,
+}
+
 /// The local owner and the owner device set used to decide owner trust.
 ///
 /// Cheap to clone: the device-set slot is shared, so installing the store
 /// once (at daemon startup) is seen by every clone, including the stream
 /// accept loop.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct OwnerTrust {
     local_owner: Option<UserId>,
     evidence: Arc<std::sync::RwLock<std::sync::Weak<crate::peer_evidence::EvidenceRuntime>>>,
@@ -67,6 +89,23 @@ pub struct OwnerTrust {
     /// #926 owner-side grant redelivery outbox. Shared slot like `grants`.
     grant_outbox:
         Arc<std::sync::RwLock<Option<Arc<crate::share_grant::outbox::GrantRedeliveryOutbox>>>>,
+    /// Construction-injected unix-seconds clock for grant/cert expiry.
+    pub(crate) clock: TrustClock,
+}
+
+impl Default for OwnerTrust {
+    fn default() -> Self {
+        Self {
+            local_owner: None,
+            evidence: Default::default(),
+            devices: Arc::new(std::sync::RwLock::new(None)),
+            bindings: AuthenticatedMachineBindings::default(),
+            announced: Arc::new(std::sync::RwLock::new(None)),
+            grants: Arc::new(std::sync::RwLock::new(None)),
+            grant_outbox: Arc::new(std::sync::RwLock::new(None)),
+            clock: system_trust_clock(),
+        }
+    }
 }
 
 impl std::fmt::Debug for OwnerTrust {
@@ -103,7 +142,24 @@ impl OwnerTrust {
             announced: Arc::new(std::sync::RwLock::new(None)),
             grants: Arc::new(std::sync::RwLock::new(None)),
             grant_outbox: Arc::new(std::sync::RwLock::new(None)),
+            clock: system_trust_clock(),
         }
+    }
+
+    /// Replace the construction-injected clock (tests / paused-tokio reauth).
+    #[must_use]
+    /// Inject a clock (tests / deterministic expiry). Production keeps the
+    /// system default from [`Self::new`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_clock(mut self, clock: TrustClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Current unix seconds from the construction-injected clock.
+    #[must_use]
+    pub(crate) fn now_unix_secs(&self) -> u64 {
+        (self.clock)()
     }
 
     /// ADR 0115 §2: install the announced-binding store.
@@ -346,31 +402,27 @@ impl OwnerTrust {
         agent_id: &AgentId,
         machine_id: &MachineId,
     ) -> crate::share_grant::GrantAccess {
-        self.grant_access_at_inner(
+        self.grant_access_at(
             contact_store,
             discovery_cache,
             revocation_set,
             agent_id,
             machine_id,
-            None,
             true,
         )
         .await
         .access
     }
 
-    /// [`Self::grant_access`] with an explicit clock (ADR-0074 §4 re-check).
+    /// [`Self::grant_access`] with optional EvidenceV1 wait/lookup (ADR-0074 §4).
     ///
-    /// After the contact-store await, the effective clock is
-    /// `max(now_unix, wall)`. A caller stamp captured before earlier awaits
-    /// (`evaluate_pair_with`, discovery reads) cannot admit a grant that
-    /// expired during those waits, while a reauth / test clock that runs
-    /// ahead of wall time (paused tokio) is preserved.
+    /// Clock is construction-injected ([`Self::with_clock`]); callers cannot
+    /// pass now. After the contact-store await, expiry uses [`Self::now_unix_secs`].
     ///
     /// With `allow_evidence_lookup = false` the evaluation still reads local
     /// usable evidence but skips EvidenceV1 wait/lookup, so a reauth pass
-    /// stays inside the ADR-0074 five-second bound.
-    #[allow(clippy::too_many_arguments)]
+    /// stays inside the ADR-0074 five-second bound. Contended `try_usable`
+    /// collapses to empty access here; gates use [`Self::grant_access_nonblocking`].
     pub(crate) async fn grant_access_at(
         &self,
         contact_store: &RwLock<ContactStore>,
@@ -378,40 +430,58 @@ impl OwnerTrust {
         revocation_set: &RwLock<RevocationSet>,
         agent_id: &AgentId,
         machine_id: &MachineId,
-        now_unix: u64,
         allow_evidence_lookup: bool,
     ) -> crate::share_grant::GrantAccessEval {
-        self.grant_access_at_inner(
-            contact_store,
-            discovery_cache,
-            revocation_set,
-            agent_id,
-            machine_id,
-            Some(now_unix),
-            allow_evidence_lookup,
-        )
-        .await
+        match self
+            .grant_access_eval(
+                contact_store,
+                discovery_cache,
+                revocation_set,
+                agent_id,
+                machine_id,
+                allow_evidence_lookup,
+            )
+            .await
+        {
+            NonblockingEval::Done(access) => access,
+            NonblockingEval::Busy => crate::share_grant::GrantAccessEval::default(),
+        }
     }
 
-    /// Shared body for [`Self::grant_access`] / [`Self::grant_access_at`].
+    /// Nonblocking grant eval for local-authority reauth/gates.
     ///
-    /// `now_unix = None` means wall clock after the first contact-store
-    /// read. `Some(n)` becomes `max(n, wall)` after that read so a stale
-    /// caller stamp cannot outlive the grant across an await, while a
-    /// paused-tokio reauth clock ahead of wall still drives expiry.
-    #[allow(clippy::too_many_arguments)]
-    async fn grant_access_at_inner(
+    /// `Busy` when a contended evidence read blocked grant authority for this
+    /// pair (`allow_evidence_lookup = false` path).
+    pub(crate) async fn grant_access_nonblocking(
         &self,
         contact_store: &RwLock<ContactStore>,
         discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
         revocation_set: &RwLock<RevocationSet>,
         agent_id: &AgentId,
         machine_id: &MachineId,
-        now_unix: Option<u64>,
+    ) -> NonblockingEval<crate::share_grant::GrantAccessEval> {
+        self.grant_access_eval(
+            contact_store,
+            discovery_cache,
+            revocation_set,
+            agent_id,
+            machine_id,
+            false,
+        )
+        .await
+    }
+
+    async fn grant_access_eval(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
         allow_evidence_lookup: bool,
-    ) -> crate::share_grant::GrantAccessEval {
+    ) -> NonblockingEval<crate::share_grant::GrantAccessEval> {
         let Some(store) = self.share_grant_store() else {
-            return crate::share_grant::GrantAccessEval::default();
+            return NonblockingEval::Done(crate::share_grant::GrantAccessEval::default());
         };
         let base = {
             let contacts = contact_store.read().await;
@@ -420,12 +490,9 @@ impl OwnerTrust {
                 machine_id,
             })
         };
-        // Wall clock after the contact-store await. Instant adjustment
-        // inside evaluate starts too late to cover this wait. `max` with a
-        // caller stamp closes the stale-Some admission path without
-        // discarding paused-tokio reauth clocks (Codex P2 / #1488 RC9).
-        let wall = unix_now_secs();
-        let now_unix = now_unix.map_or(wall, |n| n.max(wall));
+        // Construction-injected clock after the contact-store await; callers
+        // cannot pass now (Codex P2 / #1488 RC10).
+        let now_unix = self.now_unix_secs();
         let rejected = |decision: TrustDecision| {
             matches!(
                 decision,
@@ -433,10 +500,10 @@ impl OwnerTrust {
             )
         };
         if rejected(base) {
-            return crate::share_grant::GrantAccessEval::default();
+            return NonblockingEval::Done(crate::share_grant::GrantAccessEval::default());
         }
         let evidence = self.evidence();
-        let access = crate::share_grant::evaluate_grant_access_with_evidence(
+        let access = match crate::share_grant::evaluate_grant_access_with_evidence(
             &store,
             &self.bindings,
             discovery_cache,
@@ -447,7 +514,11 @@ impl OwnerTrust {
             evidence.as_deref(),
             allow_evidence_lookup,
         )
-        .await;
+        .await
+        {
+            Ok(access) => access,
+            Err(()) => return NonblockingEval::Busy,
+        };
         // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin
         // that landed while the grant was being evaluated still wins.
         let last = {
@@ -458,9 +529,9 @@ impl OwnerTrust {
             })
         };
         if rejected(last) {
-            return crate::share_grant::GrantAccessEval::default();
+            return NonblockingEval::Done(crate::share_grant::GrantAccessEval::default());
         }
-        access
+        NonblockingEval::Done(access)
     }
 
     /// The local owner, if this install has one.
@@ -571,7 +642,7 @@ impl OwnerTrust {
             return false;
         };
         drop(bindings);
-        let now_ms = unix_now_secs().saturating_mul(1000);
+        let now_ms = self.now_unix_secs().saturating_mul(1000);
         devices.try_evidence_enrolled(&machine, &owner, now_ms) == Some(true)
     }
 
@@ -602,6 +673,7 @@ impl OwnerTrust {
     /// fallback uses [`EvidenceRuntime::try_usable`] so a contended store
     /// reads as no evidence (fail closed). Reauth needs this: ADR-0074 §4's
     /// five-second bound cannot interrupt a synchronous `usable()` wait.
+    /// Gates that must surface Busy use [`Self::is_owner_trusted_nonblocking`].
     pub(crate) async fn is_owner_trusted_with(
         &self,
         discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
@@ -610,30 +682,75 @@ impl OwnerTrust {
         machine_id: &MachineId,
         nonblocking_evidence: bool,
     ) -> bool {
+        if nonblocking_evidence {
+            match self
+                .is_owner_trusted_nonblocking(discovery_cache, revocation_set, agent_id, machine_id)
+                .await
+            {
+                NonblockingEval::Done(trusted) => trusted,
+                NonblockingEval::Busy => false,
+            }
+        } else {
+            match self
+                .is_owner_trusted_eval(discovery_cache, revocation_set, agent_id, machine_id, false)
+                .await
+            {
+                NonblockingEval::Done(trusted) => trusted,
+                NonblockingEval::Busy => false,
+            }
+        }
+    }
+
+    /// Nonblocking owner-trust probe for local-authority gates/reauth.
+    pub(crate) async fn is_owner_trusted_nonblocking(
+        &self,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+    ) -> NonblockingEval<bool> {
+        self.is_owner_trusted_eval(discovery_cache, revocation_set, agent_id, machine_id, true)
+            .await
+    }
+
+    async fn is_owner_trusted_eval(
+        &self,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        nonblocking_evidence: bool,
+    ) -> NonblockingEval<bool> {
         let Some(owner) = self.local_owner else {
-            return false;
+            return NonblockingEval::Done(false);
         };
         let Some(devices) = self.device_store() else {
-            return false;
+            return NonblockingEval::Done(false);
         };
-        let now_ms = unix_now_secs().saturating_mul(1000);
-        // Contended lock → no evidence (fail closed; matches share_grant's
-        // local reauth path). Reauth cannot block here: ADR-0074 §4's bound
-        // uses timeout_at, which does not interrupt a synchronous usable().
-        let usable_view = |runtime: &crate::peer_evidence::EvidenceRuntime| {
-            if nonblocking_evidence {
-                runtime
-                    .try_usable(*agent_id, *machine_id, now_ms)
-                    .ok()
-                    .flatten()
-            } else {
-                runtime.usable(*agent_id, *machine_id, now_ms)
-            }
-        };
+        let now_ms = self.now_unix_secs().saturating_mul(1000);
+        // Contended try_usable → Busy (gates); bool API maps Busy → false.
+        // Reauth cannot block here: ADR-0074 §4's bound uses timeout_at,
+        // which does not interrupt a synchronous usable().
+        let usable_view =
+            |runtime: &crate::peer_evidence::EvidenceRuntime| -> NonblockingEval<Option<_>> {
+                if nonblocking_evidence {
+                    match runtime.try_usable(*agent_id, *machine_id, now_ms) {
+                        Ok(view) => NonblockingEval::Done(view),
+                        Err(()) => NonblockingEval::Busy,
+                    }
+                } else {
+                    NonblockingEval::Done(runtime.usable(*agent_id, *machine_id, now_ms))
+                }
+            };
         match crate::dm_inbox::authenticated_machine_binding(&self.bindings, agent_id).await {
             Some(bound) if bound == *machine_id => {}
-            None if self.evidence().and_then(|e| usable_view(&e)).is_some() => {}
-            _ => return false,
+            None => match self.evidence().map(|e| usable_view(&e)) {
+                None => return NonblockingEval::Done(false),
+                Some(NonblockingEval::Busy) => return NonblockingEval::Busy,
+                Some(NonblockingEval::Done(None)) => return NonblockingEval::Done(false),
+                Some(NonblockingEval::Done(Some(_))) => {}
+            },
+            _ => return NonblockingEval::Done(false),
         }
         let cert = {
             let cache = discovery_cache.read().await;
@@ -641,13 +758,16 @@ impl OwnerTrust {
                 .get(agent_id)
                 .and_then(|entry| entry.agent_certificate.clone())
         };
-        let cert = cert.or_else(|| {
-            self.evidence()
-                .and_then(|e| usable_view(&e))
-                .and_then(|v| v.certificate.clone())
-        });
+        let cert = match cert {
+            Some(cert) => Some(cert),
+            None => match self.evidence().map(|e| usable_view(&e)) {
+                None => None,
+                Some(NonblockingEval::Busy) => return NonblockingEval::Busy,
+                Some(NonblockingEval::Done(view)) => view.and_then(|v| v.certificate.clone()),
+            },
+        };
         let Some(cert) = cert else {
-            return false;
+            return NonblockingEval::Done(false);
         };
         let revoked = {
             let revoked = revocation_set.read().await;
@@ -655,10 +775,10 @@ impl OwnerTrust {
                 || revoked.is_machine_revoked(machine_id)
                 || revoked.is_binding_revoked(agent_id, machine_id)
         };
-        if !certificate_chains_to_owner(&owner, agent_id, &cert, revoked, unix_now_secs()) {
-            return false;
+        if !certificate_chains_to_owner(&owner, agent_id, &cert, revoked, self.now_unix_secs()) {
+            return NonblockingEval::Done(false);
         }
-        devices.is_enrolled(machine_id, &owner).await
+        NonblockingEval::Done(devices.is_enrolled(machine_id, &owner).await)
     }
 
     /// Evaluate trust for a pair with the owner-trust input applied, in the
@@ -690,7 +810,9 @@ impl OwnerTrust {
     }
 
     /// [`Self::evaluate_pair`]; with `nonblocking_evidence` owner-trust's
-    /// evidence fallback never blocks (ADR-0074 §4 reauth).
+    /// evidence fallback never blocks (ADR-0074 §4 reauth). Contended
+    /// evidence maps to `owner_trusted = false`; gates use
+    /// [`Self::evaluate_pair_nonblocking`] for Busy.
     pub(crate) async fn evaluate_pair_with(
         &self,
         contact_store: &RwLock<ContactStore>,
@@ -700,6 +822,83 @@ impl OwnerTrust {
         machine_id: &MachineId,
         nonblocking_evidence: bool,
     ) -> PairTrust {
+        if nonblocking_evidence {
+            match self
+                .evaluate_pair_nonblocking(
+                    contact_store,
+                    discovery_cache,
+                    revocation_set,
+                    agent_id,
+                    machine_id,
+                )
+                .await
+            {
+                NonblockingEval::Done(pair) => pair,
+                NonblockingEval::Busy => {
+                    let ctx = TrustContext {
+                        agent_id,
+                        machine_id,
+                    };
+                    let decision = {
+                        let contacts = contact_store.read().await;
+                        TrustEvaluator::new(&contacts).evaluate(&ctx)
+                    };
+                    PairTrust {
+                        decision,
+                        owner_trusted: false,
+                    }
+                }
+            }
+        } else {
+            match self
+                .evaluate_pair_eval(
+                    contact_store,
+                    discovery_cache,
+                    revocation_set,
+                    agent_id,
+                    machine_id,
+                    false,
+                )
+                .await
+            {
+                NonblockingEval::Done(pair) => pair,
+                NonblockingEval::Busy => PairTrust {
+                    decision: TrustDecision::Unknown,
+                    owner_trusted: false,
+                },
+            }
+        }
+    }
+
+    /// Nonblocking pair eval for local-authority gates/reauth.
+    pub(crate) async fn evaluate_pair_nonblocking(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+    ) -> NonblockingEval<PairTrust> {
+        self.evaluate_pair_eval(
+            contact_store,
+            discovery_cache,
+            revocation_set,
+            agent_id,
+            machine_id,
+            true,
+        )
+        .await
+    }
+
+    async fn evaluate_pair_eval(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        nonblocking_evidence: bool,
+    ) -> NonblockingEval<PairTrust> {
         let ctx = TrustContext {
             agent_id,
             machine_id,
@@ -712,13 +911,13 @@ impl OwnerTrust {
             base,
             TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
         ) {
-            return PairTrust {
+            return NonblockingEval::Done(PairTrust {
                 decision: base,
                 owner_trusted: false,
-            };
+            });
         }
-        if !self
-            .is_owner_trusted_with(
+        let owner_trusted = match self
+            .is_owner_trusted_eval(
                 discovery_cache,
                 revocation_set,
                 agent_id,
@@ -727,10 +926,14 @@ impl OwnerTrust {
             )
             .await
         {
-            return PairTrust {
+            NonblockingEval::Busy => return NonblockingEval::Busy,
+            NonblockingEval::Done(trusted) => trusted,
+        };
+        if !owner_trusted {
+            return NonblockingEval::Done(PairTrust {
                 decision: base,
                 owner_trusted: false,
-            };
+            });
         }
         let decision = {
             let contacts = contact_store.read().await;
@@ -738,13 +941,13 @@ impl OwnerTrust {
                 .with_owner_trust(true)
                 .evaluate(&ctx)
         };
-        PairTrust {
+        NonblockingEval::Done(PairTrust {
             decision,
             owner_trusted: !matches!(
                 decision,
                 TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
             ),
-        }
+        })
     }
 }
 

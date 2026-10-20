@@ -467,7 +467,9 @@ pub(crate) struct AttestationVerifyCtx {
     >,
     contact_store: std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
     own_machine_id: MachineId,
-    now_ms: u64,
+    /// Unix-ms clock set at construction (system / ReauthCtx). Freshness and
+    /// post-await cert expiry read `(clock)()`; callers cannot stamp `now`.
+    clock: teardown::Clock,
     revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
     move_state: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
     /// ADR-0070 §1 owner trust: feeds the trust decision and the
@@ -539,8 +541,9 @@ async fn decide_inbound_attested_with_authority(
         );
         return Err(ConnectDenialReason::AttestationFailed);
     }
+    let now_ms = (ctx.clock)();
     // Stale: older than the TTL window.
-    if ctx.now_ms
+    if now_ms
         > header
             .issued_at_ms
             .saturating_add(FORWARD_V2_ATTESTATION_TTL_MS)
@@ -549,23 +552,19 @@ async fn decide_inbound_attested_with_authority(
             target: "x0x::forward",
             reason = "stale_attestation",
             issued_at_ms = header.issued_at_ms,
-            now_ms = ctx.now_ms,
+            now_ms,
             ttl_ms = FORWARD_V2_ATTESTATION_TTL_MS,
             "forward v2 attestation denied: attestation older than TTL"
         );
         return Err(ConnectDenialReason::AttestationFailed);
     }
     // Future: more than the skew allowance ahead of our clock.
-    if header.issued_at_ms
-        > ctx
-            .now_ms
-            .saturating_add(FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS)
-    {
+    if header.issued_at_ms > now_ms.saturating_add(FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS) {
         tracing::warn!(
             target: "x0x::forward",
             reason = "future_attestation",
             issued_at_ms = header.issued_at_ms,
-            now_ms = ctx.now_ms,
+            now_ms,
             skew_ms = FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS,
             "forward v2 attestation denied: attestation dated beyond clock-skew allowance"
         );
@@ -637,10 +636,20 @@ async fn decide_inbound_attested_with_authority(
     // The opener is now cryptographically authenticated: authorize that
     // specific agent against current authority. The same check re-runs on
     // every live stream (ADR-0074 §4, `teardown`).
-    let authority =
-        authorize_attested_opener(&header.opener_agent_id, peer_machine, &target, policy, ctx)
-            .await
-            .map_err(AuthzDenial::connect_reason)?;
+    let authority = match authorize_attested_opener(
+        &header.opener_agent_id,
+        peer_machine,
+        &target,
+        policy,
+        ctx,
+    )
+    .await
+    {
+        LocalAuthorityOutcome::Allow(a) => a,
+        LocalAuthorityOutcome::Deny(d) => return Err(d.connect_reason()),
+        // Admission uses blocking evidence reads; Busy is reauth-only.
+        LocalAuthorityOutcome::Busy => return Err(ConnectDenialReason::AttestationFailed),
+    };
     Ok((target, authority))
 }
 
@@ -656,6 +665,102 @@ async fn decide_inbound_attested(
     decide_inbound_attested_with_authority(header, policy, peer_machine, ctx)
         .await
         .map(|(target, _)| target)
+}
+
+/// Outcome of a local-authority gate or authorize evaluation (crate-private).
+///
+/// `Busy` means any nonblocking authority read performed during this
+/// evaluation was contended (`try_usable` → `Err`). Teardown retries on Busy
+/// and treats Deny as a fresh authority verdict — it must not probe agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalAuthorityOutcome<T, E> {
+    Allow(T),
+    Deny(E),
+    Busy,
+}
+
+/// Gate error for local-authority (`local_authority_only`) peer gates.
+///
+/// `Busy` when any resident's nonblocking authority read during that eval
+/// was contended (`try_usable` → `Err`).
+#[derive(Debug)]
+pub(crate) enum PeerGateError {
+    Busy,
+    Network(NetworkError),
+}
+
+impl From<NetworkError> for PeerGateError {
+    fn from(e: NetworkError) -> Self {
+        Self::Network(e)
+    }
+}
+
+impl PeerGateError {
+    pub(crate) fn into_outcome<T>(self) -> LocalAuthorityOutcome<T, NetworkError> {
+        match self {
+            Self::Busy => LocalAuthorityOutcome::Busy,
+            Self::Network(e) => LocalAuthorityOutcome::Deny(e),
+        }
+    }
+
+    /// Admission / new-stream fail-closed mapping (Busy is not a public error).
+    pub(crate) fn fail_closed_admission(self, agent_id: [u8; 32]) -> NetworkError {
+        match self {
+            Self::Busy => NetworkError::PeerNotVerified { agent_id },
+            Self::Network(e) => e,
+        }
+    }
+}
+
+/// Reauth wrapper for [`crate::Agent::gate_peer_outbound_at`].
+///
+/// Busy comes from the gate itself when the peer agent's nonblocking
+/// authority read was contended.
+pub(crate) async fn gate_peer_outbound_outcome(
+    ctx: &teardown::ReauthCtx,
+    peer_agent: &AgentId,
+) -> LocalAuthorityOutcome<MachineId, NetworkError> {
+    match crate::Agent::gate_peer_outbound_at(
+        &ctx.discovery_cache,
+        &ctx.contact_store,
+        &ctx.revocation_set,
+        &ctx.move_state,
+        &ctx.owner_trust,
+        &ctx.announced_bindings,
+        &ctx.authenticated_bindings,
+        peer_agent,
+        true,
+    )
+    .await
+    {
+        Ok(machine) => LocalAuthorityOutcome::Allow(machine),
+        Err(e) => e.into_outcome(),
+    }
+}
+
+/// Reauth wrapper for [`crate::Agent::gate_peer_machine_inbound_at`].
+///
+/// Busy when **any** resident agent's nonblocking authority read was
+/// contended (not only the attested opener).
+pub(crate) async fn gate_peer_machine_inbound_outcome(
+    ctx: &teardown::ReauthCtx,
+    machine: &MachineId,
+) -> LocalAuthorityOutcome<Vec<AgentId>, NetworkError> {
+    match crate::Agent::gate_peer_machine_inbound_at(
+        &ctx.discovery_cache,
+        &ctx.contact_store,
+        &ctx.revocation_set,
+        &ctx.move_state,
+        &ctx.connect_policy,
+        &ctx.owner_trust,
+        machine,
+        true,
+    )
+    .await
+    {
+        Ok(agents) => LocalAuthorityOutcome::Allow(agents),
+        Err(e) => e.into_outcome(),
+    }
 }
 
 /// Why [`authorize_attested_opener`] refused (internal). Maps onto the wire
@@ -702,20 +807,37 @@ impl AuthzDenial {
 ///
 /// Returns the authority the stream holds: the ACL entry kind that matched
 /// and, for a grant, the Connect grants covering the target port.
+///
+/// When a nonblocking authority read inside this path is contended,
+/// returns [`LocalAuthorityOutcome::Busy`].
 pub(crate) async fn authorize_attested_opener(
     opener: &AgentId,
     peer_machine: &MachineId,
     target: &SocketAddr,
     policy: &ConnectPolicy,
     ctx: &AttestationVerifyCtx,
-) -> Result<teardown::StreamAuthority, AuthzDenial> {
+) -> LocalAuthorityOutcome<teardown::StreamAuthority, AuthzDenial> {
+    authorize_attested_opener_inner(opener, peer_machine, target, policy, ctx).await
+}
+
+async fn authorize_attested_opener_inner(
+    opener: &AgentId,
+    peer_machine: &MachineId,
+    target: &SocketAddr,
+    policy: &ConnectPolicy,
+    ctx: &AttestationVerifyCtx,
+) -> LocalAuthorityOutcome<teardown::StreamAuthority, AuthzDenial> {
+    use crate::owner_trust::NonblockingEval;
+
     let agent = {
         let cache = ctx.discovery_cache.read().await;
         cache.get(opener).cloned()
-    }
-    .ok_or(AuthzDenial::AgentUnknown)?;
+    };
+    let Some(agent) = agent else {
+        return LocalAuthorityOutcome::Deny(AuthzDenial::AgentUnknown);
+    };
     if agent.machine_id != *peer_machine {
-        return Err(AuthzDenial::AgentNotOnMachine);
+        return LocalAuthorityOutcome::Deny(AuthzDenial::AgentNotOnMachine);
     }
 
     // ── Trust evaluation (#204 must-fix 3): evaluate the attested agent's
@@ -723,40 +845,72 @@ pub(crate) async fn authorize_attested_opener(
     // must be denied here (same pattern as the stream gate).
     // ADR-0070 §1: owner trust is an input to that decision, and the only
     // way a `principal = "owner"` ACL entry can match.
-    // ADR-0074 §4: reauth (`local_authority_only`) must not block on a
-    // contended evidence store inside owner-trust (same flag as grant_access).
-    let pair = ctx
-        .owner_trust
-        .evaluate_pair_with(
-            &ctx.contact_store,
-            &ctx.discovery_cache,
-            &ctx.revocation_set,
-            opener,
-            peer_machine,
-            ctx.local_authority_only,
-        )
-        .await;
+    // ADR-0074 §4: reauth (`local_authority_only`) surfaces Busy on a
+    // contended evidence store inside owner-trust / grant eval.
+    let pair = if ctx.local_authority_only {
+        match ctx
+            .owner_trust
+            .evaluate_pair_nonblocking(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+            )
+            .await
+        {
+            NonblockingEval::Busy => return LocalAuthorityOutcome::Busy,
+            NonblockingEval::Done(pair) => pair,
+        }
+    } else {
+        ctx.owner_trust
+            .evaluate_pair_with(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+                false,
+            )
+            .await
+    };
 
     // ADR-0070 §2: a current ShareGrant whose Connect ports cover THIS
     // target lets a `principal = "grant"` entry match, and raises the trust
     // decision for this target only. Blocked/pin mismatch get no grant.
-    let access = ctx
-        .owner_trust
-        .grant_access_at(
-            &ctx.contact_store,
-            &ctx.discovery_cache,
-            &ctx.revocation_set,
-            opener,
-            peer_machine,
-            ctx.now_ms / 1000,
-            !ctx.local_authority_only,
-        )
-        .await;
+    // Grant expiry uses OwnerTrust's construction-injected clock (no now arg).
+    let access = if ctx.local_authority_only {
+        match ctx
+            .owner_trust
+            .grant_access_nonblocking(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+            )
+            .await
+        {
+            NonblockingEval::Busy => return LocalAuthorityOutcome::Busy,
+            NonblockingEval::Done(access) => access,
+        }
+    } else {
+        ctx.owner_trust
+            .grant_access_at(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+                true,
+            )
+            .await
+    };
     let grant_port_allowed = access.allows_connect_port(target.port());
     let decision = pair.decision.with_owner_trust(grant_port_allowed);
 
     // ACL-check that specific agent with its REAL trust decision.
-    evaluate_connect_gate_for_principals(
+    if let Err(reason) = evaluate_connect_gate_for_principals(
         /* verified */ true,
         Some(decision),
         policy,
@@ -765,8 +919,9 @@ pub(crate) async fn authorize_attested_opener(
         pair.owner_trusted,
         grant_port_allowed,
         target,
-    )
-    .map_err(AuthzDenial::Gate)?;
+    ) {
+        return LocalAuthorityOutcome::Deny(AuthzDenial::Gate(reason));
+    }
 
     // The machine-level gate may have excluded a moved-away co-resident
     // while accepting a live agent on the same machine. Authenticate the
@@ -779,23 +934,27 @@ pub(crate) async fn authorize_attested_opener(
         .map(|record| std::collections::HashMap::from([(*opener, record)]))
         .unwrap_or_default();
     let revoked = ctx.revocation_set.read().await;
-    crate::streams::stream_gate(
+    // Read clock immediately before expiry — not a stamp captured pre-await.
+    let now_secs = (ctx.clock)() / 1000;
+    if let Err(e) = crate::streams::stream_gate(
         opener,
         Some(decision),
         revoked.is_agent_revoked(opener),
         revoked.is_machine_revoked(peer_machine),
-        crate::identity::is_expired(agent.cert_not_after, ctx.now_ms / 1000),
-    )
-    .map_err(|e| match e {
-        NetworkError::PeerRevoked { .. } => AuthzDenial::Revoked,
-        NetworkError::PeerNotVerified { .. } => AuthzDenial::CertExpired,
-        _ => AuthzDenial::TrustRejected,
-    })?;
+        crate::identity::is_expired(agent.cert_not_after, now_secs),
+    ) {
+        let denial = match e {
+            NetworkError::PeerRevoked { .. } => AuthzDenial::Revoked,
+            NetworkError::PeerNotVerified { .. } => AuthzDenial::CertExpired,
+            _ => AuthzDenial::TrustRejected,
+        };
+        return LocalAuthorityOutcome::Deny(denial);
+    }
     if crate::key_move::enforce_pairing(&revoked, &placements, opener, peer_machine).is_some() {
-        return Err(AuthzDenial::PairingRetired);
+        return LocalAuthorityOutcome::Deny(AuthzDenial::PairingRetired);
     }
 
-    Ok(teardown::StreamAuthority::classify(
+    LocalAuthorityOutcome::Allow(teardown::StreamAuthority::classify(
         policy,
         opener,
         peer_machine,
@@ -1033,15 +1192,11 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                         return;
                     }
                 };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
             let verify_ctx = AttestationVerifyCtx {
                 discovery_cache: Arc::clone(&ctx.discovery_cache),
                 contact_store: Arc::clone(&ctx.contact_store),
                 own_machine_id: ctx.own_machine_id,
-                now_ms,
+                clock: teardown::system_clock(),
                 revocation_set: Arc::clone(&ctx.revocation_set),
                 move_state: Arc::clone(&ctx.move_state),
                 owner_trust: ctx.owner_trust.clone(),
@@ -2736,7 +2891,7 @@ mod tests {
                     discovery_cache: cache,
                     contact_store: contacts,
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2780,7 +2935,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2815,7 +2970,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2851,7 +3006,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2885,7 +3040,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2921,7 +3076,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, stranger_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2958,7 +3113,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3048,7 +3203,7 @@ mod tests {
             discovery_cache: cache,
             contact_store: contacts,
             own_machine_id: recipient,
-            now_ms: now_ms(),
+            clock: Arc::new(now_ms),
             revocation_set: revoked,
             move_state: moves,
             owner_trust: crate::owner_trust::OwnerTrust::default(),
@@ -3077,7 +3232,7 @@ mod tests {
             discovery_cache: cache.clone(),
             contact_store: trusted_store(kp.agent_id()),
             own_machine_id: recipient,
-            now_ms: now_ms(),
+            clock: Arc::new(now_ms),
             revocation_set: Arc::new(tokio::sync::RwLock::new(
                 crate::revocation::RevocationSet::new(),
             )),
@@ -3322,7 +3477,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3348,7 +3503,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3376,7 +3531,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3403,7 +3558,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3430,7 +3585,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3457,7 +3612,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3512,7 +3667,7 @@ mod tests {
                     discovery_cache: cache,
                     contact_store: contacts,
                     own_machine_id: own_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3555,7 +3710,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: own_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3592,7 +3747,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: other_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3632,7 +3787,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3672,7 +3827,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3709,7 +3864,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3781,7 +3936,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3806,7 +3961,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3879,7 +4034,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -4014,16 +4169,16 @@ mod tests {
         assert_eq!(refuse_outcome, "PeerRejectedV2");
     }
 
-    /// WHY (Codex P2 on #1488 RC9): forward admission must not evaluate a
-    /// grant against a clock captured before lock waits. `authorize_attested_opener`
-    /// awaits `evaluate_pair_with` (contact-store read) then calls
-    /// `grant_access_at` with `ctx.now_ms`; a grant that expires during that
-    /// wait must be denied, not admitted on the stale timestamp.
+    /// WHY (Codex P2 on #1488 RC10): forward admission uses construction-injected
+    /// clocks. `authorize_attested_opener` awaits `evaluate_pair_with` then
+    /// `grant_access_at` (OwnerTrust clock, no caller now). A grant that expires
+    /// during the contact-store wait must be denied.
     #[tokio::test]
     async fn authorize_attested_opener_denies_grant_expired_during_contact_lock_wait() {
         use crate::connect::acl::ConnectOwnerEntry;
         use crate::identity::{MachineKeypair, UserKeypair};
         use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::Duration;
 
         let owner = UserKeypair::generate().expect("owner keygen");
@@ -4034,7 +4189,7 @@ mod tests {
             .expect("remote machine")
             .machine_id();
 
-        let t0 = now_ms() / 1000;
+        let t0 = 1_700_000_000u64;
         let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
         crate::dm_inbox::record_authenticated_machine_binding(
             &bindings,
@@ -4043,7 +4198,10 @@ mod tests {
             t0,
         )
         .await;
-        let trust = crate::owner_trust::OwnerTrust::new(Some(owner.user_id()), bindings);
+        let clock_secs = Arc::new(AtomicU64::new(t0));
+        let clock_for_trust = Arc::clone(&clock_secs);
+        let trust = crate::owner_trust::OwnerTrust::new(Some(owner.user_id()), bindings)
+            .with_clock(Arc::new(move || clock_for_trust.load(Ordering::SeqCst)));
 
         let grants = Arc::new(ShareGrantStore::in_memory(
             local_agent,
@@ -4085,12 +4243,12 @@ mod tests {
         ));
         let move_state = Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new()));
 
-        // Stale clock captured before the contact-store wait (the bug).
+        let clock_for_ctx = Arc::clone(&clock_secs);
         let ctx = AttestationVerifyCtx {
             discovery_cache: Arc::clone(&cache),
             contact_store: Arc::clone(&contacts),
             own_machine_id: MachineId([0x0A; 32]),
-            now_ms: t0.saturating_mul(1000),
+            clock: Arc::new(move || clock_for_ctx.load(Ordering::SeqCst).saturating_mul(1000)),
             revocation_set: Arc::clone(&revocations),
             move_state: Arc::clone(&move_state),
             owner_trust: trust.clone(),
@@ -4100,7 +4258,7 @@ mod tests {
         let live =
             authorize_attested_opener(&remote_agent, &remote_machine, &target, &policy, &ctx).await;
         assert!(
-            live.is_ok(),
+            matches!(live, LocalAuthorityOutcome::Allow(_)),
             "control: grant must admit Connect at T0: {live:?}"
         );
 
@@ -4112,12 +4270,15 @@ mod tests {
             let move_state = Arc::clone(&move_state);
             let trust = trust.clone();
             let policy = policy.clone();
+            let clock_for_ctx = Arc::clone(&clock_secs);
             async move {
                 let ctx = AttestationVerifyCtx {
                     discovery_cache: cache,
                     contact_store: contacts,
                     own_machine_id: MachineId([0x0A; 32]),
-                    now_ms: t0.saturating_mul(1000),
+                    clock: Arc::new(move || {
+                        clock_for_ctx.load(Ordering::SeqCst).saturating_mul(1000)
+                    }),
                     revocation_set: revocations,
                     move_state,
                     owner_trust: trust,
@@ -4130,15 +4291,168 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let wall = now_ms() / 1000;
-        let past_expiry = Duration::from_secs(expiry.saturating_sub(wall).saturating_add(1));
-        tokio::time::sleep(past_expiry).await;
+        clock_secs.store(expiry + 1, Ordering::SeqCst);
         drop(held);
 
         let denied = pending.await.expect("authorize task");
         assert!(
-            denied.is_err(),
+            matches!(denied, LocalAuthorityOutcome::Deny(_)),
             "grant that expired during contact-lock wait must not admit: {denied:?}"
+        );
+    }
+
+    /// WHY (RC10): gate expiry must read OwnerTrust's clock after the
+    /// discovery-cache await, not a caller stamp taken before it. Holding the
+    /// discovery write lock parks the gate's cache read; advancing the clock
+    /// past `cert_not_after` before release must Deny the new lane.
+    #[tokio::test]
+    async fn gate_peer_denies_cert_expired_during_discovery_lock_wait() {
+        use crate::identity::MachineKeypair;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let remote_kp = AgentKeypair::generate().expect("remote agent");
+        let remote_agent = remote_kp.agent_id();
+        let remote_machine = MachineKeypair::generate()
+            .expect("remote machine")
+            .machine_id();
+
+        let t0 = 1_700_000_000u64;
+        let cert_not_after = t0 + 10;
+        let cache = cache_with_agent(&remote_kp, remote_machine);
+        {
+            let mut guard = cache.write().await;
+            let entry = guard.get_mut(&remote_agent).expect("cached");
+            entry.cert_not_after = Some(cert_not_after);
+        }
+
+        let clock = Arc::new(AtomicU64::new(t0));
+        let clock_task = Arc::clone(&clock);
+        let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            remote_agent,
+            remote_machine,
+            t0,
+        )
+        .await;
+        let announced = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &announced,
+            remote_agent,
+            remote_machine,
+            t0,
+        )
+        .await;
+        let trust = crate::owner_trust::OwnerTrust::new(None, Arc::clone(&bindings))
+            .with_clock(Arc::new(move || clock_task.load(Ordering::SeqCst)));
+        trust.install_announced_bindings(Arc::clone(&announced));
+
+        let contacts = trusted_store(remote_agent);
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let move_state = Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new()));
+        let connect_policy = Arc::new(std::sync::RwLock::new(Arc::new(ConnectPolicy::default())));
+
+        let live = crate::Agent::gate_peer_outbound_at(
+            &cache,
+            &contacts,
+            &revocations,
+            &move_state,
+            &trust,
+            &announced,
+            &bindings,
+            &remote_agent,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(live, Ok(m) if m == remote_machine),
+            "control: unexpired cert must admit outbound: {live:?}"
+        );
+        let live_in = crate::Agent::gate_peer_machine_inbound_at(
+            &cache,
+            &contacts,
+            &revocations,
+            &move_state,
+            &connect_policy,
+            &trust,
+            &remote_machine,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(live_in, Ok(ref agents) if agents == &[remote_agent]),
+            "control: unexpired cert must admit inbound: {live_in:?}"
+        );
+
+        let held = cache.write().await;
+        let pending_out = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let contacts = Arc::clone(&contacts);
+            let revocations = Arc::clone(&revocations);
+            let move_state = Arc::clone(&move_state);
+            let trust = trust.clone();
+            let announced = Arc::clone(&announced);
+            let bindings = Arc::clone(&bindings);
+            async move {
+                crate::Agent::gate_peer_outbound_at(
+                    &cache,
+                    &contacts,
+                    &revocations,
+                    &move_state,
+                    &trust,
+                    &announced,
+                    &bindings,
+                    &remote_agent,
+                    false,
+                )
+                .await
+            }
+        });
+        let pending_in = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let contacts = Arc::clone(&contacts);
+            let revocations = Arc::clone(&revocations);
+            let move_state = Arc::clone(&move_state);
+            let connect_policy = Arc::clone(&connect_policy);
+            let trust = trust.clone();
+            async move {
+                crate::Agent::gate_peer_machine_inbound_at(
+                    &cache,
+                    &contacts,
+                    &revocations,
+                    &move_state,
+                    &connect_policy,
+                    &trust,
+                    &remote_machine,
+                    false,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Past not_after and the identity skew window so is_expired is true.
+        clock.store(
+            cert_not_after
+                .saturating_add(crate::identity::EXPIRY_CLOCK_SKEW_SECS)
+                .saturating_add(1),
+            Ordering::SeqCst,
+        );
+        drop(held);
+
+        let denied_out = pending_out.await.expect("outbound gate task");
+        assert!(
+            matches!(denied_out, Err(PeerGateError::Network(_))),
+            "cert expired during discovery-lock wait must deny outbound: {denied_out:?}"
+        );
+        let denied_in = pending_in.await.expect("inbound gate task");
+        assert!(
+            matches!(denied_in, Err(PeerGateError::Network(_))),
+            "cert expired during discovery-lock wait must deny inbound: {denied_in:?}"
         );
     }
 }

@@ -56,7 +56,10 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
-use super::{AttestationVerifyCtx, AuthzDenial, ForwardDiagnostics};
+use super::{
+    gate_peer_machine_inbound_outcome, gate_peer_outbound_outcome, AttestationVerifyCtx,
+    AuthzDenial, ForwardDiagnostics, LocalAuthorityOutcome,
+};
 use crate::connect::gate::ConnectDenialReason;
 use crate::connect::{evaluate_connect_gate, ConnectPolicy};
 use crate::error::NetworkError;
@@ -390,7 +393,9 @@ fn denial_reason(denial: AuthzDenial) -> &'static str {
 }
 
 /// One local-authority re-check outcome. `Busy` is lock contention on a
-/// store the non-blocking path needs — not an authority deny.
+/// store the non-blocking path needs — not an authority deny. Busy comes
+/// from the gate/authorize [`LocalAuthorityOutcome`], never from teardown
+/// probing which agent might be contended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReauthCheck {
     Allow(StreamAuthority),
@@ -398,113 +403,31 @@ enum ReauthCheck {
     Busy,
 }
 
-/// Whether the local-authority path for `(agent, machine)` would consult
-/// evidence and the ready store is contended (`try_usable` → `Err`).
-///
-/// Matches [`OwnerTrust::is_owner_trusted_with`]: pairing skips evidence only
-/// when the **authenticated** binding names `machine` (announced alone still
-/// needs usable evidence). The certificate skips evidence only when discovery
-/// already has one. Skip the Busy probe only when both hold — otherwise a
-/// held store can explain a fail-closed deny and must stay Busy until the
-/// deadline. Announced-only must not skip even with a discovery cert.
-async fn reauth_evidence_busy(ctx: &ReauthCtx, agent: &AgentId, machine: &MachineId) -> bool {
-    let Some(runtime) = ctx.owner_trust.evidence() else {
-        return false;
-    };
-    let attested = ctx.authenticated_bindings.read().await.peek(agent);
-    let authenticated_ok = attested.is_some_and(|b| b.machine_id == *machine);
-    let cert_in_discovery = {
-        let cache = ctx.discovery_cache.read().await;
-        cache
-            .get(agent)
-            .and_then(|e| e.agent_certificate.as_ref())
-            .is_some()
-    };
-    if authenticated_ok && cert_in_discovery {
-        return false;
+fn map_gate_outcome<T>(outcome: LocalAuthorityOutcome<T, NetworkError>) -> Result<T, ReauthCheck> {
+    match outcome {
+        LocalAuthorityOutcome::Allow(v) => Ok(v),
+        LocalAuthorityOutcome::Deny(e) => Err(ReauthCheck::Deny(network_reason(&e))),
+        LocalAuthorityOutcome::Busy => Err(ReauthCheck::Busy),
     }
-    runtime.try_usable(*agent, *machine, (ctx.clock)()).is_err()
-}
-
-/// Agents whose evidence the gate may need under local-authority reauth.
-fn reauth_evidence_agents(gate: &StreamGate) -> Option<Vec<(AgentId, MachineId)>> {
-    match gate {
-        StreamGate::Outbound {
-            peer_agent,
-            machine,
-        }
-        | StreamGate::InboundAttested {
-            opener: peer_agent,
-            machine,
-            ..
-        } => Some(vec![(*peer_agent, *machine)]),
-        StreamGate::InboundLegacy { .. } => None,
-    }
-}
-
-/// Upgrade a deny to [`ReauthCheck::Busy`] when evidence contention alone
-/// can explain a fail-closed local read (no fresh authority verdict yet).
-async fn reauth_check_after_deny(
-    gate: &StreamGate,
-    ctx: &ReauthCtx,
-    reason: &'static str,
-) -> ReauthCheck {
-    if let Some(pairs) = reauth_evidence_agents(gate) {
-        for (agent, machine) in pairs {
-            if reauth_evidence_busy(ctx, &agent, &machine).await {
-                return ReauthCheck::Busy;
-            }
-        }
-    } else if let StreamGate::InboundLegacy { machine, .. } = gate {
-        // Legacy gates name a machine only; any co-resident agent whose
-        // evidence is contended blocks a fresh verdict for the machine.
-        let agents: Vec<AgentId> = {
-            let cache = ctx.discovery_cache.read().await;
-            cache
-                .values()
-                .filter(|a| a.machine_id == *machine)
-                .map(|a| a.agent_id)
-                .collect()
-        };
-        for agent in agents {
-            if reauth_evidence_busy(ctx, &agent, machine).await {
-                return ReauthCheck::Busy;
-            }
-        }
-    }
-    ReauthCheck::Deny(reason)
 }
 
 /// Re-run `gate` against current state once. Distinguishes authority deny
-/// from evidence-store lock contention.
+/// from evidence-store lock contention via the gate/authorize outcome.
 async fn reevaluate(
     gate: &StreamGate,
     ctx: &ReauthCtx,
     verify: &AttestationVerifyCtx,
     policy: &ConnectPolicy,
 ) -> ReauthCheck {
-    let now_secs = verify.now_ms / 1000;
     match gate {
         StreamGate::Outbound {
             peer_agent,
             machine,
         } => {
-            let resolved = match crate::Agent::gate_peer_outbound_at(
-                &ctx.discovery_cache,
-                &ctx.contact_store,
-                &ctx.revocation_set,
-                &ctx.move_state,
-                &ctx.owner_trust,
-                &ctx.announced_bindings,
-                &ctx.authenticated_bindings,
-                peer_agent,
-                now_secs,
-                true,
-            )
-            .await
+            let resolved = match map_gate_outcome(gate_peer_outbound_outcome(ctx, peer_agent).await)
             {
                 Ok(resolved) => resolved,
-                Err(e) => return reauth_check_after_deny(gate, ctx, network_reason(&e)).await,
+                Err(check) => return check,
             };
             if resolved != *machine {
                 return ReauthCheck::Deny("machine_changed");
@@ -520,43 +443,23 @@ async fn reevaluate(
             // the forwarder's gate for the attested opener — the same two
             // layers the stream cleared at admission.
             // ADR-0074 §4: same local-only bound as outbound / AttestationVerifyCtx.
-            if let Err(e) = crate::Agent::gate_peer_machine_inbound_at(
-                &ctx.discovery_cache,
-                &ctx.contact_store,
-                &ctx.revocation_set,
-                &ctx.move_state,
-                &ctx.connect_policy,
-                &ctx.owner_trust,
-                machine,
-                now_secs,
-                true,
-            )
-            .await
+            if let Err(check) =
+                map_gate_outcome(gate_peer_machine_inbound_outcome(ctx, machine).await)
             {
-                return reauth_check_after_deny(gate, ctx, network_reason(&e)).await;
+                return check;
             }
             match super::authorize_attested_opener(opener, machine, target, policy, verify).await {
-                Ok(authority) => ReauthCheck::Allow(authority),
-                Err(denial) => reauth_check_after_deny(gate, ctx, denial_reason(denial)).await,
+                LocalAuthorityOutcome::Allow(authority) => ReauthCheck::Allow(authority),
+                LocalAuthorityOutcome::Deny(denial) => ReauthCheck::Deny(denial_reason(denial)),
+                LocalAuthorityOutcome::Busy => ReauthCheck::Busy,
             }
         }
         StreamGate::InboundLegacy { machine, target } => {
-            let agents = match crate::Agent::gate_peer_machine_inbound_at(
-                &ctx.discovery_cache,
-                &ctx.contact_store,
-                &ctx.revocation_set,
-                &ctx.move_state,
-                &ctx.connect_policy,
-                &ctx.owner_trust,
-                machine,
-                now_secs,
-                true,
-            )
-            .await
-            {
-                Ok(agents) => agents,
-                Err(e) => return reauth_check_after_deny(gate, ctx, network_reason(&e)).await,
-            };
+            let agents =
+                match map_gate_outcome(gate_peer_machine_inbound_outcome(ctx, machine).await) {
+                    Ok(agents) => agents,
+                    Err(check) => return check,
+                };
             for agent in &agents {
                 if let Err(reason) = evaluate_connect_gate(
                     true,
@@ -566,7 +469,9 @@ async fn reevaluate(
                     machine,
                     target,
                 ) {
-                    return reauth_check_after_deny(gate, ctx, connect_reason(reason)).await;
+                    // ACL deny after a successful gate eval is a real deny
+                    // (gate already returned Allow; contention would be Busy).
+                    return ReauthCheck::Deny(connect_reason(reason));
                 }
             }
             ReauthCheck::Allow(StreamAuthority::AclEntry)
@@ -619,7 +524,7 @@ fn pass_inputs(ctx: &ReauthCtx) -> (Arc<ConnectPolicy>, AttestationVerifyCtx) {
         discovery_cache: Arc::clone(&ctx.discovery_cache),
         contact_store: Arc::clone(&ctx.contact_store),
         own_machine_id: ctx.own_machine_id,
-        now_ms: (ctx.clock)(),
+        clock: Arc::clone(&ctx.clock),
         revocation_set: Arc::clone(&ctx.revocation_set),
         move_state: Arc::clone(&ctx.move_state),
         owner_trust: ctx.owner_trust.clone(),

@@ -1301,11 +1301,13 @@ async fn s3_enrolled_machine_gets_reserved_evidence_capacity_without_discovery()
     drop(strangers);
 }
 
-/// WHY (Codex P2 on #1488): `grant_access` must read the wall clock after
+/// WHY (Codex P2 on #1488): `grant_access` must read the injected clock after
 /// the contact-store lock, not before. A grant that expires while that
 /// read awaits a contended write lock must come back empty, not Allow.
 #[tokio::test]
 async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     let owner = UserKeypair::generate().expect("owner keygen");
     let local_agent = AgentKeypair::generate().expect("local agent").agent_id();
     let remote_agent = AgentKeypair::generate().expect("remote agent").agent_id();
@@ -1314,7 +1316,7 @@ async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
         .machine_id();
 
     let bindings = AuthenticatedMachineBindings::default();
-    let t0 = unix_now_secs();
+    let t0 = 1_700_000_000u64;
     crate::dm_inbox::record_authenticated_machine_binding(
         &bindings,
         remote_agent,
@@ -1323,7 +1325,10 @@ async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
     )
     .await;
 
-    let trust = OwnerTrust::new(Some(owner.user_id()), bindings);
+    let clock = Arc::new(AtomicU64::new(t0));
+    let clock_task = Arc::clone(&clock);
+    let trust = OwnerTrust::new(Some(owner.user_id()), bindings)
+        .with_clock(Arc::new(move || clock_task.load(Ordering::SeqCst)));
     let grants = Arc::new(ShareGrantStore::in_memory(
         local_agent,
         Some(owner.user_id()),
@@ -1349,8 +1354,7 @@ async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
     let cache = Arc::new(RwLock::new(HashMap::new()));
     let revocations = Arc::new(RwLock::new(RevocationSet::new()));
 
-    // Control: grant_access_at uses max(t0, wall) after the contact read;
-    // t0 ≈ now so the short-lived grant still admits.
+    // Control: construction clock is still t0 after the contact read.
     let live = trust
         .grant_access_at(
             &contacts,
@@ -1358,7 +1362,6 @@ async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
             &revocations,
             &remote_agent,
             &remote_machine,
-            t0,
             true,
         )
         .await;
@@ -1368,7 +1371,7 @@ async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
     );
 
     // Hold the write lock so grant_access's contact read blocks until we
-    // release, after the grant's expiry.
+    // advance the injected clock past expiry and release.
     let held = contacts.write().await;
     let trust_task = trust.clone();
     let contacts_task = Arc::clone(&contacts);
@@ -1385,12 +1388,11 @@ async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
             )
             .await
     });
-    // Let the spawned task park on the contact read before sleeping.
+    // Let the spawned task park on the contact read before advancing time.
     tokio::task::yield_now().await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let past_expiry = Duration::from_secs(expiry.saturating_sub(unix_now_secs()).saturating_add(1));
-    tokio::time::sleep(past_expiry).await;
+    clock.store(expiry + 1, Ordering::SeqCst);
     drop(held);
 
     let access = pending.await.expect("grant_access task");

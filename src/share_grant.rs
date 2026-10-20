@@ -1078,12 +1078,18 @@ pub async fn evaluate_grant_access(
         true,
     )
     .await
+    // Blocking path never returns Busy.
+    .unwrap_or_default()
     .access
 }
 
 /// With `allow_network_lookup = false`, skip EvidenceV1 wait/lookup but still
 /// read local usable evidence (`try_usable`) so a reauth pass keeps
 /// authenticated bindings without network I/O.
+///
+/// Returns `Err(())` when `allow_network_lookup` is false and a `try_usable`
+/// evidence read is contended — callers that need Busy (gates / reauth) must
+/// not collapse this to empty access.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate_grant_access_with_evidence(
     store: &ShareGrantStore,
@@ -1095,17 +1101,17 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     now_unix: u64,
     evidence: Option<&crate::peer_evidence::EvidenceRuntime>,
     allow_network_lookup: bool,
-) -> GrantAccessEval {
+) -> Result<GrantAccessEval, ()> {
     let evaluated_at = std::time::Instant::now();
     let mut access = GrantAccessEval::default();
     // A failed clock read maps to 0; never evaluate validity windows
     // against it (it could reactivate a long-expired grant). Fail closed.
     if now_unix == 0 {
-        return access;
+        return Ok(access);
     }
     let candidates = store.candidates_for_local_agent(now_unix);
     if candidates.is_empty() {
-        return access;
+        return Ok(access);
     }
     if allow_network_lookup
         && crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
@@ -1122,21 +1128,21 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     }
     let now_unix = now_unix.saturating_add(evaluated_at.elapsed().as_secs());
     let now_ms = now_unix.saturating_mul(1000);
-    let usable_view = |runtime: &crate::peer_evidence::EvidenceRuntime| {
+    // Local usable view: `Err(())` is lock contention on the nonblocking path.
+    let usable_view = |runtime: &crate::peer_evidence::EvidenceRuntime| -> Result<Option<_>, ()> {
         if allow_network_lookup {
-            runtime.usable(*requester_agent, *requester_machine, now_ms)
+            Ok(runtime.usable(*requester_agent, *requester_machine, now_ms))
         } else {
-            // Contended lock → no evidence (fail closed; matches reauth).
-            runtime
-                .try_usable(*requester_agent, *requester_machine, now_ms)
-                .ok()
-                .flatten()
+            runtime.try_usable(*requester_agent, *requester_machine, now_ms)
         }
     };
     match crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent).await {
         Some(bound) if bound == *requester_machine => {}
-        None if evidence.and_then(usable_view).is_some() => {}
-        _ => return access,
+        None => match evidence.map(usable_view).transpose()?.flatten() {
+            Some(_) => {}
+            None => return Ok(access),
+        },
+        _ => return Ok(access),
     }
     let live: Vec<ShareGrant> = {
         let revoked = revocation_set.read().await;
@@ -1145,7 +1151,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             || revoked.is_machine_revoked(requester_machine)
             || revoked.is_binding_revoked(requester_agent, requester_machine)
         {
-            return access;
+            return Ok(access);
         }
         candidates
             .into_iter()
@@ -1155,16 +1161,19 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             .collect()
     };
     let cert = if live.iter().any(|g| matches!(g.grantee, Grantee::User(_))) {
-        discovery_cache
+        let from_discovery = discovery_cache
             .read()
             .await
             .get(requester_agent)
-            .and_then(|entry| entry.agent_certificate.clone())
-            .or_else(|| {
-                evidence
-                    .and_then(usable_view)
-                    .and_then(|v| v.certificate.clone())
-            })
+            .and_then(|entry| entry.agent_certificate.clone());
+        match from_discovery {
+            Some(cert) => Some(cert),
+            None => evidence
+                .map(usable_view)
+                .transpose()?
+                .flatten()
+                .and_then(|v| v.certificate.clone()),
+        }
     } else {
         None
     };
@@ -1185,7 +1194,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             access.absorb(&grant.caps, grant.grant_id);
         }
     }
-    access
+    Ok(access)
 }
 
 /// The DM-acceptance input of ADR-0070 §2, handed to the DM inbox: a

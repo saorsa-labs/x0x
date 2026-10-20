@@ -3716,7 +3716,8 @@ mod tests {
             Some(&runtime),
             true,
         )
-        .await;
+        .await
+        .expect("blocking grant eval");
         assert!(
             access.dm,
             "both binding and user certificate resolve after restart"
@@ -3739,7 +3740,8 @@ mod tests {
             Some(&runtime),
             true,
         )
-        .await;
+        .await
+        .expect("blocking grant eval");
         assert!(denied.is_empty());
         assert!(
             runtime.usable(p.a(), p.m(), now + 61_000).is_none(),

@@ -154,7 +154,16 @@ impl World {
             .unwrap();
         devices.set_device_change_notify(Arc::clone(&kick));
         let grants = Arc::new(ShareGrantStore::in_memory(a1, Some(owner_a.user_id())));
-        let trust = OwnerTrust::new(Some(owner_a.user_id()), Arc::clone(&authenticated));
+        // Same Instant as ReauthCtx/AttestationVerifyCtx: paused-tokio advances
+        // grant expiry with the reauth clock (RC10 construction-injected clock).
+        let start = Instant::now();
+        let trust = OwnerTrust::new(Some(owner_a.user_id()), Arc::clone(&authenticated))
+            .with_clock({
+                let start = start;
+                Arc::new(move || {
+                    base_secs.saturating_add(u64::try_from(start.elapsed().as_secs()).unwrap_or(0))
+                })
+            });
         trust.install_announced_bindings(Arc::clone(&announced));
         trust.install_device_store(Arc::clone(&devices));
         trust.install_share_grant_store(Arc::clone(&grants));
@@ -185,7 +194,7 @@ impl World {
             live: Arc::new(LiveStreams::new(Arc::clone(&diag))),
             diag,
             base_secs,
-            start: Instant::now(),
+            start,
         }
     }
 
@@ -843,7 +852,6 @@ async fn outbound_reauth_keeps_stream_when_cache_route_is_stale_but_authority_na
         &w.announced,
         &w.authenticated,
         &w.b1,
-        w.base_secs,
         true,
     )
     .await
@@ -1242,10 +1250,9 @@ async fn reauth_enforces_revocation_within_5s_despite_slow_evidence() {
         let revocations = Arc::clone(&w.revocations);
         let b1 = w.b1;
         let mb = w.mb;
-        let now = w.base_secs;
         async move {
             trust
-                .grant_access_at(&contacts, &cache, &revocations, &b1, &mb, now, true)
+                .grant_access_at(&contacts, &cache, &revocations, &b1, &mb, true)
                 .await
         }
     });
@@ -1260,15 +1267,7 @@ async fn reauth_enforces_revocation_within_5s_despite_slow_evidence() {
     let local_probe = Instant::now();
     let _ = w
         .trust
-        .grant_access_at(
-            &w.contacts,
-            &w.cache,
-            &w.revocations,
-            &w.b1,
-            &w.mb,
-            w.base_secs,
-            false,
-        )
+        .grant_access_at(&w.contacts, &w.cache, &w.revocations, &w.b1, &w.mb, false)
         .await;
     assert!(
         local_probe.elapsed() < Duration::from_millis(50),
@@ -2190,4 +2189,266 @@ async fn reauth_both_bindings_no_discovery_cert_evidence_busy_through_deadline_t
         "both bindings no discovery cert",
     )
     .await;
+}
+
+/// Build an enrolled evidence record for `(agent_kp, machine_kp, cert)`.
+fn enrolled_evidence_record(
+    agent_kp: &AgentKeypair,
+    machine_kp: &MachineKeypair,
+    cert: &AgentCertificate,
+    now_ms: u64,
+    self_name: &str,
+) -> crate::peer_evidence::EvidenceRecordV1 {
+    use crate::announce_v3::IdentityAnnouncementV3;
+    use crate::dm::DmCapabilities;
+    use crate::dm_capability::{CapabilityAdvert, RegistryTrailer, REGISTRY_TRAILER_MAGIC};
+
+    let peer = agent_kp.agent_id();
+    let machine = machine_kp.machine_id();
+    let v2 = crate::IdentityAnnouncement {
+        self_name: Some(self_name.into()),
+        agent_id: peer,
+        machine_id: machine,
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: machine_kp.public_key().as_bytes().to_vec(),
+        machine_signature: vec![],
+        addresses: vec![],
+        announced_at: now_ms / 1000,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+        agent_public_key: agent_kp.public_key().as_bytes().to_vec(),
+    };
+    let mut ann = IdentityAnnouncementV3::build_from_v2(&v2, machine_kp.secret_key(), 0).unwrap();
+    ann.sign_v3_1(machine_kp.secret_key()).unwrap();
+    let mut caps = DmCapabilities::pending();
+    caps.kem_public_key = vec![42; 1184];
+    let mut advert = CapabilityAdvert {
+        protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+        agent_id: *peer.as_bytes(),
+        machine_id: *machine.as_bytes(),
+        created_at_unix_ms: now_ms,
+        capabilities: caps,
+        signature: vec![],
+    };
+    advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        agent_kp.secret_key(),
+        &advert.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut trailer = RegistryTrailer {
+        registry: Default::default(),
+        signature: vec![],
+    };
+    trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        agent_kp.secret_key(),
+        &trailer.signed_bytes(&advert).unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut bytes = postcard::to_stdvec(&advert).unwrap();
+    bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
+    bytes.extend(postcard::to_stdvec(&trailer).unwrap());
+    crate::peer_evidence::EvidenceRecordV1 {
+        announcement: crate::announce_v3::serialize_v3_1(&ann).unwrap(),
+        advert: bytes,
+        certificate: Some(cert.to_storage_bytes().unwrap()),
+        relation: crate::peer_evidence::ENROLLED,
+        stored_at_ms: now_ms,
+    }
+}
+
+/// RC10: opener A skips evidence (authenticated binding + discovery cert);
+/// co-resident B on the same machine still needs the evidence store.
+/// Contention on B must surface as gate Busy (not an immediate deny that
+/// only probed A).
+async fn multi_agent_opener_clean_coresident_needs_evidence_fixture() -> (
+    World,
+    LiveStreamGuard,
+    Arc<crate::peer_evidence::PeerEvidenceStore>,
+    Arc<crate::peer_evidence::EvidenceRuntime>,
+) {
+    use crate::peer_evidence::{
+        EvidenceConfig, EvidenceRuntime, IngestSource, PeerEvidenceStore, RuntimePolicy,
+    };
+
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], true, false));
+
+    let opener_kp = AgentKeypair::generate().unwrap();
+    let coresident_kp = AgentKeypair::generate().unwrap();
+    let machine_kp = MachineKeypair::generate().unwrap();
+    let opener = opener_kp.agent_id();
+    let coresident = coresident_kp.agent_id();
+    let machine = machine_kp.machine_id();
+    let opener_cert = AgentCertificate::issue(&w.owner_a, &opener_kp).unwrap();
+    let coresident_cert = AgentCertificate::issue(&w.owner_a, &coresident_kp).unwrap();
+    w.devices
+        .enroll(OwnerEnrollment::sign(machine, &w.owner_a, w.base_secs * 1000, None).unwrap())
+        .await
+        .unwrap();
+    {
+        let mut cache = w.cache.write().await;
+        cache.insert(opener, discovered(&opener_kp, machine, opener_cert.clone()));
+        cache.insert(
+            coresident,
+            discovered(&coresident_kp, machine, coresident_cert.clone()),
+        );
+    }
+
+    let now_ms = w.base_secs.saturating_mul(1000);
+    let policy = Arc::new(RuntimePolicy::new(
+        w.a1,
+        w.trust.clone(),
+        Arc::clone(&w.revocations),
+    ));
+    let store = Arc::new(
+        PeerEvidenceStore::open(
+            &w.dir.path().join("evidence-multi-agent-busy"),
+            EvidenceConfig::default(),
+            policy,
+            now_ms,
+        )
+        .unwrap(),
+    );
+    store
+        .ingest(
+            enrolled_evidence_record(&opener_kp, &machine_kp, &opener_cert, now_ms, "opener A"),
+            IngestSource::Hello,
+            now_ms,
+        )
+        .unwrap();
+    store
+        .ingest(
+            enrolled_evidence_record(
+                &coresident_kp,
+                &machine_kp,
+                &coresident_cert,
+                now_ms,
+                "coresident B",
+            ),
+            IngestSource::Hello,
+            now_ms,
+        )
+        .unwrap();
+    let (evidence, ready) = EvidenceRuntime::loading_store_for_test(Arc::clone(&store));
+    ready.cancel();
+    assert!(
+        evidence.usable(opener, machine, now_ms).is_some(),
+        "control: opener evidence usable before admission"
+    );
+    assert!(
+        evidence.usable(coresident, machine, now_ms).is_some(),
+        "control: coresident evidence usable before admission"
+    );
+    w.trust.install_evidence(&evidence);
+
+    {
+        let mut auth = w.authenticated.write().await;
+        auth.clear_for_test();
+    }
+    {
+        let mut ann = w.announced.write().await;
+        ann.clear_for_test();
+    }
+    // Opener A: authenticated + discovery cert → Busy probe would skip A alone.
+    crate::dm_inbox::record_authenticated_machine_binding(
+        &w.authenticated,
+        opener,
+        machine,
+        w.base_secs,
+    )
+    .await;
+    assert!(
+        w.cache
+            .read()
+            .await
+            .get(&opener)
+            .and_then(|e| e.agent_certificate.as_ref())
+            .is_some(),
+        "control: opener keeps discovery cert so A alone would skip evidence"
+    );
+    assert!(
+        w.cache
+            .read()
+            .await
+            .get(&coresident)
+            .and_then(|e| e.agent_certificate.as_ref())
+            .is_some(),
+        "control: coresident has discovery cert but no authenticated binding"
+    );
+
+    let gate = w.inbound(opener, machine);
+    let authority = check_gate(&gate, &w.ctx())
+        .await
+        .expect("multi-agent: opener stream must admit with clean A + evidence B");
+    assert_eq!(authority, StreamAuthority::OwnerTrust);
+    let stream = w.live.register(gate, authority);
+    (w, stream, store, evidence)
+}
+
+/// RC10: co-resident evidence contention that clears inside the budget must
+/// not tear down (Busy from gate eval of B, not opener-only probe).
+#[tokio::test(start_paused = true)]
+async fn reauth_multi_agent_coresident_evidence_busy_resolves_inside_budget_stream_survives() {
+    let (w, stream, store, _evidence) =
+        multi_agent_opener_clean_coresident_needs_evidence_fixture().await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "coresident Busy alone must not tear down before the deadline"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "stream must survive after coresident contention clears inside the budget"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+    assert!(w.reasons().is_empty());
+}
+
+/// RC10: co-resident evidence held through the five-second budget →
+/// `reauth_deadline` (must not immediate-deny because opener A looks clean).
+#[tokio::test(start_paused = true)]
+async fn reauth_multi_agent_coresident_evidence_busy_through_deadline_tears_down() {
+    let (w, stream, store, _evidence) =
+        multi_agent_opener_clean_coresident_needs_evidence_fixture().await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    let started = Instant::now();
+    w.kick.notify_waiters();
+    closes_within(&stream, EVENT_BOUND + Duration::from_millis(250)).await;
+    assert!(
+        started.elapsed() <= EVENT_BOUND + Duration::from_millis(250),
+        "multi-agent busy-through-deadline teardown exceeded EVENT_BOUND ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 1);
+    assert_eq!(w.reasons().get("reauth_deadline"), Some(&1));
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
 }

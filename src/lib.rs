@@ -18882,16 +18882,17 @@ impl Agent {
             &self.announced_machine_bindings,
             &self.authenticated_machine_bindings,
             agent_id,
-            Self::unix_timestamp_secs(),
             false,
         )
         .await
+        .map_err(|e| e.fail_closed_admission(agent_id.0))
     }
 
     /// Shared body for [`Self::gate_peer_outbound`] and the ADR-0074 §4
-    /// re-check. Cert expiry is evaluated at `now_secs`. With
+    /// re-check. Cert expiry uses [`OwnerTrust::now_unix_secs`] immediately
+    /// before the compare (after discovery + authority awaits). With
     /// `local_authority_only`, ADR 0115 confirmation uses only local
-    /// stores / non-blocking evidence (no network EvidenceV1 wait).
+    /// stores / non-blocking evidence and contended reads return Busy.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn gate_peer_outbound_at(
         identity_discovery_cache: &tokio::sync::RwLock<
@@ -18904,9 +18905,9 @@ impl Agent {
         announced_bindings: &dm_inbox::AuthenticatedMachineBindings,
         authenticated_bindings: &dm_inbox::AuthenticatedMachineBindings,
         agent_id: &identity::AgentId,
-        now_secs: u64,
         local_authority_only: bool,
-    ) -> error::NetworkResult<identity::MachineId> {
+    ) -> Result<identity::MachineId, crate::forward::PeerGateError> {
+        use crate::owner_trust::NonblockingEval;
         let (routing, cert_not_after) = {
             let cache = identity_discovery_cache.read().await;
             cache
@@ -18945,10 +18946,27 @@ impl Agent {
         // announcements at ingest but never re-checks a cached entry on
         // the live path. Absent expiry (None) is fail-open — is_expired
         // returns false, preserving compatibility with pre-#130 peers.
+        // Clock after discovery + authority awaits, immediately before compare.
+        let now_secs = owner_trust.now_unix_secs();
         let expired = identity::is_expired(cert_not_after, now_secs);
 
-        // ADR-0074 §4: reauth shares this body — never block on evidence.
-        let trust_decision = Some(
+        // ADR-0074 §4: reauth shares this body — never block on evidence;
+        // contended nonblocking reads surface Busy (not Deny).
+        let trust_decision = Some(if local_authority_only {
+            match owner_trust
+                .evaluate_pair_nonblocking(
+                    contact_store,
+                    identity_discovery_cache,
+                    revocation_set,
+                    agent_id,
+                    &machine_id,
+                )
+                .await
+            {
+                NonblockingEval::Busy => return Err(crate::forward::PeerGateError::Busy),
+                NonblockingEval::Done(pair) => pair.decision,
+            }
+        } else {
             owner_trust
                 .evaluate_pair_with(
                     contact_store,
@@ -18956,11 +18974,11 @@ impl Agent {
                     revocation_set,
                     agent_id,
                     &machine_id,
-                    local_authority_only,
+                    false,
                 )
                 .await
-                .decision,
-        );
+                .decision
+        });
         let (revoked_agent, revoked_machine, resync_required) = {
             let revoked = revocation_set.read().await;
             (
@@ -18980,7 +18998,8 @@ impl Agent {
             }
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: agent_id.0,
-            });
+            }
+            .into());
         }
         streams::stream_gate(
             agent_id,
@@ -19011,7 +19030,8 @@ impl Agent {
             }
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: agent_id.0,
-            });
+            }
+            .into());
         }
         Ok(machine_id)
     }
@@ -19056,11 +19076,12 @@ impl Agent {
         .await
     }
 
-    /// [`Self::gate_peer_machine_inbound`] with cert expiry and grant
-    /// validity evaluated at `now_secs` (ADR-0074 §4 re-check).
+    /// [`Self::gate_peer_machine_inbound`] for ADR-0074 §4 re-check.
     ///
-    /// With `local_authority_only`, ADR 0115 confirmation and grant evidence
-    /// use only local / non-blocking reads (no EvidenceV1 wait/lookup).
+    /// Cert expiry / grant validity use [`OwnerTrust::now_unix_secs`] inside
+    /// the eval (no caller stamp). With `local_authority_only`, ADR 0115
+    /// confirmation and grant evidence use only local / non-blocking reads;
+    /// any contended resident authority read returns Busy.
     pub(crate) async fn gate_peer_machine_inbound_at(
         discovery_cache: &std::sync::Arc<
             tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -19071,9 +19092,8 @@ impl Agent {
         connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
         owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
-        now_secs: u64,
         local_authority_only: bool,
-    ) -> error::NetworkResult<Vec<identity::AgentId>> {
+    ) -> Result<Vec<identity::AgentId>, crate::forward::PeerGateError> {
         #![allow(clippy::too_many_arguments)]
         Self::gate_peer_machine_inbound_for_evidence(
             discovery_cache,
@@ -19085,7 +19105,6 @@ impl Agent {
             machine_id,
             None,
             false,
-            now_secs,
             local_authority_only,
         )
         .await
@@ -19129,17 +19148,18 @@ impl Agent {
             machine_id,
             call_caller,
             false,
-            Self::unix_timestamp_secs(),
             false,
         )
         .await
+        .map_err(|e| e.fail_closed_admission(machine_id.0))
     }
 
     /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
     /// peers gain evidence admission; every other check remains unchanged.
     ///
     /// With `local_authority_only`, confirmation and grant evaluation use
-    /// non-blocking local evidence only (ADR-0074 §4 reauth).
+    /// non-blocking local evidence only (ADR-0074 §4 reauth); contended
+    /// reads return Busy.
     #[allow(clippy::too_many_arguments)]
     async fn gate_peer_machine_inbound_for_evidence(
         discovery_cache: &std::sync::Arc<
@@ -19153,9 +19173,9 @@ impl Agent {
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
         evidence_only: bool,
-        now_secs: u64,
         local_authority_only: bool,
-    ) -> error::NetworkResult<Vec<identity::AgentId>> {
+    ) -> Result<Vec<identity::AgentId>, crate::forward::PeerGateError> {
+        use crate::owner_trust::NonblockingEval;
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -19180,7 +19200,8 @@ impl Agent {
             );
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: machine_id.0,
-            });
+            }
+            .into());
         }
         // Review r2 H5: pairing denials are PER-AGENT exclusions, not
         // machine denials. Identity-level gates (revocation/expiry/trust,
@@ -19197,34 +19218,71 @@ impl Agent {
         let mut grant_only: Vec<identity::AgentId> = Vec::new();
         for (agent_id, cert_not_after) in &agents {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
-            // cert has expired must be refused on the live path.
+            // cert has expired must be refused on the live path. Re-read
+            // the OwnerTrust clock per agent after any prior awaits.
+            let now_secs = owner_trust.now_unix_secs();
             let expired = identity::is_expired(*cert_not_after, now_secs);
-            // ADR-0074 §4: match grant_access_at — reauth must not block on
-            // a contended evidence store inside owner-trust.
-            let pair = owner_trust
-                .evaluate_pair_with(
-                    contact_store,
-                    discovery_cache,
-                    revocation_set,
-                    agent_id,
-                    machine_id,
-                    local_authority_only,
-                )
-                .await;
+            // ADR-0074 §4: local-authority reauth surfaces Busy on a
+            // contended evidence store inside owner-trust / grant eval.
+            let pair = if local_authority_only {
+                match owner_trust
+                    .evaluate_pair_nonblocking(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                    )
+                    .await
+                {
+                    NonblockingEval::Busy => {
+                        return Err(crate::forward::PeerGateError::Busy);
+                    }
+                    NonblockingEval::Done(pair) => pair,
+                }
+            } else {
+                owner_trust
+                    .evaluate_pair_with(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                        false,
+                    )
+                    .await
+            };
             if pair.owner_trusted {
                 owner_trusted.push(*agent_id);
             }
-            let access = owner_trust
-                .grant_access_at(
-                    contact_store,
-                    discovery_cache,
-                    revocation_set,
-                    agent_id,
-                    machine_id,
-                    now_secs,
-                    !local_authority_only,
-                )
-                .await;
+            let access = if local_authority_only {
+                match owner_trust
+                    .grant_access_nonblocking(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                    )
+                    .await
+                {
+                    NonblockingEval::Busy => {
+                        return Err(crate::forward::PeerGateError::Busy);
+                    }
+                    NonblockingEval::Done(access) => access,
+                }
+            } else {
+                owner_trust
+                    .grant_access_at(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                        true,
+                    )
+                    .await
+            };
             let has_connect_grant = !access.connect_ports.is_empty();
             // ADR-0073 × ADR-0070 (#980): only on the call-signaling gate,
             // and only for the ringing agent itself.
@@ -19268,7 +19326,8 @@ impl Agent {
                 );
                 return Err(error::NetworkError::PeerNotVerified {
                     agent_id: agent_id.0,
-                });
+                }
+                .into());
             }
             if let Err(e) = streams::stream_gate(
                 agent_id,
@@ -19286,7 +19345,7 @@ impl Agent {
                     error = %e,
                     "inbound traffic denied at identity gate (one agent on the machine failed)"
                 );
-                return Err(e);
+                return Err(e.into());
             }
             // ADR-0043 §9: B and P per (agent, machine) pairing — the
             // source pairing of an activated move dies here, permanently,
@@ -19323,7 +19382,8 @@ impl Agent {
             );
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: machine_id.0,
-            });
+            }
+            .into());
         }
 
         // ADR 0115 §2: a routing entry alone never makes an
@@ -19348,7 +19408,8 @@ impl Agent {
             );
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: machine_id.0,
-            });
+            }
+            .into());
         }
 
         // Connect-ACL gate input: every surviving routed agent stays listed
@@ -19383,7 +19444,7 @@ impl Agent {
                 error = %e,
                 "inbound traffic denied at connect-ACL gate (unlisted peer)"
             );
-            return Err(e);
+            return Err(e.into());
         }
         // Gate cleared — the ordered, authority-confirmed agent list for
         // the stream/lane handle.
@@ -19648,7 +19709,6 @@ impl Agent {
                         machine_id,
                         None,
                         true,
-                        Self::unix_timestamp_secs(),
                         false,
                     )
                     .await
@@ -19771,7 +19831,6 @@ impl Agent {
                         &machine_id,
                         None,
                         true,
-                        Self::unix_timestamp_secs(),
                         false,
                     )
                     .await
