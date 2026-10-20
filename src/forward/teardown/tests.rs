@@ -363,8 +363,85 @@ fn cancel_all_cancels_guard_and_empties_registry() {
         "cancel_all must fire the live-stream guard token"
     );
     assert_eq!(live.len(), 0, "cancel_all must drain the registry");
-    assert_eq!(diag.torn_down_reauth(), 1);
+    assert_eq!(diag.torn_down_reauth(), 0);
+    assert_eq!(diag.torn_down_shutdown(), 1);
     assert_eq!(diag.torn_down_reasons().get("shutdown"), Some(&1));
+}
+
+/// RC13 / #1488: after `cancel_all`, every later `register` returns a child
+/// of the already-cancelled `closed` parent, so a late admit cannot start
+/// an uncancelled bridge. Late register is not a trust-loss teardown.
+#[tokio::test]
+async fn register_after_cancel_all_yields_cancelled_token() {
+    let diag = Arc::new(ForwardDiagnostics::default());
+    let live = Arc::new(LiveStreams::new(Arc::clone(&diag)));
+
+    // Close an empty registry: parent `closed` must still poison later children.
+    live.cancel_all("shutdown");
+    let late_empty = live.register(
+        StreamGate::Outbound {
+            peer_agent: AgentId([0x51; 32]),
+            machine: MachineId([0xB0; 32]),
+        },
+        StreamAuthority::PeerTrust,
+    );
+    assert!(
+        late_empty.token().is_cancelled(),
+        "register after cancel_all must yield an already-cancelled child token"
+    );
+    let token = late_empty.token().clone();
+    let mut bridge_started = false;
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {}
+        _ = async {
+            bridge_started = true;
+            std::future::pending::<()>().await
+        } => {}
+    }
+    assert!(
+        !bridge_started,
+        "cancelled token must win before any bridge work"
+    );
+    assert_eq!(
+        diag.torn_down_reauth(),
+        0,
+        "late register is not a trust-loss teardown"
+    );
+    drop(late_empty);
+
+    // Same after cancel_all previously drained a live entry.
+    let diag2 = Arc::new(ForwardDiagnostics::default());
+    let live2 = Arc::new(LiveStreams::new(Arc::clone(&diag2)));
+    let early = live2.register(
+        StreamGate::Outbound {
+            peer_agent: AgentId([0x52; 32]),
+            machine: MachineId([0xB1; 32]),
+        },
+        StreamAuthority::PeerTrust,
+    );
+    assert!(!early.token().is_cancelled());
+    live2.cancel_all("shutdown");
+    assert!(early.token().is_cancelled());
+    drop(early);
+
+    let late_after_drain = live2.register(
+        StreamGate::Outbound {
+            peer_agent: AgentId([0x53; 32]),
+            machine: MachineId([0xB2; 32]),
+        },
+        StreamAuthority::PeerTrust,
+    );
+    assert!(
+        late_after_drain.token().is_cancelled(),
+        "register after drained cancel_all must still yield a cancelled child"
+    );
+    assert_eq!(diag2.torn_down_reauth(), 0);
+    assert_eq!(
+        diag2.torn_down_shutdown(),
+        1,
+        "only the drained live entry counts as shutdown teardown"
+    );
 }
 
 /// WHY (ADR-0074 §4, Q5): revoking the ShareGrant a forward was admitted

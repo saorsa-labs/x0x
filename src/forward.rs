@@ -975,7 +975,11 @@ pub struct ForwardDiagnostics {
     header_timeout: AtomicU64,
     /// Live streams torn down because their authority is gone (ADR-0074 §4).
     torn_down_reauth: AtomicU64,
-    /// `torn_down_reauth` broken down by reason.
+    /// Live streams torn down by process/service shutdown (not trust-loss).
+    torn_down_shutdown: AtomicU64,
+    /// Teardown reasons for debug (`revoked`, `trust_rejected`, `shutdown`, …).
+    /// Shutdown increments [`Self::torn_down_shutdown`], not
+    /// [`Self::torn_down_reauth`].
     torn_down_reasons: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>,
 }
 
@@ -1013,14 +1017,28 @@ impl ForwardDiagnostics {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *reasons.entry(reason).or_insert(0) += 1;
     }
+    /// Record a live stream torn down by shutdown (not trust-loss).
+    pub(crate) fn record_torn_down_shutdown(&self) {
+        self.torn_down_shutdown.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self
+            .torn_down_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reasons.entry("shutdown").or_insert(0) += 1;
+    }
     /// Live streams torn down because their authority is gone (ADR-0074 §4).
     /// Logged as `torn_down_total` on each teardown.
     #[must_use]
     pub(crate) fn torn_down_reauth(&self) -> u64 {
         self.torn_down_reauth.load(Ordering::Relaxed)
     }
-    /// `torn_down_reauth` by reason (`revoked`, `trust_rejected`,
-    /// `target_not_allowed`, ...).
+    /// Live streams torn down by shutdown (not trust-loss).
+    #[must_use]
+    pub(crate) fn torn_down_shutdown(&self) -> u64 {
+        self.torn_down_shutdown.load(Ordering::Relaxed)
+    }
+    /// Teardown reasons for debug (`revoked`, `trust_rejected`,
+    /// `target_not_allowed`, `shutdown`, ...).
     #[must_use]
     pub(crate) fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
         self.torn_down_reasons
@@ -3436,7 +3454,8 @@ mod tests {
             "shutdown must cancel live bridge tokens immediately"
         );
         assert_eq!(service.live.len(), 0, "shutdown must drain live registry");
-        assert_eq!(service.diagnostics().torn_down_reauth(), 1);
+        assert_eq!(service.diagnostics().torn_down_reauth(), 0);
+        assert_eq!(service.diagnostics().torn_down_shutdown(), 1);
         assert_eq!(
             service.diagnostics().torn_down_reasons().get("shutdown"),
             Some(&1)
@@ -3444,6 +3463,130 @@ mod tests {
         // Agent stays alive: do not call agent.shutdown(); Arc still usable.
         assert!(!agent.shutdown_token().is_cancelled());
         assert!(!agent.agent_id().as_bytes().is_empty());
+    }
+
+    /// RC13 / #1488: `ForwardService::shutdown` closes the live registry so a
+    /// register that lands afterward cannot obtain an uncancelled bridge token,
+    /// while the Agent stays alive (#456 explicit identity paths).
+    #[tokio::test]
+    async fn shutdown_late_register_cancelled_while_agent_alive() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Explicit paths (incl. absent user.key) so unit runs without
+        // nextest's X0X_HOME — avoids #456 real-home panic in Agent::build.
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_user_key_path(dir.path().join("user.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(agent.clone(), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+
+        // Shutdown first; Agent stays alive — do not call agent.shutdown().
+        service.shutdown();
+        assert!(!agent.shutdown_token().is_cancelled());
+
+        let late = service.live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: AgentId([0x51; 32]),
+                machine: MachineId([0xB0; 32]),
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert!(
+            late.token().is_cancelled(),
+            "register after ForwardService::shutdown must yield a cancelled token"
+        );
+        assert!(!agent.shutdown_token().is_cancelled());
+        assert_eq!(
+            service.diagnostics().torn_down_reauth(),
+            0,
+            "empty/late shutdown path must not count as trust-loss"
+        );
+    }
+
+    /// RC13 / #1488: a handler that stalls before `live.register`, then resumes
+    /// after `ForwardService::shutdown` while the Agent is still alive, must
+    /// see a cancelled registration and must not start bridging.
+    ///
+    /// Unit-style oneshot barrier; no real QUIC.
+    #[tokio::test]
+    async fn shutdown_cancels_registration_resumed_after_pending_handler() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_user_key_path(dir.path().join("user.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(agent.clone(), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let live = Arc::clone(&service.live);
+        let join = tokio::spawn(async move {
+            let _ = pending_tx.send(());
+            let _ = resume_rx.await;
+            let guard = live.register(
+                teardown::StreamGate::Outbound {
+                    peer_agent: AgentId([0x51; 32]),
+                    machine: MachineId([0xB0; 32]),
+                },
+                teardown::StreamAuthority::PeerTrust,
+            );
+            let token = guard.token().clone();
+            let mut bridge_started = false;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {}
+                _ = async {
+                    bridge_started = true;
+                    std::future::pending::<()>().await
+                } => {}
+            }
+            (token.is_cancelled(), bridge_started)
+        });
+
+        pending_rx.await.expect("handler reached pending point");
+        service.shutdown();
+        assert!(
+            !agent.shutdown_token().is_cancelled(),
+            "Agent must stay alive across ForwardService::shutdown"
+        );
+        resume_tx.send(()).expect("resume pending handler");
+        let (cancelled, bridge_started) = join.await.expect("handler join");
+        assert!(
+            cancelled,
+            "registration resumed after shutdown must be cancelled"
+        );
+        assert!(
+            !bridge_started,
+            "cancelled registration must not start bridging"
+        );
+        assert_eq!(
+            service.diagnostics().torn_down_reauth(),
+            0,
+            "pending-handler race must not count as trust-loss"
+        );
     }
 
     #[tokio::test]

@@ -191,6 +191,10 @@ pub(crate) struct LiveStreams {
     next_id: AtomicU64,
     streams: std::sync::Mutex<HashMap<u64, LiveEntry>>,
     diag: Arc<ForwardDiagnostics>,
+    /// Parent of every registration token. Cancelled first in
+    /// [`Self::cancel_all`] so a register that races or follows shutdown
+    /// cannot obtain an uncancelled bridge token.
+    closed: CancellationToken,
 }
 
 /// Registration of one live stream. Its token fires on teardown; dropping
@@ -221,6 +225,7 @@ impl LiveStreams {
             next_id: AtomicU64::new(0),
             streams: std::sync::Mutex::new(HashMap::new()),
             diag,
+            closed: CancellationToken::new(),
         }
     }
 
@@ -231,13 +236,17 @@ impl LiveStreams {
     }
 
     /// Register a stream admitted under `authority` by a gate run on `gate`.
+    ///
+    /// The guard token is a child of [`Self`]'s `closed` parent. After
+    /// `cancel_all`, every new child is already cancelled, so a late
+    /// register cannot start an uncancelled bridge.
     pub(crate) fn register(
         self: &Arc<Self>,
         gate: StreamGate,
         authority: StreamAuthority,
     ) -> LiveStreamGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let cancel = CancellationToken::new();
+        let cancel = self.closed.child_token();
         self.lock().insert(
             id,
             LiveEntry {
@@ -287,11 +296,30 @@ impl LiveStreams {
     ///
     /// Call before stopping the reauth loop so shutdown never leaves a
     /// bridge without revocation enforcement (ADR-0074 §4 / #1388).
+    ///
+    /// Cancels `closed` first so any concurrent or subsequent `register`
+    /// receives an already-cancelled child token.
     pub(crate) fn cancel_all(&self, reason: &'static str) {
+        self.closed.cancel();
         let entries: Vec<LiveEntry> = self.lock().drain().map(|(_, e)| e).collect();
+        let n = entries.len();
         for entry in entries {
             entry.cancel.cancel();
-            self.diag.record_torn_down(reason);
+            if reason == "shutdown" {
+                self.diag.record_torn_down_shutdown();
+            } else {
+                self.diag.record_torn_down(reason);
+            }
+        }
+        if reason == "shutdown" {
+            tracing::info!(
+                target: "x0x::forward",
+                drained = n,
+                torn_down_shutdown = self.diag.torn_down_shutdown(),
+                torn_down_reauth = self.diag.torn_down_reauth(),
+                outcome = "registry_closed",
+                "live forward registry closed for shutdown (not trust-loss)"
+            );
         }
     }
 
