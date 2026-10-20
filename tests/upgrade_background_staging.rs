@@ -153,13 +153,35 @@ macro_rules! background_staging_regression_tests {
                 manifest.assets[0].archive_url = "background-fixture://no-download".into();
                 manifest.assets[0].signature_url = "background-fixture://no-download".into();
                 let started = tokio::time::Instant::now();
+                let (_shutdown_tx, shutdown_watch) = watch::channel(false);
+                let runtime = BackgroundRuntime {
+                    config, data_dir: data.clone(),
+                    api_addr: SocketAddr::from(([127, 0, 0, 1], 12700)),
+                    shutdown: (shutdown, shutdown_watch),
+                    apply_lock: Arc::new(Mutex::new(())),
+                    staging: StartupStagingContext {
+                        install: install.clone(), identity_root: data.clone(), machine_id: [42; 32],
+                        observed: None,
+                        clock: Some(Arc::new(move || Ok(crate::upgrade::probe::ProbeClock {
+                            boot_id: "background-owned-fixture".into(),
+                            monotonic_ms: 1000 + u64::try_from(started.elapsed().as_millis())
+                                .map_err(std::io::Error::other)?,
+                        }))),
+                    },
+                    operation_observer: None,
+                };
+                let verified = crate::upgrade::monitor::VerifiedRelease {
+                    manifest_json: serde_json::to_vec(&manifest).unwrap(), manifest,
+                    signature: Vec::new(), gossip_payload: Vec::new(),
+                };
+                let permit = crate::upgrade::apply::ReleasePermit::default();
                 let mut result = None;
                 {
                     // This is the helper called by BOTH real background loops.
-                    // No staging request or ignored future configuration is
-                    // attached by the fixture to alter the baseline behavior.
-                    let operation = apply_background_release(&config, &data,
-                        SocketAddr::from(([127, 0, 0, 1], 12700)), &shutdown, &manifest);
+                    // GREEN supplies the same real boot identity and original
+                    // manifest bytes now carried by production. The prior RED
+                    // commit used this helper before it accepted these inputs.
+                    let operation = apply_background_release(&runtime, &verified, &permit);
                     tokio::pin!(operation);
                     for step in 0..2 {
                         if step == 1 {
