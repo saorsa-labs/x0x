@@ -10891,7 +10891,11 @@ impl Agent {
             let evidence = self.peer_evidence();
             let lookup = async {
                 if evidence.wait(0).await {
-                    evidence.lookup(*to, None).await;
+                    // #1239: synchronous Lookup reads must not block this
+                    // executor or its timers. Load and Lookup share the
+                    // resolver's deadline; only the source re-read below
+                    // can establish a binding.
+                    let _ = evidence.lookup_before(*to, deadline).await;
                 }
             };
             tokio::pin!(lookup);
