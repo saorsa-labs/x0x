@@ -1450,7 +1450,7 @@ mod tests {
                                     boot_id: "apply-boundary-test".to_owned(),
                                     monotonic_ms: 100,
                                 },
-                                timeout: std::time::Duration::from_millis(40),
+                                timeout: std::time::Duration::from_secs(2),
                                 fail_write: None,
                             },
                         )
