@@ -752,6 +752,7 @@ impl AutoApplyUpgrader {
                 result = restart::resolve_staging_identity(
                     self.stop_on_upgrade, &gate.request.install,
                     self.restart_context.data_dir.as_deref(), self.restart_context.api_addr,
+                    self.release_permit.as_ref().and_then(ReleasePermit::http_wait_slot),
                 ) => result.map_err(UpgradeError::from)?,
             };
             self.check_release()?;
@@ -934,19 +935,25 @@ impl AutoApplyUpgrader {
         binary_path: &Path,
     ) -> Result<restart::RestartPlan, UpgradeError> {
         let signals = restart::SupervisionSignals::sample();
-        let launchd_readback = restart::readback_launchd_policy_offloaded(
+        let launchd_readback = restart::readback_launchd_policy_retaining(
             &signals,
             binary_path,
             &restart::current_argv(),
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
         )
         .await;
         // #690: the systemd-side twin — no-op (NotApplicable) unless a
         // systemd signal classified this instance, so macOS and unsupervised
         // applies shell out to nothing.
-        let systemd_readback = restart::readback_systemd_policy_offloaded(
+        let systemd_readback = restart::readback_systemd_policy_retaining(
             &signals,
             binary_path,
             &restart::current_argv(),
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
         )
         .await;
         restart::resolve_restart_plan(

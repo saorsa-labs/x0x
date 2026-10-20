@@ -378,23 +378,133 @@ pub async fn readback_launchd_policy_offloaded(
     executable: &Path,
     argv: &[String],
 ) -> LaunchdPolicyReadback {
-    let signals = signals.clone();
-    let executable = executable.to_path_buf();
-    let argv = argv.to_vec();
-    spawn_readback_offloaded(move || readback_launchd_policy(&signals, &executable, &argv)).await
+    readback_launchd_policy_retaining(signals, executable, argv, None).await
 }
 
-/// spawn_blocking core of [`readback_launchd_policy_offloaded`], split so the
-/// offload itself is testable with a stand-in readback closure instead of the
-/// real plutil/launchctl subprocesses.
-async fn spawn_readback_offloaded(
-    readback: impl FnOnce() -> LaunchdPolicyReadback + Send + 'static,
+/// Internal HTTP custody; the public readback contract remains unchanged.
+pub(crate) type ReadbackLease = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadbackKind {
+    Launchd,
+    SystemdPolicy,
+    #[cfg(unix)]
+    SystemdIdentity,
+}
+
+/// Every actual readback closure owns its lease before it enters the blocking
+/// queue. Dropping the async observer cannot free HTTP capacity before exit.
+async fn spawn_readback_retaining<T: Send + 'static>(
+    _target: PathBuf,
+    _kind: ReadbackKind,
+    lease: Option<ReadbackLease>,
+    readback: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    #[cfg(test)]
+    let hook = readback_custody_seam::capture(&_target);
+    #[cfg(test)]
+    let queued_hook = hook.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        // Drop the lease before publishing Exited, including unwind paths.
+        #[cfg(test)]
+        let _exit = readback_custody_seam::Exit(hook.clone(), _kind);
+        let _lease = lease;
+        #[cfg(test)]
+        readback_custody_seam::observe(&hook, _kind, readback_custody_seam::ReadbackEvent::Entered);
+        readback()
+    });
+    #[cfg(test)]
+    readback_custody_seam::observe(
+        &queued_hook,
+        _kind,
+        readback_custody_seam::ReadbackEvent::Queued,
+    );
+    task.await
+}
+
+pub(crate) async fn readback_launchd_policy_retaining(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+    lease: Option<ReadbackLease>,
 ) -> LaunchdPolicyReadback {
-    match tokio::task::spawn_blocking(readback).await {
+    let signals = signals.clone();
+    let executable = executable.to_path_buf();
+    let target = executable.clone();
+    let argv = argv.to_vec();
+    match spawn_readback_retaining(target, ReadbackKind::Launchd, lease, move || {
+        readback_launchd_policy(&signals, &executable, &argv)
+    })
+    .await
+    {
         Ok(verdict) => verdict,
         Err(join_err) => LaunchdPolicyReadback::NotGuaranteed {
             detail: format!("launchd policy readback task failed: {join_err}"),
         },
+    }
+}
+
+/// Retain the existing offload-thread/failure tests on the same spawn path.
+#[cfg(test)]
+async fn spawn_readback_offloaded(
+    readback: impl FnOnce() -> LaunchdPolicyReadback + Send + 'static,
+) -> LaunchdPolicyReadback {
+    match spawn_readback_retaining(PathBuf::new(), ReadbackKind::Launchd, None, readback).await {
+        Ok(verdict) => verdict,
+        Err(join_err) => LaunchdPolicyReadback::NotGuaranteed {
+            detail: format!("launchd policy readback task failed: {join_err}"),
+        },
+    }
+}
+
+/// Target-keyed observations of actual blocking readbacks. Tests may pause at
+/// Entered; the real readback then continues through its existing inert seam.
+#[cfg(test)]
+pub(crate) mod readback_custody_seam {
+    use super::ReadbackKind;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ReadbackEvent {
+        Queued,
+        Entered,
+        Exited,
+    }
+    pub(crate) type Hook = Arc<dyn Fn(ReadbackKind, ReadbackEvent) + Send + Sync>;
+
+    fn hooks() -> &'static Mutex<HashMap<PathBuf, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    pub(crate) struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = hooks().lock() {
+                hooks.remove(&self.0);
+            }
+        }
+    }
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        let mut hooks = hooks().lock().expect("readback hooks");
+        assert!(!hooks.contains_key(&target), "duplicate readback hook");
+        hooks.insert(target.clone(), hook);
+        Guard(target)
+    }
+    pub(super) fn capture(target: &Path) -> Option<Hook> {
+        hooks().lock().ok()?.get(target).cloned()
+    }
+    pub(super) fn observe(hook: &Option<Hook>, kind: ReadbackKind, event: ReadbackEvent) {
+        if let Some(hook) = hook {
+            hook(kind, event);
+        }
+    }
+    pub(super) struct Exit(pub Option<Hook>, pub ReadbackKind);
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            observe(&self.0, self.1, ReadbackEvent::Exited);
+        }
     }
 }
 
@@ -1948,14 +2058,26 @@ pub async fn readback_systemd_policy_offloaded(
     executable: &Path,
     argv: &[String],
 ) -> SystemdPolicyReadback {
+    readback_systemd_policy_retaining(signals, executable, argv, None).await
+}
+
+pub(crate) async fn readback_systemd_policy_retaining(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+    lease: Option<ReadbackLease>,
+) -> SystemdPolicyReadback {
     let signals = signals.clone();
     let executable = executable.to_path_buf();
+    let target = executable.clone();
     let argv = argv.to_vec();
-    tokio::task::spawn_blocking(move || readback_systemd_policy(&signals, &executable, &argv))
-        .await
-        .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
-            detail: format!("systemd readback task failed: {e}"),
-        })
+    spawn_readback_retaining(target, ReadbackKind::SystemdPolicy, lease, move || {
+        readback_systemd_policy(&signals, &executable, &argv)
+    })
+    .await
+    .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
+        detail: format!("systemd readback task failed: {e}"),
+    })
 }
 
 /// #1196 round 2 test seam (cfg(test) only; no env vars, no cargo
@@ -2332,15 +2454,20 @@ pub(crate) async fn resolve_staging_identity(
     executable: &Path,
     data_root_hint: Option<&Path>,
     api_addr: Option<SocketAddr>,
+    lease: Option<ReadbackLease>,
 ) -> Result<StagingIdentity, RestartOwnershipError> {
     let signals = SupervisionSignals::sample();
     let argv = current_argv();
-    let launchd = readback_launchd_policy_offloaded(&signals, executable, &argv).await;
+    let launchd =
+        readback_launchd_policy_retaining(&signals, executable, &argv, lease.clone()).await;
     let observed_signals = signals.clone();
     let observed_executable = executable.to_path_buf();
-    let systemd = tokio::task::spawn_blocking(move || {
-        readback_systemd_observation(&observed_signals, &observed_executable, &argv)
-    })
+    let systemd = spawn_readback_retaining(
+        executable.to_path_buf(),
+        ReadbackKind::SystemdIdentity,
+        lease,
+        move || readback_systemd_observation(&observed_signals, &observed_executable, &argv),
+    )
     .await
     .unwrap_or_else(|error| {
         SystemdPolicyReadback::NotGuaranteed {
