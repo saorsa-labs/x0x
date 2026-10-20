@@ -207,6 +207,8 @@ pub(crate) struct ProbeOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Each fault point names the exact file or directory durability operation.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum StageBarrierStep {
     DaemonFileSync,
     DaemonDirectorySync,
