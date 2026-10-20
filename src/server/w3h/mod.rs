@@ -744,7 +744,12 @@ impl Sim {
                     fabric: Arc::clone(&fabric),
                     logs: Arc::clone(&logs),
                 }
-                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                .with_filter(
+                    // DIAG #1364 (do not merge): DEBUG for treekem.trace.
+                    tracing_subscriber::filter::Targets::new()
+                        .with_default(tracing::Level::WARN)
+                        .with_target("treekem.trace", tracing::Level::DEBUG),
+                ),
             ),
         );
         let sim = Self {

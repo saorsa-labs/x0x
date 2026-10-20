@@ -13,16 +13,22 @@
 //!   certificates inline only up to the DM budget
 //!   (`attach_roster_certificates_to_member_added`), so A keeps some X
 //!   seats digest-only. A asks the group for the omitted certificates
-//!   (#946). Until t1 the harness drops every frame toward A that carries
-//!   an X certificate (other than A's own seat event) and every #946
-//!   answer (ADR 0111 H3: the harness makes the admin's seat
-//!   digest-only). Evidence: A
-//!   holds digest-only seats, and O and the X devices hold their bytes.
-//! - t1: O and every X device go offline. A restarts on its own
-//!   directories. Evidence: after the restart A is still an admin, its
-//!   digest-only seats are the same, its durable announce cache has no
-//!   certificate for them, and every eligible holder (an active member that
-//!   holds the bytes) is offline.
+//!   (#946). The digest-only state is HARNESS-MADE (ADR 0111 H3: the
+//!   harness makes the admin's seat digest-only). On `main` A otherwise
+//!   gets every certificate: a Home seat event carries all of them inline
+//!   (its TreeKEM fields put the event over the DM budget, so the sidecar
+//!   is not trimmed below 32 certificates), and in a GSS group each X's
+//!   `MemberJoined` and `MemberAdded` are replayed to A on G's metadata
+//!   topic. So, during setup only, the harness drops every frame toward A
+//!   that carries an X certificate (other than A's own seat event) and
+//!   every #946 answer. It lifts the drop at a named trace mark before
+//!   the holders go offline. Evidence (read from A's state, not from the
+//!   drop count): the exact list of A's digest-only seats.
+//! - t1: the drop is lifted, then O and every X device go offline. A
+//!   restarts on its own directories. Evidence: after the restart A is
+//!   still an admin, its digest-only seats are the same, its durable
+//!   announce cache has no certificate for them, and every eligible holder
+//!   (an active member that holds the bytes) is offline.
 //! - t2: A mints J's invite and J redeems it. Desired (ADR 0111 S5,
 //!   fetch by hash from any holder): A seals and J becomes Active. On
 //!   `main`, A's seal refuses with `OwnerCertMemberPending` naming exactly
@@ -370,6 +376,45 @@ async fn admitted(
     }
 }
 
+/// Whether `observer` verifies `subject`'s AgentId->MachineId binding now
+/// (the `verified` flag of a direct message from `subject`).
+async fn binding_verified(sim: &Sim, observer: &str, subject: &str) -> Result<bool> {
+    let state = sim.state(observer)?;
+    let (agent, machine) = sim.ids(subject)?;
+    sim.at_instant(
+        &format!("read whether {observer} verifies {subject}'s binding"),
+        async move {
+            state
+                .agent
+                .is_agent_machine_verified(&agent, &machine)
+                .await
+        },
+    )
+    .await
+}
+
+/// `subject` re-announces (`POST /announce`); whether `observer` then
+/// verifies `subject`'s machine binding within 30 s.
+async fn announce_and_wait_verified(sim: &Sim, subject: &str, observer: &str) -> Result<bool> {
+    let (status, body) = sim
+        .api(subject, Method::POST, "/announce", Some(json!({})))
+        .await?;
+    ensure!(status.is_success(), "{subject} announce: {status} {body}");
+    let what = format!("{observer} verifies {subject}'s binding");
+    match sim
+        .until(&what, secs(30), async |s: &Sim| {
+            binding_verified(s, observer, subject)
+                .await
+                .unwrap_or(false)
+        })
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(error) if expired(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Watch A's DM layer for J's join `fetch_request` for `gid`, from now on.
 /// The watcher is one more subscriber of A's `DirectMessaging` fan-out
 /// (either DM transport), so it sees what A's join listener sees.
@@ -497,13 +542,18 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         ),
     };
 
-    // t1: the holders go offline, the drop ends, and A restarts.
+    // t1: the setup drop ends, then the holders go offline (no await in
+    // between, so no frame moves), and A restarts.
+    answers.release();
+    sim.fabric().mark(format!(
+        "setup fault lifted: X-certificate and #946 drop toward A ({} frames dropped)",
+        answers.dropped()
+    ));
     for label in HOLDERS {
         if Some(*label) != stays_online {
             sim.set_online(label, false)?;
         }
     }
-    answers.release();
     let a_peer = sim.peer("A")?;
     let incarnation = sim
         .fabric()
@@ -534,6 +584,26 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .await?
         .map_err(|error| anyhow!("A could not dial {label}: {error}"))?;
     }
+    // A's discovery cache is in memory, so after its restart A cannot
+    // verify J's AgentId->MachineId binding until J announces again. An
+    // unverified MemberJoined or fetch_request is dropped before the
+    // MemberJoined arm, at DEBUG only
+    // (`apply_named_group_metadata_event_inner`, reason "unverified"), so
+    // A never reaches its seal (run 39371831602: 123 join messages, all
+    // verified=false, in both arms). J re-announces, as a joiner that
+    // comes online after A's restart does at its start, and the case
+    // waits until A verifies J's binding (`case_1207.rs` does the same).
+    let j_verified = announce_and_wait_verified(sim, "J", "A").await?;
+    receipt.evidence(
+        "a_verifies_j_binding_after_its_restart",
+        j_verified,
+        format!("after J's re-announce, A verifies J's machine binding: {j_verified}"),
+        at(sim),
+    );
+    ensure!(
+        j_verified,
+        "INFRA: A never verified J's machine binding after A's restart"
+    );
     receipt.setup_done(at(sim));
 
     let after = seat_view(sim, "A", &home.gid).await?;
@@ -609,9 +679,11 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
+    // Only a verified message reaches A's MemberJoined arm and its seal.
     let first = received
-        .first()
-        .filter(|seen| seen.position > join_position);
+        .iter()
+        .find(|seen| seen.verified && seen.position > join_position);
+    let unverified = received.iter().filter(|seen| !seen.verified).count();
     let first_request = first.map(|seen| seen.at);
     let direct_frames = sim
         .fabric()
@@ -622,11 +694,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         first.is_some(),
         format!(
             "{} join messages from J for this group reached A's DM layer after the \
-             join call (trace #{join_position}); {direct_frames} frames J->A delivered; \
-             first at trace #{} (verified={})",
+             join call (trace #{join_position}), {unverified} of them unverified; \
+             {direct_frames} frames J->A delivered; first verified at trace #{}",
             received.len(),
             first.map_or("none".to_string(), |seen| seen.position.to_string()),
-            first.is_some_and(|seen| seen.verified),
         ),
         at(sim),
     );
@@ -656,6 +727,13 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             refusal.is_some(),
             at(sim),
         );
+        // DIAG #1364 (do not merge): every captured log after t2.
+        let t2_at = received.first().map(|seen| seen.at).unwrap_or_default();
+        for log in sim.logs_containing(&[]) {
+            if log.at >= t2_at.saturating_sub(secs(5)) {
+                eprintln!("W3H-DIAG @{}us {}", log.at.as_micros(), log.text);
+            }
+        }
         let a_rows = roster(sim, "A", &home.gid).await.unwrap_or_default();
         let j_state = membership_state(sim, "J", &home.gid).await.ok().flatten();
         sim.fabric().mark(format!(
