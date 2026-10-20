@@ -6,8 +6,6 @@
 //! support.
 
 pub mod apply;
-#[cfg(unix)]
-mod inventory_commands;
 pub(crate) mod journal;
 pub mod manifest;
 pub mod monitor;
@@ -18,6 +16,9 @@ pub mod restart;
 pub mod rollout;
 pub mod signature;
 pub mod verification_probe;
+
+#[cfg(unix)]
+mod inventory_commands;
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
