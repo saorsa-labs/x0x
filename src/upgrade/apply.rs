@@ -23,6 +23,52 @@ use super::{UpgradeError, UpgradeResult, Upgrader};
 pub(crate) const HTTP_DEFERRED_RESTART_DELAY: std::time::Duration =
     std::time::Duration::from_millis(750);
 
+/// The probe runs with the existing install locks held, before admission.
+type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + Send>;
+
+#[cfg(unix)]
+async fn inspect_probe_admission(
+    install: PathBuf,
+    version: String,
+) -> Result<super::probe::Admission, UpgradeError> {
+    tokio::task::spawn_blocking(move || {
+        let _lock = super::acquire_host_upgrade_lock(&install)?;
+        super::probe::inspect_admission(&install, &version)
+            .map_err(|error| UpgradeError::Other(error.to_string()))
+    })
+    .await
+    .map_err(|error| UpgradeError::Other(format!("probe admission worker failed: {error}")))?
+}
+
+#[cfg(unix)]
+async fn probe_retry_delay_for_install(
+    install: PathBuf,
+    version: String,
+) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+    tokio::task::spawn_blocking(move || {
+        let _lock = super::acquire_host_upgrade_lock(&install)?;
+        let admission = super::probe::inspect_admission(&install, &version)
+            .map_err(|error| UpgradeError::Other(error.to_string()))?;
+        // Inspect and read under the same lock. An expired durable
+        // InterruptedWait is an immediate retry, not "no pending work".
+        let state = super::probe::read_state(&install)
+            .map_err(|error| UpgradeError::Other(error.to_string()))?;
+        Ok(state
+            .filter(|state| {
+                state.version == version && state.phase == super::probe::ProbePhase::InterruptedWait
+            })
+            .map(|state| super::probe_retry::RetryWait {
+                delay: match admission {
+                    super::probe::Admission::Ready => std::time::Duration::ZERO,
+                    super::probe::Admission::Waiting { retry_after } => retry_after,
+                },
+                transaction_id: state.transaction_id,
+            }))
+    })
+    .await
+    .map_err(|error| UpgradeError::Other(format!("probe retry-state worker failed: {error}")))?
+}
+
 /// Arm the HTTP deferred-restart owner before any host mutation (#1447 RC5).
 ///
 /// Spawns a parked OS thread first. On `Builder::spawn` failure, returns `Err`
@@ -203,6 +249,7 @@ async fn apply_replacements_offloaded(
     companion: Option<(Upgrader, PathBuf)>,
     temp_guard: TempDirGuard,
     mut on_success: Option<Box<dyn FnOnce() + Send>>,
+    probe_admission: Option<ProbeAdmission>,
 ) -> Result<UpgradeResult, UpgradeError> {
     let caller_alive = Arc::new(AtomicBool::new(true));
     let worker_alive = Arc::clone(&caller_alive);
@@ -252,6 +299,15 @@ async fn apply_replacements_offloaded(
         if !worker_alive.load(Ordering::Acquire) {
             return Err(UpgradeError::Other(
                 "upgrade cancelled before host replace".to_string(),
+            ));
+        }
+
+        if let Some(probe) = probe_admission {
+            probe(&worker_alive)?;
+        }
+        if !worker_alive.load(Ordering::Acquire) {
+            return Err(UpgradeError::Other(
+                "upgrade cancelled during candidate probes".to_string(),
             ));
         }
 
@@ -358,6 +414,35 @@ impl AutoApplyUpgrader {
     pub(crate) fn with_http_deferred_restart(mut self, enable: bool) -> Self {
         self.http_deferred_restart = enable;
         self
+    }
+
+    pub(crate) fn for_probe_retry(&self) -> Self {
+        Self {
+            binary_name: self.binary_name.clone(),
+            stop_on_upgrade: self.stop_on_upgrade,
+            restart_on_success: self.restart_on_success,
+            http_deferred_restart: self.http_deferred_restart,
+            restart_context: self.restart_context.clone(),
+        }
+    }
+
+    /// Read the durable retry state on the blocking pool under the install lock.
+    /// Failed holds and ambiguous records never produce a retry timer.
+    pub(crate) async fn probe_retry_delay(
+        &self,
+        version: &str,
+    ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+        #[cfg(unix)]
+        {
+            let install = current_binary_path()?;
+            let version = version.to_owned();
+            probe_retry_delay_for_install(install, version).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = version;
+            Ok(None)
+        }
     }
 
     /// Restart the current binary using the planned restart mode.
@@ -476,6 +561,8 @@ impl AutoApplyUpgrader {
         // installed binaries untouched. The plan is then carried through
         // replacement and restart — never re-derived post-swap.
         let restart_plan = self.resolve_restart_plan(&target_path).await?;
+        #[cfg(unix)]
+        let probe_launch = super::probe::ProbeLaunch::capture(&restart_plan.cwd);
         // Refuse a failed Unix record barrier before download or replacement.
         // Unmanaged Windows keeps the released legacy helper path; managed
         // Windows is refused by the restart planner and has no M2 barrier.
@@ -483,6 +570,14 @@ impl AutoApplyUpgrader {
         super::journal::check_record_barrier_support(&restart_plan.data_root).map_err(|error| {
             UpgradeError::Other(format!("upgrade record barrier unavailable: {error}"))
         })?;
+        #[cfg(unix)]
+        if let super::probe::Admission::Waiting { retry_after } =
+            inspect_probe_admission(target_path.clone(), manifest.version.clone()).await?
+        {
+            return Err(UpgradeError::Other(
+                super::probe::ProbeRefusal::Waiting { retry_after }.to_string(),
+            ));
+        }
         info!(
             mode = ?restart_plan.mode,
             supervision = restart_plan.supervision_signal.as_deref().unwrap_or("none"),
@@ -566,6 +661,28 @@ impl AutoApplyUpgrader {
         let extracted_path = temp_dir.join("extracted-binary");
         extract_binary_from_archive(&archive_path, &extracted_path, &binary_name)?;
 
+        // M2 probes both packaged executables even when the installed CLI is
+        // split/package-managed and will not be replaced by this transaction.
+        // Preserve the released unmanaged Windows path without an M2 claim.
+        #[cfg(unix)]
+        let (probe_daemon, probe_cli) = {
+            let daemon = if self.binary_name == "x0xd" {
+                extracted_path.clone()
+            } else {
+                let path = temp_dir.join("probe-x0xd");
+                extract_binary_from_archive(&archive_path, &path, "x0xd")?;
+                path
+            };
+            let cli = if self.binary_name == "x0x" {
+                extracted_path.clone()
+            } else {
+                let path = temp_dir.join("extracted-x0x");
+                extract_binary_from_archive(&archive_path, &path, "x0x")?;
+                path
+            };
+            (daemon, cli)
+        };
+
         // Prepare an optional companion replace; both locks run off-worker below.
         let mut companion = None;
         if self.binary_name == "x0xd" {
@@ -580,18 +697,49 @@ impl AutoApplyUpgrader {
             let x0x_path = parent_dir.join(x0x_name);
             if x0x_path.exists() {
                 info!("Found x0x CLI companion in same directory, upgrading it too...");
-                let extracted_x0x = temp_dir.join("extracted-x0x");
-                if let Err(e) = extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+                #[cfg(unix)]
                 {
-                    warn!("Failed to extract companion x0x binary: {e}");
-                } else {
                     companion = Some((
                         Upgrader::new(x0x_path, current_version.clone()),
-                        extracted_x0x,
+                        probe_cli.clone(),
                     ));
+                }
+                #[cfg(not(unix))]
+                {
+                    let extracted_x0x = temp_dir.join("extracted-x0x");
+                    if let Err(e) =
+                        extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+                    {
+                        warn!("Failed to extract companion x0x binary: {e}");
+                    } else {
+                        companion = Some((
+                            Upgrader::new(x0x_path, current_version.clone()),
+                            extracted_x0x,
+                        ));
+                    }
                 }
             }
         }
+
+        #[cfg(unix)]
+        let probe_admission: Option<ProbeAdmission> = {
+            let request = super::probe::ProbeRequest {
+                install: target_path.clone(),
+                version: manifest.version.clone(),
+                platform: platform_target.to_owned(),
+                archive_sha256: asset.archive_sha256,
+                daemon: probe_daemon,
+                cli: probe_cli,
+                launch: probe_launch,
+            };
+            Some(Box::new(move |alive| {
+                super::probe::run_before_swap(&request, alive)
+                    .map(|_| ())
+                    .map_err(|error| UpgradeError::Other(error.to_string()))
+            }))
+        };
+        #[cfg(not(unix))]
+        let probe_admission = None;
 
         // Move temp-dir custody into the blocking task so cancel cannot delete
         // extracted binaries mid-replace. The guard cleans up when that task ends
@@ -653,6 +801,7 @@ impl AutoApplyUpgrader {
             companion,
             _temp_guard,
             on_success,
+            probe_admission,
         )
         .await?;
 
@@ -1138,6 +1287,312 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    struct ProbePairFixture {
+        _root: TempDir,
+        primary: PathBuf,
+        cli: PathBuf,
+        stage: PathBuf,
+        candidate_daemon: PathBuf,
+        candidate_cli: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ProbePairFixture {
+        fn new(cli_version: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let evidence = std::env::var_os("X0X_UPGRADE_PROBE_EVIDENCE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join(".planning/upgrade-probe-fixtures")
+                });
+            std::fs::create_dir_all(&evidence).unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("apply-probe-")
+                .tempdir_in(evidence)
+                .unwrap();
+            let primary = root.path().join("x0xd");
+            let cli = root.path().join("x0x");
+            let stage = root.path().join("stage");
+            std::fs::create_dir(&stage).unwrap();
+            std::fs::write(&primary, b"old daemon").unwrap();
+            std::fs::write(&cli, b"old cli").unwrap();
+            let candidate_daemon = stage.join("daemon");
+            let candidate_cli = stage.join("cli");
+            for (path, version) in [(&candidate_daemon, "2.0.0"), (&candidate_cli, cli_version)] {
+                let output = serde_json::json!({
+                    "version": version,
+                    "platform": current_platform_target().unwrap(),
+                });
+                std::fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n")).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            Self {
+                _root: root,
+                primary,
+                cli,
+                stage,
+                candidate_daemon,
+                candidate_cli,
+            }
+        }
+
+        fn request(&self) -> super::super::probe::ProbeRequest {
+            super::super::probe::ProbeRequest {
+                install: self.primary.clone(),
+                version: "2.0.0".to_owned(),
+                platform: current_platform_target().unwrap().to_owned(),
+                archive_sha256: [7; 32],
+                daemon: self.candidate_daemon.clone(),
+                cli: self.candidate_cli.clone(),
+                launch: super::super::probe::ProbeLaunch::capture(self._root.path()),
+            }
+        }
+
+        fn assert_old_pair(&self) {
+            assert_eq!(std::fs::read(&self.primary).unwrap(), b"old daemon");
+            assert_eq!(std::fs::read(&self.cli).unwrap(), b"old cli");
+            assert!(!self.primary.with_extension("backup").exists());
+            assert!(!self.cli.with_extension("backup").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_probe_retry_bridge_distinguishes_due_waits_from_holds() {
+        use super::super::probe::{self, ProbeCause, ProbePhase};
+
+        let fixture = ProbePairFixture::new("2.0.0");
+        let check = || probe_retry_delay_for_install(fixture.primary.clone(), "2.0.0".to_owned());
+        assert!(check().await.unwrap().is_none());
+        {
+            let _lock = super::super::acquire_host_upgrade_lock(&fixture.primary).unwrap();
+            probe::run_before_swap(&fixture.request(), &AtomicBool::new(true)).unwrap();
+        }
+        assert!(check().await.unwrap().is_none(), "passed is not pending");
+        let path = probe::state_path(&fixture.primary).unwrap();
+        let mut state = probe::read_state(&fixture.primary).unwrap().unwrap();
+        state.phase = ProbePhase::InterruptedWait;
+        state.cause = Some(ProbeCause::Timeout);
+        state.retry_remaining_ms = 1;
+        state.retry_deadline_ms = 1;
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let due = check().await.unwrap().expect("expired wait must retry");
+        assert_eq!(due.delay, std::time::Duration::ZERO);
+        assert_eq!(due.transaction_id, state.transaction_id);
+        assert!(
+            probe_retry_delay_for_install(fixture.primary.clone(), "3.0.0".to_owned())
+                .await
+                .unwrap()
+                .is_none(),
+            "a newer release cannot inherit the old transaction's retry"
+        );
+        for (phase, cause) in [
+            (ProbePhase::FailedHold, Some(ProbeCause::VersionMismatch)),
+            (ProbePhase::Running, None),
+        ] {
+            state.phase = phase;
+            state.cause = cause;
+            state.retry_remaining_ms = 0;
+            state.retry_deadline_ms = 0;
+            let bytes = serde_json::to_vec(&state).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(check().await.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        state.phase = ProbePhase::Passed;
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let marker = probe::uncertainty_path(&fixture.primary).unwrap();
+        std::fs::write(&marker, b"uncertain terminal write").unwrap();
+        assert!(check().await.is_err(), "a marker forbids a retry");
+        assert_eq!(std::fs::read(marker).unwrap(), b"uncertain terminal write");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_failure_blocks_both_actual_replacements_and_restart() {
+        for failure in ["version", "loader", "timeout"] {
+            let fixture = ProbePairFixture::new(if failure == "version" {
+                "9.0.0"
+            } else {
+                "2.0.0"
+            });
+            if failure == "loader" {
+                std::fs::write(&fixture.candidate_cli, b"#!/no/such/upgrade-probe-loader\n")
+                    .unwrap();
+            } else if failure == "timeout" {
+                std::fs::write(&fixture.candidate_cli, b"#!/bin/sh\nsleep 5\n").unwrap();
+            }
+            let request = fixture.request();
+            let restarted = Arc::new(AtomicBool::new(false));
+            let marker = Arc::clone(&restarted);
+            let result = apply_replacements_offloaded(
+                Upgrader::new(fixture.primary.clone(), semver::Version::new(1, 0, 0)),
+                fixture.candidate_daemon.clone(),
+                semver::Version::new(2, 0, 0),
+                Some((
+                    Upgrader::new(fixture.cli.clone(), semver::Version::new(1, 0, 0)),
+                    fixture.candidate_cli.clone(),
+                )),
+                TempDirGuard {
+                    path: fixture.stage.clone(),
+                },
+                Some(Box::new(move || marker.store(true, Ordering::Release))),
+                Some(Box::new(move |alive| {
+                    let result = if failure == "timeout" {
+                        super::super::probe::run_before_swap_with_options(
+                            &request,
+                            alive,
+                            &super::super::probe::ProbeOptions {
+                                clock: super::super::probe::ProbeClock {
+                                    boot_id: "apply-boundary-test".to_owned(),
+                                    monotonic_ms: 100,
+                                },
+                                timeout: std::time::Duration::from_millis(40),
+                                fail_write: None,
+                            },
+                        )
+                    } else {
+                        super::super::probe::run_before_swap(&request, alive)
+                    };
+                    result
+                        .map(|_| ())
+                        .map_err(|error| UpgradeError::Other(error.to_string()))
+                })),
+            )
+            .await;
+            assert!(result.is_err());
+            fixture.assert_old_pair();
+            assert!(!restarted.load(Ordering::Acquire));
+            assert!(!fixture.stage.exists());
+            assert_eq!(
+                super::super::probe::read_state(&fixture.primary)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                if failure == "timeout" {
+                    super::super::probe::ProbePhase::InterruptedWait
+                } else {
+                    super::super::probe::ProbePhase::FailedHold
+                }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_probe_precedes_pair_swap_and_owned_continuation() {
+        let fixture = ProbePairFixture::new("2.0.0");
+        let request = fixture.request();
+        let daemon_bytes = std::fs::read(&fixture.candidate_daemon).unwrap();
+        let cli_bytes = std::fs::read(&fixture.candidate_cli).unwrap();
+        let primary = fixture.primary.clone();
+        let cli = fixture.cli.clone();
+        let stage = fixture.stage.clone();
+        let continued = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&continued);
+        let result = apply_replacements_offloaded(
+            Upgrader::new(fixture.primary.clone(), semver::Version::new(1, 0, 0)),
+            fixture.candidate_daemon.clone(),
+            semver::Version::new(2, 0, 0),
+            Some((
+                Upgrader::new(fixture.cli.clone(), semver::Version::new(1, 0, 0)),
+                fixture.candidate_cli.clone(),
+            )),
+            TempDirGuard {
+                path: fixture.stage.clone(),
+            },
+            Some(Box::new(move || {
+                assert_eq!(std::fs::read(primary).unwrap(), daemon_bytes);
+                assert_eq!(std::fs::read(cli).unwrap(), cli_bytes);
+                assert!(!stage.exists());
+                marker.store(true, Ordering::Release);
+            })),
+            Some(Box::new(move |alive| {
+                assert_eq!(std::fs::read(&request.install).unwrap(), b"old daemon");
+                assert!(!request.install.with_extension("backup").exists());
+                super::super::probe::run_before_swap(&request, alive)
+                    .map(|_| ())
+                    .map_err(|error| UpgradeError::Other(error.to_string()))
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, UpgradeResult::Success { .. }));
+        assert!(continued.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_probe_observer_cannot_admit_either_swap() {
+        let fixture = ProbePairFixture::new("2.0.0");
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        let primary = fixture.primary.clone();
+        let cli = fixture.cli.clone();
+        let incoming = fixture.candidate_daemon.clone();
+        let incoming_cli = fixture.candidate_cli.clone();
+        let stage = fixture.stage.clone();
+        let restarted = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&restarted);
+        let task = tokio::spawn(async move {
+            apply_replacements_offloaded(
+                Upgrader::new(primary, semver::Version::new(1, 0, 0)),
+                incoming,
+                semver::Version::new(2, 0, 0),
+                Some((
+                    Upgrader::new(cli, semver::Version::new(1, 0, 0)),
+                    incoming_cli,
+                )),
+                TempDirGuard { path: stage },
+                Some(Box::new(move || marker.store(true, Ordering::Release))),
+                Some(Box::new(move |alive| {
+                    entered.send(()).unwrap();
+                    released
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    assert!(!alive.load(Ordering::Acquire));
+                    finished.send(()).unwrap();
+                    // The outer worker must recheck cancellation even if a
+                    // probe callback returns success after cancellation.
+                    Ok(())
+                })),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), done)
+            .await
+            .unwrap()
+            .unwrap();
+        // Acquiring the same lock waits for the blocking worker to leave its
+        // critical section. Its temp guard drops just after the lock.
+        let primary = fixture.primary.clone();
+        tokio::task::spawn_blocking(move || {
+            drop(super::super::acquire_host_upgrade_lock(&primary).unwrap());
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fixture.stage.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.assert_old_pair();
+        assert!(!fixture.stage.exists());
+        assert!(!restarted.load(Ordering::Acquire));
+    }
 
     /// Magic prefix of a native executable on the host platform, so archive
     /// contents built by these tests pass the post-extraction magic check.
@@ -2018,6 +2473,7 @@ mod tests {
             None,
             temp_guard,
             None,
+            None,
         );
 
         let start = Instant::now();
@@ -2101,6 +2557,7 @@ mod tests {
                     path: scratch_for_task,
                 },
                 on_success,
+                None,
             );
             tokio::pin!(replacement);
             let mut waiting_tx = Some(waiting_tx);
@@ -2231,6 +2688,7 @@ mod tests {
                     path: scratch_for_task,
                 },
                 on_success,
+                None,
             );
             tokio::pin!(replacement);
             let mut waiting_tx = Some(waiting_tx);
@@ -2447,6 +2905,7 @@ mod tests {
                     path: scratch_for_task,
                 },
                 on_success,
+                None,
             )
             .await?;
             let _ = result;
@@ -2604,6 +3063,7 @@ mod tests {
                     path: scratch_for_task,
                 },
                 on_success,
+                None,
             );
             tokio::pin!(replacement);
             let mut done_tx = Some(done_tx);
@@ -2765,6 +3225,7 @@ mod tests {
             None,
             TempDirGuard { path: scratch },
             on_success,
+            None,
         )
         .await
         .expect("replace");
@@ -2857,6 +3318,7 @@ mod tests {
                     path: scratch_for_task,
                 },
                 on_success,
+                None,
             );
             tokio::pin!(replacement);
             let mut ready_tx = Some(ready_tx);
@@ -2944,6 +3406,7 @@ mod tests {
             None,
             TempDirGuard { path: scratch },
             on_success,
+            None,
         )
         .await
         .expect("replace");
