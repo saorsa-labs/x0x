@@ -712,6 +712,187 @@ macro_rules! background_driver_regression_tests {
             }
 
             #[tokio::test(start_paused = true)]
+            async fn background_retry_readback_drains_before_latest_release_starts() {
+                use crate::upgrade::{apply, probe};
+                use restart::{readback_custody_seam::{self, ReadbackEvent}, ReadbackKind};
+                use std::sync::atomic::AtomicBool;
+
+                struct ReadbackDrain {
+                    release: Option<std::sync::mpsc::Sender<()>>,
+                    finished: std::sync::mpsc::Receiver<()>,
+                    entered: Arc<AtomicBool>,
+                    queued: Arc<AtomicU64>,
+                    drained: bool,
+                }
+                impl ReadbackDrain {
+                    fn release(&mut self) {
+                        if let Some(release) = self.release.take() { let _ = release.send(()); }
+                    }
+                    fn wait(&mut self) {
+                        self.release();
+                        if self.entered.load(Ordering::SeqCst) || self.queued.load(Ordering::SeqCst) >= 2 {
+                            self.finished.recv_timeout(Duration::from_secs(20)).unwrap();
+                        }
+                        self.drained = true;
+                    }
+                }
+                impl Drop for ReadbackDrain {
+                    fn drop(&mut self) {
+                        self.release();
+                        if !self.drained && (self.entered.load(Ordering::SeqCst) || self.queued.load(Ordering::SeqCst) >= 2) {
+                            let _ = self.finished.recv_timeout(Duration::from_secs(20));
+                        }
+                    }
+                }
+
+                let mut fixture = Fixture::new(0);
+                let older = fixture.release("9.9.9");
+                let older_request = fixture.request(&older);
+                let newer = fixture.release("9.9.10");
+                let newer_request = fixture.request(&newer);
+                let state = probe::ProbeState {
+                    schema_version: 1, record_kind: "probe".into(), install: fixture.install.clone(),
+                    version: older.manifest.version.clone(), platform: older.manifest.assets[0].target.clone(),
+                    archive_sha256: older.manifest.assets[0].archive_sha256,
+                    transaction_id: "15141514-1514-4514-8514-151415141514".into(), attempt: 1,
+                    phase: probe::ProbePhase::InterruptedWait, cause: Some(probe::ProbeCause::Timeout),
+                    last_pid: None, boot_id: "background-retry-previous-boot".into(),
+                    retry_remaining_ms: 1_800_000, retry_deadline_ms: 1_800_001,
+                    daemon_sha256: None, cli_sha256: None,
+                };
+                assert_ne!(state.boot_id, probe::ProbeClock::now().unwrap().boot_id);
+                let probe_path = probe::state_path(&fixture.install).unwrap();
+                let seeded_path = probe_path.clone();
+                let _cut = apply::pre_probe_admission_seam::install(fixture.install.clone(), Box::new(move |install| {
+                    // The real apply must first pass staging. Its subsequent
+                    // real probe read will return Waiting and enter the owned
+                    // retry loop; no copied error or retry adapter is involved.
+                    assert_eq!(install, state.install);
+                    let held = std::fs::OpenOptions::new().read(true).write(true)
+                        .open(install.with_file_name("x0xd.upgrade.lock")).unwrap();
+                    held.try_lock().unwrap();
+                    std::fs::write(&seeded_path, serde_json::to_vec(&state).unwrap()).unwrap();
+                    assert_eq!(probe::read_state(install).unwrap().unwrap().phase, probe::ProbePhase::InterruptedWait);
+                }));
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let release_rx = StdMutex::new(release_rx);
+                let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+                let (paused_tx, mut paused_rx) = mpsc::unbounded_channel();
+                let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
+                let paused_thread = StdMutex::new(None);
+                let entered = Arc::new(AtomicBool::new(false));
+                let exited = Arc::new(AtomicBool::new(false));
+                let overlap = Arc::new(AtomicBool::new(false));
+                let timed_out = Arc::new(AtomicBool::new(false));
+                let entries = Arc::new(AtomicU64::new(0));
+                let queued = Arc::new(AtomicU64::new(0));
+                let observed = (Arc::clone(&entered), Arc::clone(&exited), Arc::clone(&overlap),
+                    Arc::clone(&timed_out), Arc::clone(&entries), Arc::clone(&queued));
+                let _readback_hook = readback_custody_seam::install(fixture.install.clone(), Arc::new(move |kind, event| {
+                    let (entered, exited, overlap, timed_out, entries, queued) = &observed;
+                    if kind != ReadbackKind::SystemdIdentity {
+                        if matches!(event, ReadbackEvent::Queued | ReadbackEvent::Entered)
+                            && entered.load(Ordering::SeqCst) && !exited.load(Ordering::SeqCst) {
+                            overlap.store(true, Ordering::SeqCst);
+                        }
+                        return;
+                    }
+                    match event {
+                        ReadbackEvent::Queued => {
+                            if queued.fetch_add(1, Ordering::SeqCst) >= 2 && !exited.load(Ordering::SeqCst) {
+                                overlap.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        ReadbackEvent::Entered => {
+                            let ordinal = entries.fetch_add(1, Ordering::SeqCst) + 1;
+                            if ordinal > 2 && !exited.load(Ordering::SeqCst) { overlap.store(true, Ordering::SeqCst); }
+                            if ordinal == 2 {
+                                *paused_thread.lock().unwrap() = Some(std::thread::current().id());
+                                entered.store(true, Ordering::SeqCst);
+                                let _ = paused_tx.send(());
+                                if release_rx.lock().unwrap().recv_timeout(Duration::from_secs(20)).is_err() {
+                                    timed_out.store(true, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        ReadbackEvent::Exited => {
+                            if paused_thread.lock().unwrap().as_ref() == Some(&std::thread::current().id())
+                                && !exited.swap(true, Ordering::SeqCst) {
+                                let _ = exited_tx.send(());
+                                let _ = finished_tx.send(());
+                            }
+                        }
+                    }
+                }));
+                // Drop order releases and observes the actual blocked closure
+                // before scoped hooks or owned roots disappear on failure.
+                let mut drain = ReadbackDrain { release: Some(release_tx), finished: finished_rx,
+                    entered: Arc::clone(&entered), queued: Arc::clone(&queued), drained: false };
+                let (input, driver) = fixture.gossip();
+                let owner = fixture.owner.take().unwrap();
+                let running = async { tokio::join!(owner.run(), driver); };
+                tokio::pin!(running);
+                input.send(older).unwrap();
+                let old_submission = event(running.as_mut(), &mut fixture.processed).await;
+                event(running.as_mut(), &mut paused_rx).await;
+                let retry_claim = crate::upgrade::probe_retry::claim_retry(fixture.install.clone(), "9.9.9".into());
+                let retry_owned = retry_claim.is_none();
+                drop(retry_claim);
+                let before = fixture.bytes();
+                let old_probe = std::fs::read(&probe_path).unwrap();
+                let receipt_path = crate::upgrade::staging::receipt_path(&older_request).unwrap();
+                let old_receipt = std::fs::read(&receipt_path).unwrap();
+                let old_probe_state = probe::read_state(&fixture.install).unwrap().unwrap();
+                // The first real inspection, before retry readback, did run.
+                let initial_probe_acknowledged = old_probe_state.boot_id == probe::ProbeClock::now().unwrap().boot_id;
+                while fixture.operations.try_recv().is_ok() {}
+                while fixture.observed.try_recv().is_ok() {}
+                input.send(newer).unwrap();
+                let latest_submission = event(running.as_mut(), &mut fixture.processed).await;
+                // Poll the actual owner and driver while the real closure is
+                // held. Queued/Entered hooks detect even a newer spawned readback.
+                let until = std::time::Instant::now() + Duration::from_millis(100);
+                while std::time::Instant::now() < until {
+                    tokio::select! { biased;
+                        _ = running.as_mut() => panic!("background owner ended before readback release"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
+                let bytes_while_held = fixture.bytes();
+                let no_new_operation = fixture.operations.try_recv().is_err();
+                let no_new_observation = fixture.observed.try_recv().is_err();
+                let no_early_apply = fixture.attempts.lock().unwrap().is_empty();
+                let entries_while_held = entries.load(Ordering::SeqCst);
+                let queued_while_held = queued.load(Ordering::SeqCst);
+                drain.release();
+                event(running.as_mut(), &mut exited_rx).await;
+                let applied = event(running.as_mut(), &mut fixture.applied).await;
+                fixture.stop();
+                finish(running.as_mut()).await;
+                drain.wait();
+                drop(crate::upgrade::probe_retry::claim_retry(fixture.install.clone(), "9.9.9".into())
+                    .expect("old retry owner must be fully drained"));
+
+                assert_eq!(old_submission, ("9.9.9".into(), SubmitOutcome::Accepted));
+                assert_eq!(latest_submission, ("9.9.10".into(), SubmitOutcome::Accepted));
+                assert!(initial_probe_acknowledged);
+                assert!(retry_owned, "paused identity readback must belong to the actual retry loop");
+                assert_eq!(entries_while_held, 2, "retry readback is the second real identity observation");
+                assert_eq!(queued_while_held, 2);
+                assert!(!overlap.load(Ordering::SeqCst), "latest readback must not start before old closure exits");
+                assert!(!timed_out.load(Ordering::SeqCst), "fixture must release the worker explicitly");
+                assert!(no_new_operation && no_new_observation && no_early_apply);
+                assert_eq!(bytes_while_held, before, "supersession may not mutate state during retained readback");
+                assert_eq!(applied, "9.9.10");
+                assert_eq!(*fixture.attempts.lock().unwrap(), vec!["9.9.10".to_owned()]);
+                assert_eq!(std::fs::read(&probe_path).unwrap(), old_probe, "cancelled retry must not acknowledge probe progress");
+                assert_eq!(std::fs::read(receipt_path).unwrap(), old_receipt);
+                assert_eq!(crate::upgrade::staging_selection::read_selection(&newer_request).unwrap().unwrap().release.version, "9.9.10");
+                assert_eq!(std::fs::read(&fixture.install).unwrap(), b"owned startup staging executable fixture");
+                assert!(fixture.apply_lock.try_lock().is_ok());
+            }
+
+            #[tokio::test(start_paused = true)]
             async fn background_shutdown_closed_watch_and_drop_refuse_queued_record_writes() {
                 for mode in ["signal", "closed", "drop"] {
                     let mut fixture = Fixture::new(60);
