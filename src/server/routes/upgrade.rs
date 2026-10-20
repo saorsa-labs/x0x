@@ -1740,6 +1740,10 @@ mod tests {
         };
         config.update.rollout_window_minutes = 0;
         let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        #[cfg(unix)]
+        let _observed_executable = crate::upgrade::apply::current_binary_path_seam::install(
+            data_dir.path().canonicalize().unwrap().join("x0xd"),
+        );
         // Activation entered at monotonic 1 s. The first readback observes
         // monotonic 3 s (2 s into the 10 s window — fresh activation);
         // the retry's observes monotonic 15 s (14 s in — the window has
@@ -1820,6 +1824,10 @@ mod tests {
         };
         config.update.rollout_window_minutes = 0;
         let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        #[cfg(unix)]
+        let _observed_executable = crate::upgrade::apply::current_binary_path_seam::install(
+            data_dir.path().canonicalize().unwrap().join("x0xd"),
+        );
         let _readback = restart::systemd_readback_seam::install(staging_readback(
             one_call_scenario("0", "5"),
             &runtime,
@@ -1869,6 +1877,10 @@ mod tests {
         };
         config.update.rollout_window_minutes = 0;
         let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        #[cfg(unix)]
+        let _observed_executable = crate::upgrade::apply::current_binary_path_seam::install(
+            data_dir.path().canonicalize().unwrap().join("x0xd"),
+        );
         let _readback = restart::systemd_readback_seam::install(staging_readback(
             one_call_scenario("10s", "0"),
             &runtime,
