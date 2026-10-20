@@ -79,22 +79,37 @@ The two verifies do not cost the same. The outer stage verify costs
 v0.48.1 runs are the low end); the inner envelope verify is consistently
 cheaper, 78.06–83.76 µs, and sits below every outer mean in its run.
 Combined, v0.48.1 spends ~162–171 µs verifying each delivered message.
-The cross-version-comparable outer rate is flat: v0.45.0 1115–1190 /s
-versus v0.48.1 1058–1159 /s, a difference inside the A/B/A/B drift, so
-v0.48.1 shows no cut in verify rate. Publish throughput: 1117–1191 msg/s
-(v0.45.0) versus 1061–1163 msg/s (v0.48.1).
+The per-second rates carry no verify verdict on their own: the runs were
+unpaced, so verify rate is confounded with publish throughput, and the
+two move together. Paired leg by leg, the outer rate is 2.6–6.5 % lower
+on v0.48.1 (1180→1103, 1190→1159, 1156→1099, 1115→1058 /s) while
+publish throughput is 2.4–6.7 % lower in the same pairs (1183→1104,
+1191→1163, 1159→1101, 1117→1061 msg/s). The count is what compares
+cleanly: both versions land 2000 outer verifies per 2000 delivered
+messages, so verifies per message are unchanged and this measurement
+demonstrates no verify saving.
 
 ## Verdict against the 20 % target
 
 Not met in this local measurement. The best case is a 17.5 % cut in bytes
-per frame (256 B payload); verifies per second did not fall. What blocks
-the cut:
+per frame (256 B payload); no verify saving is demonstrated — verifies
+per delivered message are unchanged. What blocks the cut:
 
-1. **The frame is dominated by fixed cryptographic material.** The 8 770 B
-   per-frame overhead on v0.48.1 decomposes as two ML-DSA-65 signatures
-   (3 309 B each) plus one public key (1 952 B) plus roughly 200 B of
-   framing. The 1 915 B saved between v0.45.0 and v0.48.1 equals one
-   ML-DSA-65 public key. The issue's 20 % target is a cut against the
+1. **The frame is dominated by fixed cryptographic material.** The
+   per-frame overhead fits the ML-DSA-65 material exactly: v0.45.0's
+   10 685 B = two signatures (3 309 B each) + two full public keys
+   (1 952 B each) + ~160 B of framing; v0.48.1's 8 770 B = the same two
+   signatures + one full key + ~200 B of framing. The 1 915 B saved
+   between the versions is the net effect of v0.48.1's outer-key cache:
+   in every v0.48.1 run `sub`'s diagnostics show
+   Δ`key_cache.ref_in_frames` = 2000 with Δ`key_cache.cache_hits` = 2000
+   and Δ`cache_misses` = 0, and the key-reference byte delta equals the
+   full eager inbound byte delta, so with the key cached warm every
+   eager frame arrived carrying a key reference where v0.45.0 carried a
+   full 1 952 B key — 1 952 B out, ~37 B of reference back, for the
+   measured net 1 915 B per frame. A cold receiver pays the full-key
+   frame first (`full_in_frames` ≥ 1), so the saving holds while the
+   cache stays warm. The issue's 20 % target is a cut against the
    v0.45.0 baseline (#1396: "v0.45 against current"), so the targets are
    8 752.8 B/frame at 256 B (0.8 × 10 941) and 11 824.8 B/frame at
    4 096 B (0.8 × 14 781). From v0.48.1's 9 026 / 12 866 B that leaves a
@@ -105,16 +120,23 @@ the cut:
    announce-referenced keys; the `key_cache_control` outbound kind already
    exists in v0.48.1's stage stats and points at that direction, #1170 /
    PR #1435 on hold). Fenced: needs David.
-2. **Verify work is protocol-pinned.** Every delivered message pays one
-   counted outer verify on both versions (86.95–88.87 µs on v0.45.0,
-   83.69–87.80 µs on v0.48.1), and on v0.48.1 additionally one counted
-   inner envelope verify (78.06–83.76 µs) — about 162–171 µs of verify
-   CPU per message on v0.48.1, where both layers are counted. A 20 %
-   cut at the same message rate needs fewer or cheaper verifies per
-   message, and the cheap lever is already spent: the pinned dependency
-   drops cached duplicates before the verify (point 4). What remains is
+2. **Verify count and verify CPU cost are different metrics; the issue's
+   verifies/s is a count.** Every delivered message pays one counted
+   outer verify on both versions (86.95–88.87 µs on v0.45.0,
+   83.69–87.80 µs on v0.48.1) and, on v0.48.1, one counted inner
+   envelope verify (78.06–83.76 µs) — about 162–171 µs of verify CPU per
+   message on v0.48.1. The per-message count did not move between
+   releases, and a 20 % cut in verifies/s at a given message rate can
+   only come from fewer verify calls per message. The cheap count lever
+   is already spent — the pinned dependency drops cached duplicates
+   before the verify (point 4) — so what remains is protocol change:
    collapsing the two envelope layers, or batch/aggregate signatures.
-   All wire or protocol changes. Fenced: needs David.
+   Fenced: needs David. Cheaper individual verifies would cut fleet
+   verify CPU without moving verifies/s at all; that is the
+   backend-optimization benchmark path of E-D14
+   (`docs/design/x0x-direction.md`: a new ML-DSA backend, SIMD and
+   expanded-key caching, benchmarked only, ADR only for a ≥ 2×
+   candidate), ruled separately from this issue's count target.
 3. **Counter comparability.** v0.45.0 has no `inner_envelope_verify` and no
    `uptime_secs` in `/diagnostics/gossip`, so only `pubsub_stages.verify`
    compares across versions, and its stage internals may differ between
