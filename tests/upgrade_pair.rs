@@ -17,7 +17,6 @@ use tempfile::TempDir;
 
 #[path = "../src/upgrade/journal.rs"]
 mod journal;
-#[allow(dead_code)]
 #[path = "../src/upgrade/pair.rs"]
 mod pair;
 
