@@ -803,6 +803,8 @@ impl AutoApplyUpgrader {
                 gate.require_due(&install, &staging_plan)
             })
             .await?;
+            #[cfg(test)]
+            pre_probe_admission_seam::run(&target_path);
         }
         #[cfg(unix)]
         if let super::probe::Admission::Waiting { retry_after } = inspect_probe_admission(
@@ -1197,6 +1199,53 @@ pub(crate) mod current_binary_path_seam {
 
     pub(super) fn observation() -> Option<PathBuf> {
         OBSERVATION.with(|slot| slot.borrow().clone())
+    }
+}
+
+/// Observe the actual gap between staged admission and the separate probe
+/// lock. The hook changes no input and runs after the first lock is released.
+#[cfg(all(test, unix))]
+pub(crate) mod pre_probe_admission_seam {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{LazyLock, Mutex},
+    };
+
+    type Hook = Box<dyn FnOnce(&Path) + Send>;
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct Guard {
+        target: PathBuf,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.remove(&self.target);
+            }
+        }
+    }
+
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        let mut hooks = HOOKS.lock().expect("probe admission seam poisoned");
+        assert!(
+            !hooks.contains_key(&target),
+            "probe admission seam already installed"
+        );
+        hooks.insert(target.clone(), hook);
+        Guard { target }
+    }
+
+    pub(super) fn run(target: &Path) {
+        let hook = HOOKS
+            .lock()
+            .expect("probe admission seam poisoned")
+            .remove(target);
+        if let Some(hook) = hook {
+            hook(target);
+        }
     }
 }
 
