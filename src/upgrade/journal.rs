@@ -290,12 +290,24 @@ pub(crate) fn read_boot_records(data_dir: &Path) -> BootRecords {
     }
 }
 
-/// Without a readable, resolved transaction there is no safe reference set
-/// for cleanup. Preserve every candidate artifact when any record remains.
-/// The caller supplies the existing sweep; this module never follows paths
-/// taken from a record.
-pub(crate) fn sweep_if_no_records(data_dir: &Path, sweep: impl FnOnce() -> usize) -> usize {
-    if read_boot_records(data_dir).has_records() {
+/// Pending or unreadable M2 records have no safe cleanup reference set.
+/// Ordinary released legacy intent permits unrelated debris cleanup. If its
+/// recorded target or backup can match the sweep patterns, preserve candidates
+/// conservatively instead. No path taken from a record is followed.
+pub(crate) fn sweep_if_no_pending_records(data_dir: &Path, sweep: impl FnOnce() -> usize) -> usize {
+    let records = read_boot_records(data_dir);
+    let legacy_references_candidates = match &records.handoff {
+        RecordRead::LegacyHandoff(value) => ["target_path", "backup_path"].iter().any(|name| {
+            value.get(name).and_then(Value::as_str).is_none_or(|path| {
+                Path::new(path).components().any(|component| {
+                    let name = component.as_os_str().to_string_lossy();
+                    name.starts_with(".x0x-upgrade-") || name.contains(".x0xold-")
+                })
+            })
+        }),
+        _ => false,
+    };
+    if records.blocks_apply() || legacy_references_candidates {
         0
     } else {
         sweep()
@@ -590,15 +602,64 @@ pub(crate) fn read_handoff(path: &Path) -> io::Result<Value> {
     decode_handoff(&read_bytes(path)?)
 }
 
-/// Preserve released diagnostic fields and add an explicit format marker.
+/// Unix uses the durable versioned diagnostic writer. Windows retains the
+/// released unmanaged helper's unversioned intent, without an M2 durability
+/// claim; typed M2 writes still require the directory barrier.
 pub(crate) fn write_handoff(path: &Path, handoff: &impl Serialize) -> io::Result<()> {
-    let mut value = serde_json::to_value(handoff).map_err(invalid)?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| invalid("handoff must be an object"))?;
-    object.insert("schema_version".into(), Value::from(SCHEMA_VERSION));
-    object.insert("record_kind".into(), Value::from("legacy_handoff"));
-    write_record(path, &value)
+    #[cfg(windows)]
+    {
+        write_legacy_handoff(path, handoff)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut value = serde_json::to_value(handoff).map_err(invalid)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| invalid("handoff must be an object"))?;
+        object.insert("schema_version".into(), Value::from(SCHEMA_VERSION));
+        object.insert("record_kind".into(), Value::from("legacy_handoff"));
+        write_record(path, &value)
+    }
+}
+
+/// Compatibility writer for the unmanaged Windows helper. Rename avoids
+/// truncating the previous record while its replacement is written. There is
+/// no supported directory-sync barrier here, so this is never M2 armed intent.
+#[cfg(any(windows, test))]
+pub(crate) fn write_legacy_handoff(path: &Path, handoff: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(handoff).map_err(invalid)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(invalid("record exceeds the size limit"));
+    }
+    let value = decode_handoff(&bytes)?;
+    if value.get("schema_version").is_some() || value.get("record_kind").is_some() {
+        return Err(invalid(
+            "legacy compatibility writes require unversioned helper intent",
+        ));
+    }
+    match read_handoff(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Released Windows writes create a missing data directory. This remains
+    // compatibility behavior and does not claim a durable ancestor barrier.
+    std::fs::create_dir_all(parent)?;
+    let (temporary_path, mut temporary) = create_replacement(parent)?;
+    let result = (|| {
+        temporary.write_all(&bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        std::fs::rename(&temporary_path, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 /// Complete the record barrier before acknowledging success. The caller must
