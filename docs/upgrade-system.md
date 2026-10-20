@@ -12,7 +12,21 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 - **`restart.rs`**: the #261 restart transaction — supervision classification (`RestartMode`), the `upgrade-handoff.json` intent record, the detached handoff helper, and the loud `UPGRADE_FAILED` artifact.
 - **`journal.rs`**: private M2 record formats, bounded readers and record barriers. Unknown, corrupt or pending M2 records block apply and preserve recovery material. Reading a record does not authorize recovery.
 - **`probe.rs` / `probe_retry.rs`**: candidate execution checks, install-scoped release holds and bounded interrupted retries before replacement.
-- **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
+- **`rollout.rs`**: Deterministic delay calculator salted with the MachineId and release version.
+
+### Rollout defaults and delay bounds (M2 S2b)
+
+The compiled daemon configuration defaults to a 60-minute rollout window
+(D183). An omitted update section or window has the same default. The
+calculator selects a whole-second delay strictly below a positive window,
+using the leading 64 bits of the hash and integer arithmetic. It preserves
+the zero-window calculator behavior. A minute value too large to represent
+in whole seconds uses `u64::MAX` seconds as the effective bound.
+
+This first S2b slice fixes the default and calculation. The running apply
+triggers still need durable first-receipt waits, the fleet minimum policy and
+the complete host participant gate. A configured window alone does not yet
+prove that an apply waits.
 
 ### Candidate execution probes (M2 S2d)
 
