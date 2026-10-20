@@ -31,6 +31,10 @@ fn names_router_inner(state: Arc<AppState>, with_auth: bool) -> axum::Router {
         .route("/names/pins/:name", delete(names_unpin))
         .route("/forwards", post(super::super::connect::forward_add))
         .route(
+            "/forwards/:local_addr",
+            delete(super::super::connect::forward_remove),
+        )
+        .route(
             "/agent/card/import",
             post(super::super::identity::import_agent_card),
         );
@@ -408,7 +412,8 @@ async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
 }
 
 /// WHY: ADR-0074 §1 — session and rider tokens must not mutate `/names*`,
-/// must not `POST /forwards` (resolve pins), and must not bind via card
+/// must not `POST /forwards` (resolve pins), must not `DELETE /forwards`
+/// (that removes the owner's record), and must not bind via card
 /// import (import may still 200 for contacts). Driven through the REAL
 /// `auth_middleware`; the handler-side durable gate is checked too.
 #[tokio::test]
@@ -470,6 +475,11 @@ async fn names_and_forwards_refuse_session_and_rider_tokens() -> anyhow::Result<
             String::new(),
         ),
         ("POST", "/forwards".to_string(), forward_body),
+        (
+            "DELETE",
+            "/forwards/127.0.0.1:18022".to_string(),
+            String::new(),
+        ),
     ];
     for (method, path, body) in &surfaces {
         for (who, bearer) in [("session", session.as_str()), ("rider", rider.as_str())] {
@@ -542,5 +552,102 @@ async fn names_and_forwards_refuse_session_and_rider_tokens() -> anyhow::Result<
         ))?;
     let (status, json) = send_req(&bare, req).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/forwards/127.0.0.1:18022")
+        .extension(ActorContext::Owner { durable: false })
+        .body(axum::body::Body::empty())?;
+    let (status, json) = send_req(&bare, req).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "handler delete gate: {json}");
+    Ok(())
+}
+
+/// WHY: DELETE /forwards/:local_addr removes the owner's persisted record.
+/// A session or rider token is refused. The durable owner deletes it.
+#[tokio::test]
+async fn forward_delete_refuses_session_and_rider_and_accepts_durable_owner() -> anyhow::Result<()>
+{
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let session = state.sessions.issue(std::time::Instant::now());
+    let rider = {
+        let mut store = state.rider_tokens.lock().await;
+        let (token, _record) = store
+            .issue(
+                "aa".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("rider token issue: {e}"))?;
+        token
+    };
+    let agent = Arc::clone(&state.agent);
+    let mut state = Arc::into_inner(state).expect("test state is unique before the router");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+    let spec = x0x::forward::ForwardSpec {
+        local_addr: addr,
+        peer_agent: x0x::identity::AgentId([0x55; 32]),
+        target_host: "127.0.0.1".to_string(),
+        target_port: 9,
+        name: None,
+        kind: x0x::names::NameKind::Agent,
+        pinned_machine: Some(x0x::identity::MachineId([0x11; 32])),
+        persistent: true,
+    };
+    assert!(state.forwards.remember(&spec).await?);
+    let policy = Arc::new(x0x::connect::ConnectPolicy::default());
+    let diagnostics = Arc::new(x0x::connect::ConnectDiagnostics::new(policy.summary()));
+    let forwarder = Arc::new(
+        x0x::forward::ForwardService::new(agent, policy, diagnostics, true)
+            .map_err(|e| anyhow::anyhow!("forwarder: {e}"))?,
+    );
+    forwarder
+        .add_forward(spec)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
+    state.forward_service = Some(Arc::clone(&forwarder));
+    let state = Arc::new(state);
+    let path = format!("/forwards/{addr}");
+    let app = names_router_with_auth(Arc::clone(&state));
+
+    for (who, bearer) in [("session", session.as_str()), ("rider", rider.as_str())] {
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(&path)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(axum::body::Body::empty())?;
+        let (status, json) = send_req(&app, req).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{who} delete: {json}");
+    }
+    assert_eq!(
+        state.forwards.records().await?.len(),
+        1,
+        "a refused delete must leave the persisted forward"
+    );
+    assert!(
+        forwarder.forward_at(addr).is_some(),
+        "a refused delete must leave the listener"
+    );
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(&path)
+        .header("authorization", format!("Bearer {DURABLE}"))
+        .body(axum::body::Body::empty())?;
+    let (status, json) = send_req(&app, req).await?;
+    assert_eq!(status, StatusCode::OK, "durable owner delete: {json}");
+    assert_eq!(json["removed"], true, "{json}");
+    assert!(state.forwards.records().await?.is_empty());
+    assert!(forwarder.forward_at(addr).is_none());
+    forwarder.shutdown();
     Ok(())
 }

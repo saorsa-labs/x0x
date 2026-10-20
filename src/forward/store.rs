@@ -9,10 +9,14 @@
 //! is never silently retargeted.
 //!
 //! The file is versioned JSON with `deny_unknown_fields`, written with
-//! [`crate::storage::write_private_bytes_durable`] (temp file, fsync, mode
-//! `0600`, atomic rename) — the same pattern as `names.json`. A missing
-//! file is an empty store; an unreadable or malformed one leaves the store
-//! refusing every operation, and it is never overwritten.
+//! [`crate::storage::write_private_bytes_durable_typed_after_rename`] (temp
+//! file, fsync, mode `0600`, atomic rename) — the same pattern as
+//! `names.json`. A missing file is an empty store; an unreadable or
+//! malformed one leaves the store refusing persistent operations, and it is
+//! never overwritten. A failure before the rename leaves memory unchanged.
+//! A failure after the rename keeps the new set in memory so it matches
+//! the file, and reports [`ForwardStoreError::Unconfirmed`] until a later
+//! write confirms the parent-directory fsync.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -43,9 +47,17 @@ pub enum ForwardStoreError {
     /// The on-disk file could not be read or parsed (fail closed).
     #[error("forward store not usable: {0}")]
     Unusable(String),
-    /// Persisting failed; nothing changed.
+    /// Persisting failed before the rename. Memory and disk are unchanged.
     #[error("forward store write failed: {0}")]
     Write(String),
+    /// The new bytes are in place and memory matches them, but the
+    /// parent-directory fsync did not confirm durability. Callers must not
+    /// roll the change back. A later mutation retries the write.
+    #[error(
+        "applied, but durability is not confirmed (directory fsync failed): {0}; the change is in \
+         effect"
+    )]
+    Unconfirmed(String),
     /// The store already holds [`MAX_FORWARDS`] records.
     #[error("forward store is full ({MAX_FORWARDS} forwards)")]
     Full,
@@ -60,6 +72,14 @@ pub enum ForwardStoreError {
     /// otherwise make the whole file fail closed at the next start.
     #[error("forward cannot be persisted: {0}")]
     Invalid(String),
+}
+
+impl ForwardStoreError {
+    /// Memory and disk already show this change. Do not roll it back.
+    #[must_use]
+    pub(crate) fn durability_unconfirmed(&self) -> bool {
+        matches!(self, Self::Unconfirmed(_))
+    }
 }
 
 /// One persisted forward (the ADR-0074 §2 record).
@@ -244,8 +264,12 @@ fn decode_file(bytes: &[u8]) -> Result<Vec<ForwardRecord>, String> {
 }
 
 /// Persistent forwards (`<data_dir>/forwards.json`). All mutations are
-/// serialised under one lock held across the durable write; a failed write
-/// changes nothing.
+/// serialised under one lock held across the durable write. A failure
+/// before the rename changes nothing. A failure after the rename keeps the
+/// new set in memory (it matches the file) and reports
+/// [`ForwardStoreError::Unconfirmed`] until a later write confirms the
+/// parent-directory fsync. An identical retry must not report success
+/// while that confirmation is still pending.
 ///
 /// `ops` is a second lock, held by restore, add, and remove together. The
 /// record lock above covers one write; `ops` covers the gap between reading
@@ -257,6 +281,14 @@ pub struct ForwardStore {
     state: tokio::sync::Mutex<Vec<ForwardRecord>>,
     load_error: Option<String>,
     ops: Arc<tokio::sync::Mutex<()>>,
+    /// Set when a write crossed the rename but parent-dir fsync failed.
+    /// Cleared only by a successful durable persist. While set, [`Self::commit`]
+    /// re-attempts the write even when the mutate is a no-op.
+    pending_durability: std::sync::atomic::AtomicBool,
+    /// Staged by the post-rename callback; drained into [`Self::state`]
+    /// under the lock so a cancelled persist await cannot lose the
+    /// advanced disk state.
+    install_slot: std::sync::Mutex<Option<Vec<ForwardRecord>>>,
     /// Test seam: restore notifies `entered` after it has copied the records
     /// and waits on `release`, still holding `ops`. One shot.
     #[cfg(test)]
@@ -278,6 +310,8 @@ impl ForwardStore {
             state: tokio::sync::Mutex::new(Vec::new()),
             load_error: None,
             ops: Arc::new(tokio::sync::Mutex::new(())),
+            pending_durability: std::sync::atomic::AtomicBool::new(false),
+            install_slot: std::sync::Mutex::new(None),
             #[cfg(test)]
             restore_pause: std::sync::Mutex::new(None),
         }
@@ -377,19 +411,108 @@ impl ForwardStore {
         }
     }
 
-    async fn persist(&self, records: &[ForwardRecord]) -> Result<(), ForwardStoreError> {
+    /// Write `records` atomically (mode 0600). `on_renamed` runs when the
+    /// new bytes are visible (after rename, before parent-dir fsync).
+    async fn persist_with_install(
+        &self,
+        records: &[ForwardRecord],
+        on_renamed: impl FnOnce(),
+    ) -> Result<(), crate::storage::DurableWriteError> {
         let Some(path) = &self.path else {
+            on_renamed();
             return Ok(());
         };
         let file = ForwardsFile {
             version: STORE_VERSION,
             forwards: records.iter().map(RecordJson::from_record).collect(),
         };
-        let bytes = serde_json::to_vec_pretty(&file)
-            .map_err(|e| ForwardStoreError::Write(format!("encode: {e}")))?;
-        crate::storage::write_private_bytes_durable(path, bytes)
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| {
+            crate::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
+                "encode: {e}"
+            )))
+        })?;
+        crate::storage::write_private_bytes_durable_typed_after_rename(path, bytes, on_renamed)
             .await
-            .map_err(|e| ForwardStoreError::Write(format!("{}: {e}", path.display())))
+            .map_err(|e| e.with_path(path))
+    }
+
+    fn drain_install_slot(&self, guard: &mut Vec<ForwardRecord>) {
+        if let Ok(mut slot) = self.install_slot.lock() {
+            if let Some(next) = slot.take() {
+                *guard = next;
+            }
+        }
+    }
+
+    async fn lock_state(&self) -> tokio::sync::MutexGuard<'_, Vec<ForwardRecord>> {
+        let mut guard = self.state.lock().await;
+        self.drain_install_slot(&mut guard);
+        guard
+    }
+
+    /// Apply `mutate` to a copy, persist it, then commit.
+    ///
+    /// Success installs the new set. `BeforeRename` keeps the old memory
+    /// (disk unchanged). `AfterRename` stages the new set in
+    /// [`Self::install_slot`] inside the rename callback (cancel-safe),
+    /// drains it into the lock, then returns
+    /// [`ForwardStoreError::Unconfirmed`]. A later no-op mutate retries
+    /// the write while durability is pending — it must not report success
+    /// until a parent-directory fsync succeeds.
+    async fn commit(
+        &self,
+        mutate: impl FnOnce(&mut Vec<ForwardRecord>) -> Result<bool, ForwardStoreError>,
+    ) -> Result<bool, ForwardStoreError> {
+        use std::sync::atomic::Ordering;
+        self.usable()?;
+        let mut guard = self.lock_state().await;
+        let mut next = guard.clone();
+        let changed = mutate(&mut next)?;
+        if changed {
+            let to_install = next.clone();
+            let slot = &self.install_slot;
+            let pending = &self.pending_durability;
+            match self
+                .persist_with_install(&next, move || {
+                    if let Ok(mut staged) = slot.lock() {
+                        *staged = Some(to_install);
+                    }
+                    pending.store(true, Ordering::Release);
+                })
+                .await
+            {
+                Ok(()) => {
+                    self.drain_install_slot(&mut guard);
+                    self.pending_durability.store(false, Ordering::Release);
+                }
+                Err(e) if e.crossed_rename() => {
+                    self.drain_install_slot(&mut guard);
+                    return Err(ForwardStoreError::Unconfirmed(e.to_string()));
+                }
+                Err(e) => {
+                    let _ = self.install_slot.lock().map(|mut staged| staged.take());
+                    return Err(ForwardStoreError::Write(format!("write {e}")));
+                }
+            }
+        } else if self.pending_durability.load(Ordering::Acquire) {
+            let pending = &self.pending_durability;
+            let held = guard.clone();
+            match self
+                .persist_with_install(&held, || {
+                    pending.store(true, Ordering::Release);
+                })
+                .await
+            {
+                Ok(()) => {
+                    self.pending_durability.store(false, Ordering::Release);
+                }
+                Err(e) if e.crossed_rename() => {
+                    return Err(ForwardStoreError::Unconfirmed(e.to_string()));
+                }
+                Err(e) => return Err(ForwardStoreError::Write(format!("write {e}"))),
+            }
+        }
+        Ok(changed)
     }
 
     /// Every persisted forward.
@@ -398,7 +521,7 @@ impl ForwardStore {
     /// [`ForwardStoreError::Unusable`] when the file did not load.
     pub async fn records(&self) -> Result<Vec<ForwardRecord>, ForwardStoreError> {
         self.usable()?;
-        Ok(self.state.lock().await.clone())
+        Ok(self.lock_state().await.clone())
     }
 
     /// Whether [`Self::remember`] would accept `spec`, without writing — so
@@ -424,44 +547,46 @@ impl ForwardStore {
     /// same id. Returns whether a record was written.
     ///
     /// # Errors
-    /// `Unusable`, `Unpinned`, `Invalid`, `Full` or `Write`; on error nothing
-    /// changed.
+    /// `Unusable`, `Unpinned`, `Invalid`, `Full`, `Write` (disk unchanged),
+    /// or `Unconfirmed` (the new record is in memory and on disk; durability
+    /// is not confirmed).
     pub async fn remember(&self, spec: &ForwardSpec) -> Result<bool, ForwardStoreError> {
         let Some(record) = ForwardRecord::from_spec(spec)? else {
             return Ok(false);
         };
         validate(&record)?;
-        self.usable()?;
-        let mut guard = self.state.lock().await;
-        let mut next = guard.clone();
-        if let Some(held) = next.iter_mut().find(|r| r.id == record.id) {
-            *held = record;
-        } else {
-            if next.len() >= MAX_FORWARDS {
+        self.commit(move |records| {
+            if let Some(held) = records.iter_mut().find(|held| held.id == record.id) {
+                if *held == record {
+                    return Ok(false);
+                }
+                *held = record;
+                return Ok(true);
+            }
+            if records.len() >= MAX_FORWARDS {
                 return Err(ForwardStoreError::Full);
             }
-            next.push(record);
-        }
-        self.persist(&next).await?;
-        *guard = next;
-        Ok(true)
+            records.push(record);
+            Ok(true)
+        })
+        .await
     }
 
     /// Delete the record bound to `local_addr`. Returns whether one existed.
     ///
     /// # Errors
-    /// `Unusable` or `Write`; on error nothing changed.
+    /// `Unusable`, `Write` (disk unchanged), or `Unconfirmed` (the record is
+    /// already gone from memory and from the renamed file; durability is
+    /// not confirmed). A retry while confirmation is pending does not
+    /// report success.
     pub async fn forget(&self, local_addr: SocketAddr) -> Result<bool, ForwardStoreError> {
-        self.usable()?;
-        let mut guard = self.state.lock().await;
         let id = local_addr.to_string();
-        if !guard.iter().any(|r| r.id == id) {
-            return Ok(false);
-        }
-        let next: Vec<ForwardRecord> = guard.iter().filter(|r| r.id != id).cloned().collect();
-        self.persist(&next).await?;
-        *guard = next;
-        Ok(true)
+        self.commit(move |records| {
+            let before = records.len();
+            records.retain(|record| record.id != id);
+            Ok(records.len() != before)
+        })
+        .await
     }
 }
 

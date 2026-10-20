@@ -3,10 +3,11 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 //!
-//! `POST /forwards` is owner/durable-token only: a named peer resolves
-//! (and pins) locally. The auth middleware refuses session bearers and
-//! riders before any extractor runs (`requires_durable_owner`); the
-//! handler re-checks as defense in depth.
+//! `POST /forwards` and `DELETE /forwards/:local_addr` are owner/durable-token
+//! only. Adding a forward resolves (and pins) a name; deleting one removes
+//! the owner's persisted record. The auth middleware refuses session
+//! bearers and riders before any extractor runs
+//! (`requires_durable_owner`); the handlers re-check as defense in depth.
 
 use super::super::api_error;
 use super::super::rider_auth::ActorContext;
@@ -62,9 +63,9 @@ fn forward_error(status: StatusCode, code: &str, error: String) -> axum::respons
 fn store_error_response(e: &x0x::forward::store::ForwardStoreError) -> axum::response::Response {
     use x0x::forward::store::ForwardStoreError;
     let (status, code) = match e {
-        ForwardStoreError::Unusable(_) | ForwardStoreError::Write(_) => {
-            (StatusCode::SERVICE_UNAVAILABLE, "forward_store")
-        }
+        ForwardStoreError::Unusable(_)
+        | ForwardStoreError::Write(_)
+        | ForwardStoreError::Unconfirmed(_) => (StatusCode::SERVICE_UNAVAILABLE, "forward_store"),
         ForwardStoreError::Full => (StatusCode::CONFLICT, "forward_store_full"),
         ForwardStoreError::Unpinned(_) => (StatusCode::CONFLICT, "machine_unknown"),
         ForwardStoreError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_forward"),
@@ -177,8 +178,12 @@ enum CommitError {
 ///
 /// An ephemeral spec deletes any durable record at the bound address, so a
 /// disabled persistent forward replaced by `--ephemeral` cannot return on
-/// restart. A store failure removes the listener just bound (and puts a
-/// disabled entry back when that is what the bind replaced).
+/// restart. A store failure before the rename removes the listener just
+/// bound (and puts a disabled entry back when that is what the bind
+/// replaced). A failure after the rename leaves the listener in place:
+/// the new file is already on disk, so tearing the listener down would
+/// let a restart bring the forward back. An unreadable store does not
+/// block an ephemeral add — there is no usable record to delete.
 async fn commit_forward(
     store: &x0x::forward::store::ForwardStore,
     forwarder: &x0x::forward::ForwardService,
@@ -200,14 +205,20 @@ async fn commit_forward(
     registered.local_addr = bound;
     let persisted = if registered.persistent {
         store.remember(&registered).await.map(|_| ())
+    } else if store.load_error().is_some() {
+        Ok(())
     } else {
         store.forget(bound).await.map(|_| ())
     };
     if let Err(e) = persisted {
-        forwarder.remove_forward(bound);
-        if let Some(prev) = previous.filter(|status| status.spec.local_addr == bound) {
-            if let Some(reason) = prev.error {
-                forwarder.add_disabled(prev.spec, reason);
+        // After the rename the new bytes are the store. Keep the listener
+        // so a restart cannot resurrect a forward this handler tore down.
+        if !e.durability_unconfirmed() {
+            forwarder.remove_forward(bound);
+            if let Some(prev) = previous.filter(|status| status.spec.local_addr == bound) {
+                if let Some(reason) = prev.error {
+                    forwarder.add_disabled(prev.spec, reason);
+                }
             }
         }
         return Err(CommitError::Store(e));
@@ -251,11 +262,19 @@ pub(in crate::server) async fn forward_list(
 }
 
 /// DELETE /forwards/:local_addr — tear down a forward by its local bind
-/// addr and delete its persisted record.
+/// addr and delete its persisted record. Durable-owner only: a session
+/// or rider token must not delete the owner's forwards.
 pub(in crate::server) async fn forward_remove(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
     Path(local_addr): Path<String>,
 ) -> impl IntoResponse {
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": DURABLE_REQUIRED })),
+        );
+    }
     let Some(forwarder) = state.forward_service.as_ref() else {
         return (
             StatusCode::CONFLICT,
@@ -302,14 +321,24 @@ pub(in crate::server) const FORWARD_RESTORE_RETRY_SECS: u64 = 10;
 
 /// Delete the durable record at `addr` and the in-memory forward, holding
 /// the lifecycle lock for both. The record is removed even when the live
-/// entry is ephemeral.
+/// entry is ephemeral, unless the store did not load: an unreadable file
+/// must not block teardown of a live ephemeral forward, and it is never
+/// overwritten. A persistent live entry stays until the file can be updated.
 async fn remove_persisted(
     store: &x0x::forward::store::ForwardStore,
     forwarder: &x0x::forward::ForwardService,
     addr: SocketAddr,
 ) -> Result<bool, x0x::forward::store::ForwardStoreError> {
     let _ops = store.lock_ops().await;
-    let forgotten = store.forget(addr).await?;
+    let live_persistent = forwarder
+        .list_forwards()
+        .into_iter()
+        .any(|status| status.spec.local_addr == addr && status.spec.persistent);
+    let forgotten = if store.load_error().is_some() && !live_persistent {
+        false
+    } else {
+        store.forget(addr).await?
+    };
     Ok(forwarder.remove_forward(addr) || forgotten)
 }
 
@@ -692,5 +721,138 @@ mod tests {
             "restart must not bring back the replaced target"
         );
         restarted.shutdown();
+    }
+
+    /// WHY: a directory fsync that fails after the rename has already
+    /// published the new `forwards.json`. The handler must keep the
+    /// listener. Removing it would let a restart resurrect the forward,
+    /// and a later DELETE would 404 without deleting the saved record.
+    #[tokio::test]
+    async fn after_rename_failure_keeps_listener_until_durability_is_confirmed() {
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let store = ForwardStore::load(path.clone()).await;
+        let addr = free_loopback().await;
+        let spec = hex_spec(addr);
+
+        let seam = x0x::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+        let err = commit_forward(&store, &forwarder, spec.clone())
+            .await
+            .expect_err("add must not ACK");
+        assert!(
+            matches!(
+                err,
+                CommitError::Store(ref e) if e.durability_unconfirmed()
+            ),
+            "{err:?}"
+        );
+        assert!(
+            forwarder.forward_at(addr).is_some(),
+            "the listener stays; restart would otherwise resurrect it"
+        );
+        assert_eq!(store.records().await.expect("records").len(), 1);
+        let disk = ForwardStore::load(path.clone()).await;
+        assert_eq!(disk.records().await.expect("disk").len(), 1);
+
+        // The port is already bound, so the durability retry is the store
+        // write, not a second bind.
+        let retry = store
+            .remember(&spec)
+            .await
+            .expect_err("retry under the fault must not ACK");
+        assert!(retry.durability_unconfirmed());
+        assert!(forwarder.forward_at(addr).is_some());
+
+        let deleted = remove_persisted(&store, &forwarder, addr)
+            .await
+            .expect_err("delete must not ACK while the fsync fault is armed");
+        assert!(deleted.durability_unconfirmed());
+        assert!(
+            forwarder.forward_at(addr).is_some(),
+            "the listener stays until a confirmed delete"
+        );
+        assert!(store.records().await.expect("records").is_empty());
+        let disk = ForwardStore::load(path.clone()).await;
+        assert!(
+            disk.records().await.expect("disk").is_empty(),
+            "the renamed file no longer has the forward"
+        );
+
+        drop(seam);
+        let removed = remove_persisted(&store, &forwarder, addr)
+            .await
+            .expect("confirmed delete");
+        assert!(
+            removed,
+            "the live forward is torn down once durability is confirmed"
+        );
+        assert!(forwarder.forward_at(addr).is_none());
+        let disk = ForwardStore::load(path).await;
+        assert!(disk.records().await.expect("disk").is_empty());
+        forwarder.shutdown();
+    }
+
+    /// WHY: an unreadable `forwards.json` must not block `--ephemeral` adds
+    /// or deletion of a live ephemeral forward. Persistent adds, and
+    /// deletion of a live persistent forward, stay fail-closed, and the
+    /// corrupt file is never overwritten.
+    #[tokio::test]
+    async fn corrupt_store_still_adds_and_deletes_ephemeral_forwards() {
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let original = b"{not json".to_vec();
+        std::fs::write(&path, &original).expect("write corrupt store");
+        let store = ForwardStore::load(path.clone()).await;
+        assert!(store.load_error().is_some());
+
+        let addr = free_loopback().await;
+        let mut ephemeral = hex_spec(addr);
+        ephemeral.persistent = false;
+        ephemeral.pinned_machine = None;
+        let bound = commit_forward(&store, &forwarder, ephemeral)
+            .await
+            .expect("ephemeral add against a corrupt store");
+        assert_eq!(bound, addr);
+        assert!(forwarder.forward_at(addr).is_some());
+        assert_eq!(std::fs::read(&path).expect("read"), original);
+
+        let removed = remove_persisted(&store, &forwarder, addr)
+            .await
+            .expect("delete live ephemeral");
+        assert!(removed);
+        assert!(forwarder.forward_at(addr).is_none());
+        assert_eq!(std::fs::read(&path).expect("read"), original);
+
+        let persistent = hex_spec(addr);
+        let err = commit_forward(&store, &forwarder, persistent)
+            .await
+            .expect_err("persistent add stays fail-closed");
+        assert!(matches!(
+            err,
+            CommitError::Store(x0x::forward::store::ForwardStoreError::Unusable(_))
+        ));
+        assert!(forwarder.forward_at(addr).is_none());
+        assert_eq!(std::fs::read(&path).expect("read"), original);
+
+        let addr_persistent = free_loopback().await;
+        let live = hex_spec(addr_persistent);
+        forwarder
+            .add_forward(live)
+            .await
+            .expect("register a persistent listener without the store");
+        let err = remove_persisted(&store, &forwarder, addr_persistent)
+            .await
+            .expect_err("a persistent forward stays until the file can be updated");
+        assert!(matches!(
+            err,
+            x0x::forward::store::ForwardStoreError::Unusable(_)
+        ));
+        assert!(forwarder.forward_at(addr_persistent).is_some());
+        assert_eq!(std::fs::read(&path).expect("read"), original);
+        forwarder.shutdown();
     }
 }

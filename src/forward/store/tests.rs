@@ -339,3 +339,90 @@ async fn restore_with_a_pin_mismatch_leaves_the_forward_disabled() {
         machine_spec(true)
     );
 }
+
+fn assert_unconfirmed(result: &Result<bool, ForwardStoreError>) {
+    assert!(
+        matches!(result, Err(e) if e.durability_unconfirmed() && e.to_string().contains("not confirmed")),
+        "post-rename failure must not ACK: {result:?}"
+    );
+}
+
+/// WHY (#1101, same contract as NameStore): a parent-directory fsync that
+/// fails after the rename has already replaced `forwards.json`. Add and
+/// delete must keep memory equal to that file, refuse to ACK, and a retry
+/// under the fault must not ACK either. After the fault drops, the retry
+/// confirms durability and a reload agrees.
+#[tokio::test]
+async fn after_rename_failure_keeps_add_and_delete_and_reload_agrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = ForwardStore::path_in(dir.path());
+    let store = ForwardStore::load(path.clone()).await;
+    let first = agent_spec(18022);
+    let second = agent_spec(18023);
+
+    // Before the rename, disk and memory stay on the old set.
+    {
+        let seam = crate::storage::arm_fail_durable_before_rename_for_testing(&path);
+        let err = store.remember(&first).await.unwrap_err();
+        assert!(
+            matches!(err, ForwardStoreError::Write(_)),
+            "before-rename must not install: {err}"
+        );
+        assert!(!err.durability_unconfirmed());
+        assert!(store.records().await.unwrap().is_empty());
+        drop(seam);
+    }
+    assert!(!path.exists(), "a before-rename failure must not publish");
+
+    let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let added = store.remember(&first).await;
+    assert_unconfirmed(&added);
+    assert_eq!(store.records().await.unwrap(), vec![record(&first)]);
+
+    // Identical retry while fsync still fails must not ACK.
+    let retry_add = store.remember(&first).await;
+    assert_unconfirmed(&retry_add);
+    assert_eq!(store.records().await.unwrap(), vec![record(&first)]);
+
+    // A second add under the same fault keeps both records (memory == disk).
+    let added_second = store.remember(&second).await;
+    assert_unconfirmed(&added_second);
+    assert_eq!(
+        store.records().await.unwrap(),
+        vec![record(&first), record(&second)]
+    );
+
+    let deleted = store.forget(first.local_addr).await;
+    assert_unconfirmed(&deleted);
+    assert_eq!(store.records().await.unwrap(), vec![record(&second)]);
+    let retry_delete = store.forget(first.local_addr).await;
+    assert_unconfirmed(&retry_delete);
+    assert_eq!(
+        store.records().await.unwrap(),
+        vec![record(&second)],
+        "a retry must not resurrect the deleted forward"
+    );
+
+    drop(seam);
+    let reloaded_while_pending = ForwardStore::load(path.clone()).await;
+    assert_eq!(
+        reloaded_while_pending.records().await.unwrap(),
+        vec![record(&second)],
+        "reload must see the renamed file, not the pre-fault set"
+    );
+
+    assert!(
+        !store.remember(&second).await.unwrap(),
+        "durability retry of an identical record ACKs only after the fault drops"
+    );
+    assert!(
+        !store.forget(first.local_addr).await.unwrap(),
+        "the deleted id stays gone once durability is confirmed"
+    );
+    let reloaded = ForwardStore::load(path).await;
+    assert_eq!(reloaded.records().await.unwrap(), vec![record(&second)]);
+    assert_eq!(
+        reloaded.records().await.unwrap(),
+        store.records().await.unwrap()
+    );
+}
