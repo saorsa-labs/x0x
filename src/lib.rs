@@ -86,6 +86,7 @@ pub mod key_move;
 
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
+pub mod names;
 pub mod owner_sync;
 pub mod owner_trust;
 pub mod share_grant;
