@@ -64,7 +64,8 @@
 //!   (D64). ADR 0111 H3 brings the holder back at minute 12, after the
 //!   10-minute #946 terminal refusal (`CERT_EVIDENCE_DEADLINE_MS`), and
 //!   requires no terminal refusal before then. So the case polls every 5 s
-//!   for 720 s (`HOLDER_GAP`) after J's join call. It reads `/groups/{gid}`
+//!   for 720 s (`HOLDER_GAP`) after J's join call (150 s, `RECOVERY_GAP`,
+//!   in the recovery control). It reads `/groups/{gid}`
 //!   at A for the typed wait, and `/groups/{gid}` and
 //!   `/groups/{gid}/join-status` at J. It reads A's roster from
 //!   `/groups/{gid}/members`. Every read must answer with the expected
@@ -163,12 +164,18 @@
 //!   expected RED.
 //! - `w3h_1023_control_holder_returns_recovers`: the recovery control. It
 //!   runs the same scenario as the red test: the same setup, the same
-//!   720 s gap with every holder offline, the same gap evidence and the
-//!   same return. FINAL `j_active_after_the_holder_returns_after_the_gap`
-//!   needs only the recovery (A's bytes within 60 s, J Active within
-//!   120 s). The typed-wait components are notes only. Expected GREEN on `main`
-//!   and under a correct S5. It proves the recovery path that the red
-//!   test's second cause needs.
+//!   gap evidence and the same return. Only the gap is shorter: the
+//!   holder returns after 150 s (`RECOVERY_GAP`), not 720 s. That is past
+//!   J's 120 s join-result poll deadline and before the 600 s terminal
+//!   refusal, and it keeps the control inside the W3-H job budget. The red
+//!   test enforces the minute-12 recovery itself, by its recovery cause.
+//!   At 150 s J's attempt can still be pending, so the attempt must resume
+//!   by itself (no new join call). FINAL
+//!   `j_active_after_the_holder_returns_after_the_gap` needs only the
+//!   recovery (A's bytes within 60 s, J Active within 120 s). The
+//!   typed-wait components are notes only. Expected GREEN on `main` and
+//!   under a correct S5. It proves the recovery path that the red test's
+//!   second cause needs.
 //! - `w3h_1023_restart_one_holder_online_admits`: the control. One X
 //!   device that holds every missing certificate stays online after A's
 //!   restart. A gets the bytes from it and J is admitted. GREEN. The
@@ -216,6 +223,14 @@ const TERMINAL_REASON: &str = "certificate_evidence_unavailable";
 /// §8, D64) and past `TERMINAL_REFUSAL`.
 const HOLDER_GAP: Duration = secs(720);
 const _: () = assert!(HOLDER_GAP.as_secs() > TERMINAL_REFUSAL.as_secs());
+/// The recovery control's gap. It is past J's 120 s join-result poll
+/// deadline (ADR 0111 §8, D64) and before the 600 s terminal refusal
+/// (`TERMINAL_REFUSAL`). So the control stays inside the W3-H job budget.
+/// The red test enforces the minute-12 recovery itself, by its recovery
+/// cause stage (`record_return`).
+const RECOVERY_GAP: Duration = secs(150);
+const _: () = assert!(RECOVERY_GAP.as_secs() > 120);
+const _: () = assert!(RECOVERY_GAP.as_secs() < TERMINAL_REFUSAL.as_secs());
 /// ADR 0111 H3: A holds the certificates within 60 s of the holder's start.
 const RETURN_FETCH: Duration = secs(60);
 /// How long J has to become Active after A holds the certificates.
@@ -254,9 +269,10 @@ enum Arm {
     /// `HOLDER_GAP` the X device that holds every missing certificate
     /// comes back.
     HolderReturns,
-    /// The same scenario as `HolderReturns`: the same setup, the same
-    /// gap with every holder offline and the same return. FINAL is only
-    /// the recovery after the return. This GREEN control proves that the
+    /// The same scenario as `HolderReturns`: the same setup, a gap with
+    /// every holder offline and the same return. The gap is
+    /// `RECOVERY_GAP` (150 s), not `HOLDER_GAP`. FINAL is only the
+    /// recovery after the return. This GREEN control proves that the
     /// recovery path works, so a recovery failure cannot hide in the red
     /// test.
     HolderReturnsRecovers,
@@ -275,6 +291,20 @@ impl Arm {
             Arm::HolderReturnsRecovers => "j_active_after_the_holder_returns_after_the_gap",
             Arm::OneHolderOnline => "j_active_within_180s_after_a_restart",
             Arm::HoldersNeverReturn => "fail_closed_never_admitted_never_silently_dropped",
+        }
+    }
+
+    /// How long every holder stays offline after J's join call before the
+    /// case reads the gap evidence. The red test uses ADR 0111 H3's
+    /// minute 12 (`HOLDER_GAP`). The recovery control uses `RECOVERY_GAP`.
+    /// The never-return control polls the same first `HOLDER_GAP` span,
+    /// then continues to `NEVER_WINDOW` (`never_return`). The one-holder
+    /// control does not poll a gap; it waits `JOIN_BUDGET` for J.
+    fn gap(self) -> Duration {
+        match self {
+            Arm::HolderReturns | Arm::HoldersNeverReturn => HOLDER_GAP,
+            Arm::HolderReturnsRecovers => RECOVERY_GAP,
+            Arm::OneHolderOnline => JOIN_BUDGET,
         }
     }
 }
@@ -2454,7 +2484,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             // Every holder is offline: the wait must be typed and must not
             // end at J's 120 s poll deadline (ADR 0111 §8, D64).
             window
-                .poll_until(sim, &home.gid, &missing, joined_at, HOLDER_GAP)
+                .poll_until(sim, &home.gid, &missing, joined_at, arm.gap())
                 .await?;
             None
         }
@@ -2585,7 +2615,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     None => format!(
                         "{} polls over {}s: A never seats J active and J is never active",
                         window.polls(),
-                        HOLDER_GAP.as_secs()
+                        arm.gap().as_secs()
                     ),
                 },
                 at(sim),
@@ -2666,17 +2696,19 @@ async fn holder_returns(
 ) -> Result<bool> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let since_join = |sim: &Sim| sim.fabric().now().saturating_sub(ret.joined_at).as_secs();
-    // ADR 0111 H3: the holder returns at minute 12, after the 10-minute
-    // terminal refusal, and never before.
+    // ADR 0111 H3: in the red test the holder returns at minute 12, after
+    // the 10-minute terminal refusal, and never before. The recovery
+    // control returns it after `RECOVERY_GAP` (`Arm::gap`).
     // The last poll must have STARTED at or after the gap.
+    let bound = arm.gap();
     let gap = sim.fabric().now().saturating_sub(ret.joined_at);
     ensure!(
-        span_reached(window.last_poll(), gap, HOLDER_GAP),
+        span_reached(window.last_poll(), gap, bound),
         "INFRA: the holder would return at t2+{} (last poll started {}; {}), before the {}s gap",
         ms_text(gap),
         at_text(window.last_poll()),
         window.last_span(),
-        HOLDER_GAP.as_secs()
+        bound.as_secs()
     );
     // The last read before the return: A's #946 terminal refusals for G.
     let terminal_before_return = a_terminal_refusals(sim, ret.gid).await?;
@@ -2755,7 +2787,7 @@ async fn holder_returns(
                     "none in {} polls over {}s; A {TERMINAL_REASON} refusals for G at the \
                      return: {terminal_before_return}",
                     window.polls(),
-                    HOLDER_GAP.as_secs()
+                    bound.as_secs()
                 ),
             },
         ),
@@ -2971,7 +3003,10 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
         "arm {arm:?}, FINAL {}: with every holder offline the case polls A \
          (/groups/{{gid}}, /members, #946 refusal counter) and J (/groups/{{gid}}, \
          /join-status) every {}s for {}s (the red test, ADR 0111 H3 minute 12, past \
-         the {}s terminal refusal) or {}s (the never-return control). Every read must \
+         the {}s terminal refusal), {}s (the recovery control: past J's 120s poll \
+         deadline, before the terminal refusal, inside the W3-H job budget; the red \
+         test's recovery cause enforces the minute-12 recovery) or {}s (the \
+         never-return control). Every read must \
          answer with its route's status and body shape, and join_state, \
          last_join_outcome and membership_state must be known values, or the run is \
          INFRA. A typed wait is a parsed object tagged evidence_pending at A or \
@@ -2984,6 +3019,7 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
         POLL.as_secs(),
         HOLDER_GAP.as_secs(),
         TERMINAL_REFUSAL.as_secs(),
+        RECOVERY_GAP.as_secs(),
         NEVER_WINDOW.as_secs()
     ));
     receipt.note(
@@ -3969,4 +4005,18 @@ fn w3h_1023_join_answer_closed_set() {
             "{status} {body:?}"
         );
     }
+}
+
+#[test]
+fn w3h_1023_recovery_gap_bounds() {
+    // The red test keeps ADR 0111 H3's minute 12.
+    assert_eq!(Arm::HolderReturns.gap(), secs(720));
+    assert_eq!(Arm::HolderReturns.gap(), HOLDER_GAP);
+    // The recovery control: past J's 120 s poll deadline, before the
+    // 600 s terminal refusal.
+    assert_eq!(Arm::HolderReturnsRecovers.gap(), secs(150));
+    assert!(Arm::HolderReturnsRecovers.gap() > secs(120));
+    assert!(Arm::HolderReturnsRecovers.gap() < TERMINAL_REFUSAL);
+    // The never-return control polls the same first span as the red test.
+    assert_eq!(Arm::HoldersNeverReturn.gap(), HOLDER_GAP);
 }
