@@ -1,6 +1,6 @@
 //! Route tests for ADR-0074 §1 names: every `/names` route is wired and
 //! answers its contract, resolution pins and survives a daemon restart, a
-//! signed card binds an owner petname once, and `POST /forwards` refuses a
+//! certified card binds an owner petname once, and `POST /forwards` refuses a
 //! `machine:` name (fail closed until slice 2).
 
 use super::*;
@@ -9,8 +9,20 @@ use axum::http::Request;
 use axum::routing::{delete, get, post};
 use tower::ServiceExt;
 
+/// The fixture's durable API token (`secure_endpoint_test_state_at`
+/// hard-codes `"test-token"`).
+const DURABLE: &str = "test-token";
+
 fn names_router(state: Arc<AppState>) -> axum::Router {
-    axum::Router::new()
+    names_router_inner(state, false)
+}
+
+fn names_router_with_auth(state: Arc<AppState>) -> axum::Router {
+    names_router_inner(state, true)
+}
+
+fn names_router_inner(state: Arc<AppState>, with_auth: bool) -> axum::Router {
+    let router = axum::Router::new()
         .route("/names", get(names_list))
         .route("/names/resolve", post(names_resolve))
         .route("/names/owners", post(names_owner_bind))
@@ -21,8 +33,16 @@ fn names_router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/agent/card/import",
             post(super::super::identity::import_agent_card),
-        )
-        .with_state(state)
+        );
+    let router = if with_auth {
+        router.layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::server::auth::auth_middleware,
+        ))
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 async fn send(
@@ -41,6 +61,13 @@ async fn send(
         } else {
             body.to_string()
         }))?;
+    send_req(app, req).await
+}
+
+async fn send_req(
+    app: &axum::Router,
+    req: Request<axum::body::Body>,
+) -> anyhow::Result<(StatusCode, serde_json::Value)> {
     let resp = app.clone().oneshot(req).await?;
     let status = resp.status();
     let bytes = to_bytes(resp.into_body(), 1 << 20).await?;
@@ -263,19 +290,57 @@ async fn forward_add_refuses_machine_names() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn signed_card(owner: &crate::identity::UserKeypair, owner_name: &str) -> anyhow::Result<String> {
+/// A signed agent card claiming `owner`'s user id and display name.
+/// Returns `(card_link, agent_keypair)` so callers can issue a matching
+/// [`crate::identity::AgentCertificate`] and seed discovery.
+fn signed_card(
+    owner: &crate::identity::UserKeypair,
+    owner_name: &str,
+) -> anyhow::Result<(String, crate::identity::AgentKeypair)> {
     let kp = crate::identity::AgentKeypair::generate()?;
     let mut card =
         x0x::groups::card::AgentCard::new("bot".to_string(), &kp.agent_id(), &"ee".repeat(32));
     card.user_id = Some(hex::encode(owner.user_id().as_bytes()));
     card.owner_name = Some(owner_name.to_string());
     card.sign(&kp)?;
-    Ok(card.to_link())
+    Ok((card.to_link(), kp))
 }
 
-/// WHY: importing a signed card binds its `owner_name` as a petname at
-/// first bind; a later card claiming the same owner name for a different
-/// key never rebinds it.
+async fn seed_agent_cert(
+    state: &AppState,
+    agent_kp: &crate::identity::AgentKeypair,
+    cert: crate::identity::AgentCertificate,
+) {
+    let now = unix_now_secs();
+    let machine = crate::identity::MachineId([0xee; 32]);
+    state
+        .agent
+        .insert_discovered_agent_for_testing(crate::DiscoveredAgent {
+            self_name: None,
+            agent_id: agent_kp.agent_id(),
+            machine_id: machine,
+            user_id: cert.user_id().ok(),
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: cert.not_after(),
+            agent_certificate: Some(cert),
+            agent_public_key: agent_kp.public_key().as_bytes().to_vec(),
+            cert_digest: None,
+        })
+        .await;
+}
+
+/// WHY: a forged squat (signed card, bare `user_id`, no Bob-issued cert)
+/// must not freeze Bob's label. An honest Bob-certified agent binds once;
+/// a later impostor claiming the same owner name never rebinds it.
 #[tokio::test]
 async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
     let (state, _dir) =
@@ -284,22 +349,49 @@ async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
     let bob = crate::identity::UserKeypair::generate()?;
     let impostor = crate::identity::UserKeypair::generate()?;
 
+    // Forged squat: signed card claims Bob without a Bob-issued cert.
+    let (squat_link, _) = signed_card(&bob, "Bob Smith")?;
     let (status, json) = send(
         &app,
         "POST",
         "/agent/card/import",
-        serde_json::json!({ "card": signed_card(&bob, "Bob Smith")? }),
+        serde_json::json!({ "card": squat_link }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["owner_label"]["status"], "unverified_owner",
+        "bare user_id must not bind: {json}"
+    );
+    assert!(
+        state.names.owner("bob-smith").await?.is_none(),
+        "forged squat must leave Bob's label unbound"
+    );
+
+    // Honest: Bob issues a cert for the agent; seed it; durable import binds.
+    let (honest_link, honest_kp) = signed_card(&bob, "Bob Smith")?;
+    let cert = crate::identity::AgentCertificate::issue(&bob, &honest_kp)?;
+    seed_agent_cert(&state, &honest_kp, cert).await;
+    let (status, json) = send(
+        &app,
+        "POST",
+        "/agent/card/import",
+        serde_json::json!({ "card": honest_link }),
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json["owner_label"]["label"], "bob-smith", "{json}");
     assert_eq!(json["owner_label"]["status"], "bound", "{json}");
 
+    // Impostor: own cert + same owner_name → conflict; first bind stands.
+    let (impostor_link, impostor_kp) = signed_card(&impostor, "Bob Smith")?;
+    let impostor_cert = crate::identity::AgentCertificate::issue(&impostor, &impostor_kp)?;
+    seed_agent_cert(&state, &impostor_kp, impostor_cert).await;
     let (status, json) = send(
         &app,
         "POST",
         "/agent/card/import",
-        serde_json::json!({ "card": signed_card(&impostor, "Bob Smith")? }),
+        serde_json::json!({ "card": impostor_link }),
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "{json}");
@@ -310,5 +402,143 @@ async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
         Some(bob.user_id()),
         "the first bind stands"
     );
+    Ok(())
+}
+
+/// WHY: ADR-0074 §1 — session and rider tokens must not mutate `/names*`,
+/// must not `POST /forwards` (resolve pins), and must not bind via card
+/// import (import may still 200 for contacts). Driven through the REAL
+/// `auth_middleware`; the handler-side durable gate is checked too.
+#[tokio::test]
+async fn names_and_forwards_refuse_session_and_rider_tokens() -> anyhow::Result<()> {
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let app = names_router_with_auth(Arc::clone(&state));
+    let session = state.sessions.issue(std::time::Instant::now());
+    let rider = {
+        let mut store = state.rider_tokens.lock().await;
+        let (token, _record) = store
+            .issue(
+                "aa".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("rider token issue: {e}"))?;
+        token
+    };
+
+    let forward_body = serde_json::json!({
+        "local_addr": "127.0.0.1:18022",
+        "peer_agent": "ab".repeat(32),
+        "target_host": "127.0.0.1",
+        "target_port": 22,
+    })
+    .to_string();
+    let surfaces = [
+        ("GET", "/names".to_string(), String::new()),
+        (
+            "POST",
+            "/names/resolve".to_string(),
+            serde_json::json!({ "name": "studio.me" }).to_string(),
+        ),
+        (
+            "POST",
+            "/names/owners".to_string(),
+            serde_json::json!({ "label": "bob", "user_id": "bb".repeat(32) }).to_string(),
+        ),
+        ("DELETE", "/names/owners/bob".to_string(), String::new()),
+        (
+            "POST",
+            "/names/machines".to_string(),
+            serde_json::json!({
+                "name": "machine:box.bob",
+                "machine_id": "dd".repeat(32)
+            })
+            .to_string(),
+        ),
+        (
+            "DELETE",
+            "/names/pins/agent:studio.bob".to_string(),
+            String::new(),
+        ),
+        ("POST", "/forwards".to_string(), forward_body),
+    ];
+    for (method, path, body) in &surfaces {
+        for (who, bearer) in [("session", session.as_str()), ("rider", rider.as_str())] {
+            let req = Request::builder()
+                .method(*method)
+                .uri(path.as_str())
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.clone()))?;
+            let (status, json) = send_req(&app, req).await?;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{who} {method} {path}: {json}"
+            );
+        }
+        let req = Request::builder()
+            .method(*method)
+            .uri(path.as_str())
+            .header("authorization", format!("Bearer {DURABLE}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.clone()))?;
+        let (status, json) = send_req(&app, req).await?;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "durable {method} {path} must clear the gate: {json}"
+        );
+    }
+
+    // Card import: session may import contacts but must not bind.
+    let bob = crate::identity::UserKeypair::generate()?;
+    let (card_link, agent_kp) = signed_card(&bob, "Bob Smith")?;
+    let cert = crate::identity::AgentCertificate::issue(&bob, &agent_kp)?;
+    seed_agent_cert(&state, &agent_kp, cert).await;
+    let import_body = serde_json::json!({ "card": card_link }).to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/card/import")
+        .header("authorization", format!("Bearer {session}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(import_body.clone()))?;
+    let (status, json) = send_req(&app, req).await?;
+    assert_eq!(status, StatusCode::OK, "session import contacts: {json}");
+    assert!(
+        json["owner_label"].is_null(),
+        "session must not bind: {json}"
+    );
+    assert!(
+        state.names.owner("bob-smith").await?.is_none(),
+        "names store unchanged after session import"
+    );
+
+    // Defense in depth: handler refuses a non-durable actor even if a
+    // future router wiring skipped the middleware.
+    let bare = names_router(Arc::clone(&state));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/forwards")
+        .header("content-type", "application/json")
+        .extension(ActorContext::Owner { durable: false })
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "local_addr": "127.0.0.1:18022",
+                "peer_agent": "ab".repeat(32),
+                "target_host": "127.0.0.1",
+                "target_port": 22,
+            })
+            .to_string(),
+        ))?;
+    let (status, json) = send_req(&bare, req).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
     Ok(())
 }

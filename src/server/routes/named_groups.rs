@@ -50352,7 +50352,7 @@ pub(in crate::server) mod tests {
             "trust_level": "known"
         }))
         .context("deserialize ImportCardRequest")?;
-        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+        let response = import_agent_card(State(Arc::clone(&state)), None, Json(req))
             .await
             .into_response();
         let (status, body) = response_json(response).await?;
@@ -50391,7 +50391,7 @@ pub(in crate::server) mod tests {
             "trust_level": "known"
         }))
         .context("deserialize ImportCardRequest")?;
-        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+        let response = import_agent_card(State(Arc::clone(&state)), None, Json(req))
             .await
             .into_response();
         let (status, body) = response_json(response).await?;
@@ -50462,7 +50462,7 @@ pub(in crate::server) mod tests {
             "trust_level": "known"
         }))
         .context("deserialize ImportCardRequest")?;
-        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+        let response = import_agent_card(State(Arc::clone(&state)), None, Json(req))
             .await
             .into_response();
         let (status, body) = response_json(response).await?;

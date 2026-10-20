@@ -2,17 +2,34 @@
 //!
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
+//!
+//! `POST /forwards` is owner/durable-token only: a named peer resolves
+//! (and pins) locally. The auth middleware refuses session bearers and
+//! riders before any extractor runs (`requires_durable_owner`); the
+//! handler re-checks as defense in depth.
 
 use super::super::api_error;
+use super::super::rider_auth::ActorContext;
 use super::super::state::AppState;
 use crate as x0x;
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+const DURABLE_REQUIRED: &str =
+    "name management requires the durable API token (not a session or rider token)";
+
+fn durable_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "ok": false, "error": DURABLE_REQUIRED })),
+    )
+        .into_response()
+}
 
 // ── Tailnet forwarding (#132 T6) ──────────────────────────────────────────
 
@@ -33,11 +50,15 @@ pub(in crate::server) struct ForwardAddRequest {
 
 pub(in crate::server) async fn forward_add(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
     Json(req): Json<ForwardAddRequest>,
 ) -> impl IntoResponse {
     use x0x::forward::ForwardSpec;
     use x0x::identity::AgentId;
     use x0x::names::PeerRef;
+    if !actor.is_durable_owner() {
+        return durable_forbidden();
+    }
     // Syntax first, before any state is consulted: a malformed peer or a
     // `machine:` name (fail closed until slice 2) is refused outright.
     let peer = match PeerRef::parse_forward_peer(&req.peer_agent) {

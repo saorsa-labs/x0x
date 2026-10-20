@@ -336,12 +336,17 @@ pub(in crate::server) async fn names_unpin(
 /// ADR-0074 §1: bind an owner petname from an imported card.
 ///
 /// Only a **signed** (already verified) card that carries both `user_id`
-/// and `owner_name`, for a contact that is not `Blocked`, binds; the label
-/// is the card's `owner_name` as a DNS label ([`x0x::names::label_from_display`]).
-/// A user that already has a label, or the local owner (always `me`), binds
-/// nothing. A label already bound to a different user is left untouched
-/// and reported as `conflict` (frozen at first bind). The import itself
-/// never fails because of naming. Returns `null` when nothing applied.
+/// and `owner_name`, for a contact that is not `Blocked`, may bind — and
+/// only when a local discovery/cache [`AgentCertificate`] for the card's
+/// agent chains to that claimed `user_id` (valid, unexpired, unrevoked)
+/// via [`x0x::owner_trust::certificate_chains_to_owner`]. A bare
+/// `card.user_id` is never trusted alone: no cert → `unverified_owner`,
+/// import still succeeds. The label is the card's `owner_name` as a DNS
+/// label ([`x0x::names::label_from_display`]). A user that already has a
+/// label, or the local owner (always `me`), binds nothing. A label already
+/// bound to a different user is left untouched and reported as `conflict`
+/// (frozen at first bind). The import itself never fails because of naming.
+/// Returns `null` when nothing applied.
 pub(in crate::server) async fn bind_owner_from_card(
     state: &AppState,
     card: &x0x::groups::card::AgentCard,
@@ -358,6 +363,28 @@ pub(in crate::server) async fn bind_owner_from_card(
     };
     if state.agent.user_id() == Some(user) {
         return serde_json::Value::Null;
+    }
+    let Ok(agent_id) = parse_id32("agent_id", &card.agent_id).map(x0x::identity::AgentId) else {
+        return serde_json::Value::Null;
+    };
+    let now = unix_now_secs();
+    let cert = {
+        let cache_arc = state.agent.identity_discovery_cache();
+        let cache = cache_arc.read().await;
+        cache
+            .get(&agent_id)
+            .and_then(|entry| entry.agent_certificate.clone())
+    };
+    let Some(cert) = cert else {
+        return serde_json::json!({ "status": "unverified_owner" });
+    };
+    let revoked = {
+        let set_arc = state.agent.revocation_set();
+        let set = set_arc.read().await;
+        set.is_agent_revoked(&agent_id)
+    };
+    if !x0x::owner_trust::certificate_chains_to_owner(&user, &agent_id, &cert, revoked, now) {
+        return serde_json::json!({ "status": "unverified_owner" });
     }
     match state.names.label_for(&user).await {
         Ok(Some(label)) => {

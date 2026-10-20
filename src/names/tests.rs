@@ -670,3 +670,44 @@ async fn names_and_pins_persist_across_restart() {
         assert_eq!(err.code(), "name_store", "{bad}: must refuse, not re-pin");
     }
 }
+
+/// WHY (#1101 / PR #1494 P2): when the durable store write fails AFTER the
+/// atomic rename, the new binding is already in `names.json`. Commit must
+/// keep it in memory (memory == disk) and still return [`NameError::Store`]
+/// — never roll memory back below an advanced disk. Uses the parent-dir
+/// fsync AfterRename seam (`arm_fail_parent_dir_fsync_for_testing`); the
+/// corrupt-after-rename seam would overwrite the new bytes and break the
+/// agreement assertion.
+#[tokio::test]
+async fn commit_after_rename_failure_keeps_binding_and_reload_agrees() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let owner = UserId([9; 32]);
+    let store = NameStore::load(path.clone()).await;
+    assert!(store.load_error().is_none());
+
+    let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let outcome = store
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await;
+    assert!(
+        matches!(&outcome, Err(NameError::Store(msg)) if msg.contains("not confirmed")),
+        "post-rename failure must not ACK: {outcome:?}"
+    );
+
+    // Memory keeps the binding: it matches the advanced disk.
+    let mem = store.owner("bob").await.unwrap().expect("memory has bob");
+    assert_eq!(mem.user_id, owner);
+
+    // A reload from disk agrees with memory — the binding really is stored.
+    drop(_seam);
+    let reloaded = NameStore::load(path).await;
+    assert!(
+        reloaded.load_error().is_none(),
+        "{:?}",
+        reloaded.load_error()
+    );
+    let disk = reloaded.owner("bob").await.unwrap().expect("disk has bob");
+    assert_eq!(disk.user_id, owner);
+    assert_eq!(disk, mem);
+}

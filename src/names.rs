@@ -798,7 +798,10 @@ impl NamesState {
 /// store; an unreadable or malformed file leaves the store holding nothing
 /// and refusing every name operation ([`NameError::Store`]), so pins are
 /// never silently lost and re-learned. All mutations are serialised under
-/// one lock held across the durable write; a failed write rolls back.
+/// one lock held across the durable write. A failure before the rename
+/// leaves memory and disk on the old state; a failure after the rename
+/// keeps the new state in memory so it matches the advanced disk (issue
+/// #1101).
 #[derive(Debug)]
 pub struct NameStore {
     path: Option<PathBuf>,
@@ -861,18 +864,31 @@ impl NameStore {
         }
     }
 
-    async fn persist(&self, state: &NamesState) -> Result<(), NameError> {
+    /// Write `state` atomically (mode 0600). The error says which half of
+    /// the durable write failed (issue #1101): `BeforeRename` leaves the
+    /// old file in place (callers keep old memory); `AfterRename` means
+    /// the new file is already there (callers install the mutation and
+    /// still report failure).
+    async fn persist(&self, state: &NamesState) -> Result<(), crate::storage::DurableWriteError> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let bytes = serde_json::to_vec_pretty(&state.to_file())
-            .map_err(|e| NameError::Store(format!("encode: {e}")))?;
-        crate::storage::write_private_bytes_durable(path, bytes)
+        let bytes = serde_json::to_vec_pretty(&state.to_file()).map_err(|e| {
+            crate::storage::DurableWriteError::BeforeRename(std::io::Error::other(format!(
+                "encode: {e}"
+            )))
+        })?;
+        crate::storage::write_private_bytes_durable_typed(path, bytes)
             .await
-            .map_err(|e| NameError::Store(format!("write {}: {e}", path.display())))
+            .map_err(|e| e.with_path(path))
     }
 
-    /// Apply `mutate` to a copy, persist it, then commit (all-or-nothing).
+    /// Apply `mutate` to a copy, persist it, then commit.
+    ///
+    /// Success installs the new state. `BeforeRename` keeps the old memory
+    /// (disk unchanged). `AfterRename` installs the new state so memory
+    /// matches the advanced disk, then still returns [`NameError::Store`]
+    /// — durability is unconfirmed.
     async fn commit<T>(
         &self,
         mutate: impl FnOnce(&mut NamesState) -> Result<(T, bool), NameError>,
@@ -882,8 +898,24 @@ impl NameStore {
         let mut next = guard.clone();
         let (out, changed) = mutate(&mut next)?;
         if changed {
-            self.persist(&next).await?;
-            *guard = next;
+            match self.persist(&next).await {
+                Ok(()) => {
+                    *guard = next;
+                }
+                Err(e) if e.crossed_rename() => {
+                    // Issue #1101: the rename already happened — the new
+                    // binding IS in `names.json`. Keep it (memory matches
+                    // the advanced disk) and still report failure.
+                    *guard = next;
+                    return Err(NameError::Store(format!(
+                        "applied, but durability is not confirmed (directory fsync failed): \
+                         {e}; the change is in effect"
+                    )));
+                }
+                Err(e) => {
+                    return Err(NameError::Store(format!("write {e}")));
+                }
+            }
         }
         Ok(out)
     }

@@ -403,6 +403,8 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/groups/secure/open-envelope"
                     // ADR 0116 §4: the runtime history trim.
                     | "/history/retain"
+                    // ADR-0074 §1: named forwards resolve (and pin) a name.
+                    | "/forwards"
             ) || is_two_segment_action(path, "delegate")
                 || is_group_quarantine_clear(path)
         }
@@ -1497,5 +1499,20 @@ mod tests {
         ] {
             assert!(!is_names_path(path), "{path} must not be classified");
         }
+    }
+
+    #[test]
+    fn forward_add_requires_durable_owner() {
+        // ADR-0074 §1: POST /forwards resolves a peer name and pins it at
+        // first use. Session and rider bearers must not reach it. Card
+        // import stays session-reachable (contacts only; bind is gated in
+        // the handler).
+        assert!(requires_durable_owner(&Method::POST, "/forwards"));
+        assert!(!requires_durable_owner(&Method::GET, "/forwards"));
+        assert!(!requires_durable_owner(
+            &Method::DELETE,
+            "/forwards/127.0.0.1:8022"
+        ));
+        assert!(!requires_durable_owner(&Method::POST, "/agent/card/import"));
     }
 }

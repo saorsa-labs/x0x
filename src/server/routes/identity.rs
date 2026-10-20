@@ -899,6 +899,7 @@ pub(in crate::server) async fn get_a2a_agent_card(
 /// POST /agent/card/import — import an agent card to contacts.
 pub(in crate::server) async fn import_agent_card(
     State(state): State<Arc<AppState>>,
+    actor: Option<axum::extract::Extension<crate::server::rider_auth::ActorContext>>,
     Json(req): Json<ImportCardRequest>,
 ) -> impl IntoResponse {
     // Parse card
@@ -1100,9 +1101,17 @@ pub(in crate::server) async fn import_agent_card(
         }
     }
 
-    // ADR-0074 §1: a signed card's owner_name binds a local owner petname
-    // at first bind (never rebinds; a taken label is reported, not changed).
-    let owner_label = super::names::bind_owner_from_card(&state, &card, effective_trust).await;
+    // ADR-0074 §1: a durable owner may bind a petname from a certified
+    // card (see `bind_owner_from_card`). Session and rider imports still
+    // add the contact — they never write a binding.
+    let durable = actor
+        .as_ref()
+        .is_some_and(|axum::extract::Extension(a)| a.is_durable_owner());
+    let owner_label = if durable {
+        super::names::bind_owner_from_card(&state, &card, effective_trust).await
+    } else {
+        serde_json::Value::Null
+    };
 
     (
         StatusCode::OK,
