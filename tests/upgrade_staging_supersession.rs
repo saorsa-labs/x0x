@@ -20,6 +20,9 @@ macro_rules! staging_supersession_regression_tests {
             // Create the owned install once. Both operations use the same real
             // participant, restart context, shutdown watch and apply mutex.
             let (mut older_runtime, _shutdown) = e2e_startup_runtime(&root);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                root.join("x0xd"),
+            );
             let started = tokio::time::Instant::now();
             older_runtime.staging.machine_id = [42; 32];
             older_runtime.staging.clock = Some(Arc::new(move || {
