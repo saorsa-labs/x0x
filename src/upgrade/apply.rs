@@ -1694,6 +1694,10 @@ fn extract_from_zip(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    include!("../../tests/upgrade_background_staging.rs");
+    #[cfg(unix)]
+    background_permit_regression_tests!();
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
