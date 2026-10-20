@@ -209,6 +209,8 @@ pub(in crate::server) struct VerdictSample {
     pub upgrade_latest_version: Option<String>,
     pub upgrade_checked_age_secs: Option<u64>,
     pub upgrade_handoff_pending: bool,
+    /// Local recovery-record diagnosis; represented by existing verdict reasons.
+    pub upgrade_record_diagnostic: Option<String>,
     pub upgrade_failed_artifact: bool,
     /// Age of the refresher's cached sample when it was served, set by
     /// the handler merge in `HealthSnapshot::merged_verdict_inputs`.
@@ -247,6 +249,7 @@ impl Default for VerdictSample {
             upgrade_latest_version: None,
             upgrade_checked_age_secs: None,
             upgrade_handoff_pending: false,
+            upgrade_record_diagnostic: None,
             upgrade_failed_artifact: false,
             sample_age_secs: None,
         }
@@ -419,6 +422,10 @@ pub(in crate::server) async fn sample_verdict_inputs(
         .data_dir
         .join(crate::upgrade::restart::HANDOFF_FILE_NAME)
         .exists();
+    // Read at the initial sample and every refresh. Corrupt and unknown records
+    // degrade the existing verdict without blocking configured daemon startup,
+    // following recorded paths, or attempting recovery (ADR 0094 section 6).
+    sample.upgrade_record_diagnostic = recovery_record_diagnostic(&state.data_dir);
     sample.upgrade_failed_artifact = state
         .data_dir
         .join(crate::upgrade::restart::UPGRADE_FAILED_FILE_NAME)
@@ -432,6 +439,35 @@ pub(in crate::server) async fn sample_verdict_inputs(
     // review of #1380).
 
     sample
+}
+
+// Use fixed text: parser errors can contain data copied from a local record.
+fn recovery_record_diagnostic(data_dir: &Path) -> Option<String> {
+    crate::upgrade::journal::read_boot_records(data_dir)
+        .blocks_apply()
+        .then(|| {
+            "upgrade recovery records require reconciliation; protection \
+             unprotected/degraded; records preserved"
+                .to_string()
+        })
+}
+
+/// Publish the boot-time diagnosis before HTTP starts serving or refresh waits.
+/// This inspection is read-only and cannot reject configured daemon startup.
+pub(in crate::server) fn initial_health_snapshot(data_dir: &Path) -> HealthSnapshot {
+    let snapshot = HealthSnapshot::default();
+    let diagnostic = recovery_record_diagnostic(data_dir);
+    if let Some(reason) = &diagnostic {
+        tracing::warn!("{reason}; starting configured binary normally");
+    }
+    snapshot.store_verdict_sample(VerdictSample {
+        upgrade_handoff_pending: data_dir
+            .join(crate::upgrade::restart::HANDOFF_FILE_NAME)
+            .exists(),
+        upgrade_record_diagnostic: diagnostic,
+        ..VerdictSample::unsampled()
+    });
+    snapshot
 }
 
 /// Filesystem capacity for the given path, or `None` where unsupported
@@ -861,7 +897,11 @@ pub(in crate::server) fn classify_with_detail(
     // Upgrade: read through existing accessors only. A staged handoff or
     // the loud UPGRADE_FAILED artifact is a real maintenance state. An
     // available update or a failed lookup stays `ok` (matches doctor).
-    let upgrade_state = if sample.upgrade_handoff_pending {
+    let upgrade_state = if let Some(diagnostic) = &sample.upgrade_record_diagnostic {
+        bump(InputState::Degraded);
+        reasons.push(diagnostic.clone());
+        InputState::Degraded
+    } else if sample.upgrade_handoff_pending {
         bump(InputState::Degraded);
         reasons.push(format!(
             "upgrade handoff staged ({} present); restart pending",
@@ -1672,6 +1712,32 @@ mod tests {
     // Upgrade -----------------------------------------------------------
 
     #[test]
+    fn recovery_records_degrade_health_without_exposing_or_changing_contents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(recovery_record_diagnostic(dir.path()).is_none());
+        for name in [
+            crate::upgrade::journal::JOURNAL_FILE_NAME,
+            crate::upgrade::journal::BOOT_FILE_NAME,
+            crate::upgrade::restart::HANDOFF_FILE_NAME,
+        ] {
+            let path = dir.path().join(name);
+            let bytes = br#"{"schema_version":999,"private-value":"must-not-escape"}"#;
+            std::fs::write(&path, bytes).unwrap();
+            let mut inputs = sample();
+            let snapshot = initial_health_snapshot(dir.path());
+            inputs.upgrade_record_diagnostic = snapshot.verdict_sample().upgrade_record_diagnostic;
+            let verdict = classify(&inputs);
+            assert_eq!(verdict.verdict, "degraded");
+            assert_eq!(verdict.inputs.upgrade.state, "degraded");
+            let output = serde_json::to_string(&verdict).unwrap();
+            assert!(output.contains("unprotected/degraded"));
+            assert!(!output.contains("must-not-escape"));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn staged_upgrade_handoff_degrades() {
         let mut sample = sample();
         sample.upgrade_handoff_pending = true;
@@ -1682,6 +1748,40 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains(crate::upgrade::restart::HANDOFF_FILE_NAME)));
+    }
+
+    #[test]
+    fn legacy_handoff_keeps_restart_pending_health_detail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(crate::upgrade::restart::HANDOFF_FILE_NAME);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "from_version": "0.48.0",
+            "to_version": "0.48.1",
+            "target_path": dir.path().join("x0xd"),
+            "backup_path": dir.path().join("x0xd.backup"),
+            "argv": ["x0xd"],
+            "cwd": dir.path(),
+            "env": {},
+            "old_pid": 123,
+            "api_addr": "127.0.0.1:12700",
+            "started_at": 1,
+            "mode": "SupervisedExit"
+        }))
+        .unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let snapshot = initial_health_snapshot(dir.path()).verdict_sample();
+        assert!(snapshot.upgrade_record_diagnostic.is_none());
+        assert!(snapshot.upgrade_handoff_pending);
+        let mut inputs = sample();
+        inputs.upgrade_handoff_pending = snapshot.upgrade_handoff_pending;
+        inputs.upgrade_record_diagnostic = snapshot.upgrade_record_diagnostic;
+        let verdict = classify(&inputs);
+        assert_eq!(verdict.inputs.upgrade.state, "degraded");
+        assert!(verdict
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("restart pending")));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

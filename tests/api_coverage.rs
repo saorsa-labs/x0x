@@ -96,6 +96,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Delete, "/sync/devices/:machine_id", sync_routes_wired),
     covered!(Get, "/owner/agents", daemon_api_profile_round_trip),
     covered!(
+        Get,
+        "/owner/machines",
+        owner_machines_lists_enrolled_devices_and_local_digest
+    ),
+    covered!(
         Post,
         "/owner/agents/issue",
         rider_issuance_journals_and_roster_lists
@@ -146,6 +151,11 @@ const COVERED: &[CoveredEndpoint] = &[
         Get,
         "/diagnostics/transport",
         daemon_api_diagnostics_transport
+    ),
+    covered!(
+        Get,
+        "/diagnostics/upgrade",
+        upgrade_diagnostics_reports_version_policy_digest
     ),
     covered!(Get, "/diagnostics/relay", daemon_api_diagnostics_relay),
     covered!(Get, "/diagnostics/dm", daemon_api_diagnostics_dm),
@@ -629,6 +639,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/network.rs",
         include_str!("../src/server/routes/network.rs"),
+    ),
+    // #1383: the owner machine census route's coverage lives in the
+    // owner route lib tests.
+    (
+        "src/server/routes/owner.rs",
+        include_str!("../src/server/routes/owner.rs"),
     ),
     (
         "tests/daemon_api_integration.rs",
