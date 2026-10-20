@@ -18916,6 +18916,13 @@ impl Agent {
                     agent_id: agent_id.0,
                 })?
         };
+        // Same as [`Self::authorized_routing_machine_with`]: a zero routing
+        // machine is not a route. Do not fall back to the authority store.
+        let routing = Some(routing).filter(|m| m.0 != [0u8; 32]).ok_or(
+            error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            },
+        )?;
         // ADR 0115 §2: a route counts only when an authority store confirms
         // it; otherwise the authority stores' machine is used. Admission and
         // reauth share this body so a stale/unconfirmed cache entry cannot
@@ -19049,6 +19056,9 @@ impl Agent {
 
     /// [`Self::gate_peer_machine_inbound`] with cert expiry and grant
     /// validity evaluated at `now_secs` (ADR-0074 §4 re-check).
+    ///
+    /// With `local_authority_only`, ADR 0115 confirmation and grant evidence
+    /// use only local / non-blocking reads (no EvidenceV1 wait/lookup).
     pub(crate) async fn gate_peer_machine_inbound_at(
         discovery_cache: &std::sync::Arc<
             tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -19060,6 +19070,7 @@ impl Agent {
         owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
         now_secs: u64,
+        local_authority_only: bool,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
         #![allow(clippy::too_many_arguments)]
         Self::gate_peer_machine_inbound_for_evidence(
@@ -19073,6 +19084,7 @@ impl Agent {
             None,
             false,
             now_secs,
+            local_authority_only,
         )
         .await
     }
@@ -19116,12 +19128,16 @@ impl Agent {
             call_caller,
             false,
             Self::unix_timestamp_secs(),
+            false,
         )
         .await
     }
 
     /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
     /// peers gain evidence admission; every other check remains unchanged.
+    ///
+    /// With `local_authority_only`, confirmation and grant evaluation use
+    /// non-blocking local evidence only (ADR-0074 §4 reauth).
     #[allow(clippy::too_many_arguments)]
     async fn gate_peer_machine_inbound_for_evidence(
         discovery_cache: &std::sync::Arc<
@@ -19136,6 +19152,7 @@ impl Agent {
         call_caller: Option<&identity::AgentId>,
         evidence_only: bool,
         now_secs: u64,
+        local_authority_only: bool,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
@@ -19200,7 +19217,7 @@ impl Agent {
                     agent_id,
                     machine_id,
                     now_secs,
-                    true,
+                    !local_authority_only,
                 )
                 .await;
             let has_connect_grant = !access.connect_ports.is_empty();
@@ -19310,7 +19327,10 @@ impl Agent {
         // confirms on this machine is admitted.
         let mut confirmed: Vec<identity::AgentId> = Vec::with_capacity(surviving.len());
         for agent_id in &surviving {
-            if owner_trust.authority_confirms(agent_id, machine_id).await {
+            if owner_trust
+                .authority_confirms_with(agent_id, machine_id, local_authority_only)
+                .await
+            {
                 confirmed.push(*agent_id);
             }
         }
@@ -19624,6 +19644,7 @@ impl Agent {
                         None,
                         true,
                         Self::unix_timestamp_secs(),
+                        false,
                     )
                     .await
                     .ok()?;
@@ -19746,6 +19767,7 @@ impl Agent {
                         None,
                         true,
                         Self::unix_timestamp_secs(),
+                        false,
                     )
                     .await
                     .is_err())

@@ -1075,11 +1075,15 @@ pub async fn evaluate_grant_access(
         requester_machine,
         now_unix,
         None,
+        true,
     )
     .await
     .access
 }
 
+/// With `allow_network_lookup = false`, skip EvidenceV1 wait/lookup but still
+/// read local usable evidence (`try_usable`) so a reauth pass keeps
+/// authenticated bindings without network I/O.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate_grant_access_with_evidence(
     store: &ShareGrantStore,
@@ -1090,6 +1094,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     requester_machine: &MachineId,
     now_unix: u64,
     evidence: Option<&crate::peer_evidence::EvidenceRuntime>,
+    allow_network_lookup: bool,
 ) -> GrantAccessEval {
     let evaluated_at = std::time::Instant::now();
     let mut access = GrantAccessEval::default();
@@ -1102,9 +1107,10 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     if candidates.is_empty() {
         return access;
     }
-    if crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
-        .await
-        .is_none()
+    if allow_network_lookup
+        && crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
+            .await
+            .is_none()
     {
         if let Some(evidence) = evidence {
             if evidence.wait(0).await {
@@ -1115,17 +1121,21 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
         }
     }
     let now_unix = now_unix.saturating_add(evaluated_at.elapsed().as_secs());
+    let now_ms = now_unix.saturating_mul(1000);
+    let usable_view = |runtime: &crate::peer_evidence::EvidenceRuntime| {
+        if allow_network_lookup {
+            runtime.usable(*requester_agent, *requester_machine, now_ms)
+        } else {
+            // Contended lock → no evidence (fail closed; matches reauth).
+            runtime
+                .try_usable(*requester_agent, *requester_machine, now_ms)
+                .ok()
+                .flatten()
+        }
+    };
     match crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent).await {
         Some(bound) if bound == *requester_machine => {}
-        None if evidence
-            .and_then(|e| {
-                e.usable(
-                    *requester_agent,
-                    *requester_machine,
-                    now_unix.saturating_mul(1000),
-                )
-            })
-            .is_some() => {}
+        None if evidence.and_then(usable_view).is_some() => {}
         _ => return access,
     }
     let live: Vec<ShareGrant> = {
@@ -1152,13 +1162,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             .and_then(|entry| entry.agent_certificate.clone())
             .or_else(|| {
                 evidence
-                    .and_then(|e| {
-                        e.usable(
-                            *requester_agent,
-                            *requester_machine,
-                            now_unix.saturating_mul(1000),
-                        )
-                    })
+                    .and_then(usable_view)
                     .and_then(|v| v.certificate.clone())
             })
     } else {

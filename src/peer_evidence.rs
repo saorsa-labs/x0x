@@ -3714,6 +3714,7 @@ mod tests {
             &p.m(),
             now / 1000,
             Some(&runtime),
+            true,
         )
         .await;
         assert!(
@@ -3736,6 +3737,7 @@ mod tests {
             &MachineId([9; 32]),
             now / 1000,
             Some(&runtime),
+            true,
         )
         .await;
         assert!(denied.is_empty());

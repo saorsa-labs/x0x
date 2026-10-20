@@ -12,7 +12,7 @@ use super::*;
 use crate::connect::{ConnectAcl, ConnectAllowEntry, ConnectOwnerEntry};
 use crate::contacts::{ContactStore, TrustLevel};
 use crate::dm_inbox::AuthenticatedMachineBindings;
-use crate::identity::{AgentCertificate, AgentKeypair, UserKeypair};
+use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
 use crate::owner_sync::{OwnerEnrollment, OwnerSyncStore};
 use crate::owner_trust::OwnerTrust;
 use crate::revocation::RevocationSet;
@@ -382,8 +382,9 @@ async fn trust_downgrade_closes_within_5s() {
     assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
 }
 
-/// WHY: an edit through `ContactStore::get_mut` bypasses the persisting
-/// methods; the handle's drop must still raise the event (sweep off).
+/// WHY (Codex P2): the public `ContactStore::get_mut` returns a Drop-notifying
+/// guard; setting `Blocked` and dropping the guard (no save) must wake reauth
+/// and close the stream within EVENT_BOUND (sweep off).
 #[tokio::test(start_paused = true)]
 async fn get_mut_edit_closes_within_5s() {
     let w = World::new().await;
@@ -397,12 +398,7 @@ async fn get_mut_edit_closes_within_5s() {
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(!stream.token().is_cancelled());
 
-    w.contacts
-        .write()
-        .await
-        .get_mut_tracked(&w.b1)
-        .unwrap()
-        .trust_level = TrustLevel::Blocked;
+    w.contacts.write().await.get_mut(&w.b1).unwrap().trust_level = TrustLevel::Blocked;
     closes_within(&stream, EVENT_BOUND).await;
 }
 
@@ -750,6 +746,143 @@ async fn outbound_reauth_keeps_stream_when_cache_route_is_stale_but_authority_na
     assert_eq!(w.diag.torn_down_reauth(), 0);
 }
 
+/// WHY (Claude Low / RC3): a stream admitted on usable persisted evidence
+/// with no authenticated binding must survive a local-only reauth pass.
+/// Reauth must not tear it down just because bindings are absent.
+#[tokio::test(start_paused = true)]
+async fn evidence_admitted_stream_survives_reauth_without_bindings() {
+    use crate::announce_v3::IdentityAnnouncementV3;
+    use crate::dm::DmCapabilities;
+    use crate::dm_capability::{CapabilityAdvert, RegistryTrailer, REGISTRY_TRAILER_MAGIC};
+    use crate::peer_evidence::{
+        EvidenceConfig, EvidenceRecordV1, EvidenceRuntime, IngestSource, PeerEvidenceStore,
+        RuntimePolicy,
+    };
+
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], false, true));
+
+    let agent_kp = AgentKeypair::generate().unwrap();
+    let machine_kp = MachineKeypair::generate().unwrap();
+    let peer = agent_kp.agent_id();
+    let machine = machine_kp.machine_id();
+    let cert = AgentCertificate::issue(&w.user_b, &agent_kp).unwrap();
+    w.cache
+        .write()
+        .await
+        .insert(peer, discovered(&agent_kp, machine, cert.clone()));
+    let _grant = w
+        .grant(0x51, Grantee::Agent(peer), w.base_secs + 3_600)
+        .await;
+
+    // Usable persisted evidence for the peer (ready store, no load barrier).
+    let now_ms = w.base_secs.saturating_mul(1000);
+    let record = {
+        let v2 = crate::IdentityAnnouncement {
+            self_name: Some("evidence peer".into()),
+            agent_id: peer,
+            machine_id: machine,
+            user_id: None,
+            agent_certificate: None,
+            machine_public_key: machine_kp.public_key().as_bytes().to_vec(),
+            machine_signature: vec![],
+            addresses: vec![],
+            announced_at: now_ms / 1000,
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            agent_public_key: agent_kp.public_key().as_bytes().to_vec(),
+        };
+        let mut ann =
+            IdentityAnnouncementV3::build_from_v2(&v2, machine_kp.secret_key(), 0).unwrap();
+        ann.sign_v3_1(machine_kp.secret_key()).unwrap();
+        let mut caps = DmCapabilities::pending();
+        caps.kem_public_key = vec![42; 1184];
+        let mut advert = CapabilityAdvert {
+            protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+            agent_id: *peer.as_bytes(),
+            machine_id: *machine.as_bytes(),
+            created_at_unix_ms: now_ms,
+            capabilities: caps,
+            signature: vec![],
+        };
+        advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            agent_kp.secret_key(),
+            &advert.signed_bytes().unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        let mut trailer = RegistryTrailer {
+            registry: Default::default(),
+            signature: vec![],
+        };
+        trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            agent_kp.secret_key(),
+            &trailer.signed_bytes(&advert).unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        let mut bytes = postcard::to_stdvec(&advert).unwrap();
+        bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
+        bytes.extend(postcard::to_stdvec(&trailer).unwrap());
+        EvidenceRecordV1 {
+            announcement: crate::announce_v3::serialize_v3_1(&ann).unwrap(),
+            advert: bytes,
+            certificate: Some(cert.to_storage_bytes().unwrap()),
+            relation: crate::peer_evidence::GROUP,
+            stored_at_ms: now_ms,
+        }
+    };
+    let policy = Arc::new(RuntimePolicy::new(
+        w.a1,
+        w.trust.clone(),
+        Arc::clone(&w.revocations),
+    ));
+    let store = Arc::new(
+        PeerEvidenceStore::open(
+            &w.dir.path().join("evidence-survive"),
+            EvidenceConfig::default(),
+            policy,
+            now_ms,
+        )
+        .unwrap(),
+    );
+    store.ingest(record, IngestSource::Hello, now_ms).unwrap();
+    let (evidence, ready) = EvidenceRuntime::loading_store_for_test(store);
+    ready.cancel();
+    assert!(
+        evidence.usable(peer, machine, now_ms).is_some(),
+        "control: persisted evidence must be usable before reauth"
+    );
+    w.trust.install_evidence(&evidence);
+
+    // No authenticated binding — grant authority rides on local usable evidence.
+    {
+        let mut bind = w.authenticated.write().await;
+        *bind = crate::dm_inbox::AuthenticatedMachineBindingCache::default();
+    }
+
+    // Drive the same gate registration admission would after an
+    // evidence-backed grant (local reauth flags already on pass_inputs).
+    let gate = w.inbound(peer, machine);
+    let authority = check_gate(&gate, &w.ctx())
+        .await
+        .expect("evidence-backed grant must admit without authenticated binding");
+    assert!(matches!(authority, StreamAuthority::Grant { .. }));
+    let stream = w.live.register(gate, authority);
+    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert!(
+        !stream.token().is_cancelled(),
+        "local reauth must keep an evidence-admitted stream when bindings stay cleared"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
 /// WHY (Codex P1): grant evaluation can await a 5 s EvidenceV1 load barrier
 /// when an authenticated binding is absent. Several open streams must not
 /// push revocation past the ADR-0074 five-second bound — reauth uses local
@@ -823,17 +956,8 @@ async fn reauth_enforces_revocation_within_5s_despite_slow_evidence() {
         "control: evidence wait(0) must still be pending after 1 s"
     );
     blocked.abort();
-    // Restore bindings so revocation has a clean local grant path to deny.
-    for (agent, machine) in [(w.b1, w.mb), (w.c1, w.mc)] {
-        crate::dm_inbox::record_authenticated_machine_binding(
-            &w.authenticated,
-            agent,
-            machine,
-            w.base_secs,
-        )
-        .await;
-    }
-
+    // Bindings stay cleared: reauth must tear down via the local-only inbound
+    // path (no wait/lookup), not by restoring bindings first.
     let local_probe = Instant::now();
     let _ = w
         .trust
@@ -856,6 +980,7 @@ async fn reauth_enforces_revocation_within_5s_despite_slow_evidence() {
     let started = Instant::now();
     w.revoke_grant(&grant_b).await;
     w.revoke_grant(&grant_c).await;
+    // EVENT_BOUND already covers REAUTH_MIN_SPACING (250 ms) after the kick.
     for stream in &streams {
         closes_within(stream, EVENT_BOUND).await;
     }
@@ -873,7 +998,8 @@ async fn reauth_enforces_revocation_within_5s_despite_slow_evidence() {
 
 /// WHY (Codex P1 / Claude #2): handlers race every pre-bridge I/O against
 /// the cancel token via [`wait_cancellable`] (not a post-hoc `is_cancelled`
-/// poll), then [`deny_pre_bridge`] resets QUIC (0x5244) and RSTs TCP.
+/// poll), then [`deny_pre_bridge`] resets QUIC with
+/// [`ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE`] and RSTs TCP.
 /// This drives that sequence: register → stall on response read →
 /// `tear_down` → wait returns [`Cancelled`] → deny RSTs the local socket.
 #[tokio::test]
@@ -916,8 +1042,9 @@ async fn pre_bridge_cancel_interrupts_stalled_io_and_rsts_tcp() {
         "stalled pre-bridge wait must return Cancelled when reauth tears down"
     );
 
-    // Handler deny path after Cancelled: RST TCP (QUIC 0x5244 covered by
-    // reset_quic / bridge teardown with real halves).
+    // Handler deny path after Cancelled: RST TCP (QUIC
+    // DROPPED_UNFINISHED_ERROR_CODE covered by reset_quic / bridge teardown
+    // with real halves).
     reset_tcp(&server);
     drop(server);
 

@@ -361,9 +361,9 @@ impl OwnerTrust {
 
     /// [`Self::grant_access`] with an explicit clock (ADR-0074 §4 re-check).
     ///
-    /// With `allow_evidence_lookup = false` the evaluation uses only local
-    /// authority stores — no EvidenceV1 wait/lookup — so a reauth pass stays
-    /// inside the ADR-0074 five-second bound.
+    /// With `allow_evidence_lookup = false` the evaluation still reads local
+    /// usable evidence but skips EvidenceV1 wait/lookup, so a reauth pass
+    /// stays inside the ADR-0074 five-second bound.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn grant_access_at(
         &self,
@@ -394,11 +394,7 @@ impl OwnerTrust {
         if rejected(base) {
             return crate::share_grant::GrantAccessEval::default();
         }
-        let evidence = if allow_evidence_lookup {
-            self.evidence()
-        } else {
-            None
-        };
+        let evidence = self.evidence();
         let access = crate::share_grant::evaluate_grant_access_with_evidence(
             &store,
             &self.bindings,
@@ -408,6 +404,7 @@ impl OwnerTrust {
             machine_id,
             now_unix,
             evidence.as_deref(),
+            allow_evidence_lookup,
         )
         .await;
         // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin

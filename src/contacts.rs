@@ -229,13 +229,14 @@ pub struct ContactStore {
     change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
-/// Mutable handle to one contact ([`ContactStore::get_mut_tracked`]).
-/// Signals the store's change notifier when dropped. Production mutators
-/// notify via [`ContactStore::save`]; this path covers in-memory edits
-/// (see `forward::teardown` tests).
+/// Mutable handle to one contact ([`ContactStore::get_mut`]).
+///
+/// Signals the store's change notifier when dropped so ADR-0074 §4 reauth
+/// wakes after in-memory edits (including `Blocked`) that never call
+/// [`ContactStore::save`]. Production mutators that persist still notify
+/// via `save`; this guard covers every public `get_mut` path.
 #[derive(Debug)]
-#[allow(dead_code)] // used from teardown tests; save() covers production wakes
-pub(crate) struct ContactMut<'a> {
+pub struct ContactMut<'a> {
     contact: &'a mut Contact,
     notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
@@ -408,15 +409,10 @@ impl ContactStore {
         self.contacts.get(&agent_id.0)
     }
 
-    /// Get a mutable reference to a contact by agent ID.
-    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<&mut Contact> {
-        self.contacts.get_mut(&agent_id.0)
-    }
-
-    /// Mutable contact handle that wakes the ADR-0074 §4 reauth notifier on
-    /// drop (in-memory edits that do not go through [`Self::save`]).
-    #[allow(dead_code)] // used from teardown tests; save() covers production wakes
-    pub(crate) fn get_mut_tracked(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
+    /// Mutable contact handle. Drop wakes the ADR-0074 §4 reauth notifier
+    /// when set, so in-memory edits (including `Blocked`) that skip
+    /// [`Self::save`] still re-check open streams.
+    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
         let notify = self.change_notify.clone();
         self.contacts
             .get_mut(&agent_id.0)

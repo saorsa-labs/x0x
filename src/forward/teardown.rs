@@ -34,9 +34,10 @@
 //! ## What a teardown does
 //!
 //! The stream's cancellation token fires. The bridge then resets both QUIC
-//! halves (never a FIN, so the peer sees an abort rather than a short but
-//! well-formed stream), closes the local TCP socket with an RST, and counts
-//! the teardown in `torn_down_reauth` with its reason.
+//! halves with [`ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE`] (never
+//! a FIN; same code as unfinished-half drops on main), closes the local TCP
+//! socket with an RST, and counts the teardown in `torn_down_reauth` with
+//! its reason. Reauth is distinguished locally via that counter/logs only.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -70,10 +71,6 @@ pub(crate) const REAUTH_MIN_SPACING: Duration = Duration::from_millis(250);
 /// authority reads should finish well under this; the deadline fail-closes
 /// any stream still unchecked when it expires.
 pub(crate) const REAUTH_PASS_BUDGET: Duration = Duration::from_secs(5);
-
-/// QUIC application error code sent when a live stream is torn down
-/// because its authority is gone. Peers observe this reset code on the wire.
-pub(crate) const REAUTH_RESET_CODE: u32 = 0x5244;
 
 /// The authority a live stream holds (ADR-0074 §4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -421,6 +418,7 @@ async fn reevaluate(
             // The accept-loop gate first (every agent on the machine), then
             // the forwarder's gate for the attested opener — the same two
             // layers the stream cleared at admission.
+            // ADR-0074 §4: same local-only bound as outbound / AttestationVerifyCtx.
             crate::Agent::gate_peer_machine_inbound_at(
                 &ctx.discovery_cache,
                 &ctx.contact_store,
@@ -430,6 +428,7 @@ async fn reevaluate(
                 &ctx.owner_trust,
                 machine,
                 now_secs,
+                true,
             )
             .await
             .map_err(|e| network_reason(&e))?;
@@ -447,6 +446,7 @@ async fn reevaluate(
                 &ctx.owner_trust,
                 machine,
                 now_secs,
+                true,
             )
             .await
             .map_err(|e| network_reason(&e))?;
@@ -516,24 +516,23 @@ pub(crate) async fn reauth_pass(live: &LiveStreams, ctx: &ReauthCtx) -> usize {
     let mut verdicts: HashMap<StreamGate, Result<StreamAuthority, &'static str>> = HashMap::new();
     let mut torn_down = 0;
     for (id, gate) in entries {
-        let verdict = if tokio::time::Instant::now() >= deadline {
-            Err("reauth_deadline")
-        } else {
-            match verdicts.get(&gate) {
-                Some(verdict) => verdict.clone(),
-                None => {
-                    let verdict = match tokio::time::timeout_at(
-                        deadline,
-                        reevaluate(&gate, ctx, &verify, &policy),
-                    )
-                    .await
-                    {
-                        Ok(verdict) => verdict,
-                        Err(_) => Err("reauth_deadline"),
-                    };
-                    verdicts.insert(gate.clone(), verdict.clone());
-                    verdict
-                }
+        // Cache hit always wins; the pass deadline only fails closed gates
+        // that have not yet been evaluated in this pass.
+        let verdict = match verdicts.get(&gate) {
+            Some(verdict) => verdict.clone(),
+            None if tokio::time::Instant::now() >= deadline => Err("reauth_deadline"),
+            None => {
+                let verdict = match tokio::time::timeout_at(
+                    deadline,
+                    reevaluate(&gate, ctx, &verify, &policy),
+                )
+                .await
+                {
+                    Ok(verdict) => verdict,
+                    Err(_) => Err("reauth_deadline"),
+                };
+                verdicts.insert(gate.clone(), verdict.clone());
+                verdict
             }
         };
         match verdict {
@@ -546,6 +545,7 @@ pub(crate) async fn reauth_pass(live: &LiveStreams, ctx: &ReauthCtx) -> usize {
                         ?gate,
                         reason,
                         torn_down_total = live.diag.torn_down_reauth(),
+                        reasons = ?live.diag.torn_down_reasons(),
                         outcome = "torn_down_reauth",
                         "live forward stream torn down: its authority is gone (ADR-0074 §4)"
                     );
@@ -633,11 +633,16 @@ where
 }
 
 /// Reset both QUIC halves of a torn-down stream.
+///
+/// Uses the same application error as main's forward deny path when dropping
+/// unfinished halves ([`ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE`],
+/// ADR 0022). Reauth teardowns are distinguished locally via
+/// `torn_down_reauth` counters/logs only — no new wire-visible code.
 pub(crate) fn reset_quic(
     send: &mut crate::network::StreamSend,
     recv: &mut crate::network::StreamRecv,
 ) {
-    let code = ant_quic::VarInt::from_u32(REAUTH_RESET_CODE);
+    let code = ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE;
     // Either half may already be closed; that is not an error here.
     let _ = send.reset(code);
     let _ = recv.stop(code);
@@ -676,7 +681,9 @@ where
 }
 
 /// ADR-0074 §4 deny during the connect/header/response window: reset both
-/// QUIC halves with [`REAUTH_RESET_CODE`] and RST the local TCP when present.
+/// QUIC halves with [`ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE`]
+/// (same code as unfinished-half drops on main) and RST the local TCP when
+/// present. Reauth vs other denies is local-only (`torn_down_reauth`).
 ///
 /// Takes [`PeerStream`] so the send and recv borrows are sequential (not
 /// overlapping in one call expression).
@@ -684,7 +691,7 @@ pub(crate) fn deny_pre_bridge(
     stream: &mut crate::streams::PeerStream,
     tcp: Option<&tokio::net::TcpStream>,
 ) {
-    let code = ant_quic::VarInt::from_u32(REAUTH_RESET_CODE);
+    let code = ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE;
     let _ = stream.send_mut().reset(code);
     let _ = stream.recv_mut().stop(code);
     if let Some(tcp) = tcp {

@@ -853,7 +853,7 @@ impl ForwardDiagnostics {
         self.header_timeout.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a live stream torn down for `reason` (ADR-0074 §4).
-    pub fn record_torn_down(&self, reason: &'static str) {
+    pub(crate) fn record_torn_down(&self, reason: &'static str) {
         self.torn_down_reauth.fetch_add(1, Ordering::Relaxed);
         let mut reasons = self
             .torn_down_reasons
@@ -862,16 +862,15 @@ impl ForwardDiagnostics {
         *reasons.entry(reason).or_insert(0) += 1;
     }
     /// Live streams torn down because their authority is gone (ADR-0074 §4).
-    /// Exposed on [`ForwardService::diagnostics`] for operators; also logged
-    /// as `torn_down_total` on each teardown.
+    /// Logged as `torn_down_total` on each teardown.
     #[must_use]
-    pub fn torn_down_reauth(&self) -> u64 {
+    pub(crate) fn torn_down_reauth(&self) -> u64 {
         self.torn_down_reauth.load(Ordering::Relaxed)
     }
     /// `torn_down_reauth` by reason (`revoked`, `trust_rejected`,
     /// `target_not_allowed`, ...).
     #[must_use]
-    pub fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
+    pub(crate) fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
         self.torn_down_reasons
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1276,8 +1275,9 @@ async fn bridge(
     // response. A full reset only happens on error or reauth teardown.
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
     // ADR-0074 §4: `cancel` fires when the stream's authority is gone. Both
-    // halves reset (QUIC code 0x5244 "RD", TCP with linger 0 / RST) so
-    // neither end keeps a half-open zombie.
+    // halves reset with DROPPED_UNFINISHED_ERROR_CODE (same as main's deny
+    // drop path) and TCP linger 0 / RST so neither end keeps a half-open
+    // zombie. Reauth teardowns are counted in `torn_down_reauth`.
     let torn_down =
         teardown::bridge_io(&mut tcp_read, &mut tcp_write, &mut recv, &mut send, cancel).await;
     if torn_down {
