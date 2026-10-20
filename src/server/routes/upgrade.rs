@@ -1399,6 +1399,13 @@ mod tests {
     ));
     #[cfg(unix)]
     fleet_startup_regression_tests!();
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging_supersession.rs"
+    ));
+    #[cfg(unix)]
+    staging_supersession_regression_tests!();
 
     use super::*;
     use crate::upgrade::restart;
