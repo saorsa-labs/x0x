@@ -905,6 +905,10 @@ pub struct Agent {
     /// the experimental roaming-move ceremony is disabled — not just the
     /// REST surface. Loading existing move state is unaffected.
     move_ceremony_enabled: bool,
+    /// ADR-0074 §4: wakes the forward reauth loop when authority changes
+    /// (revocation, contacts, ACL reload, placement, device set, discovery
+    /// cert). Shared with the stores that raise those events.
+    stream_reauth: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -4761,9 +4765,12 @@ async fn upsert_discovered_agent(
     >,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     mut incoming: DiscoveredAgent,
-) {
+) -> bool {
     prioritize_discovery_addresses(&mut incoming.addresses);
     let mut cache = cache.write().await;
+    let agent_id = incoming.agent_id;
+    let before = cache.get(&agent_id).map(discovery_gate_inputs);
+    let mut evicted = false;
     match cache.get_mut(&incoming.agent_id) {
         Some(existing) => {
             if incoming.announced_at >= existing.announced_at {
@@ -4870,6 +4877,7 @@ async fn upsert_discovered_agent(
                     .map(|(id, _)| *id)
                 {
                     cache.remove(&stalest);
+                    evicted = true;
                 }
             }
             // E2d: a certificate arriving with a COLD entry lands too —
@@ -4882,6 +4890,21 @@ async fn upsert_discovered_agent(
             }
         }
     }
+    evicted || cache.get(&agent_id).map(discovery_gate_inputs) != before
+}
+
+/// The discovery-entry fields the stream gates read (ADR-0074 §4): the
+/// machine binding and the certificate evidence. [`upsert_discovered_agent`]
+/// reports a change to them so live streams are re-checked.
+fn discovery_gate_inputs(
+    entry: &DiscoveredAgent,
+) -> (identity::MachineId, Option<u64>, Option<[u8; 32]>, bool) {
+    (
+        entry.machine_id,
+        entry.cert_not_after,
+        entry.cert_digest,
+        entry.agent_certificate.is_some(),
+    )
 }
 
 /// #447: merge an announce-blob pair into the discovery entry the moment a
@@ -4902,7 +4925,7 @@ async fn patch_discovery_entry_when_blob_lands(
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
     agent_id: &identity::AgentId,
-) {
+) -> bool {
     let attempts = (announce_blob::BLOB_FETCH_TIMEOUT_SECS * 2).max(1);
     for _ in 0..attempts {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -4910,14 +4933,14 @@ async fn patch_discovery_entry_when_blob_lands(
             continue;
         };
         let Some(cert) = blob.agent_certificate.as_ref() else {
-            return; // anonymous pair fetched — nothing to attach
+            return false; // anonymous pair fetched — nothing to attach
         };
         if !cert.agent_id().is_ok_and(|id| id == *agent_id) || cert.user_id().ok() != blob.user_id {
             tracing::debug!(
                 agent = %hex::encode(agent_id.0),
                 "announce blob landed but binds a different agent; not patching discovery entry (#447)"
             );
-            return;
+            return false;
         }
         // x0x #1150 (r7g): the announced-binding store is taken FIRST and
         // held until the binding carries the landed expiry, so no pinned
@@ -4968,8 +4991,9 @@ async fn patch_discovery_entry_when_blob_lands(
         // depends on the blob surviving for a later lookup.
         store.record_certificate_landed(agent_id, *digest, cert.not_after());
         drop(store);
-        return;
+        return true;
     }
+    false
 }
 
 fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
@@ -5308,7 +5332,7 @@ async fn cache_verified_announcement(
     >,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     discovered_agent: DiscoveredAgent,
-) {
+) -> bool {
     upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
     let (agent_id, machine_id, announced_at, cert_digest, inline_not_after) = (
         discovered_agent.agent_id,
@@ -5334,7 +5358,7 @@ async fn cache_verified_announcement(
     #[cfg(test)]
     announced_record_barrier::park(&agent_id, announced_record_barrier::INGEST_BETWEEN_WRITES)
         .await;
-    upsert_discovered_agent(cache, cert_events, discovered_agent).await;
+    upsert_discovered_agent(cache, cert_events, discovered_agent).await
 }
 
 async fn upsert_discovered_machine_from_agent(
@@ -7186,6 +7210,22 @@ fn capability_binding_supports_durable_ack(
     binding.is_some_and(|binding| {
         binding.machine_id.0 != [0_u8; 32] && binding.capabilities.supports_durable_app_ack()
     })
+}
+
+/// Swap the effective connect policy in `holder` and signal `reauth`, so an
+/// ADR-0074 §4 open-stream re-check runs promptly after an ACL reload.
+pub(crate) fn install_connect_policy(
+    holder: &std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>,
+    reauth: &tokio::sync::Notify,
+    policy: std::sync::Arc<connect::ConnectPolicy>,
+) {
+    {
+        let mut guard = holder
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+    reauth.notify_one();
 }
 
 impl Agent {
@@ -13253,6 +13293,9 @@ impl Agent {
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         // E2d: the listener's upserts fire verified-certificate events.
         let cert_events = std::sync::Arc::clone(&self.verified_cert_tx);
+        // ADR-0074 §4: a peer's machine binding or certificate changing
+        // re-checks live streams.
+        let stream_reauth = std::sync::Arc::clone(&self.stream_reauth);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let announced_machine_bindings = std::sync::Arc::clone(&self.announced_machine_bindings);
@@ -13977,8 +14020,9 @@ impl Agent {
                                 let watch_cert_events = std::sync::Arc::clone(&cert_events);
                                 let watch_digest = cert_digest;
                                 let watch_agent = converted.agent_id;
+                                let watch_reauth = std::sync::Arc::clone(&stream_reauth);
                                 tokio::spawn(async move {
-                                    patch_discovery_entry_when_blob_lands(
+                                    if patch_discovery_entry_when_blob_lands(
                                         &watch_cache,
                                         &watch_announced,
                                         &watch_blob_cache,
@@ -13986,7 +14030,12 @@ impl Agent {
                                         &watch_digest,
                                         &watch_agent,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        // ADR-0074 §4: certificate evidence
+                                        // changed; re-check live streams.
+                                        watch_reauth.notify_one();
+                                    }
                                 });
                             }
                         }
@@ -14260,7 +14309,7 @@ impl Agent {
                     now,
                     cache_freshness_ttl_secs,
                 ) {
-                    cache_verified_announcement(
+                    if cache_verified_announcement(
                         &machine_cache,
                         &announced_machine_bindings,
                         Some(&announce_blob_cache),
@@ -14268,7 +14317,10 @@ impl Agent {
                         &cert_events,
                         discovered_agent,
                     )
-                    .await;
+                    .await
+                    {
+                        stream_reauth.notify_one();
+                    }
                 } else {
                     tracing::debug!(
                         target: "x0x::discovery",
@@ -17640,7 +17692,9 @@ impl Agent {
                                 )
                                 .await;
                             }
-                            upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
+                            if upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await {
+                                self.stream_reauth.notify_one();
+                            }
                             return Ok(Some(addrs));
                         }
                     }
@@ -18895,6 +18949,74 @@ impl Agent {
         Ok(machine_id)
     }
 
+    /// [`Self::gate_peer_outbound`] over explicit shared state, with cert
+    /// expiry evaluated at `now_secs` (ADR-0074 §4 re-check).
+    pub(crate) async fn gate_peer_outbound_at(
+        identity_discovery_cache: &tokio::sync::RwLock<
+            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        >,
+        contact_store: &tokio::sync::RwLock<contacts::ContactStore>,
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        move_state: &tokio::sync::RwLock<key_move::MoveState>,
+        owner_trust: &owner_trust::OwnerTrust,
+        agent_id: &identity::AgentId,
+        now_secs: u64,
+    ) -> error::NetworkResult<identity::MachineId> {
+        let (machine_id, cert_not_after) = {
+            let cache = identity_discovery_cache.read().await;
+            cache
+                .get(agent_id)
+                .map(|entry| (entry.machine_id, entry.cert_not_after))
+                .ok_or(error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                })?
+        };
+        let expired = identity::is_expired(cert_not_after, now_secs);
+        let trust_decision = Some(
+            owner_trust
+                .evaluate_pair(
+                    contact_store,
+                    identity_discovery_cache,
+                    revocation_set,
+                    agent_id,
+                    &machine_id,
+                )
+                .await
+                .decision,
+        );
+        let (revoked_agent, revoked_machine, resync_required) = {
+            let revoked = revocation_set.read().await;
+            (
+                revoked.is_agent_revoked(agent_id),
+                revoked.is_machine_revoked(&machine_id),
+                revoked.revocation_resync_required(),
+            )
+        };
+        if resync_required {
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
+        streams::stream_gate(
+            agent_id,
+            trust_decision,
+            revoked_agent,
+            revoked_machine,
+            expired,
+        )?;
+        let pairing = {
+            let revoked = revocation_set.read().await;
+            let placements = move_state.read().await;
+            key_move::enforce_pairing(&revoked, placements.placement_view(), agent_id, &machine_id)
+        };
+        if pairing.is_some() {
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
+        Ok(machine_id)
+    }
+
     /// Inbound gate for connection-borne traffic from a
     /// transport-authenticated machine — the accept-loop posture, shared
     /// by inbound byte-streams and the datagram lane
@@ -18931,6 +19053,36 @@ impl Agent {
             owner_trust,
             machine_id,
             None,
+        )
+        .await
+    }
+
+    /// [`Self::gate_peer_machine_inbound`] with cert expiry and grant
+    /// validity evaluated at `now_secs` (ADR-0074 §4 re-check).
+    pub(crate) async fn gate_peer_machine_inbound_at(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        now_secs: u64,
+    ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        #![allow(clippy::too_many_arguments)]
+        Self::gate_peer_machine_inbound_for_evidence(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            None,
+            false,
+            now_secs,
         )
         .await
     }
@@ -18973,6 +19125,7 @@ impl Agent {
             machine_id,
             call_caller,
             false,
+            Self::unix_timestamp_secs(),
         )
         .await
     }
@@ -18992,6 +19145,7 @@ impl Agent {
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
         evidence_only: bool,
+        now_secs: u64,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
@@ -19019,7 +19173,6 @@ impl Agent {
                 agent_id: machine_id.0,
             });
         }
-        let now_secs = Self::unix_timestamp_secs();
         // Review r2 H5: pairing denials are PER-AGENT exclusions, not
         // machine denials. Identity-level gates (revocation/expiry/trust,
         // #192) still deny the machine; but a DEAD PAIRING (moved-away
@@ -19050,12 +19203,13 @@ impl Agent {
                 owner_trusted.push(*agent_id);
             }
             let access = owner_trust
-                .grant_access(
+                .grant_access_at(
                     contact_store,
                     discovery_cache,
                     revocation_set,
                     agent_id,
                     machine_id,
+                    now_secs,
                 )
                 .await;
             let has_connect_grant = !access.connect_ports.is_empty();
@@ -19329,11 +19483,7 @@ impl Agent {
     /// The daemon calls this once at startup with the loaded policy; library
     /// embedders that want ACL-gated streams do the same.
     pub fn set_connect_policy(&self, policy: std::sync::Arc<connect::ConnectPolicy>) {
-        let mut guard = self
-            .connect_policy
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = policy;
+        install_connect_policy(&self.connect_policy, &self.stream_reauth, policy);
     }
 
     /// The currently installed connect ACL policy (defaults to
@@ -19345,6 +19495,20 @@ impl Agent {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::sync::Arc::clone(&guard)
+    }
+
+    /// Hot-swappable connect-policy holder (ADR-0074 §4 reauth loop).
+    #[must_use]
+    pub(crate) fn connect_policy_holder(
+        &self,
+    ) -> std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>> {
+        std::sync::Arc::clone(&self.connect_policy)
+    }
+
+    /// Wake signal for the forward open-stream reauth loop (ADR-0074 §4).
+    #[must_use]
+    pub(crate) fn stream_reauth_signal(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.stream_reauth)
     }
 
     /// #1040 pre-prefix check: whether an inbound stream from `machine_id`
@@ -19468,6 +19632,7 @@ impl Agent {
                         machine_id,
                         None,
                         true,
+                        Self::unix_timestamp_secs(),
                     )
                     .await
                     .ok()?;
@@ -19589,6 +19754,7 @@ impl Agent {
                         &machine_id,
                         None,
                         true,
+                        Self::unix_timestamp_secs(),
                     )
                     .await
                     .is_err())
@@ -21734,9 +21900,13 @@ impl AgentBuilder {
         // listener can enforce revocation on inbound relayed envelopes. The
         // same Arc is moved into the Agent below, so the listener and the
         // Agent's `/identity/revoke` writes observe one shared set.
-        let revocation_set = std::sync::Arc::new(tokio::sync::RwLock::new(
-            storage::load_revocation_set(self.identity_dir.as_deref()).await,
-        ));
+        // ADR-0074 §4: one Notify shared by every authority-change hook and
+        // the forward reauth loop.
+        let stream_reauth = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut revocation_loaded =
+            storage::load_revocation_set(self.identity_dir.as_deref()).await;
+        revocation_loaded.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+        let revocation_set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation_loaded));
 
         // ADR-0043: load-or-generate this machine's ML-KEM-768 enrollment
         // key (beside the machine key) and load the derived move state
@@ -21852,6 +22022,8 @@ impl AgentBuilder {
                 );
             }
         }
+        let mut move_state = move_state;
+        move_state.set_change_notify(std::sync::Arc::clone(&stream_reauth));
         let move_state = std::sync::Arc::new(tokio::sync::RwLock::new(move_state));
         let move_state_load_failed =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(move_logs_corrupt));
@@ -21865,9 +22037,9 @@ impl AgentBuilder {
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("contacts.json")
         });
-        let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
-            contacts::ContactStore::new(contacts_path),
-        ));
+        let mut contact_store_inner = contacts::ContactStore::new(contacts_path);
+        contact_store_inner.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+        let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(contact_store_inner));
         // ADR 0115 D214: quarantine pre-upgrade issuer
         // revocations and bundle tombstones before anything reads them.
         let revocation_quarantine = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -22057,6 +22229,7 @@ impl AgentBuilder {
             move_state,
             move_state_load_failed,
             move_ceremony_enabled: self.move_ceremony_enabled,
+            stream_reauth,
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),

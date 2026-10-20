@@ -224,6 +224,38 @@ pub struct ContactStore {
     revoked_keys: HashSet<[u8; 32]>,
     revocations: Vec<RevocationRecord>,
     storage_path: PathBuf,
+    /// ADR-0074 §4: woken on every persisted change so live tailnet streams
+    /// are re-checked promptly after a trust change. `None` wakes nothing.
+    change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+/// Mutable handle to one contact ([`ContactStore::get_mut`]). Signals the
+/// store's change notifier when dropped.
+#[derive(Debug)]
+pub struct ContactMut<'a> {
+    contact: &'a mut Contact,
+    notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+impl std::ops::Deref for ContactMut<'_> {
+    type Target = Contact;
+    fn deref(&self) -> &Contact {
+        self.contact
+    }
+}
+
+impl std::ops::DerefMut for ContactMut<'_> {
+    fn deref_mut(&mut self) -> &mut Contact {
+        self.contact
+    }
+}
+
+impl Drop for ContactMut<'_> {
+    fn drop(&mut self) {
+        if let Some(notify) = &self.notify {
+            notify.notify_one();
+        }
+    }
 }
 
 /// Serializable format for the contacts file.
@@ -252,6 +284,7 @@ impl ContactStore {
             revoked_keys: HashSet::new(),
             revocations: Vec::new(),
             storage_path,
+            change_notify: None,
         };
         // Best-effort load from disk
         let _ = store.load();
@@ -373,8 +406,19 @@ impl ContactStore {
     }
 
     /// Get a mutable reference to a contact by agent ID.
-    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<&mut Contact> {
-        self.contacts.get_mut(&agent_id.0)
+    /// The handle derefs to [`Contact`]. Dropping it signals a change
+    /// (ADR-0074 §4) so open streams re-check without waiting for `save`.
+    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
+        let notify = self.change_notify.clone();
+        self.contacts
+            .get_mut(&agent_id.0)
+            .map(|contact| ContactMut { contact, notify })
+    }
+
+    /// Wake `notify` on every future change to the store (ADR-0074 §4
+    /// open-stream re-check). Replaces any previously installed notifier.
+    pub fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        self.change_notify = Some(notify);
     }
 
     /// List all contacts.
@@ -550,6 +594,9 @@ impl ContactStore {
 
     /// Persist contacts and revocations to disk.
     fn save(&self) -> std::io::Result<()> {
+        if let Some(notify) = &self.change_notify {
+            notify.notify_one();
+        }
         let file = ContactsFile {
             contacts: self.contacts.values().cloned().collect(),
             revocations: self.revocations.clone(),

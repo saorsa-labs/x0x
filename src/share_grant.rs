@@ -977,6 +977,9 @@ pub struct GrantAccess {
     /// `Connect`: `principal = "grant"` connect entries may match for these
     /// target ports.
     pub connect_ports: BTreeSet<u16>,
+    /// Ids of the ShareGrants that contributed a `Connect` capability
+    /// (ADR-0074 §4 authority label for live forward streams).
+    pub connect_grant_ids: BTreeSet<[u8; 32]>,
     /// `GroupInvite`: groups may be seeded without a contact entry.
     pub group_invite: bool,
     /// `Call` (ADR-0073): the inbound call gate admits the caller (#980).
@@ -1146,7 +1149,14 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             }),
         };
         if grantee_matches {
+            let conferred_connect = grant
+                .caps
+                .iter()
+                .any(|cap| matches!(cap, ShareCap::Connect { .. }));
             access.absorb(&grant.caps);
+            if conferred_connect {
+                access.connect_grant_ids.insert(grant.grant_id);
+            }
         }
     }
     access

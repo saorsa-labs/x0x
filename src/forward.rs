@@ -56,6 +56,8 @@ use crate::identity::{AgentId, AgentKeypair, MachineId};
 use crate::streams::{PeerStream, StreamProtocol};
 use crate::trust::TrustDecision;
 
+pub mod teardown;
+
 // Import the ant-quic stream halves under stable names for the bridge helper,
 // plus the ML-DSA-65 sign/verify primitives for ForwardV2 attestation.
 use crate::network::{StreamRecv as HighLevelRecvStream, StreamSend as HighLevelSendStream};
@@ -459,7 +461,7 @@ fn decide_inbound(
 
 /// Verification context bundled to keep `decide_inbound_attested` arg-count
 /// under the clippy threshold (#204).
-struct AttestationVerifyCtx {
+pub(crate) struct AttestationVerifyCtx {
     discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
     >,
@@ -496,12 +498,13 @@ struct AttestationVerifyCtx {
 /// Fail-closed on: agent not in cache, no cached key, wrong machine,
 /// recipient mismatch, stale/future timestamp, signature failure, trust
 /// rejection, or ACL denial.
-async fn decide_inbound_attested(
+/// Also returns the authority the stream is admitted under (ADR-0074 §4).
+async fn decide_inbound_attested_with_authority(
     header: &ForwardV2Header,
     policy: &ConnectPolicy,
     peer_machine: &MachineId,
     ctx: &AttestationVerifyCtx,
-) -> Result<SocketAddr, ConnectDenialReason> {
+) -> Result<(SocketAddr, teardown::StreamAuthority), ConnectDenialReason> {
     // Resolve the target first (same as V1 — a non-loopback target is
     // refused before the attestation check, so an unverified peer learns
     // nothing about which agents exist).
@@ -628,6 +631,90 @@ async fn decide_inbound_attested(
         }
     }
 
+    // The opener is now cryptographically authenticated: authorize that
+    // specific agent against current authority. The same check re-runs on
+    // every live stream (ADR-0074 §4, `teardown`).
+    let authority =
+        authorize_attested_opener(&header.opener_agent_id, peer_machine, &target, policy, ctx)
+            .await
+            .map_err(AuthzDenial::connect_reason)?;
+    Ok((target, authority))
+}
+
+/// [`decide_inbound_attested_with_authority`] without the authority (the
+/// gate-matrix tests compare the admitted target only).
+#[cfg(test)]
+async fn decide_inbound_attested(
+    header: &ForwardV2Header,
+    policy: &ConnectPolicy,
+    peer_machine: &MachineId,
+    ctx: &AttestationVerifyCtx,
+) -> Result<SocketAddr, ConnectDenialReason> {
+    decide_inbound_attested_with_authority(header, policy, peer_machine, ctx)
+        .await
+        .map(|(target, _)| target)
+}
+
+/// Why [`authorize_attested_opener`] refused (internal). Maps onto the wire
+/// [`ConnectDenialReason`] exactly as the pre-split gate did, and onto a
+/// finer teardown reason for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthzDenial {
+    /// The connect gate refused.
+    Gate(ConnectDenialReason),
+    /// The opener is absent from the discovery cache.
+    AgentUnknown,
+    /// The opener's cached machine is not the transport peer.
+    AgentNotOnMachine,
+    /// The opener or its machine is revoked.
+    Revoked,
+    /// The opener's certificate has expired.
+    CertExpired,
+    /// The opener's trust decision is not `Accept`.
+    TrustRejected,
+    /// ADR-0043: the (agent, machine) pairing is retired.
+    PairingRetired,
+}
+
+impl AuthzDenial {
+    /// The typed denial frame the opener sees at admission.
+    fn connect_reason(self) -> ConnectDenialReason {
+        match self {
+            Self::Gate(reason) => reason,
+            Self::AgentNotOnMachine => ConnectDenialReason::AgentNotOnMachine,
+            Self::AgentUnknown
+            | Self::Revoked
+            | Self::CertExpired
+            | Self::TrustRejected
+            | Self::PairingRetired => ConnectDenialReason::AttestationFailed,
+        }
+    }
+}
+
+/// Authorization half of the attested (`ForwardV2`) inbound gate: every
+/// check that depends on current authority rather than on the header bytes.
+/// Admission runs it after the attestation checks; the ADR-0074 §4 re-check
+/// runs it again on every live stream, so a stream is kept exactly while a
+/// fresh admission would still pass.
+///
+/// Returns the authority the stream holds: the ACL entry kind that matched
+/// and, for a grant, the Connect grants covering the target port.
+pub(crate) async fn authorize_attested_opener(
+    opener: &AgentId,
+    peer_machine: &MachineId,
+    target: &SocketAddr,
+    policy: &ConnectPolicy,
+    ctx: &AttestationVerifyCtx,
+) -> Result<teardown::StreamAuthority, AuthzDenial> {
+    let agent = {
+        let cache = ctx.discovery_cache.read().await;
+        cache.get(opener).cloned()
+    }
+    .ok_or(AuthzDenial::AgentUnknown)?;
+    if agent.machine_id != *peer_machine {
+        return Err(AuthzDenial::AgentNotOnMachine);
+    }
+
     // ── Trust evaluation (#204 must-fix 3): evaluate the attested agent's
     // real trust — NOT a hard-coded Accept. A Blocked-but-announced agent
     // must be denied here (same pattern as the stream gate).
@@ -639,7 +726,7 @@ async fn decide_inbound_attested(
             &ctx.contact_store,
             &ctx.discovery_cache,
             &ctx.revocation_set,
-            &header.opener_agent_id,
+            opener,
             peer_machine,
         )
         .await;
@@ -647,31 +734,32 @@ async fn decide_inbound_attested(
     // ADR-0070 §2: a current ShareGrant whose Connect ports cover THIS
     // target lets a `principal = "grant"` entry match, and raises the trust
     // decision for this target only. Blocked/pin mismatch get no grant.
-    let grant_port_allowed = ctx
+    let access = ctx
         .owner_trust
-        .grant_access(
+        .grant_access_at(
             &ctx.contact_store,
             &ctx.discovery_cache,
             &ctx.revocation_set,
-            &header.opener_agent_id,
+            opener,
             peer_machine,
+            ctx.now_ms / 1000,
         )
-        .await
-        .allows_connect_port(target.port());
+        .await;
+    let grant_port_allowed = access.allows_connect_port(target.port());
     let decision = pair.decision.with_owner_trust(grant_port_allowed);
 
-    // The opener is now cryptographically authenticated: ACL-check that
-    // specific agent with its REAL trust decision.
+    // ACL-check that specific agent with its REAL trust decision.
     evaluate_connect_gate_for_principals(
         /* verified */ true,
         Some(decision),
         policy,
-        &header.opener_agent_id,
+        opener,
         peer_machine,
         pair.owner_trusted,
         grant_port_allowed,
-        &target,
-    )?;
+        target,
+    )
+    .map_err(AuthzDenial::Gate)?;
 
     // The machine-level gate may have excluded a moved-away co-resident
     // while accepting a live agent on the same machine. Authenticate the
@@ -679,36 +767,35 @@ async fn decide_inbound_attested(
     // and a stale discovery binding must not resurrect that dead pairing.
     // Snapshot only this placement, then release its lock before reading
     // revocation state; no shared locks are held across another lock await.
-    let placement = ctx
-        .move_state
-        .read()
-        .await
-        .placement(&header.opener_agent_id)
-        .cloned();
+    let placement = ctx.move_state.read().await.placement(opener).cloned();
     let placements = placement
-        .map(|record| std::collections::HashMap::from([(header.opener_agent_id, record)]))
+        .map(|record| std::collections::HashMap::from([(*opener, record)]))
         .unwrap_or_default();
     let revoked = ctx.revocation_set.read().await;
     crate::streams::stream_gate(
-        &header.opener_agent_id,
+        opener,
         Some(decision),
-        revoked.is_agent_revoked(&header.opener_agent_id),
+        revoked.is_agent_revoked(opener),
         revoked.is_machine_revoked(peer_machine),
         crate::identity::is_expired(agent.cert_not_after, ctx.now_ms / 1000),
     )
-    .map_err(|_| ConnectDenialReason::AttestationFailed)?;
-    if crate::key_move::enforce_pairing(
-        &revoked,
-        &placements,
-        &header.opener_agent_id,
-        peer_machine,
-    )
-    .is_some()
-    {
-        return Err(ConnectDenialReason::AttestationFailed);
+    .map_err(|e| match e {
+        NetworkError::PeerRevoked { .. } => AuthzDenial::Revoked,
+        NetworkError::PeerNotVerified { .. } => AuthzDenial::CertExpired,
+        _ => AuthzDenial::TrustRejected,
+    })?;
+    if crate::key_move::enforce_pairing(&revoked, &placements, opener, peer_machine).is_some() {
+        return Err(AuthzDenial::PairingRetired);
     }
 
-    Ok(target)
+    Ok(teardown::StreamAuthority::classify(
+        policy,
+        opener,
+        peer_machine,
+        pair.owner_trusted,
+        target,
+        &access.connect_grant_ids,
+    ))
 }
 
 /// Forwarder-owned diagnostics beyond the connect ACL's allow/deny counters
@@ -730,6 +817,10 @@ pub struct ForwardDiagnostics {
     /// Streams reset because the forward header did not arrive within
     /// `HEADER_READ_TIMEOUT` (FIX 2).
     header_timeout: AtomicU64,
+    /// Live streams torn down because their authority is gone (ADR-0074 §4).
+    torn_down_reauth: AtomicU64,
+    /// `torn_down_reauth` broken down by reason.
+    torn_down_reasons: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>,
 }
 
 impl ForwardDiagnostics {
@@ -756,6 +847,31 @@ impl ForwardDiagnostics {
     /// Record a header-read timeout (FIX 2).
     pub fn record_header_timeout(&self) {
         self.header_timeout.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a live stream torn down for `reason` (ADR-0074 §4).
+    pub fn record_torn_down(&self, reason: &'static str) {
+        self.torn_down_reauth.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self
+            .torn_down_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reasons.entry(reason).or_insert(0) += 1;
+    }
+    /// Live streams torn down because their authority is gone.
+    #[must_use]
+    pub fn torn_down_reauth(&self) -> u64 {
+        self.torn_down_reauth.load(Ordering::Relaxed)
+    }
+    /// `torn_down_reauth` by reason (`revoked`, `trust_rejected`,
+    /// `target_not_allowed`, ...).
+    #[must_use]
+    pub fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
+        self.torn_down_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(k, count)| ((*k).to_string(), *count))
+            .collect()
     }
     /// Current connect-failure count.
     #[must_use]
@@ -802,6 +918,9 @@ pub(crate) struct InboundCtx {
     pub require_attestation: bool,
     /// ADR-0070 §1 owner trust for the attested (`ForwardV2`) gate.
     pub owner_trust: crate::owner_trust::OwnerTrust,
+    /// ADR-0074 §4 registry of live forward streams (re-checked on every
+    /// authority change; see [`teardown`]).
+    pub live: Arc<teardown::LiveStreams>,
 }
 
 /// Drive the inbound half of a forward: read the header, run the connect
@@ -875,7 +994,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
     // cached agent key, confirm machine binding, ACL-check the single
     // authenticated agent (#204). ForwardV1: legacy multi-agent fail-closed
     // (#192), kept for backward compatibility with pre-#204 peers.
-    let target = match stream.protocol() {
+    let (target, gate, authority) = match stream.protocol() {
         StreamProtocol::ForwardV2 => {
             // FIX 2: bound the header read (larger budget for the ~3.3 KB
             // ML-DSA-65 signature). Reset + count on timeout.
@@ -916,8 +1035,23 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                 move_state: Arc::clone(&ctx.move_state),
                 owner_trust: ctx.owner_trust.clone(),
             };
-            match decide_inbound_attested(&header, &ctx.policy, &machine_id, &verify_ctx).await {
-                Ok(addr) => addr,
+            match decide_inbound_attested_with_authority(
+                &header,
+                &ctx.policy,
+                &machine_id,
+                &verify_ctx,
+            )
+            .await
+            {
+                Ok((addr, authority)) => (
+                    addr,
+                    teardown::StreamGate::InboundAttested {
+                        opener: header.opener_agent_id,
+                        machine: machine_id,
+                        target: addr,
+                    },
+                    authority,
+                ),
                 Err(reason) => {
                     ctx.connect_diag.record_denied(reason);
                     send_denial(&mut stream, reason).await;
@@ -976,7 +1110,14 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                     }
                 };
             match decide_inbound(&header, &ctx.policy, &agents, &machine_id) {
-                Ok(addr) => addr,
+                Ok(addr) => (
+                    addr,
+                    teardown::StreamGate::InboundLegacy {
+                        machine: machine_id,
+                        target: addr,
+                    },
+                    teardown::StreamAuthority::AclEntry,
+                ),
                 Err(reason) => {
                     ctx.connect_diag.record_denied(reason);
                     send_denial(&mut stream, reason).await;
@@ -1041,8 +1182,12 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
     {
         return;
     }
+    // ADR-0074 §4: register the bridged stream with the gate inputs and the
+    // authority it was admitted under, so a revocation, trust drop, grant
+    // expiry or ACL reload can tear it down while it is still open.
+    let live = ctx.live.register(gate, authority);
     let (send, recv) = stream.into_split();
-    bridge(local, send, recv).await;
+    bridge(local, send, recv, live.token()).await;
 }
 
 /// RAII guard that decrements the active-stream counter when a forward task ends.
@@ -1080,24 +1225,26 @@ async fn send_denial(stream: &mut PeerStream, reason: ConnectDenialReason) {
 /// flowing. On a copy error the writer is left unfinished, so dropping the
 /// QUIC send stream resets it and the truncation surfaces as an error rather
 /// than a well-formed but short stream.
-async fn bridge(tcp: TcpStream, mut send: HighLevelSendStream, mut recv: HighLevelRecvStream) {
-    use tokio::io::AsyncWriteExt;
-    // Split the TCP socket into owned read/write halves so the two copy tasks
-    // can run concurrently without overlapping mutable borrows.
+async fn bridge(
+    tcp: TcpStream,
+    mut send: HighLevelSendStream,
+    mut recv: HighLevelRecvStream,
+    cancel: &CancellationToken,
+) {
+    // #961: split the TCP so each direction can half-close independently.
+    // When the local client is done writing, we finish the QUIC send half
+    // (FIN) without resetting the stream — the peer can still drain its
+    // response. A full reset only happens on error or reauth teardown.
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let to_stream = async {
-        if tokio::io::copy(&mut tcp_read, &mut send).await.is_ok() {
-            // `SendStream::poll_shutdown` is `finish()`: queues a FIN; the
-            // connection retransmits buffered data even after drop.
-            let _ = send.shutdown().await;
-        }
-    };
-    let from_stream = async {
-        if tokio::io::copy(&mut recv, &mut tcp_write).await.is_ok() {
-            let _ = tcp_write.shutdown().await;
-        }
-    };
-    tokio::join!(to_stream, from_stream);
+    // ADR-0074 §4: `cancel` fires when the stream's authority is gone. Both
+    // halves reset (QUIC code 0x5244 "RD", TCP with linger 0 / RST) so
+    // neither end keeps a half-open zombie.
+    let torn_down =
+        teardown::bridge_io(&mut tcp_read, &mut tcp_write, &mut recv, &mut send, cancel).await;
+    if torn_down {
+        teardown::reset_quic(&mut send, &mut recv);
+        teardown::reset_tcp(&tcp_write);
+    }
 }
 
 /// Read a length-prefixed `ForwardHeader` from an async reader.
@@ -1278,6 +1425,10 @@ pub struct ForwardService {
     /// (#204 must-fix 1). Set `[forward] require_attestation = false` in the
     /// daemon TOML to allow V1 for mixed-version deployments.
     require_attestation: bool,
+    /// ADR-0074 §4: live bridged streams, re-checked when authority changes.
+    live: Arc<teardown::LiveStreams>,
+    /// Ensures the reauth loop is spawned once.
+    reauth_started: std::sync::atomic::AtomicBool,
 }
 
 /// RAII per-peer slot: decrements the per-peer counter (and prunes the entry
@@ -1381,10 +1532,12 @@ impl ForwardService {
         // The agent owns the effective (hot-swappable) connect policy; the
         // forwarder reads it per stream rather than pinning a copy.
         agent.set_connect_policy(policy);
+        let fwd_diag = Arc::new(ForwardDiagnostics::default());
         Ok(Self {
             agent,
             connect_diag,
-            fwd_diag: Arc::new(ForwardDiagnostics::default()),
+            live: Arc::new(teardown::LiveStreams::new(Arc::clone(&fwd_diag))),
+            fwd_diag,
             forwards: std::sync::Mutex::new(Vec::new()),
             inbound_token: CancellationToken::new(),
             inbound_acceptors: std::sync::Mutex::new(Some((acceptor_v1, acceptor_v2))),
@@ -1396,6 +1549,7 @@ impl ForwardService {
             discovery_cache,
             contact_store,
             require_attestation,
+            reauth_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1424,6 +1578,7 @@ impl ForwardService {
     /// the acceptors already moved into their loops and returns without
     /// spawning duplicates. Returns immediately.
     pub fn spawn_inbound(self: &Arc<Self>) {
+        self.ensure_reauth_loop();
         let acceptors = self
             .inbound_acceptors
             .lock()
@@ -1438,6 +1593,29 @@ impl ForwardService {
         };
         self.spawn_acceptor_loop(acceptor_v1);
         self.spawn_acceptor_loop(acceptor_v2);
+    }
+
+    fn ensure_reauth_loop(&self) {
+        if self.reauth_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let ctx = teardown::ReauthCtx {
+            discovery_cache: Arc::clone(&self.discovery_cache),
+            contact_store: Arc::clone(&self.contact_store),
+            revocation_set: Arc::clone(&self.revocation_set),
+            move_state: Arc::clone(&self.move_state),
+            connect_policy: self.agent.connect_policy_holder(),
+            owner_trust: self.agent.owner_trust().clone(),
+            own_machine_id: self.agent.machine_id(),
+            clock: teardown::system_clock(),
+        };
+        teardown::spawn_reauth_loop(
+            Arc::clone(&self.live),
+            ctx,
+            self.agent.stream_reauth_signal(),
+            self.inbound_token.clone(),
+            Some(teardown::REAUTH_SWEEP_INTERVAL),
+        );
     }
 
     /// Drain one protocol acceptor until shutdown or accept-loop stop,
@@ -1511,6 +1689,7 @@ impl ForwardService {
                 own_machine_id: this.agent.machine_id(),
                 require_attestation: this.require_attestation,
                 owner_trust: this.agent.owner_trust().clone(),
+                live: Arc::clone(&this.live),
             };
             handle_inbound(stream, &inbound_ctx).await;
         });
@@ -1522,6 +1701,7 @@ impl ForwardService {
     /// # Errors
     /// `NetworkError` if the local listener cannot be bound.
     pub async fn add_forward(&self, spec: ForwardSpec) -> NetworkResult<SocketAddr> {
+        self.ensure_reauth_loop();
         let listener = TcpListener::bind(spec.local_addr).await.map_err(|e| {
             NetworkError::ConnectionFailed(format!("bind {}: {e}", spec.local_addr))
         })?;
@@ -1549,6 +1729,7 @@ impl ForwardService {
         let target_host = spec.target_host;
         let target_port = spec.target_port;
         let require_attestation = self.require_attestation;
+        let live = Arc::clone(&self.live);
         tokio::spawn(async move {
             tracing::info!(
                 target: "x0x::forward",
@@ -1589,6 +1770,7 @@ impl ForwardService {
                 };
                 let agent = Arc::clone(&agent);
                 let fwd_diag = Arc::clone(&fwd_diag);
+                let live = Arc::clone(&live);
                 let target_host = target_host.clone();
                 tokio::spawn(async move {
                     let _admission = admission;
@@ -1601,6 +1783,7 @@ impl ForwardService {
                         target_port,
                         tcp,
                         require_attestation,
+                        &live,
                     )
                     .await;
                 });
@@ -1660,12 +1843,13 @@ async fn drive_outbound(
     target_port: u16,
     tcp: TcpStream,
     require_attestation: bool,
+    live: &Arc<teardown::LiveStreams>,
 ) {
     // Try ForwardV2 (attestation). On peer rejection (old software), fall
     // back to ForwardV1 — but ONLY when require_attestation is false. When
     // true (the default) there is no fallback: a peer that cannot handle V2
     // simply cannot forward (#204 must-fix 1).
-    match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp).await {
+    match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp, live).await {
         OutboundOutcome::Done => (),
         OutboundOutcome::PeerRejectedV2(tcp) => {
             if require_attestation {
@@ -1680,7 +1864,7 @@ async fn drive_outbound(
                     peer = %hex::encode(peer_agent.as_bytes()),
                     "outbound forward: peer does not support ForwardV2 — falling back to V1"
                 );
-                drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp).await;
+                drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp, live).await;
             }
         }
     }
@@ -1704,6 +1888,7 @@ async fn try_outbound_v2(
     target_host: &str,
     target_port: u16,
     tcp: TcpStream,
+    live: &Arc<teardown::LiveStreams>,
 ) -> OutboundOutcome {
     let mut stream = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
@@ -1773,7 +1958,7 @@ async fn try_outbound_v2(
         );
         return OutboundOutcome::Done;
     }
-    finish_outbound(stream, resp, peer_agent, tcp).await;
+    finish_outbound(stream, resp, peer_agent, tcp, live).await;
     OutboundOutcome::Done
 }
 
@@ -1785,6 +1970,7 @@ async fn drive_outbound_v1(
     target_host: &str,
     target_port: u16,
     tcp: TcpStream,
+    live: &Arc<teardown::LiveStreams>,
 ) {
     let mut stream = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV1)
@@ -1818,15 +2004,32 @@ async fn drive_outbound_v1(
         );
         return;
     }
-    finish_outbound(stream, resp, peer_agent, tcp).await;
+    finish_outbound(stream, resp, peer_agent, tcp, live).await;
 }
 
 /// Shared tail: interpret the connect-response byte and bridge on `connected`.
-async fn finish_outbound(stream: PeerStream, resp: [u8; 1], peer_agent: &AgentId, tcp: TcpStream) {
+///
+/// ADR-0074 §4 ("both ends enforce"): a connected stream is registered with
+/// the peer trust it was opened under, so the opener also tears it down
+/// once the peer is revoked, blocked or no longer trusted.
+async fn finish_outbound(
+    stream: PeerStream,
+    resp: [u8; 1],
+    peer_agent: &AgentId,
+    tcp: TcpStream,
+    live: &Arc<teardown::LiveStreams>,
+) {
     match response_connected(resp[0]) {
         Some(true) => {
+            let guard = live.register(
+                teardown::StreamGate::Outbound {
+                    peer_agent: *peer_agent,
+                    machine: stream.peer(),
+                },
+                teardown::StreamAuthority::PeerTrust,
+            );
             let (send, recv) = stream.into_split();
-            bridge(tcp, send, recv).await;
+            bridge(tcp, send, recv, guard.token()).await;
         }
         Some(false) => {
             tracing::info!(
