@@ -1666,6 +1666,9 @@ mod tests {
         mut scenario: restart::systemd_readback_seam::Scenario,
         runtime: &StartupUpdateCheckRuntime,
     ) -> restart::systemd_readback_seam::Scenario {
+        // These fixtures isolate start-rate behavior on an untracked unit.
+        // Fleet controls explicitly replace this cgroup after this helper.
+        scenario.cgroup = "0::/system.slice/x0x-staging-test.service".to_string();
         #[cfg(unix)]
         {
             let current = crate::upgrade::apply::current_binary_path().unwrap();
@@ -1756,6 +1759,12 @@ mod tests {
                 cgroup: "0::/system.slice/x0xd.service".to_string(),
                 invocation_id: Some(SEAM_INVOCATION_ID.to_string()),
                 calls: vec![
+                    // Staging identity and the first apply each observe the
+                    // same still-pending activation; only the retry ages out.
+                    restart::systemd_readback_seam::ReadbackCall {
+                        show_output: show_for_this_process("10s", "5", 1_000_000),
+                        monotonic_now_us: 3_000_000,
+                    },
                     restart::systemd_readback_seam::ReadbackCall {
                         show_output: show_for_this_process("10s", "5", 1_000_000),
                         monotonic_now_us: 3_000_000,

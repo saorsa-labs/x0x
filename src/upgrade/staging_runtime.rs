@@ -1,7 +1,7 @@
 //! Private admission adapter. Receipt I/O runs under the canonical install lock.
 #![cfg(unix)]
 
-use super::{journal, probe, staging, UpgradeError};
+use super::{fleet_policy, journal, probe, restart, staging, UpgradeError};
 use std::{path::Path, time::Duration};
 
 #[cfg(test)]
@@ -29,21 +29,48 @@ impl Gate {
     }
 
     /// The caller holds the actual install lock; no lock is acquired here.
-    pub fn observe_locked(&self, install: &Path) -> Result<staging::Decision, UpgradeError> {
-        let clock = self
-            .clock()
-            .map_err(|error| UpgradeError::Other(error.to_string()))?;
-        self.observe_locked_at(install, &clock)
-    }
-
     pub fn observe_locked_at(
         &self,
         install: &Path,
         clock: &probe::ProbeClock,
+        identity: &restart::StagingIdentity,
+    ) -> Result<staging::Decision, UpgradeError> {
+        self.check_data_root(&identity.data_root)?;
+        let policy =
+            fleet_policy::effective_staging_window(self.request.window_minutes, install, identity)
+                .map_err(|error| UpgradeError::Other(error.to_string()))?;
+        self.observe_with_policy(install, clock, policy)
+    }
+
+    fn check_data_root(&self, data_root: &Path) -> Result<(), UpgradeError> {
+        if std::fs::canonicalize(data_root)
+            .map_err(|error| UpgradeError::Other(error.to_string()))?
+            != self.request.data_root
+        {
+            return Err(UpgradeError::Other("staging data root changed".into()));
+        }
+        Ok(())
+    }
+
+    fn observe_with_policy(
+        &self,
+        install: &Path,
+        clock: &probe::ProbeClock,
+        policy: fleet_policy::WindowPolicy,
     ) -> Result<staging::Decision, UpgradeError> {
         let error = |error: std::io::Error| UpgradeError::Other(error.to_string());
         if std::fs::canonicalize(install).map_err(error)? != self.request.install {
             return Err(UpgradeError::Other("staging install changed".into()));
+        }
+        let mut request = self.request.clone();
+        request.window_minutes = policy.window_minutes;
+        // This read MUST precede observe: observing even a due receipt writes
+        // an acknowledged clock tick. Preserve an older undersized receipt
+        // byte-for-byte instead of resetting its first-receipt history.
+        if let Some(receipt) = staging::read_receipt(&request).map_err(error)? {
+            policy
+                .check_receipt_window(receipt.window_minutes)
+                .map_err(error)?;
         }
         if journal::read_boot_records(&self.request.data_root).blocks_apply() {
             return Err(UpgradeError::Other(
@@ -74,7 +101,7 @@ impl Gate {
             probe::Admission::Ready => Duration::ZERO,
             probe::Admission::Waiting { retry_after } => retry_after,
         };
-        let decision = staging::observe(&self.request, clock).map_err(error)?;
+        let decision = staging::observe(&request, clock).map_err(error)?;
         let remaining = match decision {
             staging::Decision::Due => retry,
             staging::Decision::Waiting(wait) => wait.max(retry),
@@ -86,8 +113,18 @@ impl Gate {
         })
     }
 
-    pub fn require_due(&self, install: &Path) -> Result<(), UpgradeError> {
-        match self.observe_locked(install)? {
+    pub fn require_due(
+        &self,
+        install: &Path,
+        plan: &restart::RestartPlan,
+    ) -> Result<(), UpgradeError> {
+        self.check_data_root(&plan.data_root)?;
+        let policy = fleet_policy::effective_window(self.request.window_minutes, install, plan)
+            .map_err(|error| UpgradeError::Other(error.to_string()))?;
+        let clock = self
+            .clock()
+            .map_err(|error| UpgradeError::Other(error.to_string()))?;
+        match self.observe_with_policy(install, &clock, policy)? {
             staging::Decision::Due => Ok(()),
             staging::Decision::Waiting(wait) => Err(UpgradeError::Other(format!(
                 "staging is not due; remaining {} seconds",

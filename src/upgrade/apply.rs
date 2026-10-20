@@ -444,6 +444,17 @@ impl AutoApplyUpgrader {
             if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
             }
+            // Resolve actual service identity before the first receipt. A
+            // pending restart rate window does not erase a verified fleet
+            // binding, but it still refuses the later full apply plan.
+            let identity = tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Err(UpgradeError::Other("staging cancelled by shutdown".into())),
+                result = restart::resolve_staging_identity(
+                    self.stop_on_upgrade, &gate.request.install,
+                    self.restart_context.data_dir.as_deref(), self.restart_context.api_addr,
+                ) => result.map_err(UpgradeError::from)?,
+            };
             let gate = gate.clone();
             let worker_shutdown = shutdown.clone();
             let worker = run_owned_blocking(move |worker_alive| {
@@ -462,7 +473,7 @@ impl AutoApplyUpgrader {
                 let clock = gate
                     .clock()
                     .map_err(|error| UpgradeError::Other(error.to_string()))?;
-                gate.observe_locked_at(&gate.request.install, &clock)
+                gate.observe_locked_at(&gate.request.install, &clock, &identity)
             });
             let decision = tokio::select! {
                 biased;
@@ -693,14 +704,6 @@ impl AutoApplyUpgrader {
             UpgradeError::Other(format!("upgrade record barrier unavailable: {error}"))
         })?;
         #[cfg(unix)]
-        if let super::probe::Admission::Waiting { retry_after } =
-            inspect_probe_admission(target_path.clone(), manifest.version.clone()).await?
-        {
-            return Err(UpgradeError::Other(
-                super::probe::ProbeRefusal::Waiting { retry_after }.to_string(),
-            ));
-        }
-        #[cfg(unix)]
         if let Some(gate) = &self.staging {
             super::monitor::validate_manifest_timestamp(manifest)?;
             if gate.request.version != manifest.version
@@ -715,6 +718,7 @@ impl AutoApplyUpgrader {
             }
             let gate = gate.clone();
             let install = target_path.clone();
+            let staging_plan = restart_plan.clone();
             run_owned_blocking(move |caller_alive| {
                 let _lock = super::acquire_host_upgrade_lock(&install)?;
                 if !caller_alive.load(Ordering::Acquire) {
@@ -722,9 +726,17 @@ impl AutoApplyUpgrader {
                         "staging admission cancelled before record I/O".into(),
                     ));
                 }
-                gate.require_due(&install)
+                gate.require_due(&install, &staging_plan)
             })
             .await?;
+        }
+        #[cfg(unix)]
+        if let super::probe::Admission::Waiting { retry_after } =
+            inspect_probe_admission(target_path.clone(), manifest.version.clone()).await?
+        {
+            return Err(UpgradeError::Other(
+                super::probe::ProbeRefusal::Waiting { retry_after }.to_string(),
+            ));
         }
         info!(
             mode = ?restart_plan.mode,
@@ -881,10 +893,11 @@ impl AutoApplyUpgrader {
                 launch: probe_launch,
             };
             let staging = self.staging.clone();
+            let staging_plan = restart_plan.clone();
             let admitted_manifest = manifest.clone();
             Some(Box::new(move |alive| {
                 if let Some(gate) = &staging {
-                    gate.require_due(&request.install)?;
+                    gate.require_due(&request.install, &staging_plan)?;
                 }
                 super::probe::run_before_swap(&request, alive)
                     .map(|_| ())

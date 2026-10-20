@@ -6,6 +6,8 @@
 //! support.
 
 pub mod apply;
+#[cfg(unix)]
+pub(crate) mod fleet_policy;
 pub(crate) mod journal;
 pub mod manifest;
 pub mod monitor;

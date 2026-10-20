@@ -52,8 +52,38 @@ pub(crate) fn effective_window(
     canonical_install: &Path,
     plan: &RestartPlan,
 ) -> io::Result<WindowPolicy> {
+    effective_window_for_binding(
+        configured_minutes,
+        canonical_install,
+        &plan.executable,
+        plan.systemd_verified.as_ref(),
+    )
+}
+
+/// Staging can identify a verified unit before its restart rate window ends.
+/// This identity is never a grant to restart or replace an installed binary.
+#[cfg(unix)]
+pub(crate) fn effective_staging_window(
+    configured_minutes: u64,
+    canonical_install: &Path,
+    identity: &super::restart::StagingIdentity,
+) -> io::Result<WindowPolicy> {
+    effective_window_for_binding(
+        configured_minutes,
+        canonical_install,
+        &identity.executable,
+        identity.systemd_verified.as_ref(),
+    )
+}
+
+fn effective_window_for_binding(
+    configured_minutes: u64,
+    canonical_install: &Path,
+    executable: &Path,
+    service: Option<&SystemdVerifiedUnit>,
+) -> io::Result<WindowPolicy> {
     if std::fs::canonicalize(canonical_install)? != canonical_install
-        || std::fs::canonicalize(&plan.executable)? != canonical_install
+        || std::fs::canonicalize(executable)? != canonical_install
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -66,16 +96,19 @@ pub(crate) fn effective_window(
     #[cfg(unix)]
     let authority = resolve_authority(authority)?;
 
-    let classification = classify(
-        canonical_install,
-        plan.systemd_verified.as_ref(),
-        &authority,
-    );
-    Ok(policy(
+    let classification = classify(canonical_install, service, &authority);
+    let window = policy(
         configured_minutes,
         classification,
         cfg!(all(feature = "upgrade-test-signing", debug_assertions)),
-    ))
+    );
+    tracing::debug!(
+        classification = ?window.classification,
+        configured_minutes,
+        effective_minutes = window.window_minutes,
+        "Resolved rollout fleet policy"
+    );
+    Ok(window)
 }
 
 #[cfg(unix)]
