@@ -1,0 +1,1393 @@
+//! ADR 0110 (slice S4 of ADR 0088): revocation eviction, designated first.
+//!
+//! This module holds the pure, I/O-free core of S4:
+//!
+//! - [`S4Timing`]: the measured timing values (W, completion bound, Δ and
+//!   the restart sync wait). The defaults are placeholders that wait for the
+//!   W3-H p99.9 numbers (D69, D73).
+//! - The obligation model (§1): one row per (stable group ID, target agent
+//!   ID), with the set of verified trigger hashes, the phase (§5) and the
+//!   typed waiting cause (D64).
+//! - [`RevocationIntake`]: the queue that the single post-verification hook
+//!   in `lib.rs` feeds after `verify_and_insert` returns `Ok(true)`.
+//!
+//! The daemon side (`x0xd`) owns scheduling, locks, persistence I/O and the
+//! commit path. This module never touches the network or the disk.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::identity::EXPIRY_CLOCK_SKEW_SECS;
+
+/// Expiry tolerance τ (D127): today's [`EXPIRY_CLOCK_SKEW_SECS`], so the
+/// eviction trigger and the D60 delivery refusal use one test.
+pub const EXPIRY_TOLERANCE_SECS: u64 = EXPIRY_CLOCK_SKEW_SECS;
+
+/// Completed rows drop their signed evidence bodies this long after
+/// verified completion (D128).
+pub const COMPLETED_EVIDENCE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// At most this many compact completed records are kept per group, oldest
+/// first out (D128).
+pub const MAX_COMPACT_RECORDS_PER_GROUP: usize = 4096;
+
+// ─── Timing (D69, D73) ─────────────────────────────────────────────────────
+
+/// Whether the [`S4Timing`] defaults are still the placeholders.
+///
+/// `true` until the lead replaces the defaults with the W3-H harness p99.9
+/// values (`s4_timing_measurement`) and David accepts them. The daemon logs
+/// this flag once at startup so an operator can see that the values are
+/// provisional.
+pub const S4_TIMING_PENDING_MEASUREMENT: bool = true;
+
+/// The S4 timing values. Every S4 budget reads them from here.
+///
+/// ADR 0110 §2: W and the completion bound come from the W3-H p99.9 of
+/// hand-off delivery-and-verification skew, plus fsync, CPU-stall and
+/// seal-and-propagation time, with margin. Δ is at least the measured
+/// p99.9 seal-and-head-propagation time. The restart sync wait is at least
+/// the measured p99.9 head catch-up.
+///
+/// **The defaults are PENDING MEASUREMENT** (see
+/// [`S4_TIMING_PENDING_MEASUREMENT`]). They are deliberately not the 2 s / 5 s
+/// values that D69 rejected. Replace them from the `s4_timing_measurement`
+/// numbers before the implementation PR is proposed for merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct S4Timing {
+    /// W: only the designated admin may start an exclusion before this
+    /// much suspend-inclusive monotonic time has passed since T_obs.
+    pub designated_window: Duration,
+    /// The completion bound: the time from T_obs to a verified exclusion
+    /// while one eligible compatible admin and the evidence are reachable.
+    pub completion_bound: Duration,
+    /// Δ: the stagger between fallback ranks. Rank r may start at
+    /// `T_obs + W + (r − 1)·Δ`.
+    pub fallback_stagger: Duration,
+    /// The bounded wait for a head catch-up round after a restart.
+    pub restart_sync_wait: Duration,
+}
+
+impl S4Timing {
+    /// PENDING MEASUREMENT placeholder for W.
+    pub const PENDING_DESIGNATED_WINDOW: Duration = Duration::from_secs(30);
+    /// PENDING MEASUREMENT placeholder for the completion bound.
+    pub const PENDING_COMPLETION_BOUND: Duration = Duration::from_secs(120);
+    /// PENDING MEASUREMENT placeholder for Δ.
+    pub const PENDING_FALLBACK_STAGGER: Duration = Duration::from_secs(10);
+    /// PENDING MEASUREMENT placeholder for the restart sync wait (the
+    /// provisional D73 range is 10 s to 30 s; the top of the range is used).
+    pub const PENDING_RESTART_SYNC_WAIT: Duration = Duration::from_secs(30);
+
+    /// The earliest elapsed time since T_obs at which fallback rank `rank`
+    /// may start. Rank 0 is the designated admin and may start at once.
+    #[must_use]
+    pub fn fallback_offset(&self, rank: usize) -> Duration {
+        if rank == 0 {
+            return Duration::ZERO;
+        }
+        let extra = u32::try_from(rank.saturating_sub(1)).unwrap_or(u32::MAX);
+        self.designated_window
+            .saturating_add(self.fallback_stagger.saturating_mul(extra))
+    }
+}
+
+impl Default for S4Timing {
+    fn default() -> Self {
+        Self {
+            designated_window: Self::PENDING_DESIGNATED_WINDOW,
+            completion_bound: Self::PENDING_COMPLETION_BOUND,
+            fallback_stagger: Self::PENDING_FALLBACK_STAGGER,
+            restart_sync_wait: Self::PENDING_RESTART_SYNC_WAIT,
+        }
+    }
+}
+
+// ─── Typed states (D64) ────────────────────────────────────────────────────
+
+/// A typed, visible wait that names its cause (D64, L3). The `snake_case`
+/// names are the public status strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingCause {
+    /// The obligation or its evidence is not durable yet; retrying.
+    WaitingForDurableIntake,
+    /// A lower-ranked admin is designated; this node waits for its fallback
+    /// time.
+    WaitingForDesignatedAdmin,
+    /// The hand-off has not reached the designated admin and returned no
+    /// definitive failure; priority is kept through W only.
+    UnresolvedDesignatedAdmin,
+    /// A catch-up round must complete before any S4 seal.
+    WaitingForHeadSync,
+    /// The target's KeyPackage is needed for the TreeKEM removal.
+    WaitingForMemberKeyPackage,
+    /// A competing exclusion landed on another branch.
+    WaitingForForkResolution,
+    /// A receiver lacks a capability that the commit needs.
+    WaitingForReceiverUpgrade,
+    /// This node may not seal (demoted, removed, revoked, left, or its own
+    /// selected certificate expired).
+    LocalCommitterIneligible,
+    /// Verified revocations cover every Admin-or-higher Active seat.
+    WaitingForEligibleAdminRevocation,
+    /// The roster has no Active admin at all (ADR 0088 §2 item 3).
+    WaitingForActiveAdmin,
+    /// Every admin other than the target holds an expired selected
+    /// certificate.
+    WaitingForAdminCertificateRenewal,
+    /// The committed certificate bytes for a digest-only seat are missing.
+    WaitingForCertificateEvidence,
+    /// ADR 0094 trial: S4 writes wait for the host commit.
+    WaitingForHostCommit,
+    /// The S4 sidecar is being rebuilt by ADR 0108 §5a.
+    RebuildingObligationStore,
+    /// The expiry clock check has not passed the raw `not_after` yet.
+    WaitingForCertificateExpiry,
+}
+
+impl WaitingCause {
+    /// The public status string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForDurableIntake => "waiting_for_durable_intake",
+            Self::WaitingForDesignatedAdmin => "waiting_for_designated_admin",
+            Self::UnresolvedDesignatedAdmin => "unresolved_designated_admin",
+            Self::WaitingForHeadSync => "waiting_for_head_sync",
+            Self::WaitingForMemberKeyPackage => "waiting_for_member_key_package",
+            Self::WaitingForForkResolution => "waiting_for_fork_resolution",
+            Self::WaitingForReceiverUpgrade => "waiting_for_receiver_upgrade",
+            Self::LocalCommitterIneligible => "local_committer_ineligible",
+            Self::WaitingForEligibleAdminRevocation => "waiting_for_eligible_admin_revocation",
+            Self::WaitingForActiveAdmin => "waiting_for_active_admin",
+            Self::WaitingForAdminCertificateRenewal => "waiting_for_admin_certificate_renewal",
+            Self::WaitingForCertificateEvidence => "waiting_for_certificate_evidence",
+            Self::WaitingForHostCommit => "waiting_for_host_commit",
+            Self::RebuildingObligationStore => "rebuilding_obligation_store",
+            Self::WaitingForCertificateExpiry => "waiting_for_certificate_expiry",
+        }
+    }
+}
+
+/// Why a designated admin is waiting, for `waiting_for_designated_admin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignatedWaitDetail {
+    /// The designated admin is compatible; this node waits for its rank.
+    Rank,
+    /// The designated admin lacks `eviction_handoff_v1` (§4).
+    DesignatedAdminUnsupported,
+}
+
+/// The persisted phase of one obligation (§5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Work is known and not started, or was abandoned back to pending.
+    Pending,
+    /// A `.evjournal` holds a prepared transition; no legacy commit yet.
+    Prepared,
+    /// The exclusion is committed locally; delivery is not finished.
+    CommittedDeliveryPending,
+    /// A verified exclusion is on the current chain.
+    Complete,
+    /// The work ended without a removal.
+    Terminated,
+}
+
+impl Phase {
+    /// The public status string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Prepared => "prepared",
+            Self::CommittedDeliveryPending => "committed_delivery_pending",
+            Self::Complete => "complete",
+            Self::Terminated => "terminated",
+        }
+    }
+
+    /// Whether S4 still owes work for this row.
+    #[must_use]
+    pub fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Prepared | Self::CommittedDeliveryPending
+        )
+    }
+}
+
+/// The cause recorded with [`Phase::Terminated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationCause {
+    /// A signed group deletion ended the work (ADR 0088 §2 item 5).
+    GroupDeleted,
+    /// A verified `certificate_rebind_v1` renewed the seat (§4a).
+    CertificateValid,
+}
+
+impl TerminationCause {
+    /// The public status string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GroupDeleted => "group_deleted",
+            Self::CertificateValid => "certificate_valid",
+        }
+    }
+}
+
+// ─── Obligation key, triggers and rows (§1) ────────────────────────────────
+
+/// The obligation key: (stable group ID, target agent ID).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EvictionKey {
+    /// The group's stable ID (`GroupInfo::stable_group_id`).
+    pub stable_group_id: String,
+    /// The target agent ID (raw 32 bytes).
+    pub target: [u8; 32],
+}
+
+impl EvictionKey {
+    /// Build a key.
+    #[must_use]
+    pub fn new(stable_group_id: impl Into<String>, target: [u8; 32]) -> Self {
+        Self {
+            stable_group_id: stable_group_id.into(),
+            target,
+        }
+    }
+}
+
+/// One verified trigger (§1, §1a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvictionTrigger {
+    /// A verified Agent-subject revocation of the target.
+    AgentRevocation {
+        /// `RevocationRecord::record_hash`.
+        record_hash: [u8; 32],
+        /// The signed record (bincode, as the revocation store holds it).
+        /// Persisted as evidence; may be empty when the store keeps it.
+        record_bytes: Vec<u8>,
+    },
+    /// A verified, chained self-leave of the target.
+    SelfLeave {
+        /// The head hash at which the leave was observed on the verified
+        /// chain.
+        commit_hash: String,
+    },
+    /// The committed certificate of an Active seat in an `OwnerCertified`
+    /// group expired on this node's clock (§1a).
+    CertificateExpiry {
+        /// `owner_cert::certificate_digest_hex` of the committed certificate.
+        certificate_digest: String,
+        /// Its signed `not_after` (Unix seconds).
+        not_after: u64,
+    },
+}
+
+/// The result of one intake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntakeOutcome {
+    /// A new obligation row was created; T_obs starts now.
+    Created,
+    /// The row existed; the trigger added evidence. No window is extended.
+    AddedEvidence,
+    /// The trigger was already recorded. Nothing changed.
+    Duplicate,
+    /// A completed or terminated row was reopened for a new incarnation
+    /// or for a revocation after a renewal.
+    Reopened,
+}
+
+impl IntakeOutcome {
+    /// Whether the store changed and must be persisted.
+    #[must_use]
+    pub fn changed(self) -> bool {
+        !matches!(self, Self::Duplicate)
+    }
+}
+
+/// The typed waiting state shown on a row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingState {
+    /// The cause.
+    pub cause: WaitingCause,
+    /// The agent IDs the state names (designated admin, revoked admins,
+    /// holding survivors).
+    pub named: Vec<[u8; 32]>,
+    /// For `waiting_for_designated_admin`: why.
+    pub designated_detail: Option<DesignatedWaitDetail>,
+    /// For timed waits: the remaining budget in milliseconds at the time
+    /// the state was computed.
+    pub remaining_ms: Option<u64>,
+}
+
+impl WaitingState {
+    /// A state with only a cause.
+    #[must_use]
+    pub fn cause(cause: WaitingCause) -> Self {
+        Self {
+            cause,
+            named: Vec::new(),
+            designated_detail: None,
+            remaining_ms: None,
+        }
+    }
+}
+
+/// One obligation row. This is the frozen v1 persisted shape (§5): field
+/// order is the postcard layout; append only under a new header version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObligationRow {
+    /// Stable group ID.
+    pub stable_group_id: String,
+    /// Target agent ID.
+    pub target: [u8; 32],
+    /// Verified revocation record hashes.
+    pub revocation_hashes: BTreeSet<[u8; 32]>,
+    /// Signed revocation records (bincode), keyed by hash. Dropped 30 days
+    /// after verified completion (D128).
+    pub revocation_records: BTreeMap<[u8; 32], Vec<u8>>,
+    /// Verified self-leave commit hashes.
+    pub self_leave_commits: BTreeSet<String>,
+    /// Expired committed certificates: digest → `not_after`.
+    pub expired_certificates: BTreeMap<String, u64>,
+    /// The target's TreeKEM KeyPackage hash when the row opened (seat/leaf
+    /// incarnation). An old exclusion never certifies a new leaf.
+    pub incarnation: Option<String>,
+    /// Wall-clock time of first observation (display only, Unix ms).
+    pub observed_at_unix_ms: u64,
+    /// Wall-clock time of the first hand-off dispatch attempt (Unix ms).
+    pub first_dispatch_unix_ms: Option<u64>,
+    /// Wall-clock time of the earliest verified hand-off receipt (Unix ms).
+    pub earliest_handoff_receipt_unix_ms: Option<u64>,
+    /// Boot identity that recorded `elapsed_budget_ms`.
+    pub boot_id: [u8; 16],
+    /// Monotonic budget consumed since T_obs at the last persist (ms).
+    pub elapsed_budget_ms: u64,
+    /// The designated admin at the last derivation.
+    pub designated: Option<[u8; 32]>,
+    /// Fallback ranks (rank 1 first) at the last derivation.
+    pub ranks: Vec<[u8; 32]>,
+    /// Phase.
+    pub phase: Phase,
+    /// Cause for [`Phase::Terminated`].
+    pub termination: Option<TerminationCause>,
+    /// The typed waiting state at the last evaluation.
+    pub waiting: Option<WaitingState>,
+    /// The parent head the prepared transition extends.
+    pub parent_head: Option<String>,
+    /// The head of the verified exclusion.
+    pub result_head: Option<String>,
+    /// The epoch after the verified exclusion.
+    pub result_epoch: Option<u64>,
+    /// The exact outgoing event of a prepared or committed transition.
+    pub outgoing_event: Option<Vec<u8>>,
+    /// Wall-clock time of verified completion (Unix ms).
+    pub completed_at_unix_ms: Option<u64>,
+}
+
+impl ObligationRow {
+    fn new(key: &EvictionKey, now_unix_ms: u64, boot_id: [u8; 16]) -> Self {
+        Self {
+            stable_group_id: key.stable_group_id.clone(),
+            target: key.target,
+            revocation_hashes: BTreeSet::new(),
+            revocation_records: BTreeMap::new(),
+            self_leave_commits: BTreeSet::new(),
+            expired_certificates: BTreeMap::new(),
+            incarnation: None,
+            observed_at_unix_ms: now_unix_ms,
+            first_dispatch_unix_ms: None,
+            earliest_handoff_receipt_unix_ms: None,
+            boot_id,
+            elapsed_budget_ms: 0,
+            designated: None,
+            ranks: Vec::new(),
+            phase: Phase::Pending,
+            termination: None,
+            waiting: None,
+            parent_head: None,
+            result_head: None,
+            result_epoch: None,
+            outgoing_event: None,
+            completed_at_unix_ms: None,
+        }
+    }
+
+    /// The obligation key.
+    #[must_use]
+    pub fn key(&self) -> EvictionKey {
+        EvictionKey::new(self.stable_group_id.clone(), self.target)
+    }
+
+    /// Whether any revocation evidence is held. A renewal never cancels it.
+    #[must_use]
+    pub fn has_revocation(&self) -> bool {
+        !self.revocation_hashes.is_empty()
+    }
+
+    /// Whether the only triggers are certificate expiry.
+    #[must_use]
+    pub fn expiry_only(&self) -> bool {
+        self.revocation_hashes.is_empty()
+            && self.self_leave_commits.is_empty()
+            && !self.expired_certificates.is_empty()
+    }
+
+    /// The trigger kinds, for status output.
+    #[must_use]
+    pub fn trigger_kinds(&self) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        if !self.revocation_hashes.is_empty() {
+            kinds.push("agent_revocation");
+        }
+        if !self.self_leave_commits.is_empty() {
+            kinds.push("self_leave");
+        }
+        if !self.expired_certificates.is_empty() {
+            kinds.push("certificate_expiry");
+        }
+        kinds
+    }
+
+    /// Record one trigger. Returns whether the row changed.
+    fn absorb(&mut self, trigger: EvictionTrigger) -> bool {
+        match trigger {
+            EvictionTrigger::AgentRevocation {
+                record_hash,
+                record_bytes,
+            } => {
+                let added = self.revocation_hashes.insert(record_hash);
+                if added && !record_bytes.is_empty() {
+                    self.revocation_records.insert(record_hash, record_bytes);
+                }
+                added
+            }
+            EvictionTrigger::SelfLeave { commit_hash } => {
+                // One leave proof per incarnation is enough: a later
+                // observation of the same leave at a newer head is not a
+                // new trigger.
+                if self.self_leave_commits.is_empty() {
+                    self.self_leave_commits.insert(commit_hash)
+                } else {
+                    false
+                }
+            }
+            EvictionTrigger::CertificateExpiry {
+                certificate_digest,
+                not_after,
+            } => self
+                .expired_certificates
+                .insert(certificate_digest, not_after)
+                .is_none(),
+        }
+    }
+
+    fn reopen(&mut self, now_unix_ms: u64, boot_id: [u8; 16]) {
+        self.phase = Phase::Pending;
+        self.termination = None;
+        self.waiting = None;
+        self.parent_head = None;
+        self.result_head = None;
+        self.result_epoch = None;
+        self.outgoing_event = None;
+        self.completed_at_unix_ms = None;
+        self.observed_at_unix_ms = now_unix_ms;
+        self.first_dispatch_unix_ms = None;
+        self.earliest_handoff_receipt_unix_ms = None;
+        self.boot_id = boot_id;
+        self.elapsed_budget_ms = 0;
+    }
+}
+
+/// All S4 obligations held by this node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObligationStore {
+    rows: BTreeMap<EvictionKey, ObligationRow>,
+}
+
+impl ObligationStore {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a store from decoded rows. Later duplicates of a key are
+    /// merged into the first row.
+    #[must_use]
+    pub fn from_rows(rows: Vec<ObligationRow>) -> Self {
+        let mut store = Self::new();
+        for row in rows {
+            let key = row.key();
+            match store.rows.get_mut(&key) {
+                Some(existing) => {
+                    existing.revocation_hashes.extend(row.revocation_hashes);
+                    existing.revocation_records.extend(row.revocation_records);
+                    existing.self_leave_commits.extend(row.self_leave_commits);
+                    existing
+                        .expired_certificates
+                        .extend(row.expired_certificates);
+                }
+                None => {
+                    store.rows.insert(key, row);
+                }
+            }
+        }
+        store
+    }
+
+    /// The rows in key order.
+    pub fn rows(&self) -> impl Iterator<Item = &ObligationRow> {
+        self.rows.values()
+    }
+
+    /// The rows as an owned list (for encoding).
+    #[must_use]
+    pub fn to_rows(&self) -> Vec<ObligationRow> {
+        self.rows.values().cloned().collect()
+    }
+
+    /// Number of rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// One row.
+    #[must_use]
+    pub fn get(&self, key: &EvictionKey) -> Option<&ObligationRow> {
+        self.rows.get(key)
+    }
+
+    /// One row, mutable.
+    pub fn get_mut(&mut self, key: &EvictionKey) -> Option<&mut ObligationRow> {
+        self.rows.get_mut(key)
+    }
+
+    /// Open rows of one group.
+    pub fn open_rows_for_group<'a>(
+        &'a self,
+        stable_group_id: &'a str,
+    ) -> impl Iterator<Item = &'a ObligationRow> + 'a {
+        self.rows
+            .values()
+            .filter(move |row| row.stable_group_id == stable_group_id && row.phase.is_open())
+    }
+
+    /// All rows of one group, open or not.
+    pub fn rows_for_group<'a>(
+        &'a self,
+        stable_group_id: &'a str,
+    ) -> impl Iterator<Item = &'a ObligationRow> + 'a {
+        self.rows
+            .values()
+            .filter(move |row| row.stable_group_id == stable_group_id)
+    }
+
+    /// §1 intake. Duplicates and extra hashes for the same excluded leaf do
+    /// not create another worker, extend a window or undo a completion.
+    ///
+    /// `incarnation` is the target's current seat/leaf identity (its
+    /// KeyPackage hash when known). A completed row reopens only when a
+    /// still-applicable Agent revocation names a different incarnation, or
+    /// when a revocation arrives after a renewal terminated expiry work.
+    pub fn intake(
+        &mut self,
+        key: &EvictionKey,
+        trigger: EvictionTrigger,
+        incarnation: Option<&str>,
+        now_unix_ms: u64,
+        boot_id: [u8; 16],
+    ) -> IntakeOutcome {
+        let is_revocation = matches!(trigger, EvictionTrigger::AgentRevocation { .. });
+        let Some(row) = self.rows.get_mut(key) else {
+            let mut row = ObligationRow::new(key, now_unix_ms, boot_id);
+            row.incarnation = incarnation.map(str::to_string);
+            row.absorb(trigger);
+            self.rows.insert(key.clone(), row);
+            return IntakeOutcome::Created;
+        };
+        match row.phase {
+            Phase::Complete => {
+                let new_incarnation = match (row.incarnation.as_deref(), incarnation) {
+                    (Some(old), Some(new)) => old != new,
+                    _ => false,
+                };
+                if is_revocation && new_incarnation {
+                    row.absorb(trigger);
+                    row.incarnation = incarnation.map(str::to_string);
+                    row.reopen(now_unix_ms, boot_id);
+                    return IntakeOutcome::Reopened;
+                }
+                if row.absorb(trigger) {
+                    IntakeOutcome::AddedEvidence
+                } else {
+                    IntakeOutcome::Duplicate
+                }
+            }
+            Phase::Terminated => {
+                let renewed = row.termination == Some(TerminationCause::CertificateValid);
+                if renewed && is_revocation {
+                    // A renewal never cancels revocation work (§1a).
+                    row.absorb(trigger);
+                    row.reopen(now_unix_ms, boot_id);
+                    return IntakeOutcome::Reopened;
+                }
+                IntakeOutcome::Duplicate
+            }
+            Phase::Pending | Phase::Prepared | Phase::CommittedDeliveryPending => {
+                if row.absorb(trigger) {
+                    IntakeOutcome::AddedEvidence
+                } else {
+                    IntakeOutcome::Duplicate
+                }
+            }
+        }
+    }
+
+    /// Mark a row complete with the verified exclusion's head and epoch.
+    /// Returns whether the row changed.
+    pub fn complete(
+        &mut self,
+        key: &EvictionKey,
+        result_head: Option<String>,
+        result_epoch: Option<u64>,
+        now_unix_ms: u64,
+    ) -> bool {
+        let Some(row) = self.rows.get_mut(key) else {
+            return false;
+        };
+        if !row.phase.is_open() {
+            return false;
+        }
+        row.phase = Phase::Complete;
+        row.waiting = None;
+        row.result_head = result_head;
+        row.result_epoch = result_epoch;
+        row.outgoing_event = None;
+        row.completed_at_unix_ms = Some(now_unix_ms);
+        true
+    }
+
+    /// Terminate a row (signed deletion or a verified rebind). A rebind
+    /// never terminates a row that holds revocation or self-leave work.
+    /// Returns whether the row changed.
+    pub fn terminate(&mut self, key: &EvictionKey, cause: TerminationCause) -> bool {
+        let Some(row) = self.rows.get_mut(key) else {
+            return false;
+        };
+        if !row.phase.is_open() {
+            return false;
+        }
+        if cause == TerminationCause::CertificateValid && !row.expiry_only() {
+            return false;
+        }
+        row.phase = Phase::Terminated;
+        row.termination = Some(cause);
+        row.waiting = None;
+        row.outgoing_event = None;
+        true
+    }
+
+    /// Terminate every open row of a deleted group. Returns the count.
+    pub fn terminate_group(&mut self, stable_group_id: &str) -> usize {
+        let keys: Vec<EvictionKey> = self
+            .rows
+            .values()
+            .filter(|row| row.stable_group_id == stable_group_id && row.phase.is_open())
+            .map(ObligationRow::key)
+            .collect();
+        keys.iter()
+            .filter(|key| self.terminate(key, TerminationCause::GroupDeleted))
+            .count()
+    }
+
+    /// Set the typed waiting state of a row. Returns whether it changed
+    /// (the remaining budget alone does not count as a change).
+    pub fn set_waiting(&mut self, key: &EvictionKey, waiting: Option<WaitingState>) -> bool {
+        let Some(row) = self.rows.get_mut(key) else {
+            return false;
+        };
+        let same = match (&row.waiting, &waiting) {
+            (Some(a), Some(b)) => {
+                a.cause == b.cause
+                    && a.named == b.named
+                    && a.designated_detail == b.designated_detail
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        row.waiting = waiting;
+        !same
+    }
+
+    /// Retention (D72, D128). Drops terminated rows, drops evidence bodies
+    /// of rows completed more than 30 days ago, and keeps at most
+    /// [`MAX_COMPACT_RECORDS_PER_GROUP`] completed rows per group, oldest
+    /// first out. Pending rows are never dropped. Returns whether the store
+    /// changed.
+    pub fn apply_retention(&mut self, now_unix_ms: u64) -> bool {
+        let before = self.rows.len();
+        self.rows.retain(|_, row| row.phase != Phase::Terminated);
+        let mut changed = self.rows.len() != before;
+        for row in self.rows.values_mut() {
+            if row.phase != Phase::Complete || row.revocation_records.is_empty() {
+                continue;
+            }
+            let done = row.completed_at_unix_ms.unwrap_or(now_unix_ms);
+            if now_unix_ms.saturating_sub(done) >= COMPLETED_EVIDENCE_RETENTION_MS {
+                row.revocation_records.clear();
+                changed = true;
+            }
+        }
+        let mut per_group: BTreeMap<String, Vec<(u64, EvictionKey)>> = BTreeMap::new();
+        for (key, row) in &self.rows {
+            if row.phase == Phase::Complete {
+                per_group
+                    .entry(row.stable_group_id.clone())
+                    .or_default()
+                    .push((row.completed_at_unix_ms.unwrap_or(0), key.clone()));
+            }
+        }
+        for (_, mut completed) in per_group {
+            if completed.len() <= MAX_COMPACT_RECORDS_PER_GROUP {
+                continue;
+            }
+            completed.sort();
+            let excess = completed.len() - MAX_COMPACT_RECORDS_PER_GROUP;
+            for (_, key) in completed.into_iter().take(excess) {
+                self.rows.remove(&key);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Drop every row of a group this node no longer belongs to (D128:
+    /// local retention ends). Returns the count.
+    pub fn forget_group(&mut self, stable_group_id: &str) -> usize {
+        let before = self.rows.len();
+        self.rows
+            .retain(|_, row| row.stable_group_id != stable_group_id);
+        before - self.rows.len()
+    }
+}
+
+// ─── Certificate expiry (§1a) ──────────────────────────────────────────────
+
+/// An admin's own expiry trigger fires once its wall clock passes the
+/// selected certificate's `not_after + τ`.
+#[must_use]
+pub fn own_expiry_trigger_due(not_after: u64, now_unix: u64) -> bool {
+    now_unix > not_after.saturating_add(EXPIRY_TOLERANCE_SECS)
+}
+
+/// A hand-off or a pre-seal re-check counts only after the node's own wall
+/// clock has passed the raw `not_after`.
+#[must_use]
+pub fn raw_expiry_passed(not_after: u64, now_unix: u64) -> bool {
+    now_unix > not_after
+}
+
+// ─── Designation and fallback (§2) ─────────────────────────────────────────
+
+/// The designation derived from the current committed parent roster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Designation {
+    /// The lowest eligible admin by raw 32-byte ID (D74).
+    pub designated: [u8; 32],
+    /// The other eligible admins in raw-ID order; index 0 is rank 1.
+    pub ranks: Vec<[u8; 32]>,
+}
+
+impl Designation {
+    /// The rank of `agent`: 0 for the designated admin, r ≥ 1 for a
+    /// fallback rank, `None` when not eligible.
+    #[must_use]
+    pub fn rank_of(&self, agent: &[u8; 32]) -> Option<usize> {
+        if &self.designated == agent {
+            return Some(0);
+        }
+        self.ranks
+            .iter()
+            .position(|id| id == agent)
+            .map(|index| index.saturating_add(1))
+    }
+}
+
+/// Derive the designation. `eligible_admins` are Active, Admin-or-higher
+/// seats that pass revocation, owner-policy and containment checks
+/// (certificate expiry is not evaluated, §1a). The target is never
+/// designated or ranked.
+#[must_use]
+pub fn designate(
+    eligible_admins: impl IntoIterator<Item = [u8; 32]>,
+    target: &[u8; 32],
+) -> Option<Designation> {
+    let ordered: BTreeSet<[u8; 32]> = eligible_admins
+        .into_iter()
+        .filter(|id| id != target)
+        .collect();
+    let mut iter = ordered.into_iter();
+    let designated = iter.next()?;
+    Some(Designation {
+        designated,
+        ranks: iter.collect(),
+    })
+}
+
+/// Whether this node may start the exclusion now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitPermission {
+    /// This node is the designated admin.
+    Designated,
+    /// This node's fallback time has passed.
+    Fallback {
+        /// Its rank (≥ 1).
+        rank: usize,
+    },
+    /// This node waits for the designated admin until its fallback time.
+    Wait {
+        /// The designated admin.
+        designated: [u8; 32],
+        /// The time left until this node's fallback time.
+        remaining: Duration,
+    },
+    /// This node is not an eligible committer.
+    NotEligible,
+}
+
+impl CommitPermission {
+    /// Whether the node may seal now.
+    #[must_use]
+    pub fn may_commit(&self) -> bool {
+        matches!(self, Self::Designated | Self::Fallback { .. })
+    }
+}
+
+/// Decide whether `local` may start the exclusion, given the elapsed
+/// monotonic budget since T_obs (§2).
+#[must_use]
+pub fn commit_permission(
+    local: &[u8; 32],
+    designation: &Designation,
+    elapsed_since_t_obs: Duration,
+    timing: &S4Timing,
+) -> CommitPermission {
+    match designation.rank_of(local) {
+        None => CommitPermission::NotEligible,
+        Some(0) => CommitPermission::Designated,
+        Some(rank) => {
+            let start = timing.fallback_offset(rank);
+            if elapsed_since_t_obs >= start {
+                CommitPermission::Fallback { rank }
+            } else {
+                CommitPermission::Wait {
+                    designated: designation.designated,
+                    remaining: start.saturating_sub(elapsed_since_t_obs),
+                }
+            }
+        }
+    }
+}
+
+/// Admin availability for one group (§4, D75, D126).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminAvailability {
+    /// At least one eligible admin exists.
+    Eligible(Designation),
+    /// Verified Agent-subject revocations cover every Admin-or-higher
+    /// Active seat.
+    AllRevoked {
+        /// The revoked admin IDs.
+        revoked_admins: Vec<[u8; 32]>,
+    },
+    /// The roster has no Active admin at all.
+    NoActiveAdmin,
+}
+
+/// Classify admin availability. `active_admins` are the Admin-or-higher
+/// Active seats; `is_revoked` reports a verified Agent-subject revocation;
+/// `is_ineligible` reports any other failed eligibility check.
+pub fn admin_availability(
+    active_admins: &[[u8; 32]],
+    target: &[u8; 32],
+    is_revoked: impl Fn(&[u8; 32]) -> bool,
+    is_ineligible: impl Fn(&[u8; 32]) -> bool,
+) -> AdminAvailability {
+    if active_admins.is_empty() {
+        return AdminAvailability::NoActiveAdmin;
+    }
+    let eligible: Vec<[u8; 32]> = active_admins
+        .iter()
+        .filter(|id| !is_revoked(id) && !is_ineligible(id))
+        .copied()
+        .collect();
+    if let Some(designation) = designate(eligible, target) {
+        return AdminAvailability::Eligible(designation);
+    }
+    let mut revoked: Vec<[u8; 32]> = active_admins
+        .iter()
+        .filter(|id| is_revoked(id))
+        .copied()
+        .collect();
+    revoked.sort();
+    if revoked.len() == active_admins.len() {
+        AdminAvailability::AllRevoked {
+            revoked_admins: revoked,
+        }
+    } else {
+        // The only eligible admin is the target itself, or the others fail
+        // a non-revocation check: there is no committer, but the group is
+        // not in the D75 state.
+        AdminAvailability::NoActiveAdmin
+    }
+}
+
+// ─── Monotonic budget (§2) ─────────────────────────────────────────────────
+
+/// The elapsed budget of one row on this boot.
+///
+/// `consumed_before_boot` is the budget persisted by an earlier boot; the
+/// in-boot part runs on the monotonic clock, so a wall-clock change or a
+/// rollback never renews W.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowBudget {
+    /// Budget consumed by earlier boots.
+    pub consumed_before_boot: Duration,
+    /// The monotonic instant at which this boot started counting.
+    pub counting_since: std::time::Instant,
+}
+
+impl RowBudget {
+    /// Start counting now with `consumed_before_boot` already used.
+    #[must_use]
+    pub fn resume(consumed_before_boot: Duration, now: std::time::Instant) -> Self {
+        Self {
+            consumed_before_boot,
+            counting_since: now,
+        }
+    }
+
+    /// The elapsed budget at `now`.
+    #[must_use]
+    pub fn elapsed(&self, now: std::time::Instant) -> Duration {
+        self.consumed_before_boot
+            .saturating_add(now.saturating_duration_since(self.counting_since))
+    }
+
+    /// An earlier verified hand-off may shorten a budget: move T_obs back
+    /// by `earlier_by`. Duplicates and retries never extend or restart it.
+    pub fn shorten(&mut self, earlier_by: Duration) {
+        self.consumed_before_boot = self.consumed_before_boot.saturating_add(earlier_by);
+    }
+}
+
+/// Convert a duration to whole milliseconds, saturating.
+#[must_use]
+pub fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+// ─── Intake queue (§1 post-verification hook) ──────────────────────────────
+
+/// One verified Agent-subject revocation, as the hook saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAgentRevocation {
+    /// The revoked agent.
+    pub target: [u8; 32],
+    /// `RevocationRecord::record_hash`.
+    pub record_hash: [u8; 32],
+    /// The signed record (bincode); empty when encoding failed.
+    pub record_bytes: Vec<u8>,
+    /// Whether it came from a startup load rather than a live route.
+    pub from_startup_load: bool,
+}
+
+/// Upper bound on queued intake items. On overflow the queue drops the
+/// oldest items and raises the reconcile flag, so the worker rescans the
+/// whole revocation set: no verified record is lost, only batched.
+pub const MAX_QUEUED_INTAKE: usize = 4096;
+
+#[derive(Debug, Default)]
+struct IntakeInner {
+    queue: VecDeque<VerifiedAgentRevocation>,
+    reconcile_all: bool,
+}
+
+/// The queue between the revocation choke point in `lib.rs` and the S4
+/// worker in `x0xd`. Cloning shares the queue.
+///
+/// The hook only enqueues; it never takes membership or persistence locks,
+/// so the revocation-set lock is released before S4 takes them (§1).
+#[derive(Debug, Clone, Default)]
+pub struct RevocationIntake {
+    inner: std::sync::Arc<std::sync::Mutex<IntakeInner>>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl RevocationIntake {
+    /// A new, empty queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The post-verification hook: call after `verify_and_insert` returned
+    /// `Ok(true)`. Only Agent subjects schedule seat exclusion; every other
+    /// subject is ignored here (its serving denial is immediate elsewhere).
+    pub fn note_verified(&self, record: &crate::revocation::RevocationRecord) {
+        self.note_verified_from(record, false);
+    }
+
+    /// The startup-load hook: every loaded record was verified by
+    /// `verify_and_insert` while decoding the store.
+    pub fn note_loaded(&self, record: &crate::revocation::RevocationRecord) {
+        self.note_verified_from(record, true);
+    }
+
+    fn note_verified_from(
+        &self,
+        record: &crate::revocation::RevocationRecord,
+        from_startup_load: bool,
+    ) {
+        let crate::revocation::RevokedSubject::Agent(agent) = &record.subject else {
+            return;
+        };
+        let item = VerifiedAgentRevocation {
+            target: *agent.as_bytes(),
+            record_hash: record.record_hash(),
+            record_bytes: bincode::serialize(record).unwrap_or_default(),
+            from_startup_load,
+        };
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.queue.len() >= MAX_QUEUED_INTAKE {
+                inner.queue.pop_front();
+                inner.reconcile_all = true;
+            }
+            inner.queue.push_back(item);
+        }
+        self.notify.notify_one();
+    }
+
+    /// Ask the worker for a full reconciliation pass.
+    pub fn request_reconcile(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reconcile_all = true;
+        self.notify.notify_one();
+    }
+
+    /// Take every queued item and the reconcile flag.
+    #[must_use]
+    pub fn drain(&self) -> (Vec<VerifiedAgentRevocation>, bool) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let items = inner.queue.drain(..).collect();
+        let reconcile = std::mem::take(&mut inner.reconcile_all);
+        (items, reconcile)
+    }
+
+    /// The wake-up signal for the worker.
+    #[must_use]
+    pub fn notified(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.notify)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn key(target: u8) -> EvictionKey {
+        EvictionKey::new("group", id(target))
+    }
+
+    fn revocation(hash: u8) -> EvictionTrigger {
+        EvictionTrigger::AgentRevocation {
+            record_hash: id(hash),
+            record_bytes: vec![hash],
+        }
+    }
+
+    #[test]
+    fn timing_defaults_are_pending_and_not_rejected_values() {
+        let timing = S4Timing::default();
+        const { assert!(S4_TIMING_PENDING_MEASUREMENT) };
+        assert_ne!(timing.designated_window, Duration::from_secs(2));
+        assert_ne!(timing.completion_bound, Duration::from_secs(5));
+        assert_eq!(timing.fallback_offset(0), Duration::ZERO);
+        assert_eq!(timing.fallback_offset(1), timing.designated_window);
+        assert_eq!(
+            timing.fallback_offset(3),
+            timing.designated_window + timing.fallback_stagger * 2
+        );
+    }
+
+    #[test]
+    fn intake_dedupes_and_never_extends_window() {
+        let mut store = ObligationStore::new();
+        let k = key(9);
+        assert_eq!(
+            store.intake(&k, revocation(1), None, 1_000, [0; 16]),
+            IntakeOutcome::Created
+        );
+        assert_eq!(
+            store.intake(&k, revocation(1), None, 5_000, [0; 16]),
+            IntakeOutcome::Duplicate
+        );
+        assert_eq!(
+            store.intake(&k, revocation(2), None, 6_000, [0; 16]),
+            IntakeOutcome::AddedEvidence
+        );
+        let row = store.get(&k).expect("row");
+        assert_eq!(row.observed_at_unix_ms, 1_000);
+        assert_eq!(row.revocation_hashes.len(), 2);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn completed_row_is_not_reopened_by_duplicate_or_same_incarnation() {
+        let mut store = ObligationStore::new();
+        let k = key(9);
+        store.intake(&k, revocation(1), Some("leaf-a"), 1, [0; 16]);
+        assert!(store.complete(&k, Some("head".into()), Some(4), 2));
+        assert_eq!(
+            store.intake(&k, revocation(1), Some("leaf-a"), 3, [0; 16]),
+            IntakeOutcome::Duplicate
+        );
+        assert_eq!(
+            store.intake(&k, revocation(2), Some("leaf-a"), 3, [0; 16]),
+            IntakeOutcome::AddedEvidence
+        );
+        assert_eq!(store.get(&k).expect("row").phase, Phase::Complete);
+    }
+
+    #[test]
+    fn revocation_reopens_for_a_new_incarnation_but_self_leave_does_not() {
+        let mut store = ObligationStore::new();
+        let k = key(9);
+        store.intake(&k, revocation(1), Some("leaf-a"), 1, [0; 16]);
+        store.complete(&k, None, None, 2);
+        let leave = EvictionTrigger::SelfLeave {
+            commit_hash: "h".into(),
+        };
+        assert_ne!(
+            store.intake(&k, leave, Some("leaf-b"), 3, [0; 16]),
+            IntakeOutcome::Reopened
+        );
+        assert_eq!(
+            store.intake(&k, revocation(1), Some("leaf-b"), 4, [0; 16]),
+            IntakeOutcome::Reopened
+        );
+        let row = store.get(&k).expect("row");
+        assert_eq!(row.phase, Phase::Pending);
+        assert_eq!(row.incarnation.as_deref(), Some("leaf-b"));
+    }
+
+    #[test]
+    fn renewal_terminates_expiry_only_and_revocation_reopens() {
+        let mut store = ObligationStore::new();
+        let k = key(9);
+        let expiry = EvictionTrigger::CertificateExpiry {
+            certificate_digest: "d".into(),
+            not_after: 10,
+        };
+        store.intake(&k, expiry, None, 1, [0; 16]);
+        assert!(store.terminate(&k, TerminationCause::CertificateValid));
+        assert_eq!(
+            store.intake(&k, revocation(1), None, 2, [0; 16]),
+            IntakeOutcome::Reopened
+        );
+        // A renewal never cancels revocation work.
+        assert!(!store.terminate(&k, TerminationCause::CertificateValid));
+        assert!(store.get(&k).expect("row").phase.is_open());
+    }
+
+    #[test]
+    fn retention_keeps_pending_and_drops_old_evidence() {
+        let mut store = ObligationStore::new();
+        store.intake(&key(1), revocation(1), None, 0, [0; 16]);
+        store.intake(&key(2), revocation(2), None, 0, [0; 16]);
+        store.complete(&key(2), None, None, 0);
+        store.intake(&key(3), revocation(3), None, 0, [0; 16]);
+        store.terminate_group("other");
+        assert!(store.apply_retention(COMPLETED_EVIDENCE_RETENTION_MS));
+        assert!(
+            store
+                .get(&key(1))
+                .expect("pending")
+                .revocation_records
+                .len()
+                == 1
+        );
+        assert!(store
+            .get(&key(2))
+            .expect("done")
+            .revocation_records
+            .is_empty());
+        assert!(store.terminate_group("group") == 2);
+        assert!(store.apply_retention(COMPLETED_EVIDENCE_RETENTION_MS));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn designation_is_lowest_eligible_and_excludes_target() {
+        let designation = designate([id(5), id(2), id(9), id(3)], &id(2)).expect("some");
+        assert_eq!(designation.designated, id(3));
+        assert_eq!(designation.ranks, vec![id(5), id(9)]);
+        assert_eq!(designation.rank_of(&id(9)), Some(2));
+        assert_eq!(designation.rank_of(&id(2)), None);
+        assert!(designate([id(2)], &id(2)).is_none());
+    }
+
+    #[test]
+    fn fallback_ranks_are_staggered() {
+        let timing = S4Timing::default();
+        let designation = designate([id(1), id(2), id(3)], &id(9)).expect("some");
+        assert_eq!(
+            commit_permission(&id(1), &designation, Duration::ZERO, &timing),
+            CommitPermission::Designated
+        );
+        let before = timing.designated_window - Duration::from_millis(1);
+        assert!(matches!(
+            commit_permission(&id(2), &designation, before, &timing),
+            CommitPermission::Wait { designated, .. } if designated == id(1)
+        ));
+        assert_eq!(
+            commit_permission(&id(2), &designation, timing.designated_window, &timing),
+            CommitPermission::Fallback { rank: 1 }
+        );
+        assert!(
+            !commit_permission(&id(3), &designation, timing.designated_window, &timing)
+                .may_commit()
+        );
+        assert!(commit_permission(
+            &id(3),
+            &designation,
+            timing.designated_window + timing.fallback_stagger,
+            &timing
+        )
+        .may_commit());
+        assert_eq!(
+            commit_permission(&id(7), &designation, Duration::MAX, &timing),
+            CommitPermission::NotEligible
+        );
+    }
+
+    #[test]
+    fn admin_availability_classifies_all_revoked() {
+        let admins = [id(1), id(2)];
+        assert!(matches!(
+            admin_availability(&admins, &id(9), |a| a == &id(1), |_| false),
+            AdminAvailability::Eligible(d) if d.designated == id(2)
+        ));
+        assert_eq!(
+            admin_availability(&admins, &id(9), |_| true, |_| false),
+            AdminAvailability::AllRevoked {
+                revoked_admins: vec![id(1), id(2)]
+            }
+        );
+        assert_eq!(
+            admin_availability(&[], &id(9), |_| false, |_| false),
+            AdminAvailability::NoActiveAdmin
+        );
+    }
+
+    #[test]
+    fn expiry_checks_use_tau() {
+        assert!(!own_expiry_trigger_due(100, 100 + EXPIRY_TOLERANCE_SECS));
+        assert!(own_expiry_trigger_due(100, 101 + EXPIRY_TOLERANCE_SECS));
+        assert!(!raw_expiry_passed(100, 100));
+        assert!(raw_expiry_passed(100, 101));
+    }
+
+    #[test]
+    fn budget_survives_restart_and_shortens_only() {
+        let now = std::time::Instant::now();
+        let mut budget = RowBudget::resume(Duration::from_secs(4), now);
+        assert_eq!(budget.elapsed(now), Duration::from_secs(4));
+        budget.shorten(Duration::from_secs(1));
+        assert_eq!(budget.elapsed(now), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn waiting_cause_strings_match_serde() {
+        for cause in [
+            WaitingCause::WaitingForDurableIntake,
+            WaitingCause::WaitingForDesignatedAdmin,
+            WaitingCause::UnresolvedDesignatedAdmin,
+            WaitingCause::WaitingForHeadSync,
+            WaitingCause::WaitingForMemberKeyPackage,
+            WaitingCause::WaitingForForkResolution,
+            WaitingCause::WaitingForReceiverUpgrade,
+            WaitingCause::LocalCommitterIneligible,
+            WaitingCause::WaitingForEligibleAdminRevocation,
+            WaitingCause::WaitingForActiveAdmin,
+            WaitingCause::WaitingForAdminCertificateRenewal,
+            WaitingCause::WaitingForCertificateEvidence,
+            WaitingCause::WaitingForHostCommit,
+            WaitingCause::RebuildingObligationStore,
+            WaitingCause::WaitingForCertificateExpiry,
+        ] {
+            let json = serde_json::to_string(&cause).expect("json");
+            assert_eq!(json, format!("\"{}\"", cause.as_str()));
+        }
+    }
+
+    #[test]
+    fn intake_queue_keeps_agent_subjects_only() {
+        let kp = crate::identity::AgentKeypair::generate().expect("kp");
+        let intake = RevocationIntake::new();
+        let agent_record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            1,
+            None,
+        )
+        .expect("sign");
+        let machine_record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(crate::identity::MachineId([3; 32])),
+            kp.public_key(),
+            kp.secret_key(),
+            1,
+            None,
+        )
+        .expect("sign");
+        intake.note_verified(&machine_record);
+        intake.note_verified(&agent_record);
+        intake.note_loaded(&agent_record);
+        let (items, reconcile) = intake.drain();
+        assert!(!reconcile);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].target, *kp.agent_id().as_bytes());
+        assert!(!items[0].from_startup_load);
+        assert!(items[1].from_startup_load);
+    }
+}

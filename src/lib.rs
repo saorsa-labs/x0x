@@ -795,6 +795,10 @@ pub struct Agent {
     /// and never await while holding it — write lock is taken only when
     /// applying a new revocation (rare) and when persisting to disk.
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    /// ADR 0110 §1: the S4 intake queue. Every route that inserts a
+    /// verified revocation feeds it after `verify_and_insert` returns
+    /// `Ok(true)`, and the startup load feeds it every loaded record.
+    s4_revocation_intake: groups::eviction::RevocationIntake,
     /// Identity-scoped directory.  When `Some`, revocations.bin is saved here
     /// instead of `~/.x0x/`.
     identity_dir: Option<std::path::PathBuf>,
@@ -3694,6 +3698,7 @@ async fn apply_legacy_revocation_records(
     records: Vec<revocation::RevocationRecord>,
     subject_certs: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: &groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: &owner_trust::OwnerTrust,
     contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
@@ -3725,7 +3730,11 @@ async fn apply_legacy_revocation_records(
                 subject_cert,
                 Agent::unix_timestamp_secs(),
             ) {
-                Ok(true) => newly_inserted.push(record),
+                Ok(true) => {
+                    // ADR 0110 §1: the S4 post-verification hook.
+                    s4_intake.note_verified(&record);
+                    newly_inserted.push(record);
+                }
                 Ok(false) => {}
                 Err(e) => {
                     tracing::debug!("revocation record rejected: {e}");
@@ -3800,6 +3809,7 @@ async fn apply_v2_revocation_records(
     records: Vec<revocation::RevocationRecord>,
     subject_certs: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: &groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: &owner_trust::OwnerTrust,
 ) {
@@ -3822,8 +3832,11 @@ async fn apply_v2_revocation_records(
             };
             let is_share_grant =
                 matches!(record.subject, revocation::RevokedSubject::ShareGrant(_));
+            // ADR 0110 §1: the S4 hook needs the record after the insert.
+            let hook_record = record.clone();
             match set.verify_and_insert_at(record, subject_cert, Agent::unix_timestamp_secs()) {
                 Ok(true) => {
+                    s4_intake.note_verified(&hook_record);
                     inserted = true;
                     share_grant_inserted |= is_share_grant;
                 }
@@ -3855,6 +3868,7 @@ async fn apply_v2_revocation_records(
 struct LegacyCertRecovery {
     records: Vec<revocation::RevocationRecord>,
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: owner_trust::OwnerTrust,
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
@@ -3869,6 +3883,7 @@ struct LegacyCertRecovery {
 struct V2CertRecovery {
     records: Vec<revocation::RevocationRecord>,
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: owner_trust::OwnerTrust,
 }
@@ -4394,6 +4409,7 @@ fn spawn_cert_recovery_task(
                     batch.records,
                     fetched.found,
                     &batch.revocation_set,
+                    &batch.s4_intake,
                     batch.identity_dir,
                     &batch.owner_trust,
                     &batch.contact_store,
@@ -4407,6 +4423,7 @@ fn spawn_cert_recovery_task(
                     batch.records,
                     fetched.found,
                     &batch.revocation_set,
+                    &batch.s4_intake,
                     batch.identity_dir,
                     &batch.owner_trust,
                 )
@@ -6521,6 +6538,8 @@ pub(crate) async fn ingest_share_grant_revocations(
             {
                 continue;
             }
+            // ADR 0110 §1: this route inserts ShareGrant subjects only, so
+            // the S4 hook (Agent subjects) has nothing to schedule here.
             match set.verify_and_insert_at(record, None, Agent::unix_timestamp_secs()) {
                 Ok(true) => inserted = true,
                 Ok(false) => {}
@@ -13335,6 +13354,7 @@ impl Agent {
         // #926: every share-grant revocation insert takes the redelivery
         // outbox's barrier (see `share_grant::outbox`).
         let owner_trust_for_listener = self.owner_trust.clone();
+        let s4_intake_for_listener = self.s4_revocation_intake.clone();
         let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
         // L3 fetch-on-miss: the listener resolves V3 cert digests from the
         // blob cache (hit) or fires a background fetch (miss) — never
@@ -13680,6 +13700,7 @@ impl Agent {
                                 CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                                     records,
                                     revocation_set: revocation_set.clone(),
+                                    s4_intake: s4_intake_for_listener.clone(),
                                     identity_dir: identity_dir_for_listener.clone(),
                                     owner_trust: owner_trust_for_listener.clone(),
                                     contact_store: contact_store_for_evict.clone(),
@@ -13692,6 +13713,7 @@ impl Agent {
                                 records,
                                 found,
                                 &revocation_set,
+                                &s4_intake_for_listener,
                                 identity_dir_for_listener.clone(),
                                 &owner_trust_for_listener,
                                 &contact_store_for_evict,
@@ -13797,6 +13819,7 @@ impl Agent {
                                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                                     records,
                                     revocation_set: revocation_set.clone(),
+                                    s4_intake: s4_intake_for_listener.clone(),
                                     identity_dir: identity_dir_for_listener.clone(),
                                     owner_trust: owner_trust_for_listener.clone(),
                                 })),
@@ -13806,6 +13829,7 @@ impl Agent {
                                 records,
                                 found,
                                 &revocation_set,
+                                &s4_intake_for_listener,
                                 identity_dir_for_listener.clone(),
                                 &owner_trust_for_listener,
                             )
@@ -15912,6 +15936,12 @@ impl Agent {
         true
     }
 
+    /// ADR 0110 §1: the S4 intake queue fed by the revocation choke point.
+    #[must_use]
+    pub fn s4_revocation_intake(&self) -> groups::eviction::RevocationIntake {
+        self.s4_revocation_intake.clone()
+    }
+
     /// Return the shared revocation set.
     ///
     /// Callers that need to publish a new revocation record should call
@@ -16078,12 +16108,20 @@ impl Agent {
                 .share_grant_revocation_barrier(std::iter::once(&record), &self.revocation_set)
                 .await;
             let mut set = self.revocation_set.write().await;
-            if let Err(e) =
-                set.verify_and_insert_at(record.clone(), subject_cert, Self::unix_timestamp_secs())
-            {
-                return Err(error::IdentityError::CertificateVerification(format!(
-                    "revocation rejected: {e}"
-                )));
+            match set.verify_and_insert_at(
+                record.clone(),
+                subject_cert,
+                Self::unix_timestamp_secs(),
+            ) {
+                // ADR 0110 §1: the S4 post-verification hook for local
+                // revocations (`revoke_as_owner`, self-revocation).
+                Ok(true) => self.s4_revocation_intake.note_verified(&record),
+                Ok(false) => {}
+                Err(e) => {
+                    return Err(error::IdentityError::CertificateVerification(format!(
+                        "revocation rejected: {e}"
+                    )));
+                }
             }
         }
         persist_completed_revocation_rebuild(&self.revocation_set, self.identity_dir.as_deref())
@@ -22005,6 +22043,14 @@ impl AgentBuilder {
         let mut revocation_loaded =
             storage::load_revocation_set(self.identity_dir.as_deref()).await;
         revocation_loaded.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+        // ADR 0110 §1: every loaded record was verified by
+        // `verify_and_insert` while the store decoded. The S4 worker
+        // reconciles them against the loaded rosters (read-only until its
+        // host-commit gate).
+        let s4_revocation_intake = groups::eviction::RevocationIntake::new();
+        for record in revocation_loaded.all_records() {
+            s4_revocation_intake.note_loaded(&record);
+        }
         let revocation_set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation_loaded));
 
         // ADR-0043: load-or-generate this machine's ML-KEM-768 enrollment
@@ -22403,6 +22449,7 @@ impl AgentBuilder {
             own_cert_pair: announce_blob::shared_cert_pair(own_pair_user, own_pair_cert),
             dm_inbox_service: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             revocation_set,
+            s4_revocation_intake,
             identity_dir: self.identity_dir,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             tracked_tasks: std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
@@ -35037,6 +35084,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records: records.clone(),
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -35054,6 +35102,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
             })),
@@ -35158,6 +35207,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner.clone(),
                 })),
@@ -35261,6 +35311,7 @@ mod tests {
                     CertRecoveryApply::V2(Box::new(V2CertRecovery {
                         records: Vec::new(),
                         revocation_set: std::sync::Arc::clone(&rig.set),
+                        s4_intake: groups::eviction::RevocationIntake::new(),
                         identity_dir: None,
                         owner_trust: rig.owner.clone(),
                     })),
@@ -35306,6 +35357,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: signed.clone(),
                 revocation_set: std::sync::Arc::clone(&rig.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: rig.owner.clone(),
             })),
@@ -35343,6 +35395,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: signed,
                 revocation_set: std::sync::Arc::clone(&rig.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: rig.owner.clone(),
             })),
@@ -35371,6 +35424,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&rig.set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: rig.owner.clone(),
                 })),
@@ -35407,6 +35461,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![later],
                 revocation_set: std::sync::Arc::clone(&rig.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: rig.owner.clone(),
             })),
@@ -35445,6 +35500,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![fat_record],
                 revocation_set: std::sync::Arc::clone(&fat.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: fat.owner.clone(),
             })),
@@ -35487,6 +35543,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![matching_record],
                 revocation_set: std::sync::Arc::clone(&matching_fat.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: matching_fat.owner.clone(),
             })),
@@ -35662,6 +35719,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -35677,6 +35735,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records,
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust,
             })),
@@ -35779,6 +35838,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -35796,6 +35856,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m1.clone(), pending_record],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -35812,6 +35873,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m2.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -35846,6 +35908,7 @@ mod tests {
             view[0].records.clone(),
             view[0].found.clone(),
             &set,
+            &groups::eviction::RevocationIntake::new(),
             None,
             &owner_trust,
         )
@@ -35864,6 +35927,7 @@ mod tests {
             vec![record_m1, record_m2],
             only_a,
             &negative,
+            &groups::eviction::RevocationIntake::new(),
             None,
             &owner_trust,
         )
@@ -35986,6 +36050,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36001,6 +36066,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m2.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -36017,6 +36083,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m1.clone(), pending_record],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust,
             })),
@@ -36146,6 +36213,7 @@ mod tests {
                     CertRecoveryApply::V2(Box::new(V2CertRecovery {
                         records,
                         revocation_set: std::sync::Arc::clone(&set),
+                        s4_intake: groups::eviction::RevocationIntake::new(),
                         identity_dir: None,
                         owner_trust: owner_trust.clone(),
                     })),
@@ -36440,6 +36508,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: vec![record],
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36456,6 +36525,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36745,6 +36815,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36760,6 +36831,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m1.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -36776,6 +36848,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m2.clone(), record_y.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -36884,6 +36957,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -37015,6 +37089,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records: held_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -37047,6 +37122,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: waiting_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
             })),
@@ -37154,6 +37230,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records: occupier_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -37188,6 +37265,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: waiter_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
             })),

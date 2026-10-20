@@ -9,12 +9,14 @@
 mod control_blob;
 mod direct_metadata_lanes;
 mod fair_admission;
+mod revocation_eviction;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
 pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
 pub(in crate::server) use fair_admission::FairAdmission;
+pub(in crate::server) use revocation_eviction::{run_revocation_eviction_worker, S4Runtime};
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
@@ -45591,6 +45593,7 @@ pub(in crate::server) mod tests {
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
+            revocation_evictions: S4Runtime::default(),
             ws_sessions: RwLock::new(HashMap::new()),
             ws_topics: RwLock::new(HashMap::new()),
             ws_outbound_stats: Arc::new(WsOutboundStats::default()),

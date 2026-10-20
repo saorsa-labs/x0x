@@ -1217,6 +1217,7 @@ pub async fn serve_with_options(
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
+        revocation_evictions: routes::named_groups::S4Runtime::default(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -2226,6 +2227,11 @@ pub async fn serve_with_options(
                 .await;
         }));
     }
+
+    // ADR 0110 S4: revocation eviction, designated first.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
+    ));
 
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route

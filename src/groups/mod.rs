@@ -14,6 +14,7 @@ pub mod card;
 pub mod diagnostics;
 pub mod directory;
 pub mod discovery;
+pub mod eviction;
 pub mod invite;
 pub mod kem_envelope;
 pub mod kv_context;
