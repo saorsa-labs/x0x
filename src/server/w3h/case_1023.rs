@@ -61,31 +61,42 @@
 //!   states: the authority reports `evidence_pending` for each missing
 //!   digest, and a capable joiner shows `awaiting_evidence` with the same
 //!   digests. The joiner's attempt does not end at its 120 s poll deadline
-//!   (D64). So the case polls every 5 s for 150 s (`HOLDER_GAP`). It scans
-//!   `/groups/{gid}` at A for the typed wait, and `/groups/{gid}` and
+//!   (D64). ADR 0111 H3 brings the holder back at minute 12, after the
+//!   10-minute #946 terminal refusal (`CERT_EVIDENCE_DEADLINE_MS`), and
+//!   requires no terminal refusal before then. So the case polls every 5 s
+//!   for 720 s (`HOLDER_GAP`) after J's join call. It reads `/groups/{gid}`
+//!   at A for the typed wait, and `/groups/{gid}` and
 //!   `/groups/{gid}/join-status` at J. It reads A's roster from
-//!   `/groups/{gid}/members` but does not scan it, because it lists seat
-//!   digests. One body shows a typed wait when it contains the state name
-//!   and names every missing digest (as hex or base64). An S5
-//!   implementation must expose the typed states on one of the scanned
-//!   routes. Evidence (red test only): J is not admitted during the gap,
-//!   and A holds none of the missing bytes at its end. On `main`, A's seal refuses
-//!   with `OwnerCertMemberPending` naming exactly A's digest-only seats,
-//!   A and J show no typed state, and J's attempt ends `timed_out` at
-//!   120 s.
+//!   `/groups/{gid}/members`. Every read must answer with the expected
+//!   HTTP status and body shape; any other answer is INFRA, never a
+//!   verdict. A typed wait is a parsed JSON object, not a substring: an
+//!   object whose tag field (`state`, `status`, `cause`, `type`,
+//!   `join_state` or `wait`) is exactly the state name, or an object keyed
+//!   by the state name, with its own `digest` or `digests` field. Each
+//!   digest must decode to 32 bytes (hex or base64). Subtrees under
+//!   `error` and `message` are not read. A shows `evidence_pending` when
+//!   the digests of its typed objects are exactly the missing set. J shows
+//!   `awaiting_evidence` when one typed object names exactly the missing
+//!   set. An S5 implementation must expose the typed states on one of
+//!   these routes. Evidence (red test only): J is not admitted during the
+//!   gap, and A holds none of the missing bytes at its end. On `main`, A's
+//!   seal refuses with `OwnerCertMemberPending` naming exactly A's
+//!   digest-only seats, and A and J show no typed state.
 //! - After the gap (red test only, ADR 0111 H3): the X device that holds
 //!   every missing certificate comes back and A dials it. If J's attempt
 //!   is still pending, the attempt must resume by itself. Otherwise J
 //!   redeems the same invite again. A must hold every missing certificate
-//!   within 60 s, and J must become Active within 120 s.
+//!   within 60 s, and J must become Active within 120 s. No terminal
+//!   refusal may come before the return: J shows no `refused` outcome, and
+//!   A records no `certificate_evidence_unavailable` refusal for G.
 //!
 //! Three tests share the scenario:
 //! - `w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes`:
 //!   every eligible holder is offline, then one returns. FINAL
 //!   `typed_retryable_wait_then_j_active_after_holder_returns` needs A's
 //!   typed `evidence_pending`, J's typed `awaiting_evidence`, no end of J's
-//!   attempt during the gap, A's bytes within 60 s of the return and J
-//!   Active after it. RED on `main`. The cause is the
+//!   attempt and no terminal refusal during the gap, A's bytes within 60 s
+//!   of the return and J Active after it. RED on `main`. The cause is the
 //!   `OwnerCertMemberPending` refusal above, with no typed wait at A or J.
 //! - `w3h_1023_restart_one_holder_online_admits`: the control. One X
 //!   device that holds every missing certificate stays online after A's
@@ -93,14 +104,15 @@
 //!   restart and the setup are the same in all tests, so only the offline
 //!   holders make the red case red.
 //! - `w3h_1023_control_holders_never_return_fail_closed`: every holder
-//!   stays offline for 330 s (`NEVER_WINDOW`, the span of the red test).
-//!   FINAL `fail_closed_never_admitted_never_silently_dropped`: J is never
+//!   stays offline for 900 s (`NEVER_WINDOW`, the span of the red test),
+//!   past the same minute-12 boundary. FINAL
+//!   `fail_closed_never_admitted_never_silently_dropped`: J is never
 //!   admitted and A never holds any of the missing bytes (both fail FINAL,
-//!   not INFRA, in this test), and at every poll J's
-//!   join-status shows a pending attempt or a typed outcome (`timed_out`,
-//!   or a refusal). ADR 0088 L4 keeps the wait fail-closed. GREEN on
-//!   `main` (pending, then `timed_out` at 120 s) and GREEN under a correct
-//!   S5 (pending throughout).
+//!   not INFRA, in this test), and at every poll J's join-status shows a
+//!   pending attempt or a typed outcome (`timed_out`, or a refusal such as
+//!   the 10-minute `certificate_evidence_unavailable`). ADR 0088 L4 keeps
+//!   the wait fail-closed. GREEN on `main` and GREEN under a correct S5
+//!   (pending throughout). The receipt names the first terminal refusal.
 
 #![cfg(test)]
 
@@ -112,7 +124,7 @@ use crate::identity::{AgentId, UserKeypair};
 use crate::network::sim::{Fault, Write};
 use anyhow::ensure;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const LABELS: &[&str] = &["O", "X1", "X2", "X3", "A", "J"];
@@ -124,19 +136,30 @@ const SEAL_REFUSAL: &str = "failed to seal authoritative add";
 const PENDING_CAUSE: &str = "pending certificate resolution";
 /// How often the case reads the wait states of A and J.
 const POLL: Duration = secs(5);
-/// How long every holder stays offline after J's join: past J's 120 s
-/// join-result poll deadline (ADR 0111 §8, D64).
-const HOLDER_GAP: Duration = secs(150);
+/// When `main` stages the #946 terminal refusal after continuous seal
+/// refusals (`CERT_EVIDENCE_DEADLINE_MS`, `seat_cert_fetch.rs`).
+const TERMINAL_REFUSAL: Duration = secs(600);
+/// The reason of that terminal refusal.
+const TERMINAL_REASON: &str = "certificate_evidence_unavailable";
+/// How long every holder stays offline after J's join: ADR 0111 H3's
+/// minute 12. This is past J's 120 s join-result poll deadline (ADR 0111
+/// §8, D64) and past `TERMINAL_REFUSAL`.
+const HOLDER_GAP: Duration = secs(720);
+const _: () = assert!(HOLDER_GAP.as_secs() > TERMINAL_REFUSAL.as_secs());
 /// ADR 0111 H3: A holds the certificates within 60 s of the holder's start.
 const RETURN_FETCH: Duration = secs(60);
 /// How long J has to become Active after A holds the certificates.
 const RETURN_ADMIT: Duration = secs(120);
-/// The never-return control covers the same span as the red test.
+/// The never-return control covers the same span as the red test (900 s).
 const NEVER_WINDOW: Duration = HOLDER_GAP
     .saturating_add(RETURN_FETCH)
     .saturating_add(RETURN_ADMIT);
 /// J's `join_state` while its attempt waits for the authority.
 const JOIN_PENDING: &str = "pending_authority_commit";
+/// The authority's typed wait for a missing digest (ADR 0111 §8).
+const EVIDENCE_PENDING: &str = "evidence_pending";
+/// A capable joiner's typed wait (ADR 0111 §8).
+const AWAITING_EVIDENCE: &str = "awaiting_evidence";
 /// The #946 answer domain (`seat_cert_fetch::GROUP_CERT_FETCH_RESPONSE_DOMAIN`).
 /// It leads the pubsub payload in clear.
 const FETCH_RESPONSE_DOMAIN: &[u8] = b"x0x/group-cert-fetch-response-v1\0";
@@ -296,7 +319,9 @@ async fn seat_view(sim: &Sim, label: &str, gid: &str) -> Result<SeatView> {
 
 /// Whether `label` is an eligible holder of each digest: an active member
 /// of G that holds bytes for it, on the matching seat or in its
-/// durable announce cache. The result lists the digests it holds.
+/// durable announce cache. The result lists the digests it holds. A node
+/// with no entry for G is an error: every node that the case reads this
+/// way joined G during the setup.
 async fn held_digests(
     sim: &Sim,
     label: &str,
@@ -307,25 +332,26 @@ async fn held_digests(
     let local = sim.agent_hex(label)?;
     let gid = gid.to_string();
     let digests = digests.to_vec();
-    sim.at_instant(&format!("read {label}'s certificate bytes"), async move {
+    let what = format!("read {label}'s certificate bytes");
+    let label = label.to_string();
+    sim.at_instant(&what, async move {
         let (active, on_seats) = {
             let groups = state.named_groups.read().await;
-            match crate::server::resolve_group_entry_locked(&groups, &gid) {
-                Some((_, info)) => (
-                    info.has_active_member(&local),
-                    info.members_v2
-                        .values()
-                        .filter_map(|seat| {
-                            let cert = seat.certificate.as_ref()?;
-                            let digest = seat.certificate_digest.as_ref()?;
-                            crate::groups::owner_cert::certificate_digest_hex(cert)
-                                .eq_ignore_ascii_case(digest)
-                                .then(|| digest.to_ascii_lowercase())
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                None => (false, Vec::new()),
-            }
+            let (_, info) = crate::server::resolve_group_entry_locked(&groups, &gid)
+                .with_context(|| format!("{label} has no entry for G"))?;
+            (
+                info.has_active_member(&local),
+                info.members_v2
+                    .values()
+                    .filter_map(|seat| {
+                        let cert = seat.certificate.as_ref()?;
+                        let digest = seat.certificate_digest.as_ref()?;
+                        crate::groups::owner_cert::certificate_digest_hex(cert)
+                            .eq_ignore_ascii_case(digest)
+                            .then(|| digest.to_ascii_lowercase())
+                    })
+                    .collect::<Vec<_>>(),
+            )
         };
         let mut held = Vec::new();
         for digest in digests {
@@ -342,18 +368,21 @@ async fn held_digests(
                 held.push(digest);
             }
         }
-        (active, held)
+        Ok((active, held))
     })
-    .await
+    .await?
 }
 
 fn parse_digest(digest: &str) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(hex::decode(digest).ok()?).ok()
 }
 
-/// Whether `label` is on the fabric now.
+/// Whether `label` is on the fabric now. A node that the fabric does not
+/// know is an error.
 fn online(sim: &Sim, label: &str) -> Result<bool> {
-    Ok(sim.fabric().is_online(&sim.peer(label)?).unwrap_or(false))
+    sim.fabric()
+        .is_online(&sim.peer(label)?)
+        .with_context(|| format!("{label} is not on the fabric"))
 }
 
 /// One join `fetch_request` from J that A's DM layer handed to its
@@ -504,22 +533,35 @@ async fn binding_verified(sim: &Sim, observer: &str, subject: &str) -> Result<bo
 }
 
 /// `subject` re-announces (`POST /announce`); whether `observer` then
-/// verifies `subject`'s machine binding within 30 s.
+/// verifies `subject`'s machine binding within 30 s. A failed read is an
+/// error, not "not verified".
 async fn announce_and_wait_verified(sim: &Sim, subject: &str, observer: &str) -> Result<bool> {
     let (status, body) = sim
         .api(subject, Method::POST, "/announce", Some(json!({})))
         .await?;
     ensure!(status.is_success(), "{subject} announce: {status} {body}");
     let what = format!("{observer} verifies {subject}'s binding");
-    match sim
+    let mut verified = false;
+    let mut failure = None;
+    let waited = sim
         .until(&what, secs(30), async |s: &Sim| {
-            binding_verified(s, observer, subject)
-                .await
-                .unwrap_or(false)
+            match binding_verified(s, observer, subject).await {
+                Ok(now) => {
+                    verified = now;
+                    now
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            }
         })
-        .await
-    {
-        Ok(()) => Ok(true),
+        .await;
+    if let Some(error) = failure {
+        return Err(error.context(format!("INFRA: reading whether {what}")));
+    }
+    match waited {
+        Ok(()) => Ok(verified),
         Err(error) if expired(&error) => Ok(false),
         Err(error) => Err(error),
     }
@@ -665,100 +707,280 @@ fn refused_members(text: &str) -> Option<Vec<String>> {
     Some(members)
 }
 
-/// The forms in which a read route can name `digest`. The S5 encoding is
-/// not fixed, so lowercase hex, uppercase hex and each base64 alphabet of
-/// the 32 bytes count.
-fn digest_forms(digest: &str) -> Vec<String> {
+/// The fields whose string value names a typed state of the object that
+/// holds them.
+const TAG_KEYS: &[&str] = &["state", "status", "cause", "type", "join_state", "wait"];
+/// Subtrees that the typed-state parse does not read: error text is not
+/// a typed state.
+const SKIPPED_KEYS: &[&str] = &["error", "message"];
+
+/// One digest decoded to its 32 bytes: 64 hex digits, or base64 (standard
+/// or URL-safe, padded or not). `None` for any other text.
+fn decode_digest(text: &str) -> Option<[u8; 32]> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     use base64::Engine as _;
-    let mut forms = vec![digest.to_ascii_lowercase(), digest.to_ascii_uppercase()];
-    if let Some(bytes) = parse_digest(digest) {
-        for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
-            forms.push(engine.encode(bytes));
+    if text.len() == 64 {
+        if let Some(bytes) = parse_digest(text) {
+            return Some(bytes);
         }
     }
-    forms
+    [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| <[u8; 32]>::try_from(engine.decode(text).ok()?).ok())
 }
 
-/// Whether `body` shows the typed state `marker` and names every digest.
-fn names_every(body: &serde_json::Value, marker: &str, digests: &[String]) -> bool {
-    let text = body.to_string();
-    text.contains(marker)
-        && digests
-            .iter()
-            .all(|digest| digest_forms(digest).iter().any(|form| text.contains(form)))
+/// The digests that one typed object names in its own `digest` and
+/// `digests` fields. `None` when it names none, or when one field has the
+/// wrong type or a digest does not decode: such an object is not a typed
+/// state.
+fn own_digests(object: &serde_json::Map<String, serde_json::Value>) -> Option<BTreeSet<[u8; 32]>> {
+    let mut digests = BTreeSet::new();
+    if let Some(one) = object.get("digest") {
+        digests.insert(decode_digest(one.as_str()?)?);
+    }
+    if let Some(many) = object.get("digests") {
+        for digest in many.as_array()? {
+            digests.insert(decode_digest(digest.as_str()?)?);
+        }
+    }
+    (!digests.is_empty()).then_some(digests)
+}
+
+/// The digest set of each typed `state` object in `body`. A typed object
+/// has a tag field (`TAG_KEYS`) whose value is exactly `state`, or it is
+/// the value of a `state` key (externally tagged). Its digests are its
+/// own `digest`/`digests` fields. Subtrees under `SKIPPED_KEYS` are not
+/// read.
+fn typed_digest_sets(body: &serde_json::Value, state: &str) -> Vec<BTreeSet<[u8; 32]>> {
+    let mut found = Vec::new();
+    let mut stack = vec![body];
+    while let Some(value) = stack.pop() {
+        match value {
+            serde_json::Value::Object(object) => {
+                let tagged = TAG_KEYS
+                    .iter()
+                    .any(|key| object.get(*key).and_then(|tag| tag.as_str()) == Some(state));
+                if tagged {
+                    found.extend(own_digests(object));
+                }
+                if let Some(serde_json::Value::Object(inner)) = object.get(state) {
+                    found.extend(own_digests(inner));
+                }
+                stack.extend(
+                    object
+                        .iter()
+                        .filter(|(key, _)| !SKIPPED_KEYS.contains(&key.as_str()))
+                        .map(|(_, child)| child),
+                );
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The missing digests as bytes. A digest that does not decode is an
+/// error: the case read every digest from A's own seats.
+fn digest_set(digests: &[String]) -> Result<BTreeSet<[u8; 32]>> {
+    digests
+        .iter()
+        .map(|digest| parse_digest(digest).with_context(|| format!("bad seat digest {digest}")))
+        .collect()
+}
+
+/// Whether the typed `state` objects in `body` together name exactly
+/// `want` (the authority reports one object per missing digest).
+fn shows_all(body: &serde_json::Value, state: &str, want: &BTreeSet<[u8; 32]>) -> bool {
+    let sets = typed_digest_sets(body, state);
+    !sets.is_empty() && sets.into_iter().flatten().collect::<BTreeSet<_>>() == *want
+}
+
+/// Whether one typed `state` object in `body` names exactly `want` (the
+/// joiner reports one wait naming every digest).
+fn shows_one(body: &serde_json::Value, state: &str, want: &BTreeSet<[u8; 32]>) -> bool {
+    typed_digest_sets(body, state).iter().any(|set| set == want)
+}
+
+/// J's `last_join_outcome`.
+struct JoinOutcome {
+    outcome: String,
+    reason: Option<String>,
+}
+
+impl JoinOutcome {
+    fn text(&self) -> String {
+        match &self.reason {
+            Some(reason) => format!("{} ({reason})", self.outcome),
+            None => self.outcome.clone(),
+        }
+    }
 }
 
 /// One read of the wait states of A and J during the holder gap.
 struct Snapshot {
-    /// A shows `evidence_pending` naming every missing digest.
+    /// A shows `evidence_pending` naming exactly the missing digests.
     a_typed: bool,
-    /// J shows `awaiting_evidence` naming every missing digest.
+    /// J shows `awaiting_evidence` naming exactly the missing digests.
     j_typed: bool,
     a_lists_j: bool,
     j_active: bool,
-    /// J's `join_state`; `None` when the join-status body has none.
+    /// J's `join_state`; `None` when join-status answered 404.
     join_state: Option<String>,
     /// J's join-status answered 404: the local stub is gone.
     stub_gone: bool,
-    /// J's `last_join_outcome`, with its reason when it has one.
-    outcome: Option<String>,
+    /// J's `last_join_outcome`.
+    outcome: Option<JoinOutcome>,
+    /// How many #946 terminal refusals A recorded for G.
+    a_terminal: u64,
 }
 
-/// Read the group routes at A and J once. A 404 counts as "nothing
-/// shown"; a failed request is an error.
-async fn snapshot(sim: &Sim, gid: &str, digests: &[String]) -> Result<Snapshot> {
+/// GET `path` at `label`: the status and the body, which must be a JSON
+/// object.
+async fn get_object(
+    sim: &Sim,
+    label: &str,
+    path: &str,
+) -> Result<(StatusCode, serde_json::Map<String, serde_json::Value>)> {
+    let (status, body) = sim.request(label, Method::GET, path, None).await?;
+    match body {
+        serde_json::Value::Object(object) => Ok((status, object)),
+        other => bail!("{label} GET {path}: {status}: body is not an object: {other}"),
+    }
+}
+
+fn str_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    object.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// The `last_join_outcome` of a join-status body: absent or null, or an
+/// object with a string `outcome` and an optional string `reason`. Any
+/// other shape is an error.
+fn join_outcome(
+    path: &str,
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<JoinOutcome>> {
+    let last = match body.get("last_join_outcome") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Object(last)) => last,
+        Some(other) => bail!("J GET {path}: last_join_outcome is not an object: {other}"),
+    };
+    let outcome = str_field(last, "outcome")
+        .with_context(|| format!("J GET {path}: last_join_outcome has no outcome: {last:?}"))?;
+    let reason = match last.get("reason") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(reason)) => Some(reason.clone()),
+        Some(other) => bail!("J GET {path}: reason is not a string: {other}"),
+    };
+    Ok(Some(JoinOutcome {
+        outcome: outcome.to_string(),
+        reason,
+    }))
+}
+
+/// How many #946 terminal refusals (`TERMINAL_REASON`) A recorded for G,
+/// from A's groups diagnostics (`record_invite_refusal`).
+async fn a_terminal_refusals(sim: &Sim, gid: &str) -> Result<u64> {
+    let a = sim.state("A")?;
+    let gid = gid.to_string();
+    sim.at_instant("read A's #946 terminal refusals for G", async move {
+        let groups = a.named_groups.read().await;
+        let (key, _) = crate::server::resolve_group_entry_locked(&groups, &gid)
+            .context("A has no entry for G")?;
+        let key = key.to_string();
+        let snapshot = a.groups_diagnostics.snapshot(
+            &groups,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            a.groups_config.mandate_grace_days,
+        );
+        Ok(snapshot
+            .groups
+            .iter()
+            .filter(|row| row.group_id == key || row.group_id == gid)
+            .map(|row| {
+                row.counters
+                    .invites_refused_reasons
+                    .get(TERMINAL_REASON)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum())
+    })
+    .await?
+}
+
+/// Read the group routes at A and J once. Each read must answer with its
+/// route's status and body shape. J's two routes may answer 404 with the
+/// handler's not-found body (J's stub is gone). Any other answer is an
+/// error, so a broken read is INFRA, never "nothing shown".
+async fn snapshot(sim: &Sim, gid: &str, want: &BTreeSet<[u8; 32]>) -> Result<Snapshot> {
     let j_hex = sim.agent_hex("J")?;
-    // A's typed wait is read from `/groups/{gid}` only: the members body
-    // lists seat digests, so a marker elsewhere in it would match falsely.
-    let (_, group) = sim
-        .request("A", Method::GET, &format!("/groups/{gid}"), None)
-        .await?;
-    let a_typed = names_every(&group, "evidence_pending", digests);
-    let (status, members) = sim
-        .request("A", Method::GET, &format!("/groups/{gid}/members"), None)
-        .await?;
+    let group_path = format!("/groups/{gid}");
+    let status_path = format!("/groups/{gid}/join-status");
+    let (status, a_group) = get_object(sim, "A", &group_path).await?;
     ensure!(
-        status.is_success(),
-        "A GET /groups/{gid}/members: {status} {members}"
+        status == StatusCode::OK && str_field(&a_group, "group_id") == Some(gid),
+        "A GET {group_path}: {status} {a_group:?}"
     );
-    let a_lists_j = members["members"]
-        .as_array()
-        .with_context(|| format!("A GET /groups/{gid}/members: no members array: {members}"))?
+    let a_typed = shows_all(&serde_json::Value::Object(a_group), EVIDENCE_PENDING, want);
+    let a_lists_j = roster(sim, "A", gid)
+        .await?
         .iter()
-        .any(|row| {
-            row["agent_id"]
-                .as_str()
-                .is_some_and(|id| id.eq_ignore_ascii_case(&j_hex))
-        });
-    let (status, group) = sim
-        .request("J", Method::GET, &format!("/groups/{gid}"), None)
-        .await?;
-    let j_active = status.is_success() && group["membership_state"] == "active";
-    let (status, join) = sim
-        .request(
-            "J",
-            Method::GET,
-            &format!("/groups/{gid}/join-status"),
-            None,
+        .any(|(id, _)| id.eq_ignore_ascii_case(&j_hex));
+    let (status, j_group) = get_object(sim, "J", &group_path).await?;
+    let j_membership = if status == StatusCode::OK {
+        ensure!(
+            str_field(&j_group, "group_id") == Some(gid),
+            "J GET {group_path}: wrong group: {j_group:?}"
+        );
+        Some(
+            str_field(&j_group, "membership_state")
+                .with_context(|| format!("J GET {group_path}: no membership_state: {j_group:?}"))?
+                .to_string(),
         )
-        .await?;
-    let last = &join["last_join_outcome"];
-    let outcome = last["outcome"]
-        .as_str()
-        .map(|outcome| match last["reason"].as_str() {
-            Some(reason) => format!("{outcome} ({reason})"),
-            None => outcome.to_string(),
-        });
+    } else {
+        ensure!(
+            status == StatusCode::NOT_FOUND
+                && j_group.get("ok") == Some(&serde_json::Value::Bool(false))
+                && str_field(&j_group, "error") == Some("group not found"),
+            "J GET {group_path}: {status} {j_group:?}"
+        );
+        None
+    };
+    let (status, join) = get_object(sim, "J", &status_path).await?;
+    let join_state = if status == StatusCode::OK {
+        Some(
+            str_field(&join, "join_state")
+                .with_context(|| format!("J GET {status_path}: no join_state: {join:?}"))?
+                .to_string(),
+        )
+    } else {
+        ensure!(
+            status == StatusCode::NOT_FOUND
+                && str_field(&join, "error") == Some("group_not_found")
+                && !join.contains_key("join_state"),
+            "J GET {status_path}: {status} {join:?}"
+        );
+        None
+    };
+    let outcome = join_outcome(&status_path, &join)?;
+    let j_group = serde_json::Value::Object(j_group);
+    let join = serde_json::Value::Object(join);
     Ok(Snapshot {
         a_typed,
-        j_typed: names_every(&group, "awaiting_evidence", digests)
-            || names_every(&join, "awaiting_evidence", digests),
+        j_typed: shows_one(&j_group, AWAITING_EVIDENCE, want)
+            || shows_one(&join, AWAITING_EVIDENCE, want),
         a_lists_j,
-        j_active,
-        join_state: join["join_state"].as_str().map(str::to_string),
+        j_active: j_membership.as_deref() == Some("active"),
+        join_state,
         stub_gone: status == StatusCode::NOT_FOUND,
         outcome,
+        a_terminal: a_terminal_refusals(sim, gid).await?,
     })
 }
 
@@ -777,8 +999,13 @@ struct WaitWindow {
     silent_drop: Option<(Duration, String)>,
     /// The first poll at which A held any missing digest, and how many.
     a_held: Option<(Duration, usize)>,
+    /// The first poll at which J showed a `refused` outcome or A had
+    /// recorded the #946 terminal refusal for G, and what it showed.
+    terminal_refusal: Option<(Duration, String)>,
     /// At the last poll, J's attempt was pending with no outcome.
     j_pending_now: bool,
+    /// The time of the last poll.
+    last_poll: Option<Duration>,
     /// J's state at each change.
     timeline: Vec<(Duration, String)>,
 }
@@ -786,6 +1013,21 @@ struct WaitWindow {
 impl WaitWindow {
     fn record(&mut self, since: Duration, snap: &Snapshot) {
         self.polls += 1;
+        self.last_poll = Some(since);
+        let j_refused = snap
+            .outcome
+            .as_ref()
+            .filter(|outcome| outcome.outcome == "refused");
+        if self.terminal_refusal.is_none() && (j_refused.is_some() || snap.a_terminal > 0) {
+            self.terminal_refusal = Some((
+                since,
+                format!(
+                    "J outcome: {}; A {TERMINAL_REASON} refusals for G: {}",
+                    j_refused.map_or("none".to_string(), JoinOutcome::text),
+                    snap.a_terminal
+                ),
+            ));
+        }
         if snap.a_typed {
             self.a_typed_at.get_or_insert(since);
         }
@@ -801,11 +1043,12 @@ impl WaitWindow {
         // A correct S5 joiner may report its typed wait as the join state
         // itself (ADR 0111 §8), so that state also counts as pending.
         let pending = snap.j_typed
-            || snap
-                .join_state
-                .as_deref()
-                .is_some_and(|state| state == JOIN_PENDING || state.contains("awaiting_evidence"));
+            || matches!(
+                snap.join_state.as_deref(),
+                Some(JOIN_PENDING | AWAITING_EVIDENCE)
+            );
         self.j_pending_now = pending && snap.outcome.is_none();
+        let outcome = snap.outcome.as_ref().map(JoinOutcome::text);
         let state = format!(
             "join_state={} outcome={}{}",
             match (&snap.join_state, snap.stub_gone) {
@@ -813,7 +1056,7 @@ impl WaitWindow {
                 (None, true) => "stub gone (404)",
                 (None, false) => "none",
             },
-            snap.outcome.as_deref().unwrap_or("none"),
+            outcome.as_deref().unwrap_or("none"),
             if snap.j_active { " active" } else { "" }
         );
         if !snap.j_active {
@@ -838,15 +1081,19 @@ impl WaitWindow {
         joined_at: Duration,
         until: Duration,
     ) -> Result<()> {
+        let want = digest_set(digests)?;
         loop {
             let since = sim.fabric().now().saturating_sub(joined_at);
             let snap = sim
                 .within(
                     &format!("read the wait states at t2+{}s", since.as_secs()),
                     secs(10),
-                    snapshot(sim, gid, digests),
+                    snapshot(sim, gid, &want),
                 )
-                .await??;
+                .await?
+                .with_context(|| {
+                    format!("INFRA: reading the wait states at t2+{}s", since.as_secs())
+                })?;
             self.record(since, &snap);
             let (_, held) = held_digests(sim, "A", gid, digests).await?;
             if !held.is_empty() && self.a_held.is_none() {
@@ -1190,7 +1437,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             at(sim),
         ),
         Some(label) => {
-            let (_, online_held) = holders.get(label).cloned().unwrap_or_default();
+            let (_, online_held) = holders
+                .get(label)
+                .cloned()
+                .with_context(|| format!("no holder read for {label}"))?;
             receipt.evidence(
                 "a_bytes_after_its_restart_come_only_from_the_online_holder",
                 a_held.iter().all(|digest| online_held.contains(digest)),
@@ -1208,7 +1458,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let mut online_holders = Vec::new();
     let mut offline_holders = 0usize;
     for label in HOLDERS {
-        let (active, held) = holders.get(label).cloned().unwrap_or_default();
+        let (active, held) = holders
+            .get(label)
+            .cloned()
+            .with_context(|| format!("no holder read for {label}"))?;
         let up = online(sim, label)?;
         if active && !held.is_empty() {
             if up {
@@ -1330,8 +1583,8 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     refusal.is_some(),
                     at(sim),
                 );
-                let a_rows = roster(sim, "A", &home.gid).await.unwrap_or_default();
-                let j_state = membership_state(sim, "J", &home.gid).await.ok().flatten();
+                let a_rows = roster(sim, "A", &home.gid).await?;
+                let j_state = membership_state(sim, "J", &home.gid).await?;
                 sim.fabric().mark(format!(
                     "observed: A lists {} members, J membership_state={j_state:?}",
                     a_rows.len()
@@ -1426,6 +1679,18 @@ async fn holder_returns(
 ) -> Result<bool> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let since_join = |sim: &Sim| sim.fabric().now().saturating_sub(ret.joined_at).as_secs();
+    // ADR 0111 H3: the holder returns at minute 12, after the 10-minute
+    // terminal refusal, and never before.
+    let gap = sim.fabric().now().saturating_sub(ret.joined_at);
+    ensure!(
+        window.last_poll.is_some_and(|last| last >= HOLDER_GAP) && gap >= HOLDER_GAP,
+        "INFRA: the holder would return at t2+{}s (last poll {}), before the {}s gap",
+        gap.as_secs(),
+        at_text(window.last_poll),
+        HOLDER_GAP.as_secs()
+    );
+    // The last read before the return: A's #946 terminal refusals for G.
+    let terminal_before_return = a_terminal_refusals(sim, ret.gid).await?;
     sim.set_online(ret.holder, true)?;
     sim.fabric()
         .mark(format!("holder {} returns after the gap", ret.holder));
@@ -1494,6 +1759,19 @@ async fn holder_returns(
             },
         ),
         (
+            "no_terminal_refusal_before_return",
+            window.terminal_refusal.is_none() && terminal_before_return == 0,
+            match &window.terminal_refusal {
+                Some((since, how)) => format!("first at t2+{}s: {how}", since.as_secs()),
+                None => format!(
+                    "none in {} polls over {}s; A {TERMINAL_REASON} refusals for G at the \
+                     return: {terminal_before_return}",
+                    window.polls,
+                    HOLDER_GAP.as_secs()
+                ),
+            },
+        ),
+        (
             "a_holds_within_60s",
             a_holds.is_some(),
             a_holds.map_or(
@@ -1523,11 +1801,15 @@ async fn holder_returns(
     if !passed {
         let typed_absent = window.a_typed_at.is_none() && window.j_typed_at.is_none();
         let summary = format!(
-            "J's attempt end: {}; A held the bytes after the return: {}; J active after \
-             the return: {j_active}",
+            "J's attempt end: {}; terminal refusal: {}; A held the bytes after the return: \
+             {}; J active after the return: {j_active}",
             match &ended_in_gap {
                 Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
                 None => "none during the gap".to_string(),
+            },
+            match &window.terminal_refusal {
+                Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
+                None => "none before the return".to_string(),
             },
             a_holds.map_or("no".to_string(), |took| format!(
                 "yes, after {}s",
@@ -1564,11 +1846,19 @@ async fn never_return(
     window
         .poll_until(sim, gid, missing, joined_at, NEVER_WINDOW)
         .await?;
+    ensure!(
+        window
+            .last_poll
+            .is_some_and(|last| last >= NEVER_WINDOW && last > HOLDER_GAP),
+        "INFRA: the never-return polls ended at {}, before {}s",
+        at_text(window.last_poll),
+        NEVER_WINDOW.as_secs()
+    );
     let (_, held) = held_digests(sim, "A", gid, missing).await?;
     receipt.note(format!(
         "{} polls over {}s; J admitted: {:?}; J silently dropped: {:?}; A first held \
          bytes: {:?}; A holds {} of {} missing digests at the end; A typed wait first at \
-         {}; J typed wait first at {}",
+         {}; J typed wait first at {}; first terminal refusal (fail-closed, allowed): {:?}",
         window.polls,
         NEVER_WINDOW.as_secs(),
         window.admitted,
@@ -1577,7 +1867,8 @@ async fn never_return(
         held.len(),
         missing.len(),
         at_text(window.a_typed_at),
-        at_text(window.j_typed_at)
+        at_text(window.j_typed_at),
+        window.terminal_refusal
     ));
     receipt.note(format!("J's states: {}", window.timeline()));
     Ok(window.admitted.is_none()
@@ -1598,13 +1889,19 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
     );
     receipt.note(format!(
         "arm {arm:?}, FINAL {}: with every holder offline the case polls A \
-         (/groups/{{gid}}) and J (/groups/{{gid}}, /join-status) every {}s \
-         for {}s; a typed wait is evidence_pending at A and awaiting_evidence at J, \
-         each naming every missing digest (ADR 0088 §1 L3, §2 item 8; ADR 0111 §8, \
-         H3). The holder returns after the gap in the red test only",
+         (/groups/{{gid}}, /members, #946 refusal counter) and J (/groups/{{gid}}, \
+         /join-status) every {}s for {}s (the red test, ADR 0111 H3 minute 12, past \
+         the {}s terminal refusal) or {}s (the never-return control). Every read must \
+         answer with its route's status and body shape, or the run is INFRA. A typed \
+         wait is a parsed object tagged evidence_pending at A or awaiting_evidence at \
+         J whose own digest/digests fields name exactly the missing digests (ADR 0088 \
+         §1 L3, §2 item 8; ADR 0111 §8, H3). The holder returns after the gap in the \
+         red test only",
         arm.final_name(),
         POLL.as_secs(),
-        HOLDER_GAP.as_secs()
+        HOLDER_GAP.as_secs(),
+        TERMINAL_REFUSAL.as_secs(),
+        NEVER_WINDOW.as_secs()
     ));
     receipt.note(
         "sim byte streams (EvidenceV1 hello, SyncV1 owner sync) are in-memory \
@@ -1693,4 +1990,98 @@ fn w3h_1023_refused_members_parses_the_seal_refusal() {
         Some(vec!["aa".to_string(), "bb".to_string()])
     );
     assert_eq!(refused_members("no refusal here"), None);
+}
+
+#[cfg(test)]
+fn typed_fixture() -> (String, String, BTreeSet<[u8; 32]>) {
+    let (one, two) = ([0x11_u8; 32], [0x22_u8; 32]);
+    (
+        hex::encode(one),
+        hex::encode(two),
+        BTreeSet::from([one, two]),
+    )
+}
+
+#[test]
+fn w3h_1023_typed_state_name_in_error_text_does_not_match() {
+    let (one, two, want) = typed_fixture();
+    let body = json!({
+        "ok": false,
+        "error": format!("evidence_pending for {one} and {two}"),
+        "message": {"state": "evidence_pending", "digests": [one, two]},
+    });
+    assert!(!shows_all(&body, EVIDENCE_PENDING, &want));
+    assert!(!shows_one(&body, EVIDENCE_PENDING, &want));
+}
+
+#[test]
+fn w3h_1023_typed_digest_in_unrelated_field_does_not_match() {
+    let (one, two, want) = typed_fixture();
+    // The state tag and the digests are in different objects.
+    let body = json!({
+        "status": "evidence_pending",
+        "members": [{"agent_id": "aa", "certificate_digest": one, "digest_of": two}],
+        "wait": {"state": "awaiting_evidence"},
+        "digests": "not an array",
+    });
+    assert!(!shows_all(&body, EVIDENCE_PENDING, &want));
+    assert!(!shows_one(&body, AWAITING_EVIDENCE, &want));
+}
+
+#[test]
+fn w3h_1023_typed_tagged_node_with_exact_digests_matches() {
+    use base64::Engine as _;
+    let (one, two, want) = typed_fixture();
+    let b64 = |hex_digest: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(parse_digest(hex_digest).unwrap_or_default())
+    };
+    // The authority: one object per digest, hex and base64.
+    let authority = json!({
+        "group_id": "g",
+        "evidence": [
+            {"state": "evidence_pending", "kind": "certificate", "digest": one},
+            {"state": "evidence_pending", "kind": "certificate", "digest": b64(&two)},
+        ],
+    });
+    assert!(shows_all(&authority, EVIDENCE_PENDING, &want));
+    // The joiner: one wait that names every digest.
+    let joiner =
+        json!({"join_state": "awaiting_evidence", "digests": [b64(&one), two], "since": 1});
+    assert!(shows_one(&joiner, AWAITING_EVIDENCE, &want));
+}
+
+#[test]
+fn w3h_1023_typed_wrong_or_partial_digest_set_does_not_match() {
+    let (one, two, want) = typed_fixture();
+    let other = hex::encode([0x33_u8; 32]);
+    let partial = json!({"state": "evidence_pending", "digest": one});
+    assert!(!shows_all(&partial, EVIDENCE_PENDING, &want));
+    let extra = json!([
+        {"state": "evidence_pending", "digest": one},
+        {"state": "evidence_pending", "digest": two},
+        {"state": "evidence_pending", "digest": other},
+    ]);
+    assert!(!shows_all(&extra, EVIDENCE_PENDING, &want));
+    let split = json!([
+        {"join_state": "awaiting_evidence", "digests": [one]},
+        {"join_state": "awaiting_evidence", "digests": [two]},
+    ]);
+    assert!(!shows_one(&split, AWAITING_EVIDENCE, &want));
+    let undecodable = json!({"state": "awaiting_evidence", "digests": [one, two, "zz"]});
+    assert!(!shows_one(&undecodable, AWAITING_EVIDENCE, &want));
+    let wrong_state = json!({"state": "evidence_pendingx", "digests": [one, two]});
+    assert!(!shows_one(&wrong_state, EVIDENCE_PENDING, &want));
+}
+
+#[test]
+fn w3h_1023_typed_externally_tagged_form_matches() {
+    let (one, two, want) = typed_fixture();
+    let body = json!({
+        "last_join_outcome": null,
+        "attempt": {"awaiting_evidence": {"digests": [one, two], "since": 7}},
+    });
+    assert!(shows_one(&body, AWAITING_EVIDENCE, &want));
+    let authority = json!({"evidence_pending": {"digest": one}, "more": [{"evidence_pending": {"digest": two}}]});
+    assert!(shows_all(&authority, EVIDENCE_PENDING, &want));
 }
