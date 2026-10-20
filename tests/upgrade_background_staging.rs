@@ -342,3 +342,409 @@ macro_rules! background_permit_regression_tests {
         }
     };
 }
+
+// Production-used ingress drivers and owner. Fixtures replace only verified
+// discovery input and publication I/O; receipts, admission and custody are real.
+#[allow(unused_macros)]
+macro_rules! background_driver_regression_tests {
+    () => {
+        #[cfg(unix)]
+        mod background_driver_regressions {
+            use super::*;
+            use sha2::Digest;
+            use std::collections::{BTreeMap, VecDeque};
+            use std::future::Future;
+            use std::pin::Pin;
+            use std::sync::Mutex as StdMutex;
+            use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+
+            type Driver = Pin<Box<dyn Future<Output = ()>>>;
+            struct Fixture {
+                submit: BackgroundSubmit,
+                owner: Option<BackgroundOwner>,
+                shutdown: Option<watch::Sender<bool>>,
+                shutdown_watch: watch::Receiver<bool>,
+                processed: UnboundedReceiver<(String, SubmitOutcome)>,
+                observed: UnboundedReceiver<crate::upgrade::staging::Decision>,
+                operations: UnboundedReceiver<bool>,
+                applied: UnboundedReceiver<String>,
+                attempts: Arc<StdMutex<Vec<String>>>,
+                apply_lock: Arc<Mutex<()>>,
+                install: PathBuf,
+                data: PathBuf,
+                identity: PathBuf,
+                window: u64,
+                timestamp: u64,
+                _readback: restart::systemd_readback_seam::Guard,
+                _apply: crate::upgrade::apply::apply_attempt_seam::Guard,
+                _root: tempfile::TempDir,
+            }
+
+            impl Fixture {
+                fn new(window: u64) -> Self {
+                    let base = std::env::var_os("X0X_UPGRADE_STAGING_EVIDENCE_DIR")
+                        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join(".planning/upgrade-staging-fixtures"));
+                    std::fs::create_dir_all(&base).unwrap();
+                    let root = tempfile::Builder::new().prefix("background-driver-").tempdir_in(base).unwrap();
+                    let data = root.path().join("data");
+                    let identity = root.path().join("identity");
+                    std::fs::create_dir(&data).unwrap();
+                    std::fs::create_dir(&identity).unwrap();
+                    let data = data.canonicalize().unwrap();
+                    let identity = identity.canonicalize().unwrap();
+                    let (mut startup, shutdown) = e2e_startup_runtime(&data);
+                    startup.staging.identity_root = identity.clone();
+                    let install = startup.staging.install.clone();
+                    std::fs::write(data.join("SKILL.md"), b"original guide").unwrap();
+                    let (observed_tx, observed) = mpsc::unbounded_channel();
+                    startup.staging.observed = Some(Arc::new(move |decision| {
+                        let _ = observed_tx.send(decision);
+                    }));
+                    let readback = restart::systemd_readback_seam::install(staging_readback(
+                        one_call_scenario("0", "5"), &startup,
+                    ));
+                    let (operation_tx, operations) = mpsc::unbounded_channel();
+                    let (applied_tx, applied) = mpsc::unbounded_channel();
+                    let attempts = Arc::new(StdMutex::new(Vec::new()));
+                    let counted = Arc::clone(&attempts);
+                    let expected_install = install.clone();
+                    let expected_data = data.clone();
+                    let apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                        assert_eq!(plan.executable, expected_install);
+                        assert_eq!(plan.data_root, expected_data);
+                        counted.lock().unwrap().push(manifest.version.clone());
+                        let _ = applied_tx.send(manifest.version.clone());
+                        x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
+                    }));
+                    let apply_lock = Arc::clone(&startup.upgrade_apply_lock);
+                    let shutdown_watch = startup.shutdown_watch.clone();
+                    let (mut submit, owner) = background_channel(BackgroundRuntime {
+                        config: DaemonUpdateConfig { rollout_window_minutes: window, ..Default::default() },
+                        data_dir: data.clone(), api_addr: SocketAddr::from(([127, 0, 0, 1], 12700)),
+                        shutdown: (Arc::new(|| panic!("fixture must never restart")), startup.shutdown_watch),
+                        apply_lock: Arc::clone(&apply_lock), staging: startup.staging,
+                        operation_observer: Some(Arc::new(move |entered| { let _ = operation_tx.send(entered); })),
+                    });
+                    let (processed_tx, processed) = mpsc::unbounded_channel();
+                    submit.processed = Some(Arc::new(move |version, outcome| {
+                        let _ = processed_tx.send((version, outcome));
+                    }));
+                    Self { submit, owner: Some(owner), shutdown: Some(shutdown), shutdown_watch,
+                        processed, observed, operations, applied, attempts, apply_lock,
+                        install, data, identity, window,
+                        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                        _readback: readback, _apply: apply, _root: root }
+                }
+
+                fn release(&self, version: &str) -> crate::upgrade::monitor::VerifiedRelease {
+                    let mut manifest = manifest_for_this_platform(version);
+                    manifest.timestamp = self.timestamp;
+                    manifest.skill_sha256 = sha2::Sha256::digest(b"original guide").into();
+                    let bytes = serde_json::to_vec(&manifest).unwrap();
+                    crate::upgrade::monitor::VerifiedRelease {
+                        manifest, manifest_json: bytes.clone(), signature: Vec::new(), gossip_payload: bytes,
+                    }
+                }
+
+                fn request(&self, release: &crate::upgrade::monitor::VerifiedRelease) -> crate::upgrade::staging::StagingRequest {
+                    crate::upgrade::staging::StagingRequest {
+                        install: self.install.clone(), data_root: self.data.clone(), identity_root: self.identity.clone(),
+                        machine_id: [42; 32], version: release.manifest.version.clone(),
+                        manifest_sha256: sha2::Sha256::digest(&release.manifest_json).into(),
+                        archive_sha256: release.manifest.assets[0].archive_sha256, window_minutes: self.window,
+                    }
+                }
+
+                fn gossip(&self) -> (UnboundedSender<crate::upgrade::monitor::VerifiedRelease>, Driver) {
+                    let (send, receive) = mpsc::unbounded_channel();
+                    let releases = futures::stream::unfold(receive, |mut receive| async {
+                        receive.recv().await.map(|value| (value, receive))
+                    });
+                    let future = run_gossip_update_driver(releases, self.submit.clone(),
+                        Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                        |_| async { Ok(()) }, self.shutdown_watch.clone());
+                    (send, Box::pin(future))
+                }
+
+                fn fallback(&self, queued: Arc<StdMutex<VecDeque<crate::upgrade::monitor::VerifiedRelease>>>,
+                    checks: Arc<AtomicU64>) -> Driver {
+                    let submit = self.submit.clone();
+                    let shutdown = self.shutdown_watch.clone();
+                    Box::pin(async move {
+                        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                        ticker.tick().await;
+                        let ticks = futures::stream::unfold(ticker, |mut ticker| async {
+                            ticker.tick().await; Some(((), ticker))
+                        });
+                        run_fallback_update_driver(ticks, move || {
+                            checks.fetch_add(1, Ordering::SeqCst);
+                            let release = queued.lock().unwrap().pop_front();
+                            async move { Ok(release) }
+                        }, submit, Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                            |_| async { Ok(()) }, shutdown).await;
+                    })
+                }
+
+                fn bytes(&self) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
+                    std::fs::read_dir(&self.data).unwrap().map(|entry| entry.unwrap())
+                        .filter(|entry| entry.file_type().unwrap().is_file())
+                        .map(|entry| (entry.file_name(), std::fs::read(entry.path()).unwrap())).collect()
+                }
+
+                fn stop(&mut self) { self.shutdown.as_ref().unwrap().send(true).unwrap(); }
+            }
+
+            async fn event<F: Future<Output = ()>, T>(mut running: Pin<&mut F>,
+                events: &mut UnboundedReceiver<T>) -> T {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    assert!(std::time::Instant::now() < deadline, "actual background event deadline");
+                    tokio::select! {
+                        biased;
+                        result = running.as_mut() => panic!("background owner/drivers ended before event: {result:?}"),
+                        event = events.recv() => return event.expect("actual event producer remains alive"),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
+            }
+
+            async fn finish<F: Future<Output = ()>>(mut running: Pin<&mut F>) {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                loop {
+                    assert!(std::time::Instant::now() < deadline, "actual background completion deadline");
+                    tokio::select! {
+                        biased;
+                        _ = running.as_mut() => return,
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn background_gossip_drains_duplicates_and_supersedes_before_due_once() {
+                let mut fixture = Fixture::new(60);
+                let mut older = fixture.release("9.9.9");
+                older.manifest.skill_url = "inert-guide://must-not-download-before-due".into();
+                older.manifest.skill_sha256 = sha2::Sha256::digest(b"candidate guide").into();
+                older.manifest_json = serde_json::to_vec(&older.manifest).unwrap();
+                older.gossip_payload = older.manifest_json.clone();
+                let older_request = fixture.request(&older);
+                let newer = fixture.release("9.9.10");
+                let newer_request = fixture.request(&newer);
+                let older_json = older.manifest_json.clone();
+                let (download_tx, mut download_rx) = tokio::sync::oneshot::channel();
+                let _guide = skill_download_seam::install(async move {
+                    let _ = download_tx.send(());
+                    std::future::pending::<Vec<u8>>().await
+                });
+                let (input, driver) = fixture.gossip();
+                let owner = fixture.owner.take().unwrap();
+                let running = async { tokio::join!(owner.run(), driver); };
+                tokio::pin!(running);
+                input.send(older).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.9".into(), SubmitOutcome::Accepted));
+                assert_eq!(event(running.as_mut(), &mut fixture.observed).await,
+                    crate::upgrade::staging::Decision::Waiting(Duration::from_secs(3260)));
+                let old_path = crate::upgrade::staging::receipt_path(&older_request).unwrap();
+                let old_bytes = std::fs::read(&old_path).unwrap();
+                assert!(fixture.apply_lock.try_lock().is_ok());
+                assert!(fixture.attempts.lock().unwrap().is_empty());
+                assert!(download_rx.try_recv().is_err(), "guide download must wait with the release");
+                let duplicate_manifest = serde_json::from_slice(&older_json).unwrap();
+                input.send(crate::upgrade::monitor::VerifiedRelease {
+                    manifest: duplicate_manifest, manifest_json: older_json.clone(),
+                    signature: Vec::new(), gossip_payload: older_json,
+                }).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.9".into(), SubmitOutcome::Duplicate));
+                assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+                assert!(fixture.observed.try_recv().is_err(), "duplicate cannot restart a waiter");
+                input.send(newer).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.10".into(), SubmitOutcome::Accepted));
+                assert_eq!(event(running.as_mut(), &mut fixture.observed).await,
+                    crate::upgrade::staging::Decision::Waiting(Duration::from_secs(1276)));
+                assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+                assert!(crate::upgrade::staging_selection::check_request(&older_request).is_err());
+                let newer_receipt = crate::upgrade::staging::read_receipt(&newer_request).unwrap().unwrap();
+                assert_eq!(newer_receipt.first_receipt_ms, 1000);
+                assert_eq!(newer_receipt.chosen_delay, Duration::from_secs(1276));
+                input.send(fixture.release("9.9.9")).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.9".into(), SubmitOutcome::Older));
+                tokio::time::advance(Duration::from_secs(1276)).await;
+                assert_eq!(event(running.as_mut(), &mut fixture.applied).await, "9.9.10");
+                input.send(fixture.release("9.9.10")).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.10".into(), SubmitOutcome::Duplicate));
+                fixture.stop();
+                finish(running.as_mut()).await;
+                assert_eq!(*fixture.attempts.lock().unwrap(), vec!["9.9.10".to_owned()]);
+                assert_eq!(std::fs::read(&fixture.install).unwrap(), b"owned startup staging executable fixture");
+                assert_eq!(std::fs::read(fixture.data.join("SKILL.md")).unwrap(), b"original guide");
+                assert!(download_rx.try_recv().is_err(), "superseded guide was never downloaded");
+                assert_eq!(std::fs::read(old_path).unwrap(), old_bytes);
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn background_fallback_keeps_checking_while_first_receipt_waits() {
+                let mut fixture = Fixture::new(60);
+                let first = fixture.release("9.9.9");
+                let request = fixture.request(&first);
+                let queued = Arc::new(StdMutex::new(VecDeque::from([
+                    first, fixture.release("9.9.9"), fixture.release("9.9.10"),
+                ])));
+                let checks = Arc::new(AtomicU64::new(0));
+                let driver = fixture.fallback(Arc::clone(&queued), Arc::clone(&checks));
+                let owner = fixture.owner.take().unwrap();
+                let running = async { tokio::join!(owner.run(), driver); };
+                tokio::pin!(running);
+                // Poll once to establish the real interval before advancing it.
+                std::future::poll_fn(|cx| {
+                    assert!(running.as_mut().poll(cx).is_pending()); std::task::Poll::Ready(())
+                }).await;
+                tokio::time::advance(Duration::from_secs(60)).await;
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.9".into(), SubmitOutcome::Accepted));
+                assert_eq!(event(running.as_mut(), &mut fixture.observed).await,
+                    crate::upgrade::staging::Decision::Waiting(Duration::from_secs(3260)));
+                let first = crate::upgrade::staging::read_receipt(&request).unwrap().unwrap();
+                assert_eq!(first.first_receipt_ms, 61_000);
+                tokio::time::advance(Duration::from_secs(60)).await;
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.9".into(), SubmitOutcome::Duplicate));
+                assert_eq!(checks.load(Ordering::SeqCst), 2);
+                assert!(fixture.attempts.lock().unwrap().is_empty());
+                assert!(fixture.apply_lock.try_lock().is_ok());
+                let retained = crate::upgrade::staging::read_receipt(&request).unwrap().unwrap();
+                assert_eq!(retained.first_receipt_ms, first.first_receipt_ms);
+                assert_eq!(retained.chosen_delay, first.chosen_delay);
+                tokio::time::advance(Duration::from_secs(60)).await;
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.10".into(), SubmitOutcome::Accepted));
+                assert_eq!(checks.load(Ordering::SeqCst), 3);
+                // Wait for the newer real barrier before shutdown, so no
+                // detached observation can make a later byte snapshot vacuous.
+                loop {
+                    let decision = event(running.as_mut(), &mut fixture.observed).await;
+                    if decision == crate::upgrade::staging::Decision::Waiting(Duration::from_secs(1276)) { break; }
+                    assert!(matches!(decision, crate::upgrade::staging::Decision::Waiting(_)));
+                }
+                fixture.stop();
+                finish(running.as_mut()).await;
+                let preserved = fixture.bytes();
+                tokio::time::advance(Duration::from_secs(7200)).await;
+                assert_eq!(fixture.bytes(), preserved);
+                assert!(fixture.attempts.lock().unwrap().is_empty());
+                assert_eq!(checks.load(Ordering::SeqCst), 3);
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn background_shared_drivers_coalesce_while_cancelled_worker_drains() {
+                let mut fixture = Fixture::new(60);
+                let held = crate::upgrade::acquire_host_upgrade_lock(&fixture.install).unwrap();
+                let original = fixture.bytes();
+                let first = fixture.release("9.9.9");
+                let mut superseded = vec![fixture.request(&first)];
+                let from_poll = fixture.release("9.9.10");
+                superseded.push(fixture.request(&from_poll));
+                let queued = Arc::new(StdMutex::new(VecDeque::from([from_poll])));
+                let checks = Arc::new(AtomicU64::new(0));
+                let fallback = fixture.fallback(queued, Arc::clone(&checks));
+                let (input, gossip) = fixture.gossip();
+                let owner = fixture.owner.take().unwrap();
+                let running = async { tokio::join!(owner.run(), gossip, fallback); };
+                tokio::pin!(running);
+                input.send(first).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.9".into(), SubmitOutcome::Accepted));
+                assert!(event(running.as_mut(), &mut fixture.operations).await,
+                    "real first blocking operation must enter before lock release");
+                assert_eq!(fixture.bytes(), original);
+                tokio::time::advance(Duration::from_secs(60)).await;
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.10".into(), SubmitOutcome::Accepted));
+                assert_eq!(checks.load(Ordering::SeqCst), 1);
+                assert!(fixture.operations.try_recv().is_err(), "poll submission cannot start another queued worker");
+                for version in ["9.9.11", "9.9.12", "9.9.99"] {
+                    let release = fixture.release(version);
+                    if version != "9.9.99" { superseded.push(fixture.request(&release)); }
+                    input.send(release).unwrap();
+                    assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                        (version.into(), SubmitOutcome::Accepted));
+                    assert!(fixture.operations.try_recv().is_err(),
+                        "new discovery must coalesce, not spawn another blocked worker");
+                    assert_eq!(fixture.bytes(), original);
+                }
+                assert!(fixture.apply_lock.try_lock().is_ok());
+                assert!(fixture.attempts.lock().unwrap().is_empty());
+                drop(held);
+                // Callbacks run inside actual blocking closures: the old exit
+                // precedes entry of the sole coalesced replacement observation.
+                assert!(!event(running.as_mut(), &mut fixture.operations).await);
+                assert!(event(running.as_mut(), &mut fixture.operations).await);
+                assert!(!event(running.as_mut(), &mut fixture.operations).await);
+                assert_eq!(event(running.as_mut(), &mut fixture.observed).await,
+                    crate::upgrade::staging::Decision::Waiting(Duration::from_secs(2890)));
+                for request in superseded {
+                    assert!(!crate::upgrade::staging::receipt_path(&request).unwrap().exists(),
+                        "cancelled/coalesced release {} must not acquire a first receipt", request.version);
+                }
+                let latest = fixture.request(&fixture.release("9.9.99"));
+                let receipt = crate::upgrade::staging::read_receipt(&latest).unwrap().unwrap();
+                assert_eq!(receipt.first_receipt_ms, 61_000, "queued time is not durable wait");
+                assert_eq!(receipt.chosen_delay, Duration::from_secs(2890));
+                assert_eq!(crate::upgrade::staging_selection::read_selection(&latest).unwrap().unwrap().release.version,
+                    "9.9.99");
+                assert!(fixture.operations.try_recv().is_err());
+                fixture.stop();
+                finish(running.as_mut()).await;
+                assert!(fixture.attempts.lock().unwrap().is_empty());
+                assert_eq!(std::fs::read(&fixture.install).unwrap(), b"owned startup staging executable fixture");
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn background_shutdown_closed_watch_and_drop_refuse_queued_record_writes() {
+                for mode in ["signal", "closed", "drop"] {
+                    let mut fixture = Fixture::new(60);
+                    let held = crate::upgrade::acquire_host_upgrade_lock(&fixture.install).unwrap();
+                    let original = fixture.bytes();
+                    let (input, driver) = fixture.gossip();
+                    let owner = fixture.owner.take().unwrap();
+                    let mut running = Some(Box::pin(async { tokio::join!(owner.run(), driver); }));
+                    input.send(fixture.release("9.9.9")).unwrap();
+                    assert_eq!(event(running.as_mut().unwrap().as_mut(), &mut fixture.processed).await,
+                        ("9.9.9".into(), SubmitOutcome::Accepted));
+                    assert!(event(running.as_mut().unwrap().as_mut(), &mut fixture.operations).await);
+                    match mode {
+                        "signal" => fixture.stop(),
+                        "closed" => drop(fixture.shutdown.take()),
+                        "drop" => drop(running.take()),
+                        _ => unreachable!(),
+                    }
+                    if let Some(running) = running.as_mut() { finish(running.as_mut()).await; }
+                    assert_eq!(fixture.bytes(), original);
+                    drop(held);
+                    // Await the actual abandoned blocking closure's exit. A
+                    // cancelled owner return alone does not prove disk custody.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                    loop {
+                        assert!(std::time::Instant::now() < deadline, "cancelled worker exit bound");
+                        match fixture.operations.try_recv() {
+                            Ok(entered) => { assert!(!entered, "shutdown must not start another worker"); break; }
+                            Err(mpsc::error::TryRecvError::Empty) => tokio::task::yield_now().await,
+                            Err(error) => panic!("worker exit witness lost: {error}"),
+                        }
+                    }
+                    assert_eq!(fixture.bytes(), original, "late record write after {mode}");
+                    assert!(fixture.attempts.lock().unwrap().is_empty());
+                    assert!(fixture.submit.submit(fixture.release("9.9.10")).is_err());
+                    assert!(fixture.operations.try_recv().is_err());
+                    assert!(fixture.observed.try_recv().is_err());
+                }
+            }
+        }
+    };
+}
