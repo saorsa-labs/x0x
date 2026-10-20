@@ -106,6 +106,9 @@ pub mod streams;
 /// Local port-forwarder over tailnet byte-streams (tailnet Phase 1, #132 T4).
 pub mod forward;
 
+/// SOCKS5 front-end over ForwardV2 (ADR-0074 §3 / #1389).
+pub mod socks;
+
 /// Contact store with trust levels for message filtering.
 pub mod contacts;
 

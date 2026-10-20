@@ -366,7 +366,10 @@ mod tests {
             allow: Vec::new(),
             owner_allow: vec![crate::connect::acl::ConnectOwnerEntry {
                 description: None,
-                targets: targets.iter().map(|t| t.parse().unwrap()).collect(),
+                targets: targets
+                    .iter()
+                    .map(|t| crate::connect::acl::OwnerTarget::Exact(t.parse().unwrap()))
+                    .collect(),
             }],
             grant_allow: Vec::new(),
         })

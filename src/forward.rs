@@ -2043,6 +2043,158 @@ impl ForwardService {
             }
         }
     }
+
+    /// ADR-0074 §3: open a ForwardV2 tunnel for SOCKS without bridging yet.
+    ///
+    /// On [`Ok`], the peer's connect gate allowed `127.0.0.1:port` and the
+    /// caller should send the SOCKS success reply then [`PreparedSocksTunnel::bridge`].
+    /// [`PrepareSocksError::Denied`] means the peer refused and zero bytes
+    /// reached the target.
+    pub async fn prepare_socks_tunnel(
+        &self,
+        peer: &AgentId,
+        target_port: u16,
+    ) -> Result<PreparedSocksTunnel, PrepareSocksError> {
+        prepare_outbound_v2_for_socks(&self.agent, peer, "127.0.0.1", target_port, &self.live).await
+    }
+}
+
+/// Outcome of [`ForwardService::prepare_socks_tunnel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareSocksError {
+    /// Peer connect gate denied the target (SOCKS `0x02`).
+    Denied,
+    /// Stream open / attestation / transport failure (SOCKS `0x04`).
+    Failed,
+}
+
+/// A peer stream that has cleared the remote connect gate and is ready to bridge.
+pub struct PreparedSocksTunnel {
+    stream: PeerStream,
+    guard: teardown::LiveStreamGuard,
+}
+
+impl PreparedSocksTunnel {
+    /// Bridge `client` to the prepared peer stream until either side closes.
+    pub async fn bridge(self, tcp: TcpStream) {
+        let PreparedSocksTunnel { stream, guard } = self;
+        if guard.token().is_cancelled() {
+            let mut stream = stream;
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return;
+        }
+        let (send, recv) = stream.into_split();
+        bridge(tcp, send, recv, guard.token()).await;
+    }
+}
+
+/// Open ForwardV2, write the attested header, read the peer response.
+/// Does not take a local TCP — the SOCKS layer writes its reply first.
+async fn prepare_outbound_v2_for_socks(
+    agent: &Arc<crate::Agent>,
+    peer_agent: &AgentId,
+    target_host: &str,
+    target_port: u16,
+    live: &Arc<teardown::LiveStreams>,
+) -> Result<PreparedSocksTunnel, PrepareSocksError> {
+    let mut stream = match agent
+        .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                error = %e,
+                "socks prepare: could not open ForwardV2"
+            );
+            return Err(PrepareSocksError::Failed);
+        }
+    };
+    let guard = live.register(
+        teardown::StreamGate::Outbound {
+            peer_agent: *peer_agent,
+            machine: stream.peer(),
+        },
+        teardown::StreamAuthority::PeerTrust,
+    );
+    agent.stream_reauth_signal().notify_one();
+    if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+        return Err(PrepareSocksError::Failed);
+    }
+    match wait_signing_gate_or_cancel(guard.token(), agent.signing_gate_allows(&agent.agent_id()))
+        .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            return Err(PrepareSocksError::Failed);
+        }
+        Ok(false) => {
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            return Err(PrepareSocksError::Failed);
+        }
+        Ok(true) => {}
+    }
+    let mut header = ForwardV2Header::new(
+        target_host.to_string(),
+        target_port,
+        agent.agent_id(),
+        agent
+            .identity()
+            .agent_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+        stream.peer(),
+    );
+    if header.sign(agent.identity().agent_keypair()).is_err() {
+        teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+        return Err(PrepareSocksError::Failed);
+    }
+    match teardown::wait_cancellable(guard.token(), write_header_v2(stream.send_mut(), &header))
+        .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            return Err(PrepareSocksError::Failed);
+        }
+        Ok(Err(_)) => {
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            return Err(PrepareSocksError::Failed);
+        }
+        Ok(Ok(())) => {}
+    }
+    let mut resp = [0u8; 1];
+    match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            return Err(PrepareSocksError::Failed);
+        }
+        Ok(Err(_)) => {
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            return Err(PrepareSocksError::Failed);
+        }
+        Ok(Ok(())) => {}
+    }
+    if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+        return Err(PrepareSocksError::Failed);
+    }
+    match response_connected(resp[0]) {
+        Some(true) => Ok(PreparedSocksTunnel { stream, guard }),
+        Some(false) => {
+            // Peer denied — reset the QUIC halves; target got zero bytes.
+            teardown::deny_pre_bridge(&mut stream, None);
+            drop(guard);
+            Err(PrepareSocksError::Denied)
+        }
+        None => {
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            Err(PrepareSocksError::Failed)
+        }
+    }
 }
 
 /// Outbound driver: open the peer stream, write the header, read the peer's
@@ -4419,7 +4571,7 @@ mod tests {
             owner_allow: Vec::new(),
             grant_allow: vec![ConnectOwnerEntry {
                 description: None,
-                targets: vec![target],
+                targets: vec![crate::connect::acl::OwnerTarget::Exact(target)],
             }],
         });
 

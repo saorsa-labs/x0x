@@ -715,6 +715,11 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
         .history
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid [history] configuration: {e}"))?;
+    // ADR-0074 §3: non-loopback SOCKS binds are a hard refuse at load time.
+    config
+        .socks
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid [socks] configuration: {e}"))?;
     Ok((config, findings.warning_lines()))
 }
 

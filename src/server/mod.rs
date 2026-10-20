@@ -1005,6 +1005,54 @@ pub async fn serve_with_options(
         None
     };
 
+    // ADR-0074 §3: optional loopback SOCKS5 listener. Needs ForwardService
+    // (CONNECT opens ForwardV2). Non-loopback listen was refused at config load.
+    let socks_cancel = tokio_util::sync::CancellationToken::new();
+    let socks_service = if config.socks.enabled() {
+        match &forward_service {
+            Some(fs) => {
+                let connector = std::sync::Arc::new(x0x::socks::ForwardSocksConnector::new(
+                    std::sync::Arc::clone(fs),
+                ));
+                match x0x::socks::SocksService::spawn(
+                    &config.socks,
+                    std::sync::Arc::new(api_token.clone()),
+                    connector,
+                    socks_cancel.clone(),
+                )
+                .await
+                {
+                    Ok(svc) => {
+                        tracing::info!(
+                            listen = %config.socks.listen.expect("enabled ⇒ listen set"),
+                            "SOCKS5 listener started (ADR-0074 §3)"
+                        );
+                        Some(svc)
+                    }
+                    Err(e) => {
+                        return Err(finish_startup_error(
+                            &exec_service,
+                            &agent,
+                            &shutdown_notify,
+                            forward_service.as_deref(),
+                            &mut startup_tasks,
+                            anyhow::anyhow!("failed to bind SOCKS5 listener: {e}"),
+                        )
+                        .await);
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "socks.listen is set but connect ACL is disabled — SOCKS5 not started"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ADR-0012 Phase 4: restore live TreeKEM groups from on-disk snapshots.
     // Must happen before the AppState is built so secure endpoints see the
     // groups immediately. Done with `named_groups` still owned (it is moved
@@ -1250,6 +1298,7 @@ pub async fn serve_with_options(
         acl_admin: Arc::clone(&acl_admin),
         connect_diagnostics,
         forward_service,
+        socks_service,
         owner_sync,
         startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
         startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
@@ -2955,6 +3004,9 @@ pub async fn serve_with_options(
         //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
             forwarder.shutdown();
+        }
+        if let Some(socks) = &state.socks_service {
+            socks.shutdown();
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
         //    Agent's shutdown token and close its tracked-task registry NOW,
