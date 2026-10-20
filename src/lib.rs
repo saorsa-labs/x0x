@@ -18947,14 +18947,16 @@ impl Agent {
         // returns false, preserving compatibility with pre-#130 peers.
         let expired = identity::is_expired(cert_not_after, now_secs);
 
+        // ADR-0074 §4: reauth shares this body — never block on evidence.
         let trust_decision = Some(
             owner_trust
-                .evaluate_pair(
+                .evaluate_pair_with(
                     contact_store,
                     identity_discovery_cache,
                     revocation_set,
                     agent_id,
                     &machine_id,
+                    local_authority_only,
                 )
                 .await
                 .decision,
@@ -19197,13 +19199,16 @@ impl Agent {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
             // cert has expired must be refused on the live path.
             let expired = identity::is_expired(*cert_not_after, now_secs);
+            // ADR-0074 §4: match grant_access_at — reauth must not block on
+            // a contended evidence store inside owner-trust.
             let pair = owner_trust
-                .evaluate_pair(
+                .evaluate_pair_with(
                     contact_store,
                     discovery_cache,
                     revocation_set,
                     agent_id,
                     machine_id,
+                    local_authority_only,
                 )
                 .await;
             if pair.owner_trusted {

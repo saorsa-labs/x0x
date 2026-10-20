@@ -229,12 +229,12 @@ pub struct ContactStore {
     change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
-/// Mutable handle to one contact ([`ContactStore::get_mut`]).
+/// Mutable handle to one contact ([`ContactStore::get_mut_notify`]).
 ///
 /// Signals the store's change notifier when dropped so ADR-0074 §4 reauth
 /// wakes after in-memory edits (including `Blocked`) that never call
 /// [`ContactStore::save`]. Production mutators that persist still notify
-/// via `save`; this guard covers every public `get_mut` path.
+/// via `save`. Use this guard for in-memory field edits that skip `save`.
 #[derive(Debug)]
 pub struct ContactMut<'a> {
     contact: &'a mut Contact,
@@ -409,10 +409,20 @@ impl ContactStore {
         self.contacts.get(&agent_id.0)
     }
 
+    /// Get a mutable reference to a contact by agent ID.
+    ///
+    /// Direct field mutation through this reference does **not** wake
+    /// ADR-0074 §4 reauth. Use [`Self::get_mut_notify`] for in-memory edits
+    /// that must re-check open streams, or a notifying mutator such as
+    /// [`Self::set_trust`] / [`Self::remove`] (they notify via [`Self::save`]).
+    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<&mut Contact> {
+        self.contacts.get_mut(&agent_id.0)
+    }
+
     /// Mutable contact handle. Drop wakes the ADR-0074 §4 reauth notifier
     /// when set, so in-memory edits (including `Blocked`) that skip
     /// [`Self::save`] still re-check open streams.
-    pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
+    pub fn get_mut_notify(&mut self, agent_id: &AgentId) -> Option<ContactMut<'_>> {
         let notify = self.change_notify.clone();
         self.contacts
             .get_mut(&agent_id.0)

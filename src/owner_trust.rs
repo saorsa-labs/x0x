@@ -543,6 +543,9 @@ impl OwnerTrust {
     /// Cheap checks run first so a non-owner peer costs a cache lookup and
     /// a hash, never an ML-DSA verification. Each lock is taken in its own
     /// scope; none is held across another lock or the enrollment check.
+    ///
+    /// Admission may block briefly on a ready evidence store. Reauth must
+    /// call [`Self::is_owner_trusted_with`] with `nonblocking_evidence`.
     pub async fn is_owner_trusted(
         &self,
         discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
@@ -550,20 +553,45 @@ impl OwnerTrust {
         agent_id: &AgentId,
         machine_id: &MachineId,
     ) -> bool {
+        self.is_owner_trusted_with(discovery_cache, revocation_set, agent_id, machine_id, false)
+            .await
+    }
+
+    /// [`Self::is_owner_trusted`]; with `nonblocking_evidence` the ADR 0089
+    /// fallback uses [`EvidenceRuntime::try_usable`] so a contended store
+    /// reads as no evidence (fail closed). Reauth needs this: ADR-0074 §4's
+    /// five-second bound cannot interrupt a synchronous `usable()` wait.
+    pub async fn is_owner_trusted_with(
+        &self,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        nonblocking_evidence: bool,
+    ) -> bool {
         let Some(owner) = self.local_owner else {
             return false;
         };
         let Some(devices) = self.device_store() else {
             return false;
         };
+        let now_ms = unix_now_secs().saturating_mul(1000);
+        // Contended lock → no evidence (fail closed; matches share_grant's
+        // local reauth path). Reauth cannot block here: ADR-0074 §4's bound
+        // uses timeout_at, which does not interrupt a synchronous usable().
+        let usable_view = |runtime: &crate::peer_evidence::EvidenceRuntime| {
+            if nonblocking_evidence {
+                runtime
+                    .try_usable(*agent_id, *machine_id, now_ms)
+                    .ok()
+                    .flatten()
+            } else {
+                runtime.usable(*agent_id, *machine_id, now_ms)
+            }
+        };
         match crate::dm_inbox::authenticated_machine_binding(&self.bindings, agent_id).await {
             Some(bound) if bound == *machine_id => {}
-            None if self
-                .evidence()
-                .and_then(|e| {
-                    e.usable(*agent_id, *machine_id, unix_now_secs().saturating_mul(1000))
-                })
-                .is_some() => {}
+            None if self.evidence().and_then(|e| usable_view(&e)).is_some() => {}
             _ => return false,
         }
         let cert = {
@@ -574,9 +602,7 @@ impl OwnerTrust {
         };
         let cert = cert.or_else(|| {
             self.evidence()
-                .and_then(|e| {
-                    e.usable(*agent_id, *machine_id, unix_now_secs().saturating_mul(1000))
-                })
+                .and_then(|e| usable_view(&e))
                 .and_then(|v| v.certificate.clone())
         });
         let Some(cert) = cert else {
@@ -611,6 +637,28 @@ impl OwnerTrust {
         agent_id: &AgentId,
         machine_id: &MachineId,
     ) -> PairTrust {
+        self.evaluate_pair_with(
+            contact_store,
+            discovery_cache,
+            revocation_set,
+            agent_id,
+            machine_id,
+            false,
+        )
+        .await
+    }
+
+    /// [`Self::evaluate_pair`]; with `nonblocking_evidence` owner-trust's
+    /// evidence fallback never blocks (ADR-0074 §4 reauth).
+    pub async fn evaluate_pair_with(
+        &self,
+        contact_store: &RwLock<ContactStore>,
+        discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+        revocation_set: &RwLock<RevocationSet>,
+        agent_id: &AgentId,
+        machine_id: &MachineId,
+        nonblocking_evidence: bool,
+    ) -> PairTrust {
         let ctx = TrustContext {
             agent_id,
             machine_id,
@@ -629,7 +677,13 @@ impl OwnerTrust {
             };
         }
         if !self
-            .is_owner_trusted(discovery_cache, revocation_set, agent_id, machine_id)
+            .is_owner_trusted_with(
+                discovery_cache,
+                revocation_set,
+                agent_id,
+                machine_id,
+                nonblocking_evidence,
+            )
             .await
         {
             return PairTrust {

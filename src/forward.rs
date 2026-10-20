@@ -723,14 +723,17 @@ pub(crate) async fn authorize_attested_opener(
     // must be denied here (same pattern as the stream gate).
     // ADR-0070 §1: owner trust is an input to that decision, and the only
     // way a `principal = "owner"` ACL entry can match.
+    // ADR-0074 §4: reauth (`local_authority_only`) must not block on a
+    // contended evidence store inside owner-trust (same flag as grant_access).
     let pair = ctx
         .owner_trust
-        .evaluate_pair(
+        .evaluate_pair_with(
             &ctx.contact_store,
             &ctx.discovery_cache,
             &ctx.revocation_set,
             opener,
             peer_machine,
+            ctx.local_authority_only,
         )
         .await;
 

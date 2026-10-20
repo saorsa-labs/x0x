@@ -13,8 +13,9 @@
 //!
 //! ## When a pass runs
 //!
-//! **On an event** (bound ≤5 s; the pass starts at most
-//! [`REAUTH_MIN_SPACING`] after the signal). The agent's re-check signal is
+//! **On an event** (bound ≤5 s from the triggering event; a pass may start
+//! up to [`REAUTH_MIN_SPACING`] later, and its deadline is still
+//! `event_at + `[`REAUTH_PASS_BUDGET`]). The agent's re-check signal is
 //! woken by every change to a gate input:
 //!
 //! | Trigger | Where the event is raised |
@@ -501,17 +502,28 @@ pub(crate) async fn check_gate(
     reevaluate(gate, ctx, &verify, &policy).await
 }
 
+/// Keep the earliest pending reauth trigger time.
+fn note_reauth_event(pending: &mut Option<tokio::time::Instant>, at: tokio::time::Instant) {
+    *pending = Some(match *pending {
+        Some(earliest) => earliest.min(at),
+        None => at,
+    });
+}
+
 /// One re-check pass over every live stream. Returns how many were torn
 /// down. Streams sharing gate inputs (many connections through one forward)
-/// are evaluated once per pass. The whole pass is bounded by
-/// [`REAUTH_PASS_BUDGET`]; streams still unchecked when the budget expires
-/// are fail-closed torn down.
-pub(crate) async fn reauth_pass(live: &LiveStreams, ctx: &ReauthCtx) -> usize {
+/// are evaluated once per pass. `deadline` is the absolute fail-closed cut-off
+/// (normally the triggering event's time plus [`REAUTH_PASS_BUDGET`]); streams
+/// still unchecked when it expires are torn down.
+pub(crate) async fn reauth_pass(
+    live: &LiveStreams,
+    ctx: &ReauthCtx,
+    deadline: tokio::time::Instant,
+) -> usize {
     let entries = live.gates();
     if entries.is_empty() {
         return 0;
     }
-    let deadline = tokio::time::Instant::now() + REAUTH_PASS_BUDGET;
     let (policy, verify) = pass_inputs(ctx);
     let mut verdicts: HashMap<StreamGate, Result<StreamAuthority, &'static str>> = HashMap::new();
     let mut torn_down = 0;
@@ -559,6 +571,11 @@ pub(crate) async fn reauth_pass(live: &LiveStreams, ctx: &ReauthCtx) -> usize {
 /// Run re-check passes on every `kick` and, when `sweep` is set, every
 /// `sweep` period, until `stop` fires. Production passes
 /// `Some(REAUTH_SWEEP_INTERVAL)`; `None` (tests) leaves only the events.
+///
+/// Each pass's deadline is measured from the earliest pending trigger
+/// (`event_at + `[`REAUTH_PASS_BUDGET`]), not from pass start. Kicks that
+/// arrive during an in-flight pass or the [`REAUTH_MIN_SPACING`] cooldown
+/// coalesce into the earliest pending `event_at` for the next pass.
 pub(crate) fn spawn_reauth_loop(
     live: Arc<LiveStreams>,
     ctx: ReauthCtx,
@@ -572,24 +589,64 @@ pub(crate) fn spawn_reauth_loop(
             sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             sweep
         });
+        let mut pending_event: Option<tokio::time::Instant> = None;
         loop {
-            let tick = async {
-                match sweep.as_mut() {
-                    Some(sweep) => {
-                        sweep.tick().await;
+            if pending_event.is_none() {
+                let tick = async {
+                    match sweep.as_mut() {
+                        Some(sweep) => {
+                            sweep.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
                     }
-                    None => std::future::pending::<()>().await,
+                };
+                tokio::select! {
+                    () = stop.cancelled() => break,
+                    () = kick.notified() => {
+                        note_reauth_event(&mut pending_event, tokio::time::Instant::now());
+                    }
+                    () = tick => {
+                        note_reauth_event(&mut pending_event, tokio::time::Instant::now());
+                    }
                 }
-            };
-            tokio::select! {
-                () = stop.cancelled() => break,
-                () = kick.notified() => {}
-                () = tick => {}
             }
-            reauth_pass(&live, &ctx).await;
-            tokio::select! {
-                () = stop.cancelled() => break,
-                () = tokio::time::sleep(REAUTH_MIN_SPACING) => {}
+            let Some(event_at) = pending_event.take() else {
+                break;
+            };
+            let deadline = event_at + REAUTH_PASS_BUDGET;
+            {
+                let pass = reauth_pass(&live, &ctx, deadline);
+                tokio::pin!(pass);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return,
+                        () = kick.notified() => {
+                            note_reauth_event(
+                                &mut pending_event,
+                                tokio::time::Instant::now(),
+                            );
+                        }
+                        _ = &mut pass => break,
+                    }
+                }
+            }
+            {
+                let spacing = tokio::time::sleep(REAUTH_MIN_SPACING);
+                tokio::pin!(spacing);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return,
+                        () = kick.notified() => {
+                            note_reauth_event(
+                                &mut pending_event,
+                                tokio::time::Instant::now(),
+                            );
+                        }
+                        () = &mut spacing => break,
+                    }
+                }
             }
         }
     })

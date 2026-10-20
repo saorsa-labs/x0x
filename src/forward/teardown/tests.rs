@@ -382,11 +382,11 @@ async fn trust_downgrade_closes_within_5s() {
     assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
 }
 
-/// WHY (Codex P2): the public `ContactStore::get_mut` returns a Drop-notifying
-/// guard; setting `Blocked` and dropping the guard (no save) must wake reauth
-/// and close the stream within EVENT_BOUND (sweep off).
+/// WHY (Codex P2): the public `ContactStore::get_mut_notify` returns a
+/// Drop-notifying guard; setting `Blocked` and dropping the guard (no save)
+/// must wake reauth and close the stream within EVENT_BOUND (sweep off).
 #[tokio::test(start_paused = true)]
-async fn get_mut_edit_closes_within_5s() {
+async fn get_mut_notify_edit_closes_within_5s() {
     let w = World::new().await;
     w.contacts
         .write()
@@ -398,7 +398,12 @@ async fn get_mut_edit_closes_within_5s() {
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(!stream.token().is_cancelled());
 
-    w.contacts.write().await.get_mut(&w.b1).unwrap().trust_level = TrustLevel::Blocked;
+    w.contacts
+        .write()
+        .await
+        .get_mut_notify(&w.b1)
+        .unwrap()
+        .trust_level = TrustLevel::Blocked;
     closes_within(&stream, EVENT_BOUND).await;
 }
 
@@ -573,13 +578,19 @@ async fn repeat_pass_without_changes_performs_no_verification() {
     let (_b, _) = w.admit(w.inbound(w.b1, w.mb)).await;
 
     let before = ml_dsa_verify_count::get();
-    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert_eq!(
+        reauth_pass(&w.live, &w.ctx(), Instant::now() + REAUTH_PASS_BUDGET).await,
+        0
+    );
     let first = ml_dsa_verify_count::get() - before;
     // Admission above already filled the memo, so even this pass is free;
     // clear it through a revocation-set change to measure a cold pass.
     w.revoke_grant(&unrelated).await;
     let before = ml_dsa_verify_count::get();
-    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert_eq!(
+        reauth_pass(&w.live, &w.ctx(), Instant::now() + REAUTH_PASS_BUDGET).await,
+        0
+    );
     let cold = ml_dsa_verify_count::get() - before;
     assert!(
         cold >= 3,
@@ -587,7 +598,10 @@ async fn repeat_pass_without_changes_performs_no_verification() {
     );
 
     let before = ml_dsa_verify_count::get();
-    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert_eq!(
+        reauth_pass(&w.live, &w.ctx(), Instant::now() + REAUTH_PASS_BUDGET).await,
+        0
+    );
     assert_eq!(
         ml_dsa_verify_count::get() - before,
         0,
@@ -690,7 +704,10 @@ async fn ended_stream_leaves_the_registry_uncounted() {
     assert_eq!(w.live.len(), 1);
     drop(guard);
     assert_eq!(w.live.len(), 0);
-    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert_eq!(
+        reauth_pass(&w.live, &w.ctx(), Instant::now() + REAUTH_PASS_BUDGET).await,
+        0
+    );
     assert_eq!(w.diag.torn_down_reauth(), 0);
 }
 
@@ -738,7 +755,10 @@ async fn outbound_reauth_keeps_stream_when_cache_route_is_stale_but_authority_na
         })
         .await;
     assert_eq!(authority, StreamAuthority::PeerTrust);
-    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert_eq!(
+        reauth_pass(&w.live, &w.ctx(), Instant::now() + REAUTH_PASS_BUDGET).await,
+        0
+    );
     assert!(
         !stream.token().is_cancelled(),
         "reauth must not tear down as machine_changed when authority still names mb"
@@ -875,12 +895,179 @@ async fn evidence_admitted_stream_survives_reauth_without_bindings() {
         .expect("evidence-backed grant must admit without authenticated binding");
     assert!(matches!(authority, StreamAuthority::Grant { .. }));
     let stream = w.live.register(gate, authority);
-    assert_eq!(reauth_pass(&w.live, &w.ctx()).await, 0);
+    assert_eq!(
+        reauth_pass(&w.live, &w.ctx(), Instant::now() + REAUTH_PASS_BUDGET).await,
+        0
+    );
     assert!(
         !stream.token().is_cancelled(),
         "local reauth must keep an evidence-admitted stream when bindings stay cleared"
     );
     assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
+/// WHY (Codex P1 / RC4): owner-trust can fall through to synchronous
+/// [`EvidenceRuntime::usable`] when the authenticated binding is missing.
+/// A held ready-store mutex then blocks the reauth task; `timeout_at` cannot
+/// interrupt that wait, so teardown misses ADR-0074 §4's five-second bound.
+/// Reauth must use `try_usable` (fail closed while busy) on that path.
+#[tokio::test(start_paused = true)]
+async fn owner_trust_reauth_tears_down_within_5s_while_evidence_store_held() {
+    use crate::announce_v3::IdentityAnnouncementV3;
+    use crate::dm::DmCapabilities;
+    use crate::dm_capability::{CapabilityAdvert, RegistryTrailer, REGISTRY_TRAILER_MAGIC};
+    use crate::peer_evidence::{
+        EvidenceConfig, EvidenceRecordV1, EvidenceRuntime, IngestSource, PeerEvidenceStore,
+        RuntimePolicy,
+    };
+
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], true, false));
+
+    let agent_kp = AgentKeypair::generate().unwrap();
+    let machine_kp = MachineKeypair::generate().unwrap();
+    let peer = agent_kp.agent_id();
+    let machine = machine_kp.machine_id();
+    let cert = AgentCertificate::issue(&w.owner_a, &agent_kp).unwrap();
+    w.devices
+        .enroll(OwnerEnrollment::sign(machine, &w.owner_a, w.base_secs * 1000, None).unwrap())
+        .await
+        .unwrap();
+    w.cache
+        .write()
+        .await
+        .insert(peer, discovered(&agent_kp, machine, cert.clone()));
+
+    let now_ms = w.base_secs.saturating_mul(1000);
+    let record = {
+        let v2 = crate::IdentityAnnouncement {
+            self_name: Some("owner evidence peer".into()),
+            agent_id: peer,
+            machine_id: machine,
+            user_id: None,
+            agent_certificate: None,
+            machine_public_key: machine_kp.public_key().as_bytes().to_vec(),
+            machine_signature: vec![],
+            addresses: vec![],
+            announced_at: now_ms / 1000,
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            agent_public_key: agent_kp.public_key().as_bytes().to_vec(),
+        };
+        let mut ann =
+            IdentityAnnouncementV3::build_from_v2(&v2, machine_kp.secret_key(), 0).unwrap();
+        ann.sign_v3_1(machine_kp.secret_key()).unwrap();
+        let mut caps = DmCapabilities::pending();
+        caps.kem_public_key = vec![42; 1184];
+        let mut advert = CapabilityAdvert {
+            protocol_version: crate::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+            agent_id: *peer.as_bytes(),
+            machine_id: *machine.as_bytes(),
+            created_at_unix_ms: now_ms,
+            capabilities: caps,
+            signature: vec![],
+        };
+        advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            agent_kp.secret_key(),
+            &advert.signed_bytes().unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        let mut trailer = RegistryTrailer {
+            registry: Default::default(),
+            signature: vec![],
+        };
+        trailer.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            agent_kp.secret_key(),
+            &trailer.signed_bytes(&advert).unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        let mut bytes = postcard::to_stdvec(&advert).unwrap();
+        bytes.extend_from_slice(REGISTRY_TRAILER_MAGIC);
+        bytes.extend(postcard::to_stdvec(&trailer).unwrap());
+        EvidenceRecordV1 {
+            announcement: crate::announce_v3::serialize_v3_1(&ann).unwrap(),
+            advert: bytes,
+            certificate: Some(cert.to_storage_bytes().unwrap()),
+            relation: crate::peer_evidence::ENROLLED,
+            stored_at_ms: now_ms,
+        }
+    };
+    let policy = Arc::new(RuntimePolicy::new(
+        w.a1,
+        w.trust.clone(),
+        Arc::clone(&w.revocations),
+    ));
+    let store = Arc::new(
+        PeerEvidenceStore::open(
+            &w.dir.path().join("evidence-owner-reauth"),
+            EvidenceConfig::default(),
+            policy,
+            now_ms,
+        )
+        .unwrap(),
+    );
+    store.ingest(record, IngestSource::Hello, now_ms).unwrap();
+    let (evidence, ready) = EvidenceRuntime::loading_store_for_test(Arc::clone(&store));
+    ready.cancel();
+    assert!(
+        evidence.usable(peer, machine, now_ms).is_some(),
+        "control: enrolled evidence must be usable before admission"
+    );
+    w.trust.install_evidence(&evidence);
+
+    // Force owner-trust's evidence fallback (no authenticated binding).
+    {
+        let mut bind = w.authenticated.write().await;
+        *bind = crate::dm_inbox::AuthenticatedMachineBindingCache::default();
+    }
+
+    let gate = w.inbound(peer, machine);
+    let authority = check_gate(&gate, &w.ctx())
+        .await
+        .expect("owner stream must admit on enrolled evidence without binding");
+    assert_eq!(authority, StreamAuthority::OwnerTrust);
+    let stream = w.live.register(gate, authority);
+
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+
+    // Hold the ready store on a real OS thread so a blocking `usable()` would
+    // stall the reauth task without parking the paused tokio clock.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let _guard = store.hold_state_for_testing();
+            let _ = held_tx.send(());
+            let _ = release_rx.recv();
+        })
+    };
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("evidence store lock holder must start");
+
+    let started = Instant::now();
+    assert!(w.devices.unenroll(&machine).await.unwrap());
+    closes_within(&stream, EVENT_BOUND).await;
+    assert!(
+        started.elapsed() <= EVENT_BOUND,
+        "owner-trust reauth exceeded the five-second bound while the evidence store was held ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(w.reasons().get("trust_rejected"), Some(&1));
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
 }
 
 /// WHY (Codex P1): grant evaluation can await a 5 s EvidenceV1 load barrier
@@ -1059,4 +1246,164 @@ async fn pre_bridge_cancel_interrupts_stalled_io_and_rsts_tcp() {
         ),
     }
     assert_eq!(diag.torn_down_reauth(), 1);
+}
+
+/// Hold a write lock on `lock` until `release` fires. Signals `held` once
+/// acquired so the test can race the reauth loop against a stalled gate.
+fn hold_write<T: Send + Sync + 'static>(
+    lock: Arc<RwLock<T>>,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _guard = lock.write().await;
+        let _ = held_tx.send(());
+        let _ = release_rx.await;
+    });
+    (release_tx, held_rx, handle)
+}
+
+/// WHY (Codex P2 / RC4): a kick during [`REAUTH_MIN_SPACING`] must measure the
+/// next pass deadline from that event, not from pass start after the cooldown.
+/// Holding the discovery-cache write lock forces the follow-up pass onto the
+/// fail-closed deadline path so a fresh `now()+5s` budget would miss
+/// [`EVENT_BOUND`].
+#[tokio::test(start_paused = true)]
+async fn kick_during_spacing_deadline_from_event() {
+    let w = World::new().await;
+    w.set_policy_silently(w.acl(&[], false, true));
+    let grant = w
+        .grant(0x61, Grantee::User(w.user_b.user_id()), w.base_secs + 3_600)
+        .await;
+    let (stream, _) = w.admit(w.inbound(w.b1, w.mb)).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    // First pass: no-op kick so the loop enters spacing.
+    w.kick.notify_waiters();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+
+    let (release_tx, held_rx, holder) = hold_write(Arc::clone(&w.cache));
+    held_rx
+        .await
+        .expect("discovery-cache write holder must start");
+
+    let event_at = Instant::now();
+    w.revoke_grant(&grant).await;
+
+    // Finish the remaining spacing; the pending event's pass starts blocked.
+    tokio::time::advance(REAUTH_MIN_SPACING - Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "stream must still be open while the stalled pass awaits the deadline"
+    );
+
+    let remain = EVENT_BOUND.saturating_sub(event_at.elapsed());
+    tokio::time::advance(remain).await;
+    tokio::task::yield_now().await;
+    assert!(
+        stream.token().is_cancelled(),
+        "teardown must land within 5 s of the spacing kick (elapsed {:?})",
+        event_at.elapsed()
+    );
+    assert!(
+        event_at.elapsed() <= EVENT_BOUND,
+        "deadline-from-event exceeded EVENT_BOUND ({:?})",
+        event_at.elapsed()
+    );
+
+    let _ = release_tx.send(());
+    let _ = holder.await;
+}
+
+/// WHY (Codex P2 / RC4): a kick during an in-flight pass must schedule the
+/// next pass with a deadline from that mid-pass event. A stream registered
+/// after the in-flight `gates()` snapshot is only checked on the follow-up
+/// pass; stalling that pass on the discovery-cache lock proves the budget is
+/// not reset at pass start.
+#[tokio::test(start_paused = true)]
+async fn kick_during_inflight_pass_deadline_from_event() {
+    let w = World::new().await;
+    w.contacts
+        .write()
+        .await
+        .set_trust(&w.b1, TrustLevel::Trusted);
+    w.set_policy_silently(w.acl(&[(w.b1, w.mb)], false, true));
+    let (decoy, _) = w.admit(w.inbound(w.b1, w.mb)).await;
+    let grant = w
+        .grant(0x62, Grantee::Agent(w.c1), w.base_secs + 3_600)
+        .await;
+
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let (release_tx, held_rx, holder) = hold_write(Arc::clone(&w.cache));
+    held_rx
+        .await
+        .expect("discovery-cache write holder must start");
+
+    // Start a pass that stalls on the decoy while the cache write is held.
+    let pass1_at = Instant::now();
+    w.kick.notify_waiters();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!decoy.token().is_cancelled());
+
+    // Mid-pass event: register a grant-backed stream the in-flight snapshot
+    // never saw, then revoke it so only the follow-up pass can tear it down.
+    let event_at = Instant::now();
+    let target = w.live.register(
+        w.inbound(w.c1, w.mc),
+        StreamAuthority::Grant {
+            grant_ids: vec![hex::encode(grant.grant_id)],
+        },
+    );
+    w.revoke_grant(&grant).await;
+    tokio::task::yield_now().await;
+
+    // Exhaust the first pass's budget (from the priming kick). Decoy
+    // fail-closes; target is untouched. Spacing then starts the pending pass.
+    let pass1_remain = REAUTH_PASS_BUDGET.saturating_sub(pass1_at.elapsed());
+    tokio::time::advance(pass1_remain).await;
+    tokio::task::yield_now().await;
+    assert!(
+        decoy.token().is_cancelled(),
+        "in-flight pass must fail-close the decoy at its own deadline"
+    );
+    assert!(
+        !target.token().is_cancelled(),
+        "target registered mid-pass must survive the in-flight snapshot"
+    );
+
+    tokio::time::advance(REAUTH_MIN_SPACING).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !target.token().is_cancelled(),
+        "follow-up pass must still be stalled before the event deadline"
+    );
+
+    let remain = EVENT_BOUND.saturating_sub(event_at.elapsed());
+    tokio::time::advance(remain).await;
+    tokio::task::yield_now().await;
+    assert!(
+        target.token().is_cancelled(),
+        "mid-pass revocation must tear down within 5 s of that event (elapsed {:?})",
+        event_at.elapsed()
+    );
+    assert!(
+        event_at.elapsed() <= EVENT_BOUND,
+        "deadline-from-event exceeded EVENT_BOUND ({:?})",
+        event_at.elapsed()
+    );
+
+    let _ = release_tx.send(());
+    let _ = holder.await;
 }
