@@ -1860,29 +1860,79 @@ pub async fn serve_with_options(
         }));
     }
 
+    // One background apply owner serves both discovery paths. Actual boot
+    // identity is carried into receipts; neither source invents a participant.
+    let background_submit = if self_update_enabled
+        && config.update.enabled
+        && (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)
+    {
+        let runtime = async {
+            #[cfg(unix)]
+            let staging = {
+                let identity_root = match identity_dir.clone() {
+                    Some(path) => path,
+                    None => crate::storage::x0x_dir().await?,
+                };
+                routes::StartupStagingContext {
+                    install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                    identity_root: identity_root.canonicalize()?,
+                    machine_id: *state.agent.machine_id().as_bytes(),
+                    #[cfg(test)]
+                    clock: None,
+                    #[cfg(test)]
+                    observed: None,
+                }
+            };
+            Ok::<_, anyhow::Error>(routes::BackgroundRuntime {
+                config: config.update.clone(),
+                data_dir: config.data_dir.clone(),
+                api_addr: state.api_address,
+                shutdown: (
+                    daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx),
+                    state.shutdown_notify.subscribe(),
+                ),
+                apply_lock: Arc::clone(&state.upgrade_apply_lock),
+                #[cfg(unix)]
+                staging,
+                #[cfg(test)]
+                operation_observer: None,
+            })
+        }
+        .await;
+        match runtime {
+            Ok(runtime) => {
+                let (submit, owner) = routes::background_channel(runtime);
+                bg_tasks.push(tokio::spawn(owner.run()));
+                Some(submit)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Background upgrade staging identity is unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Gossip-based release subscription (primary update mechanism). This
     // listener can download + install + restart, so it is gated on
     // `self_update_enabled` — embedders never replace the host binary.
-    if self_update_enabled && config.update.enabled && config.update.gossip_updates {
-        let update_config = config.update.clone();
+    if let Some(submit) = background_submit
+        .as_ref()
+        .filter(|_| config.update.gossip_updates)
+    {
+        let submit = submit.clone();
         let agent_for_gossip = Arc::clone(&state.agent);
-        let data_dir = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
-        // #261: the listener's restart planner needs the bound API address
-        // (health commit) and the graceful-shutdown hook (bounded cancel).
-        let gossip_api_addr = state.api_address;
-        let gossip_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
+        // Restart context stays with the shared owner; this source only
+        // discovers verified releases and observes daemon shutdown.
         let gossip_shutdown_watch = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             run_gossip_update_listener(
                 agent_for_gossip,
-                update_config,
-                data_dir,
-                upgrade_apply_lock,
+                submit,
                 self_published_for_gossip,
-                gossip_api_addr,
-                (gossip_shutdown, gossip_shutdown_watch),
+                gossip_shutdown_watch,
             )
             .await;
         }));
@@ -1914,27 +1964,22 @@ pub async fn serve_with_options(
 
     // GitHub fallback poll (safety net, default every 48h). Install/restart
     // capable, so gated on `self_update_enabled` (embedders opt out).
-    if self_update_enabled
-        && config.update.enabled
-        && config.update.fallback_check_interval_minutes > 0
+    if let Some(submit) = background_submit
+        .as_ref()
+        .filter(|_| config.update.fallback_check_interval_minutes > 0)
     {
+        let submit = submit.clone();
         let update_config = config.update.clone();
         let agent_for_poll = Arc::clone(&state.agent);
-        let data_dir_for_poll = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_poll = Arc::clone(&self_published_release_manifests);
-        let poll_api_addr = state.api_address;
-        let poll_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let poll_shutdown_watch = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             run_fallback_github_poll(
                 agent_for_poll,
                 update_config,
-                data_dir_for_poll,
-                upgrade_apply_lock,
+                submit,
                 self_published_for_poll,
-                poll_api_addr,
-                (poll_shutdown, poll_shutdown_watch),
+                poll_shutdown_watch,
             )
             .await;
         }));
