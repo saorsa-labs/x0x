@@ -48,6 +48,10 @@ macro_rules! inventory_accounts_regression_tests {
                     "passwd: files\ngroup: files sss\n",
                     "passwd: files systemd\ngroup: files\n",
                     "passwd: files [NOTFOUND=return]\ngroup: files\n",
+                    "passwd: files;\ngroup: files\n",
+                    "passwd: files\ngroup: files ;\n",
+                    "passwd: files[NOTFOUND=return]\ngroup: files\n",
+                    "passwd: files\ngroup: files\ninitgroups: files [SUCCESS=continue]\n",
                     "passwd: files\ngroup: files\ninitgroups: files ldap\n",
                     "passwd: files\ngroup:\n",
                 ] {
@@ -55,6 +59,21 @@ macro_rules! inventory_accounts_regression_tests {
                 }
                 assert!(AccountTable::parse(POLICY, PASSWD, GROUP).is_ok());
                 assert!(AccountTable::parse(b"passwd: files\ngroup: files\ninitgroups: files\n", PASSWD, GROUP).is_ok());
+            }
+
+            #[test]
+            fn inventory_accounts_refuse_hidden_optional_database_authority() {
+                let base = "passwd: files\ngroup: files\n";
+                // glibc identifies the database at the first C whitespace or
+                // colon. A later colon must not hide an initgroups policy.
+                for separator in [' ', '\t', '\x0b', '\x0c', '\r'] {
+                    let policy = format!("{base}initgroups{separator}extra: files\n");
+                    assert!(AccountTable::parse(policy.as_bytes(), PASSWD, GROUP).is_err(), "{policy:?}");
+                }
+                // The local supported subset requires an explicit colon; it
+                // must also refuse, not ignore, a colon-free optional row.
+                assert!(AccountTable::parse(format!("{base}initgroups files\n").as_bytes(), PASSWD, GROUP).is_err());
+                assert!(AccountTable::parse(format!("{base}initgroups: files\n").as_bytes(), PASSWD, GROUP).is_ok());
             }
 
             #[test]
