@@ -1,7 +1,7 @@
 //! Read-only GitHub release checks. Installation belongs to the daemon.
 //!
-//! Standalone applies are refused before any I/O: daemon discovery cannot
-//! prove that no instance is using the installed binary.
+//! The CLI dispatch sends apply requests through the authenticated daemon
+//! client. This standalone helper only checks releases and never installs.
 
 use anyhow::Result;
 
@@ -61,7 +61,7 @@ pub async fn run(check_only: bool, force: bool) -> Result<()> {
     let new_version = &verified.manifest.version;
 
     eprintln!("Update available: v{current} → v{new_version}");
-    eprintln!("Use authenticated POST /upgrade/apply on the running daemon to install.");
+    eprintln!("Use `x0x upgrade --apply` to install through the running daemon.");
 
     Ok(())
 }

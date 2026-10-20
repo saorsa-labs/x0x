@@ -265,17 +265,23 @@ pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<
     serve_with_options(config, options).await?.wait().await
 }
 
-/// CLI `--check-updates`: run the startup update check, print its outcome, and
-/// return without serving. Mirrors the print-and-exit behaviour the daemon had
-/// inline before the [`serve_with_options`] extraction. Only the binary calls
-/// this; the embed path never installs updates.
+/// CLI `--check-updates`: check the signed release, print its availability, and
+/// return without serving. This path never installs binaries or SKILL.md;
+/// installation belongs to the serving daemon's authenticated apply route.
 pub async fn run_update_check_and_report(
     config: &DaemonConfig,
     skip_update_check: bool,
 ) -> anyhow::Result<()> {
     if config.update.enabled && !skip_update_check {
-        match run_startup_update_check(config, None, None).await {
-            Ok(Some(version)) => println!("x0xd updated to {version}"),
+        let monitor =
+            x0x::upgrade::monitor::UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
+                .map_err(anyhow::Error::msg)?
+                .with_include_prereleases(config.update.include_prereleases);
+        match monitor.check_for_updates().await {
+            Ok(Some(release)) => {
+                println!("x0xd update available: {}", release.manifest.version);
+                println!("Use `x0x upgrade --apply` to install through the running daemon.");
+            }
             Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
             Err(e) => return Err(e).context("self-update check failed"),
         }
