@@ -29,6 +29,8 @@ mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+mod update_check;
+pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
 mod w3h;
@@ -263,28 +265,6 @@ const DM_INBOX_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// does exactly that).
 pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<()> {
     serve_with_options(config, options).await?.wait().await
-}
-
-/// CLI `--check-updates`: run the startup update check, print its outcome, and
-/// return without serving. Mirrors the print-and-exit behaviour the daemon had
-/// inline before the [`serve_with_options`] extraction. Only the binary calls
-/// this; the embed path never installs updates.
-pub async fn run_update_check_and_report(
-    config: &DaemonConfig,
-    skip_update_check: bool,
-) -> anyhow::Result<()> {
-    if config.update.enabled && !skip_update_check {
-        match run_startup_update_check(config, None, None).await {
-            Ok(Some(version)) => println!("x0xd updated to {version}"),
-            Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
-            Err(e) => return Err(e).context("self-update check failed"),
-        }
-    } else if !config.update.enabled {
-        println!("self-update checks are disabled by configuration");
-    } else {
-        println!("self-update check skipped by --skip-update-check");
-    }
-    Ok(())
 }
 
 /// Resolve where `x0x user-id create` recorded the install's owner.
@@ -2885,11 +2865,18 @@ pub async fn serve_with_options(
             // Before the accept loop. A `/health` success cannot precede this
             // line, so a child log can show whether SIGTERM was registered first.
             record_startup_diagnostic("http server accepting");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = server_shutdown_rx.changed().await;
-                })
-                .await
+            // Served with connect info so handlers can read the real peer
+            // address (`ConnectInfo<SocketAddr>`) — the /health detail gate
+            // decides loopback from it (David's 20 Oct 2026 ruling on
+            // #1480 Finding 3). Proxy headers are never consulted.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_rx.changed().await;
+            })
+            .await
         });
 
         // Fix B (Issue #110 Phase 2): include the axum server `JoinHandle` in the

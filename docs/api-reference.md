@@ -53,7 +53,10 @@ Every endpoint except `GET /health` and `GET /constitution*` requires an
 
 Auth-class labels used throughout this reference:
 
-- **public** — no token (`/health`, `/constitution*` only).
+- **public** — no token (`/health`, `/constitution*` only). `/health` always
+  answers the bare verdict; its node-specific `verdict.inputs` detail has its
+  own loopback/authenticated gate (see the privacy boundary in the System
+  section).
 - **bearer** — the durable API token or a session token in the
   `Authorization` header (the default for ordinary surfaces).
 - **durable-owner** — requires the durable API token; a session token or
@@ -229,7 +232,7 @@ table (#446–#451). This reference documents **175 endpoints — exactly the se
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380) |
+| GET | `/health` | `x0x health` | Health probe with the M1 structured verdict (#1380); the node-specific detail is gated to loopback/authenticated callers (see the privacy boundary below) |
 | GET | `/status` | `x0x status` | Runtime status, bound API address, connectivity, peers, warnings |
 | POST | `/shutdown` | `x0x stop` | Gracefully stop the daemon |
 | POST | `/auth/session` | `x0x auth session` | Exchange the durable API token for a short-lived browser session token (WS1.6) |
@@ -366,18 +369,34 @@ degrades with a staleness reason — a stalled sampler's frozen inputs cannot
 vouch for current health, and they cannot hide a probe failure recorded
 after the last refresh.
 
-**Privacy boundary.** `/health` is auth-exempt, so the verdict reports
-counts, booleans and classifications only. It never reports agent or
-machine ids (presence booleans only; the ids stay on the authed `/agent`),
-never the raw custom plane id, never seed addresses, and never the upgrade
+**Privacy boundary.** `/health` stays auth-exempt (issue #600): every
+caller — on any interface, with or without a token — gets the bare
+verdict, and the endpoint never answers `401`. The verdict reports
+counts, booleans and classifications only: never agent or machine ids
+(presence booleans only; the ids stay on the authed `/agent`), never the
+raw custom plane id, never seed addresses, and never the upgrade
 repository. The counts are still host detail — disk free/total bytes,
 `latest_version`, `user_present`, windowed error and publish-failure
-counts. On the default loopback bind only the local operator can read
-them; on a non-loopback `api_address` bind (which logs a loud startup
-warning) any unauthenticated caller that reaches the port can. Treat
-loopback-by-default as part of this boundary; an off-loopback bind that
-must not disclose host detail needs a reverse proxy in front (#1466
-review finding).
+counts (#1466 review finding) — and that detail is gated (David's
+20 Oct 2026 ruling on #1480): the node-specific values inside
+`verdict.inputs` are served only to loopback callers and to callers that
+present the same valid `Authorization: Bearer` token the authenticated
+routes accept (durable or session). For every other caller those fields
+are absent, and the same numbers are withheld from `reasons` sentences —
+a redacted reason names the bound that was crossed, not the measurement.
+On the default loopback bind only the local operator can read them; on a
+non-loopback `api_address` bind (which logs a loud startup warning) the
+gate itself withholds the detail from callers without a token, so
+loopback-by-default and the gate together hold the boundary.
+
+Loopback is decided from the peer address of the connection itself, so
+proxy headers (`X-Forwarded-For` and similar) are never consulted, and a
+daemon behind a reverse proxy treats the proxy as the peer: give the
+proxy the bearer token, or run the probe on the host. IPv4-mapped IPv6
+peers (`::ffff:127.0.0.1`) count as non-loopback and fail closed — in
+particular, a dual-stack `[::]` bind receives local IPv4 probes as
+v4-mapped addresses, so they get the redacted payload; bind `127.0.0.1`
+(the default) or probe over IPv6 when the full detail is wanted.
 
 ### Example: status
 
@@ -2573,13 +2592,19 @@ Run a command on **another** agent's machine. Disabled by default; every request
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
-| POST | `/upgrade/apply` | — (CLI does not call this) | Daemon applies the latest verified release manifest with transactional restart |
+| POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart |
 
-**The CLI only checks; it never installs.** `x0x upgrade --check` is a
-read-only check against GitHub and needs **no running daemon**. `x0x upgrade`,
-`--apply` and `--force` refuse installation (N2, v0.46.0): install with the
-authenticated daemon endpoint `POST /upgrade/apply` (or let the daemon's
-self-update apply it), over REST or the GUI. See
+**The serving daemon owns installation.** `x0x upgrade --apply` sends an
+authenticated `POST /upgrade/apply` through the normal daemon client, using
+the selected `--name` or `--api` and its bearer token. It does not install
+from the CLI process. Apply fails if no daemon is available.
+
+Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
+installation. `x0x upgrade --check` is a standalone GitHub release check and
+needs **no running daemon**. `--check` takes precedence over `--apply`;
+`--check --force` fetches the current manifest regardless of version.
+`--force` does not bypass any daemon apply check. `x0xd --check-updates` also
+reports only and does not install binaries or SKILL.md. See
 [docs/upgrade-system.md](upgrade-system.md).
 
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old

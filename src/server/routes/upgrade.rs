@@ -291,18 +291,18 @@ where
 }
 /// Startup GitHub check. Returns Some(version) if an update was applied.
 ///
-/// `runtime` distinguishes the two callers: the daemon's startup check —
+/// The daemon's startup check supplies `runtime`. It is
 /// spawned by `serve_with_options` as a background task after the API
 /// listener is bound (#1086: a firewalled update endpoint must never gate
-/// API readiness on its ~30 s HTTP timeout) — hands the restart to the #261
+/// API readiness on its ~30 s HTTP timeout). It hands the restart to the #261
 /// planner because a daemon process must come back up, and serializes its
 /// apply against the gossip release listener and the fallback poll. On a
 /// systemd host whose activation has not yet outlived
 /// `StartLimitIntervalUSec`, it waits out the window and retries the apply
-/// once (#1196) instead of skipping the version. The CLI `--check-updates`
-/// print-and-exit mode passes `None` — there is no daemon to keep alive,
-/// and a handoff respawn of `x0xd --check-updates` could never serve
-/// `/health`, so it would spuriously roll a good update back.
+/// once (#1196) instead of skipping the version. All production callers
+/// supply a runtime. The legacy `None` branch remains for a separate cleanup;
+/// `x0xd --check-updates` now uses the read-only reporter and never calls this
+/// installer.
 pub(in crate::server) async fn run_startup_update_check(
     config: &DaemonConfig,
     agent: Option<&Arc<Agent>>,
@@ -379,9 +379,9 @@ pub(in crate::server) async fn run_startup_update_check(
         Some(runtime) => upgrader
             .with_restart_on_success(true)
             .with_restart_context(runtime.restart_context),
-        // CLI `--check-updates`: no daemon to keep alive, so no restart —
-        // but the apply planner still needs the data dir and configured
-        // address for its bookkeeping.
+        // Legacy no-runtime mode, unused by production callers. It does
+        // not restart, but still supplies the planner's data directory
+        // and configured address. The read-only reporter does not use it.
         None => upgrader
             .with_restart_on_success(false)
             .with_restart_context(RestartContext {
@@ -398,8 +398,7 @@ pub(in crate::server) async fn run_startup_update_check(
         // readback's own remaining window) and retried once, instead of
         // skipping the version until the 6-hourly fallback poll.
         Some(shutdown) => apply_with_start_rate_retry(apply_lock.as_ref(), attempt, shutdown).await,
-        // CLI `--check-updates`: no daemon, no shutdown watch — a single
-        // apply attempt, exactly as before #1196.
+        // Legacy no-runtime mode has no shutdown watch or retry.
         None => attempt().await,
     };
 

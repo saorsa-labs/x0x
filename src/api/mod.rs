@@ -1744,7 +1744,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/upgrade/apply",
         cli_name: "upgrade --apply",
-        description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply refuses and directs callers here)",
+        description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)",
         category: "upgrade",
         request: RequestSpec::None,
     },

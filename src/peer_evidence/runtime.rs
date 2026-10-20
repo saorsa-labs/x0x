@@ -242,12 +242,22 @@ impl EvidenceRuntime {
     }
 
     fn spawn_lookup_worker(&self, work: impl std::future::Future<Output = ()> + Send + 'static) {
-        let mut workers = self.workers();
-        if workers.closed {
-            return;
-        }
-        while workers.tasks.try_join_next().is_some() {}
-        workers.tasks.spawn(work);
+        // #1239: a background task still blocks Tokio if its evidence or
+        // responder-policy reads take a synchronous lock. Keep the entire
+        // Lookup on a tracked blocking worker, as for lookup_before. Both
+        // callers reserve a Lookup permit before this call; a running read
+        // retains that permit and its join handle through shutdown's grace.
+        let executor = tokio::runtime::Handle::current();
+        let stopping = self.stopping.clone();
+        let _ = self.spawn_blocking_worker(move || {
+            executor.block_on(async move {
+                tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => {},
+                    _ = work => {},
+                }
+            });
+        });
     }
 
     /// Close admission and cancel queued/async work, then join within one grace.
