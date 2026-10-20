@@ -333,26 +333,29 @@ pub(in crate::server) async fn names_unpin(
     }
 }
 
-/// ADR-0074 §1: bind an owner petname from an imported card.
+/// Bind an owner petname from an imported card (ADR-0074 §1).
 ///
-/// Only a **signed** (already verified) card that carries both `user_id`
-/// and `owner_name`, for a contact that is not `Blocked`, may bind — and
-/// only when a local discovery/cache [`AgentCertificate`] for the card's
-/// agent chains to that claimed `user_id` (valid, unexpired, unrevoked)
-/// via [`x0x::owner_trust::certificate_chains_to_owner`]. A bare
-/// `card.user_id` is never trusted alone: no cert → `unverified_owner`,
-/// import still succeeds. The label is the card's `owner_name` as a DNS
-/// label ([`x0x::names::label_from_display`]). A user that already has a
-/// label, or the local owner (always `me`), binds nothing. A label already
-/// bound to a different user is left untouched and reported as `conflict`
-/// (frozen at first bind). The import itself never fails because of naming.
-/// Returns `null` when nothing applied.
+/// Trust level does not narrow the bind. Held ADR 0079 is not applied, so
+/// an Unknown contact binds the same way as Known or Trusted. Only a
+/// **signed** (already verified) card that carries both `user_id` and
+/// `owner_name` may bind, and only when a local discovery/cache
+/// [`AgentCertificate`] for the card's agent chains to that claimed
+/// `user_id` (valid, unexpired, unrevoked) via
+/// [`x0x::owner_trust::certificate_chains_to_owner`]. A bare `card.user_id`
+/// is never trusted alone: no cert → `unverified_owner`, import still
+/// succeeds. The label is the card's `owner_name` as a DNS label
+/// ([`x0x::names::label_from_display`]). A user that already has a label
+/// returns status `existing` only after the store confirms durability. A
+/// post-rename fsync error stays `store_error` on retry and is not reported
+/// as `existing`. The local owner (always `me`) binds nothing. A label
+/// already bound to a different user is left untouched and reported as
+/// `conflict` (frozen at first bind). The import itself never fails because
+/// of naming. Returns `null` when nothing applied.
 pub(in crate::server) async fn bind_owner_from_card(
     state: &AppState,
     card: &x0x::groups::card::AgentCard,
-    trust: x0x::contacts::TrustLevel,
 ) -> serde_json::Value {
-    if card.signature.is_none() || trust == x0x::contacts::TrustLevel::Blocked {
+    if card.signature.is_none() {
         return serde_json::Value::Null;
     }
     let (Some(user_hex), Some(owner_name)) = (&card.user_id, &card.owner_name) else {
@@ -388,7 +391,22 @@ pub(in crate::server) async fn bind_owner_from_card(
     }
     match state.names.label_for(&user).await {
         Ok(Some(label)) => {
-            return serde_json::json!({ "label": label, "status": "existing" });
+            // Same user, same label: `bind_owner` is unchanged, but it still
+            // re-syncs while durability is pending. Do not ACK `existing`
+            // over a failed parent-directory fsync.
+            return match state
+                .names
+                .bind_owner(&label, user, BindSource::Card, unix_now_secs())
+                .await
+            {
+                Ok(BindOutcome::Unchanged) => {
+                    serde_json::json!({ "label": label, "status": "existing" })
+                }
+                Ok(BindOutcome::Inserted) => {
+                    serde_json::json!({ "label": label, "status": "bound" })
+                }
+                Err(e) => serde_json::json!({ "status": "store_error", "error": e.to_string() }),
+            };
         }
         Ok(None) => {}
         Err(e) => return serde_json::json!({ "status": "store_error", "error": e.to_string() }),

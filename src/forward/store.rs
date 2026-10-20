@@ -416,7 +416,7 @@ impl ForwardStore {
     async fn persist_with_install(
         &self,
         records: &[ForwardRecord],
-        on_renamed: impl FnOnce(),
+        on_renamed: impl FnOnce() + Send,
     ) -> Result<(), crate::storage::DurableWriteError> {
         let Some(path) = &self.path else {
             on_renamed();

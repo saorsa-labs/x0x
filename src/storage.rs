@@ -939,7 +939,7 @@ pub async fn write_private_bytes_durable_typed(
 pub async fn write_private_bytes_durable_typed_after_rename(
     path: &Path,
     bytes: Vec<u8>,
-    on_renamed: impl FnOnce(),
+    on_renamed: impl FnOnce() + Send,
 ) -> std::result::Result<(), DurableWriteError> {
     let guard = revocation_write_guard(path)
         .await
@@ -1381,7 +1381,7 @@ async fn write_private_bytes_durable_guarded_after_rename(
     path: &Path,
     bytes: Vec<u8>,
     _revocation_guard: Option<RevocationWriteGuard>,
-    on_renamed: impl FnOnce(),
+    on_renamed: impl FnOnce() + Send,
 ) -> std::result::Result<(), DurableWriteError> {
     // Production uses tokio::fs::File + AsyncWriteExt; test builds use
     // w3h_fs::File's inherent write_all (inline under the shim).
@@ -1506,6 +1506,18 @@ async fn sync_published_file(path: &Path) -> std::result::Result<(), DurableWrit
         .await
         .map_err(DurableWriteError::AfterRename)?;
     Ok(())
+}
+
+/// Confirm that a file already visible at `path` is durable.
+///
+/// Fsync the file, then fsync its parent directory. [`DurableWriteError::AfterRename`]
+/// means the bytes are visible and the directory entry is not confirmed.
+/// Name-store load uses this so a restart after a failed parent-directory
+/// fsync does not clear the pending-durability flag.
+pub(crate) async fn confirm_published_durability(
+    path: &Path,
+) -> std::result::Result<(), DurableWriteError> {
+    sync_published_file(path).await
 }
 
 /// Write arbitrary secret bytes to `path` with the same protection x0x gives

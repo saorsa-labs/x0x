@@ -2641,6 +2641,16 @@ Remote machines' digests reach an owner only through a later approved
 announcement change; until then the owner-side census is
 `GET /owner/machines` (see [Device sync](#device-sync-adr-0041-tier-1)).
 
+**Minimum supported version and support window (#1384, D35).** The same
+response carries `minimum_supported_version` and `support_window`. Both ship
+as explicit `null` — by David's 20 Oct 2026 ruling the fields exist now and
+the VALUES are set by David later; `null` is the published state ("no fleet
+minimum published yet"), not a missing field. They are not part of the
+digest preimage: they are centrally published fleet policy, not per-machine
+policy, so they add nothing to a machine-to-machine census comparison. When
+David sets them, the change is a value substitution here and in the daemon —
+no wire or code-shape change.
+
 **The serving daemon owns installation.** `x0x upgrade --apply` sends an
 authenticated `POST /upgrade/apply` through the normal daemon client, using
 the selected `--name` or `--api` and its bearer token. It does not install
@@ -3196,14 +3206,14 @@ At daemon start each persisted forward is re-bound. A named forward is first re-
 These are local names for agents and machines: `[agent:|machine:]<label>.<owner>`. Labels are lowercase DNS labels (`[a-z0-9-]`, 1–63 characters, no leading or trailing `-`). `me`, `agent` and `machine` are reserved. A 64-character hex agent id stays valid wherever a name is accepted.
 
 - **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of two ways:
-  - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`.
+  - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`. A signed card binds the owner label when that user has no petname yet. Unknown, Known and Trusted all bind. Trust level does not narrow the bind.
   - `POST /names/owners`.
 
   A petname is frozen at first bind. Binding it to another key returns `409` `pin_mismatch` until the label is removed.
 - **Agent label.** This is the announced self-name, mapped to a label the same way. It resolves only to an agent whose valid, unexpired, unrevoked `AgentCertificate` chains to the owner.
 - **Machine label, own machines (`me`).** This is the ADR-0036 `machine_name` synced across your devices. It resolves only for a machine with a current ADR-0041 `OwnerEnrollment` by you.
 - **Machine label, shared machines.** You label these yourself with `POST /names/machines`. They resolve only while the machine hosts a certified agent of an active, unrevoked `ShareGrant` you received from that owner.
-- **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. A bare name keeps the kind of that pin (`agent` or `machine`). If the same bare name would now select the other kind, the call returns `409` `pin_mismatch` and does not write a second pin. To re-pin on purpose, delete the pin.
+- **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. A bare name that matches both an agent and a machine returns `409` `ambiguous_kind`, even when a pin already exists. Retry with `agent:` or `machine:`. `pin_mismatch` is returned only when the single remaining candidate's kind differs from the existing pin, and that call does not write a second pin. To re-pin on purpose, delete the pin.
 
 Resolution is local and makes no network query. It adds no trust: every identity, contact and connect-ACL gate still applies. All `/names` routes need the durable API token. Session and rider tokens get `403`. Names persist in `<data_dir>/names.json` (versioned JSON, mode `0600`). If that file is unreadable, every name operation fails with `503` `name_store`, but hex ids keep working.
 
@@ -3241,7 +3251,7 @@ Refusals are `{"ok": false, "error", "code"}`:
 | `unknown_name` | 404 | Unbound owner label, or nothing carries the name (for a forward to a machine name: no single agent is announced on that machine) |
 | `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
 | `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
-| `ambiguous_kind` | 409 | A bare label names both an agent and a machine, and no single pin has fixed the kind. Retry with `agent:` or `machine:` |
+| `ambiguous_kind` | 409 | A bare label names both an agent and a machine, even when a pin exists. Retry with `agent:` or `machine:` |
 | `pin_mismatch` | 409 | The name is pinned to another key. The body carries `pinned` and `current` |
 | `name_store` | 503 | `names.json` is unreadable (fail closed) |
 
