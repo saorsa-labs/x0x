@@ -405,6 +405,88 @@ async fn signed_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// WHY: ADR-0079 contact gate — Unknown must not bind a petname from a
+/// signed, certified card. There is no suggestion store in this slice, so
+/// the import returns null and the label stays unbound.
+#[tokio::test]
+async fn unknown_trust_signed_card_import_leaves_owner_unbound() -> anyhow::Result<()> {
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let app = names_router(Arc::clone(&state));
+    let bob = crate::identity::UserKeypair::generate()?;
+    let (link, kp) = signed_card(&bob, "Bob Smith")?;
+    let cert = crate::identity::AgentCertificate::issue(&bob, &kp)?;
+    seed_agent_cert(&state, &kp, cert).await;
+    let (status, json) = send(
+        &app,
+        "POST",
+        "/agent/card/import",
+        serde_json::json!({ "card": link, "trust_level": "unknown" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(
+        json["owner_label"].is_null(),
+        "Unknown leaves the label unbound: {json}"
+    );
+    assert!(
+        state.names.owner("bob-smith").await?.is_none(),
+        "Unknown must not store a petname"
+    );
+    Ok(())
+}
+
+/// WHY: ADR-0079 contact gate — Trusted binds once, the same as Known
+/// (covered by `signed_card_import_binds_owner_petname_once`). A later
+/// different user at Trusted onto the same label is `conflict` and does
+/// not rebind.
+#[tokio::test]
+async fn trusted_card_import_binds_owner_petname_once() -> anyhow::Result<()> {
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let app = names_router(Arc::clone(&state));
+    let bob = crate::identity::UserKeypair::generate()?;
+    let impostor = crate::identity::UserKeypair::generate()?;
+
+    let (honest_link, honest_kp) = signed_card(&bob, "Bob Smith")?;
+    let cert = crate::identity::AgentCertificate::issue(&bob, &honest_kp)?;
+    seed_agent_cert(&state, &honest_kp, cert).await;
+    let (status, json) = send(
+        &app,
+        "POST",
+        "/agent/card/import",
+        serde_json::json!({ "card": honest_link, "trust_level": "trusted" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["owner_label"]["label"], "bob-smith", "{json}");
+    assert_eq!(json["owner_label"]["status"], "bound", "{json}");
+    assert_eq!(
+        state.names.owner("bob-smith").await?.map(|b| b.user_id),
+        Some(bob.user_id()),
+        "Trusted stores the petname"
+    );
+
+    let (impostor_link, impostor_kp) = signed_card(&impostor, "Bob Smith")?;
+    let impostor_cert = crate::identity::AgentCertificate::issue(&impostor, &impostor_kp)?;
+    seed_agent_cert(&state, &impostor_kp, impostor_cert).await;
+    let (status, json) = send(
+        &app,
+        "POST",
+        "/agent/card/import",
+        serde_json::json!({ "card": impostor_link, "trust_level": "trusted" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["owner_label"]["status"], "conflict", "{json}");
+    assert_eq!(
+        state.names.owner("bob-smith").await?.map(|b| b.user_id),
+        Some(bob.user_id()),
+        "the first bind stands"
+    );
+    Ok(())
+}
+
 /// WHY: ADR-0074 §1 — session and rider tokens must not mutate `/names*`,
 /// must not `POST /forwards` (resolve pins), and must not bind via card
 /// import (import may still 200 for contacts). Driven through the REAL

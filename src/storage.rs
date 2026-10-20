@@ -939,7 +939,7 @@ pub async fn write_private_bytes_durable_typed(
 pub async fn write_private_bytes_durable_typed_after_rename(
     path: &Path,
     bytes: Vec<u8>,
-    on_renamed: impl FnOnce(),
+    on_renamed: impl FnOnce() + Send,
 ) -> std::result::Result<(), DurableWriteError> {
     let guard = revocation_write_guard(path)
         .await
@@ -1381,7 +1381,7 @@ async fn write_private_bytes_durable_guarded_after_rename(
     path: &Path,
     bytes: Vec<u8>,
     _revocation_guard: Option<RevocationWriteGuard>,
-    on_renamed: impl FnOnce(),
+    on_renamed: impl FnOnce() + Send,
 ) -> std::result::Result<(), DurableWriteError> {
     // Production uses tokio::fs::File + AsyncWriteExt; test builds use
     // w3h_fs::File's inherent write_all (inline under the shim).

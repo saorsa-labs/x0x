@@ -828,51 +828,55 @@ impl NamesState {
 /// store; an unreadable or malformed file leaves the store holding nothing
 /// and refusing every name operation ([`NameError::Store`]), so pins are
 /// never silently lost and re-learned. All mutations are serialised under
-/// one lock held across the durable write, including a rename that is
-/// cancelled while the publish can still complete. A failure before the
-/// rename leaves memory and disk on the old state; a failure after the
+/// one lock held across the durable write. `commit` runs the lock, the
+/// write, and the memory install on a task the caller cannot cancel.
+/// Dropping the caller's future detaches the task, which keeps the
+/// lock until memory matches the published file. A sync rename still
+/// publishes if that task is cancelled at its own await. A failure before
+/// the rename leaves memory and disk on the old state; a failure after the
 /// rename keeps the new state in memory so it matches the advanced disk
 /// (issue #1101) and raises a pending-durability flag until a later write
-/// confirms the parent-directory fsync — an identical retry must not ACK
-/// as [`BindOutcome::Unchanged`] while that flag is set. Cancellation
-/// after the bytes are visible installs that state before the lock is
-/// released, so a later write cannot replace the published binding with
-/// the stale copy.
+/// confirms the parent-directory fsync. An identical retry must not ACK as
+/// [`BindOutcome::Unchanged`] while that flag is set.
 #[derive(Debug)]
 pub struct NameStore {
     path: Option<PathBuf>,
-    state: tokio::sync::Mutex<NamesState>,
+    state: std::sync::Arc<tokio::sync::Mutex<NamesState>>,
     load_error: Option<String>,
     /// Set when a write crossed the rename but parent-dir fsync failed.
     /// Cleared only by a successful durable persist. While set, `commit`
     /// re-attempts the write even when the mutate is a no-op.
-    pending_durability: std::sync::atomic::AtomicBool,
+    pending_durability: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Staged by the post-rename callback; drained into [`Self::state`]
     /// under the lock so a cancelled persist await cannot lose the
     /// advanced disk state (Send-safe; no raw pointers in the future).
-    install_slot: std::sync::Mutex<Option<NamesState>>,
+    install_slot: std::sync::Arc<std::sync::Mutex<Option<NamesState>>>,
     /// Tasks blocked in [`Self::lock_state`], not the holder. The rename
     /// cancellation test waits until a later write is queued on this lock.
     #[cfg(test)]
-    lock_waiters: std::sync::atomic::AtomicUsize,
+    lock_waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn install_staged(slot: &std::sync::Mutex<Option<NamesState>>, guard: &mut NamesState) {
+    if let Ok(mut staged) = slot.lock() {
+        if let Some(next) = staged.take() {
+            *guard = next;
+        }
+    }
 }
 
 /// Holds the name-store lock until drop, and installs a staged publish
 /// into that lock before releasing it.
 struct HeldCommit<'a> {
     guard: tokio::sync::MutexGuard<'a, NamesState>,
-    slot: &'a std::sync::Mutex<Option<NamesState>>,
-    pending: &'a std::sync::atomic::AtomicBool,
+    slot: std::sync::Arc<std::sync::Mutex<Option<NamesState>>>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     install_on_drop: bool,
 }
 
 impl HeldCommit<'_> {
     fn drain(&mut self) {
-        if let Ok(mut slot) = self.slot.lock() {
-            if let Some(next) = slot.take() {
-                *self.guard = next;
-            }
-        }
+        install_staged(&self.slot, &mut self.guard);
     }
 }
 
@@ -890,12 +894,12 @@ impl NameStore {
     pub fn in_memory() -> Self {
         Self {
             path: None,
-            state: tokio::sync::Mutex::new(NamesState::default()),
+            state: std::sync::Arc::new(tokio::sync::Mutex::new(NamesState::default())),
             load_error: None,
-            pending_durability: std::sync::atomic::AtomicBool::new(false),
-            install_slot: std::sync::Mutex::new(None),
+            pending_durability: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            install_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
-            lock_waiters: std::sync::atomic::AtomicUsize::new(0),
+            lock_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -921,7 +925,7 @@ impl NameStore {
             .map_err(|e| format!("decode {}: {e}", path.display()))
             .and_then(NamesState::from_file);
         match parsed {
-            Ok(state) => store.state = tokio::sync::Mutex::new(state),
+            Ok(state) => store.state = std::sync::Arc::new(tokio::sync::Mutex::new(state)),
             Err(e) => {
                 tracing::warn!("name store unreadable, refusing name operations: {e}");
                 store.load_error = Some(e);
@@ -946,11 +950,11 @@ impl NameStore {
     /// Write `state` atomically (mode 0600). `on_renamed` runs when the
     /// new bytes are visible (after rename, before parent-dir fsync).
     async fn persist_with_install(
-        &self,
+        path: &Option<PathBuf>,
         state: &NamesState,
-        on_renamed: impl FnOnce(),
+        on_renamed: impl FnOnce() + Send,
     ) -> Result<(), crate::storage::DurableWriteError> {
-        let Some(path) = &self.path else {
+        let Some(path) = path.as_deref() else {
             on_renamed();
             return Ok(());
         };
@@ -964,24 +968,28 @@ impl NameStore {
             .map_err(|e| e.with_path(path))
     }
 
-    fn drain_install_slot(&self, guard: &mut NamesState) {
-        if let Ok(mut slot) = self.install_slot.lock() {
-            if let Some(next) = slot.take() {
-                *guard = next;
-            }
-        }
+    async fn lock_parts<'a>(
+        state: &'a tokio::sync::Mutex<NamesState>,
+        slot: &std::sync::Mutex<Option<NamesState>>,
+        #[cfg(test)] waiters: &std::sync::atomic::AtomicUsize,
+    ) -> tokio::sync::MutexGuard<'a, NamesState> {
+        #[cfg(test)]
+        waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = state.lock().await;
+        #[cfg(test)]
+        waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        install_staged(slot, &mut guard);
+        guard
     }
 
     async fn lock_state(&self) -> tokio::sync::MutexGuard<'_, NamesState> {
-        #[cfg(test)]
-        self.lock_waiters
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut guard = self.state.lock().await;
-        #[cfg(test)]
-        self.lock_waiters
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        self.drain_install_slot(&mut guard);
-        guard
+        Self::lock_parts(
+            &self.state,
+            &self.install_slot,
+            #[cfg(test)]
+            &self.lock_waiters,
+        )
+        .await
     }
 
     /// Tasks waiting to take the name-store lock. Test builds only.
@@ -992,39 +1000,83 @@ impl NameStore {
 
     /// Apply `mutate` to a copy, persist it, then commit.
     ///
+    /// The critical section runs on a spawned task. Awaiting the join is
+    /// the success path. Dropping this future detaches that task. It does
+    /// not abort it, so the task still holds the name lock until memory
+    /// matches the published file.
+    ///
     /// Success installs the new state. `BeforeRename` keeps the old memory
     /// (disk unchanged). `AfterRename` stages the new state in
     /// [`Self::install_slot`] inside the rename callback (cancel-safe),
     /// drains it into the lock, marks durability pending, then still
     /// returns [`NameError::Store`]. A later identical mutate (`changed =
-    /// false`) retries the write while pending — it must not ACK as
-    /// success until a parent-directory fsync succeeds.
+    /// false`) retries the write while pending. It must not ACK as success
+    /// until a parent-directory fsync succeeds.
     async fn commit<T>(
         &self,
-        mutate: impl FnOnce(&mut NamesState) -> Result<(T, bool), NameError>,
+        mutate: impl FnOnce(&mut NamesState) -> Result<(T, bool), NameError> + Send + 'static,
+    ) -> Result<T, NameError>
+    where
+        T: Send + 'static,
+    {
+        self.usable()?;
+        let state = std::sync::Arc::clone(&self.state);
+        let slot = std::sync::Arc::clone(&self.install_slot);
+        let pending = std::sync::Arc::clone(&self.pending_durability);
+        let path = self.path.clone();
+        #[cfg(test)]
+        let waiters = std::sync::Arc::clone(&self.lock_waiters);
+        let task = tokio::spawn(Self::commit_holding_lock(
+            state,
+            slot,
+            pending,
+            path,
+            #[cfg(test)]
+            waiters,
+            mutate,
+        ));
+        match task.await {
+            Ok(result) => result,
+            Err(error) => Err(NameError::Store(format!(
+                "name commit task failed: {error}"
+            ))),
+        }
+    }
+
+    async fn commit_holding_lock<T>(
+        state: std::sync::Arc<tokio::sync::Mutex<NamesState>>,
+        slot: std::sync::Arc<std::sync::Mutex<Option<NamesState>>>,
+        pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        path: Option<PathBuf>,
+        #[cfg(test)] waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        mutate: impl FnOnce(&mut NamesState) -> Result<(T, bool), NameError> + Send,
     ) -> Result<T, NameError> {
         use std::sync::atomic::Ordering;
-        self.usable()?;
         let mut held = HeldCommit {
-            guard: self.lock_state().await,
-            slot: &self.install_slot,
-            pending: &self.pending_durability,
+            guard: Self::lock_parts(
+                &state,
+                &slot,
+                #[cfg(test)]
+                &waiters,
+            )
+            .await,
+            slot,
+            pending,
             install_on_drop: true,
         };
         let mut next = held.guard.clone();
         let (out, changed) = mutate(&mut next)?;
         if changed {
             let to_install = next.clone();
-            let slot = held.slot;
-            let pending = held.pending;
-            match self
-                .persist_with_install(&next, move || {
-                    if let Ok(mut g) = slot.lock() {
-                        *g = Some(to_install);
-                    }
-                    pending.store(true, Ordering::Release);
-                })
-                .await
+            let slot = std::sync::Arc::clone(&held.slot);
+            let pending = std::sync::Arc::clone(&held.pending);
+            match Self::persist_with_install(&path, &next, move || {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(to_install);
+                }
+                pending.store(true, Ordering::Release);
+            })
+            .await
             {
                 Ok(()) => {
                     held.drain();
@@ -1046,13 +1098,12 @@ impl NameStore {
                 }
             }
         } else if held.pending.load(Ordering::Acquire) {
-            let pending = held.pending;
+            let pending = std::sync::Arc::clone(&held.pending);
             let snapshot = held.guard.clone();
-            match self
-                .persist_with_install(&snapshot, || {
-                    pending.store(true, Ordering::Release);
-                })
-                .await
+            match Self::persist_with_install(&path, &snapshot, move || {
+                pending.store(true, Ordering::Release);
+            })
+            .await
             {
                 Ok(()) => {
                     held.pending.store(false, Ordering::Release);
@@ -1116,13 +1167,14 @@ impl NameStore {
         if is_reserved(label) {
             return Err(NameError::Reserved(label.to_string()));
         }
-        self.commit(|state| {
-            if let Some(held) = state.owners.get(label) {
+        let label = label.to_string();
+        self.commit(move |state| {
+            if let Some(held) = state.owners.get(&label) {
                 return if held.user_id == user {
                     Ok((BindOutcome::Unchanged, false))
                 } else {
                     Err(NameError::PinMismatch {
-                        name: label.to_string(),
+                        name: label,
                         pinned: hex::encode(held.user_id.as_bytes()),
                         current: hex::encode(user.as_bytes()),
                     })
@@ -1132,7 +1184,7 @@ impl NameStore {
                 return Err(NameError::Store("owner label table is full".into()));
             }
             state.owners.insert(
-                label.to_string(),
+                label,
                 OwnerBinding {
                     user_id: user,
                     bound_at: now_unix,
@@ -1151,9 +1203,10 @@ impl NameStore {
     /// [`NameError::Store`].
     pub async fn unbind_owner(&self, label: &str) -> Result<bool, NameError> {
         validate_label(label)?;
+        let label = label.to_string();
         let suffix = format!(".{label}");
-        self.commit(|state| {
-            if state.owners.remove(label).is_none() {
+        self.commit(move |state| {
+            if state.owners.remove(&label).is_none() {
                 return Ok((false, false));
             }
             state.pins.retain(|key, _| !key.ends_with(&suffix));
@@ -1178,11 +1231,12 @@ impl NameStore {
         now_unix: u64,
     ) -> Result<BindOutcome, NameError> {
         parse_pin_key(key)?;
-        self.commit(|state| {
-            if let Some(held) = state.pins.get(key) {
+        let key = key.to_string();
+        self.commit(move |state| {
+            if let Some(held) = state.pins.get(&key) {
                 if held.id != id || held.owner != owner {
                     return Err(NameError::PinMismatch {
-                        name: key.to_string(),
+                        name: key,
                         pinned: hex::encode(held.id),
                         current: hex::encode(id),
                     });
@@ -1193,7 +1247,7 @@ impl NameStore {
                 return Err(NameError::Store("pin table is full".into()));
             }
             state.pins.insert(
-                key.to_string(),
+                key,
                 NamePin {
                     id,
                     owner,
@@ -1212,8 +1266,9 @@ impl NameStore {
     /// Invalid key, or `Store`.
     pub async fn unpin(&self, key: &str) -> Result<bool, NameError> {
         parse_pin_key(key)?;
-        self.commit(|state| {
-            let removed = state.pins.remove(key).is_some();
+        let key = key.to_string();
+        self.commit(move |state| {
+            let removed = state.pins.remove(&key).is_some();
             Ok((removed, removed))
         })
         .await

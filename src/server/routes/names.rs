@@ -345,26 +345,40 @@ pub(in crate::server) async fn names_unpin(
     }
 }
 
-/// ADR-0074 §1: bind an owner petname from an imported card.
+/// ADR-0079 contact gate (amends ADR-0074 §1): bind an owner petname from
+/// an imported card.
+///
+/// A default is applied directly only when the imported contact is `Known`
+/// or `Trusted` and that `UserId` has no petname yet. `Unknown` is left
+/// unbound (no suggestion store in this slice) and returns `null`, the same
+/// shape as nothing applied. `Blocked` stays unbound and also returns
+/// `null`.
 ///
 /// Only a **signed** (already verified) card that carries both `user_id`
-/// and `owner_name`, for a contact that is not `Blocked`, may bind — and
-/// only when a local discovery/cache [`AgentCertificate`] for the card's
-/// agent chains to that claimed `user_id` (valid, unexpired, unrevoked)
-/// via [`x0x::owner_trust::certificate_chains_to_owner`]. A bare
-/// `card.user_id` is never trusted alone: no cert → `unverified_owner`,
-/// import still succeeds. The label is the card's `owner_name` as a DNS
-/// label ([`x0x::names::label_from_display`]). A user that already has a
-/// label, or the local owner (always `me`), binds nothing. A label already
-/// bound to a different user is left untouched and reported as `conflict`
-/// (frozen at first bind). The import itself never fails because of naming.
-/// Returns `null` when nothing applied.
+/// and `owner_name` may bind, and only when a local discovery/cache
+/// [`AgentCertificate`] for the card's agent chains to that claimed
+/// `user_id` (valid, unexpired, unrevoked) via
+/// [`x0x::owner_trust::certificate_chains_to_owner`]. A bare `card.user_id`
+/// is never trusted alone: no cert → `unverified_owner`, import still
+/// succeeds. The label is the card's `owner_name` as a DNS label
+/// ([`x0x::names::label_from_display`]). A user that already has a label
+/// returns status `existing`. The local owner (always `me`) binds nothing.
+/// A label already bound to a different user is left untouched and reported
+/// as `conflict` (frozen at first bind). The import itself never fails
+/// because of naming. Returns `null` when nothing applied.
 pub(in crate::server) async fn bind_owner_from_card(
     state: &AppState,
     card: &x0x::groups::card::AgentCard,
     trust: x0x::contacts::TrustLevel,
 ) -> serde_json::Value {
-    if card.signature.is_none() || trust == x0x::contacts::TrustLevel::Blocked {
+    // ADR-0079 contact gate: Known and Trusted may bind. Unknown and
+    // Blocked return null and leave the label unbound.
+    if card.signature.is_none()
+        || !matches!(
+            trust,
+            x0x::contacts::TrustLevel::Known | x0x::contacts::TrustLevel::Trusted
+        )
+    {
         return serde_json::Value::Null;
     }
     let (Some(user_hex), Some(owner_name)) = (&card.user_id, &card.owner_name) else {

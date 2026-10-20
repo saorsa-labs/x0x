@@ -3167,7 +3167,7 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 These are local names for agents and machines: `[agent:|machine:]<label>.<owner>`. Labels are lowercase DNS labels (`[a-z0-9-]`, 1–63 characters, no leading or trailing `-`). `me`, `agent` and `machine` are reserved. A 64-character hex agent id stays valid wherever a name is accepted.
 
 - **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of two ways:
-  - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`.
+  - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`. A signed card binds the owner label only when the imported contact is Known or Trusted and that user has no petname yet; Unknown leaves the label unbound for an explicit bind.
   - `POST /names/owners`.
 
   A petname is frozen at first bind. Binding it to another key returns `409` `pin_mismatch` until the label is removed.
