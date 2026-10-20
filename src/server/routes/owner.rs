@@ -731,6 +731,71 @@ pub(in crate::server) async fn owner_riders_revoke(
     }
 }
 
+/// One machine row in the `GET /owner/machines` census (#1383).
+#[derive(Debug, serde::Serialize)]
+pub(in crate::server) struct OwnerMachineEntry {
+    machine_id: String,
+    enrolled_at_ms: u64,
+    expires_at_ms: Option<u64>,
+    last_session_ms: Option<u64>,
+    last_session_ok: Option<bool>,
+    is_this_machine: bool,
+}
+
+/// GET /owner/machines — the #1167 M1 owner's machine census over owner-sync
+/// (#1383, David's 20 Oct 2026 ruling: additive local API, no wire change).
+/// One row per enrolled device with its last-sync status; the local daemon's
+/// version and version/policy digest ride in `this_machine`. Remote
+/// per-machine versions stay absent until an approved announcement change
+/// carries the digest on the wire — this surface changes no announcement and
+/// adds no capability bit. `409` when no owner identity (and therefore no
+/// sync service) is configured, mirroring `GET /sync/devices`.
+pub(in crate::server) async fn owner_machines(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(sync) = state.owner_sync.as_ref() else {
+        return api_error(StatusCode::CONFLICT, "no owner identity configured");
+    };
+    let Some(owner) = state.agent.identity().user_keypair() else {
+        return api_error(StatusCode::CONFLICT, "no owner identity configured");
+    };
+    let this_machine = state.agent.machine_id();
+    let version = env!("CARGO_PKG_VERSION");
+    let digest = super::network::version_policy_digest(version, &state.update_config);
+    let statuses = sync.store().session_statuses().await;
+    let mut machines: Vec<OwnerMachineEntry> = sync
+        .store()
+        .enrolled_devices()
+        .await
+        .into_iter()
+        .map(|enrollment| {
+            let status = statuses.get(&enrollment.machine_id);
+            OwnerMachineEntry {
+                machine_id: hex::encode(enrollment.machine_id),
+                enrolled_at_ms: enrollment.enrolled_at_ms,
+                expires_at_ms: enrollment.expires_at_ms,
+                last_session_ms: status.map(|s| s.last_session_ms),
+                last_session_ok: status.map(|s| s.last_session_ok),
+                is_this_machine: enrollment.machine_id == this_machine.0,
+            }
+        })
+        .collect();
+    machines.sort_by(|a, b| a.machine_id.cmp(&b.machine_id));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "owner_user_id": hex::encode(owner.user_id().0),
+            "this_machine": {
+                "machine_id": hex::encode(this_machine.0),
+                "version": version,
+                "version_policy_digest": digest,
+            },
+            "machines": machines,
+        })),
+    )
+}
+
 #[cfg(test)]
 mod revocation_persistence_tests {
     use super::*;
@@ -811,5 +876,169 @@ mod revocation_persistence_tests {
             "the live path no longer holds the corrupt payload"
         );
         state.agent.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod owner_machines_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    /// #1383: the census lists every enrolled device with its last-sync
+    /// status and carries THIS machine's version + version/policy digest.
+    /// Local only: remote rows never claim a version until an approved
+    /// announcement change carries the digest on the wire.
+    #[tokio::test]
+    async fn owner_machines_lists_enrolled_devices_and_local_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let user =
+            crate::identity::UserKeypair::from_seed(&[0x4D; 32]).expect("deterministic user key");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(crate::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+        let sync = state.owner_sync.as_ref().expect("owned state wires sync");
+        let this_machine = state.agent.machine_id();
+        let other_machine = crate::identity::MachineId([0x07; 32]);
+        sync.store()
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(this_machine, owner_kp, 1_000, None)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        sync.store()
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(
+                    other_machine,
+                    owner_kp,
+                    2_000,
+                    Some(9_000),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/owner/machines", get(owner_machines))
+            .with_state(Arc::clone(&state));
+        let response = app
+            .oneshot(Request::get("/owner/machines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["owner_user_id"], hex::encode(owner_kp.user_id().0));
+        assert_eq!(
+            body["this_machine"]["machine_id"],
+            hex::encode(this_machine.0)
+        );
+        assert_eq!(body["this_machine"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            body["this_machine"]["version_policy_digest"],
+            super::super::network::version_policy_digest(
+                env!("CARGO_PKG_VERSION"),
+                &state.update_config
+            )
+        );
+        let machines = body["machines"].as_array().expect("machines array");
+        assert_eq!(machines.len(), 2, "both enrollments are censused");
+        let other_row = machines
+            .iter()
+            .find(|m| m["machine_id"] == hex::encode(other_machine.0))
+            .expect("other machine row");
+        assert_eq!(other_row["enrolled_at_ms"], 2_000);
+        assert_eq!(other_row["expires_at_ms"], 9_000);
+        assert_eq!(other_row["is_this_machine"], false);
+        assert!(
+            other_row.get("version").is_none(),
+            "remote rows carry no version until an approved wire change"
+        );
+        let this_row = machines
+            .iter()
+            .find(|m| m["is_this_machine"] == true)
+            .expect("this machine row");
+        assert_eq!(this_row["machine_id"], hex::encode(this_machine.0));
+
+        agent.shutdown().await;
+    }
+
+    /// #1383: an ownerless install has no sync service, so the census
+    /// answers `409` exactly like `GET /sync/devices`.
+    #[tokio::test]
+    async fn owner_machines_conflicts_without_owner_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(crate::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state.owner_sync.is_none(),
+            "ownerless state wires no sync service"
+        );
+        let app = Router::new()
+            .route("/owner/machines", get(owner_machines))
+            .with_state(state);
+        let response = app
+            .oneshot(Request::get("/owner/machines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        agent.shutdown().await;
     }
 }

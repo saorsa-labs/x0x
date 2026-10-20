@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 204,
+  "endpoint_count": 206,
   "endpoints": [
     {
       "category": "status",
@@ -444,7 +444,7 @@
     {
       "category": "identity",
       "cli_name": "owner placement",
-      "description": "Derived placement ledger (lazy mint + ≥1-Roaming Home invariant)",
+      "description": "Derived placement ledger (lazy mint + \u22651-Roaming Home invariant)",
       "method": "GET",
       "path": "/owner/placement",
       "request": {
@@ -553,6 +553,16 @@
       "description": "Roster of agents certified by this install's owner (journal-backed; survives restarts)",
       "method": "GET",
       "path": "/owner/agents",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner machines",
+      "description": "M1 machine census over owner-sync: enrolled devices + last-sync status + local version/policy digest (#1383)",
+      "method": "GET",
+      "path": "/owner/machines",
       "request": {
         "kind": "none"
       }
@@ -871,6 +881,16 @@
       "description": "Transport connection accounting (zombie-connection hunt, #368)",
       "method": "GET",
       "path": "/diagnostics/transport",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics upgrade",
+      "description": "Local version + update-policy digest for the M1 census (#1383; local only, no wire change)",
+      "method": "GET",
+      "path": "/diagnostics/upgrade",
       "request": {
         "kind": "none"
       }
