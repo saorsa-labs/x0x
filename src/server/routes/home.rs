@@ -2979,9 +2979,19 @@ pub(in crate::server::routes) mod tests {
             body["warnings"]["no_roaming_agent"], false,
             "fresh Home carries a Roaming founding agent"
         );
-        let health_json = crate::server::routes::status::health(State(Arc::clone(&state))).await;
-        let health_body: serde_json::Value =
-            serde_json::to_value(&health_json.0).unwrap_or_default();
+        // Loopback peer, no bearer: the full-detail branch of the (never
+        // redacted) warnings field is what this test reads.
+        let health_response = crate::server::routes::status::health(
+            State(Arc::clone(&state)),
+            Some(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            )))),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let health_bytes = axum::body::to_bytes(health_response.into_body(), 1 << 20).await?;
+        let health_body: serde_json::Value = serde_json::from_slice(&health_bytes)?;
         assert!(
             health_body["warnings"]
                 .as_array()
