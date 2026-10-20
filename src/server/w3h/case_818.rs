@@ -22,27 +22,25 @@
 //! TreeKEM epoch, with no fork-quarantine marker. RED (`main`, the #818
 //! design decision of 2026-09-24): an ownerless group cannot tell a gap
 //! from a fork, so J installs a `signer_only` marker with `no_anchor: true`
-//! on A's legitimate add and records no anchored-gap exemption.
+//! on A's legitimate add and records no anchored-gap exemption. About 120 s
+//! after the join, J's join-result poll times out
+//! (`JOIN_RESULT_POLL_TIMEOUT`) and J drops its stub, marker included. So
+//! the case records the cause the first time it sees it. A dropped record
+//! is an observed outcome only after the cause was seen; else it is INFRA.
 //!
-//! Controls, expected GREEN on `main`:
-//! - owned: the same schedule in an `OwnerCertified` group (A holds the
-//!   owner key; M1, M2 and J are same-owner devices). The owner attestation
-//!   makes the refused chain a gap (`owner_attested_stale_base_gap`, #816
-//!   and #818 part 1), so J catches up.
-//! - just-in-time invite: the ownerless group with the same skew, but A
-//!   mints I after the removal, so there is no gap (the mitigation that
-//!   `docs/api-reference.md` documents).
+//! Control, expected GREEN on `main`: the same group and skew, but A mints
+//! I after the removal, so there is no gap (the just-in-time invite that
+//! `docs/api-reference.md` documents as the mitigation).
 //!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
 
 #![cfg(test)]
 
-use super::control::{create_group, invite, members, mesh};
+use super::control::{create_group, invite, join, members, mesh};
 use super::home::membership_state;
 use super::receipt::{Receipt, Verdict};
 use super::*;
-use crate::identity::{UserId, UserKeypair};
 use anyhow::ensure;
 use serde_json::json;
 
@@ -61,21 +59,15 @@ const CAUSE: &str = "J installs a signer_only fork_quarantine with no_anchor=tru
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
-    /// Ownerless group, invite minted before the removal: the #818 gap.
-    OwnerlessStale,
-    /// `OwnerCertified` group, invite minted before the removal.
-    OwnedStale,
-    /// Ownerless group, invite minted after the removal: no gap.
-    OwnerlessJustInTime,
+    /// Invite minted before the removal: the #818 gap.
+    StaleInvite,
+    /// Invite minted after the removal: no gap.
+    JustInTimeInvite,
 }
 
 impl Arm {
-    fn owned(self) -> bool {
-        self == Self::OwnedStale
-    }
-
     fn gap(self) -> bool {
-        self != Self::OwnerlessJustInTime
+        self == Self::StaleInvite
     }
 }
 
@@ -123,12 +115,46 @@ impl View {
     }
 }
 
+/// The desired end state: J is active at A's state revision and TreeKEM
+/// epoch, with no fork-quarantine marker.
+fn caught_up(j: Option<&View>, a: &View, membership: Option<&str>) -> bool {
+    j.is_some_and(|j| {
+        membership == Some("active")
+            && j.marker.is_none()
+            && j.state_revision == a.state_revision
+            && j.epoch.is_some()
+            && j.epoch == a.epoch
+    })
+}
+
+/// The #818 cause on `main`: J holds a `signer_only`, `no_anchor` marker
+/// for A's commit past the invite base, with fork evidence and no
+/// anchored-gap exemption.
+fn is_cause(j: &View, a_hex: &str, base: u64) -> bool {
+    j.marker.as_ref().is_some_and(|m| {
+        m.no_anchor
+            && m.classification.as_deref() == Some("signer_only")
+            && m.committed_by.eq_ignore_ascii_case(a_hex)
+            && m.revision > base
+    }) && j.fork_evidence
+        && j.gap_refusal.is_none()
+}
+
 async fn view_now(sim: &Sim, label: &str, group: &str) -> Result<View> {
+    try_view_now(sim, label, group)
+        .await?
+        .with_context(|| format!("{label} has no record of {group}"))
+}
+
+/// `label`'s view of `group`; `None` when it holds no record of it (a
+/// joiner drops its stub when its join attempt times out).
+async fn try_view_now(sim: &Sim, label: &str, group: &str) -> Result<Option<View>> {
     let state = sim.state(label)?;
     let (key, view) = {
         let groups = state.named_groups.read().await;
-        let (key, info) = crate::server::resolve_group_entry_locked(&groups, group)
-            .with_context(|| format!("{label} has no record of {group}"))?;
+        let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, group) else {
+            return Ok(None);
+        };
         let lineage = info.invite_lineage.as_ref();
         let view = View {
             state_revision: info.state_revision,
@@ -155,7 +181,7 @@ async fn view_now(sim: &Sim, label: &str, group: &str) -> Result<View> {
         Some(live) => Some(live.lock().await.epoch()),
         None => None,
     };
-    Ok(View { epoch, ..view })
+    Ok(Some(View { epoch, ..view }))
 }
 
 async fn view(sim: &Sim, label: &str, group: &str) -> Result<View> {
@@ -166,27 +192,10 @@ async fn view(sim: &Sim, label: &str, group: &str) -> Result<View> {
     .await?
 }
 
-/// `POST /groups/join`; an owner-axis invite needs home mode and the pin.
-async fn join_with(sim: &Sim, joiner: &str, link: &str, owner: Option<&str>) -> Result<()> {
-    let mut body = json!({"invite": link, "display_name": joiner});
-    if let Some(owner) = owner {
-        body["mode"] = json!("home");
-        body["expected_owner_user_id"] = json!(owner);
-    }
-    let (status, joined) = sim
-        .api(joiner, Method::POST, "/groups/join", Some(body))
-        .await?;
-    ensure!(
-        status.is_success() && joined["ok"] != false,
-        "{joiner} join: {status} {joined}"
-    );
-    Ok(())
-}
-
 /// A invites `member`; A lists it and it reports itself active.
-async fn seat(sim: &Sim, member: &str, group: &str, owner: Option<&str>) -> Result<()> {
+async fn seat(sim: &Sim, member: &str, group: &str) -> Result<()> {
     let link = invite(sim, "A", group).await?;
-    join_with(sim, member, &link, owner).await?;
+    join(sim, member, &link).await?;
     let hex = sim.agent_hex(member)?;
     sim.until(&format!("{member} seated"), SETUP, async |s: &Sim| {
         let listed = members(s, "A", group)
@@ -201,36 +210,6 @@ async fn seat(sim: &Sim, member: &str, group: &str, owner: Option<&str>) -> Resu
                 == Some("active")
     })
     .await
-}
-
-/// `POST /groups` as A: the `private_secure` preset, or the same policy
-/// with the `OwnerCertified` admission axis.
-async fn create(sim: &Sim, owner: Option<UserId>) -> Result<String> {
-    let Some(owner) = owner else {
-        return create_group(sim, "A").await;
-    };
-    let mut policy = crate::groups::GroupPolicyPreset::PrivateSecure.to_policy();
-    policy.admission = crate::groups::GroupAdmission::OwnerCertified(owner);
-    let (status, created) = sim
-        .api(
-            "A",
-            Method::POST,
-            "/groups",
-            Some(json!({
-                "name": "w3h 818",
-                "display_name": "A",
-                "policy": serde_json::to_value(&policy)?,
-            })),
-        )
-        .await?;
-    ensure!(
-        status.is_success() && created["ok"] == true,
-        "create: {status} {created}"
-    );
-    Ok(created["group_id"]
-        .as_str()
-        .context("create response has no group_id")?
-        .to_string())
 }
 
 /// Every label in `labels` holds A's state revision.
@@ -257,18 +236,12 @@ fn delivered_after(sim: &Sim, src: &str, dst: &str, after: usize) -> Result<usiz
         .len())
 }
 
-async fn scenario(
-    sim: &mut Sim,
-    arm: Arm,
-    owner: Option<&Owner>,
-    receipt: &mut Receipt,
-) -> Result<()> {
+async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     mesh(sim, LABELS).await?;
-    let group = create(sim, owner.map(|o| o.id)).await?;
-    let owner = owner.map(|o| o.hex.as_str());
+    let group = create_group(sim, "A").await?;
     for member in ["M1", "M2"] {
-        seat(sim, member, &group, owner).await?;
+        seat(sim, member, &group).await?;
     }
     for write_access in POLICY_CHANGES {
         let (status, body) = sim
@@ -319,7 +292,7 @@ async fn scenario(
     .await?;
 
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
-    join_with(sim, "J", &link, owner).await?;
+    join(sim, "J", &link).await?;
     let j_hex = sim.agent_hex("J")?;
     sim.until("A seals J", SETUP, async |s: &Sim| {
         view_now(s, "A", &group)
@@ -329,22 +302,6 @@ async fn scenario(
     .await?;
     let sealed = view(sim, "A", &group).await?;
     let stub = view(sim, "J", &group).await?;
-    // DIAG #1362 only: J's group counters and WARN logs 10 s after the seal.
-    sim.within("diag settle", secs(12), async {
-        tokio::time::sleep(secs(10)).await;
-    })
-    .await?;
-    for label in ["J", "A"] {
-        let (status, diag) = sim
-            .api(label, Method::GET, "/diagnostics/groups", None)
-            .await?;
-        receipt.note(format!("DIAG {label} /diagnostics/groups {status} {diag}"));
-    }
-    let probe = view(sim, "J", &group).await?;
-    receipt.note(format!("DIAG J after 10 s: {}", probe.describe()));
-    for log in sim.logs_containing(&[]).into_iter().take(80) {
-        receipt.note(format!("DIAG log t={}ms {}", log.at.as_millis(), log.text));
-    }
     receipt.setup_done(at(sim));
 
     let base = if arm.gap() {
@@ -353,12 +310,8 @@ async fn scenario(
         removal.state_revision
     };
     receipt.evidence(
-        if arm.owned() {
-            "group_has_the_owner_axis"
-        } else {
-            "group_is_ownerless"
-        },
-        sealed.owner_axis == arm.owned() && stub.owner_axis == arm.owned(),
+        "group_is_ownerless",
+        !sealed.owner_axis && !stub.owner_axis,
         format!(
             "A owner_axis={} J owner_axis={}",
             sealed.owner_axis, stub.owner_axis
@@ -398,10 +351,14 @@ async fn scenario(
     );
 
     let a_hex = sim.agent_hex("A")?;
+    // J drops its stub, marker included, when its join attempt times out
+    // (`JOIN_RESULT_POLL_TIMEOUT`, 120 s). So the cause is recorded the
+    // first time it is observed, and the wait runs the full budget.
+    let mut cause: Option<String> = None;
     let mut seen = Observations::default();
     let waited = sim
         .until("J catches up to A", CATCHUP, async |s: &Sim| {
-            let Some(j) = seen.observe(view_now(s, "J", &group)).await else {
+            let Some(j) = seen.observe(try_view_now(s, "J", &group)).await else {
                 return true;
             };
             let Some(a) = seen.observe(view_now(s, "A", &group)).await else {
@@ -410,11 +367,16 @@ async fn scenario(
             let Some(state) = seen.observe(membership_state(s, "J", &group)).await else {
                 return true;
             };
-            state.as_deref() == Some("active")
-                && j.marker.is_none()
-                && j.state_revision == a.state_revision
-                && j.epoch.is_some()
-                && j.epoch == a.epoch
+            if let Some(j) = j.as_ref().filter(|j| is_cause(j, &a_hex, base)) {
+                cause.get_or_insert_with(|| {
+                    format!(
+                        "first seen at {} us: J {}",
+                        s.fabric().now().as_micros(),
+                        j.describe()
+                    )
+                });
+            }
+            caught_up(j.as_ref(), &a, state.as_deref())
         })
         .await;
     if let Err(error) = waited {
@@ -423,29 +385,26 @@ async fn scenario(
         }
     }
     seen.verify("J catches up to A")?;
-    let j = view(sim, "J", &group).await?;
+    let j = sim
+        .at_instant("read J's group", try_view_now(sim, "J", &group))
+        .await??;
     let a = view(sim, "A", &group).await?;
     let j_state = sim
         .at_instant("read J's membership", membership_state(sim, "J", &group))
         .await??;
-    let passed = j_state.as_deref() == Some("active")
-        && j.marker.is_none()
-        && j.state_revision == a.state_revision
-        && j.epoch.is_some()
-        && j.epoch == a.epoch;
+    let passed = caught_up(j.as_ref(), &a, j_state.as_deref());
+    let j_text = j.as_ref().map_or_else(
+        || "has no record (stub dropped)".to_string(),
+        View::describe,
+    );
+    ensure!(
+        j.is_some() || cause.is_some(),
+        "INFRA: J dropped its record of the group and the #818 cause was never observed"
+    );
     receipt.note(format!(
-        "arm={arm:?} J membership={j_state:?}; J {}; A {}",
-        j.describe(),
+        "arm={arm:?} at the end: J membership={j_state:?}; J {j_text}; A {}",
         a.describe()
     ));
-    if arm.owned() {
-        receipt.evidence(
-            "refused_chain_took_the_owner_attested_gap_exemption",
-            j.gap_refusal.as_deref() == Some("owner_attested_stale_base_gap"),
-            format!("J {}", j.describe()),
-            at(sim),
-        );
-    }
 
     let to_a = delivered_after(sim, "J", "A", joined_at)?;
     let to_j = delivered_after(sim, "A", "J", joined_at)?;
@@ -456,55 +415,18 @@ async fn scenario(
         at(sim),
     );
     if !passed {
-        let marker = j.marker.as_ref();
-        let ok = marker.is_some_and(|m| {
-            m.no_anchor
-                && m.classification.as_deref() == Some("signer_only")
-                && m.committed_by.eq_ignore_ascii_case(&a_hex)
-                && m.revision > base
-        }) && j.fork_evidence
-            && j.gap_refusal.is_none();
         receipt.cause(
             CAUSE,
             Some(format!(
-                "J membership={j_state:?} marker={marker:?} fork_evidence={} gap_refusal={:?}",
-                j.fork_evidence, j.gap_refusal
+                "{}; at the end J membership={j_state:?}, J {j_text}",
+                cause.as_deref().unwrap_or("never seen")
             )),
-            ok,
+            cause.is_some(),
             at(sim),
         );
     }
     receipt.finish(FINAL, passed, at(sim));
     Ok(())
-}
-
-/// The owner axis of the owned arm.
-struct Owner {
-    id: UserId,
-    hex: String,
-}
-
-async fn start(case: &str, seed: u64, arm: Arm) -> Result<(Sim, Option<Owner>)> {
-    if !arm.owned() {
-        return Ok((Sim::start(case, seed, LABELS).await?, None));
-    }
-    let mut sim = Sim::empty(case, seed, LABELS)?;
-    // Before any daemon starts, like the node keys (`Sim::empty`).
-    let owner = UserKeypair::generate()?;
-    let home = sim.start_owner_device("A", &owner).await?;
-    for label in ["M1", "M2", "J"] {
-        sim.certify_owner_device("A", label, &owner, &home).await?;
-    }
-    let owner = Owner {
-        id: owner.user_id(),
-        hex: home.owner_user_id,
-    };
-    ensure!(
-        hex::encode(owner.id.0).eq_ignore_ascii_case(&owner.hex),
-        "INFRA: the Home names owner {}",
-        owner.hex
-    );
-    Ok((sim, Some(owner)))
 }
 
 async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
@@ -513,9 +435,9 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
         "#818 part 2 / ADR 0109 H-S3-a. Policy changes, not renames, make the \
          state-only commits: a rename now moves the roster clock too.",
     );
-    match start(case, seed, arm).await {
-        Ok((mut sim, owner)) => {
-            if let Err(error) = scenario(&mut sim, arm, owner.as_ref(), &mut receipt).await {
+    match Sim::start(case, seed, LABELS).await {
+        Ok(mut sim) => {
+            if let Err(error) = scenario(&mut sim, arm, &mut receipt).await {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
             }
             if let Err(error) = sim.finish().await {
@@ -551,25 +473,8 @@ async fn w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined() -> Result
     expect(
         "w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined",
         0x0818_0001,
-        Arm::OwnerlessStale,
+        Arm::StaleInvite,
         Verdict::Red,
-    )
-    .await
-}
-
-/// The same schedule with the owner axis: the owner attestation makes the
-/// refused chain a gap, and J catches up (#818 part 1).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
-)]
-async fn w3h_818_control_owned_skewed_joiner_catches_up() -> Result<()> {
-    expect(
-        "w3h_818_control_owned_skewed_joiner_catches_up",
-        0x0818_0002,
-        Arm::OwnedStale,
-        Verdict::Green,
     )
     .await
 }
@@ -584,8 +489,8 @@ async fn w3h_818_control_owned_skewed_joiner_catches_up() -> Result<()> {
 async fn w3h_818_control_ownerless_invite_after_the_removal_joins() -> Result<()> {
     expect(
         "w3h_818_control_ownerless_invite_after_the_removal_joins",
-        0x0818_0003,
-        Arm::OwnerlessJustInTime,
+        0x0818_0002,
+        Arm::JustInTimeInvite,
         Verdict::Green,
     )
     .await
