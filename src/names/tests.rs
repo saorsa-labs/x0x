@@ -49,7 +49,7 @@ fn agent_only(agents: Vec<AgentCandidate>) -> Candidates {
 fn verified_agent(id: u8, label: &str) -> AgentCandidate {
     AgentCandidate {
         agent_id: AgentId([id; 32]),
-        label: label.to_string(),
+        label: Some(label.to_string()),
         machine_id: None,
         verified: true,
     }
@@ -167,6 +167,36 @@ fn peer_ref_accepts_hex_and_forward_peer_refuses_machine_names() {
     let (agent, pinned) = forward_target(&resolved, &name("machine:studio.me")).unwrap();
     assert_eq!(agent, AgentId([2; 32]));
     assert_eq!(pinned, Some(MachineId([3; 32])));
+}
+
+/// WHY (Claude #1494 e338df79): a bare label that resolves to a machine must
+/// not pin when the caller asked for an agent-only resolution.
+/// `resolve_with_options` checks kind before `pin`. `POST /forwards` does
+/// not use that flag: a machine name is pinned and bound (ADR-0074 slice 2).
+#[tokio::test]
+async fn agent_only_resolve_refuses_machine_before_pinning() {
+    let store = NameStore::in_memory();
+    let owner = UserId([9; 32]);
+    let candidates = Candidates {
+        agents: vec![],
+        machines: vec![verified_machine(3, "studio")],
+    };
+    let err = resolve_with_options(&store, &name("studio.me"), owner, &candidates, NOW, true)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "machine_target_unsupported", "{err}");
+    assert!(
+        store.get_pin("machine:studio.me").await.unwrap().is_none(),
+        "refused forward must not write a machine pin"
+    );
+}
+
+/// WHY (Claude #1494 e338df79): `unbind_owner` validates the label first.
+#[tokio::test]
+async fn unbind_owner_rejects_invalid_label() {
+    let store = NameStore::in_memory();
+    let err = store.unbind_owner("Not A Label").await.unwrap_err();
+    assert_eq!(err.code(), "invalid_name", "{err}");
 }
 
 #[test]
@@ -462,6 +492,201 @@ fn shared_machine_name_resolves_only_while_granted() {
     }
 }
 
+/// WHY (Claude #1494 e338df79 P2): announce `self_name` is verified only
+/// when announce machine == authenticated binding.
+#[test]
+fn verified_announce_self_name_requires_authenticated_machine_match() {
+    let announce = MachineId([1; 32]);
+    let auth = MachineId([1; 32]);
+    let other = MachineId([2; 32]);
+    assert_eq!(
+        verified_announce_self_name(announce, Some(auth), Some("studio".into())).as_deref(),
+        Some("studio")
+    );
+    assert!(
+        verified_announce_self_name(announce, Some(other), Some("evil".into())).is_none(),
+        "foreign announce machine must drop the label"
+    );
+    assert!(
+        verified_announce_self_name(announce, None, Some("evil".into())).is_none(),
+        "no auth binding while announce claims a name ⇒ unverified"
+    );
+    assert!(
+        verified_announce_self_name(
+            MachineId([0; 32]),
+            Some(MachineId([0; 32])),
+            Some("x".into())
+        )
+        .is_none(),
+        "all-zero machine id is not a verified announce source"
+    );
+}
+
+/// WHY (Claude #1494 e338df79 P2): a certified peer claiming the same label
+/// from a foreign announce machine is stripped at the gatherer. Modelled
+/// via [`verified_announce_self_name`]: the spoofed label is absent, the
+/// legitimate candidate still resolves, and there is no AmbiguousName.
+#[test]
+fn foreign_machine_self_name_spoof_does_not_hijack_or_ambiguate() {
+    let bob = user();
+    let real = agent();
+    let spoof_agent = agent();
+    let auth_machine = MachineId([4; 32]);
+    let foreign_machine = MachineId([5; 32]);
+    // Legitimate observation (gatherer kept self_name — machines matched).
+    let legit = observed(
+        &real,
+        Some(bob.user_id()),
+        Some(&bob),
+        "studio",
+        Some(auth_machine),
+    );
+    // Second certified agent under the same owner. If the gatherer trusted
+    // its announce self_name ("studio") despite machine mismatch, select
+    // would return AmbiguousName. After the strip, it has no label.
+    let mut spoof_stripped = observed(
+        &spoof_agent,
+        Some(bob.user_id()),
+        Some(&bob),
+        "studio",
+        Some(foreign_machine),
+    );
+    spoof_stripped.self_name =
+        verified_announce_self_name(foreign_machine, Some(auth_machine), Some("studio".into()));
+    assert!(spoof_stripped.self_name.is_none());
+    // ObservedAgent.machine_id is the authenticated binding (gatherer).
+    spoof_stripped.machine_id = Some(auth_machine);
+    let agents = agent_candidates(&bob.user_id(), &[legit, spoof_stripped], NOW);
+    let studio = select(&name("studio.bob"), &agent_only(agents)).unwrap();
+    assert_eq!(studio.agent_id, Some(real.agent_id()));
+    let ambiguated = agent_candidates(
+        &bob.user_id(),
+        &[
+            observed(
+                &real,
+                Some(bob.user_id()),
+                Some(&bob),
+                "studio",
+                Some(auth_machine),
+            ),
+            observed(
+                &spoof_agent,
+                Some(bob.user_id()),
+                Some(&bob),
+                "studio",
+                Some(foreign_machine),
+            ),
+        ],
+        NOW,
+    );
+    assert!(
+        matches!(
+            select(&name("studio.bob"), &agent_only(ambiguated)),
+            Err(NameError::AmbiguousName { .. })
+        ),
+        "control: trusting both announce labels would AmbiguousName"
+    );
+}
+
+/// WHY (PR #1494 P2b): a certified granted agent with no display name still
+/// proves shared-machine eligibility — machine binding is independent of
+/// agent-label matching.
+#[test]
+fn shared_machine_resolves_when_granted_agent_has_no_display_name() {
+    let bob = user();
+    let me = user();
+    let bob_agent = agent();
+    let machine = MachineId([9; 32]);
+    let mut obs = observed(
+        &bob_agent,
+        Some(bob.user_id()),
+        Some(&bob),
+        "srv",
+        Some(machine),
+    );
+    obs.self_name = None;
+    let agents = agent_candidates(&bob.user_id(), &[obs], NOW);
+    assert!(
+        agents.iter().any(|a| a.verified && a.label.is_none()),
+        "unlabeled verified host must remain a candidate"
+    );
+    assert!(
+        select(&name("agent:srv.bob"), &agent_only(agents.clone())).is_err(),
+        "no DNS self-name ⇒ no agent-label match"
+    );
+    let grant = crate::share_grant::ShareGrant::sign(
+        &bob,
+        [7; 32],
+        Grantee::User(me.user_id()),
+        vec![bob_agent.agent_id()],
+        vec![ShareCap::Connect { ports: vec![22] }],
+        NOW - 100,
+        NOW + 3600,
+    )
+    .unwrap();
+    let machines = shared_machine_candidates(
+        &bob.user_id(),
+        &[("box".to_string(), machine)],
+        &[(grant, false)],
+        &agents,
+        &BTreeSet::new(),
+        NOW,
+    );
+    let ok = select(&name("machine:box.bob"), &Candidates { agents, machines }).unwrap();
+    assert_eq!(ok.machine_id, Some(machine));
+    assert_eq!(ok.agent_id, Some(bob_agent.agent_id()));
+}
+
+/// WHY (PR #1494 P2b): a Unicode self-name (`René`) is not a DNS label, but
+/// the certified granted agent on that machine still verifies a shared
+/// machine label.
+#[test]
+fn shared_machine_resolves_when_granted_agent_has_unicode_name() {
+    let bob = user();
+    let me = user();
+    let bob_agent = agent();
+    let machine = MachineId([11; 32]);
+    let obs = observed(
+        &bob_agent,
+        Some(bob.user_id()),
+        Some(&bob),
+        "René",
+        Some(machine),
+    );
+    assert!(
+        label_from_display("René").is_none(),
+        "Unicode display must not yield a DNS label"
+    );
+    let agents = agent_candidates(&bob.user_id(), &[obs], NOW);
+    assert!(
+        agents
+            .iter()
+            .any(|a| a.verified && a.label.is_none() && a.machine_id == Some(machine)),
+        "Unicode-named verified host must remain for machine checks"
+    );
+    let grant = crate::share_grant::ShareGrant::sign(
+        &bob,
+        [8; 32],
+        Grantee::User(me.user_id()),
+        vec![bob_agent.agent_id()],
+        vec![ShareCap::Connect { ports: vec![22] }],
+        NOW - 100,
+        NOW + 3600,
+    )
+    .unwrap();
+    let machines = shared_machine_candidates(
+        &bob.user_id(),
+        &[("box".to_string(), machine)],
+        &[(grant, false)],
+        &agents,
+        &BTreeSet::new(),
+        NOW,
+    );
+    let ok = select(&name("machine:box.bob"), &Candidates { agents, machines }).unwrap();
+    assert_eq!(ok.machine_id, Some(machine));
+    assert_eq!(ok.agent_id, Some(bob_agent.agent_id()));
+}
+
 // ── Pins and persistence ───────────────────────────────────────────────────
 
 /// WHY: the first successful resolution pins the name; later resolutions
@@ -673,12 +898,13 @@ async fn names_and_pins_persist_across_restart() {
     }
 }
 
-/// WHY (#1101 / PR #1494 P2): when the durable store write fails AFTER the
+/// WHY (#1101 / PR #1494 P2a): when the durable store write fails AFTER the
 /// atomic rename, the new binding is already in `names.json`. Commit must
 /// keep it in memory (memory == disk) and still return [`NameError::Store`]
-/// — never roll memory back below an advanced disk. Uses the parent-dir
-/// fsync AfterRename seam (`arm_fail_parent_dir_fsync_for_testing`); the
-/// corrupt-after-rename seam would overwrite the new bytes and break the
+/// — never roll memory back below an advanced disk. An identical retry while
+/// fsync still fails must not ACK as [`BindOutcome::Unchanged`]. Uses the
+/// parent-dir fsync AfterRename seam (`arm_fail_parent_dir_fsync_for_testing`);
+/// the corrupt-after-rename seam would overwrite the new bytes and break the
 /// agreement assertion.
 #[tokio::test]
 async fn commit_after_rename_failure_keeps_binding_and_reload_agrees() {
@@ -688,7 +914,7 @@ async fn commit_after_rename_failure_keeps_binding_and_reload_agrees() {
     let store = NameStore::load(path.clone()).await;
     assert!(store.load_error().is_none());
 
-    let _seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
     let outcome = store
         .bind_owner("bob", owner, BindSource::Manual, NOW)
         .await;
@@ -701,8 +927,33 @@ async fn commit_after_rename_failure_keeps_binding_and_reload_agrees() {
     let mem = store.owner("bob").await.unwrap().expect("memory has bob");
     assert_eq!(mem.user_id, owner);
 
+    // Identical retry while fsync still fails: pending durability must
+    // re-attempt the write and still refuse the ACK (not Unchanged).
+    let retry_while_faulted = store
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await;
+    assert!(
+        matches!(&retry_while_faulted, Err(NameError::Store(msg)) if msg.contains("not confirmed")),
+        "retry under AfterRename fault must not ACK Unchanged: {retry_while_faulted:?}"
+    );
+    assert_eq!(
+        store
+            .owner("bob")
+            .await
+            .unwrap()
+            .expect("still bob")
+            .user_id,
+        owner
+    );
+
     // A reload from disk agrees with memory — the binding really is stored.
-    drop(_seam);
+    drop(seam);
+    let confirmed = store
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await
+        .expect("durability retry after seam drop");
+    assert_eq!(confirmed, BindOutcome::Unchanged);
+
     let reloaded = NameStore::load(path).await;
     assert!(
         reloaded.load_error().is_none(),

@@ -257,7 +257,7 @@ fn agent_candidate(id: u8) -> Candidates {
     Candidates {
         agents: vec![AgentCandidate {
             agent_id: AgentId([id; 32]),
-            label: "studio".to_string(),
+            label: Some("studio".to_string()),
             machine_id: None,
             verified: true,
         }],

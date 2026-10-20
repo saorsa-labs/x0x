@@ -783,11 +783,23 @@ pub async fn write_private_bytes_durable_typed(
     path: &Path,
     bytes: Vec<u8>,
 ) -> std::result::Result<(), DurableWriteError> {
+    write_private_bytes_durable_typed_after_rename(path, bytes, || {}).await
+}
+
+/// Like [`write_private_bytes_durable_typed`], but runs `on_renamed`
+/// synchronously once the new bytes are visible (after rename, before
+/// parent-directory fsync). NameStore uses this so a cancelled await
+/// cannot skip installing in-memory state that already matches disk.
+pub async fn write_private_bytes_durable_typed_after_rename(
+    path: &Path,
+    bytes: Vec<u8>,
+    on_renamed: impl FnOnce(),
+) -> std::result::Result<(), DurableWriteError> {
     let guard = revocation_write_guard(path)
         .await
         .map_err(guard_refusal_before_rename)?;
     let bytes = monotonic_v1_v2_bytes(path, bytes).await?;
-    write_private_bytes_durable_guarded(path, bytes, guard).await
+    write_private_bytes_durable_guarded_after_rename(path, bytes, guard, on_renamed).await
 }
 
 /// Unite `incoming` with verified records in a readable v1 or v2 file.
@@ -1214,7 +1226,16 @@ fn durable_write_identity_error(error: DurableWriteError) -> IdentityError {
 async fn write_private_bytes_durable_guarded(
     path: &Path,
     bytes: Vec<u8>,
+    revocation_guard: Option<RevocationWriteGuard>,
+) -> std::result::Result<(), DurableWriteError> {
+    write_private_bytes_durable_guarded_after_rename(path, bytes, revocation_guard, || {}).await
+}
+
+async fn write_private_bytes_durable_guarded_after_rename(
+    path: &Path,
+    bytes: Vec<u8>,
     _revocation_guard: Option<RevocationWriteGuard>,
+    on_renamed: impl FnOnce(),
 ) -> std::result::Result<(), DurableWriteError> {
     // Production uses tokio::fs::File + AsyncWriteExt; test builds use
     // w3h_fs::File's inherent write_all (inline under the shim).
@@ -1283,7 +1304,10 @@ async fn write_private_bytes_durable_guarded(
         return Err(DurableWriteError::BeforeRename(err));
     }
 
-    // Everything below runs with the NEW bytes already visible on disk.
+    // NEW bytes are visible — stage caller memory before parent-dir fsync
+    // so cancellation cannot leave disk ahead of every in-memory copy.
+    on_renamed();
+
     sync_published_file(path).await
 }
 

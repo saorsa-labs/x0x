@@ -78,9 +78,10 @@ Auth-class labels used throughout this reference:
   (metadata presence is the marker — never the current policy axes, so
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
-  route. The join-request list, approve and reject are not on this list.
-  They take one class that depends on the group: see **Join-request admin
-  (#1347)** below.
+  route, (#1386) `POST /forwards` in every case (including plain hex
+  `peer_agent`), and every `/names*` route. The join-request list,
+  approve and reject are not on this list. They take one class that
+  depends on the group: see **Join-request admin (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
@@ -3139,7 +3140,7 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`) |
+| POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`; **durable-owner** in every case) |
 | GET | `/forwards` | `x0x forward list` | List registered forwards, including persisted forwards that are down |
 | DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address and delete its persisted record |
 | GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed and machine-mismatch counters + connect-ACL snapshot |
@@ -3155,6 +3156,8 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
   "ephemeral": false
 }
 ```
+
+`POST /forwards` requires the durable owner API token (**durable-owner**) in every case. Session and rider tokens receive a typed `403`, including a plain hex `peer_agent` that writes no name or pin. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward.
 
 `local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
 

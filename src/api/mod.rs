@@ -1944,8 +1944,8 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "names resolve",
         description: "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
         category: "names",
-        // Positional NAME — must not synthesize `--name` (collides with the
-        // global instance `--name` flag; see cli_request_parity).
+        // Positional NAME — dump-request must not synthesize `--name`
+        // (collides with the global instance `--name` flag).
         request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
     },
     EndpointDef {
@@ -1973,6 +1973,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "names machine label",
         description: "Label a shared machine (machine:<label>.<owner> -> machine id)",
         category: "names",
+        // Same positional NAME rule as `/names/resolve` (global `--name` clash).
         request: RequestSpec::Fields(&[
             RequestField::body_as("name", true, "NAME"),
             RequestField::body_as("machine_id", true, "MACHINE_ID"),
