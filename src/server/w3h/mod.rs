@@ -44,6 +44,7 @@ mod case_1105;
 mod case_1161;
 mod case_1191;
 mod case_1256;
+mod case_1356;
 mod case_1357;
 mod case_1427;
 mod case_1471;
