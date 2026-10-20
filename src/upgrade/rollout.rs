@@ -23,6 +23,9 @@ impl StagedRollout {
     /// # Arguments
     /// * `node_id` - Unique node identifier (MachineId bytes)
     /// * `max_delay_minutes` - Maximum rollout window in minutes (0 = no delay)
+    ///
+    /// Windows larger than `u64::MAX` seconds use that many seconds. Delays
+    /// have whole-second precision and remain strictly below a positive window.
     pub fn new(node_id: &[u8], max_delay_minutes: u64) -> Self {
         Self {
             node_id: node_id.to_vec(),
@@ -38,25 +41,7 @@ impl StagedRollout {
             return Duration::ZERO;
         }
 
-        let hash = Sha256::digest(&self.node_id);
-        let fraction = self.hash_to_fraction(&hash);
-        let delay_secs = (fraction * (self.max_delay_minutes as f64) * 60.0) as u64;
-        let delay = Duration::from_secs(delay_secs);
-
-        let hours = delay_secs / 3600;
-        let minutes = (delay_secs % 3600) / 60;
-        let seconds = delay_secs % 60;
-        debug!(
-            delay_hours = hours,
-            delay_minutes = minutes,
-            delay_seconds = seconds,
-            "Calculated staged rollout delay: {}h {}m {}s",
-            hours,
-            minutes,
-            seconds
-        );
-
-        delay
+        self.delay_from_hash(Sha256::digest(&self.node_id).into())
     }
 
     /// Calculate a version-specific delay.
@@ -71,10 +56,18 @@ impl StagedRollout {
         let mut hasher = Sha256::new();
         hasher.update(&self.node_id);
         hasher.update(version.as_bytes());
-        let hash = hasher.finalize();
+        self.delay_from_hash(hasher.finalize().into())
+    }
 
-        let fraction = self.hash_to_fraction(&hash);
-        let delay_secs = (fraction * (self.max_delay_minutes as f64) * 60.0) as u64;
+    fn delay_from_hash(&self, hash: [u8; 32]) -> Duration {
+        let value = u64::from_be_bytes([
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+        ]);
+        let window_secs = self.max_delay_minutes.saturating_mul(60);
+        // Scale the fraction value / 2^64 with an exact 128-bit product.
+        // Both factors fit u64, so the product cannot overflow; because value
+        // is below 2^64, its whole-second result is below window_secs.
+        let delay_secs = ((u128::from(value) * u128::from(window_secs)) >> 64) as u64;
         let delay = Duration::from_secs(delay_secs);
 
         let hours = delay_secs / 3600;
@@ -91,14 +84,6 @@ impl StagedRollout {
         );
 
         delay
-    }
-
-    /// Convert a SHA-256 hash to a fraction in [0.0, 1.0).
-    fn hash_to_fraction(&self, hash: &[u8]) -> f64 {
-        let value = u64::from_be_bytes([
-            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
-        ]);
-        value as f64 / u64::MAX as f64
     }
 }
 
