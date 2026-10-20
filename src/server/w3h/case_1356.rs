@@ -42,7 +42,11 @@
 //! at state revision r. Every write from X is dropped ([`OutboundHold`]);
 //! X renames (r+1′, on X only) and A renames (r+1). X still receives A's
 //! r+1, a sibling of its own head, so X installs a `no_anchor` marker.
-//! After X's resends end the hold is lifted. X's head is on no admin's
+//! After X's resends end, only X's pubsub writes stay held, for the rest
+//! of the run: direct messages (an S3 `group_attest_request`, the re-seat
+//! join) pass. In CI run 39496687111 a full release let X's pubsub cache
+//! replay r+1′ to A about 26 s later, and A was marked too, which is not
+//! this case's shape (H-S3-c "holds" the fork from the main chain). X's head is on no admin's
 //! chain: X is forked (ADR 0109 §3), while A and M1 share one chain and
 //! are unmarked. The case then advances [`ATTEST_ROUND`].
 //!
@@ -95,6 +99,14 @@ const CAUSE_ALIGNED: &str = "J is never marked and is not active at the end: the
                              and the join attempt ends with no typed state";
 
 /// The WARN line the frontier gate writes when it queues an event.
+/// Real-time limit for a join arm's scenario, below nextest's 300 s kill
+/// (`slow-timeout` 60 s x 5 in the `w3h-gate` profile), so a slow run
+/// still writes its receipt (INFRA) with what it saw. In CI run
+/// 39496687111 the aligned arm was killed at 300 s with no receipt.
+const REAL_SCENARIO_LIMIT: std::time::Duration = std::time::Duration::from_secs(230);
+/// Virtual interval between `W3H-PROGRESS` lines in a join window.
+const PROGRESS_EVERY: Duration = Duration::from_secs(10);
+
 const QUEUED_LOG: &str = "queued TreeKEM membership event pending catch-up/replay";
 
 /// S0 step 3: state-only commits before the mint. A rename now moves the
@@ -380,13 +392,24 @@ fn at(sim: &Sim) -> u128 {
     sim.fabric().now().as_micros()
 }
 
+/// One `W3H-PROGRESS` line on stdout (nextest shows it for a killed test).
+fn progress(sim: &Sim, started: std::time::Instant, what: &str) {
+    println!(
+        "W3H-PROGRESS virt={}ms real={}ms {what}",
+        sim.fabric().now().as_millis(),
+        started.elapsed().as_millis()
+    );
+}
+
 /// Join arms: S0 or S0′ up to J's seal, then [`CATCHUP`].
 async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
+    let started = std::time::Instant::now();
     mesh(sim, JOIN_LABELS).await?;
     let group = create_group(sim, "A").await?;
     for member in ["M1", "M2"] {
         seat(sim, "A", member, &group).await?;
     }
+    progress(sim, started, "M1 and M2 seated");
     if arm.skew() {
         for write_access in POLICY_CHANGES {
             let (code, body) = sim
@@ -426,6 +449,7 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     })
     .await?;
 
+    progress(sim, started, "removal resends done");
     let a_recovery_before = status(sim, "A", &group).await?.map(|st| st.recovery);
     let m1_recovery_before = status(sim, "M1", &group).await?.map(|st| st.recovery);
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
@@ -439,6 +463,7 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     .await?;
     let sealed = view(sim, "A", &group).await?;
     let stub = view(sim, "J", &group).await?;
+    progress(sim, started, "A sealed J");
     receipt.setup_done(at(sim));
 
     let base = minted.state_revision;
@@ -493,12 +518,30 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     let mut bystander_marked: Option<String> = None;
     let mut max_revision = 0_u64;
     let mut j_seen = false;
+    let mut next_progress = sim.fabric().now();
+    let mut real_limit_hit: Option<String> = None;
     let mut seen = Observations::default();
     let waited = sim
         .until("J catches up to A", CATCHUP, async |s: &Sim| {
             let Some(j) = seen.observe(try_view_now(s, "J", &group)).await else {
                 return true;
             };
+            let now = s.fabric().now();
+            let j_text = j
+                .as_ref()
+                .map_or_else(|| "no record".to_string(), View::describe);
+            if now >= next_progress {
+                next_progress = now + PROGRESS_EVERY;
+                progress(s, started, &format!("window: J {j_text}"));
+            }
+            if started.elapsed() > REAL_SCENARIO_LIMIT {
+                real_limit_hit = Some(format!(
+                    "at virtual {} ms, real {} ms: J {j_text}",
+                    now.as_millis(),
+                    started.elapsed().as_millis()
+                ));
+                return true;
+            }
             let Some(a) = seen.observe(view_now(s, "A", &group)).await else {
                 return true;
             };
@@ -542,6 +585,9 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
         }
     }
     seen.verify("J catches up to A")?;
+    if let Some(hit) = real_limit_hit {
+        bail!("INFRA: the join window passed its real-time limit {REAL_SCENARIO_LIMIT:?} {hit}");
+    }
     let j = sim
         .at_instant("read J's group", try_view_now(sim, "J", &group))
         .await??;
@@ -621,24 +667,38 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     Ok(())
 }
 
-/// Drops every write from one node while held, and counts them. The node
-/// still receives.
+/// Drops writes from one node, and counts them. The node still receives.
+/// Installed holding every write; [`Self::release`] then holds only its
+/// pubsub writes, so its fork commit never reaches the main chain while
+/// its direct messages pass.
 struct OutboundHold {
     held: Arc<std::sync::atomic::AtomicBool>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
+    pubsub_dropped: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OutboundHold {
     fn install(sim: &Sim, node: &str) -> Result<Self> {
-        use crate::network::sim::Fault;
+        use crate::network::sim::{Fault, LaneClass};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let machine = sim.peer(node)?.0;
         let held = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
-        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        let pubsub_dropped = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_dropped, rule_pubsub) = (
+            Arc::clone(&held),
+            Arc::clone(&dropped),
+            Arc::clone(&pubsub_dropped),
+        );
         sim.fabric().add_rule(move |write| {
-            if rule_held.load(Ordering::SeqCst) && write.lane.src == machine {
+            if write.lane.src != machine {
+                return Fault::Pass;
+            }
+            if rule_held.load(Ordering::SeqCst) {
                 rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else if write.lane.class == LaneClass::PubSub {
+                rule_pubsub.fetch_add(1, Ordering::SeqCst);
                 Fault::Drop
             } else {
                 Fault::Pass
@@ -646,17 +706,26 @@ impl OutboundHold {
         });
         sim.fabric()
             .mark(format!("fault: every write from {node} withheld"));
-        Ok(Self { held, dropped })
+        Ok(Self {
+            held,
+            dropped,
+            pubsub_dropped,
+        })
     }
 
     fn release(&self, sim: &Sim, node: &str) {
         self.held.store(false, std::sync::atomic::Ordering::SeqCst);
         sim.fabric()
-            .mark(format!("fault: writes from {node} released"));
+            .mark(format!("fault: writes from {node} released, except pubsub"));
     }
 
     fn dropped(&self) -> usize {
         self.dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn pubsub_dropped(&self) -> usize {
+        self.pubsub_dropped
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -931,8 +1000,10 @@ async fn fork_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     );
     receipt.note(format!(
         "arm={arm:?} after the window: X {x_status_text}; X {}; X recovered: {x_recovered:?}; \
-         X recovery first seen: {x_recovery_seen:?}",
-        x1.describe()
+         X recovery first seen: {x_recovery_seen:?}; X pubsub writes held since the \
+         release: {}",
+        x1.describe(),
+        hold.pubsub_dropped()
     ));
     let contained = x1.marker.is_some() && x_recovered.is_none();
     let (final_name, passed) = match arm {
