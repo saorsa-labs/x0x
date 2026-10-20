@@ -18,10 +18,14 @@ struct ProbeFixture {
 
 impl ProbeFixture {
     fn new() -> Self {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .expect("test runner home directory");
-        let evidence = PathBuf::from(home).join("x0x-codex/evidence/1372/red");
+        // The nextest wrapper replaces HOME with /tmp/x0x-nextest-home.
+        // Use the explicitly owned evidence root or the allowed repo scratch
+        // directory, never that synthetic HOME or the system temp directory.
+        let evidence = std::env::var_os("X0X_UPGRADE_PROBE_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(".planning/upgrade-probe-fixtures")
+            });
         std::fs::create_dir_all(&evidence).expect("probe evidence directory");
         let root = tempfile::Builder::new()
             .prefix("packaged-probe-")
