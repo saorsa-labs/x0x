@@ -17,6 +17,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -245,11 +246,27 @@ fn decode_file(bytes: &[u8]) -> Result<Vec<ForwardRecord>, String> {
 /// Persistent forwards (`<data_dir>/forwards.json`). All mutations are
 /// serialised under one lock held across the durable write; a failed write
 /// changes nothing.
+///
+/// `ops` is a second lock, held by restore, add, and remove together. The
+/// record lock above covers one write; `ops` covers the gap between reading
+/// the records and binding a listener, so a delete in that gap cannot be
+/// overwritten by a stale restore.
 #[derive(Debug)]
 pub struct ForwardStore {
     path: Option<PathBuf>,
     state: tokio::sync::Mutex<Vec<ForwardRecord>>,
     load_error: Option<String>,
+    ops: Arc<tokio::sync::Mutex<()>>,
+    /// Test seam: restore notifies `entered` after it has copied the records
+    /// and waits on `release`, still holding `ops`. One shot.
+    #[cfg(test)]
+    restore_pause: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+/// Records copied for restore, with `ops` still held so add and remove wait.
+pub(crate) struct RestoreSession {
+    _ops: tokio::sync::OwnedMutexGuard<()>,
+    pub(crate) records: Vec<ForwardRecord>,
 }
 
 impl ForwardStore {
@@ -260,6 +277,61 @@ impl ForwardStore {
             path: None,
             state: tokio::sync::Mutex::new(Vec::new()),
             load_error: None,
+            ops: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            restore_pause: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Hold `ops` for one restore, add, or remove. The guard owns its
+    /// `Arc`, so the caller can keep it across later `&self` borrows.
+    pub(crate) async fn lock_ops(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.ops).lock_owned().await
+    }
+
+    /// Copy the records and keep `ops` until the session is dropped.
+    ///
+    /// # Errors
+    /// [`ForwardStoreError::Unusable`] when the file did not load. The
+    /// lock is not held in that case.
+    pub(crate) async fn begin_restore(&self) -> Result<RestoreSession, ForwardStoreError> {
+        let ops = self.lock_ops().await;
+        let records = self.records().await?;
+        #[cfg(test)]
+        self.pause_restore_if_armed().await;
+        Ok(RestoreSession { _ops: ops, records })
+    }
+
+    /// `Some` when `ops` is free. Tests use this to prove restore still holds
+    /// the lifecycle lock after it has copied the records.
+    #[cfg(test)]
+    pub(crate) fn ops_try_lock(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.ops).try_lock_owned().ok()
+    }
+
+    /// Arm the one-shot pause inside [`Self::begin_restore`].
+    #[cfg(test)]
+    pub(crate) fn arm_restore_pause(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self
+            .restore_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered, release));
+    }
+
+    #[cfg(test)]
+    async fn pause_restore_if_armed(&self) {
+        let gate = self
+            .restore_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
         }
     }
 
