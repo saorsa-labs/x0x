@@ -350,6 +350,12 @@ fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Read an auxiliary upgrade record through the journal's bounded,
+/// regular-file, no-symlink reader. The caller validates its schema.
+pub(crate) fn read_auxiliary_record(path: &Path) -> io::Result<Vec<u8>> {
+    read_bytes(path)
+}
+
 fn classify(bytes: &[u8], expected: &str) -> io::Result<RecordRead> {
     let value: Value = serde_json::from_slice(bytes).map_err(invalid)?;
     let object = value
@@ -734,7 +740,7 @@ pub(crate) fn write_record_with_failure(
 fn write_record_inner(
     path: &Path,
     record: &impl Serialize,
-    mut before: impl FnMut(BarrierStep) -> io::Result<()>,
+    before: impl FnMut(BarrierStep) -> io::Result<()>,
 ) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(record).map_err(invalid)?;
     if bytes.len() as u64 > MAX_RECORD_BYTES {
@@ -772,6 +778,61 @@ fn write_record_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    replace_record_bytes(path, &bytes, before)
+}
+
+/// A slice may define a smaller record than the complete transaction plan.
+/// Both old and new bytes must pass its strict decoder before replacement.
+pub(crate) fn write_auxiliary_record(
+    path: &Path,
+    record: &impl Serialize,
+    validate: fn(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    write_auxiliary_record_inner(path, record, validate, |_| Ok(()))
+}
+
+#[cfg(test)]
+pub(crate) fn write_auxiliary_record_with_failure(
+    path: &Path,
+    record: &impl Serialize,
+    validate: fn(&[u8]) -> io::Result<()>,
+    fail: BarrierStep,
+) -> io::Result<()> {
+    write_auxiliary_record_inner(path, record, validate, |step| {
+        if step == fail {
+            Err(io::Error::other(
+                "injected auxiliary record barrier failure",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn write_auxiliary_record_inner(
+    path: &Path,
+    record: &impl Serialize,
+    validate: fn(&[u8]) -> io::Result<()>,
+    before: impl FnMut(BarrierStep) -> io::Result<()>,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(invalid)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(invalid("record exceeds the size limit"));
+    }
+    validate(&bytes)?;
+    match read_bytes(path) {
+        Ok(existing) => validate(&existing)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    replace_record_bytes(path, &bytes, before)
+}
+
+fn replace_record_bytes(
+    path: &Path,
+    bytes: &[u8],
+    mut before: impl FnMut(BarrierStep) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -781,7 +842,7 @@ fn write_record_inner(
     let (temporary_path, mut temporary) = create_replacement(parent)?;
     let result = (|| {
         before(BarrierStep::Write)?;
-        temporary.write_all(&bytes)?;
+        temporary.write_all(bytes)?;
         before(BarrierStep::FileSync)?;
         temporary.sync_all()?;
         before(BarrierStep::Rename)?;

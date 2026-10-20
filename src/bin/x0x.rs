@@ -2053,7 +2053,7 @@ fn main() -> ExitCode {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("manifest verification failed: {error}");
+                eprintln!("inert upgrade check failed: {error}");
                 ExitCode::FAILURE
             }
         };

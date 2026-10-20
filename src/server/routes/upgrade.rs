@@ -155,6 +155,67 @@ pub(in crate::server) fn listener_restart_context(
     }
 }
 
+/// The shutdown trigger and watch travel together to updater tasks.
+pub(in crate::server) type UpdateShutdown = (Arc<dyn Fn() + Send + Sync>, watch::Receiver<bool>);
+
+/// Resume only a durable interrupted probe. The request/listener returns
+/// promptly; this waiter releases the apply mutex throughout every backoff.
+/// Its process-local claim prevents duplicate timers, while the install lock
+/// and record decide whether a fresh attempt is still allowed.
+fn schedule_probe_retry(
+    upgrader: &AutoApplyUpgrader,
+    manifest: &ReleaseManifest,
+    apply_lock: Arc<Mutex<()>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    if *shutdown.borrow() {
+        return;
+    }
+    let install = match x0x::upgrade::apply::current_binary_path().and_then(|path| {
+        std::fs::canonicalize(path)
+            .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))
+    }) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "Cannot identify install for probe retry");
+            return;
+        }
+    };
+    let Some(owner) = x0x::upgrade::probe_retry::claim_retry(install, manifest.version.clone())
+    else {
+        return;
+    };
+    let upgrader = upgrader.for_probe_retry();
+    let manifest = manifest.clone();
+    tokio::spawn(async move {
+        let _owner = owner;
+        let result = x0x::upgrade::probe_retry::run_retry_loop(
+            &apply_lock,
+            &mut shutdown,
+            || upgrader.probe_retry_delay(&manifest.version),
+            || async {
+                // A long backoff does not extend a signed manifest's lifetime.
+                x0x::upgrade::monitor::validate_manifest_timestamp(&manifest)?;
+                upgrader.apply_upgrade_from_manifest(&manifest).await
+            },
+        )
+        .await;
+        match result {
+            Ok(Some(result)) => {
+                tracing::info!(?result, version = %manifest.version, "Probe retry apply finished");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    version = %manifest.version,
+                    "Probe retry stopped; durable state retains the cause"
+                );
+            }
+        }
+    });
+}
+
 /// The deferred HTTP restart uses the same planner as every other apply path —
 /// there is no second ad-hoc exit in the HTTP handler (#261 test 6).
 fn deferred_restart_upgrader(stop_on_upgrade: bool, context: RestartContext) -> AutoApplyUpgrader {
@@ -411,6 +472,14 @@ pub(in crate::server) async fn run_startup_update_check(
         Ok(x0x::upgrade::UpgradeResult::NoUpgrade) => Ok(None),
         Err(e) => {
             tracing::error!(error = %e, "Startup upgrade failed: {e}");
+            if let (Some(lock), Some(shutdown)) = (apply_lock.as_ref(), shutdown_watch.as_ref()) {
+                schedule_probe_retry(
+                    &upgrader,
+                    &verified.manifest,
+                    Arc::clone(lock),
+                    shutdown.clone(),
+                );
+            }
             Ok(None)
         }
     }
@@ -475,8 +544,9 @@ pub(in crate::server) async fn run_gossip_update_listener(
     upgrade_apply_lock: Arc<Mutex<()>>,
     self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
     api_addr: SocketAddr,
-    shutdown: Arc<dyn Fn() + Send + Sync>,
+    shutdown: UpdateShutdown,
 ) {
+    let (shutdown, shutdown_watch) = shutdown;
     let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
         Ok(sub) => sub,
         Err(e) => {
@@ -657,6 +727,12 @@ pub(in crate::server) async fn run_gossip_update_listener(
             Err(e) => {
                 tracing::error!(error = %e, "Upgrade failed: {e}");
                 failed_apply_versions.insert(manifest.version.clone(), Instant::now());
+                schedule_probe_retry(
+                    &upgrader,
+                    &manifest,
+                    Arc::clone(&upgrade_apply_lock),
+                    shutdown_watch.clone(),
+                );
             }
             _ => {}
         }
@@ -676,8 +752,9 @@ pub(in crate::server) async fn run_fallback_github_poll(
     upgrade_apply_lock: Arc<Mutex<()>>,
     self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
     api_addr: SocketAddr,
-    shutdown: Arc<dyn Fn() + Send + Sync>,
+    shutdown: UpdateShutdown,
 ) {
+    let (shutdown, shutdown_watch) = shutdown;
     let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
     let mut ticker = tokio::time::interval(interval);
     // Skip first tick: the startup check covers the boot window (it runs
@@ -781,6 +858,12 @@ pub(in crate::server) async fn run_fallback_github_poll(
                     Err(e) => {
                         tracing::error!(error = %e, "Fallback upgrade failed: {e}");
                         failed_version = Some((verified.manifest.version.clone(), Instant::now()));
+                        schedule_probe_retry(
+                            &upgrader,
+                            &verified.manifest,
+                            Arc::clone(&upgrade_apply_lock),
+                            shutdown_watch.clone(),
+                        );
                     }
                     _ => {}
                 }
@@ -1104,6 +1187,12 @@ pub(in crate::server) async fn apply_upgrade(
         ),
         Err(e) => {
             tracing::error!("apply upgrade failed: {e}");
+            schedule_probe_retry(
+                &upgrader,
+                &release.manifest,
+                Arc::clone(&state.upgrade_apply_lock),
+                state.shutdown_notify.subscribe(),
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
