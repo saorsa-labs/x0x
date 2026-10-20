@@ -191,3 +191,11 @@ fn numeric_id(value: &str) -> io::Result<u32> {
 fn refusal(message: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
+
+#[cfg(test)]
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/upgrade_inventory_accounts.rs"
+));
+#[cfg(test)]
+inventory_accounts_regression_tests!();
