@@ -505,6 +505,36 @@ impl InputState {
     }
 }
 
+/// Audience a verdict is served to: a loopback or authenticated caller
+/// ([`DetailAccess::Full`]) versus a non-loopback unauthenticated caller
+/// ([`DetailAccess::Redacted`]).
+///
+/// David's ruling of 20 Oct 2026 (01:51 BST) on the #1480 M2 question:
+/// `/health` detail beyond the verdict is hidden from non-loopback callers
+/// unless they are authenticated. "Detail" is the node's own measured
+/// numbers — disk free/total bytes, `latest_version`, `user_present`, the
+/// windowed error count and the windowed publish-failure counts. The
+/// verdict itself stays auth-exempt (#600): states, classifications and
+/// every other field are served to every caller unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum DetailAccess {
+    /// Loopback or authenticated caller: the full current payload.
+    Full,
+    /// Non-loopback unauthenticated caller: the listed values are
+    /// withheld — from the inputs report at serve time
+    /// ([`redact_health_detail`]) and from reason sentences here.
+    Redacted,
+}
+
+impl DetailAccess {
+    /// May reason sentences carry the node's own measured numbers? The
+    /// bounds that appear instead are compile-time constants, not node
+    /// state, so a redacted reason still names what was crossed.
+    fn shows_node_numbers(self) -> bool {
+        matches!(self, DetailAccess::Full)
+    }
+}
+
 macro_rules! input_report {
     (struct $name:ident { $($field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Debug, Serialize)]
@@ -624,9 +654,26 @@ pub(in crate::server) struct HealthVerdict {
     pub(in crate::server) sample_age_secs: Option<u64>,
 }
 
-/// Classify the M1 verdict over a sample. Pure: no I/O, no locks beyond
-/// the caller's — safe to run inside the handler.
+/// Classify the M1 verdict over a sample for the full-detail audience —
+/// the loopback/authenticated view, and the default of the tests below.
+/// Pure: no I/O, no locks beyond the caller's — safe to run inside a
+/// handler. Production reaches this through
+/// [`classify_with_detail`], which picks the audience per request.
+#[cfg(test)]
 pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
+    classify_with_detail(sample, DetailAccess::Full)
+}
+
+/// [`classify`] with an explicit [`DetailAccess`]. The states, badges,
+/// input values and the overall verdict are identical for every audience
+/// (#600: the verdict is never redacted); only reason sentences differ.
+/// A redacted reason names the bound that was crossed without the node's
+/// measured number, so the gated values cannot leak through `reasons`
+/// instead of `inputs`.
+pub(in crate::server) fn classify_with_detail(
+    sample: &VerdictSample,
+    access: DetailAccess,
+) -> HealthVerdict {
     let mut reasons: Vec<String> = Vec::new();
     let mut worst: u8 = 0;
     let mut bump = |state: InputState| worst = worst.max(state.severity());
@@ -697,10 +744,17 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
             // Two decimals: the real values (0.75 ≥ 0.50), not the
             // whole-number rounding that printed "rate 1 ≥ 0" (#1466
             // review finding).
-            reasons.push(format!(
-                "{failed}/{attempts} publishes failed in the last {WINDOW_SECS}s \
-                 (rate {rate:.2} ≥ {SEND_FAILURE_RATE_DEGRADED:.2})"
-            ));
+            reasons.push(if access.shows_node_numbers() {
+                format!(
+                    "{failed}/{attempts} publishes failed in the last {WINDOW_SECS}s \
+                     (rate {rate:.2} ≥ {SEND_FAILURE_RATE_DEGRADED:.2})"
+                )
+            } else {
+                format!(
+                    "publish failures in the last {WINDOW_SECS}s are at or above \
+                     the degraded rate bound (≥ {SEND_FAILURE_RATE_DEGRADED:.2})"
+                )
+            });
             InputState::Degraded
         }
         _ => InputState::Ok,
@@ -744,17 +798,29 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
         None => InputState::Ok,
         Some(free) if free < DISK_CRITICAL_FREE_BYTES => {
             bump(InputState::Error);
-            reasons.push(format!(
-                "data-dir filesystem has {free} bytes free (< {DISK_CRITICAL_FREE_BYTES}); \
-                 durable writes are failing or about to"
-            ));
+            reasons.push(if access.shows_node_numbers() {
+                format!(
+                    "data-dir filesystem has {free} bytes free (< {DISK_CRITICAL_FREE_BYTES}); \
+                     durable writes are failing or about to"
+                )
+            } else {
+                format!(
+                    "data-dir filesystem free space is below the critical bound \
+                     (< {DISK_CRITICAL_FREE_BYTES}); durable writes are failing or about to"
+                )
+            });
             InputState::Error
         }
         Some(free) if free < DISK_DEGRADED_FREE_BYTES => {
             bump(InputState::Degraded);
-            reasons.push(format!(
-                "data-dir filesystem has {free} bytes free (< {DISK_DEGRADED_FREE_BYTES})"
-            ));
+            reasons.push(if access.shows_node_numbers() {
+                format!("data-dir filesystem has {free} bytes free (< {DISK_DEGRADED_FREE_BYTES})")
+            } else {
+                format!(
+                    "data-dir filesystem free space is below the degraded bound \
+                     (< {DISK_DEGRADED_FREE_BYTES})"
+                )
+            });
             InputState::Degraded
         }
         Some(_) => InputState::Ok,
@@ -764,10 +830,17 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
     // logs ERROR; that is routine).
     let log_state = if sample.log_errors_window >= LOG_ERROR_DEGRADED_THRESHOLD {
         bump(InputState::Degraded);
-        reasons.push(format!(
-            "{} error-level log events in the last {WINDOW_SECS}s",
-            sample.log_errors_window
-        ));
+        reasons.push(if access.shows_node_numbers() {
+            format!(
+                "{} error-level log events in the last {WINDOW_SECS}s",
+                sample.log_errors_window
+            )
+        } else {
+            format!(
+                "error-level log events in the last {WINDOW_SECS}s are at or above \
+                 the storm threshold ({LOG_ERROR_DEGRADED_THRESHOLD})"
+            )
+        });
         InputState::Degraded
     } else {
         InputState::Ok
@@ -895,6 +968,45 @@ pub(in crate::server) fn classify(sample: &VerdictSample) -> HealthVerdict {
                 failed_artifact: sample.upgrade_failed_artifact,
             },
         },
+    }
+}
+
+/// Remove the gated detail fields from a serialized `/health` payload
+/// (David's ruling of 20 Oct 2026 on #1480 Finding 3).
+///
+/// Runs only on the non-loopback unauthenticated branch of the handler:
+/// loopback and authenticated callers serve the full current payload, so
+/// this never touches their bytes. Keys are removed one by one from the
+/// inputs objects — every other key keeps its place, including keys later
+/// x0x versions may add, and `null` (value unknown) is treated exactly
+/// like a measured value: absent means withheld, never "unknown".
+///
+/// The publish-failure `rate` goes with its `attempts`/`failed` counts:
+/// it is the same windowed measurement in ratio form.
+pub(in crate::server) fn redact_health_detail(payload: &mut serde_json::Value) {
+    let Some(inputs) = payload
+        .get_mut("verdict")
+        .and_then(|verdict| verdict.get_mut("inputs"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let gated: &[(&str, &[&str])] = &[
+        ("disk", &["free_bytes", "total_bytes"]),
+        ("upgrade", &["latest_version"]),
+        ("identity", &["user_present"]),
+        ("log", &["errors"]),
+        ("send_failure_rate", &["attempts", "failed", "rate"]),
+    ];
+    for (input, keys) in gated {
+        if let Some(object) = inputs
+            .get_mut(*input)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for key in *keys {
+                object.remove(*key);
+            }
+        }
     }
 }
 
@@ -1623,6 +1735,134 @@ mod tests {
         let verdict = classify(&sample());
         assert_ok(&verdict);
         assert!(verdict.reasons.is_empty());
+    }
+
+    // Detail gate (David's 20 Oct 2026 ruling) ---------------------------
+
+    /// A sample with every gated input degraded, so each gated reason
+    /// shape is exercised. The values avoid colliding with the constants
+    /// the redacted sentences keep (bounds, windows).
+    fn gated_sample() -> VerdictSample {
+        let mut sample = sample();
+        sample.disk_free_bytes = Some(512 * 1024 * 1024); // 536870912 bytes
+        sample.disk_total_bytes = Some(64 * 1024 * 1024 * 1024);
+        sample.send_attempts_window = 100;
+        sample.send_failed_window = 75;
+        sample.log_errors_window = LOG_ERROR_DEGRADED_THRESHOLD + 7;
+        sample
+    }
+
+    /// The redacted verdict keeps the classification — same verdict, same
+    /// input states, same input values — and drops only the node's own
+    /// numbers from the reason sentences. The bounds that replace them
+    /// are compile-time constants, not node state, so a remote caller
+    /// still learns what was crossed without learning the measurement.
+    #[test]
+    fn redacted_reasons_keep_the_verdict_and_lose_the_numbers() {
+        let sample = gated_sample();
+        let full = classify(&sample);
+        let redacted = classify_with_detail(&sample, DetailAccess::Redacted);
+
+        assert_eq!(redacted.verdict, full.verdict);
+        assert_eq!(redacted.reasons.len(), full.reasons.len());
+        assert_eq!(
+            redacted.inputs.disk.free_bytes, full.inputs.disk.free_bytes,
+            "the audience never changes the input values"
+        );
+
+        let full_text = full.reasons.join(" | ");
+        assert!(
+            full_text.contains("536870912"),
+            "disk bytes in full reasons"
+        );
+        assert!(
+            full_text.contains("75/100"),
+            "publish counts in full reasons"
+        );
+        assert!(
+            full_text.contains(&(LOG_ERROR_DEGRADED_THRESHOLD + 7).to_string()),
+            "control: the full reasons carry the numbers"
+        );
+
+        let redacted_text = redacted.reasons.join(" | ");
+        assert!(!redacted_text.contains("536870912"), "{redacted_text}");
+        assert!(!redacted_text.contains("75/100"), "{redacted_text}");
+        assert!(
+            !redacted_text.contains(&(LOG_ERROR_DEGRADED_THRESHOLD + 7).to_string()),
+            "{redacted_text}"
+        );
+        // Every degraded input still explains itself, bound-first:
+        assert!(
+            redacted_text.contains("below the degraded bound"),
+            "{redacted_text}"
+        );
+        assert!(
+            redacted_text.contains("publish failures in the last 60s"),
+            "{redacted_text}"
+        );
+        assert!(
+            redacted_text.contains("error-level log events in the last 60s"),
+            "{redacted_text}"
+        );
+    }
+
+    /// The JSON redaction removes exactly the gated fields and leaves
+    /// every neighbour in place — including `null` values on ungated
+    /// fields, which stay `null` rather than vanishing.
+    #[test]
+    fn redact_health_detail_removes_exactly_the_gated_fields() {
+        let mut sample = gated_sample();
+        sample.upgrade_latest_version = Some("9.9.9".to_string());
+        sample.identity_user = true;
+        let verdict = classify(&sample);
+        let mut payload = serde_json::json!({
+            "ok": true,
+            "status": "healthy",
+            "verdict": serde_json::to_value(&verdict).expect("verdict serializes"),
+        });
+
+        super::redact_health_detail(&mut payload);
+
+        for absent in [
+            "/verdict/inputs/disk/free_bytes",
+            "/verdict/inputs/disk/total_bytes",
+            "/verdict/inputs/upgrade/latest_version",
+            "/verdict/inputs/identity/user_present",
+            "/verdict/inputs/log/errors",
+            "/verdict/inputs/send_failure_rate/attempts",
+            "/verdict/inputs/send_failure_rate/failed",
+            "/verdict/inputs/send_failure_rate/rate",
+        ] {
+            assert!(
+                payload.pointer(absent).is_none(),
+                "{absent} must be removed: {payload}"
+            );
+        }
+        for kept in [
+            "/ok",
+            "/status",
+            "/verdict/verdict",
+            "/verdict/reasons",
+            "/verdict/inputs/disk/state",
+            "/verdict/inputs/log/window_secs",
+            "/verdict/inputs/identity/agent",
+            "/verdict/inputs/identity/machine",
+            "/verdict/inputs/upgrade/update_available",
+        ] {
+            assert!(
+                payload.pointer(kept).is_some(),
+                "{kept} must survive the redaction: {payload}"
+            );
+        }
+    }
+
+    /// Redaction of a payload without a `verdict` object (a shape change
+    /// or a future endpoint) is a no-op, never a panic.
+    #[test]
+    fn redact_health_detail_ignores_a_payload_without_a_verdict() {
+        let mut payload = serde_json::json!({"ok": true});
+        super::redact_health_detail(&mut payload);
+        assert_eq!(payload, serde_json::json!({"ok": true}));
     }
 
     // Sample freshness ---------------------------------------------------

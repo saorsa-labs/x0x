@@ -2885,11 +2885,18 @@ pub async fn serve_with_options(
             // Before the accept loop. A `/health` success cannot precede this
             // line, so a child log can show whether SIGTERM was registered first.
             record_startup_diagnostic("http server accepting");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = server_shutdown_rx.changed().await;
-                })
-                .await
+            // Served with connect info so handlers can read the real peer
+            // address (`ConnectInfo<SocketAddr>`) — the /health detail gate
+            // decides loopback from it (David's 20 Oct 2026 ruling on
+            // #1480 Finding 3). Proxy headers are never consulted.
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = server_shutdown_rx.changed().await;
+            })
+            .await
         });
 
         // Fix B (Issue #110 Phase 2): include the axum server `JoinHandle` in the

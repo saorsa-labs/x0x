@@ -8,7 +8,7 @@ use super::super::state::AppState;
 use crate as x0x;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -379,9 +379,24 @@ pub(in crate::server) struct StatusData {
 /// cached sample with the live atomics (peer counts, uptime, delivery-probe
 /// results and the sample's age) and classifies — no transport state is
 /// touched.
+///
+/// Detail gate (David's ruling of 20 Oct 2026, 01:51 BST, on #1480
+/// Finding 3): the node-specific detail inside `verdict.inputs` — disk
+/// free/total bytes, `latest_version`, `user_present`, the windowed error
+/// count and the windowed publish-failure counts — is served only to
+/// loopback callers and to callers presenting a valid owner bearer
+/// ([`super::super::auth::has_valid_owner_bearer`], the same check the
+/// authenticated routes use). Every caller keeps the verdict itself:
+/// `/health` stays auth-exempt (#600) and never answers 401. Loopback is
+/// decided from the peer address the accept loop recorded (`ConnectInfo`)
+/// via [`x0x::connect::is_loopback`] — proxy headers such as
+/// `X-Forwarded-For` are never consulted, and IPv4-mapped IPv6 peers
+/// (`::ffff:127.0.0.1`) fail closed as non-loopback.
 pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<HealthData>> {
+    connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let (peers, send_ready_peers, one_sided_peers) = state.health_snapshot.load();
     let uptime_secs = state.start_time.elapsed().as_secs();
     let (status, degraded_reason) =
@@ -393,9 +408,22 @@ pub(in crate::server) async fn health(
         one_sided_peers,
         uptime_secs,
     );
-    let verdict = super::super::health_verdict::classify(&sample);
 
-    Json(ApiResponse {
+    // No ConnectInfo (an embedder serving the router without connect
+    // info) fails closed: no peer address, no detail.
+    let loopback = connect_info
+        .map(|peer| x0x::connect::is_loopback(peer.0.ip()))
+        .unwrap_or(false);
+    let access = if loopback
+        || super::super::auth::has_valid_owner_bearer(&headers, &state.api_token, &state.sessions)
+    {
+        super::super::health_verdict::DetailAccess::Full
+    } else {
+        super::super::health_verdict::DetailAccess::Redacted
+    };
+    let verdict = super::super::health_verdict::classify_with_detail(&sample, access);
+
+    let payload = ApiResponse {
         ok: true,
         data: HealthData {
             status: status.to_string(),
@@ -408,7 +436,66 @@ pub(in crate::server) async fn health(
             unsigned_group_cards_refused: super::named_groups::unsigned_group_cards_refused(),
             verdict,
         },
-    })
+    };
+    if access == super::super::health_verdict::DetailAccess::Full {
+        // Loopback and authenticated callers: the full current payload,
+        // byte for byte.
+        return Json(payload).into_response();
+    }
+    // Same payload serialized, then the gated fields removed — see
+    // `redact_health_detail`. The payload is a plain derived struct
+    // with no fallible parts, so serialization cannot fail today; if a
+    // future field ever makes it fallible, this branch fails closed
+    // instead of panicking: the bare verdict, with no detail at all.
+    let redacted = redacted_health_body(&payload, || bare_health_fallback(&payload));
+    Json(redacted).into_response()
+}
+
+/// The redacted `/health` branch: serialize the payload and strip the
+/// gated detail ([`super::super::health_verdict::redact_health_detail`]),
+/// or — when the payload does not serialize — serve `bare()` unchanged.
+/// The `Err` arm is the fail-closed root for the one fallible step this
+/// branch had: `/health` is auth-exempt (#600), so it must answer, never
+/// panic and never 401 (review of ba641b0).
+fn redacted_health_body(
+    payload: &impl Serialize,
+    bare: impl FnOnce() -> serde_json::Value,
+) -> serde_json::Value {
+    match serde_json::to_value(payload) {
+        Ok(mut value) => {
+            super::super::health_verdict::redact_health_detail(&mut value);
+            value
+        }
+        Err(_) => bare(),
+    }
+}
+
+/// The fallback body when a redacted `/health` payload does not
+/// serialize: the classification and the legacy liveness fields only —
+/// `verdict.inputs` and `verdict.reasons` are absent entirely, so no
+/// node detail can pass through this exceptional path. Built from
+/// copied `String`/`bool` primitives alone: the fallback itself cannot
+/// fail.
+fn bare_health_fallback(payload: &ApiResponse<HealthData>) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("ok".into(), serde_json::Value::Bool(true));
+    body.insert(
+        "status".into(),
+        serde_json::Value::String(payload.data.status.clone()),
+    );
+    if let Some(reason) = &payload.data.degraded_reason {
+        body.insert(
+            "degraded_reason".into(),
+            serde_json::Value::String(reason.clone()),
+        );
+    }
+    let mut verdict = serde_json::Map::new();
+    verdict.insert(
+        "verdict".into(),
+        serde_json::Value::String(payload.data.verdict.verdict.to_string()),
+    );
+    body.insert("verdict".into(), serde_json::Value::Object(verdict));
+    serde_json::Value::Object(body)
 }
 
 /// GET /status — rich runtime status with connectivity state machine.
@@ -1057,5 +1144,374 @@ mod tests {
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();
+    }
+
+    /// `/health` detail gate (David's ruling of 20 Oct 2026, 01:51 BST, on
+    /// #1480 Finding 3): the node-specific detail inside `verdict.inputs`
+    /// is served to loopback callers and to callers with a valid owner
+    /// bearer — the same check the authenticated routes use — and withheld
+    /// from everyone else. The verdict itself stays auth-exempt (#600).
+    ///
+    /// The tests drive the handler through a router, inserting
+    /// `ConnectInfo` exactly the way `into_make_service_with_connect_info`
+    /// does on the real accept loop, so the gate is tested at the same
+    /// seam production uses.
+    mod health_detail_gate {
+        use super::super::{health, AppState};
+        use crate::server::routes::named_groups::tests::secure_endpoint_test_state_at;
+        use axum::body::{to_bytes, Body};
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use axum::routing::get;
+        use std::net::{IpAddr, SocketAddr};
+        use std::sync::Arc;
+        use tower::ServiceExt as _;
+
+        /// The gated detail fields, as JSON-pointer paths into the
+        /// flattened `/health` payload. `rate` travels with its counts:
+        /// it is the same windowed publish-failure measurement.
+        const GATED_DETAIL: &[&str] = &[
+            "/verdict/inputs/disk/free_bytes",
+            "/verdict/inputs/disk/total_bytes",
+            "/verdict/inputs/upgrade/latest_version",
+            "/verdict/inputs/identity/user_present",
+            "/verdict/inputs/log/errors",
+            "/verdict/inputs/send_failure_rate/attempts",
+            "/verdict/inputs/send_failure_rate/failed",
+            "/verdict/inputs/send_failure_rate/rate",
+        ];
+
+        /// Every field that is NOT gated — the verdict itself, its state
+        /// badges, the public window constants and neighbouring inputs —
+        /// must survive the redaction untouched.
+        const UNGATED: &[&str] = &[
+            "/verdict/verdict",
+            "/verdict/reasons",
+            "/verdict/inputs/plane/state",
+            "/verdict/inputs/peers/peers",
+            "/verdict/inputs/disk/state",
+            "/verdict/inputs/log/window_secs",
+            "/verdict/inputs/identity/agent",
+            "/verdict/inputs/identity/machine",
+            "/verdict/inputs/upgrade/update_available",
+        ];
+
+        /// Non-loopback test caller (TEST-NET-1, RFC 5737).
+        fn remote() -> IpAddr {
+            "192.0.2.10".parse().expect("test-net v4 address")
+        }
+
+        fn router(state: &Arc<AppState>) -> axum::Router {
+            axum::Router::new()
+                .route("/health", get(health))
+                .with_state(Arc::clone(state))
+        }
+
+        /// One `/health` request as seen from `peer`, with an optional
+        /// bearer and extra headers. Returns the parsed flattened payload.
+        async fn get_health(
+            state: &Arc<AppState>,
+            peer: IpAddr,
+            bearer: Option<&str>,
+            extra_headers: &[(&'static str, &str)],
+        ) -> serde_json::Value {
+            let mut builder =
+                Request::get("/health").extension(ConnectInfo(SocketAddr::new(peer, 51714)));
+            if let Some(token) = bearer {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            for (name, value) in extra_headers {
+                builder = builder.header(*name, *value);
+            }
+            let response = router(state)
+                .oneshot(builder.body(Body::empty()).expect("empty body"))
+                .await
+                .expect("router answers");
+            assert_eq!(
+                response.status(),
+                200,
+                "the bare verdict is auth-exempt and never answers 401 (#600)"
+            );
+            let bytes = to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("response body");
+            serde_json::from_slice(&bytes).expect("valid JSON payload")
+        }
+
+        /// A network-free AppState: agent keys in a temp dir, no gossip
+        /// runtime, no bootstrap — the same inert fixture the profile and
+        /// history handler tests use. Every path is explicit (identity
+        /// dir, absent user key) so the builder never falls back to the
+        /// real `~/.x0x` (#456 test-home guard).
+        async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("temp data dir");
+            let agent = Arc::new(
+                crate::Agent::builder()
+                    .with_identity_dir(dir.path())
+                    .with_machine_key(dir.path().join("machine.key"))
+                    .with_agent_key(crate::identity::AgentKeypair::generate().expect("agent key"))
+                    .with_user_key_path(dir.path().join("user.key"))
+                    .with_contact_store_path(dir.path().join("contacts.json"))
+                    .with_peer_cache_disabled()
+                    .build()
+                    .await
+                    .expect("agent without a network"),
+            );
+            let state = secure_endpoint_test_state_at(dir.path(), agent)
+                .await
+                .expect("test AppState");
+            (state, dir)
+        }
+
+        /// WHY (the ruling): a non-loopback caller without a token gets
+        /// the verdict — `ok`, `status`, the verdict classification and
+        /// every non-gated input — but none of the listed detail fields.
+        /// Fails on main (8868492), which served every field to every
+        /// caller.
+        #[tokio::test]
+        async fn non_loopback_unauthenticated_gets_the_verdict_without_detail() {
+            let (state, _dir) = test_state().await;
+            let payload = get_health(&state, remote(), None, &[]).await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_none(),
+                    "{path} must be absent for a non-loopback unauthenticated caller: {payload}"
+                );
+            }
+            for path in UNGATED {
+                assert!(
+                    payload.pointer(path).is_some(),
+                    "{path} is not gated and must stay: {payload}"
+                );
+            }
+        }
+
+        /// WHY (the ruling): the durable API token authenticates a remote
+        /// caller — the same bearer the authenticated routes accept.
+        #[tokio::test]
+        async fn non_loopback_durable_bearer_gets_full_detail() {
+            let (state, _dir) = test_state().await;
+            let payload = get_health(&state, remote(), Some(&state.api_token), &[]).await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_some(),
+                    "{path} must be present for an authenticated caller: {payload}"
+                );
+            }
+        }
+
+        /// WHY (the ruling): "authenticated" means what the route layer
+        /// means — a live session bearer also unlocks the detail.
+        #[tokio::test]
+        async fn non_loopback_session_bearer_gets_full_detail() {
+            let (state, _dir) = test_state().await;
+            let token = state.sessions.issue(std::time::Instant::now());
+            let payload = get_health(&state, remote(), Some(&token), &[]).await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_some(),
+                    "{path} must be present behind a session bearer: {payload}"
+                );
+            }
+        }
+
+        /// WHY (the ruling): loopback keeps the full detail with no token
+        /// at all — the local operator and the loopback-probing watchdog
+        /// and CLI see today's payload unchanged.
+        #[tokio::test]
+        async fn loopback_unauthenticated_gets_full_detail() {
+            let (state, _dir) = test_state().await;
+            for loopback in ["127.0.0.1", "::1"] {
+                let peer: IpAddr = loopback.parse().expect("loopback address");
+                let payload = get_health(&state, peer, None, &[]).await;
+                for path in GATED_DETAIL {
+                    assert!(
+                        payload.pointer(path).is_some(),
+                        "{path} must be present for a loopback caller ({loopback}): {payload}"
+                    );
+                }
+            }
+        }
+
+        /// WHY (the ruling): the loopback decision reads the connection's
+        /// own peer address. A proxy header is client-controlled input and
+        /// must never turn a remote caller loopback.
+        #[tokio::test]
+        async fn forwarded_headers_do_not_make_a_remote_caller_loopback() {
+            let (state, _dir) = test_state().await;
+            let payload = get_health(
+                &state,
+                remote(),
+                None,
+                &[("x-forwarded-for", "127.0.0.1"), ("x-real-ip", "127.0.0.1")],
+            )
+            .await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_none(),
+                    "{path} must stay gated behind a spoofed proxy header: {payload}"
+                );
+            }
+        }
+
+        /// WHY (fail-closed): `::ffff:127.0.0.1` is not loopback under
+        /// `connect::is_loopback` — an IPv4-mapped peer is treated as the
+        /// remote caller it arrives as.
+        #[tokio::test]
+        async fn v4_mapped_loopback_peer_fails_closed() {
+            let (state, _dir) = test_state().await;
+            let peer: IpAddr = "::ffff:127.0.0.1".parse().expect("v4-mapped address");
+            let payload = get_health(&state, peer, None, &[]).await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_none(),
+                    "{path} must stay gated for an IPv4-mapped peer: {payload}"
+                );
+            }
+        }
+
+        /// WHY (the ruling): only a VALID bearer unlocks the detail. A
+        /// syntactically fine but wrong token leaves the caller gated —
+        /// and still answered, never 401.
+        #[tokio::test]
+        async fn a_wrong_bearer_does_not_unlock_detail() {
+            let (state, _dir) = test_state().await;
+            let payload = get_health(&state, remote(), Some("not-the-api-token"), &[]).await;
+            for path in GATED_DETAIL {
+                assert!(
+                    payload.pointer(path).is_none(),
+                    "{path} must stay gated behind an invalid bearer: {payload}"
+                );
+            }
+        }
+
+        /// WHY (wiring): the gate reads the peer address from
+        /// `ConnectInfo`, which only exists because the API server serves
+        /// the router through `into_make_service_with_connect_info`. A
+        /// bare `axum::serve` would make every read `None` and fail the
+        /// gate closed for loopback callers too — silently, since
+        /// `/health` keeps answering. Same source-guard convention as the
+        /// #600 guard above.
+        #[test]
+        fn api_server_supplies_connect_info_to_the_router() {
+            const SERVER_SOURCE: &str = include_str!("../mod.rs");
+            assert!(
+                SERVER_SOURCE
+                    .contains("into_make_service_with_connect_info::<std::net::SocketAddr>()"),
+                "the API server must serve the router with connect info — the /health \
+                 detail gate reads the peer address from it (David's 20 Oct 2026 ruling)"
+            );
+        }
+
+        /// WHY (no panic on the auth-exempt endpoint — both reviews of
+        /// ba641b0): the redacted branch's one fallible step, serializing
+        /// the payload, must fail closed instead of `expect`. A payload
+        /// that cannot serialize serves the bare body unchanged —
+        /// answered, never a panic, never a 401.
+        #[test]
+        fn unserializable_payload_falls_back_to_the_bare_verdict() {
+            /// A test-only payload whose serialization always errors —
+            /// the `Err` arm of the redaction helper, driven directly.
+            struct Unserializable;
+            impl serde::Serialize for Unserializable {
+                fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                    Err(serde::ser::Error::custom(
+                        "test fixture: serialization always fails",
+                    ))
+                }
+            }
+            let bare = serde_json::json!({"ok": true, "verdict": {"verdict": "ok"}});
+            let body = super::super::redacted_health_body(&Unserializable, || bare.clone());
+            assert_eq!(body, bare);
+        }
+
+        /// WHY (fail closed): if the redacted branch ever takes the
+        /// fallback, the body it serves cannot carry node detail. The
+        /// fallback drops `verdict.inputs` and `verdict.reasons`
+        /// entirely, so none of the gated values — and nothing else from
+        /// the payload — can appear in it.
+        #[test]
+        fn the_bare_verdict_fallback_cannot_leak_detail() {
+            use crate::server::health_verdict::{
+                classify_with_detail, DetailAccess, VerdictSample,
+            };
+
+            let sample = VerdictSample {
+                disk_free_bytes: Some(536870912),
+                disk_total_bytes: Some(68719476736),
+                send_attempts_window: 100,
+                send_failed_window: 75,
+                log_errors_window: 77,
+                upgrade_latest_version: Some("9.9.9-zcodeleak".to_string()),
+                identity_user: true,
+                ..VerdictSample::default()
+            };
+            let payload = super::super::ApiResponse {
+                ok: true,
+                data: super::super::HealthData {
+                    status: "degraded".to_string(),
+                    version: "0.0.0-test".to_string(),
+                    peers: 3,
+                    send_ready_peers: 2,
+                    uptime_secs: 4242,
+                    degraded_reason: None,
+                    warnings: Vec::new(),
+                    unsigned_group_cards_refused: 0,
+                    verdict: classify_with_detail(&sample, DetailAccess::Full),
+                },
+            };
+            // Control: the payload itself carries every gated value.
+            let full = serde_json::to_value(&payload).expect("payload serializes");
+            let full_text = full.to_string();
+            for probe in ["536870912", "68719476736", "9.9.9-zcodeleak", "4242"] {
+                assert!(
+                    full_text.contains(probe),
+                    "control: {probe} must be in the full payload"
+                );
+            }
+
+            let bare = super::super::bare_health_fallback(&payload);
+            assert!(bare.pointer("/verdict/inputs").is_none(), "{bare}");
+            assert!(bare.pointer("/verdict/reasons").is_none(), "{bare}");
+            assert_eq!(
+                bare.as_object()
+                    .expect("fallback is an object")
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["ok", "status", "verdict"],
+                "the fallback is exactly the bare verdict: {bare}"
+            );
+            assert_eq!(
+                bare.pointer("/verdict")
+                    .and_then(serde_json::Value::as_object)
+                    .expect("verdict is an object")
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["verdict"],
+                "only the overall classification survives: {bare}"
+            );
+            let bare_text = bare.to_string();
+            for probe in [
+                "536870912",
+                "68719476736",
+                "75",
+                "100",
+                "77",
+                "9.9.9-zcodeleak",
+                "user_present",
+                "latest_version",
+                "inputs",
+                "reasons",
+                "4242",
+                "0.0.0-test",
+            ] {
+                assert!(
+                    !bare_text.contains(probe),
+                    "{probe} leaked into the fallback: {bare_text}"
+                );
+            }
+        }
     }
 }
