@@ -78,9 +78,12 @@
 //!   C with A < D < E. A stays reachable, but revocation-topic gossip
 //!   toward A is dropped until t = W/2, so D, E and C observe at t = 0 and
 //!   A only late (direct messages, the S4 hand-off, still reach A). B
-//!   revokes its own agent at t = 0. Desired: automatic healthy exclusion
-//!   (H) within [`Bound::Fallback`], with no sibling. `main` never acts
-//!   ([`CAUSE_LATE`]).
+//!   revokes its own agent at t = 0. Desired (the ADR row): A, reachable,
+//!   acts on D's and E's hand-off and reaches H within the completion
+//!   bound from t = 0 ([`Bound::Completion`]); A signs the exclusion on
+//!   every survivor and no sibling does ([`CAUSE_SIBLING_SIGNED`]). The
+//!   receipt notes each admin's persisted hand-off times. `main` never
+//!   acts ([`CAUSE_LATE`]).
 //! - `s4_designated_late_observation`, stalled A (RED on `main`, GREEN
 //!   with S4). As
 //!   above, but A is off the fabric for the whole run; D, the next rank,
@@ -98,6 +101,13 @@
 //! - `s4_manual_remove_without_obligation` (control, GREEN on `main`). The
 //!   same five nodes, A held, but no revocation: D's manual remove of B is
 //!   not affected by S4, so it rekeys at once and reaches H.
+//!
+//! Manual requests: D's remove can answer `424 member_key_package_pending`
+//! with `retry: true` (D does not hold B's TreeKEM KeyPackage yet and
+//! requested the catch-up). The case retries such a reply with a doubling
+//! virtual-time wait ([`RETRY_FIRST`] to [`RETRY_CAP`]) up to the arm's
+//! own bound, and notes each retry. A 424 still there at the bound is RED
+//! with [`CAUSE_KEY_PACKAGE_PENDING`], not INFRA and not GREEN.
 //!
 //! Timing: W, Δ, the completion bound and the restart sync wait are the
 //! product's measured values (D69, D73), read from
@@ -140,7 +150,7 @@ enum Bound {
     /// A restarted: the restart sync wait, then the completion bound,
     /// both from the restart.
     Restart,
-    /// The designated admin is held or observes late: rank `R_MAX` may
+    /// The designated admin is held: rank `R_MAX` may
     /// start at `W + (R_MAX − 1)·Δ` (`S4Timing::fallback_offset`), and its
     /// own seal needs at most the completion bound. The product's own seal
     /// margin is 1.5 × (fsync + seal) = 12 s (PR #1508 body); the
@@ -192,12 +202,14 @@ const CAUSE_RESTART: &str = "no revocation eviction on main, before or after A's
                              still holds B's revocation after the crash, but every survivor \
                              still lists B active, at epoch e0, with the same leaf count";
 const CAUSE_LATE: &str = "no revocation eviction on main: the designated admin A observes late \
-                          and no hand-off or fallback runs, so after W + \u{394} + the bound \
-                          every survivor still lists B active, at epoch e0, with the same leaf \
-                          count";
+                          and no hand-off runs, so after the completion bound every survivor \
+                          still lists B active, at epoch e0, with the same leaf count";
 const CAUSE_STALLED: &str = "no ranked fallback on main: with the designated admin A held, D and \
                              E never act, so after W + \u{394} + the bound every survivor still \
                              lists B active, at epoch e0, with the same leaf count";
+const CAUSE_SIBLING_SIGNED: &str = "survivors reached H, but the head commit is not signed by \
+                                    the designated admin A: a sibling (D or E) signed the \
+                                    exclusion while A was reachable";
 const CAUSE_EARLY_SIBLING: &str =
     "a non-designated admin rekeyed before W/2 while the designated admin A was held";
 const CAUSE_MANUAL: &str = "non-designated manual remove rekeys at once on main: D's remove of B \
@@ -205,6 +217,14 @@ const CAUSE_MANUAL: &str = "non-designated manual remove rekeys at once on main:
                             left epoch e0 within EARLY_READ while the designated admin A was held";
 const CAUSE_NO_OBLIGATION: &str =
     "D's manual remove did not exclude B: survivors remain at epoch e0 with the same leaf count";
+const CAUSE_KEY_PACKAGE_PENDING: &str = "D's manual remove of B still answered 424 \
+                                         member_key_package_pending (retry: true) at the arm's \
+                                         bound: D never obtained B's TreeKEM KeyPackage";
+
+/// The first wait before a retry of a typed `retry: true` 424 reply; it
+/// doubles per retry, up to [`RETRY_CAP`]. Virtual time.
+const RETRY_FIRST: Duration = Duration::from_millis(250);
+const RETRY_CAP: Duration = Duration::from_secs(2);
 
 /// What happens at t = 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +298,9 @@ struct Arm {
     manual: bool,
     check: Check,
     bound: Bound,
+    /// The admin that must sign the exclusion commit on every survivor
+    /// (the head commit after H), when the ADR row names it.
+    committer: Option<&'static str>,
     cause: &'static str,
 }
 
@@ -296,6 +319,7 @@ const IDLE: Arm = Arm {
     manual: false,
     check: Check::Healthy,
     bound: Bound::Completion,
+    committer: None,
     cause: CAUSE_IDLE,
 };
 
@@ -338,6 +362,7 @@ const MANUAL_DURING_WINDOW: Arm = Arm {
     manual: true,
     check: Check::ManualQueued,
     bound: Bound::Fallback,
+    committer: None,
     cause: CAUSE_MANUAL,
 };
 
@@ -350,11 +375,19 @@ const MANUAL_WITHOUT_OBLIGATION: Arm = Arm {
     ..MANUAL_DURING_WINDOW
 };
 
+/// ADR 0110 `s4_designated_late_observation`: D and E hand the evidence to
+/// A (`EvictionHandoffV1`, which every node advertises), so A, reachable,
+/// reaches H within the completion bound from t = 0 and no sibling (D or
+/// E) signs the exclusion. PR #1508 run 39483631672: H at 11.1–13.1 s
+/// over 15 iterations, set by A's restart sync wait from process start
+/// (D73), never at D's fallback (W + 100 ms).
 const LATE_OBSERVATION: Arm = Arm {
     survivors: &["A", "D", "E", "C"],
     hold: Hold::RevocationGossipUntilHalfW,
     manual: false,
     check: Check::Healthy,
+    bound: Bound::Completion,
+    committer: Some("A"),
     cause: CAUSE_LATE,
     ..MANUAL_DURING_WINDOW
 };
@@ -399,19 +432,24 @@ struct View {
     /// Whether the live TreeKEM group still maps B to a leaf. Only the
     /// node that added B tracks it.
     tracks_b: Option<bool>,
+    /// Who signed the commit at `state_revision` (hex agent id, lower
+    /// case), from the node's retained commit log.
+    head_committed_by: Option<String>,
 }
 
 impl View {
     fn describe(&self) -> String {
         format!(
-            "state={} lists_b={} b_state={:?} epoch={:?} leaves={:?} tracks_b={:?} quarantined={}",
+            "state={} lists_b={} b_state={:?} epoch={:?} leaves={:?} tracks_b={:?} quarantined={} \
+             head_committed_by={:?}",
             self.state_revision,
             self.lists_b,
             self.b_state,
             self.epoch,
             self.leaves,
             self.tracks_b,
-            self.quarantined
+            self.quarantined,
+            self.head_committed_by
         )
     }
 }
@@ -444,6 +482,12 @@ async fn try_view_now(
             epoch: None,
             leaves: None,
             tracks_b: None,
+            head_committed_by: info
+                .commit_log
+                .iter()
+                .rev()
+                .find(|retained| retained.commit.revision == info.state_revision)
+                .map(|retained| retained.commit.committed_by.to_ascii_lowercase()),
         };
         (key.to_string(), view)
     };
@@ -876,6 +920,86 @@ impl RevocationGossipBlock {
     }
 }
 
+/// The final reply to a request sent through [`retrying`], with each
+/// typed-retry reply that came before it.
+struct Answered {
+    status: StatusCode,
+    body: serde_json::Value,
+    /// `(t_us, reply)` for each `424 retry: true` reply that was retried.
+    retries: Vec<(u128, String)>,
+    /// The deadline (virtual time since the sim started).
+    deadline: Duration,
+}
+
+impl Answered {
+    /// The last reply is a typed `424 retry: true`: the deadline came
+    /// first.
+    fn still_pending(&self) -> bool {
+        typed_retry(self.status, &self.body)
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "final {} {}; {} typed 424 retry: true replies retried before it {:?}; \
+             retry deadline {} us{}",
+            self.status,
+            self.body,
+            self.retries.len(),
+            self.retries,
+            self.deadline.as_micros(),
+            if self.still_pending() {
+                " (reached with the reply still 424)"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+/// A `424 Failed Dependency` reply that names `retry: true` (for example
+/// `member_key_package_pending`: the daemon requested the catch-up and
+/// asks the client to retry).
+fn typed_retry(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::FAILED_DEPENDENCY && body["retry"] == true
+}
+
+/// Send a manual remove/ban/seal request. A typed `424 retry: true` reply
+/// is retried with a doubling virtual-time wait, while the next attempt
+/// still starts before `deadline` (the arm's own bound). Each retried reply
+/// is kept for the receipt. Any other reply, or a 424 at the deadline, is
+/// returned as is: the caller judges it.
+async fn retrying(
+    sim: &Sim,
+    label: &str,
+    method: Method,
+    path: &str,
+    deadline: Duration,
+) -> Result<Answered> {
+    let mut retries = Vec::new();
+    let mut wait = RETRY_FIRST;
+    loop {
+        let (status, body) = sim.api(label, method.clone(), path, None).await?;
+        let now = sim.fabric().now();
+        if !typed_retry(status, &body) || now.saturating_add(wait) >= deadline {
+            return Ok(Answered {
+                status,
+                body,
+                retries,
+                deadline,
+            });
+        }
+        retries.push((now.as_micros(), format!("{status} {body}")));
+        sim.fabric().mark(format!(
+            "case: {label} {method} {path} -> 424 retry: true; retry in {wait:?}"
+        ));
+        sim.within("the typed-retry wait", wait + secs(1), async {
+            tokio::time::sleep(wait).await;
+        })
+        .await?;
+        wait = wait.saturating_mul(2).min(RETRY_CAP);
+    }
+}
+
 /// Every survivor at exactly `epoch`.
 fn all_at(views: &[(&str, Option<View>)], epoch: u64) -> bool {
     !views.is_empty()
@@ -967,6 +1091,55 @@ fn handoff_support(sim: &Sim, labels: &[&str], subject: &str) -> Result<String> 
     Ok(out.join(", "))
 }
 
+/// Each label's persisted S4 row for `target` (the `.evs` sidecar), as
+/// times in ms after `zero_ms` (a wall-clock Unix ms reading): first
+/// observation, first hand-off dispatch, earliest verified hand-off
+/// receipt and completion. The public status does not expose the hand-off
+/// times; the sidecar does.
+fn handoff_times(sim: &Sim, labels: &[&str], target: &[u8; 32], zero_ms: u64) -> Result<String> {
+    use crate::groups::eviction::{decode_evs, EVS_FILE_NAME};
+    let after = |ms: Option<u64>| ms.map(|ms| i128::from(ms) - i128::from(zero_ms));
+    let mut out = Vec::with_capacity(labels.len());
+    for label in labels {
+        let path = sim.state(label)?.data_dir.join(EVS_FILE_NAME);
+        let seen = match std::fs::read(&path) {
+            Ok(bytes) => match decode_evs(&bytes) {
+                Ok(body) => body
+                    .rows
+                    .iter()
+                    .find(|row| &row.target == target)
+                    .map_or_else(
+                        || "no row".to_string(),
+                        |row| {
+                            format!(
+                                "observed {:?} first_dispatch {:?} handoff_receipt {:?} \
+                                 completed {:?} phase {:?}",
+                                after(Some(row.observed_at_unix_ms)),
+                                after(row.first_dispatch_unix_ms),
+                                after(row.earliest_handoff_receipt_unix_ms),
+                                after(row.completed_at_unix_ms),
+                                row.phase
+                            )
+                        },
+                    ),
+                Err(error) => format!("undecodable: {error:?}"),
+            },
+            Err(error) => format!("unreadable: {error}"),
+        };
+        out.push(format!("{label}: {seen}"));
+    }
+    Ok(out.join("; "))
+}
+
+/// The wall clock the daemons stamp rows with, in Unix ms.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let labels = arm.labels;
@@ -1052,6 +1225,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .fabric()
         .mark_indexed(format!("case: t=0 trigger {:?}", arm.trigger));
     let mut started = sim.fabric().now();
+    let zero_ms = wall_ms();
     match arm.trigger {
         Trigger::SelfRevoke => {
             let (status, body) = sim
@@ -1150,17 +1324,22 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
 
     // The non-designated manual request, then the early read.
     let mut manual: Option<(StatusCode, String)> = None;
+    let mut manual_pending: Option<String> = None;
     let mut early: Vec<(&str, Option<View>)> = Vec::new();
     if arm.manual {
-        let (status, body) = sim
-            .api(
-                "D",
-                Method::DELETE,
-                &format!("/groups/{group}/members/{b_hex}"),
-                None,
-            )
-            .await?;
-        manual = Some((status, body.to_string()));
+        let answer = retrying(
+            sim,
+            "D",
+            Method::DELETE,
+            &format!("/groups/{group}/members/{b_hex}"),
+            started.saturating_add(arm.bound.duration(&timing())),
+        )
+        .await?;
+        receipt.note(format!("D's manual remove of B: {}", answer.describe()));
+        if answer.still_pending() {
+            manual_pending = Some(answer.describe());
+        }
+        manual = Some((answer.status, answer.body.to_string()));
         sim.within("the early read window", EARLY_READ + secs(2), async {
             tokio::time::sleep(EARLY_READ).await;
         })
@@ -1264,14 +1443,34 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         body.contains("waiting_for_designated_admin") && body.to_ascii_lowercase().contains(&a_hex)
     });
     let early_unmoved = all_at(&early, e0);
+    let committed_by = match arm.committer {
+        Some(label) => {
+            let want = sim.agent_hex(label)?;
+            let signed = end.iter().all(|(_, seen)| {
+                seen.as_ref()
+                    .is_some_and(|seen| seen.head_committed_by.as_deref() == Some(want.as_str()))
+            });
+            receipt.note(format!(
+                "exclusion signer: want {label} ({want}) on every survivor: {signed}"
+            ));
+            signed
+        }
+        None => true,
+    };
     let passed = match arm.check {
         Check::ManualQueued => queued_typed && early_unmoved && h && data_plane,
-        Check::Healthy | Check::NoEarlySibling => h && data_plane && stays_removed,
+        Check::Healthy | Check::NoEarlySibling => h && data_plane && stays_removed && committed_by,
     };
     receipt.note(format!(
         "S4 status at the end: {}",
         statuses(sim, labels, &group).await?
     ));
+    if arm.ranked_admins() {
+        receipt.note(format!(
+            "persisted S4 rows for B, ms after t=0 (ADR 0110 §4 hand-off evidence): {}",
+            handoff_times(sim, &["A", "D", "E"], b.as_bytes(), zero_ms)?
+        ));
+    }
     receipt.note(format!(
         "arm={arm:?} e0={e0} leaves0={leaves0}; H {}; manual={manual:?}; \
          duplicate={duplicate:?}; gossip to A withheld={:?}; early: {}; end: {}; \
@@ -1319,16 +1518,36 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             format!("manual request {manual:?}"),
         ),
     };
+    if let Some(pending) = &manual_pending {
+        // D answered every attempt with the typed 424 `retry: true`
+        // until the arm's bound: the request reached D, and D could not
+        // act. That is a product failure with its own cause, not INFRA.
+        receipt.request_delivered(
+            "d_manual_remove_answered_with_typed_retry",
+            true,
+            pending.clone(),
+            at(sim),
+        );
+        receipt.cause(
+            CAUSE_KEY_PACKAGE_PENDING,
+            Some(pending.clone()),
+            true,
+            at(sim),
+        );
+        receipt.finish(arm.final_name(), false, at(sim));
+        return Ok(());
+    }
     receipt.request_delivered(delivered_name, delivered, delivered_detail, at(sim));
 
     if !passed {
-        let (ok, observed) = match arm.check {
+        let (cause, ok, observed) = match arm.check {
             Check::ManualQueued => {
                 let moved = early.iter().any(|(_, seen)| {
                     seen.as_ref()
                         .is_some_and(|seen| seen.epoch.is_some_and(|now| now > e0))
                 });
                 (
+                    arm.cause,
                     manual_ok && !queued_typed && moved,
                     format!(
                         "manual request {manual:?}; early (t+{EARLY_READ:?}): {}",
@@ -1336,7 +1555,11 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     ),
                 )
             }
+            Check::Healthy | Check::NoEarlySibling if h && !committed_by => {
+                (CAUSE_SIBLING_SIGNED, true, describe_all(&end))
+            }
             Check::Healthy | Check::NoEarlySibling => (
+                arm.cause,
                 retained(
                     &end,
                     e0,
@@ -1346,7 +1569,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 describe_all(&end),
             ),
         };
-        receipt.cause(arm.cause, Some(observed), ok, at(sim));
+        receipt.cause(cause, Some(observed), ok, at(sim));
     }
     receipt.finish(arm.final_name(), passed, at(sim));
     Ok(())
