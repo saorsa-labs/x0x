@@ -1025,6 +1025,55 @@ mod execution {
         fixture.assert_installed_pair_unchanged();
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_exited_group_check_rejects_live_child_and_accepts_unreaped_exited_leader() {
+        use std::os::unix::process::CommandExt;
+
+        let fixture = ProbeFixture::new();
+        let mut live_command = fixture.command(Path::new("/bin/sleep"));
+        live_command.arg("30").process_group(0);
+        let live = ReapedChild(Some(live_command.spawn().unwrap()));
+        let live_pid = i32::try_from(live.0.as_ref().unwrap().id()).unwrap();
+        assert!(
+            !probe::group_has_only_exited_members(live_pid).unwrap(),
+            "a live owned child is not an exited-only group"
+        );
+        drop(live);
+
+        let mut exited_command = fixture.command(Path::new("/bin/sh"));
+        exited_command.args(["-c", "exit 0"]).process_group(0);
+        let mut exited = ReapedChild(Some(exited_command.spawn().unwrap()));
+        let pid = exited.0.as_ref().unwrap().id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: this output buffer belongs to waitid. WNOWAIT leaves
+            // our direct child unreaped, preserving its group leader PID.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(result, 0);
+            // SAFETY: waitid initialized the status or left its zero value.
+            if unsafe { info.si_pid() } == i32::try_from(pid).unwrap() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "owned fixture never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            probe::group_has_only_exited_members(i32::try_from(pid).unwrap()).unwrap(),
+            "the still-waitable exited leader must establish an exited-only group"
+        );
+        assert!(exited.0.take().unwrap().wait().unwrap().success());
+        ExecutionFixture::assert_child_reaped(pid);
+    }
+
     #[test]
     fn a_newer_release_can_pass_a_failed_hold_but_cannot_clear_recovery_failure() {
         let fixture = ExecutionFixture::new();
