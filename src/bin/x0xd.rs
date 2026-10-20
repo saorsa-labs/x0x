@@ -10,7 +10,7 @@
 //! x0xd                                  # default config
 //! x0xd --config /path/to/config.toml    # custom config
 //! x0xd --check                          # validate config and exit
-//! x0xd --check-updates                  # check/apply updates and exit
+//! x0xd --check-updates                  # report update availability and exit
 //! x0xd --skip-update-check              # run daemon with self-update disabled
 //! x0xd --name alice                     # run a named instance (separate identity)
 //! x0xd --list                           # list running instances

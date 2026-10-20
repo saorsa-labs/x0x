@@ -291,17 +291,17 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<TasksSub>,
     },
-    /// Check releases; use authenticated POST /upgrade/apply to install.
+    /// Check releases or ask the running daemon to apply an update.
     Upgrade {
         /// Just check for updates, don't apply.
         #[arg(long)]
         check: bool,
-        /// Installation is refused; use authenticated POST /upgrade/apply.
+        /// Ask the running daemon to apply an update.
         /// With --check, only a read-only release check is performed.
         #[arg(long)]
         apply: bool,
         /// With --check, fetch the current manifest regardless of version.
-        /// Does not bypass the refusal to install.
+        /// Does not bypass the daemon's apply checks.
         #[arg(long)]
         force: bool,
     },
@@ -2115,9 +2115,9 @@ async fn run(
         }
         Commands::Upgrade {
             check,
-            apply: _,
+            apply,
             force,
-        } => {
+        } if *check || !*apply => {
             return commands::upgrade::run(*check, *force).await;
         }
         Commands::Instances => return commands::daemon::instances().await,
@@ -3153,7 +3153,12 @@ async fn run(
             }
         },
         Commands::Upgrade { .. } => {
-            anyhow::bail!("command dispatched earlier — dispatch table out of sync")
+            // The serving daemon owns installation and its writer lock. The
+            // existing client carries the selected instance and bearer token.
+            // --force only affects read-only checks; it cannot bypass apply.
+            let response = client.post_empty("/upgrade/apply").await?;
+            x0x::cli::print_value(client.format(), &response);
+            Ok(())
         }
         Commands::Ws { sub } => match sub {
             None => commands::ws::general(&client).await,
@@ -3437,8 +3442,9 @@ x0x (v{VERSION})
 |
 +-- System
     +-- constitution       Display the x0x Constitution
-    +-- upgrade            Read-only release check; use POST /upgrade/apply to install
+    +-- upgrade            Check releases or ask the running daemon to apply
     |   +-- --check        Just check, don't apply
+    |   +-- --apply        Apply through the running daemon
     |   +-- --force        Fetch current manifest with --check
     +-- gui                Open embedded web GUI
     +-- routes             Print all 130 REST API routes
