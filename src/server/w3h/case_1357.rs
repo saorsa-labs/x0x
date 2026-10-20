@@ -948,6 +948,25 @@ fn runtime_timing(sim: &Sim, labels: &[&str]) -> Result<(bool, String)> {
     ))
 }
 
+/// Each label's verified view of whether `subject` takes an ADR 0110 §4
+/// `EvictionHandoffV1`.
+fn handoff_support(sim: &Sim, labels: &[&str], subject: &str) -> Result<String> {
+    let (subject_id, _) = sim.ids(subject)?;
+    let mut out = Vec::with_capacity(labels.len());
+    for label in labels.iter().filter(|label| **label != subject) {
+        let supports = sim
+            .state(label)?
+            .agent
+            .capability_store()
+            .verified_registry_supports(
+                &subject_id,
+                crate::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
+            );
+        out.push(format!("{label}: {supports:?}"));
+    }
+    Ok(out.join(", "))
+}
+
 async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let labels = arm.labels;
@@ -1014,6 +1033,14 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             format!("admin agent-id order {order:?}; A hold {:?}", arm.hold),
             at(sim),
         );
+    }
+
+    if arm.ranked_admins() {
+        receipt.note(format!(
+            "verified eviction_handoff_v1 support for A (ADR 0110 §4; `None` = \
+             unknown, so no hand-off is sent): {}",
+            handoff_support(sim, labels, "A")?
+        ));
     }
 
     let gossip_block = (arm.hold == Hold::RevocationGossipUntilHalfW)
@@ -1171,10 +1198,13 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             };
             let done = excluded(&now, e0, leaves0);
             if done {
+                let elapsed = s.fabric().now().saturating_sub(started);
                 reached.get_or_insert_with(|| {
                     format!(
-                        "at {} us after t=0",
-                        s.fabric().now().saturating_sub(started).as_micros()
+                        "at {} us after t=0 (within the completion bound {:?}: {})",
+                        elapsed.as_micros(),
+                        timing.completion_bound,
+                        elapsed <= timing.completion_bound
                     )
                 });
             }
