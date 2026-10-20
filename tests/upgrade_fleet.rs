@@ -272,5 +272,139 @@ macro_rules! fleet_startup_regression_tests {
             assert!(started.elapsed() <= Duration::from_secs(3600));
             assert_eq!(std::fs::read(install).unwrap(), original);
         }
+
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_production_startup_preserves_and_refuses_an_existing_zero_window_receipt() {
+            fleet_existing_zero_receipt_case(true, true).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_ordinary_startup_keeps_explicit_zero_and_applies_without_waiting() {
+            fleet_existing_zero_receipt_case(false, false).await;
+        }
+
+        #[cfg(all(unix, feature = "upgrade-test-signing", debug_assertions))]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_compiled_rehearsal_startup_keeps_explicit_zero_and_applies_without_waiting() {
+            fleet_existing_zero_receipt_case(true, false).await;
+        }
+
+        #[cfg(unix)]
+        async fn fleet_existing_zero_receipt_case(tracked_unit: bool, must_refuse: bool) {
+            use sha2::Digest;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let evidence = std::env::var_os("X0X_UPGRADE_FLEET_EVIDENCE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(".planning/upgrade-fleet-fixtures"));
+            std::fs::create_dir_all(&evidence).unwrap();
+            let dir = tempfile::Builder::new().prefix("fleet-retained-").tempdir_in(evidence).unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (mut runtime, _shutdown) = e2e_startup_runtime(&root);
+            let install = runtime.staging.install.clone();
+            let original = std::fs::read(&install).unwrap();
+            let apply_lock = Arc::clone(&runtime.upgrade_apply_lock);
+            let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
+            let acknowledged = Arc::new(AtomicU64::new(0));
+            let observed_count = Arc::clone(&acknowledged);
+            runtime.staging.observed = Some(Arc::new(move |decision| {
+                observed_count.fetch_add(1, Ordering::SeqCst);
+                observed.send(decision).unwrap();
+            }));
+            runtime.staging.clock = Some(Arc::new(|| Ok(crate::upgrade::probe::ProbeClock {
+                boot_id: "fleet-retained-receipt".into(), monotonic_ms: 1000,
+            })));
+            let authority: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/.deployment/authority-inventory.json"
+            ))).unwrap();
+            let tracked = std::path::Path::new(authority["instances"][0]["unit"]["destination"]
+                .as_str().unwrap()).file_name().unwrap().to_str().unwrap();
+            let unit = if tracked_unit { tracked } else { "owned-untracked-fleet-control.service" };
+            assert!(!authority["instances"].as_array().unwrap().iter().any(|entry| {
+                std::path::Path::new(entry["unit"]["destination"].as_str().unwrap())
+                    .file_name().unwrap() == "owned-untracked-fleet-control.service"
+            }));
+            let mut scenario = staging_readback(one_call_scenario("0", "5"), &runtime);
+            scenario.cgroup = format!("0::/system.slice/{unit}");
+            let _readback = restart::systemd_readback_seam::install(scenario);
+            let mut manifest = manifest_for_this_platform("9.9.9");
+            manifest.timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let manifest_json = serde_json::to_vec(&manifest).unwrap();
+            let request = crate::upgrade::staging::StagingRequest {
+                install: install.clone(), data_root: root.clone(),
+                identity_root: runtime.staging.identity_root.clone(),
+                machine_id: runtime.staging.machine_id, version: manifest.version.clone(),
+                manifest_sha256: sha2::Sha256::digest(&manifest_json).into(),
+                archive_sha256: manifest.assets[0].archive_sha256, window_minutes: 0,
+            };
+            // Create real valid prior state. Later startup must not silently
+            // reset its first choice, nor advance it before checking the floor.
+            {
+                let _lock = crate::upgrade::acquire_host_upgrade_lock(&install).unwrap();
+                assert_eq!(crate::upgrade::staging::observe(&request, &crate::upgrade::probe::ProbeClock {
+                    boot_id: "fleet-retained-receipt".into(), monotonic_ms: 500,
+                }).unwrap(), crate::upgrade::staging::Decision::Due);
+            }
+            let path = crate::upgrade::staging::receipt_path(&request).unwrap();
+            let retained = std::fs::read(&path).unwrap();
+            let initial = crate::upgrade::staging::read_receipt(&request).unwrap().unwrap();
+            assert_eq!(initial.window_minutes, 0);
+            assert_eq!(initial.first_receipt_ms, 500);
+            assert_eq!(initial.manifest_sha256, request.manifest_sha256);
+            assert_eq!(initial.archive_sha256, request.archive_sha256);
+            let attempts = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&attempts);
+            let expected_unit = unit.to_owned();
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |plan, manifest| {
+                let verified = plan.systemd_verified.as_ref().unwrap();
+                assert_eq!(verified.unit, expected_unit);
+                assert!(!verified.user_manager);
+                counted.fetch_add(1, Ordering::SeqCst);
+                x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
+            }));
+            let _release = startup_release_seam::install(crate::upgrade::monitor::VerifiedRelease {
+                manifest, manifest_json, signature: Vec::new(), gossip_payload: Vec::new(),
+            });
+            let mut config = DaemonConfig { data_dir: root, ..Default::default() };
+            config.update.rollout_window_minutes = 0;
+            let started = tokio::time::Instant::now();
+            let startup = run_startup_update_check(&config, None, Some(runtime));
+            tokio::pin!(startup);
+            // Keep virtual time fixed while real blocking filesystem work runs.
+            // A rewritten sixty-minute receipt is a failure, not a long timeout.
+            let result = loop {
+                assert!(std::time::Instant::now() < deadline, "retained fleet fixture deadline");
+                tokio::select! {
+                    biased;
+                    result = startup.as_mut() => break result,
+                    Some(decision) = observations.recv() => {
+                        assert_eq!(decision, crate::upgrade::staging::Decision::Due,
+                            "an old receipt must be refused, never reset into a fresh wait");
+                    }
+                    _ = tokio::task::yield_now() => {}
+                }
+            };
+            if must_refuse {
+                assert!(matches!(&result, Ok(None)), "fleet old-window refusal: {result:?}");
+                assert_eq!(attempts.load(Ordering::SeqCst), 0);
+                assert_eq!(acknowledged.load(Ordering::SeqCst), 0);
+                assert_eq!(std::fs::read(path).unwrap(), retained,
+                    "refusal must precede every receipt write, including anchor progress");
+            } else {
+                assert!(matches!(&result, Ok(Some(version)) if version == "9.9.9"), "{result:?}");
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+                assert!(acknowledged.load(Ordering::SeqCst) > 0);
+                let final_receipt = crate::upgrade::staging::read_receipt(&request).unwrap().unwrap();
+                assert_eq!(final_receipt.window_minutes, 0);
+                assert_eq!(final_receipt.first_receipt_ms, 500);
+                assert_eq!(final_receipt.remaining, Duration::ZERO);
+            }
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert!(apply_lock.try_lock().is_ok());
+            assert_eq!(std::fs::read(install).unwrap(), original);
+        }
     };
 }
