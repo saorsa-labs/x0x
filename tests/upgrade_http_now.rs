@@ -25,6 +25,7 @@ macro_rules! http_now_regression_tests {
                 install: PathBuf, data: PathBuf, identity: PathBuf, window: u64,
                 _readback: restart::systemd_readback_seam::Guard,
                 _apply: crate::upgrade::apply::apply_attempt_seam::Guard,
+                _current_path: crate::upgrade::apply::current_binary_path_seam::Guard,
                 _root: tempfile::TempDir,
             }
 
@@ -51,6 +52,9 @@ macro_rules! http_now_regression_tests {
                     std::fs::create_dir(&data).unwrap(); std::fs::create_dir(&identity).unwrap();
                     let data = data.canonicalize().unwrap(); let identity = identity.canonicalize().unwrap();
                     let (mut startup, shutdown) = e2e_startup_runtime(&data);
+                    let current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                        data.join("x0xd"),
+                    );
                     startup.staging.identity_root = identity.clone();
                     let install = startup.staging.install.clone();
                     // Precreate the real persistent lock so preservation checks
@@ -88,7 +92,8 @@ macro_rules! http_now_regression_tests {
                         wait_slot: Arc::new(Arc::clone(&wait_lock).try_lock_owned().unwrap()),
                     };
                     Self { runtime, shutdown: Some(shutdown), observed, operations, drained, attempts, wait_lock,
-                        install, data, identity, window, _readback: readback, _apply: apply, _root: root }
+                        install, data, identity, window, _readback: readback, _apply: apply,
+                        _current_path: current_path, _root: root }
                 }
                 fn release(&self, version: &str) -> crate::upgrade::monitor::VerifiedRelease {
                     let mut manifest = manifest_for_this_platform(version);

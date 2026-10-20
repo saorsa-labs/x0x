@@ -21,6 +21,7 @@ macro_rules! http_readback_regression_tests {
                 _shutdown: watch::Sender<bool>,
                 _readback: restart::systemd_readback_seam::Guard,
                 _apply: crate::upgrade::apply::apply_attempt_seam::Guard,
+                _current_path: crate::upgrade::apply::current_binary_path_seam::Guard,
                 root: tempfile::TempDir,
             }
 
@@ -33,6 +34,9 @@ macro_rules! http_readback_regression_tests {
                     let root = tempfile::Builder::new().prefix("readback-").tempdir_in(base).unwrap();
                     let data = root.path().canonicalize().unwrap();
                     let (startup, shutdown) = e2e_startup_runtime(&data);
+                    let current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                        data.join("x0xd"),
+                    );
                     let install = startup.staging.install.clone();
                     drop(crate::upgrade::acquire_host_upgrade_lock(&install).unwrap());
                     let readback = restart::systemd_readback_seam::install(
@@ -51,7 +55,8 @@ macro_rules! http_readback_regression_tests {
                         shutdown: startup.shutdown_watch, staging: Some(startup.staging), operation_observer: None,
                     };
                     Self { runtime: Some(runtime), wait_lock, attempts, install,
-                        _shutdown: shutdown, _readback: readback, _apply: apply, root }
+                        _shutdown: shutdown, _readback: readback, _apply: apply,
+                        _current_path: current_path, root }
                 }
 
                 fn release() -> VerifiedRelease {
