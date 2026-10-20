@@ -557,23 +557,23 @@ jobs:
           --require w3h_818_control_ownerless_invite_after_the_removal_joins
           --expect w3h_818_control_ownerless_invite_after_the_removal_joins=GREEN
           --require w3h_1357_red_s4_idle_revocation_one_admin
-          --expect w3h_1357_red_s4_idle_revocation_one_admin=RED
+          --expect w3h_1357_red_s4_idle_revocation_one_admin=GREEN
           --require w3h_1357_control_s4_self_leave_crypto_only
           --expect w3h_1357_control_s4_self_leave_crypto_only=GREEN
           --require w3h_1357_red_s4_fallback_rank_manual
-          --expect w3h_1357_red_s4_fallback_rank_manual=RED
+          --expect w3h_1357_red_s4_fallback_rank_manual=GREEN
           --require w3h_1357_control_s4_manual_remove_without_obligation
           --expect w3h_1357_control_s4_manual_remove_without_obligation=GREEN
           --require w3h_1357_red_s4_idle_revocation_one_admin_home
-          --expect w3h_1357_red_s4_idle_revocation_one_admin_home=RED
+          --expect w3h_1357_red_s4_idle_revocation_one_admin_home=GREEN
           --require w3h_1357_control_s4_self_leave_then_revocation
           --expect w3h_1357_control_s4_self_leave_then_revocation=GREEN
           --require w3h_1357_red_s4_restart_intake_prepare
-          --expect w3h_1357_red_s4_restart_intake_prepare=RED
+          --expect w3h_1357_red_s4_restart_intake_prepare=GREEN
           --require w3h_1357_red_s4_designated_late_observation
-          --expect w3h_1357_red_s4_designated_late_observation=RED
+          --expect w3h_1357_red_s4_designated_late_observation=GREEN
           --require w3h_1357_red_s4_designated_stalled_a_fallback
-          --expect w3h_1357_red_s4_designated_stalled_a_fallback=RED
+          --expect w3h_1357_red_s4_designated_stalled_a_fallback=GREEN
           --require w3h_1357_control_s4_designated_no_early_sibling
           --expect w3h_1357_control_s4_designated_no_early_sibling=GREEN
 

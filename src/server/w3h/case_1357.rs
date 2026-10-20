@@ -1,7 +1,11 @@
 //! W3-H cases for #1357 (ADR 0110 S4, revocation eviction, designated
-//! admin first). Harness first (D16/D54): the red arms are committed and
-//! shown RED on `main` before S4 code merges; the controls are GREEN before
-//! and after.
+//! admin first). Harness first (D16/D54): the red arms were committed and
+//! shown RED on `main` (DIAG PR #1496) before S4 code merged. This PR has
+//! the S4 fix, so each red arm now expects GREEN (the ADR 0110 behaviour)
+//! and keeps its `_red_` name, as #1256 did. The controls are GREEN before
+//! and after. A failed red arm whose observation matches `main` (its
+//! `CAUSE_*`) is RED; any other failure is INFRA, with the views and the
+//! S4 status (`GET /groups/:id`) in the receipt notes.
 //!
 //! B is the target and C a survivor. The ordinary arms use a
 //! `private_secure` (TreeKEM) group that A creates through the public API;
@@ -21,14 +25,15 @@
 //!
 //! Arms:
 //!
-//! - `s4_idle_revocation_one_admin` (RED on `main`). Nodes A, B, C; A is
+//! - `s4_idle_revocation_one_admin` (RED on `main`, GREEN with S4). Nodes A, B, C; A is
 //!   the only admin. At t = 0 B revokes its own agent through
 //!   `POST /identity/revoke` (the issuer API; ADR 0110 "repeat
 //!   self-revocation and ordinary groups"). A and C must hold the record.
-//!   No seal or removal API is called. Desired: H within
-//!   [`S4_COMPLETION_BOUND_PLACEHOLDER`]. `main` has no revocation
+//!   No seal or removal API is called. Desired: H within the completion
+//!   bound ([`Bound::Completion`]). `main` has no revocation
 //!   eviction, so B stays seated at e0 on A and C ([`CAUSE_IDLE`]).
-//! - `s4_idle_revocation_one_admin`, Home variant (RED on `main`). A owns
+//! - `s4_idle_revocation_one_admin`, Home variant (RED on `main`, GREEN
+//!   with S4). A owns
 //!   the Home and is its only admin. At t = 0 A issuer-revokes B through
 //!   `DELETE /owner/agents/:id` (ADR-0018, signed by the owner key). The
 //!   precondition is that A, the designated admin, holds the record. C is
@@ -48,17 +53,18 @@
 //!   [`SETTLE`]) and B stays `Removed`. On `main` the leave rekeys and the
 //!   revocation does nothing more; after S4 the revocation must not rekey
 //!   a second time.
-//! - `s4_restart_intake_prepare` (RED on `main`). Nodes A, B, C. At t = 0
+//! - `s4_restart_intake_prepare` (RED on `main`, GREEN with S4). Nodes A, B, C. At t = 0
 //!   B revokes its own agent; once A and C hold the record, A is
 //!   crash-stopped and restarted on the same dirs; 100 ms after the
 //!   restart B sends the revocation again (the duplicate trigger). A must
-//!   still hold the record. Desired: H within the completion bound from
-//!   the restart, with exactly one epoch step (no duplicate rekey). `main`
+//!   still hold the record. Desired: H within the restart sync wait plus
+//!   the completion bound from the restart ([`Bound::Restart`]), with
+//!   exactly one epoch step (no duplicate rekey). `main`
 //!   never schedules the work ([`CAUSE_RESTART`]). The ADR's other runs
 //!   (a crash after the prepared journal, before the legacy commit; a
 //!   failed first intake write showing `waiting_for_durable_intake`) need
-//!   S4's own durability barriers and are added with S4.
-//! - `s4_fallback_rank_manual` (RED on `main`). Nodes A, D, E, B, C, with
+//!   S4's own durability barriers and are not in this case yet.
+//! - `s4_fallback_rank_manual` (RED on `main`, GREEN with S4). Nodes A, D, E, B, C, with
 //!   admins A < D < E by agent id (the case reassigns the pre-generated
 //!   keys of A, D and E so that this holds). A is held off the fabric
 //!   (the designated admin, stalled). At t = 0 B revokes its own agent; D,
@@ -66,34 +72,38 @@
 //!   B, well before W. Desired: D's request is queued with the typed state
 //!   `waiting_for_designated_admin` naming A, no survivor's epoch moves
 //!   in the next [`EARLY_READ`], and the ranked fallback then reaches H
-//!   within W + Δ + the completion bound. `main` rekeys at once
+//!   within [`Bound::Fallback`]. `main` rekeys at once
 //!   ([`CAUSE_MANUAL`]).
-//! - `s4_designated_late_observation` (RED on `main`). Nodes A, D, E, B,
+//! - `s4_designated_late_observation` (RED on `main`, GREEN with S4). Nodes A, D, E, B,
 //!   C with A < D < E. A stays reachable, but revocation-topic gossip
 //!   toward A is dropped until t = W/2, so D, E and C observe at t = 0 and
 //!   A only late (direct messages, the S4 hand-off, still reach A). B
 //!   revokes its own agent at t = 0. Desired: automatic healthy exclusion
-//!   (H) within W + Δ + the bound, with no sibling. `main` never acts
+//!   (H) within [`Bound::Fallback`], with no sibling. `main` never acts
 //!   ([`CAUSE_LATE`]).
-//! - `s4_designated_late_observation`, stalled A (RED on `main`). As
+//! - `s4_designated_late_observation`, stalled A (RED on `main`, GREEN
+//!   with S4). As
 //!   above, but A is off the fabric for the whole run; D, the next rank,
 //!   must fall back after W and reach H. `main` never acts
 //!   ([`CAUSE_STALLED`]).
 //! - `s4_designated_late_observation`, no early sibling (control, GREEN on
 //!   `main`). The stalled-A run read at t = W/2: no survivor has rekeyed
 //!   or is quarantined, and B is still listed. Trivially true on `main`;
-//!   after S4 it proves D and E wait for W. The ADR's "E observes first
-//!   and hands off" skew variant needs S4's hand-off to stage and is added
-//!   with S4.
+//!   after S4 it proves D and E wait for at least W/2 (W = 18 s, so the
+//!   read is at 9 s, well past the hand-off and gossip latency). The
+//!   receipt notes each node's S4 status at W/2; the ADR's typed
+//!   `waiting_for_designated_admin` state is recorded there, not asserted,
+//!   so the control stays a control. The ADR's "E observes first and
+//!   hands off" skew variant is not in this case yet.
 //! - `s4_manual_remove_without_obligation` (control, GREEN on `main`). The
 //!   same five nodes, A held, but no revocation: D's manual remove of B is
 //!   not affected by S4, so it rekeys at once and reaches H.
 //!
-//! W, Δ and the completion bound are not measured yet (D69, D73). The case
-//! uses generous named placeholders so that the RED verdict means "never
-//! happens on `main`", not a timing miss. Replace them with the W3-H
-//! p99.9 numbers (`s4_timing_measurement`) before timing-dependent S4 code
-//! merges.
+//! Timing: W, Δ, the completion bound and the restart sync wait are the
+//! product's measured values (D69, D73), read from
+//! [`S4Timing::default`] (see [`Bound`]). Each arm also records that every
+//! node's runtime S4 timing equals that default. W3-H runs on virtual
+//! time, so the production values cost little wall time.
 //!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
@@ -104,6 +114,7 @@ use super::control::{create_group, invite, join, members, mesh};
 use super::home::membership_state;
 use super::receipt::{Receipt, Verdict};
 use super::*;
+use crate::groups::eviction::S4Timing;
 use crate::identity::UserKeypair;
 use anyhow::ensure;
 use base64::Engine as _;
@@ -111,22 +122,49 @@ use serde_json::json;
 
 const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-/// PLACEHOLDER for ADR 0110's completion bound (D69): replace it with the
-/// W3-H p99.9 measured number before timing-dependent S4 code merges.
-/// Generous on purpose: the red verdict is about "never happens on main".
-const S4_COMPLETION_BOUND_PLACEHOLDER: Duration = Duration::from_secs(120);
-/// PLACEHOLDER for ADR 0110's designated-admin window W (D69): replace it
-/// with the measured number before timing-dependent S4 code merges.
-const S4_W_PLACEHOLDER: Duration = Duration::from_secs(60);
-/// PLACEHOLDER for ADR 0110's fallback rank step Δ (D73): replace it with
-/// the measured number before timing-dependent S4 code merges.
-const S4_DELTA_PLACEHOLDER: Duration = Duration::from_secs(30);
-/// The bound for arms whose designated admin is held: W + Δ + completion.
-const FALLBACK_BOUND: Duration = Duration::from_secs(
-    S4_W_PLACEHOLDER.as_secs()
-        + S4_DELTA_PLACEHOLDER.as_secs()
-        + S4_COMPLETION_BOUND_PLACEHOLDER.as_secs(),
-);
+/// ADR 0110 §2 timing: the product's measured values (D69, D73), read from
+/// [`S4Timing::default`] so that the case and the product have one source.
+fn timing() -> S4Timing {
+    S4Timing::default()
+}
+
+/// The fallback rank of the last reachable eligible admin in the
+/// five-node arms (A held: D is rank 1, E is rank 2).
+const R_MAX: usize = 2;
+
+/// Which ADR 0110 bound an arm's H must meet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bound {
+    /// The designated admin is reachable: the completion bound from t = 0.
+    Completion,
+    /// A restarted: the restart sync wait, then the completion bound,
+    /// both from the restart.
+    Restart,
+    /// The designated admin is held or observes late: rank `R_MAX` may
+    /// start at `W + (R_MAX − 1)·Δ` (`S4Timing::fallback_offset`), and its
+    /// own seal needs at most the completion bound. The product's own seal
+    /// margin is 1.5 × (fsync + seal) = 12 s (PR #1508 body); the
+    /// completion bound (18 s) covers it, so the form is the ADR's
+    /// `W + (r_max − 1)·Δ + seal margin`, rounded up to a bound that the
+    /// product exposes. `R_MAX` = 2, not 1: if D's seal fails, E's
+    /// fallback at `W + Δ` still reaches H, and that is ADR behaviour.
+    Fallback,
+}
+
+impl Bound {
+    fn duration(self, timing: &S4Timing) -> Duration {
+        match self {
+            Self::Completion => timing.completion_bound,
+            Self::Restart => timing
+                .restart_sync_wait
+                .saturating_add(timing.completion_bound),
+            Self::Fallback => timing
+                .fallback_offset(R_MAX)
+                .saturating_add(timing.completion_bound),
+        }
+    }
+}
+
 /// How long after a non-designated manual request the case checks that no
 /// survivor rekeyed. Far below any plausible W.
 const EARLY_READ: Duration = Duration::from_secs(5);
@@ -239,7 +277,7 @@ struct Arm {
     /// D calls the public remove API on B after the trigger.
     manual: bool,
     check: Check,
-    bound: Duration,
+    bound: Bound,
     cause: &'static str,
 }
 
@@ -257,7 +295,7 @@ const IDLE: Arm = Arm {
     restart_a: false,
     manual: false,
     check: Check::Healthy,
-    bound: S4_COMPLETION_BOUND_PLACEHOLDER,
+    bound: Bound::Completion,
     cause: CAUSE_IDLE,
 };
 
@@ -283,6 +321,7 @@ const LEAVE_THEN_REVOKE: Arm = Arm {
 
 const RESTART_INTAKE: Arm = Arm {
     restart_a: true,
+    bound: Bound::Restart,
     cause: CAUSE_RESTART,
     ..IDLE
 };
@@ -298,7 +337,7 @@ const MANUAL_DURING_WINDOW: Arm = Arm {
     restart_a: false,
     manual: true,
     check: Check::ManualQueued,
-    bound: FALLBACK_BOUND,
+    bound: Bound::Fallback,
     cause: CAUSE_MANUAL,
 };
 
@@ -306,7 +345,7 @@ const MANUAL_WITHOUT_OBLIGATION: Arm = Arm {
     holders: &[],
     trigger: Trigger::Nothing,
     check: Check::Healthy,
-    bound: S4_COMPLETION_BOUND_PLACEHOLDER,
+    bound: Bound::Completion,
     cause: CAUSE_NO_OBLIGATION,
     ..MANUAL_DURING_WINDOW
 };
@@ -858,6 +897,57 @@ fn retained(views: &[(&str, Option<View>)], e0: u64, leaves0: u32, listed: bool)
         })
 }
 
+/// `label`'s S4 status for `group` through the public group API
+/// (`revocation_evictions` and `admin_availability`), for the receipt.
+async fn eviction_status(sim: &Sim, label: &str, group: &str) -> Result<serde_json::Value> {
+    let (status, body) = sim
+        .api(label, Method::GET, &format!("/groups/{group}"), None)
+        .await?;
+    ensure!(
+        status.is_success(),
+        "{label} GET /groups/{group}: {status} {body}"
+    );
+    Ok(json!({
+        "revocation_evictions": body["revocation_evictions"],
+        "admin_availability": body["admin_availability"],
+    }))
+}
+
+/// The S4 status of each label, for a receipt note. A node that is off
+/// the fabric still answers its local API.
+async fn statuses(sim: &Sim, labels: &[&str], group: &str) -> Result<String> {
+    let mut out = Vec::with_capacity(labels.len());
+    for label in labels {
+        let seen = sim
+            .at_instant(
+                "read a node's S4 status",
+                eviction_status(sim, label, group),
+            )
+            .await?;
+        out.push(match seen {
+            Ok(seen) => format!("{label}: {seen}"),
+            Err(error) => format!("{label}: {error:#}"),
+        });
+    }
+    Ok(out.join("; "))
+}
+
+/// Every node runs the timing that the case reads.
+fn runtime_timing(sim: &Sim, labels: &[&str]) -> Result<(bool, String)> {
+    let want = timing();
+    let mut differ = Vec::new();
+    for label in labels {
+        let have = sim.state(label)?.revocation_evictions.timing;
+        if have != want {
+            differ.push(format!("{label}: {have:?}"));
+        }
+    }
+    Ok((
+        differ.is_empty(),
+        format!("want {want:?}; differ: {differ:?}"),
+    ))
+}
+
 async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let labels = arm.labels;
@@ -890,6 +980,8 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         sim.set_online("A", false)?;
     }
     receipt.setup_done(at(sim));
+    let (same, detail) = runtime_timing(sim, labels)?;
+    receipt.evidence("every_node_runs_s4timing_default", same, detail, at(sim));
 
     receipt.evidence(
         if arm.home {
@@ -1047,6 +1139,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         })
         .await?;
         early = views(sim, survivors, &group, &b).await?;
+        receipt.note(format!(
+            "S4 status at the early read: {}",
+            statuses(sim, labels, &group).await?
+        ));
     }
 
     if arm.check == Check::NoEarlySibling {
@@ -1054,15 +1150,18 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
 
     // H within the arm's bound, measured from t = 0.
+    let timing = timing();
     let bound = arm
         .bound
+        .duration(&timing)
         .saturating_sub(sim.fabric().now().saturating_sub(started));
     let mut reached: Option<String> = None;
     let mut seen = Observations::default();
     let waited = sim
         .until("the survivors reach H", bound, async |s: &Sim| {
             if let Some(block) = &gossip_block {
-                if block.held() && s.fabric().now().saturating_sub(started) >= S4_W_PLACEHOLDER / 2
+                if block.held()
+                    && s.fabric().now().saturating_sub(started) >= timing.designated_window / 2
                 {
                     block.release(s);
                 }
@@ -1139,6 +1238,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         Check::ManualQueued => queued_typed && early_unmoved && h && data_plane,
         Check::Healthy | Check::NoEarlySibling => h && data_plane && stays_removed,
     };
+    receipt.note(format!(
+        "S4 status at the end: {}",
+        statuses(sim, labels, &group).await?
+    ));
     receipt.note(format!(
         "arm={arm:?} e0={e0} leaves0={leaves0}; H {}; manual={manual:?}; \
          duplicate={duplicate:?}; gossip to A withheld={:?}; early: {}; end: {}; \
@@ -1234,7 +1337,7 @@ async fn no_early_sibling(
     started: Duration,
 ) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
-    let half_w = S4_W_PLACEHOLDER / 2;
+    let half_w = timing().designated_window / 2;
     let left = half_w.saturating_sub(sim.fabric().now().saturating_sub(started));
     sim.within("wait to W/2", left + secs(2), async {
         tokio::time::sleep(left).await;
@@ -1249,6 +1352,10 @@ async fn no_early_sibling(
     receipt.note(format!(
         "arm={arm:?} e0={e0}; at W/2: {}",
         describe_all(&now)
+    ));
+    receipt.note(format!(
+        "S4 status at W/2: {}",
+        statuses(sim, arm.labels, group).await?
     ));
     let held = held_by(sim, arm.holders, b_hex).await?;
     receipt.request_delivered(
@@ -1271,9 +1378,11 @@ async fn no_early_sibling(
 async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note(format!(
-        "#1357 / ADR 0110 S4. Placeholders (not measured; D69, D73): completion bound \
-         {S4_COMPLETION_BOUND_PLACEHOLDER:?}, W {S4_W_PLACEHOLDER:?}, \u{394} \
-         {S4_DELTA_PLACEHOLDER:?}."
+        "#1357 / ADR 0110 S4. Timing from S4Timing::default() (measured; D69, D73): {:?}; \
+         arm bound {:?} = {:?}.",
+        timing(),
+        arm.bound,
+        arm.bound.duration(&timing())
     ));
     match start(case, seed, arm).await {
         Ok(mut sim) => {
@@ -1303,7 +1412,7 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     Ok(())
 }
 
-/// ADR 0110 `s4_idle_revocation_one_admin`: RED on `main` until S4 lands.
+/// ADR 0110 `s4_idle_revocation_one_admin`: RED on `main`, GREEN with S4.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1314,13 +1423,14 @@ async fn w3h_1357_red_s4_idle_revocation_one_admin() -> Result<()> {
         "w3h_1357_red_s4_idle_revocation_one_admin",
         0x1357_0001,
         IDLE,
-        Verdict::Red,
+        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+        Verdict::Green,
     )
     .await
 }
 
 /// ADR 0110 `s4_idle_revocation_one_admin`, Home (`OwnerCertified`)
-/// variant: the owner issuer-revokes B. RED on `main` until S4 lands.
+/// variant: the owner issuer-revokes B. RED on `main`, GREEN with S4.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1331,7 +1441,8 @@ async fn w3h_1357_red_s4_idle_revocation_one_admin_home() -> Result<()> {
         "w3h_1357_red_s4_idle_revocation_one_admin_home",
         0x1357_0005,
         HOME_IDLE,
-        Verdict::Red,
+        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+        Verdict::Green,
     )
     .await
 }
@@ -1353,7 +1464,7 @@ async fn w3h_1357_control_s4_self_leave_crypto_only() -> Result<()> {
     .await
 }
 
-/// ADR 0110 `s4_fallback_rank_manual`: RED on `main` until S4 lands.
+/// ADR 0110 `s4_fallback_rank_manual`: RED on `main`, GREEN with S4.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1364,7 +1475,8 @@ async fn w3h_1357_red_s4_fallback_rank_manual() -> Result<()> {
         "w3h_1357_red_s4_fallback_rank_manual",
         0x1357_0003,
         MANUAL_DURING_WINDOW,
-        Verdict::Red,
+        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+        Verdict::Green,
     )
     .await
 }
@@ -1406,7 +1518,7 @@ async fn w3h_1357_control_s4_self_leave_then_revocation() -> Result<()> {
 }
 
 /// ADR 0110 `s4_restart_intake_prepare` (crash after durable intake, with
-/// a duplicate trigger): RED on `main` until S4 lands.
+/// a duplicate trigger): RED on `main`, GREEN with S4.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1417,13 +1529,14 @@ async fn w3h_1357_red_s4_restart_intake_prepare() -> Result<()> {
         "w3h_1357_red_s4_restart_intake_prepare",
         0x1357_0007,
         RESTART_INTAKE,
-        Verdict::Red,
+        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+        Verdict::Green,
     )
     .await
 }
 
 /// ADR 0110 `s4_designated_late_observation`: A observes late; automatic
-/// healthy exclusion. RED on `main` until S4 lands.
+/// healthy exclusion. RED on `main`, GREEN with S4.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1434,13 +1547,14 @@ async fn w3h_1357_red_s4_designated_late_observation() -> Result<()> {
         "w3h_1357_red_s4_designated_late_observation",
         0x1357_0008,
         LATE_OBSERVATION,
-        Verdict::Red,
+        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+        Verdict::Green,
     )
     .await
 }
 
 /// ADR 0110 `s4_designated_late_observation`, A stalled past W + Δ:
-/// D's ranked fallback reaches H. RED on `main` until S4 lands.
+/// D's ranked fallback reaches H. RED on `main`, GREEN with S4.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1451,7 +1565,8 @@ async fn w3h_1357_red_s4_designated_stalled_a_fallback() -> Result<()> {
         "w3h_1357_red_s4_designated_stalled_a_fallback",
         0x1357_0009,
         STALLED_A_FALLBACK,
-        Verdict::Red,
+        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+        Verdict::Green,
     )
     .await
 }
