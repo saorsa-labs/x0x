@@ -20,10 +20,24 @@
 //!   is not trimmed below 32 certificates), and in a GSS group each X's
 //!   `MemberJoined` and `MemberAdded` are replayed to A on G's metadata
 //!   topic. So, during setup only, the harness drops every frame toward A
-//!   that carries an X certificate (other than A's own seat event) and
-//!   every #946 answer. It lifts the drop at a named trace mark before
-//!   the holders go offline. Evidence (read from A's state, not from the
-//!   drop count): the exact list of A's digest-only seats.
+//!   and J that carries an X certificate (other than the target's own
+//!   seat event) and every #946 answer. The drop covers J because J must
+//!   not hold the missing bytes. In run 39379002253 J cached X1's
+//!   certificate, and with every holder offline A resolved X1's seat from
+//!   J. It lifts the drop at a named trace mark before the holders go
+//!   offline. Evidence (read from A's and J's state, not from the drop
+//!   count): the exact list of A's digest-only seats, and J holds none of
+//!   their certificates.
+//! - t0, after A's promotion: O announces with consent. This is the
+//!   documented #1143 workaround, which the `case_1143.rs` positive
+//!   control also uses. A REST-created owner-certified group that is not
+//!   the Home never certifies the creator's seat, so A has no certificate
+//!   for O. O's default announce is anonymous. Without the consented
+//!   announce, A holds O `InGrace` and every seal of J's add refuses
+//!   naming O, in both tests. That is a different defect from #1364 and
+//!   is out of scope. Evidence: A's verdict for O is `Clean`, before and
+//!   again after A's restart (A's discovery cache is in memory, so A must
+//!   learn O's announce again from an online node).
 //! - t1: the drop is lifted, then O and every X device go offline. A
 //!   restarts on its own directories. Evidence: after the restart A is
 //!   still an admin, its digest-only seats are the same, its durable
@@ -83,15 +97,18 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// While held, drops every frame toward `target` that carries an X
-/// device's certificate, except `target`'s own seat event, and every #946
-/// answer. Each X certificate is matched in the two forms that frames
+/// While held, drops every frame toward each target that carries an X
+/// device's certificate, except that target's own seat event, and every
+/// #946 answer. The own-seat exception applies only to frames toward the
+/// target that it names. Each X certificate is matched in the two forms that frames
 /// carry in clear: base64 of its bincode (`certificate_b64`, sidecars,
 /// replayed `MemberJoined`) and the raw bincode (identity announces).
 /// Byte streams are never touched. Run 39366636451 showed why the drop
 /// must be this wide: after A joined, each X's `MemberJoined` and
 /// `MemberAdded` were replayed to A on G's metadata topic and gave A
-/// every certificate that its own seat event had trimmed.
+/// every certificate that its own seat event had trimmed. Run 39379002253
+/// showed why J is a target too: J cached X1's certificate, and with every
+/// holder offline A resolved X1's seat from J.
 struct AnswerDrop {
     held: Arc<AtomicBool>,
     dropped: Arc<AtomicUsize>,
@@ -114,9 +131,14 @@ fn cert_needles(cert: &crate::identity::AgentCertificate) -> Result<Vec<Vec<u8>>
 }
 
 impl AnswerDrop {
-    fn install(sim: &Sim, target: &str, holders: &[&str]) -> Result<Self> {
-        let machine = sim.ids(target)?.1 .0;
-        let own_seat = format!("\"agent_id\":\"{}\"", hex::encode(sim.ids(target)?.0 .0));
+    fn install(sim: &Sim, targets: &[&str], holders: &[&str]) -> Result<Self> {
+        // Each target's machine, with that target's own-seat marker.
+        let mut destinations = Vec::new();
+        for target in targets {
+            let (agent, machine) = sim.ids(target)?;
+            let own_seat = format!("\"agent_id\":\"{}\"", hex::encode(agent.0));
+            destinations.push((machine.0, own_seat));
+        }
         let mut needles = Vec::new();
         for label in holders {
             let cert = sim
@@ -132,13 +154,18 @@ impl AnswerDrop {
         let dropped = Arc::new(AtomicUsize::new(0));
         let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
         sim.fabric().add_rule(move |write: &Write| {
+            let Some((_, own_seat)) = destinations
+                .iter()
+                .find(|(machine, _)| write.lane.dst == *machine)
+            else {
+                return Fault::Pass;
+            };
             let carries_cert = || {
                 !matches!(write.lane.class, crate::network::sim::LaneClass::Stream(_))
                     && !contains(&write.bytes, own_seat.as_bytes())
                     && needles.iter().any(|needle| contains(&write.bytes, needle))
             };
             if rule_held.load(Ordering::SeqCst)
-                && write.lane.dst == machine
                 && (contains(&write.bytes, FETCH_RESPONSE_DOMAIN) || carries_cert())
             {
                 rule_dropped.fetch_add(1, Ordering::SeqCst);
@@ -507,6 +534,103 @@ async fn diag_a_member_joined_path(sim: &Sim, gid: &str) {
     }
 }
 
+/// A clone of A's `GroupInfo` for `gid`.
+async fn a_group_info(a: &AppState, gid: &str) -> Result<crate::groups::GroupInfo> {
+    let groups = a.named_groups.read().await;
+    let (_, info) =
+        crate::server::resolve_group_entry_locked(&groups, gid).context("A has no entry for G")?;
+    Ok(info.clone())
+}
+
+/// A's owner-cert evidence for G and A's verdict per active member, as a
+/// seal computes them (`owner_cert_seal_evidence`): every active member
+/// and the local agent, each with its seat digest. `case_1143.rs`
+/// (`admin_view_of_owner`) reads the verdict the same way.
+async fn a_owner_cert_view(
+    a: &AppState,
+    info: &crate::groups::GroupInfo,
+) -> (
+    crate::groups::owner_cert::OwnerCertEvidence,
+    std::collections::HashMap<String, crate::groups::owner_cert::MemberCertStatus>,
+) {
+    let local_hex = hex::encode(a.agent.agent_id().as_bytes());
+    let mut agents: Vec<String> = info.active_members().map(|m| m.agent_id.clone()).collect();
+    if !agents.iter().any(|x| x.eq_ignore_ascii_case(&local_hex)) {
+        agents.push(local_hex);
+    }
+    let with_digests: Vec<(String, Option<String>)> = agents
+        .into_iter()
+        .map(|agent| {
+            let digest = info
+                .members_v2
+                .get(&agent)
+                .and_then(|seat| seat.certificate_digest.clone());
+            (agent, digest)
+        })
+        .collect();
+    let evidence =
+        crate::server::routes::named_groups::owner_cert_evidence_for_with_digests(a, &with_digests)
+            .await;
+    let per_member = info.clone().owner_cert_verdict(&evidence).per_member;
+    (evidence, per_member)
+}
+
+/// A's owner-cert verdict for `label`'s seat in G now. `None` when A has
+/// no verdict for that member (not an active member at A).
+async fn a_status_of(
+    sim: &Sim,
+    gid: &str,
+    label: &str,
+) -> Result<Option<crate::groups::owner_cert::MemberCertStatus>> {
+    let a = sim.state("A")?;
+    let hex = sim.agent_hex(label)?;
+    let gid = gid.to_string();
+    sim.at_instant(&format!("read A's verdict for {label}"), async move {
+        let info = a_group_info(&a, &gid).await?;
+        let (_, per_member) = a_owner_cert_view(&a, &info).await;
+        Ok(per_member.get(&hex).cloned())
+    })
+    .await?
+}
+
+/// Whether, within `budget`, A's verdict for `label` becomes `Clean`.
+/// The result also gives A's last verdict for `label`.
+async fn until_a_clean(
+    sim: &Sim,
+    gid: &str,
+    label: &str,
+    budget: Duration,
+) -> Result<(bool, Option<crate::groups::owner_cert::MemberCertStatus>)> {
+    use crate::groups::owner_cert::MemberCertStatus;
+    let mut last = None;
+    let mut failure = None;
+    let waited = sim
+        .until(
+            &format!("A verifies {label}'s certificate"),
+            budget,
+            async |s: &Sim| match a_status_of(s, gid, label).await {
+                Ok(status) => {
+                    let clean = status == Some(MemberCertStatus::Clean);
+                    last = status;
+                    clean
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            },
+        )
+        .await;
+    if let Some(error) = failure {
+        return Err(error.context(format!("INFRA: reading A's verdict for {label}")));
+    }
+    match waited {
+        Ok(()) => Ok((last == Some(MemberCertStatus::Clean), last)),
+        Err(error) if expired(&error) => Ok((false, last)),
+        Err(error) => Err(error),
+    }
+}
+
 // DIAG #1364 (do not merge): A's owner-cert verdict view of G, one line per
 // active member, plus whether J's announce cache holds A's digest-only
 // seat digests. Never fails; errors print as a W3H-DIAG line.
@@ -538,36 +662,10 @@ async fn diag_a_verdict_lines(sim: &Sim, gid: &str, tag: &str) -> Result<Vec<Str
                 .map_or_else(|| "?".to_string(), |(_, l)| l.clone())
         };
         let hex8 = |hex: &str| hex.get(..8).unwrap_or(hex).to_string();
-        let info = {
-            let groups = a.named_groups.read().await;
-            let (_, info) = crate::server::resolve_group_entry_locked(&groups, &gid)
-                .context("A has no entry for G")?;
-            info.clone()
-        };
-        let local_hex = hex::encode(a.agent.agent_id().as_bytes());
-        let mut agents: Vec<String> = info.active_members().map(|m| m.agent_id.clone()).collect();
-        if !agents.iter().any(|x| x.eq_ignore_ascii_case(&local_hex)) {
-            agents.push(local_hex);
-        }
-        let with_digests: Vec<(String, Option<String>)> = agents
-            .into_iter()
-            .map(|agent| {
-                let digest = info
-                    .members_v2
-                    .get(&agent)
-                    .and_then(|seat| seat.certificate_digest.clone());
-                (agent, digest)
-            })
-            .collect();
-        let evidence = crate::server::routes::named_groups::owner_cert_evidence_for_with_digests(
-            &a,
-            &with_digests,
-        )
-        .await;
+        let info = a_group_info(&a, &gid).await?;
+        let (evidence, per_member) = a_owner_cert_view(&a, &info).await;
         let anonymous = crate::announce_v3::anonymous_cert_digest();
         let home_scope = info.is_home_scope();
-        let mut clone = info.clone();
-        let per_member = clone.owner_cert_verdict(&evidence).per_member;
         let mut lines = Vec::new();
         let mut digest_only = Vec::new();
         for seat in info.active_members() {
@@ -678,7 +776,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             "setup: O could not seat {member}"
         );
     }
-    let answers = AnswerDrop::install(sim, "A", MEMBERS)?;
+    let answers = AnswerDrop::install(sim, &["A", "J"], MEMBERS)?;
     for device in ["A", "J"] {
         sim.certify_owner_device("O", device, &owner, &owner_home)
             .await?;
@@ -699,6 +797,30 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         tokio::time::sleep(SETTLE),
     )
     .await?;
+    // O announces with consent (the #1143 workaround): A's seat for O has
+    // no certificate, so only O's consented announce gives A O's
+    // certificate. Without it, every seal of J's add refuses naming O.
+    let (status, body) = sim
+        .api(
+            "O",
+            Method::POST,
+            "/announce",
+            Some(json!({"include_user_identity": true, "human_consent": true})),
+        )
+        .await?;
+    ensure!(status.is_success(), "O announce: {status} {body}");
+    let (o_clean, o_status) = until_a_clean(sim, &home.gid, "O", secs(60)).await?;
+    receipt.evidence(
+        "a_verifies_creator_certificate_from_its_consented_announce",
+        o_clean,
+        format!("after O's consented announce, A's verdict for O: {o_status:?}"),
+        at(sim),
+    );
+    ensure!(
+        o_clean,
+        "INFRA: A did not verify O's certificate after O's consented announce \
+         (verdict {o_status:?})"
+    );
     let before = seat_view(sim, "A", &home.gid).await?;
     diag_a_verdict(sim, &home.gid, "before-restart").await; // DIAG #1364
     let missing: Vec<String> = before.digest_only.values().cloned().collect();
@@ -719,6 +841,40 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         !missing.is_empty(),
         "INFRA: A holds every certificate after its seat event (answers dropped: {})",
         answers.dropped()
+    );
+    // J must hold none of the missing bytes, or A resolves the seats from J
+    // with every X device offline.
+    let j_holds = {
+        let j = sim.state("J")?;
+        let digests = missing.clone();
+        sim.at_instant("read J's announce cache", async move {
+            let mut held = 0usize;
+            for digest in &digests {
+                if let Some(bytes) = parse_digest(digest) {
+                    if j.agent
+                        .announce_blob_cache
+                        .find_by_cert_digest(&bytes)
+                        .await
+                        .is_some()
+                    {
+                        held += 1;
+                    }
+                }
+            }
+            held
+        })
+        .await?
+    };
+    receipt.evidence(
+        "j_holds_none_of_the_missing_certificates",
+        j_holds == 0,
+        format!("J holds {j_holds} of {}", missing.len()),
+        at(sim),
+    );
+    ensure!(
+        j_holds == 0,
+        "INFRA: J holds {j_holds} of {} certificates that A is missing",
+        missing.len()
     );
 
     // Who holds the missing bytes, while every node is still online.
@@ -743,7 +899,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // between, so no frame moves), and A restarts.
     answers.release();
     sim.fabric().mark(format!(
-        "setup fault lifted: X-certificate and #946 drop toward A ({} frames dropped)",
+        "setup fault lifted: X-certificate and #946 drop toward A and J ({} frames dropped)",
         answers.dropped()
     ));
     for label in HOLDERS {
@@ -800,6 +956,22 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     ensure!(
         j_verified,
         "INFRA: A never verified J's machine binding after A's restart"
+    );
+    // A's discovery cache is in memory, so A lost O's consented announce in
+    // the restart. A must learn it again from an online node, or every
+    // seal of J's add refuses naming O.
+    let o_wait_from = sim.fabric().now();
+    let (o_clean, o_status) = until_a_clean(sim, &home.gid, "O", secs(60)).await?;
+    let o_took = sim.fabric().now().saturating_sub(o_wait_from);
+    receipt.evidence(
+        "a_verifies_creator_certificate_after_its_restart",
+        o_clean,
+        format!("A's verdict for O after its restart: {o_status:?} (after {o_took:?})"),
+        at(sim),
+    );
+    ensure!(
+        o_clean,
+        "INFRA: A did not verify O's certificate after A's restart (verdict {o_status:?})"
     );
     receipt.setup_done(at(sim));
     diag_a_verdict(sim, &home.gid, "after-restart").await; // DIAG #1364
@@ -976,9 +1148,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
 async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note(
-        "setup fault: every frame toward A that carries an X certificate (except A's own \
-         seat event) and every #946 answer is dropped from A's start until the holders go \
-         offline, so A keeps the seats its seat event omitted \
+        "setup fault: every frame toward A or J that carries an X certificate (except the \
+         target's own seat event) and every #946 answer is dropped from A's start until \
+         the holders go offline, so A keeps the seats its seat event omitted \
          digest-only (ADR 0111 H3: the harness makes the admin's seat digest-only)",
     );
     receipt.note(
