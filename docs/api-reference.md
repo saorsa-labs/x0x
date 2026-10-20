@@ -3203,7 +3203,7 @@ These are local names for agents and machines: `[agent:|machine:]<label>.<owner>
 - **Agent label.** This is the announced self-name, mapped to a label the same way. It resolves only to an agent whose valid, unexpired, unrevoked `AgentCertificate` chains to the owner.
 - **Machine label, own machines (`me`).** This is the ADR-0036 `machine_name` synced across your devices. It resolves only for a machine with a current ADR-0041 `OwnerEnrollment` by you.
 - **Machine label, shared machines.** You label these yourself with `POST /names/machines`. They resolve only while the machine hosts a certified agent of an active, unrevoked `ShareGrant` you received from that owner.
-- **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. To re-pin on purpose, delete the pin.
+- **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. A bare name keeps the kind of that pin (`agent` or `machine`). If the same bare name would now select the other kind, the call returns `409` `pin_mismatch` and does not write a second pin. To re-pin on purpose, delete the pin.
 
 Resolution is local and makes no network query. It adds no trust: every identity, contact and connect-ACL gate still applies. All `/names` routes need the durable API token. Session and rider tokens get `403`. Names persist in `<data_dir>/names.json` (versioned JSON, mode `0600`). If that file is unreadable, every name operation fails with `503` `name_store`, but hex ids keep working.
 
@@ -3241,7 +3241,7 @@ Refusals are `{"ok": false, "error", "code"}`:
 | `unknown_name` | 404 | Unbound owner label, or nothing carries the name (for a forward to a machine name: no single agent is announced on that machine) |
 | `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
 | `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
-| `ambiguous_kind` | 409 | A bare label names both an agent and a machine. Retry with `agent:` or `machine:` |
+| `ambiguous_kind` | 409 | A bare label names both an agent and a machine, and no single pin has fixed the kind. Retry with `agent:` or `machine:` |
 | `pin_mismatch` | 409 | The name is pinned to another key. The body carries `pinned` and `current` |
 | `name_store` | 503 | `names.json` is unreadable (fail closed) |
 
