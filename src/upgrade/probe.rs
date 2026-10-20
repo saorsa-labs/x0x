@@ -225,6 +225,8 @@ struct RunOptions {
     fail_stage: Option<StageBarrierStep>,
     #[cfg(test)]
     fail_terminal_and_recovery: bool,
+    #[cfg(test)]
+    before_reap: Option<Box<dyn Fn(u32)>>,
 }
 
 impl RunOptions {
@@ -682,6 +684,8 @@ pub(crate) fn run_before_swap(
         fail_stage: None,
         #[cfg(test)]
         fail_terminal_and_recovery: false,
+        #[cfg(test)]
+        before_reap: None,
     };
     run_before_swap_inner(request, caller_alive, &options)
 }
@@ -704,6 +708,7 @@ pub(crate) fn run_before_swap_with_options(
             fail_write: options.fail_write,
             fail_stage: None,
             fail_terminal_and_recovery: false,
+            before_reap: None,
         },
     )
 }
@@ -727,6 +732,7 @@ pub(crate) fn run_before_swap_with_stage_failure(
             fail_write: options.fail_write,
             fail_stage: Some(step),
             fail_terminal_and_recovery: false,
+            before_reap: None,
         },
     )
 }
@@ -749,6 +755,31 @@ pub(crate) fn run_before_swap_with_terminal_failure(
             fail_write: options.fail_write,
             fail_stage: None,
             fail_terminal_and_recovery: true,
+            before_reap: None,
+        },
+    )
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn run_before_swap_with_cleanup_observer(
+    request: &ProbeRequest,
+    caller_alive: &AtomicBool,
+    options: &ProbeOptions,
+    before_reap: impl Fn(u32) + 'static,
+) -> Result<ProbeReceipt, ProbeRefusal> {
+    run_before_swap_inner(
+        request,
+        caller_alive,
+        &RunOptions {
+            clock: options.clock.clone(),
+            started: Instant::now(),
+            timeout: options.timeout,
+            live_clock: false,
+            fail_write: options.fail_write,
+            fail_stage: None,
+            fail_terminal_and_recovery: false,
+            before_reap: Some(Box::new(before_reap)),
         },
     )
 }
@@ -1090,16 +1121,21 @@ fn run_candidate(
             failure.pid = Some(pid);
             failure
         });
-    if result.is_err() {
-        if let Err(error) = kill_and_reap(&mut child) {
-            return Err(CandidateFailure {
-                cause: ProbeCause::CleanupFailed,
-                reason: format!("probe child cleanup failed: {error}"),
-                pid: Some(pid),
-                interrupted: false,
-                recovery_failed: true,
-            });
-        }
+    #[cfg(test)]
+    if let Some(before_reap) = options.before_reap.as_ref() {
+        before_reap(pid);
+    }
+    // The direct child remains waitable through validation. Its reserved PID
+    // anchors group cleanup even when malformed output is detected after exit.
+    // Clean up descendants on success too, before granting a probe receipt.
+    if let Err(error) = kill_and_reap(&mut child) {
+        return Err(CandidateFailure {
+            cause: ProbeCause::CleanupFailed,
+            reason: format!("probe child cleanup failed: {error}"),
+            pid: Some(pid),
+            interrupted: false,
+            recovery_failed: true,
+        });
     }
     result
 }
@@ -1160,10 +1196,10 @@ fn collect_probe_output(
             }
         }
         if status.is_none() {
-            status = child.try_wait().map_err(host_failure)?;
+            status = observe_exit(child).map_err(host_failure)?;
         }
-        if let Some(status) = status {
-            if !status.success() {
+        if let Some(success) = status {
+            if !success {
                 return Err(CandidateFailure::failed(
                     ProbeCause::NonzeroExit,
                     "candidate probe exited unsuccessfully",
@@ -1178,19 +1214,71 @@ fn collect_probe_output(
     }
 }
 
+fn observe_exit(child: &Child) -> io::Result<Option<bool>> {
+    let pid = i32::try_from(child.id()).map_err(invalid)?;
+    if pid <= 0 {
+        return Err(invalid("invalid probe child identity"));
+    }
+    // SAFETY: zero is a valid initial siginfo_t. waitid owns the writable
+    // buffer for this call; WNOWAIT observes only our direct child's exit and
+    // retains its identity until the later explicit reap.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: waitid initialized the child-status union, or left its zero
+    // value when WNOHANG found no exited child.
+    let observed = unsafe { info.si_pid() };
+    if observed == 0 {
+        return Ok(None);
+    }
+    if observed != pid {
+        return Err(invalid("probe exit observation belongs to another child"));
+    }
+    Ok(Some(
+        info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+    ))
+}
+
 fn kill_and_reap(child: &mut Child) -> io::Result<()> {
+    // Refuse to signal if another owner has already reaped the child. A
+    // waitable child (running or exited) keeps this PID from being reused.
+    let exited = observe_exit(child)?.is_some();
     let pid = i32::try_from(child.id()).map_err(invalid)?;
     // SAFETY: Command created a fresh process group whose ID is this child's
     // PID. Signal the group so a fixture/failed image cannot leave a descendant
     // holding stdout and escaping the bounded probe.
     let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
-    if killed != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+    let group_error = if killed == 0 {
+        None
+    } else {
+        Some(io::Error::last_os_error())
+    };
+    if group_error.is_some() && !exited {
+        // A candidate may have left its original group. Its direct PID is
+        // still reserved, so killing that child cannot hit a reused PID.
         child.kill()?;
     }
     let start = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
-            return Ok(());
+            return match group_error {
+                Some(error) if error.raw_os_error() != Some(libc::ESRCH) => Err(error),
+                _ => Ok(()),
+            };
         }
         if start.elapsed() >= REAP_TIMEOUT {
             return Err(io::Error::new(
