@@ -11179,6 +11179,23 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
         return;
     }
+    // ADR 0110 §4: crypto-only exclusions in the requested range go to a
+    // capable requester on their own gated carrier, never in this page.
+    if authorized {
+        let serve_state = Arc::clone(state);
+        let requester = *sender;
+        let group_ids = log_keys.clone();
+        let from_revision = request.from_revision;
+        let _spawned = state.spawn_detached(async move {
+            revocation_eviction::crypto_exclusion::serve_catchup(
+                &serve_state,
+                &requester,
+                &group_ids,
+                from_revision,
+            )
+            .await;
+        });
+    }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
     // promoted admin missing a member's key package; serve this node's cached,
     // self-signed `MemberJoined` for the target (this node witnessed the join).
@@ -25332,7 +25349,11 @@ async fn commit_treekem_self_leave_rekey_from(
         }
         return SelfLeaveRekeyStep::Deferred;
     };
-    if designated != state.agent.agent_id() {
+    // ADR 0110 §2: a ranked fallback admin may commit after its fallback
+    // time (`T_obs + W + (r − 1)·Δ`) when the designated admin did not.
+    if designated != state.agent.agent_id()
+        && !revocation_eviction::s4_self_leave_fallback_allowed(state, info.stable_group_id()).await
+    {
         let designated_hex = hex::encode(designated.as_bytes());
         let leaver = removed_member_log_id(&info);
         if self_leave_rekey_log_once(&format!(
@@ -25439,6 +25460,22 @@ async fn commit_treekem_self_leave_rekey_from(
         );
         return SelfLeaveRekeyStep::Deferred;
     };
+    // ADR 0110 §3 and §4: the leaver is already Removed, so its retained
+    // leaf is excluded by the signed crypto-only `CryptoExclusionV1`, gated
+    // per receiver on `crypto_exclusion_v1` and held by the D76 rule. No
+    // repeated `MemberRemoved` is sent on the Removed seat.
+    if revocation_eviction::crypto_exclusion::authoring_enabled() {
+        return revocation_eviction::crypto_exclusion::commit_locked(
+            state,
+            group_key,
+            &info,
+            &mut guard,
+            &leaver_hex,
+            target_agent,
+            &kp_bytes,
+        )
+        .await;
+    }
 
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();

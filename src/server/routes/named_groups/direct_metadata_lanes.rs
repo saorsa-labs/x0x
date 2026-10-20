@@ -138,6 +138,20 @@ pub(in crate::server) async fn run_direct_metadata_listener(
             );
             continue;
         }
+        // ADR 0110 §4: a signed `CryptoExclusionV1` rides the same direct
+        // carrier, never the metadata topic; it is verified off this loop.
+        if msg
+            .payload
+            .starts_with(x0x::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX)
+        {
+            super::revocation_eviction::crypto_exclusion::spawn_receipt(
+                &state,
+                msg.sender,
+                msg.verified,
+                msg.payload,
+            );
+            continue;
+        }
         let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
             continue; // not a named-group metadata event
         };

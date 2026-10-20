@@ -45,6 +45,8 @@ use x0x::groups::eviction::{
 };
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
+pub(super) mod crypto_exclusion;
+
 /// The worker's idle re-check interval. Budgets and expiry checks run at
 /// least this often; intake wakes the worker at once.
 const S4_WORKER_TICK: Duration = Duration::from_secs(1);
@@ -152,6 +154,9 @@ struct S4Inner {
     /// §4: admins whose current verified advert lacks
     /// `eviction_handoff_v1`, per row (unsupported attempts).
     unsupported_handoff: HashMap<EvictionKey, BTreeSet<[u8; 32]>>,
+    /// §4: crypto-only exclusion holds, deliveries, catch-up frames and
+    /// restart fork evidence.
+    ce: crypto_exclusion::CeState,
 }
 
 impl Default for S4Runtime {
@@ -212,6 +217,8 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         persist_obligations(&state).await;
         dispatch_handoffs(&state).await;
         drive_exclusions(&state).await;
+        crypto_exclusion::drive_deliveries(&state).await;
+        crypto_exclusion::retry_stash(&state).await;
         tokio::select! {
             () = notify.notified() => {}
             () = tokio::time::sleep(S4_WORKER_TICK) => {}
@@ -252,7 +259,8 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .budgets
             .insert(key, RowBudget::resume(Duration::ZERO, now));
     }
-    if reconcile_completion(&mut inner.store, &groups, &leaves, now_unix_ms) {
+    let delivering = inner.ce.delivering();
+    if reconcile_completion(&mut inner.store, &groups, &leaves, &delivering, now_unix_ms) {
         inner.dirty = true;
     }
     if inner.store.apply_retention(now_unix_ms) {
@@ -348,6 +356,29 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             if unsupported && waiting.designated_detail == Some(s4::DesignatedWaitDetail::Rank) {
                 waiting.designated_detail =
                     Some(s4::DesignatedWaitDetail::DesignatedAdminUnsupported);
+            }
+        }
+        // §4 (D76): the crypto-only exclusion of an already-Removed target
+        // is held while an Active survivor's current verified advert lacks
+        // `crypto_exclusion_v1`; the state names each holder on every
+        // upgraded member. §3: a saved frame that met a competing branch
+        // waits for fork resolution and is never published.
+        if inner.ce.fork.contains(&key) {
+            evaluation.waiting = Some(WaitingState::cause(WaitingCause::WaitingForForkResolution));
+            evaluation.action = RowAction::None;
+        } else if !target_seated
+            && row.phase == Phase::Pending
+            && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        {
+            let holders = crypto_exclusion::holders(state, info, &local, &key.target);
+            if holders.is_empty() {
+                inner.ce.holders.remove(&key);
+            } else {
+                let mut waiting = WaitingState::cause(WaitingCause::WaitingForReceiverUpgrade);
+                waiting.named = holders.clone();
+                evaluation.waiting = Some(waiting);
+                evaluation.action = RowAction::None;
+                inner.ce.holders.insert(key.clone(), holders);
             }
         }
         // §2: each observing admin forwards the trigger evidence to every
@@ -664,6 +695,7 @@ fn reconcile_completion(
     store: &mut ObligationStore,
     groups: &[(String, GroupInfo)],
     leaves: &RetainedLeaves,
+    delivering: &BTreeSet<EvictionKey>,
     now_unix_ms: u64,
 ) -> bool {
     let by_stable: HashMap<&str, &GroupInfo> = groups
@@ -712,6 +744,11 @@ fn reconcile_completion(
                     }
                 }
             }
+            continue;
+        }
+        if delivering.contains(&key) {
+            // §3: a committed crypto-only exclusion stays
+            // `committed_delivery_pending` while its delivery runs.
             continue;
         }
         if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
@@ -1417,6 +1454,253 @@ fn prepared_journal(row: &ObligationRow, parent_head: String, next_revision: u64
         // The legacy removal path builds and publishes the exact event
         // inside its own transaction; S4 never republishes it.
         outgoing_event: Vec::new(),
+        result_head: None,
+    }
+}
+
+// ─── §4 crypto-only exclusion: S4 row transitions ──────────────────────────
+
+/// §2 for the responsive self-leave rekey: whether this node's ranked
+/// fallback time for an open crypto-only row of `stable_group_id` has
+/// passed. The #1337 pass lets only the lowest active admin commit; S4
+/// adds the ranked fallback after W.
+pub(super) async fn s4_self_leave_fallback_allowed(
+    state: &AppState,
+    stable_group_id: &str,
+) -> bool {
+    let inner = state.revocation_evictions.inner.lock().await;
+    inner.evaluations.iter().any(|(key, evaluation)| {
+        key.stable_group_id == stable_group_id
+            && matches!(evaluation.action, RowAction::SelfLeaveRekey { rank } if rank > 0)
+            && matches!(
+                evaluation.permission,
+                Some(CommitPermission::Fallback { .. })
+            )
+    })
+}
+
+/// Record the D76 holders of one row (empty clears the hold).
+async fn note_receiver_upgrade_hold(state: &AppState, key: &EvictionKey, holders: Vec<[u8; 32]>) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    if holders.is_empty() {
+        inner.ce.holders.remove(key);
+        return;
+    }
+    let mut waiting = WaitingState::cause(WaitingCause::WaitingForReceiverUpgrade);
+    waiting.named = holders.clone();
+    inner.ce.holders.insert(key.clone(), holders);
+    if inner.store.set_waiting(key, Some(waiting)) {
+        inner.dirty = true;
+    }
+}
+
+/// §5 step 1 of a crypto-only exclusion: make sure the row exists, move it
+/// to `prepared` with the exact outgoing frame, fsync the `.evjournal`,
+/// then the `.evs`. Returns whether both are durable; on failure the row
+/// returns to `pending` and the journal is removed.
+async fn prepare_crypto_exclusion(
+    state: &AppState,
+    key: &EvictionKey,
+    journal: &EvJournalV1,
+    incarnation: Option<String>,
+) -> bool {
+    let now_ms = now_unix_ms();
+    {
+        let runtime = &state.revocation_evictions;
+        let mut inner = runtime.inner.lock().await;
+        let outcome = inner.store.intake(
+            key,
+            EvictionTrigger::SelfLeave {
+                commit_hash: journal.parent_head.clone(),
+            },
+            incarnation.as_deref(),
+            now_ms,
+            runtime.boot_id,
+        );
+        if matches!(outcome, IntakeOutcome::Created | IntakeOutcome::Reopened) {
+            inner.budgets.insert(
+                key.clone(),
+                RowBudget::resume(Duration::ZERO, Instant::now()),
+            );
+        }
+        let Some(row) = inner.store.get_mut(key) else {
+            return false;
+        };
+        row.phase = Phase::Prepared;
+        row.termination = None;
+        row.completed_at_unix_ms = None;
+        row.parent_head = Some(journal.parent_head.clone());
+        row.result_head = journal.result_head.clone();
+        row.result_epoch = journal.result_epoch;
+        row.outgoing_event = Some(journal.outgoing_event.clone());
+        inner.dirty = true;
+    }
+    let path = evjournal_path(state, &key.stable_group_id);
+    let written = write_evjournal(&path, journal).await;
+    let durable = written && persist_obligations(state).await;
+    if !durable {
+        abandon_crypto_exclusion(state, key).await;
+    }
+    durable
+}
+
+/// The legacy transaction did not commit: the row returns to `pending`,
+/// the speculative preparation is abandoned and the journal retired.
+async fn abandon_crypto_exclusion(state: &AppState, key: &EvictionKey) {
+    {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if let Some(row) = inner.store.get_mut(key) {
+            row.phase = Phase::Pending;
+            row.parent_head = None;
+            row.result_head = None;
+            row.result_epoch = None;
+            row.outgoing_event = None;
+        }
+        inner.not_durable.insert(key.clone());
+        inner
+            .next_attempt
+            .insert(key.clone(), Instant::now() + S4_COMMIT_RETRY);
+        inner.dirty = true;
+    }
+    persist_obligations(state).await;
+    remove_file_durably(&evjournal_path(state, &key.stable_group_id)).await;
+}
+
+/// §5 last steps: the legacy transaction is durable. The row moves to
+/// `committed_delivery_pending`, its delivery starts, the `.evs` is
+/// reconciled and only then is the journal retired.
+#[allow(clippy::too_many_arguments)]
+async fn committed_crypto_exclusion(
+    state: &AppState,
+    key: &EvictionKey,
+    result_head: &str,
+    result_epoch: u64,
+    next_revision: u64,
+    bytes: Vec<u8>,
+    recipients: Vec<[u8; 32]>,
+) {
+    {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if let Some(row) = inner.store.get_mut(key) {
+            row.phase = Phase::CommittedDeliveryPending;
+            row.result_head = Some(result_head.to_string());
+            row.result_epoch = Some(result_epoch);
+            row.waiting = None;
+        }
+        inner.ce.holders.remove(key);
+        inner.attempt_wait.remove(key);
+        inner.queued_manual.remove(key);
+        crypto_exclusion::new_delivery(
+            &mut inner.ce,
+            key,
+            result_head,
+            next_revision,
+            Arc::new(bytes),
+            recipients,
+            false,
+        );
+        inner.dirty = true;
+    }
+    persist_obligations(state).await;
+    remove_file_durably(&evjournal_path(state, &key.stable_group_id)).await;
+}
+
+/// §3 restart: reconcile every row that holds a saved crypto-only frame
+/// (from the `.evs` or a prepared `.evjournal`) against the loaded,
+/// verified chain. Never publish a saved frame over a competing branch.
+async fn resume_crypto_exclusions(
+    state: &AppState,
+    store: &mut ObligationStore,
+    journals: &HashMap<EvictionKey, EvJournalV1>,
+    ce_state: &mut crypto_exclusion::CeState,
+) {
+    let groups = snapshot_groups(state).await;
+    let local = *state.agent.agent_id().as_bytes();
+    let saved: Vec<(EvictionKey, Vec<u8>)> = store
+        .rows()
+        .filter(|row| row.phase.is_open())
+        .filter_map(|row| {
+            let key = row.key();
+            let journal_frame = journals
+                .get(&key)
+                .map(|journal| journal.outgoing_event.clone())
+                .filter(|frame| !frame.is_empty());
+            journal_frame
+                .or_else(|| row.outgoing_event.clone())
+                .filter(|frame| !frame.is_empty())
+                .map(|frame| (key, frame))
+        })
+        .collect();
+    for (key, frame) in saved {
+        let Some((parent_head, result_head, next_revision)) =
+            crypto_exclusion::saved_frame_heads(&frame)
+        else {
+            continue;
+        };
+        let Some(info) = groups
+            .iter()
+            .map(|(_, info)| info)
+            .find(|info| info.stable_group_id() == key.stable_group_id)
+        else {
+            continue;
+        };
+        let classified = crypto_exclusion::classify_saved_frame(info, &parent_head, &result_head);
+        let Some(row) = store.get_mut(&key) else {
+            continue;
+        };
+        match classified {
+            crypto_exclusion::SavedFrameState::CurrentHead => {
+                row.phase = Phase::CommittedDeliveryPending;
+                row.result_head = Some(result_head.clone());
+                row.outgoing_event = Some(frame.clone());
+                let recipients = info
+                    .active_members()
+                    .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
+                    .map(|agent| *agent.as_bytes())
+                    .filter(|id| *id != local && *id != key.target)
+                    .collect();
+                crypto_exclusion::new_delivery(
+                    ce_state,
+                    &key,
+                    &result_head,
+                    next_revision,
+                    Arc::new(frame),
+                    recipients,
+                    true,
+                );
+            }
+            crypto_exclusion::SavedFrameState::Superseded => {
+                // Completion is re-derived from the chain by the next
+                // pass; the obsolete delivery is discarded.
+                row.phase = Phase::CommittedDeliveryPending;
+                row.result_head = Some(result_head);
+                row.outgoing_event = None;
+            }
+            crypto_exclusion::SavedFrameState::Abandoned => {
+                row.phase = Phase::Pending;
+                row.parent_head = None;
+                row.result_head = None;
+                row.result_epoch = None;
+                row.outgoing_event = None;
+            }
+            crypto_exclusion::SavedFrameState::Fork => {
+                // Keep the frame as fork evidence; never publish it.
+                row.outgoing_event = Some(frame);
+                ce_state.fork.insert(key.clone());
+                tracing::warn!(
+                    group_id = %super::LogHexId::group(&key.stable_group_id),
+                    target = %super::LogHexId::agent(&hex::encode(key.target)),
+                    "ADR 0110 S4: a saved crypto-only exclusion meets a competing branch; waiting for fork resolution"
+                );
+            }
+            crypto_exclusion::SavedFrameState::Unknown => {
+                // Keep the frame; the head-sync wait decides later.
+                row.outgoing_event = Some(frame);
+                let mut waiting = WaitingState::cause(WaitingCause::WaitingForHeadSync);
+                waiting.named = Vec::new();
+                row.waiting = Some(waiting);
+            }
+        }
     }
 }
 
@@ -1733,14 +2017,16 @@ async fn load_persisted_obligations(state: &AppState) {
     // Speculative preparation never survives a restart on its own (§5).
     let journals = reconcile_evjournals(state).await;
     for row in store.to_rows() {
-        if row.phase == Phase::Prepared && !journals.contains(&row.key()) {
+        if row.phase == Phase::Prepared && !journals.contains_key(&row.key()) {
             if let Some(stored) = store.get_mut(&row.key()) {
                 stored.phase = Phase::Pending;
                 stored.parent_head = None;
             }
         }
     }
-    for key in &journals {
+    let mut ce_state = crypto_exclusion::CeState::default();
+    resume_crypto_exclusions(state, &mut store, &journals, &mut ce_state).await;
+    for key in journals.keys() {
         if let Some(stored) = store.get_mut(key) {
             if stored.phase == Phase::Prepared {
                 // An unchanged parent with no legacy commit evidence returns
@@ -1757,6 +2043,7 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.rebuilt_from = rebuilt_from;
     inner.rebuilding = rebuilding;
     inner.file_exists = file_exists;
+    inner.ce = ce_state;
     inner.dirty = !journals.is_empty();
 }
 
@@ -1764,8 +2051,8 @@ async fn load_persisted_obligations(state: &AppState) {
 /// retire it (§5). Damaged journals are quarantined with no replacement
 /// (ADR 0110 §5 "a missing journal is the normal state"). Returns the keys
 /// of the prepared transitions found.
-async fn reconcile_evjournals(state: &AppState) -> BTreeSet<EvictionKey> {
-    let mut keys = BTreeSet::new();
+async fn reconcile_evjournals(state: &AppState) -> HashMap<EvictionKey, EvJournalV1> {
+    let mut keys = HashMap::new();
     let Ok(mut entries) = tokio::fs::read_dir(&state.treekem_dir).await else {
         return keys;
     };
@@ -1782,7 +2069,8 @@ async fn reconcile_evjournals(state: &AppState) -> BTreeSet<EvictionKey> {
         };
         match s4::decode_evjournal(&bytes) {
             Ok(journal) => {
-                keys.insert(EvictionKey::new(journal.stable_group_id, journal.target));
+                let key = EvictionKey::new(journal.stable_group_id.clone(), journal.target);
+                keys.insert(key, journal);
                 remove_file_durably(&path).await;
             }
             Err(SidecarDecodeError::NewerFormat(_)) => {}
@@ -1915,6 +2203,7 @@ async fn group_rows_json(
                 "observed_at_unix_ms": row.observed_at_unix_ms,
                 "result_head": row.result_head,
                 "result_epoch": row.result_epoch,
+                "receiver_upgrade_members": inner.ce.stranded_json(&key),
             })
         })
         .collect();
@@ -1988,10 +2277,32 @@ mod tests {
         let mut store = ObligationStore::new();
         store.intake(&key, trigger, None, 0, [0; 16]);
         // Still seated: nothing completes.
-        assert!(!reconcile_completion(&mut store, &groups, &leaves, 1));
+        assert!(!reconcile_completion(
+            &mut store,
+            &groups,
+            &leaves,
+            &BTreeSet::new(),
+            1
+        ));
         info.remove_member(&hex::encode(member), Some(hex::encode(admin)));
         let removed = vec![("k".to_string(), info)];
-        assert!(reconcile_completion(&mut store, &removed, &leaves, 2));
+        // A running crypto-only delivery keeps the row open (§3).
+        let delivering: BTreeSet<EvictionKey> = [key.clone()].into_iter().collect();
+        assert!(!reconcile_completion(
+            &mut store,
+            &removed,
+            &leaves,
+            &delivering,
+            2
+        ));
+        assert_eq!(store.get(&key).expect("row").phase, Phase::Pending);
+        assert!(reconcile_completion(
+            &mut store,
+            &removed,
+            &leaves,
+            &BTreeSet::new(),
+            2
+        ));
         assert_eq!(store.get(&key).expect("row").phase, Phase::Complete);
     }
 
@@ -2038,6 +2349,7 @@ mod tests {
             &mut store,
             &groups,
             &RetainedLeaves::default(),
+            &BTreeSet::new(),
             1
         ));
         let row = store.get(&key).expect("row");

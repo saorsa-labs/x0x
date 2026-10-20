@@ -354,16 +354,16 @@ pub fn treekem_binding(epoch: u64, commit: &[u8]) -> String {
     )
 }
 
-/// The removal-proof hash of the target's committed Removed entry. Every
-/// node on the same head computes the same value, because the signed
-/// roster root covers the entry; it binds the exclusion to that exact
+/// The removal-proof hash of the target's committed Removed entry. It
+/// uses only fields the signed roster root covers (not the local
+/// `updated_at` clock), so every node on the same head computes the same
+/// value. With the parent head it binds the exclusion to that exact
 /// removal and leaf incarnation.
 #[must_use]
 pub fn removal_proof_hash(
     stable_group_id: &str,
     target_hex: &str,
     removed_by: Option<&str>,
-    updated_at: u64,
     leaf_key_package_hash: Option<&str>,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
@@ -377,7 +377,6 @@ pub fn removal_proof_hash(
         hasher.update(&(part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
-    hasher.update(&updated_at.to_le_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -391,7 +390,6 @@ pub fn removal_proof_for(info: &GroupInfo, target_hex: &str) -> Option<[u8; 32]>
             info.stable_group_id(),
             target_hex,
             member.removed_by.as_deref(),
-            member.updated_at,
             member.treekem_key_package_hash.as_deref(),
         )
     })
@@ -707,13 +705,10 @@ mod tests {
 
     #[test]
     fn removal_proof_binds_the_removal_and_the_leaf() {
-        let base = removal_proof_hash("g", "t", Some("t"), 5, Some("kp"));
-        assert_ne!(base, removal_proof_hash("g", "t", Some("t"), 6, Some("kp")));
-        assert_ne!(base, removal_proof_hash("g", "t", Some("a"), 5, Some("kp")));
-        assert_ne!(
-            base,
-            removal_proof_hash("g", "t", Some("t"), 5, Some("kp2"))
-        );
-        assert_eq!(base, removal_proof_hash("g", "t", Some("t"), 5, Some("kp")));
+        let base = removal_proof_hash("g", "t", Some("t"), Some("kp"));
+        assert_ne!(base, removal_proof_hash("g2", "t", Some("t"), Some("kp")));
+        assert_ne!(base, removal_proof_hash("g", "t", Some("a"), Some("kp")));
+        assert_ne!(base, removal_proof_hash("g", "t", Some("t"), Some("kp2")));
+        assert_eq!(base, removal_proof_hash("g", "t", Some("t"), Some("kp")));
     }
 }

@@ -1354,8 +1354,16 @@ pub struct EvJournalV1 {
     pub result_epoch: Option<u64>,
     /// Trigger hashes that authorize the transition.
     pub evidence: Vec<[u8; 32]>,
-    /// The exact outgoing event (empty until the legacy commit made it).
+    /// The exact outgoing event: the signed `X0XCE1` frame of a
+    /// crypto-only exclusion. Empty for a seated-target removal, whose
+    /// legacy `MemberRemoved` the unchanged removal path builds and
+    /// publishes inside its own transaction.
     pub outgoing_event: Vec<u8>,
+    /// The head the transition produces, when it is known before the
+    /// legacy commit (a crypto-only exclusion). A restart compares it with
+    /// the verified chain to tell a committed result from a competing
+    /// branch (§3).
+    pub result_head: Option<String>,
 }
 
 /// Split and check a `<prefix><digit>\0` header. Returns the version and
@@ -1957,6 +1965,7 @@ mod tests {
             result_epoch: Some(2),
             evidence: vec![[4; 32]],
             outgoing_event: vec![1, 2, 3],
+            result_head: Some("head".to_string()),
         };
         let bytes = encode_evjournal(&journal).expect("encode");
         assert_eq!(&bytes[..8], EVJOURNAL_HEADER_V1);

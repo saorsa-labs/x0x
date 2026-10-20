@@ -84,10 +84,10 @@ impl CapabilityRegistry {
     /// ADR 0093's bytes stay unchanged.
     pub const FILE_CONTROL_ACK_V1: u64 = 1 << 3;
     /// ADR 0110 §4: understands typed `EvictionHandoffV1` (`X0XEVH1`) on
-    /// the direct-message carrier. Bit 4. Not in [`Self::current`] yet.
+    /// the direct-message carrier. Bit 4.
     pub const EVICTION_HANDOFF_V1: u64 = 1 << 4;
     /// ADR 0110 §4: understands signed `CryptoExclusionV1` (`X0XCE1`).
-    /// Bit 5. Not in [`Self::current`] yet.
+    /// Bit 5.
     pub const CRYPTO_EXCLUSION_V1: u64 = 1 << 5;
     /// ADR 0110 §4a: understands signed `CertificateRebindV1` (`X0XCRB1`).
     /// Bit 6. Not in [`Self::current`] yet.
@@ -103,7 +103,9 @@ impl CapabilityRegistry {
             bits: Self::SHARE_GRANT_V1
                 | Self::PREDECESSOR_OFFER_V1
                 | Self::PEER_EVIDENCE_V1
-                | Self::FILE_CONTROL_ACK_V1,
+                | Self::FILE_CONTROL_ACK_V1
+                | Self::EVICTION_HANDOFF_V1
+                | Self::CRYPTO_EXCLUSION_V1,
         }
     }
 
@@ -122,6 +124,10 @@ impl CapabilityRegistry {
             Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
         } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
             Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
+        } else if payload.starts_with(crate::groups::eviction::EVICTION_HANDOFF_PREFIX) {
+            Some((Self::EVICTION_HANDOFF_V1, "eviction_handoff_v1"))
+        } else if payload.starts_with(crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX) {
+            Some((Self::CRYPTO_EXCLUSION_V1, "crypto_exclusion_v1"))
         } else {
             None
         }

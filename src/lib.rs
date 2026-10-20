@@ -15967,6 +15967,16 @@ impl Agent {
         Ok(self.revocation_set.read().await.contains_hash(&hash))
     }
 
+    /// ADR 0110 §4 (ADR 0093): unknown or expired support for an
+    /// application bit first requests an authenticated advert refresh.
+    /// Ask `recipient` once to republish its signed capability advert and
+    /// wait a bounded time for it; concurrent callers share one flight.
+    /// Read the result from [`Self::capability_store`] afterwards.
+    pub async fn refresh_application_capability(&self, recipient: identity::AgentId, bit: u64) {
+        self.refresh_strict_dm_capability(recipient, Some(bit), false)
+            .await;
+    }
+
     /// Return the shared revocation set.
     ///
     /// Callers that need to publish a new revocation record should call

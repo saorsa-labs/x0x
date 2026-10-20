@@ -155,6 +155,45 @@ async fn encrypt(state: &AppState, group_id: &str, plaintext: &[u8]) -> Result<V
     Ok(guard.encrypt_message(plaintext)?)
 }
 
+/// ADR 0110 §4: this binary seals a self-leaver's retained leaf with
+/// `CryptoExclusionV1`. Tests of the retained legacy paths (the outbox
+/// replay of a repeated `MemberRemoved` an earlier binary saved, and the
+/// receive checks for a legacy admin's event) produce that event the way a
+/// released v0.48.1 binary does.
+fn legacy_sender() {
+    super::super::revocation_eviction::crypto_exclusion::author_legacy_rekeys_on_this_thread_for_test();
+}
+
+/// The newest `CryptoExclusionV1` frame `state` committed or installed.
+async fn crypto_exclusion_frame(
+    state: &AppState,
+    group_id: &str,
+) -> Option<(
+    Vec<u8>,
+    x0x::groups::crypto_exclusion::SignedCryptoExclusionV1,
+)> {
+    let stable = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id)?.stable_group_id().to_string()
+    };
+    let bytes =
+        super::super::revocation_eviction::crypto_exclusion::latest_frame_for_test(state, &stable)
+            .await?;
+    let frame = x0x::groups::crypto_exclusion::decode_frame(&bytes).ok()?;
+    Some((bytes, frame))
+}
+
+fn crypto_exclusion_treekem_commit(
+    frame: &x0x::groups::crypto_exclusion::SignedCryptoExclusionV1,
+) -> Option<Vec<u8>> {
+    match &frame.body.crypto {
+        x0x::groups::crypto_exclusion::CryptoExclusionCryptoV1::TreeKem { commit, .. } => {
+            Some(commit.clone())
+        }
+        x0x::groups::crypto_exclusion::CryptoExclusionCryptoV1::Gss { .. } => None,
+    }
+}
+
 fn published_removal_commit(state: &AppState) -> Option<Vec<u8>> {
     let published = state
         .named_group_test_recorders
@@ -203,8 +242,17 @@ async fn lowest_admin_rekey_locks_self_leaver_out_of_the_next_epoch() -> Result<
         "lowest admin must advance the TreeKEM epoch on self-leave; before {}, after {epoch_after}",
         fixture.epoch_before
     );
-    let commit = published_removal_commit(&fixture.state)
-        .expect("responsive rekey must publish a TreeKEM removal commit");
+    // ADR 0110 §4: the removal is a crypto-only exclusion, never a
+    // repeated `MemberRemoved` on the metadata topic.
+    assert!(
+        published_removal_commit(&fixture.state).is_none(),
+        "no repeated MemberRemoved may be published for an already-Removed seat"
+    );
+    let (_, frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("responsive rekey must commit a CryptoExclusionV1");
+    assert_eq!(frame.body.target, *fixture.member_id.as_bytes());
+    let commit = crypto_exclusion_treekem_commit(&frame).expect("TreeKEM exclusion");
     let process = fixture.leaver_group.process_commit(&commit);
     assert!(
         process.is_err(),
@@ -538,6 +586,7 @@ async fn incapable_lowest_admin_does_not_rekey() -> Result<()> {
 /// Restart loads it back into the catch-up log.
 #[tokio::test]
 async fn restart_reloads_the_removal_event_saved_before_publish() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     let event = signed_self_leave(&fixture).await?;
     let applied =
@@ -619,8 +668,10 @@ async fn remaining_member_converges_on_the_rekey() -> Result<()> {
     assert!(applied.accepted, "the leave must apply: {applied:?}");
     let committer_hash = stored_hash(&fixture.state, &fixture.group_id).await;
     let committer_epoch = live_epoch(&fixture.state, &fixture.group_id).await;
-    let rekey = published_removal_event(&fixture.state).expect("rekey event");
-    let commit_bytes = published_removal_commit(&fixture.state).expect("rekey commit");
+    let (rekey, frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("crypto-only exclusion frame");
+    let commit_bytes = crypto_exclusion_treekem_commit(&frame).expect("rekey commit");
     survivor
         .process_commit(&commit_bytes)
         .expect("the remaining member processes the rekey");
@@ -643,17 +694,27 @@ async fn remaining_member_converges_on_the_rekey() -> Result<()> {
         replica_leave.accepted,
         "the replica must apply the self-leave: {replica_leave:?}"
     );
-    let replica_rekey = apply_named_group_metadata_event(
+    let replica_rekey = super::super::revocation_eviction::crypto_exclusion::receive(
         &replica,
-        rekey,
         fixture.state.agent.agent_id(),
-        true,
-        None,
+        &rekey,
     )
     .await;
-    assert!(
-        replica_rekey.accepted,
-        "the replica must apply the rekey: {replica_rekey:?}"
+    assert_eq!(
+        replica_rekey,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Applied,
+        "the replica must apply the crypto-only exclusion"
+    );
+    let again = super::super::revocation_eviction::crypto_exclusion::receive(
+        &replica,
+        fixture.state.agent.agent_id(),
+        &rekey,
+    )
+    .await;
+    assert_eq!(
+        again,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Duplicate,
+        "a second copy is a duplicate"
     );
     assert_eq!(
         stored_hash(&replica, &fixture.group_id).await,
@@ -863,6 +924,7 @@ async fn demotion_route_rekeys_when_the_local_admin_becomes_designated() -> Resu
 /// and it does not send the rekey again.
 #[tokio::test]
 async fn disk_restart_serves_predecessor_without_republish() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fixture
         .state
@@ -917,6 +979,7 @@ async fn disk_restart_serves_predecessor_without_republish() -> Result<()> {
 /// An outbox commit that is not in the stored chain is not published.
 #[tokio::test]
 async fn resume_drops_a_rekey_that_is_not_in_the_stored_chain() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fixture
         .state
@@ -1047,12 +1110,17 @@ async fn two_concurrent_admins_only_the_lower_id_commits() -> Result<()> {
         assert_eq!(epoch_a, epoch_before, "the higher admin must hold off");
         (&state_b, &fixture.state, epoch_b)
     };
-    let rekey = published_removal_event(committer).expect("the lower admin publishes one rekey");
+    let (rekey, _) = crypto_exclusion_frame(committer, &fixture.group_id)
+        .await
+        .expect("the lower admin commits one crypto-only exclusion");
     let committer_id = committer.agent.agent_id();
-    let applied = apply_named_group_metadata_event(holder, rekey, committer_id, true, None).await;
-    assert!(
-        applied.accepted,
-        "the higher admin must apply the shared rekey: {applied:?}"
+    let applied =
+        super::super::revocation_eviction::crypto_exclusion::receive(holder, committer_id, &rekey)
+            .await;
+    assert_eq!(
+        applied,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Applied,
+        "the higher admin must apply the shared exclusion"
     );
     assert_eq!(
         stored_hash(holder, &fixture.group_id).await,
@@ -1124,6 +1192,7 @@ async fn historical_hash_only_seat_does_not_block_the_live_leaver() -> Result<()
 /// retry installs that commit. It does not persist a second payload.
 #[tokio::test]
 async fn retry_after_outbox_sync_failure_reuses_the_saved_commit() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fail_self_leave_outbox_write_number(2);
     skip_self_leave_rekey_ack(true);
@@ -1187,6 +1256,7 @@ async fn retry_after_outbox_sync_failure_reuses_the_saved_commit() -> Result<()>
 }
 
 async fn publish_fault_leaves_rekey_pending(fault: &str) -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fixture
         .state
@@ -1254,6 +1324,7 @@ async fn timed_out_publish_stays_pending() -> Result<()> {
 /// not yet installed. The hash check runs under the membership lock.
 #[tokio::test]
 async fn resume_keeps_a_rekey_until_the_membership_lock_shows_it_stored() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     let leave = signed_self_leave(&fixture).await?;
     let applied =
@@ -1315,6 +1386,7 @@ fn unix_mode(path: &std::path::Path) -> u32 {
 /// deletes that copy. A later wipe deletes the file.
 #[tokio::test]
 async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     skip_self_leave_rekey_ack(true);
     fixture
@@ -1520,6 +1592,7 @@ async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
 /// rekey installs and the leaver cannot read it.
 #[tokio::test]
 async fn relayed_removal_rejects_another_members_treekem_commit() -> Result<()> {
+    legacy_sender();
     let mut fixture = two_member_treekem_group().await?;
     let member_b_kp = x0x::identity::AgentKeypair::generate()?;
     let member_b = member_b_kp.agent_id();
@@ -1923,6 +1996,7 @@ async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
 /// A digest-bound rekey can be relayed. Substituted bytes cannot.
 #[tokio::test]
 async fn catchup_third_party_relays_a_digest_bound_rekey() -> Result<()> {
+    legacy_sender();
     let mut cast = catchup_relay_fixture().await?;
     cast.fixture
         .state
@@ -4353,5 +4427,111 @@ async fn single_epoch_ahead_observation_asks_every_candidate() -> Result<()> {
         assert!(asked(peer), "every candidate is asked");
     }
     cast.shutdown().await;
+    Ok(())
+}
+
+fn advertise_registry(state: &AppState, peer: x0x::identity::AgentId, bits: u64) {
+    let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+    capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+    assert!(
+        state.agent.capability_store().insert(
+            peer,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            x0x::dm_capability::now_unix_ms(),
+        ),
+        "verified capability advert"
+    );
+}
+
+/// ADR 0110 §4 (D76): an Active survivor whose current verified advert
+/// lacks `crypto_exclusion_v1` holds the crypto-only exclusion. The leaver
+/// keeps its leaf, nothing is published, and the commit runs once the
+/// survivor's advert sets the bit.
+#[tokio::test]
+async fn lacking_survivor_advert_holds_the_crypto_only_exclusion() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let survivor = x0x::identity::AgentId([0x77; 32]);
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        add_active_peer(info, survivor);
+    }
+    let all = x0x::dm::CapabilityRegistry::current().bits;
+    advertise_registry(
+        &fixture.state,
+        survivor,
+        all & !x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+    );
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a lacking survivor holds the exclusion"
+    );
+    assert!(crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .is_none());
+    assert!(
+        published_removal_commit(&fixture.state).is_none(),
+        "the hold never falls back to a repeated MemberRemoved"
+    );
+
+    advertise_registry(&fixture.state, survivor, all);
+    rekey_outstanding_treekem_self_leaves(&fixture.state).await;
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
+        "the exclusion runs once the survivor upgrades"
+    );
+    let (_, frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("crypto-only exclusion frame");
+    assert_eq!(frame.body.target, *fixture.member_id.as_bytes());
+    Ok(())
+}
+
+/// ADR 0110 §4: a frame whose outer signature does not verify is refused,
+/// and a second copy of an installed frame is a duplicate.
+#[tokio::test]
+async fn tampered_crypto_exclusion_is_refused() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    let (bytes, mut frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("crypto-only exclusion frame");
+    let admin = fixture.state.agent.agent_id();
+    let ce = &super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Duplicate;
+    assert_eq!(
+        &super::super::revocation_eviction::crypto_exclusion::receive(
+            &fixture.state,
+            admin,
+            &bytes
+        )
+        .await,
+        ce
+    );
+    if let Some(byte) = frame.signature.first_mut() {
+        *byte ^= 0xff;
+    }
+    let tampered = x0x::groups::crypto_exclusion::encode_frame(&frame)?;
+    assert_eq!(
+        super::super::revocation_eviction::crypto_exclusion::receive(
+            &fixture.state,
+            admin,
+            &tampered
+        )
+        .await,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Refused(
+            x0x::groups::crypto_exclusion::CryptoExclusionRefusal::BadSignature
+        )
+    );
     Ok(())
 }

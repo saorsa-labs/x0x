@@ -91,6 +91,11 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
         || crate::exec::protocol::decode_frame_payload(payload).is_ok()
         || payload.starts_with(LTC_CARD_FRAME_PREFIX)
         || payload.starts_with(VOICE_SIGNALING_DM_PREFIX)
+        // ADR 0110 §4: S4 hand-off and crypto-only exclusion frames are
+        // protocol traffic. Only a frame that decodes is claimed, so a
+        // user message that starts with the prefix stays history.
+        || crate::groups::eviction::decode_handoff(payload).is_ok()
+        || crate::groups::crypto_exclusion::decode_frame(payload).is_ok()
     {
         return DmPayloadClass::Ephemeral;
     }
@@ -205,6 +210,29 @@ mod tests {
         assert_eq!(
             classify_dm_payload(br#"{"event":"member_added","group_id":"g","revision":1}"#),
             DmPayloadClass::Ephemeral
+        );
+    }
+
+    #[test]
+    fn s4_protocol_frames_are_ephemeral_and_prefix_text_is_durable() {
+        let handoff = crate::groups::eviction::EvictionHandoffV1 {
+            stable_group_id: "g".to_string(),
+            target: [1; 32],
+            observed_parent_head: "h".to_string(),
+            revocation_records: Vec::new(),
+            self_leave_commit: Some("h".to_string()),
+            expired_certificate: None,
+            renewed_certificate: None,
+        };
+        let bytes = crate::groups::eviction::encode_handoff(&handoff).expect("encode");
+        assert_eq!(classify_dm_payload(&bytes), DmPayloadClass::Ephemeral);
+        assert_eq!(
+            classify_dm_payload(b"X0XEVH1 is my favourite string"),
+            DmPayloadClass::Durable("text/plain")
+        );
+        assert_eq!(
+            classify_dm_payload(b"X0XCE1 hello"),
+            DmPayloadClass::Durable("text/plain")
         );
     }
 
