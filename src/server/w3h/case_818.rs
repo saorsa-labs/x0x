@@ -329,6 +329,22 @@ async fn scenario(
     .await?;
     let sealed = view(sim, "A", &group).await?;
     let stub = view(sim, "J", &group).await?;
+    // DIAG #1362 only: J's group counters and WARN logs 10 s after the seal.
+    sim.within("diag settle", secs(12), async {
+        tokio::time::sleep(secs(10)).await;
+    })
+    .await?;
+    for label in ["J", "A"] {
+        let (status, diag) = sim
+            .api(label, Method::GET, "/diagnostics/groups", None)
+            .await?;
+        receipt.note(format!("DIAG {label} /diagnostics/groups {status} {diag}"));
+    }
+    let probe = view(sim, "J", &group).await?;
+    receipt.note(format!("DIAG J after 10 s: {}", probe.describe()));
+    for log in sim.logs_containing(&[]).into_iter().take(80) {
+        receipt.note(format!("DIAG log t={}ms {}", log.at.as_millis(), log.text));
+    }
     receipt.setup_done(at(sim));
 
     let base = if arm.gap() {
