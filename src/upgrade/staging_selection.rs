@@ -349,3 +349,8 @@ fn stable_version(version: &str) -> io::Result<semver::Version> {
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
+
+#[cfg(test)]
+include!("../../tests/upgrade_staging_supersession.rs");
+#[cfg(test)]
+staging_selection_core_regression_tests!();
