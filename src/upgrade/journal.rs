@@ -233,6 +233,18 @@ pub(crate) fn read_boot_records(data_dir: &Path) -> BootRecords {
     }
 }
 
+/// Without a readable, resolved transaction there is no safe reference set
+/// for cleanup. Preserve every candidate artifact when any record remains.
+/// The caller supplies the existing sweep; this module never follows paths
+/// taken from a record.
+pub(crate) fn sweep_if_no_records(data_dir: &Path, sweep: impl FnOnce() -> usize) -> usize {
+    if read_boot_records(data_dir).has_records() {
+        0
+    } else {
+        sweep()
+    }
+}
+
 fn read_record(path: &Path, expected: &str) -> RecordRead {
     match read_bytes(path) {
         Ok(bytes) => match classify(&bytes, expected) {
@@ -501,6 +513,43 @@ pub(crate) fn write_record(path: &Path, record: &impl Serialize) -> io::Result<(
     write_record_inner(path, record, |_| Ok(()))
 }
 
+/// Check the platform and filesystem barrier before staging or binary swap.
+/// This opens and syncs an existing directory; it creates no record or root.
+/// A passing preflight cannot predict later I/O failure, so the writer still
+/// checks every barrier and never acknowledges a failed operation.
+pub(crate) fn check_record_barrier_support(data_dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let directory = File::open(data_dir).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot open upgrade record directory: {error}"),
+            )
+        })?;
+        if !directory.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "upgrade record parent must be an existing directory",
+            ));
+        }
+        directory.sync_all().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("upgrade record directory sync is unavailable: {error}"),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable upgrade record directory sync is unsupported on this platform; \
+             apply must be refused before replacing binaries",
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BarrierStep {
     Write,
@@ -570,6 +619,7 @@ fn write_record_inner(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    check_record_barrier_support(parent)?;
     let directory = File::open(parent)?;
     let (temporary_path, mut temporary) = create_replacement(parent)?;
     let result = (|| {
