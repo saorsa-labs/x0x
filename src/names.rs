@@ -181,7 +181,7 @@ fn is_reserved(label: &str) -> bool {
 ///
 /// V3 announces are machine-signed; without an authenticated machine match
 /// (or when auth is absent while a name is claimed) the label is treated as
-/// unverified and dropped. Used by [`Agent::name_candidates`].
+/// unverified and dropped. Used when gathering name candidates for an owner.
 #[must_use]
 pub fn verified_announce_self_name(
     announce_machine: MachineId,
