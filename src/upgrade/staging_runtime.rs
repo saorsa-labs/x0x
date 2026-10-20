@@ -35,11 +35,37 @@ impl Gate {
         clock: &probe::ProbeClock,
         identity: &restart::StagingIdentity,
     ) -> Result<staging::Decision, UpgradeError> {
+        self.check_install(install)?;
         self.check_data_root(&identity.data_root)?;
         let policy =
             fleet_policy::effective_staging_window(self.request.window_minutes, install, identity)
                 .map_err(|error| UpgradeError::Other(error.to_string()))?;
         self.observe_with_policy(install, clock, policy)
+    }
+
+    /// Read-only refusal checks before a retry can acknowledge its probe clock.
+    /// The caller holds the canonical install lock. A pending rollout delay
+    /// does not prevent inspecting the independent mandatory probe retry.
+    pub fn check_retry_policy(
+        &self,
+        install: &Path,
+        identity: &restart::StagingIdentity,
+    ) -> Result<(), UpgradeError> {
+        self.check_install(install)?;
+        self.check_data_root(&identity.data_root)?;
+        let policy =
+            fleet_policy::effective_staging_window(self.request.window_minutes, install, identity)
+                .map_err(|error| UpgradeError::Other(error.to_string()))?;
+        self.checked_request(install, policy).map(|_| ())
+    }
+
+    fn check_install(&self, install: &Path) -> Result<(), UpgradeError> {
+        if std::fs::canonicalize(install).map_err(|error| UpgradeError::Other(error.to_string()))?
+            != self.request.install
+        {
+            return Err(UpgradeError::Other("staging install changed".into()));
+        }
+        Ok(())
     }
 
     fn check_data_root(&self, data_root: &Path) -> Result<(), UpgradeError> {
@@ -52,16 +78,13 @@ impl Gate {
         Ok(())
     }
 
-    fn observe_with_policy(
+    fn checked_request(
         &self,
         install: &Path,
-        clock: &probe::ProbeClock,
         policy: fleet_policy::WindowPolicy,
-    ) -> Result<staging::Decision, UpgradeError> {
+    ) -> Result<staging::StagingRequest, UpgradeError> {
         let error = |error: std::io::Error| UpgradeError::Other(error.to_string());
-        if std::fs::canonicalize(install).map_err(error)? != self.request.install {
-            return Err(UpgradeError::Other("staging install changed".into()));
-        }
+        self.check_install(install)?;
         let mut request = self.request.clone();
         request.window_minutes = policy.window_minutes;
         // This read MUST precede observe: observing even a due receipt writes
@@ -95,6 +118,17 @@ impl Gate {
                 ))
             }
         }
+        Ok(request)
+    }
+
+    fn observe_with_policy(
+        &self,
+        install: &Path,
+        clock: &probe::ProbeClock,
+        policy: fleet_policy::WindowPolicy,
+    ) -> Result<staging::Decision, UpgradeError> {
+        let error = |error: std::io::Error| UpgradeError::Other(error.to_string());
+        let request = self.checked_request(install, policy)?;
         let retry = match probe::inspect_admission(install, &self.request.version)
             .map_err(|error| UpgradeError::Other(error.to_string()))?
         {
@@ -118,6 +152,7 @@ impl Gate {
         install: &Path,
         plan: &restart::RestartPlan,
     ) -> Result<(), UpgradeError> {
+        self.check_install(install)?;
         self.check_data_root(&plan.data_root)?;
         let policy = fleet_policy::effective_window(self.request.window_minutes, install, plan)
             .map_err(|error| UpgradeError::Other(error.to_string()))?;
