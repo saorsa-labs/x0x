@@ -1808,8 +1808,36 @@ pub async fn serve_with_options(
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let startup_shutdown_watch = state.shutdown_notify.subscribe();
+        #[cfg(unix)]
+        let startup_identity_dir = identity_dir.clone();
+        #[cfg(unix)]
+        let startup_machine_id = *state.agent.machine_id().as_bytes();
         bg_tasks.push(tokio::spawn(async move {
             let data_dir = startup_check_config.data_dir.clone();
+            #[cfg(unix)]
+            let staging = match async {
+                let identity_root = match startup_identity_dir {
+                    Some(path) => path,
+                    None => crate::storage::x0x_dir().await?,
+                };
+                Ok::<_, anyhow::Error>(routes::StartupStagingContext {
+                    install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                    identity_root: identity_root.canonicalize()?,
+                    machine_id: startup_machine_id,
+                    #[cfg(test)]
+                    clock: None,
+                    #[cfg(test)]
+                    observed: None,
+                })
+            }
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "Startup upgrade staging identity is unavailable");
+                    return;
+                }
+            };
             if let Err(e) = run_startup_update_check(
                 &startup_check_config,
                 None,
@@ -1821,6 +1849,8 @@ pub async fn serve_with_options(
                     ),
                     upgrade_apply_lock: startup_apply_lock,
                     shutdown_watch: startup_shutdown_watch,
+                    #[cfg(unix)]
+                    staging,
                 }),
             )
             .await

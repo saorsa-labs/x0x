@@ -23,10 +23,26 @@ using the leading 64 bits of the hash and integer arithmetic. It preserves
 the zero-window calculator behavior. A minute value too large to represent
 in whole seconds uses `u64::MAX` seconds as the effective bound.
 
-This first S2b slice fixes the default and calculation. The running apply
-triggers still need durable first-receipt waits, the fleet minimum policy and
-the complete host participant gate. A configured window alone does not yet
-prove that an apply waits.
+The Unix startup update check records the first eligible release beside the
+canonical installed binary. The private `upgrade-rollout-<digest>.json`
+receipt binds the actual data and identity roots, MachineId, release version,
+verified manifest digest and archive digest. Duplicate delivery, restart and
+later window changes retain the first choice. Monotonic elapsed time reduces
+the wait; a reboot keeps the last durable remainder and starts a new clock
+epoch. Wall-clock changes do not supply elapsed time.
+
+The startup task releases the apply mutex and install lock while waiting.
+It waits before writing release content or starting candidate probes, and
+rechecks the receipt and unresolved upgrade records under the install lock.
+Each observation requires a successful record barrier, including a receipt
+that already says the delay is complete. Unknown or damaged records remain
+in place and refuse this apply; they do not block normal daemon startup.
+Shutdown or loss of the task cancels work before mutation admission.
+
+This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
+the fleet minimum, complete host inventory and transaction-bound guide
+installation remain separate M2 work. It does not claim that every apply
+path already honors the configured window.
 
 ### Candidate execution probes (M2 S2d)
 
