@@ -1422,6 +1422,13 @@ mod tests {
     ));
     #[cfg(unix)]
     staging_supersession_regression_tests!();
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_background_staging.rs"
+    ));
+    #[cfg(unix)]
+    background_staging_regression_tests!();
 
     use super::*;
     use crate::upgrade::restart;
