@@ -196,6 +196,9 @@ macro_rules! fleet_startup_regression_tests {
             let dir = tempfile::Builder::new().prefix("fleet-startup-").tempdir_in(evidence).unwrap();
             let root = dir.path().canonicalize().unwrap();
             let (mut runtime, _shutdown) = e2e_startup_runtime(&root);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                root.join("x0xd"),
+            );
             runtime.staging.machine_id = [42; 32];
             let install = runtime.staging.install.clone();
             let original = std::fs::read(&install).unwrap();
@@ -279,6 +282,173 @@ macro_rules! fleet_startup_regression_tests {
             fleet_existing_zero_receipt_case(true, true).await;
         }
 
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_production_undersized_receipt_refusal_preserves_interrupted_probe_bytes() {
+            fleet_retained_retry_case(Some("undersized")).await;
+        }
+
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_production_unresolved_records_refusal_preserves_interrupted_probe_bytes() {
+            for barrier in ["journal", "pair"] {
+                fleet_retained_retry_case(Some(barrier)).await;
+            }
+        }
+
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_production_valid_receipt_retry_acknowledges_old_boot_without_advancing_receipt() {
+            fleet_retained_retry_case(None).await;
+        }
+
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        async fn fleet_retained_retry_case(barrier: Option<&str>) {
+            use crate::upgrade::{pair, probe, probe_retry, staging};
+            use sha2::Digest;
+
+            let evidence = std::env::var_os("X0X_UPGRADE_FLEET_EVIDENCE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(".planning/upgrade-fleet-fixtures"));
+            std::fs::create_dir_all(&evidence).unwrap();
+            let dir = tempfile::Builder::new().prefix("fleet-retry-").tempdir_in(evidence).unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let (mut runtime, shutdown) = e2e_startup_runtime(&root);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(root.join("x0xd"));
+            let install = root.join("x0xd");
+            let installed = std::fs::read(&install).unwrap();
+            let apply_lock = Arc::clone(&runtime.upgrade_apply_lock);
+            let acknowledged = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&acknowledged);
+            runtime.staging.observed = Some(Arc::new(move |_| { observed.fetch_add(1, Ordering::SeqCst); }));
+            runtime.staging.clock = Some(Arc::new(|| Ok(probe::ProbeClock {
+                boot_id: "fleet-retry-receipt".into(), monotonic_ms: 1000,
+            })));
+            let authority: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"), "/.deployment/authority-inventory.json"))).unwrap();
+            let unit = std::path::Path::new(authority["instances"][0]["unit"]["destination"].as_str().unwrap())
+                .file_name().unwrap().to_str().unwrap();
+            let mut scenario = staging_readback(one_call_scenario("0", "5"), &runtime);
+            scenario.cgroup = format!("0::/system.slice/{unit}");
+            let _readback = restart::systemd_readback_seam::install(scenario);
+            let mut manifest = manifest_for_this_platform("9.9.9");
+            manifest.timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let manifest_json = serde_json::to_vec(&manifest).unwrap();
+            let request = staging::StagingRequest {
+                install: install.clone(), data_root: root.clone(), identity_root: root.clone(),
+                machine_id: [42; 32], version: manifest.version.clone(),
+                manifest_sha256: sha2::Sha256::digest(&manifest_json).into(),
+                archive_sha256: manifest.assets[0].archive_sha256,
+                window_minutes: if barrier == Some("undersized") { 0 } else { 60 },
+            };
+            {
+                let _held = crate::upgrade::acquire_host_upgrade_lock(&install).unwrap();
+                let decision = staging::observe(&request, &probe::ProbeClock {
+                    boot_id: "fleet-retry-receipt".into(), monotonic_ms: 500,
+                }).unwrap();
+                assert_eq!(matches!(decision, staging::Decision::Due), barrier == Some("undersized"));
+            }
+            let receipt_path = staging::receipt_path(&request).unwrap();
+            let receipt_before = std::fs::read(&receipt_path).unwrap();
+            let retry_ms = if barrier.is_some() { 1 } else { 1_800_000 };
+            let state = probe::ProbeState {
+                schema_version: 1, record_kind: "probe".into(), install: install.clone(),
+                version: manifest.version.clone(), platform: manifest.assets[0].target.clone(),
+                archive_sha256: manifest.assets[0].archive_sha256,
+                transaction_id: "13131313-1313-4313-8313-131313131313".into(), attempt: 1,
+                phase: probe::ProbePhase::InterruptedWait, cause: Some(probe::ProbeCause::Timeout),
+                last_pid: None, boot_id: "fleet-retry-previous-boot".into(),
+                retry_remaining_ms: retry_ms, retry_deadline_ms: retry_ms + 1,
+                daemon_sha256: None, cli_sha256: None,
+            };
+            assert_ne!(state.boot_id, probe::ProbeClock::now().unwrap().boot_id);
+            let probe_path = probe::state_path(&install).unwrap();
+            std::fs::write(&probe_path, serde_json::to_vec(&state).unwrap()).unwrap();
+            assert_eq!(probe::read_state(&install).unwrap().unwrap().phase, probe::ProbePhase::InterruptedWait);
+            let probe_before = std::fs::read(&probe_path).unwrap();
+            let blocked_path = match barrier {
+                Some("journal") => Some(root.join(crate::upgrade::journal::JOURNAL_FILE_NAME)),
+                Some("pair") => Some(pair::pair_pending_path(&install).unwrap()),
+                _ => None,
+            };
+            if let Some(path) = &blocked_path { std::fs::write(path, b"corrupt retained intent").unwrap(); }
+            let attempts = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&attempts);
+            let _apply = crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_, manifest| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                x0x::upgrade::UpgradeResult::Success { version: manifest.version.clone() }
+            }));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            if barrier.is_some() {
+                let version = manifest.version.clone();
+                let _release = startup_release_seam::install(crate::upgrade::monitor::VerifiedRelease {
+                    manifest, manifest_json, signature: Vec::new(), gossip_payload: Vec::new(),
+                });
+                let mut config = DaemonConfig { data_dir: root.clone(), ..Default::default() };
+                config.update.rollout_window_minutes = 0;
+                let mut startup = Box::pin(run_startup_update_check(&config, None, Some(runtime)));
+                let result = loop {
+                    assert!(std::time::Instant::now() < deadline, "startup refusal did not finish");
+                    tokio::select! { biased;
+                        result = startup.as_mut() => break result,
+                        _ = tokio::task::yield_now() => {}
+                    }
+                };
+                drop(startup);
+                // schedule_probe_retry claims synchronously before startup
+                // returns. No await occurs before checking its actual claim.
+                let claim = probe_retry::claim_retry(install.clone(), version.clone());
+                let scheduled = claim.is_none();
+                drop(claim);
+                // Let the real waiter finish without cancelling a live check.
+                // The baseline acknowledges the old boot, reaches refused apply,
+                // then exits on the unchanged transaction. The fix refuses first.
+                loop {
+                    if let Some(owner) = probe_retry::claim_retry(install.clone(), version.clone()) {
+                        drop(owner); break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "actual retry owner did not drain");
+                    tokio::time::advance(Duration::from_millis(10)).await;
+                    tokio::task::yield_now().await;
+                }
+                assert!(scheduled, "actual startup error path must own the retry check");
+                assert!(matches!(result, Ok(None)), "{result:?}");
+                assert_eq!(acknowledged.load(Ordering::SeqCst), 0);
+                assert_eq!(std::fs::read(&probe_path).unwrap(), probe_before,
+                    "{barrier:?}: retry must not acknowledge boot/progress after staging refuses");
+            } else {
+                // A valid fleet receipt may still be waiting. Retry inspection
+                // must remain available without requiring rollout Due or writing
+                // a receipt tick. This awaits the actual owned worker directly.
+                let upgrader = AutoApplyUpgrader::new("x0xd")
+                    .with_stop_on_upgrade(true)
+                    .with_restart_context(runtime.restart_context)
+                    .with_staging_request(request.clone());
+                let operation = upgrader.probe_retry_delay(&manifest.version); tokio::pin!(operation);
+                let pending = loop {
+                    assert!(std::time::Instant::now() < deadline, "valid retry check did not finish");
+                    tokio::select! { biased;
+                        result = operation.as_mut() => break result.unwrap(),
+                        _ = tokio::task::yield_now() => {}
+                    }
+                }.expect("valid receipt retains its probe retry");
+                assert_eq!(pending.transaction_id, state.transaction_id);
+                assert_ne!(std::fs::read(&probe_path).unwrap(), probe_before);
+                assert_eq!(probe::read_state(&install).unwrap().unwrap().boot_id,
+                    probe::ProbeClock::now().unwrap().boot_id);
+            }
+            // Both paths have completed their actual worker and any scheduled
+            // retry owner before retained records and scoped hooks are dropped.
+            drop(shutdown);
+            assert_eq!(attempts.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_before);
+            if let Some(path) = blocked_path { assert_eq!(std::fs::read(path).unwrap(), b"corrupt retained intent"); }
+            assert_eq!(std::fs::read(install).unwrap(), installed);
+            assert!(apply_lock.try_lock().is_ok());
+        }
+
         #[cfg(unix)]
         #[tokio::test(start_paused = true)]
         async fn fleet_ordinary_startup_keeps_explicit_zero_and_applies_without_waiting() {
@@ -303,6 +473,9 @@ macro_rules! fleet_startup_regression_tests {
             let dir = tempfile::Builder::new().prefix("fleet-retained-").tempdir_in(evidence).unwrap();
             let root = dir.path().canonicalize().unwrap();
             let (mut runtime, _shutdown) = e2e_startup_runtime(&root);
+            let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
+                root.join("x0xd"),
+            );
             let install = runtime.staging.install.clone();
             let original = std::fs::read(&install).unwrap();
             let apply_lock = Arc::clone(&runtime.upgrade_apply_lock);
