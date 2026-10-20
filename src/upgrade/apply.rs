@@ -669,11 +669,6 @@ impl AutoApplyUpgrader {
             .ok_or(UpgradeError::NoPlatformAsset)?;
 
         let target_path = current_binary_path()?;
-        #[cfg(all(test, unix))]
-        let target_path = self
-            .staging
-            .as_ref()
-            .map_or(target_path, |gate| gate.request.install.clone());
 
         // ADR-0061 §1 — resolve before mutation. The restart owner, intended
         // exit behaviour, executable/argv and effective roots are resolved and
@@ -1055,7 +1050,7 @@ impl AutoApplyUpgrader {
 ///
 /// Handles the `/proc/self/exe (deleted)` suffix on Linux.
 pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
-    let exe = std::env::current_exe()
+    let exe = observe_current_executable()
         .map_err(|e| UpgradeError::Other(format!("failed to resolve current executable: {e}")))?;
 
     // On Linux, /proc/self/exe can have " (deleted)" suffix after an upgrade
@@ -1065,6 +1060,47 @@ pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
         Ok(PathBuf::from(clean))
     } else {
         Ok(exe)
+    }
+}
+
+fn observe_current_executable() -> std::io::Result<PathBuf> {
+    #[cfg(all(test, unix))]
+    if let Some(path) = current_binary_path_seam::observation() {
+        return Ok(path);
+    }
+    std::env::current_exe()
+}
+
+/// Replace only the raw executable observation, before path resolution. Tests
+/// must keep this thread-local guard on their current-thread async runtime.
+#[cfg(all(test, unix))]
+pub(crate) mod current_binary_path_seam {
+    use std::{cell::RefCell, marker::PhantomData, path::PathBuf, rc::Rc};
+
+    thread_local! {
+        static OBSERVATION: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard {
+        previous: Option<PathBuf>,
+        _thread: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVATION.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+
+    pub(crate) fn install(raw: PathBuf) -> Guard {
+        Guard {
+            previous: OBSERVATION.with(|slot| slot.replace(Some(raw))),
+            _thread: PhantomData,
+        }
+    }
+
+    pub(super) fn observation() -> Option<PathBuf> {
+        OBSERVATION.with(|slot| slot.borrow().clone())
     }
 }
 
