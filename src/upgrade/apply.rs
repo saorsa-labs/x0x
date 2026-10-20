@@ -476,6 +476,13 @@ impl AutoApplyUpgrader {
         // installed binaries untouched. The plan is then carried through
         // replacement and restart — never re-derived post-swap.
         let restart_plan = self.resolve_restart_plan(&target_path).await?;
+        // Refuse a failed Unix record barrier before download or replacement.
+        // Unmanaged Windows keeps the released legacy helper path; managed
+        // Windows is refused by the restart planner and has no M2 barrier.
+        #[cfg(unix)]
+        super::journal::check_record_barrier_support(&restart_plan.data_root).map_err(|error| {
+            UpgradeError::Other(format!("upgrade record barrier unavailable: {error}"))
+        })?;
         info!(
             mode = ?restart_plan.mode,
             supervision = restart_plan.supervision_signal.as_deref().unwrap_or("none"),
