@@ -31,11 +31,10 @@
 //!
 //! ## Persistence and machine binding (ADR-0074 §2 / §1)
 //!
-//! Forwards persist by default in [`store`]; `--ephemeral` opts out. A forward
-//! with a pinned [`MachineId`] checks `PeerStream::peer()` before any
-//! forward-header byte; a mismatch resets the stream and counts
-//! `machine_mismatch`, and never falls back to V1. Persisted forwards live in
-//! [`crate::forward::store`].
+//! Forwards persist by default in [`crate::forward::store`]; `--ephemeral`
+//! opts out. A forward with a pinned [`crate::identity::MachineId`] checks
+//! `PeerStream::peer()` before any forward-header byte; a mismatch resets
+//! the stream and counts `machine_mismatch`, and never falls back to V1.
 //! Targets are numeric loopback IPs only (`127.0.0.0/8`, `::1`). A hostname
 //! or non-loopback IP in a header is refused before the gate (defense in
 //! depth — the ACL loader already rejects non-loopback at load time, and the
