@@ -16693,6 +16693,7 @@ pub(in crate::server) async fn get_named_group(
             "revocation_evictions": s4_status.rows,
             "revocation_eviction_store": s4_status.store,
             "admin_availability": s4_status.admin_availability,
+            "certificate_evidence_waits": s4_status.certificate_evidence_waits,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),

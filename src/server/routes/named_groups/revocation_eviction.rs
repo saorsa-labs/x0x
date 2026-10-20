@@ -1291,26 +1291,29 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
     // §5 transaction order: fsync a prepared `.evjournal` with the
     // evidence and the parent head, then run the unchanged legacy
     // roster/crypto transaction, then fsync the reconciled `.evs`.
+    let (parent_head, next_revision) = {
+        let groups = state.named_groups.read().await;
+        match groups.get(group_key) {
+            Some(info) => (
+                info.state_hash.clone(),
+                info.state_revision.saturating_add(1),
+            ),
+            None => return,
+        }
+    };
     let journal = {
         let mut inner = state.revocation_evictions.inner.lock().await;
         let Some(row) = inner.store.get_mut(key) else {
             return;
         };
-        let (parent_head, next_revision) = {
-            let groups = state.named_groups.read().await;
-            match groups.get(group_key) {
-                Some(info) => (
-                    info.state_hash.clone(),
-                    info.state_revision.saturating_add(1),
-                ),
-                None => return,
-            }
-        };
+        if row.phase != Phase::Pending {
+            return;
+        }
         row.phase = Phase::Prepared;
         row.parent_head = Some(parent_head.clone());
+        let journal = prepared_journal(row, parent_head, next_revision);
         inner.dirty = true;
-        let row = inner.store.get(key).cloned();
-        row.map(|row| prepared_journal(&row, parent_head, next_revision))
+        Some(journal)
     };
     let Some(journal) = journal else {
         return;
@@ -1828,6 +1831,34 @@ pub(in crate::server) struct GroupS4Status {
     /// `admin_availability`: the derived §4/§4b state, `null` while an
     /// eligible admin exists.
     pub(in crate::server) admin_availability: serde_json::Value,
+    /// `certificate_evidence_waits`: §1a `waiting_for_certificate_evidence`
+    /// for each Active digest-only seat of an `OwnerCertified` group whose
+    /// committed certificate bytes this node lacks.
+    pub(in crate::server) certificate_evidence_waits: serde_json::Value,
+}
+
+/// §1a: Active seats whose committed digest has no matching bytes here.
+fn certificate_evidence_waits(info: &GroupInfo) -> serde_json::Value {
+    if !owner_certified(info) || info.withdrawn {
+        return serde_json::Value::Array(Vec::new());
+    }
+    let waits: Vec<serde_json::Value> = info
+        .active_members()
+        .filter_map(|member| {
+            let digest = member.certificate_digest.as_deref()?;
+            let held = member.certificate.as_ref().is_some_and(|cert| {
+                x0x::groups::owner_cert::certificate_digest_hex(cert) == digest
+            });
+            (!held).then(|| {
+                serde_json::json!({
+                    "cause": WaitingCause::WaitingForCertificateEvidence.as_str(),
+                    "agent_id": member.agent_id,
+                    "certificate_digest": digest,
+                })
+            })
+        })
+        .collect();
+    serde_json::Value::Array(waits)
 }
 
 /// The S4 rows of one group, the sidecar state and the §4 admin state.
@@ -1845,6 +1876,7 @@ pub(in crate::server) async fn group_status_json(
         rows,
         store,
         admin_availability,
+        certificate_evidence_waits: certificate_evidence_waits(info),
     }
 }
 
@@ -1922,6 +1954,98 @@ mod tests {
         leaves.by_group.insert("g".into(), None);
         assert_eq!(leaves.tracks("g", &[1; 32]), None);
         assert!(!leaves.known("g"));
+    }
+
+    fn group_with(admin: [u8; 32], member: [u8; 32]) -> GroupInfo {
+        let mut info = GroupInfo::new(
+            "g".into(),
+            String::new(),
+            x0x::identity::AgentId(admin),
+            "mls-g".into(),
+        );
+        info.add_member(hex::encode(admin), GroupRole::Admin, None, None);
+        info.add_member(hex::encode(member), GroupRole::Member, None, None);
+        info
+    }
+
+    fn revocation_of(target: [u8; 32], hash: u8) -> VerifiedAgentRevocation {
+        VerifiedAgentRevocation {
+            target,
+            record_hash: [hash; 32],
+            record_bytes: vec![hash],
+            from_startup_load: false,
+        }
+    }
+
+    #[test]
+    fn revocation_of_a_seated_member_creates_work_and_removal_completes_it() {
+        let (admin, member) = ([1; 32], [2; 32]);
+        let mut info = group_with(admin, member);
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        let groups = vec![("k".to_string(), info.clone())];
+        let leaves = RetainedLeaves::default();
+        let triggers = derive_triggers(&groups, &leaves, &[revocation_of(member, 7)], 0);
+        assert_eq!(triggers.len(), 1);
+        let (key, trigger, _) = triggers.into_iter().next().expect("trigger");
+        assert_eq!(key.target, member);
+        let mut store = ObligationStore::new();
+        store.intake(&key, trigger, None, 0, [0; 16]);
+        // Still seated: nothing completes.
+        assert!(!reconcile_completion(&mut store, &groups, &leaves, 1));
+        info.remove_member(&hex::encode(member), Some(hex::encode(admin)));
+        let removed = vec![("k".to_string(), info)];
+        assert!(reconcile_completion(&mut store, &removed, &leaves, 2));
+        assert_eq!(store.get(&key).expect("row").phase, Phase::Complete);
+    }
+
+    #[test]
+    fn a_self_leaver_without_a_retained_leaf_creates_no_work() {
+        let (admin, member) = ([1; 32], [2; 32]);
+        let mut info = group_with(admin, member);
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.remove_member(&hex::encode(member), Some(hex::encode(member)));
+        let stable = info.stable_group_id().to_string();
+        let groups = vec![("k".to_string(), info)];
+        let mut leaves = RetainedLeaves::default();
+        leaves
+            .by_group
+            .insert(stable.clone(), Some((Vec::new(), 3)));
+        assert!(derive_triggers(&groups, &leaves, &[revocation_of(member, 7)], 0).is_empty());
+        // With the leaf still in the tree, the leave and the revocation
+        // both open the one (group, target) row.
+        leaves.by_group.insert(stable, Some((vec![member], 3)));
+        let triggers = derive_triggers(&groups, &leaves, &[revocation_of(member, 7)], 0);
+        assert_eq!(triggers.len(), 2);
+        assert!(triggers.iter().all(|(key, _, _)| key.target == member));
+    }
+
+    #[test]
+    fn a_withdrawn_group_terminates_its_rows() {
+        let (admin, member) = ([1; 32], [2; 32]);
+        let mut info = group_with(admin, member);
+        let key = EvictionKey::new(info.stable_group_id(), member);
+        let mut store = ObligationStore::new();
+        store.intake(
+            &key,
+            EvictionTrigger::AgentRevocation {
+                record_hash: [7; 32],
+                record_bytes: vec![7],
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        info.withdrawn = true;
+        let groups = vec![("k".to_string(), info)];
+        assert!(reconcile_completion(
+            &mut store,
+            &groups,
+            &RetainedLeaves::default(),
+            1
+        ));
+        let row = store.get(&key).expect("row");
+        assert_eq!(row.phase, Phase::Terminated);
+        assert_eq!(row.termination, Some(TerminationCause::GroupDeleted));
     }
 
     #[tokio::test]
