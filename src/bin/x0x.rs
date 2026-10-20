@@ -3704,6 +3704,11 @@ async fn purge() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_now_cli.rs"
+    ));
+    upgrade_now_cli_regression_tests!();
     use super::*;
 
     #[test]

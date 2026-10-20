@@ -1644,6 +1644,11 @@ fn schedule_restart_after_response(
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_http_staging.rs"
+    ));
+    http_staging_regression_tests!();
     #[cfg(unix)]
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
