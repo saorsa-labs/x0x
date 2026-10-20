@@ -24,6 +24,7 @@ pub mod owner_cert;
 pub mod owner_mandate;
 pub mod policy;
 pub mod public_message;
+pub mod recovery;
 pub mod request;
 pub mod state_commit;
 
