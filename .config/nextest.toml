@@ -60,6 +60,14 @@ default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 success-output = "final"
 
+# Start the longest sims first in each rerun. In list order the 83 s
+# #1427 catch-up case waited for the 1023 sims (about 145 s each on the
+# 4-vCPU runner), so one rerun took about 226 s and 20 reruns used 86 of
+# the job's 90 minutes (run 39484483102). Order only; verdicts unchanged.
+[[profile.w3h-gate.overrides]]
+filter = 'test(/(^|::)w3h_1023_(red_baseline|control_holders_never_return|control_holder_returns_recovers|restart_one_holder)/) | test(/(^|::)w3h_1427_catchup_/)'
+priority = 50
+
 # W3-H S3: the #1143 cases with creator and admin identities permuted (ADR
 # 0108 s2_home_anonymous_owner_offline: "repeat with creator/admin
 # identities permuted"). `W3H_IDENTITY_ORDER` names the case's labels from
