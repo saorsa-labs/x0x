@@ -551,3 +551,5 @@ mod connector;
 mod fallback;
 mod pinned_lookup;
 mod shutdown;
+
+mod raw_resolution;

@@ -10326,6 +10326,36 @@ impl Agent {
         self.relay_candidates.read().await.clone()
     }
 
+    /// Read raw-resolution evidence without blocking a Tokio worker. Ordinary
+    /// reads use the existing default evidence budget for admission and the
+    /// read together. Expiry supplies no authority, preserving each caller's
+    /// fallback or existing AgentNotFound result. This is a per-read bound;
+    /// it does not bound the remaining raw-resolution or transport waits.
+    /// Cold opt-in reads retain their immediate, nonblocking behavior.
+    async fn raw_resolution_evidence(
+        &self,
+        agent: identity::AgentId,
+        machine: Option<identity::MachineId>,
+        cold: ColdResolution,
+    ) -> Option<std::sync::Arc<peer_evidence::EvidenceView>> {
+        if cold.opted_in() {
+            let now = dm_capability::now_unix_ms();
+            match machine {
+                Some(machine) => self.peer_evidence().try_usable(agent, machine, now),
+                None => self.peer_evidence().try_usable_agent(agent, now),
+            }
+            .ok()
+            .flatten()
+        } else {
+            let deadline = tokio::time::Instant::now() + dm::dm_attempt_timeout(None);
+            self.peer_evidence()
+                .usable_before(agent, machine, deadline)
+                .await
+                .ok()
+                .flatten()
+        }
+    }
+
     /// Resolve the target's currently-live machine after a dial or transport
     /// repair. Discovery can lag the direct-messaging registry during a
     /// machine transition, so prefer whichever mapping ant-quic reports as
@@ -10398,15 +10428,7 @@ impl Agent {
         }
 
         if cached_machine_id.is_none() && registry_machine_id.is_none() {
-            let now = dm_capability::now_unix_ms();
-            let view = if cold.opted_in() {
-                self.peer_evidence()
-                    .try_usable_agent(*agent_id, now)
-                    .ok()
-                    .flatten()
-            } else {
-                self.peer_evidence().usable_agent(*agent_id, now)
-            };
+            let view = self.raw_resolution_evidence(*agent_id, None, cold).await;
             if let Some(view) = view {
                 if transport
                     .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
@@ -11357,17 +11379,7 @@ impl Agent {
             && registry_machine_id.is_none()
             && Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0)).await?
         {
-            let now = dm_capability::now_unix_ms();
-            // x0x #1207 (P2): an opted-in send never blocks on the evidence
-            // store (contention reads as no evidence).
-            let view = if cold.opted_in() {
-                self.peer_evidence()
-                    .try_usable_agent(*agent_id, now)
-                    .ok()
-                    .flatten()
-            } else {
-                self.peer_evidence().usable_agent(*agent_id, now)
-            };
+            let view = self.raw_resolution_evidence(*agent_id, None, cold).await;
             view.map(|v| v.announcement.machine_id)
         } else {
             None
@@ -11593,19 +11605,10 @@ impl Agent {
         }
 
         if resolution == "peer_evidence" {
-            let now = dm_capability::now_unix_ms();
-            // x0x #1207 (P2): an opted-in send never blocks on the evidence
-            // store; contention fails closed (typed, retryable).
-            let usable = if cold.opted_in() {
-                matches!(
-                    self.peer_evidence().try_usable(*agent_id, machine_id, now),
-                    Ok(Some(_))
-                )
-            } else {
-                self.peer_evidence()
-                    .usable(*agent_id, machine_id, now)
-                    .is_some()
-            };
+            let usable = self
+                .raw_resolution_evidence(*agent_id, Some(machine_id), cold)
+                .await
+                .is_some();
             if !usable {
                 return Err(error::NetworkError::AgentNotFound(agent_id.0));
             }
