@@ -7,7 +7,7 @@ use super::super::api_error;
 use super::super::state::{AppState, CachedUpgradeCheck, DaemonConfig, DaemonUpdateConfig};
 use crate as x0x;
 use anyhow::Result;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -1471,6 +1471,7 @@ async fn store_upgrade_response(
 /// flush.
 pub(in crate::server) async fn apply_upgrade(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<UpgradeApplyQuery>,
 ) -> impl IntoResponse {
     if !state.self_update_enabled {
         // Embed path: never replace/restart the host process via the API.
@@ -1496,7 +1497,17 @@ pub(in crate::server) async fn apply_upgrade(
         );
     }
 
-    let Ok(_upgrade_guard) = state.upgrade_apply_lock.try_lock() else {
+    let Ok(http_wait_guard) = Arc::clone(&state.http_upgrade_wait_lock).try_lock_owned() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "applied": false,
+                "error": "upgrade already in progress"
+            })),
+        );
+    };
+    let Ok(upgrade_guard) = state.upgrade_apply_lock.try_lock() else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -1546,8 +1557,21 @@ pub(in crate::server) async fn apply_upgrade(
             &state.shutdown_tx,
         )),
     };
-    let (upgrader, result) =
-        apply_http_release(&state.update_config, restart_context, &release.manifest).await;
+    // Discovery retains the existing conflict behavior. The potentially long
+    // receipt/probe wait must release the shared replacement lock.
+    drop(upgrade_guard);
+    let runtime = HttpUpgradeRuntime {
+        config: state.update_config.clone(),
+        restart_context,
+        apply_lock: Arc::clone(&state.upgrade_apply_lock),
+        wait_slot: Arc::new(http_wait_guard),
+        shutdown: state.shutdown_notify.subscribe(),
+        #[cfg(unix)]
+        staging: state.upgrade_staging.clone(),
+        #[cfg(test)]
+        operation_observer: None,
+    };
+    let (upgrader, result) = apply_http_release(&runtime, &release, query.now).await;
     match result {
         Ok(x0x::upgrade::UpgradeResult::Success { version }) => (
             StatusCode::OK,
@@ -1596,26 +1620,163 @@ pub(in crate::server) async fn apply_upgrade(
     }
 }
 
-/// The actual verified HTTP apply operation. The route retains its existing
-/// apply guard through response and retry handling; deferred restart custody
-/// stays inside the real installer.
-async fn apply_http_release(
-    config: &DaemonUpdateConfig,
+/// D185 is limited to the rollout delay; authentication remains on the route.
+#[derive(Default, serde::Deserialize)]
+pub(in crate::server) struct UpgradeApplyQuery {
+    #[serde(default)]
+    now: bool,
+}
+
+struct HttpUpgradeRuntime {
+    config: DaemonUpdateConfig,
     restart_context: RestartContext,
-    manifest: &ReleaseManifest,
+    apply_lock: Arc<Mutex<()>>,
+    wait_slot: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    shutdown: watch::Receiver<bool>,
+    #[cfg(unix)]
+    staging: Option<StartupStagingContext>,
+    #[cfg(test)]
+    operation_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+}
+
+/// A dropped request withdraws admission even if its worker is queued on the
+/// install lock. An admitted worker retains its replacement/restart custody.
+struct HttpRequestCustody {
+    permit: ReleasePermit,
+    completed_attempt: bool,
+}
+
+impl Drop for HttpRequestCustody {
+    fn drop(&mut self) {
+        if !self.completed_attempt {
+            self.permit.cancel();
+        }
+        self.permit.release_http_wait_slot();
+    }
+}
+
+/// The route owns the HTTP wait slot. This future owns cancellation and takes
+/// the shared apply mutex only after staging and mandatory retry waits finish.
+async fn apply_http_release(
+    runtime: &HttpUpgradeRuntime,
+    verified: &VerifiedRelease,
+    now: bool,
 ) -> (
     AutoApplyUpgrader,
     Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
 ) {
-    // RC4: HTTP-only crate-internal deferred-restart opt-in. apply.rs owns the
-    // ~750 ms deferred restart at admission; do not schedule a second owner here.
+    let permit = ReleasePermit::for_http(Arc::clone(&runtime.wait_slot));
+    #[cfg(test)]
+    let permit = {
+        let mut permit = permit;
+        permit.observer = runtime.operation_observer.clone();
+        permit
+    };
+    let mut custody = HttpRequestCustody {
+        permit: permit.clone(),
+        completed_attempt: false,
+    };
+    // RC4: apply.rs owns the single deferred restart after admission.
     let upgrader = AutoApplyUpgrader::new("x0xd")
-        .with_stop_on_upgrade(config.stop_on_upgrade)
+        .with_stop_on_upgrade(runtime.config.stop_on_upgrade)
         .with_restart_on_success(false)
         .with_http_deferred_restart(true)
-        .with_restart_context(restart_context);
-    let result = upgrader.apply_upgrade_from_manifest(manifest).await;
+        .with_restart_context(runtime.restart_context.clone())
+        .with_release_permit(permit.clone());
+    #[cfg(unix)]
+    let upgrader = match http_staging_request(runtime, verified) {
+        Ok(request) => {
+            let upgrader = upgrader.with_staging_request(request).with_staging_now(now);
+            #[cfg(test)]
+            let upgrader = {
+                let context = runtime.staging.as_ref();
+                upgrader
+                    .with_staging_clock(context.and_then(|context| context.clock.clone()))
+                    .with_staging_observer(context.and_then(|context| context.observed.clone()))
+            };
+            upgrader
+        }
+        Err(error) => return (upgrader, Err(error)),
+    };
+    // The approved override adds no managed M2 behavior to legacy Windows.
+    #[cfg(not(unix))]
+    let _ = now;
+    let mut shutdown = runtime.shutdown.clone();
+    let result = async {
+        permit.check()?;
+        check_http_shutdown(&shutdown)?;
+        x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
+        if !is_newer(&verified.manifest.version, x0x::VERSION) {
+            return Ok(x0x::upgrade::UpgradeResult::NoUpgrade);
+        }
+        #[cfg(unix)]
+        upgrader.wait_for_staging(&mut shutdown).await?;
+        let _guard = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                return Err(x0x::upgrade::UpgradeError::Other("HTTP upgrade cancelled by shutdown".into()));
+            }
+            guard = runtime.apply_lock.lock() => guard,
+        };
+        // Cancellation or supersession while this request waited cannot
+        // authorize a late apply. The installer also rechecks under host lock.
+        permit.check()?;
+        check_http_shutdown(&shutdown)?;
+        x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                permit.cancel();
+                return Err(x0x::upgrade::UpgradeError::Other("HTTP upgrade cancelled by shutdown".into()));
+            }
+            result = upgrader.apply_upgrade_from_manifest(&verified.manifest) => result,
+        };
+        // Completed attempts retain the existing error-response/probe-retry
+        // handoff. Setup, staging and cancelled requests cannot spawn a retry.
+        custody.completed_attempt = true;
+        result
+    }.await;
     (upgrader, result)
+}
+
+fn check_http_shutdown(shutdown: &watch::Receiver<bool>) -> Result<(), x0x::upgrade::UpgradeError> {
+    if *shutdown.borrow() || shutdown.has_changed().is_err() {
+        return Err(x0x::upgrade::UpgradeError::Other(
+            "HTTP upgrade cancelled by shutdown".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn http_staging_request(
+    runtime: &HttpUpgradeRuntime,
+    verified: &VerifiedRelease,
+) -> Result<crate::upgrade::staging::StagingRequest, x0x::upgrade::UpgradeError> {
+    let context = runtime.staging.as_ref().ok_or_else(|| {
+        x0x::upgrade::UpgradeError::Other("HTTP upgrade staging identity is unavailable".into())
+    })?;
+    let data_root = runtime.restart_context.data_dir.as_ref().ok_or_else(|| {
+        x0x::upgrade::UpgradeError::Other("HTTP upgrade data root is unavailable".into())
+    })?;
+    let platform = x0x::upgrade::manifest::current_platform_target()
+        .ok_or(x0x::upgrade::UpgradeError::UnsupportedPlatform)?;
+    let asset = verified
+        .manifest
+        .matches_platform(platform)
+        .ok_or(x0x::upgrade::UpgradeError::NoPlatformAsset)?;
+    Ok(crate::upgrade::staging::StagingRequest {
+        install: context.install.clone(),
+        data_root: data_root
+            .canonicalize()
+            .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))?,
+        identity_root: context.identity_root.clone(),
+        machine_id: context.machine_id,
+        version: verified.manifest.version.clone(),
+        manifest_sha256: Sha256::digest(&verified.manifest_json).into(),
+        archive_sha256: asset.archive_sha256,
+        window_minutes: runtime.config.rollout_window_minutes,
+    })
 }
 
 /// Legacy helper retained for planner-parity unit tests. Production HTTP apply

@@ -13,6 +13,8 @@ pub(crate) type Observer = std::sync::Arc<dyn Fn(staging::Decision) + Send + Syn
 #[derive(Clone)]
 pub(crate) struct Gate {
     pub request: staging::StagingRequest,
+    /// D185: bypass only the rollout delay, retaining every admission check.
+    pub skip_staging_delay: bool,
     #[cfg(test)]
     pub clock: Option<Clock>,
     #[cfg(test)]
@@ -107,6 +109,7 @@ impl Gate {
             super::staging_selection::observe_selected(&request, clock).map_err(error)?;
         let remaining = match decision {
             staging::Decision::Due => retry,
+            staging::Decision::Waiting(_) if self.skip_staging_delay => retry,
             staging::Decision::Waiting(wait) => wait.max(retry),
         };
         Ok(if remaining.is_zero() {

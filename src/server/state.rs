@@ -1284,6 +1284,11 @@ pub(super) struct AppState {
     pub(super) upgrade_check_cache: Mutex<Option<CachedUpgradeCheck>>,
     /// Serializes all destructive binary replacement attempts.
     pub(super) upgrade_apply_lock: Arc<Mutex<()>>,
+    /// Bounds HTTP staging waits without holding the shared replacement lock.
+    pub(super) http_upgrade_wait_lock: Arc<Mutex<()>>,
+    /// Actual boot identity; unavailable identity refuses HTTP update only.
+    #[cfg(unix)]
+    pub(super) upgrade_staging: Option<super::routes::StartupStagingContext>,
     /// API bearer token for authenticating local clients.
     pub(super) api_token: String,
     /// Short-lived browser session tokens (#127 / WS1.6). The only tokens
