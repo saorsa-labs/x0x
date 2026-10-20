@@ -718,6 +718,13 @@ pub(in crate::server) fn version_policy_digest(
 /// digest (#1383, David's 20 Oct 2026 option-B ruling: local only, no wire
 /// change, no capability bit). Read-only view of what `GET /upgrade` would
 /// act on; no network check is performed here.
+///
+/// #1384 (D35): `minimum_supported_version` and `support_window` ship as
+/// explicit nulls — fleet-level policy David sets later; a null IS the
+/// published state ("no fleet minimum published yet"), not a missing field.
+/// They are deliberately outside the digest preimage: they are centrally
+/// published values, not per-machine policy, so they add nothing to a
+/// machine-to-machine census comparison.
 pub(in crate::server) async fn upgrade_diagnostics(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -736,6 +743,8 @@ pub(in crate::server) async fn upgrade_diagnostics(
             "include_prereleases": cfg.include_prereleases,
             "gossip_updates": cfg.gossip_updates,
         },
+        "minimum_supported_version": serde_json::Value::Null,
+        "support_window": serde_json::Value::Null,
         "version_policy_digest": version_policy_digest(version, cfg),
         "digest_input": input,
     }))
@@ -1281,6 +1290,16 @@ mod participation_diagnostics_tests {
         use sha2::{Digest, Sha256};
         let input = body["digest_input"].as_str().unwrap();
         assert_eq!(hex::encode(Sha256::digest(input.as_bytes())), digest);
+
+        // #1384: the D35 policy fields ship as explicit nulls — "set by
+        // David later" is the published state — and stay out of the
+        // preimage (fleet policy, not per-machine policy).
+        assert!(body["minimum_supported_version"].is_null());
+        assert!(body["support_window"].is_null());
+        assert!(
+            !input.contains("minimum_supported_version"),
+            "fleet policy must not churn the per-machine digest"
+        );
 
         agent.shutdown().await;
     }
