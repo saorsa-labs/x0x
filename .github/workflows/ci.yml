@@ -514,6 +514,10 @@ jobs:
           --expect w3h_1105_restarted_replica_obtains_n_plus_one_snapshot=GREEN
           --require w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin
           --expect w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin=GREEN
+          --require w3h_1023_red_baseline_restart_all_holders_offline_join_stays_pending
+          --expect w3h_1023_red_baseline_restart_all_holders_offline_join_stays_pending=RED
+          --require w3h_1023_restart_one_holder_online_admits
+          --expect w3h_1023_restart_one_holder_online_admits=GREEN
           --require w3h_1191_attempt_exit
           --expect w3h_1191_attempt_exit=GREEN
           --require w3h_1427_offline_member_reaches_the_epoch_it_missed
