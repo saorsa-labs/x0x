@@ -1601,6 +1601,140 @@ directly.
   by an active admin in the retained base roster); first evidence wins and
   replays do not overwrite it.
 
+### Revocation eviction (ADR 0110, S4)
+
+When a member's agent is revoked, its selected certificate expires
+(`OwnerCertified` groups), or it leaves while its TreeKEM leaf is still in
+the tree, the daemon opens one obligation for that (group, member). The
+lowest eligible admin on the roster does the exclusion first. The other
+admins wait for their ranked fallback time. These fields show the work and
+every wait. A wait always names its cause; it does not stop silently.
+
+`GET /groups/:id` adds four fields:
+
+```json
+"revocation_evictions": [
+  {
+    "target": "<64-hex agent id>",
+    "phase": "pending",
+    "triggers": ["agent_revocation", "self_leave", "certificate_expiry"],
+    "termination_cause": null,
+    "designated_admin": "<64-hex agent id>",
+    "fallback_ranks": ["<64-hex agent id>"],
+    "waiting": {
+      "cause": "waiting_for_designated_admin",
+      "named": ["<64-hex agent id>"],
+      "designated_admin": "<64-hex agent id>",
+      "detail": "rank",
+      "remaining_ms": 9000
+    },
+    "queued_requests": [{"request": "remove", "queued_at_unix_ms": 1788091312000}],
+    "observed_at_unix_ms": 1788091300000,
+    "result_head": null,
+    "result_epoch": null,
+    "receiver_upgrade_members": [
+      {
+        "cause": "waiting_for_receiver_upgrade",
+        "agent_id": "<64-hex agent id>",
+        "gap_revision": 12,
+        "advert": "lacking"
+      }
+    ]
+  }
+],
+"revocation_eviction_store": {
+  "state": "ok",
+  "file": "revocation-evictions.evs",
+  "detail": null,
+  "rebuilt_from": []
+},
+"admin_availability": null,
+"certificate_evidence_waits": [
+  {
+    "cause": "waiting_for_certificate_evidence",
+    "agent_id": "<64-hex agent id>",
+    "certificate_digest": "<hex digest>"
+  }
+]
+```
+
+- `phase` — `pending`, `prepared`, `committed_delivery_pending`, `complete`
+  or `terminated`. `termination_cause` is `group_deleted` or
+  `certificate_valid` for a `terminated` row.
+- `waiting.cause` — one of:
+  - `waiting_for_designated_admin` — another admin is designated. `detail`
+    is `rank` (this node waits for its fallback time, `remaining_ms`) or
+    `designated_admin_unsupported` (the designated admin's advert lacks
+    `eviction_handoff_v1`).
+  - `unresolved_designated_admin` — the hand-off has not reached the
+    designated admin yet.
+  - `local_committer_ineligible` — this admin may not seal (demoted,
+    removed, revoked, left, or its own certificate expired).
+  - `waiting_for_durable_intake` — the obligation is not on disk yet; the
+    daemon retries.
+  - `waiting_for_head_sync` — a catch-up round must finish first (for
+    example after a restart).
+  - `waiting_for_member_key_package` — the TreeKEM removal needs the
+    member's KeyPackage; the daemon asks for it.
+  - `waiting_for_fork_resolution` — a competing branch exists. A saved
+    exclusion is kept as evidence and is not published.
+  - `waiting_for_receiver_upgrade` — the crypto-only exclusion of a member
+    that already left is held. `named` lists each Active member whose
+    current verified advert lacks `crypto_exclusion_v1`. The hold ends when
+    each one upgrades, stops being Active, or its advert expires.
+  - `waiting_for_eligible_admin_revocation` — every Admin-or-higher seat is
+    revoked; `named` lists them.
+  - `waiting_for_active_admin` — the roster has no Active admin.
+  - `waiting_for_admin_certificate_renewal` — every other admin's
+    certificate is expired.
+  - `waiting_for_certificate_expiry` — the local clock is not past the
+    certificate's signed `not_after` yet.
+  - `waiting_for_host_commit` — an upgrade trial is running.
+  - `rebuilding_obligation_store` — the `.evs` file is being rebuilt.
+- `receiver_upgrade_members` — on the admin that committed a crypto-only
+  exclusion: each Active member that could not take it yet. `advert` is
+  `lacking` (its current verified advert lacks `crypto_exclusion_v1`; it
+  stays stranded until it upgrades) or `unknown` (no current verified
+  advert; the daemon asked for a refresh). `gap_revision` is the revision
+  it cannot cross.
+- `revocation_eviction_store.state` — `ok`, `rebuilt`,
+  `sidecar_unavailable`, `sidecar_newer_format` or
+  `sidecar_quarantine_failed` (ADR 0108 §5a).
+- `admin_availability` — `null` while an eligible admin exists. When
+  verified revocations cover every Admin-or-higher seat:
+  - `OwnerCertified` groups:
+    `{"state": "waiting_for_eligible_admin_revocation", "revoked_admins": [...], "exit": "owner_recovery"}`.
+  - Other groups, after a catch-up round:
+    `{"state": "group_admin_revoked", "revoked_admins": [...], "exit": "group_admin_revoked", "recreate_offer": {"members": [...], "name": "...", "policy": {...}}}`.
+    The group stays readable. To continue, a member makes a new group with
+    the existing create API and invites the listed members.
+
+**New status codes.**
+
+| Route | Status | Body |
+|---|---|---|
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
+| Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
+| Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
+
+**Wire and capabilities.** The daemon advertises two more ADR 0093
+application bits: `eviction_handoff_v1` (bit 4) and `crypto_exclusion_v1`
+(bit 5). Both new frames ride the direct-message carrier only. They are
+not on the metadata topic and not in a legacy-decoded container:
+
+- `X0XEVH1` — `EvictionHandoffV1`, signed evidence from one admin to the
+  others. It carries no key material.
+- `X0XCE1` — `CryptoExclusionV1`. It removes the retained TreeKEM leaf of
+  a member that is already `Removed`. The roster does not change; the
+  revision and the epoch advance together. The body is signed in domain
+  `x0x.crypto-exclusion.v1`. A daemon sends it only to a member whose
+  current verified advert sets bit 5, and it checks the recipient's agent,
+  machine and binding revocations just before each send. A capable member
+  that asks for TreeKEM catch-up gets held frames on this same carrier.
+
+DM history does not record either frame: they are protocol traffic. A user
+message that only starts with the same letters stays history.
+
 ### Roles
 
 Admin is root for the group. A hostile or compromised Admin can admit members,
