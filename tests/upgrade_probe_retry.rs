@@ -101,6 +101,106 @@ async fn durable_wait_releases_apply_mutex_and_reacquires_it_only_for_the_attemp
 }
 
 #[tokio::test(start_paused = true)]
+async fn long_wait_rereads_durable_expiry_within_one_poll_interval() {
+    let lock = Arc::new(Mutex::new(()));
+    let observed = Arc::new(Notify::new());
+    let expired = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (_notify, mut shutdown) = watch::channel(false);
+    let started = Instant::now();
+    let worker_observed = Arc::clone(&observed);
+    let worker_expired = Arc::clone(&expired);
+    let worker_checks = Arc::clone(&checks);
+    let worker_attempts = Arc::clone(&attempts);
+    let task = tokio::spawn(async move {
+        run_retry_loop(
+            &lock,
+            &mut shutdown,
+            move || {
+                worker_checks.fetch_add(1, Ordering::SeqCst);
+                worker_observed.notify_one();
+                ready(Ok::<_, &'static str>(Some(RetryWait {
+                    delay: if worker_expired.load(Ordering::SeqCst) {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(30 * 60)
+                    },
+                    transaction_id: "same-durable-transaction".to_owned(),
+                })))
+            },
+            move || {
+                worker_attempts.fetch_add(1, Ordering::SeqCst);
+                ready(Ok::<_, &'static str>(42))
+            },
+        )
+        .await
+    });
+    observed.notified().await;
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    // A suspend-inclusive durable clock can expire while Tokio's clock has
+    // advanced only a small amount. The stored deadline remains authoritative.
+    expired.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("the first periodic reread must observe durable expiry");
+    assert_eq!(result.unwrap(), Ok(Some(42)));
+    assert!(checks.load(Ordering::SeqCst) >= 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(started.elapsed() <= Duration::from_secs(30) + Duration::from_millis(2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn superseded_long_wait_stops_on_the_next_durable_reread_without_applying() {
+    let lock = Arc::new(Mutex::new(()));
+    let observed = Arc::new(Notify::new());
+    let superseded = Arc::new(AtomicBool::new(false));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (_notify, mut shutdown) = watch::channel(false);
+    let started = Instant::now();
+    let worker_observed = Arc::clone(&observed);
+    let worker_superseded = Arc::clone(&superseded);
+    let worker_checks = Arc::clone(&checks);
+    let worker_attempts = Arc::clone(&attempts);
+    let task = tokio::spawn(async move {
+        run_retry_loop(
+            &lock,
+            &mut shutdown,
+            move || {
+                worker_checks.fetch_add(1, Ordering::SeqCst);
+                worker_observed.notify_one();
+                ready(Ok::<_, &'static str>(
+                    (!worker_superseded.load(Ordering::SeqCst)).then(|| RetryWait {
+                        delay: Duration::from_secs(120 * 60),
+                        transaction_id: "superseded-durable-transaction".to_owned(),
+                    }),
+                ))
+            },
+            move || {
+                worker_attempts.fetch_add(1, Ordering::SeqCst);
+                ready(Ok::<_, &'static str>(42))
+            },
+        )
+        .await
+    });
+    observed.notified().await;
+    assert_eq!(checks.load(Ordering::SeqCst), 1);
+    superseded.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("supersession must not wait for the original two-hour timer");
+    assert_eq!(result.unwrap(), Ok(None));
+    assert!(checks.load(Ordering::SeqCst) >= 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    assert!(started.elapsed() <= Duration::from_secs(30) + Duration::from_millis(2));
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_during_wait_drops_retry_ownership_without_an_attempt() {
     let install = install_key("shutdown");
     let owner = claim_retry(install.clone(), "9.9.9".to_owned()).unwrap();
