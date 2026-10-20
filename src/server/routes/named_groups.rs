@@ -16682,8 +16682,7 @@ pub(in crate::server) async fn get_named_group(
     retry_pending_owner_cert_joins(&state, Some(&id)).await;
     let members = named_group_member_values(&info);
     // ADR 0110 (D64): the S4 obligations and their typed waits.
-    let (revocation_evictions, revocation_eviction_store) =
-        revocation_eviction::group_status_json(&state, &info).await;
+    let s4_status = revocation_eviction::group_status_json(&state, &info).await;
 
     (
         StatusCode::OK,
@@ -16691,8 +16690,9 @@ pub(in crate::server) async fn get_named_group(
             "ok": true,
             "group_id": info.mls_group_id,
             "membership_state": membership_state,
-            "revocation_evictions": revocation_evictions,
-            "revocation_eviction_store": revocation_eviction_store,
+            "revocation_evictions": s4_status.rows,
+            "revocation_eviction_store": s4_status.store,
+            "admin_availability": s4_status.admin_availability,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
@@ -17524,6 +17524,11 @@ pub(in crate::server) async fn send_group_public_message(
     >,
     Json(req): Json<SendGroupMessageRequest>,
 ) -> impl IntoResponse {
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let kind = match req.kind.as_deref().unwrap_or("chat") {
         "chat" => x0x::groups::GroupPublicMessageKind::Chat,
         "announcement" => x0x::groups::GroupPublicMessageKind::Announcement,
@@ -19497,6 +19502,11 @@ pub(in crate::server) async fn create_group_invite(
     body: Bytes,
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp.into_response();
+    }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
         return resp.into_response();
     }
     let req: CreateInviteRequest = match parse_optional_json(&headers, &body) {
@@ -21677,6 +21687,11 @@ pub(in crate::server) async fn add_named_group_member(
     Json(req): Json<AddNamedGroupMemberRequest>,
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
         return resp;
     }
     // #1116: do not add a member while a revocation carrier is unverified.
@@ -26850,6 +26865,11 @@ pub(in crate::server) async fn seal_group_state(
             return resp;
         }
     }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     // ADR 0110 §2: a seal that would evict a pending S4 target before
     // this node's fallback time is deferred (`waiting_for_designated_admin`).
     if let Some(resp) = revocation_eviction::s4_seal_request_gate(&state, &id).await {
@@ -31978,6 +31998,11 @@ pub(in crate::server) async fn secure_group_encrypt(
     >,
     Json(req): Json<SecureEncryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     // #1166 S2: the entry admission (raw-id lookup 404 with the

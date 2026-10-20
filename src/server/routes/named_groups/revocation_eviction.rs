@@ -831,6 +831,159 @@ pub(in crate::server) async fn s4_seal_request_gate(
     None
 }
 
+// ─── §4 and §4b: no eligible admin (D75, D126) ─────────────────────────────
+
+/// Public status string of the §4b(3) definitive refusal.
+pub(in crate::server) const GROUP_ADMIN_REVOKED: &str = "group_admin_revoked";
+
+/// The derived no-eligible-admin state of one group, when it applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoEligibleAdmin {
+    /// §4, §4b(1)/(2): every member waits (D75); the exit names the
+    /// owner-held path (`owner_recovery`) or, for an ordinary group before
+    /// its catch-up round, the deletion exit.
+    Waiting {
+        revoked_admins: Vec<String>,
+        exit: &'static str,
+    },
+    /// §4b(3): an ordinary group ends locally (D126).
+    GroupAdminRevoked {
+        revoked_admins: Vec<String>,
+        recreate_members: Vec<String>,
+        name: String,
+        policy: serde_json::Value,
+    },
+}
+
+/// Derive the state from the verified revocation records and the verified
+/// head. It is not signed: a later head with an eligible admin clears it
+/// (§4b(3) "late evidence").
+async fn no_eligible_admin_state(state: &AppState, info: &GroupInfo) -> Option<NoEligibleAdmin> {
+    if info.withdrawn {
+        return None;
+    }
+    let admins = active_admins_of(info);
+    if admins.is_empty() {
+        // A genuinely admin-empty roster stays ADR 0088 §2 item 3.
+        return None;
+    }
+    let (revoked, revoked_members): (Vec<[u8; 32]>, BTreeSet<[u8; 32]>) = {
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        let revoked: Vec<[u8; 32]> = admins
+            .iter()
+            .copied()
+            .filter(|id| set.is_agent_revoked(&x0x::identity::AgentId(*id)))
+            .collect();
+        let members: BTreeSet<[u8; 32]> = info
+            .active_members()
+            .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
+            .map(|agent| *agent.as_bytes())
+            .filter(|id| set.is_agent_revoked(&x0x::identity::AgentId(*id)))
+            .collect();
+        (revoked, members)
+    };
+    if revoked.len() != admins.len() {
+        return None;
+    }
+    let mut revoked_admins: Vec<String> = revoked.iter().map(hex::encode).collect();
+    revoked_admins.sort();
+    if owner_certified(info) {
+        return Some(NoEligibleAdmin::Waiting {
+            revoked_admins,
+            exit: "owner_recovery",
+        });
+    }
+    // §4b(3): derive the end only after a current catch-up round (§2).
+    if !state.revocation_evictions.head_synced(Instant::now()) {
+        return Some(NoEligibleAdmin::Waiting {
+            revoked_admins,
+            exit: GROUP_ADMIN_REVOKED,
+        });
+    }
+    let mut recreate_members: Vec<String> = info
+        .active_members()
+        .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
+        .filter(|agent| !revoked_members.contains(agent.as_bytes()))
+        .map(|agent| hex::encode(agent.as_bytes()))
+        .collect();
+    recreate_members.sort();
+    Some(NoEligibleAdmin::GroupAdminRevoked {
+        revoked_admins,
+        recreate_members,
+        name: info.name.clone(),
+        policy: serde_json::to_value(&info.policy).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn no_eligible_admin_json(state: &NoEligibleAdmin) -> serde_json::Value {
+    match state {
+        NoEligibleAdmin::Waiting {
+            revoked_admins,
+            exit,
+        } => serde_json::json!({
+            "state": WaitingCause::WaitingForEligibleAdminRevocation.as_str(),
+            "revoked_admins": revoked_admins,
+            "exit": exit,
+        }),
+        NoEligibleAdmin::GroupAdminRevoked {
+            revoked_admins,
+            recreate_members,
+            name,
+            policy,
+        } => serde_json::json!({
+            "state": GROUP_ADMIN_REVOKED,
+            "revoked_admins": revoked_admins,
+            "exit": GROUP_ADMIN_REVOKED,
+            "recreate_offer": {
+                "members": recreate_members,
+                "name": name,
+                "policy": policy,
+            },
+        }),
+    }
+}
+
+/// §4 (D75) and §4b(3) (D126): while verified Agent-subject revocations
+/// cover every Admin-or-higher Active seat, member sends, admission,
+/// invites, seals and key delivery are refused with the typed state, so no
+/// new message reaches a revoked key. Returns the refusal, or `None`.
+pub(in crate::server) async fn s4_no_eligible_admin_refusal(
+    state: &Arc<AppState>,
+    group_key: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_key)
+            .or_else(|| {
+                groups.values().find(|info| {
+                    info.stable_group_id() == group_key || info.mls_group_id == group_key
+                })
+            })?
+            .clone()
+    };
+    let derived = no_eligible_admin_state(state, &info).await?;
+    let (status, reason) = match &derived {
+        NoEligibleAdmin::Waiting { .. } => (
+            StatusCode::CONFLICT,
+            WaitingCause::WaitingForEligibleAdminRevocation.as_str(),
+        ),
+        NoEligibleAdmin::GroupAdminRevoked { .. } => (StatusCode::GONE, GROUP_ADMIN_REVOKED),
+    };
+    let mut body = no_eligible_admin_json(&derived);
+    if let Some(object) = body.as_object_mut() {
+        object.insert("ok".into(), serde_json::Value::Bool(false));
+        object.insert("error".into(), serde_json::Value::String(reason.into()));
+        object.insert("reason".into(), serde_json::Value::String(reason.into()));
+        object.insert(
+            "group_id".into(),
+            serde_json::Value::String(info.stable_group_id().to_string()),
+        );
+    }
+    Some((status, Json(body)))
+}
+
 // ─── §3 commit ─────────────────────────────────────────────────────────────
 
 /// Run every commit the last evaluation allows (§3). Each runs through the
@@ -1422,9 +1575,36 @@ fn waiting_json(waiting: &WaitingState) -> serde_json::Value {
     })
 }
 
-/// The S4 rows of one group for `GET /groups/:id` (`revocation_evictions`)
-/// and the sidecar state (`revocation_eviction_store`).
+/// The S4 public status of one group for `GET /groups/:id`.
+pub(in crate::server) struct GroupS4Status {
+    /// `revocation_evictions`: one entry per obligation row.
+    pub(in crate::server) rows: serde_json::Value,
+    /// `revocation_eviction_store`: the `.evs` sidecar state.
+    pub(in crate::server) store: serde_json::Value,
+    /// `admin_availability`: the derived §4/§4b state, `null` while an
+    /// eligible admin exists.
+    pub(in crate::server) admin_availability: serde_json::Value,
+}
+
+/// The S4 rows of one group, the sidecar state and the §4 admin state.
 pub(in crate::server) async fn group_status_json(
+    state: &AppState,
+    info: &GroupInfo,
+) -> GroupS4Status {
+    let admin_availability = no_eligible_admin_state(state, info)
+        .await
+        .map_or(serde_json::Value::Null, |derived| {
+            no_eligible_admin_json(&derived)
+        });
+    let (rows, store) = group_rows_json(state, info).await;
+    GroupS4Status {
+        rows,
+        store,
+        admin_availability,
+    }
+}
+
+async fn group_rows_json(
     state: &AppState,
     info: &GroupInfo,
 ) -> (serde_json::Value, serde_json::Value) {
