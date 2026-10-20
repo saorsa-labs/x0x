@@ -1538,7 +1538,6 @@ pub(in crate::server) async fn apply_upgrade(
         }
     };
 
-    let stop_on_upgrade = state.update_config.stop_on_upgrade;
     let restart_context = RestartContext {
         data_dir: Some(state.data_dir.clone()),
         api_addr: Some(state.api_address),
@@ -1547,18 +1546,9 @@ pub(in crate::server) async fn apply_upgrade(
             &state.shutdown_tx,
         )),
     };
-    // RC4: HTTP-only crate-internal deferred-restart opt-in. apply.rs owns the
-    // ~750 ms deferred restart at admission; do not schedule a second owner here.
-    let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-        .with_stop_on_upgrade(stop_on_upgrade)
-        .with_restart_on_success(false)
-        .with_http_deferred_restart(true)
-        .with_restart_context(restart_context);
-
-    match upgrader
-        .apply_upgrade_from_manifest(&release.manifest)
-        .await
-    {
+    let (upgrader, result) =
+        apply_http_release(&state.update_config, restart_context, &release.manifest).await;
+    match result {
         Ok(x0x::upgrade::UpgradeResult::Success { version }) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1604,6 +1594,28 @@ pub(in crate::server) async fn apply_upgrade(
             )
         }
     }
+}
+
+/// The actual verified HTTP apply operation. The route retains its existing
+/// apply guard through response and retry handling; deferred restart custody
+/// stays inside the real installer.
+async fn apply_http_release(
+    config: &DaemonUpdateConfig,
+    restart_context: RestartContext,
+    manifest: &ReleaseManifest,
+) -> (
+    AutoApplyUpgrader,
+    Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) {
+    // RC4: HTTP-only crate-internal deferred-restart opt-in. apply.rs owns the
+    // ~750 ms deferred restart at admission; do not schedule a second owner here.
+    let upgrader = AutoApplyUpgrader::new("x0xd")
+        .with_stop_on_upgrade(config.stop_on_upgrade)
+        .with_restart_on_success(false)
+        .with_http_deferred_restart(true)
+        .with_restart_context(restart_context);
+    let result = upgrader.apply_upgrade_from_manifest(manifest).await;
+    (upgrader, result)
 }
 
 /// Legacy helper retained for planner-parity unit tests. Production HTTP apply
