@@ -1392,6 +1392,13 @@ mod tests {
     staging_regression_tests!();
     #[cfg(unix)]
     staging_runtime_regression_tests!();
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging_canonical.rs"
+    ));
+    #[cfg(unix)]
+    staging_canonical_regression_tests!();
 
     use super::*;
     use crate::upgrade::restart;
