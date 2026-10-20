@@ -361,6 +361,12 @@ impl OwnerTrust {
 
     /// [`Self::grant_access`] with an explicit clock (ADR-0074 §4 re-check).
     ///
+    /// After the contact-store await, the effective clock is
+    /// `max(now_unix, wall)`. A caller stamp captured before earlier awaits
+    /// (`evaluate_pair_with`, discovery reads) cannot admit a grant that
+    /// expired during those waits, while a reauth / test clock that runs
+    /// ahead of wall time (paused tokio) is preserved.
+    ///
     /// With `allow_evidence_lookup = false` the evaluation still reads local
     /// usable evidence but skips EvidenceV1 wait/lookup, so a reauth pass
     /// stays inside the ADR-0074 five-second bound.
@@ -390,10 +396,9 @@ impl OwnerTrust {
     /// Shared body for [`Self::grant_access`] / [`Self::grant_access_at`].
     ///
     /// `now_unix = None` means wall clock after the first contact-store
-    /// read. A grant that expires while that read awaits a contended write
-    /// lock must be judged at the later time; capturing the clock before
-    /// the await would still admit it. An explicit `Some` keeps reauth and
-    /// tests on a frozen clock.
+    /// read. `Some(n)` becomes `max(n, wall)` after that read so a stale
+    /// caller stamp cannot outlive the grant across an await, while a
+    /// paused-tokio reauth clock ahead of wall still drives expiry.
     #[allow(clippy::too_many_arguments)]
     async fn grant_access_at_inner(
         &self,
@@ -415,9 +420,12 @@ impl OwnerTrust {
                 machine_id,
             })
         };
-        // Wall clock after the contact-store await: Instant adjustment
-        // inside evaluate starts too late to cover this wait.
-        let now_unix = now_unix.unwrap_or_else(unix_now_secs);
+        // Wall clock after the contact-store await. Instant adjustment
+        // inside evaluate starts too late to cover this wait. `max` with a
+        // caller stamp closes the stale-Some admission path without
+        // discarding paused-tokio reauth clocks (Codex P2 / #1488 RC9).
+        let wall = unix_now_secs();
+        let now_unix = now_unix.map_or(wall, |n| n.max(wall));
         let rejected = |decision: TrustDecision| {
             matches!(
                 decision,

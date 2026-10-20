@@ -1349,6 +1349,8 @@ async fn grant_access_denies_grant_that_expired_during_contact_lock_wait() {
     let cache = Arc::new(RwLock::new(HashMap::new()));
     let revocations = Arc::new(RwLock::new(RevocationSet::new()));
 
+    // Control: grant_access_at uses max(t0, wall) after the contact read;
+    // t0 ≈ now so the short-lived grant still admits.
     let live = trust
         .grant_access_at(
             &contacts,

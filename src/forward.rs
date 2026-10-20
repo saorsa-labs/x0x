@@ -4013,4 +4013,132 @@ mod tests {
         };
         assert_eq!(refuse_outcome, "PeerRejectedV2");
     }
+
+    /// WHY (Codex P2 on #1488 RC9): forward admission must not evaluate a
+    /// grant against a clock captured before lock waits. `authorize_attested_opener`
+    /// awaits `evaluate_pair_with` (contact-store read) then calls
+    /// `grant_access_at` with `ctx.now_ms`; a grant that expires during that
+    /// wait must be denied, not admitted on the stale timestamp.
+    #[tokio::test]
+    async fn authorize_attested_opener_denies_grant_expired_during_contact_lock_wait() {
+        use crate::connect::acl::ConnectOwnerEntry;
+        use crate::identity::{MachineKeypair, UserKeypair};
+        use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+        use std::time::Duration;
+
+        let owner = UserKeypair::generate().expect("owner keygen");
+        let local_agent = AgentKeypair::generate().expect("local agent").agent_id();
+        let remote_kp = AgentKeypair::generate().expect("remote agent");
+        let remote_agent = remote_kp.agent_id();
+        let remote_machine = MachineKeypair::generate()
+            .expect("remote machine")
+            .machine_id();
+
+        let t0 = now_ms() / 1000;
+        let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            remote_agent,
+            remote_machine,
+            t0,
+        )
+        .await;
+        let trust = crate::owner_trust::OwnerTrust::new(Some(owner.user_id()), bindings);
+
+        let grants = Arc::new(ShareGrantStore::in_memory(
+            local_agent,
+            Some(owner.user_id()),
+        ));
+        let expiry = t0 + 2;
+        let grant = ShareGrant::sign(
+            &owner,
+            [0xA2; 32],
+            Grantee::Agent(remote_agent),
+            vec![local_agent],
+            vec![ShareCap::Connect { ports: vec![22] }],
+            t0.saturating_sub(60),
+            expiry,
+        )
+        .expect("sign short-lived grant");
+        grants.accept(grant, t0).await.expect("accept grant");
+        trust.install_share_grant_store(grants);
+
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let policy = ConnectPolicy::Enabled(ConnectAcl {
+            loaded_from: "test".into(),
+            loaded_at_unix_ms: 0,
+            allow: Vec::new(),
+            owner_allow: Vec::new(),
+            grant_allow: vec![ConnectOwnerEntry {
+                description: None,
+                targets: vec![target],
+            }],
+        });
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let contacts = Arc::new(tokio::sync::RwLock::new(ContactStore::new(
+            dir.path().join("contacts.json"),
+        )));
+        let cache = cache_with_agent(&remote_kp, remote_machine);
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let move_state = Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new()));
+
+        // Stale clock captured before the contact-store wait (the bug).
+        let ctx = AttestationVerifyCtx {
+            discovery_cache: Arc::clone(&cache),
+            contact_store: Arc::clone(&contacts),
+            own_machine_id: MachineId([0x0A; 32]),
+            now_ms: t0.saturating_mul(1000),
+            revocation_set: Arc::clone(&revocations),
+            move_state: Arc::clone(&move_state),
+            owner_trust: trust.clone(),
+            local_authority_only: false,
+        };
+
+        let live =
+            authorize_attested_opener(&remote_agent, &remote_machine, &target, &policy, &ctx).await;
+        assert!(
+            live.is_ok(),
+            "control: grant must admit Connect at T0: {live:?}"
+        );
+
+        let held = contacts.write().await;
+        let pending = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let contacts = Arc::clone(&contacts);
+            let revocations = Arc::clone(&revocations);
+            let move_state = Arc::clone(&move_state);
+            let trust = trust.clone();
+            let policy = policy.clone();
+            async move {
+                let ctx = AttestationVerifyCtx {
+                    discovery_cache: cache,
+                    contact_store: contacts,
+                    own_machine_id: MachineId([0x0A; 32]),
+                    now_ms: t0.saturating_mul(1000),
+                    revocation_set: revocations,
+                    move_state,
+                    owner_trust: trust,
+                    local_authority_only: false,
+                };
+                authorize_attested_opener(&remote_agent, &remote_machine, &target, &policy, &ctx)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let wall = now_ms() / 1000;
+        let past_expiry = Duration::from_secs(expiry.saturating_sub(wall).saturating_add(1));
+        tokio::time::sleep(past_expiry).await;
+        drop(held);
+
+        let denied = pending.await.expect("authorize task");
+        assert!(
+            denied.is_err(),
+            "grant that expired during contact-lock wait must not admit: {denied:?}"
+        );
+    }
 }

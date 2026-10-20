@@ -1618,6 +1618,54 @@ async fn kick_late_in_long_pass_spacing_respects_event_deadline() {
     let _ = holder.await;
 }
 
+/// Binding layout for owner-trust Busy/reauth fixtures (RC7–RC9).
+///
+/// Discovery-cert stripping follows what owner trust still needs from
+/// evidence under that mode: announced-only keeps the discovery cert
+/// (pairing still needs usable evidence — the Codex P2 miss); authenticated
+/// and both strip it so the cert path still consults the store.
+#[derive(Clone, Copy, Debug)]
+enum OwnerEvidenceBindingMode {
+    /// No peer binding; discovery cert present (RC7 Busy path).
+    None,
+    /// Announced binding only; discovery cert present (pairing needs evidence).
+    AnnouncedOnly,
+    /// Authenticated binding only; discovery cert stripped (cert needs evidence).
+    AuthenticatedOnly,
+    /// Both announced + authenticated; discovery cert stripped (cert needs evidence).
+    Both,
+}
+
+impl OwnerEvidenceBindingMode {
+    fn strip_discovery_cert(self) -> bool {
+        matches!(self, Self::AuthenticatedOnly | Self::Both)
+    }
+
+    fn store_dir(self) -> &'static str {
+        match self {
+            Self::None => "evidence-owner-reauth-busy",
+            Self::AnnouncedOnly => "evidence-owner-reauth-busy-announced",
+            Self::AuthenticatedOnly => "evidence-owner-reauth-busy-bound",
+            Self::Both => "evidence-owner-reauth-busy-both",
+        }
+    }
+
+    fn admit_expect(self) -> &'static str {
+        match self {
+            Self::None => "owner stream must admit on enrolled evidence without binding",
+            Self::AnnouncedOnly => {
+                "owner stream must admit with announced binding, discovery cert, and evidence pairing"
+            }
+            Self::AuthenticatedOnly => {
+                "owner stream must admit with authenticated binding and evidence cert (no discovery cert)"
+            }
+            Self::Both => {
+                "owner stream must admit with both bindings and evidence cert (no discovery cert)"
+            }
+        }
+    }
+}
+
 /// Owner-trust stream admitted on enrolled evidence without an authenticated
 /// binding (RC7 busy/deadline fixtures). Returns the world, live stream, the
 /// ready evidence store (for `hold_state_for_testing`), and the live
@@ -1629,7 +1677,7 @@ async fn owner_evidence_reauth_fixture() -> (
     Arc<crate::peer_evidence::PeerEvidenceStore>,
     Arc<crate::peer_evidence::EvidenceRuntime>,
 ) {
-    owner_evidence_reauth_fixture_at(false).await
+    owner_evidence_reauth_fixture_at(OwnerEvidenceBindingMode::None).await
 }
 
 /// Same as [`owner_evidence_reauth_fixture`], but with an authenticated
@@ -1641,14 +1689,13 @@ async fn owner_evidence_bound_no_discovery_cert_reauth_fixture() -> (
     Arc<crate::peer_evidence::PeerEvidenceStore>,
     Arc<crate::peer_evidence::EvidenceRuntime>,
 ) {
-    owner_evidence_reauth_fixture_at(true).await
+    owner_evidence_reauth_fixture_at(OwnerEvidenceBindingMode::AuthenticatedOnly).await
 }
 
-/// `binding_present_no_discovery_cert`: record an authenticated binding and
-/// strip `agent_certificate` from discovery so owner trust still reads the
-/// cert from evidence. Otherwise clear bindings (RC7 no-binding Busy path).
+/// Configure peer bindings and (optionally) strip discovery cert so reauth
+/// still needs the evidence store under the given [`OwnerEvidenceBindingMode`].
 async fn owner_evidence_reauth_fixture_at(
-    binding_present_no_discovery_cert: bool,
+    mode: OwnerEvidenceBindingMode,
 ) -> (
     World,
     LiveStreamGuard,
@@ -1679,7 +1726,7 @@ async fn owner_evidence_reauth_fixture_at(
         .write()
         .await
         .insert(peer, discovered(&agent_kp, machine, cert.clone()));
-    if binding_present_no_discovery_cert {
+    if mode.strip_discovery_cert() {
         if let Some(entry) = w.cache.write().await.get_mut(&peer) {
             entry.agent_certificate = None;
         }
@@ -1752,14 +1799,9 @@ async fn owner_evidence_reauth_fixture_at(
         w.trust.clone(),
         Arc::clone(&w.revocations),
     ));
-    let store_dir = if binding_present_no_discovery_cert {
-        "evidence-owner-reauth-busy-bound"
-    } else {
-        "evidence-owner-reauth-busy"
-    };
     let store = Arc::new(
         PeerEvidenceStore::open(
-            &w.dir.path().join(store_dir),
+            &w.dir.path().join(mode.store_dir()),
             EvidenceConfig::default(),
             policy,
             now_ms,
@@ -1775,38 +1817,84 @@ async fn owner_evidence_reauth_fixture_at(
     );
     w.trust.install_evidence(&evidence);
 
-    if binding_present_no_discovery_cert {
-        crate::dm_inbox::record_authenticated_machine_binding(
-            &w.authenticated,
-            peer,
-            machine,
-            w.base_secs,
-        )
-        .await;
-        assert!(
-            w.cache
-                .read()
-                .await
-                .get(&peer)
-                .and_then(|e| e.agent_certificate.as_ref())
-                .is_none(),
-            "control: discovery must lack agent_certificate so cert comes from evidence"
-        );
-    } else {
-        let mut bind = w.authenticated.write().await;
-        // Keep change_notify installed (World wires ADR-0074 reauth wake).
-        bind.clear_for_test();
+    // Keep change_notify installed (World wires ADR-0074 reauth wake).
+    {
+        let mut auth = w.authenticated.write().await;
+        auth.clear_for_test();
+    }
+    {
+        let mut ann = w.announced.write().await;
+        ann.clear_for_test();
+    }
+    match mode {
+        OwnerEvidenceBindingMode::None => {}
+        OwnerEvidenceBindingMode::AnnouncedOnly => {
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &w.announced,
+                peer,
+                machine,
+                w.base_secs,
+            )
+            .await;
+            assert!(
+                w.cache
+                    .read()
+                    .await
+                    .get(&peer)
+                    .and_then(|e| e.agent_certificate.as_ref())
+                    .is_some(),
+                "control: announced-only keeps discovery cert (pairing still needs evidence)"
+            );
+        }
+        OwnerEvidenceBindingMode::AuthenticatedOnly => {
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &w.authenticated,
+                peer,
+                machine,
+                w.base_secs,
+            )
+            .await;
+            assert!(
+                w.cache
+                    .read()
+                    .await
+                    .get(&peer)
+                    .and_then(|e| e.agent_certificate.as_ref())
+                    .is_none(),
+                "control: discovery must lack agent_certificate so cert comes from evidence"
+            );
+        }
+        OwnerEvidenceBindingMode::Both => {
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &w.authenticated,
+                peer,
+                machine,
+                w.base_secs,
+            )
+            .await;
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &w.announced,
+                peer,
+                machine,
+                w.base_secs,
+            )
+            .await;
+            assert!(
+                w.cache
+                    .read()
+                    .await
+                    .get(&peer)
+                    .and_then(|e| e.agent_certificate.as_ref())
+                    .is_none(),
+                "control: discovery must lack agent_certificate so cert comes from evidence"
+            );
+        }
     }
 
     let gate = w.inbound(peer, machine);
-    let authority =
-        check_gate(&gate, &w.ctx())
-            .await
-            .expect(if binding_present_no_discovery_cert {
-                "owner stream must admit with binding and evidence cert (no discovery cert)"
-            } else {
-                "owner stream must admit on enrolled evidence without binding"
-            });
+    let authority = check_gate(&gate, &w.ctx())
+        .await
+        .unwrap_or_else(|_| panic!("{}", mode.admit_expect()));
     assert_eq!(authority, StreamAuthority::OwnerTrust);
     let stream = w.live.register(gate, authority);
     (w, stream, store, evidence)
@@ -1968,4 +2056,138 @@ async fn reauth_bound_no_discovery_cert_evidence_busy_through_deadline_tears_dow
 
     let _ = release_tx.send(());
     let _ = holder.join();
+}
+
+/// Shared Busy-resolves body for RC9 binding-mode matrix.
+async fn reauth_binding_mode_busy_resolves_inside_budget(
+    mode: OwnerEvidenceBindingMode,
+    label: &str,
+) {
+    let (w, stream, store, _evidence) = owner_evidence_reauth_fixture_at(mode).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "busy alone must not tear down before the deadline ({label})"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "stream must survive after contention clears inside the budget ({label})"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+    assert!(w.reasons().is_empty());
+
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "post-release reauth must keep the still-authorized stream ({label})"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
+/// Shared Busy-through-deadline body for RC9 binding-mode matrix.
+async fn reauth_binding_mode_busy_through_deadline(mode: OwnerEvidenceBindingMode, label: &str) {
+    let (w, stream, store, _evidence) = owner_evidence_reauth_fixture_at(mode).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    let started = Instant::now();
+    w.kick.notify_waiters();
+    closes_within(&stream, EVENT_BOUND + Duration::from_millis(250)).await;
+    assert!(
+        started.elapsed() <= EVENT_BOUND,
+        "busy-through-deadline teardown exceeded EVENT_BOUND ({label}: {:?})",
+        started.elapsed()
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 1);
+    assert_eq!(w.reasons().get("reauth_deadline"), Some(&1));
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+}
+
+/// Codex P2 / RC9: announced-only + discovery cert still needs evidence for
+/// pairing. Contention that clears inside the budget must not tear down.
+#[tokio::test(start_paused = true)]
+async fn reauth_announced_only_with_discovery_cert_evidence_busy_resolves_inside_budget_stream_survives(
+) {
+    reauth_binding_mode_busy_resolves_inside_budget(
+        OwnerEvidenceBindingMode::AnnouncedOnly,
+        "announced-only + discovery cert",
+    )
+    .await;
+}
+
+/// Codex P2 / RC9: announced-only + discovery cert, evidence held through the
+/// deadline → `reauth_deadline` (must not skip Busy / immediate deny).
+#[tokio::test(start_paused = true)]
+async fn reauth_announced_only_with_discovery_cert_evidence_busy_through_deadline_tears_down() {
+    reauth_binding_mode_busy_through_deadline(
+        OwnerEvidenceBindingMode::AnnouncedOnly,
+        "announced-only + discovery cert",
+    )
+    .await;
+}
+
+/// Codex P2 / RC9: authenticated-only, discovery cert stripped — same Busy
+/// path as RC8, exercised via the binding-mode fixture.
+#[tokio::test(start_paused = true)]
+async fn reauth_authenticated_only_no_discovery_cert_evidence_busy_resolves_inside_budget_stream_survives(
+) {
+    reauth_binding_mode_busy_resolves_inside_budget(
+        OwnerEvidenceBindingMode::AuthenticatedOnly,
+        "authenticated-only no discovery cert",
+    )
+    .await;
+}
+
+/// Codex P2 / RC9: authenticated-only, discovery cert stripped, held through
+/// deadline → `reauth_deadline`.
+#[tokio::test(start_paused = true)]
+async fn reauth_authenticated_only_no_discovery_cert_evidence_busy_through_deadline_tears_down() {
+    reauth_binding_mode_busy_through_deadline(
+        OwnerEvidenceBindingMode::AuthenticatedOnly,
+        "authenticated-only no discovery cert",
+    )
+    .await;
+}
+
+/// Codex P2 / RC9: both announced + authenticated, discovery cert stripped so
+/// cert still needs evidence. Contention clears inside budget → survive.
+#[tokio::test(start_paused = true)]
+async fn reauth_both_bindings_no_discovery_cert_evidence_busy_resolves_inside_budget_stream_survives(
+) {
+    reauth_binding_mode_busy_resolves_inside_budget(
+        OwnerEvidenceBindingMode::Both,
+        "both bindings no discovery cert",
+    )
+    .await;
+}
+
+/// Codex P2 / RC9: both bindings, discovery cert stripped, held through
+/// deadline → `reauth_deadline`.
+#[tokio::test(start_paused = true)]
+async fn reauth_both_bindings_no_discovery_cert_evidence_busy_through_deadline_tears_down() {
+    reauth_binding_mode_busy_through_deadline(
+        OwnerEvidenceBindingMode::Both,
+        "both bindings no discovery cert",
+    )
+    .await;
 }
