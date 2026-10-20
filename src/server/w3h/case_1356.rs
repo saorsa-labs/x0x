@@ -24,7 +24,16 @@
 //!   never marked. The base ([`CAUSE_ALIGNED`]): the frontier gate queues
 //!   the add as `revision_gap`, the r+1 page needs a TreeKEM group that a
 //!   pre-Welcome joiner does not have, and the attempt ends with J not
-//!   active and never marked.
+//!   active and never marked. J's direct messages carry
+//!   [`JOINER_DM_LATENCY`]: on the base, J asks A and M1 for the next
+//!   catch-up page each time a truncated page arrives, with no throttle
+//!   (`request_treekem_catchup_page` after `was_truncated`), and it never
+//!   applies the page, so the loop runs at the fabric's round-trip time.
+//!   In CI run 39500376563, J sent about 8,200 requests to each of A and
+//!   M1 in 71 s of virtual time (about 186 MB of responses from A), and
+//!   the run cost about 3 s of real time per virtual second, past
+//!   nextest's 300 s kill. The latency slows that loop; it is a WAN-like
+//!   delay and changes no ordering (each lane stays FIFO).
 //!
 //! - `s3_attestation_touches_only_the_subject` (H-S3-d1 in part, D41;
 //!   control, GREEN on the base and with S3). Setup S0 (skewed clocks,
@@ -99,6 +108,11 @@ const CAUSE_ALIGNED: &str = "J is never marked and is not active at the end: the
                              and the join attempt ends with no typed state";
 
 /// The WARN line the frontier gate writes when it queues an event.
+/// Extra one-way latency on J's direct messages in the aligned arm (see
+/// the module notes): it bounds the base's next-page loop so the run fits
+/// nextest's kill.
+const JOINER_DM_LATENCY: Duration = Duration::from_millis(100);
+
 /// Real-time limit for a join arm's scenario, below nextest's 300 s kill
 /// (`slow-timeout` 60 s x 5 in the `w3h-gate` profile), so a slow run
 /// still writes its receipt (INFRA) with what it saw. In CI run
@@ -452,6 +466,20 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     progress(sim, started, "removal resends done");
     let a_recovery_before = status(sim, "A", &group).await?.map(|st| st.recovery);
     let m1_recovery_before = status(sim, "M1", &group).await?.map(|st| st.recovery);
+    if !arm.skew() {
+        use crate::network::sim::{Fault, LaneClass};
+        let joiner = sim.peer("J")?.0;
+        sim.fabric().add_rule(move |write| {
+            if write.lane.src == joiner && write.lane.class == LaneClass::Direct {
+                Fault::Delay(JOINER_DM_LATENCY)
+            } else {
+                Fault::Pass
+            }
+        });
+        sim.fabric().mark(format!(
+            "fault: J's direct messages delayed {JOINER_DM_LATENCY:?}"
+        ));
+    }
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
     join(sim, "J", &link).await?;
     let j_hex = sim.agent_hex("J")?;
@@ -624,8 +652,11 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     let queued = sim.logs_containing(&[QUEUED_LOG, "revision_gap"]).len();
     receipt.note(format!(
         "arm={arm:?} at the end: J {j_status_text}; J {j_text}; A {}; \
-         J marked: {j_marked:?}; revision_gap queue WARN lines: {queued}",
-        a.describe()
+         J marked: {j_marked:?}; revision_gap queue WARN lines: {queued}; \
+         J frames since the join: to A {}, to M1 {}",
+        a.describe(),
+        delivered_after(sim, "J", "A", joined_at)?,
+        delivered_after(sim, "J", "M1", joined_at)?
     ));
     receipt.note(format!(
         "bystanders: M1 {}; marked: {bystander_marked:?}; max revision {max_revision} \
