@@ -1770,15 +1770,15 @@ pub async fn serve_with_options(
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
-    // Independent of self_update_enabled, but retained recovery records prevent
-    // cleanup: an old or unknown record may refer to any of these artifacts.
+    // Independent of self_update_enabled, but pending or unknown recovery
+    // records prevent cleanup. A validated legacy-only handoff can permit it.
     // Never delete recovery material merely to make configured startup succeed.
     let upgrade_record_root = config.data_dir.clone();
     bg_tasks.push(tokio::spawn(async move {
         let removed = x0x::history::run_blocking(move || {
             let exe = x0x::upgrade::apply::current_binary_path().ok()?;
             let dir = exe.parent()?.to_path_buf();
-            Some(crate::upgrade::journal::sweep_if_no_records(
+            Some(crate::upgrade::journal::sweep_if_no_pending_records(
                 &upgrade_record_root,
                 || x0x::upgrade::sweep_stale_upgrade_artifacts(&dir, Duration::from_secs(3600)),
             ))

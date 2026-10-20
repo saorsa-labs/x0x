@@ -3841,7 +3841,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn supervised_intent_json_records_the_verified_launchd_domain() {
         // #671: `gui/<uid>` and `user/<uid>` are disjoint, so the intent
@@ -4104,7 +4103,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn handoff_json_round_trips() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5566,7 +5564,6 @@ mod tests {
         assert!(plan.systemd_verified.is_none());
     }
 
-    #[cfg(unix)]
     #[test]
     fn handoff_roundtrips_systemd_verified_unit() {
         let dir = tempfile::tempdir().expect("tempdir");

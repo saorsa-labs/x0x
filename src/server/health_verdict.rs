@@ -444,7 +444,7 @@ pub(in crate::server) async fn sample_verdict_inputs(
 // Use fixed text: parser errors can contain data copied from a local record.
 fn recovery_record_diagnostic(data_dir: &Path) -> Option<String> {
     crate::upgrade::journal::read_boot_records(data_dir)
-        .has_records()
+        .blocks_apply()
         .then(|| {
             "upgrade recovery records require reconciliation; protection \
              unprotected/degraded; records preserved"
@@ -1748,6 +1748,40 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains(crate::upgrade::restart::HANDOFF_FILE_NAME)));
+    }
+
+    #[test]
+    fn legacy_handoff_keeps_restart_pending_health_detail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(crate::upgrade::restart::HANDOFF_FILE_NAME);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "from_version": "0.48.0",
+            "to_version": "0.48.1",
+            "target_path": dir.path().join("x0xd"),
+            "backup_path": dir.path().join("x0xd.backup"),
+            "argv": ["x0xd"],
+            "cwd": dir.path(),
+            "env": {},
+            "old_pid": 123,
+            "api_addr": "127.0.0.1:12700",
+            "started_at": 1,
+            "mode": "SupervisedExit"
+        }))
+        .unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let snapshot = initial_health_snapshot(dir.path()).verdict_sample();
+        assert!(snapshot.upgrade_record_diagnostic.is_none());
+        assert!(snapshot.upgrade_handoff_pending);
+        let mut inputs = sample();
+        inputs.upgrade_handoff_pending = snapshot.upgrade_handoff_pending;
+        inputs.upgrade_record_diagnostic = snapshot.upgrade_record_diagnostic;
+        let verdict = classify(&inputs);
+        assert_eq!(verdict.inputs.upgrade.state, "degraded");
+        assert!(verdict
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("restart pending")));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
