@@ -158,12 +158,9 @@ impl World {
         // grant expiry with the reauth clock (RC10 construction-injected clock).
         let start = Instant::now();
         let trust = OwnerTrust::new(Some(owner_a.user_id()), Arc::clone(&authenticated))
-            .with_clock({
-                let start = start;
-                Arc::new(move || {
-                    base_secs.saturating_add(u64::try_from(start.elapsed().as_secs()).unwrap_or(0))
-                })
-            });
+            .with_clock(Arc::new(move || {
+                base_secs.saturating_add(start.elapsed().as_secs())
+            }));
         trust.install_announced_bindings(Arc::clone(&announced));
         trust.install_device_store(Arc::clone(&devices));
         trust.install_share_grant_store(Arc::clone(&grants));
@@ -2451,4 +2448,277 @@ async fn reauth_multi_agent_coresident_evidence_busy_through_deadline_tears_down
 
     let _ = release_tx.send(());
     let _ = holder.join();
+}
+
+/// RC11: pairing rests only on ADR 0089 evidence (no announced/authenticated
+/// binding). Trusted contact supplies Accept; stream authority is PeerTrust
+/// (outbound) or exact-ACL AclEntry (inbound) — not OwnerTrust/Grant. Cert is
+/// issued by user_b so owner-trust promotion fails closed; enrollment exists
+/// only so Hello ingest is relationship-allowed. Outbound reauth hits
+/// `authority_confirms` Busy first (Codex); inbound may Busy from
+/// `evaluate_pair`'s no-binding usable probe and/or `authority_confirms`.
+#[derive(Clone, Copy, Debug)]
+enum EvidenceOnlyTrustedContactGate {
+    /// Outbound PeerTrust stream to an evidence-only trusted peer.
+    Outbound,
+    /// Inbound attested stream admitted by exact ACL + Trusted (no owner/grant).
+    Inbound,
+}
+
+/// Trusted contact whose machine pairing confirms only via ADR 0089 evidence.
+/// No announced/authenticated binding, no ShareGrant, owner/grant ACL off —
+/// so contention cannot skip the Busy path via a binding or OwnerTrust/Grant
+/// stream authority.
+async fn evidence_only_trusted_contact_reauth_fixture(
+    gate_kind: EvidenceOnlyTrustedContactGate,
+) -> (
+    World,
+    LiveStreamGuard,
+    Arc<crate::peer_evidence::PeerEvidenceStore>,
+    Arc<crate::peer_evidence::EvidenceRuntime>,
+) {
+    use crate::peer_evidence::{
+        EvidenceConfig, EvidenceRuntime, IngestSource, PeerEvidenceStore, RuntimePolicy,
+    };
+
+    let w = World::new().await;
+
+    let agent_kp = AgentKeypair::generate().unwrap();
+    let machine_kp = MachineKeypair::generate().unwrap();
+    let peer = agent_kp.agent_id();
+    let machine = machine_kp.machine_id();
+    // user_b cert: enrolled for ingest only; must not owner-trust-promote.
+    let cert = AgentCertificate::issue(&w.user_b, &agent_kp).unwrap();
+    w.devices
+        .enroll(OwnerEnrollment::sign(machine, &w.owner_a, w.base_secs * 1000, None).unwrap())
+        .await
+        .unwrap();
+    w.cache
+        .write()
+        .await
+        .insert(peer, discovered(&agent_kp, machine, cert.clone()));
+    w.contacts
+        .write()
+        .await
+        .set_trust(&peer, TrustLevel::Trusted);
+
+    match gate_kind {
+        EvidenceOnlyTrustedContactGate::Outbound => {
+            // Outbound PeerTrust needs no connect ACL.
+        }
+        EvidenceOnlyTrustedContactGate::Inbound => {
+            // Exact ACL only — owner/grant principals off so admission is
+            // AclEntry, not OwnerTrust/Grant.
+            w.set_policy_silently(w.acl(&[(peer, machine)], false, false));
+        }
+    }
+
+    let now_ms = w.base_secs.saturating_mul(1000);
+    let policy = Arc::new(RuntimePolicy::new(
+        w.a1,
+        w.trust.clone(),
+        Arc::clone(&w.revocations),
+    ));
+    let store_dir = match gate_kind {
+        EvidenceOnlyTrustedContactGate::Outbound => "evidence-only-outbound-busy",
+        EvidenceOnlyTrustedContactGate::Inbound => "evidence-only-inbound-trusted-busy",
+    };
+    let store = Arc::new(
+        PeerEvidenceStore::open(
+            &w.dir.path().join(store_dir),
+            EvidenceConfig::default(),
+            policy,
+            now_ms,
+        )
+        .unwrap(),
+    );
+    store
+        .ingest(
+            enrolled_evidence_record(
+                &agent_kp,
+                &machine_kp,
+                &cert,
+                now_ms,
+                "evidence-only trusted contact",
+            ),
+            IngestSource::Hello,
+            now_ms,
+        )
+        .unwrap();
+    let (evidence, ready) = EvidenceRuntime::loading_store_for_test(Arc::clone(&store));
+    ready.cancel();
+    assert!(
+        evidence.usable(peer, machine, now_ms).is_some(),
+        "control: evidence-only pairing must be usable before admission"
+    );
+    w.trust.install_evidence(&evidence);
+
+    // Strip World::new bindings so confirmation cannot skip the evidence store.
+    {
+        let mut auth = w.authenticated.write().await;
+        auth.clear_for_test();
+    }
+    {
+        let mut ann = w.announced.write().await;
+        ann.clear_for_test();
+    }
+    assert!(
+        w.authenticated.read().await.peek(&peer).is_none(),
+        "control: no authenticated binding for evidence-only peer"
+    );
+    assert!(
+        w.announced.read().await.peek(&peer).is_none(),
+        "control: no announced binding for evidence-only peer"
+    );
+
+    let (gate, expect_auth) = match gate_kind {
+        EvidenceOnlyTrustedContactGate::Outbound => (
+            StreamGate::Outbound {
+                peer_agent: peer,
+                machine,
+            },
+            StreamAuthority::PeerTrust,
+        ),
+        EvidenceOnlyTrustedContactGate::Inbound => {
+            (w.inbound(peer, machine), StreamAuthority::AclEntry)
+        }
+    };
+    let authority = check_gate(&gate, &w.ctx()).await.unwrap_or_else(|reason| {
+        panic!("evidence-only trusted contact must admit ({gate_kind:?}): {reason}")
+    });
+    assert_eq!(
+        authority, expect_auth,
+        "evidence-only trusted contact authority ({gate_kind:?})"
+    );
+    let stream = w.live.register(gate, authority);
+    (w, stream, store, evidence)
+}
+
+async fn evidence_only_trusted_contact_busy_resolves_inside_budget(
+    gate_kind: EvidenceOnlyTrustedContactGate,
+    label: &str,
+) {
+    let (w, stream, store, _evidence) =
+        evidence_only_trusted_contact_reauth_fixture(gate_kind).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    // Kick without trust/ACL change — pure authority_confirms contention.
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "authority_confirms Busy alone must not tear down before the deadline ({label})"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+    assert!(
+        !w.reasons().contains_key("not_verified"),
+        "Busy must not collapse to immediate not_verified ({label})"
+    );
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "stream must survive after authority_confirms contention clears inside the budget ({label})"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+    assert!(w.reasons().is_empty());
+
+    w.kick.notify_waiters();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !stream.token().is_cancelled(),
+        "post-release reauth must keep the still-authorized stream ({label})"
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 0);
+}
+
+async fn evidence_only_trusted_contact_busy_through_deadline(
+    gate_kind: EvidenceOnlyTrustedContactGate,
+    label: &str,
+) {
+    let (w, stream, store, _evidence) =
+        evidence_only_trusted_contact_reauth_fixture(gate_kind).await;
+    let _stop = w.spawn_loop(None);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert!(!stream.token().is_cancelled());
+
+    let (release_tx, holder) = hold_evidence_store(store);
+    let started = Instant::now();
+    w.kick.notify_waiters();
+    closes_within(&stream, EVENT_BOUND + Duration::from_millis(250)).await;
+    assert!(
+        started.elapsed() <= EVENT_BOUND + Duration::from_millis(250),
+        "authority_confirms busy-through-deadline teardown exceeded EVENT_BOUND ({label}: {:?})",
+        started.elapsed()
+    );
+    assert_eq!(w.diag.torn_down_reauth(), 1);
+    assert_eq!(
+        w.reasons().get("reauth_deadline"),
+        Some(&1),
+        "Busy held through deadline must be reauth_deadline, not not_verified ({label}); reasons={:?}",
+        w.reasons()
+    );
+    assert!(
+        !w.reasons().contains_key("not_verified"),
+        "must not tear down as immediate not_verified ({label})"
+    );
+
+    let _ = release_tx.send(());
+    let _ = holder.join();
+}
+
+/// RC11 / Codex: outbound evidence-only trusted peer — Busy clears inside
+/// the five-second budget → stream survives (torn_down_reauth == 0).
+#[tokio::test(start_paused = true)]
+async fn outbound_evidence_only_authority_confirms_busy_resolves_inside_budget_stream_survives() {
+    evidence_only_trusted_contact_busy_resolves_inside_budget(
+        EvidenceOnlyTrustedContactGate::Outbound,
+        "outbound evidence-only",
+    )
+    .await;
+}
+
+/// RC11 / Codex: outbound evidence-only — Busy held through the deadline →
+/// `reauth_deadline` (not immediate `not_verified`).
+#[tokio::test(start_paused = true)]
+async fn outbound_evidence_only_authority_confirms_busy_through_deadline_tears_down() {
+    evidence_only_trusted_contact_busy_through_deadline(
+        EvidenceOnlyTrustedContactGate::Outbound,
+        "outbound evidence-only",
+    )
+    .await;
+}
+
+/// RC11 / Codex inbound: Trusted contact, exact ACL, no owner/grant — the
+/// only Busy surface is `authority_confirms` (evidence pairing). Clears
+/// inside the budget → stream survives.
+#[tokio::test(start_paused = true)]
+async fn inbound_trusted_contact_evidence_only_authority_confirms_busy_resolves_inside_budget_stream_survives(
+) {
+    evidence_only_trusted_contact_busy_resolves_inside_budget(
+        EvidenceOnlyTrustedContactGate::Inbound,
+        "inbound trusted-contact evidence-only",
+    )
+    .await;
+}
+
+/// RC11 / Codex inbound: Trusted contact evidence-only — Busy through the
+/// deadline → `reauth_deadline` (not immediate `not_verified`).
+#[tokio::test(start_paused = true)]
+async fn inbound_trusted_contact_evidence_only_authority_confirms_busy_through_deadline_tears_down()
+{
+    evidence_only_trusted_contact_busy_through_deadline(
+        EvidenceOnlyTrustedContactGate::Inbound,
+        "inbound trusted-contact evidence-only",
+    )
+    .await;
 }

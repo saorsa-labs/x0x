@@ -15784,6 +15784,9 @@ impl Agent {
 
     /// [`Self::authority_confirms`]; with `nonblocking_evidence` (an
     /// opted-in cold send, x0x #1207) the evidence check never blocks.
+    /// Contended store maps to false (fail closed). Gate/reauth paths that
+    /// must surface Busy call
+    /// [`owner_trust::OwnerTrust::authority_confirms_nonblocking`].
     async fn authority_confirms_with(
         &self,
         agent_id: &identity::AgentId,
@@ -18928,9 +18931,18 @@ impl Agent {
         // it; otherwise the authority stores' machine is used. Admission and
         // reauth share this body so a stale/unconfirmed cache entry cannot
         // tear down a stream that a fresh admission would still open.
-        let confirmed = owner_trust
-            .authority_confirms_with(agent_id, &routing, local_authority_only)
-            .await;
+        // ADR-0074 §4: reauth must not collapse Busy→false (PeerNotVerified).
+        let confirmed = if local_authority_only {
+            match owner_trust
+                .authority_confirms_nonblocking(agent_id, &routing)
+                .await
+            {
+                NonblockingEval::Busy => return Err(crate::forward::PeerGateError::Busy),
+                NonblockingEval::Done(confirmed) => confirmed,
+            }
+        } else {
+            owner_trust.authority_confirms(agent_id, &routing).await
+        };
         let authority = {
             let announced = announced_bindings.read().await.peek(agent_id);
             let attested = authenticated_bindings.read().await.peek(agent_id);
@@ -19390,12 +19402,22 @@ impl Agent {
         // agent occupy this machine. Every routed agent above can still
         // deny (fail-closed, #192); only an agent that an authority store
         // confirms on this machine is admitted.
+        // ADR-0074 §4: any Busy during local-authority confirmation retries
+        // within budget — never empty-confirmed → PeerNotVerified.
         let mut confirmed: Vec<identity::AgentId> = Vec::with_capacity(surviving.len());
         for agent_id in &surviving {
-            if owner_trust
-                .authority_confirms_with(agent_id, machine_id, local_authority_only)
-                .await
-            {
+            if local_authority_only {
+                match owner_trust
+                    .authority_confirms_nonblocking(agent_id, machine_id)
+                    .await
+                {
+                    NonblockingEval::Busy => {
+                        return Err(crate::forward::PeerGateError::Busy);
+                    }
+                    NonblockingEval::Done(true) => confirmed.push(*agent_id),
+                    NonblockingEval::Done(false) => {}
+                }
+            } else if owner_trust.authority_confirms(agent_id, machine_id).await {
                 confirmed.push(*agent_id);
             }
         }

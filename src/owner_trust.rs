@@ -58,8 +58,9 @@ pub(crate) fn system_trust_clock() -> TrustClock {
 
 /// Result of a nonblocking local-authority evaluation.
 ///
-/// `Busy` means a `try_usable` evidence read was contended (`Err(())`). Gates
-/// surface this to teardown; bool APIs map it fail-closed to `false` / empty.
+/// `Busy` means a nonblocking evidence read was contended (`try_usable` →
+/// `Err(())`, or `try_confirms_pairing` → `None`). Gates surface this to
+/// teardown; bool APIs map it fail-closed to `false` / empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NonblockingEval<T> {
     Done(T),
@@ -147,9 +148,8 @@ impl OwnerTrust {
     }
 
     /// Replace the construction-injected clock (tests / paused-tokio reauth).
+    /// Production keeps the system default from [`Self::new`].
     #[must_use]
-    /// Inject a clock (tests / deterministic expiry). Production keeps the
-    /// system default from [`Self::new`].
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_clock(mut self, clock: TrustClock) -> Self {
         self.clock = clock;
@@ -190,45 +190,91 @@ impl OwnerTrust {
     }
 
     /// [`Self::authority_confirms`]; with `nonblocking_evidence` the ADR
-    /// 0089 check never blocks (x0x #1207: a contended evidence store reads
-    /// as no evidence, fail closed).
+    /// 0089 check never blocks (x0x #1207). Contended store maps to false
+    /// (fail closed). Gates that must surface Busy use
+    /// [`Self::authority_confirms_nonblocking`].
     pub(crate) async fn authority_confirms_with(
         &self,
         agent: &AgentId,
         machine: &MachineId,
         nonblocking_evidence: bool,
     ) -> bool {
+        if nonblocking_evidence {
+            match self.authority_confirms_nonblocking(agent, machine).await {
+                NonblockingEval::Done(confirmed) => confirmed,
+                NonblockingEval::Busy => false,
+            }
+        } else {
+            match self.authority_binding_decision(agent, machine).await {
+                Some(confirmed) => confirmed,
+                None => {
+                    let Some(runtime) = self.evidence() else {
+                        return false;
+                    };
+                    // #1239: ordinary raw resolution and known-recipient
+                    // redial also reach this check. A synchronous evidence
+                    // read here stalls Tokio's timers. Use the existing
+                    // reader and default evidence budget; brief contention
+                    // can still resolve. At expiry no evidence confirms the
+                    // pairing, so each caller keeps its existing fallback
+                    // or refusal.
+                    let deadline =
+                        tokio::time::Instant::now() + crate::dm::dm_attempt_timeout(None);
+                    runtime
+                        .confirms_pairing_before(*agent, *machine, deadline)
+                        .await
+                        .unwrap_or(false)
+                }
+            }
+        }
+    }
+
+    /// Nonblocking authority confirmation for local-authority gates/reauth.
+    ///
+    /// `Busy` when [`crate::peer_evidence::EvidenceRuntime::try_confirms_pairing`]
+    /// returns `None` (store contended). `Done(false)` is no evidence / not
+    /// confirmed.
+    pub(crate) async fn authority_confirms_nonblocking(
+        &self,
+        agent: &AgentId,
+        machine: &MachineId,
+    ) -> NonblockingEval<bool> {
+        match self.authority_binding_decision(agent, machine).await {
+            Some(confirmed) => NonblockingEval::Done(confirmed),
+            None => {
+                let Some(runtime) = self.evidence() else {
+                    return NonblockingEval::Done(false);
+                };
+                let now_ms = self.now_unix_secs().saturating_mul(1000);
+                match runtime.try_confirms_pairing(*agent, *machine, now_ms) {
+                    Some(confirmed) => NonblockingEval::Done(confirmed),
+                    None => NonblockingEval::Busy,
+                }
+            }
+        }
+    }
+
+    /// Binding-store half of ADR 0115 confirmation.
+    ///
+    /// `Some(true)` / `Some(false)` short-circuit without evidence.
+    /// `None` means evidence must decide.
+    async fn authority_binding_decision(
+        &self,
+        agent: &AgentId,
+        machine: &MachineId,
+    ) -> Option<bool> {
         let attested = self.bindings.read().await.peek(agent);
         let announced = match self.announced_bindings() {
             Some(store) => store.read().await.peek(agent),
             None => None,
         };
         if crate::identity_authority::confirms(*machine, announced, attested, || false) {
-            return true;
+            return Some(true);
         }
         if machine.0 == [0; 32] {
-            return false;
+            return Some(false);
         }
-        let Some(runtime) = self.evidence() else {
-            return false;
-        };
-        if nonblocking_evidence {
-            return runtime.try_confirms_pairing(
-                *agent,
-                *machine,
-                crate::dm_capability::now_unix_ms(),
-            ) == Some(true);
-        }
-        // #1239: ordinary raw resolution and known-recipient redial also
-        // reach this check. A synchronous evidence read here stalls Tokio's
-        // timers. Use the existing reader and default evidence budget; brief
-        // contention can still resolve. At expiry no evidence confirms the
-        // pairing, so each caller keeps its existing fallback or refusal.
-        let deadline = tokio::time::Instant::now() + crate::dm::dm_attempt_timeout(None);
-        runtime
-            .confirms_pairing_before(*agent, *machine, deadline)
-            .await
-            .unwrap_or(false)
+        None
     }
 
     /// [`Self::authority_confirms`] for synchronous seams: `None` while a
@@ -246,10 +292,9 @@ impl OwnerTrust {
         if crate::identity_authority::confirms(*machine, announced, attested, || false) {
             return Some(true);
         }
+        let now_ms = self.now_unix_secs().saturating_mul(1000);
         match self.evidence() {
-            Some(runtime) => {
-                runtime.try_confirms_pairing(*agent, *machine, crate::dm_capability::now_unix_ms())
-            }
+            Some(runtime) => runtime.try_confirms_pairing(*agent, *machine, now_ms),
             None => Some(false),
         }
     }

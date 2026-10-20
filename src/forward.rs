@@ -682,7 +682,7 @@ pub(crate) enum LocalAuthorityOutcome<T, E> {
 /// Gate error for local-authority (`local_authority_only`) peer gates.
 ///
 /// `Busy` when any resident's nonblocking authority read during that eval
-/// was contended (`try_usable` → `Err`).
+/// was contended (`try_usable` → `Err`, or `try_confirms_pairing` → `None`).
 #[derive(Debug)]
 pub(crate) enum PeerGateError {
     Busy,
@@ -811,16 +811,6 @@ impl AuthzDenial {
 /// When a nonblocking authority read inside this path is contended,
 /// returns [`LocalAuthorityOutcome::Busy`].
 pub(crate) async fn authorize_attested_opener(
-    opener: &AgentId,
-    peer_machine: &MachineId,
-    target: &SocketAddr,
-    policy: &ConnectPolicy,
-    ctx: &AttestationVerifyCtx,
-) -> LocalAuthorityOutcome<teardown::StreamAuthority, AuthzDenial> {
-    authorize_attested_opener_inner(opener, peer_machine, target, policy, ctx).await
-}
-
-async fn authorize_attested_opener_inner(
     opener: &AgentId,
     peer_machine: &MachineId,
     target: &SocketAddr,
