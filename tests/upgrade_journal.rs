@@ -15,7 +15,6 @@ use x0x::upgrade::restart::{
 // The records are crate-private until the S3 launcher consumes them. Include
 // the same implementation here to exercise the durable writer's failure hook.
 #[path = "../src/upgrade/journal.rs"]
-#[allow(dead_code)]
 mod journal;
 
 fn legacy_handoff(root: &Path, to_version: &str) -> UpgradeHandoff {
@@ -36,6 +35,7 @@ fn legacy_handoff(root: &Path, to_version: &str) -> UpgradeHandoff {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn handoff_replacement_does_not_modify_previous_record_inode() {
     let dir = TempDir::new().unwrap();
@@ -58,6 +58,7 @@ fn handoff_replacement_does_not_modify_previous_record_inode() {
     assert_eq!(UpgradeHandoff::read(&path).unwrap().to_version, "0.48.3");
 }
 
+#[cfg(unix)]
 #[test]
 fn handoff_writer_retains_legacy_diagnostic_fields_and_referenced_files() {
     let dir = TempDir::new().unwrap();
@@ -98,6 +99,72 @@ fn torn_legacy_handoff_read_preserves_diagnostic_bytes() {
     assert_eq!(std::fs::read(&path).unwrap(), torn);
 }
 
+#[test]
+fn handoff_writer_refuses_missing_parent_without_creating_directories() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("missing").join("data");
+    let path = missing.join(HANDOFF_FILE_NAME);
+    assert!(legacy_handoff(dir.path(), "0.48.2").write(&path).is_err());
+    assert!(!dir.path().join("missing").exists());
+}
+
+#[test]
+fn recovery_records_preserve_real_cleanup_candidates() {
+    let dir = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let staged = dir.path().join(".x0x-upgrade-retained");
+    let sidelined = dir.path().join("x0xd.x0xold-retained");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("candidate"), b"candidate").unwrap();
+    std::fs::write(&sidelined, b"rollback").unwrap();
+    let record = data.path().join(journal::JOURNAL_FILE_NAME);
+    for bytes in [
+        br#"{"schema_version":999}"#.as_slice(),
+        br#"{"schema_version":"#.as_slice(),
+    ] {
+        std::fs::write(&record, bytes).unwrap();
+        let removed = journal::sweep_if_no_records(data.path(), || {
+            x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
+        });
+        assert_eq!(removed, 0);
+        assert_eq!(std::fs::read(&record).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(staged.join("candidate")).unwrap(),
+            b"candidate"
+        );
+        assert_eq!(std::fs::read(&sidelined).unwrap(), b"rollback");
+    }
+    std::fs::remove_file(record).unwrap();
+    assert_eq!(
+        journal::sweep_if_no_records(data.path(), || {
+            x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
+        }),
+        2
+    );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn unsupported_record_barriers_refuse_before_mutation() {
+    let dir = TempDir::new().unwrap();
+    assert_eq!(
+        journal::check_record_barrier_support(dir.path())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    let path = dir.path().join(HANDOFF_FILE_NAME);
+    assert_eq!(
+        legacy_handoff(dir.path(), "0.48.2")
+            .write(&path)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+}
+
+#[cfg(unix)]
 #[test]
 fn handoff_writer_marks_diagnostic_schema_without_losing_legacy_fields() {
     let dir = TempDir::new().unwrap();
@@ -275,6 +342,7 @@ fn unknown_and_corrupt_boot_records_degrade_without_mutation_or_authority() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn record_barrier_failures_are_not_acknowledged_and_never_authorize_actions() {
     for failed_step in [
@@ -310,6 +378,7 @@ fn record_barrier_failures_are_not_acknowledged_and_never_authorize_actions() {
     }
 }
 
+#[cfg(unix)]
 fn journal_fixture(root: &Path) -> serde_json::Value {
     let artifact = |name: &str| {
         serde_json::json!({
@@ -338,6 +407,16 @@ fn journal_fixture(root: &Path) -> serde_json::Value {
                 "data_root": root.join("data"),
                 "identity_root": root.join("identity"),
                 "argv": ["x0xd", "--name", "alice"],
+                "cwd": root,
+                "env": {},
+                "restart": {
+                    "mode": "TransactionalHandoff",
+                    "supervised_exit_code": null,
+                    "supervision_signal": null,
+                    "launchd_verified": null,
+                    "systemd_verified": null,
+                    "launcher": null
+                },
                 "old_pid": 1234,
                 "process_start": 100,
                 "boot_id": "boot-a",
@@ -355,6 +434,7 @@ fn journal_fixture(root: &Path) -> serde_json::Value {
     })
 }
 
+#[cfg(unix)]
 #[test]
 fn versioned_journal_preserves_frozen_plan_and_never_arms_recovery() {
     let dir = TempDir::new().unwrap();
@@ -374,6 +454,7 @@ fn versioned_journal_preserves_frozen_plan_and_never_arms_recovery() {
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
+#[cfg(unix)]
 #[test]
 fn every_recorded_journal_phase_remains_dormant_until_launcher_integration() {
     for phase in [
@@ -411,6 +492,7 @@ fn every_recorded_journal_phase_remains_dormant_until_launcher_integration() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn versioned_handoff_and_boot_bind_identity_without_granting_authority() {
     let dir = TempDir::new().unwrap();
@@ -467,7 +549,9 @@ fn restart_preflight_allows_clean_data_root() {
         &executable,
         Some(dir.path()),
         None,
-        &LaunchdPolicyReadback::NotApplicable,
+        &LaunchdPolicyReadback::Unavailable {
+            detail: "filesystem-only fixture".to_string(),
+        },
         &SystemdPolicyReadback::NotApplicable,
     )
     .expect("no record means no unresolved upgrade intent");
@@ -492,7 +576,9 @@ fn released_legacy_handoff_does_not_permanently_block_new_preflight() {
         &handoff.target_path,
         Some(dir.path()),
         None,
-        &LaunchdPolicyReadback::NotApplicable,
+        &LaunchdPolicyReadback::Unavailable {
+            detail: "filesystem-only fixture".to_string(),
+        },
         &SystemdPolicyReadback::NotApplicable,
     );
 
@@ -532,7 +618,9 @@ fn restart_preflight_refuses_untrusted_records_without_changing_files() {
                 &executable,
                 Some(dir.path()),
                 None,
-                &LaunchdPolicyReadback::NotApplicable,
+                &LaunchdPolicyReadback::Unavailable {
+                    detail: "filesystem-only fixture".to_string(),
+                },
                 &SystemdPolicyReadback::NotApplicable,
             );
 

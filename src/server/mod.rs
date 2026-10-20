@@ -1224,7 +1224,7 @@ pub async fn serve_with_options(
         api_address: actual_api_addr,
         data_dir: config.data_dir.clone(),
         start_time: Instant::now(),
-        health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
+        health_snapshot: Arc::new(health_verdict::initial_health_snapshot(&config.data_dir)),
         broadcast_tx,
         calls: routes::calls::new_registry(),
         file_transfers: RwLock::new(HashMap::new()),
@@ -1770,18 +1770,17 @@ pub async fn serve_with_options(
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
-    // Runs UNCONDITIONALLY (deliberately NOT gated on self_update_enabled): this
-    // is the disk-fill safety net from the Windows self-update fix and must clean
-    // a machine even when self-update is disabled. It only matches x0x-specific
-    // artifact patterns next to the binary, so it is a harmless no-op for an
-    // embedder (which never creates such artifacts) — no host files can match.
-    bg_tasks.push(tokio::spawn(async {
-        let removed = x0x::history::run_blocking(|| {
+    // Independent of self_update_enabled, but retained recovery records prevent
+    // cleanup: an old or unknown record may refer to any of these artifacts.
+    // Never delete recovery material merely to make configured startup succeed.
+    let upgrade_record_root = config.data_dir.clone();
+    bg_tasks.push(tokio::spawn(async move {
+        let removed = x0x::history::run_blocking(move || {
             let exe = x0x::upgrade::apply::current_binary_path().ok()?;
             let dir = exe.parent()?.to_path_buf();
-            Some(x0x::upgrade::sweep_stale_upgrade_artifacts(
-                &dir,
-                Duration::from_secs(3600),
+            Some(crate::upgrade::journal::sweep_if_no_records(
+                &upgrade_record_root,
+                || x0x::upgrade::sweep_stale_upgrade_artifacts(&dir, Duration::from_secs(3600)),
             ))
         })
         .await

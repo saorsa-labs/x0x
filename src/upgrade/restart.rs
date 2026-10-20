@@ -2381,6 +2381,19 @@ pub fn resolve_restart_plan(
         });
     }
 
+    // This planner is an apply preflight, not the configured startup path.
+    // Preserve unknown or pending M2 intent before staging or replacing files.
+    // The read-only S2a reader never authorizes recovery (ADR 0094 section 6).
+    let records = super::journal::read_boot_records(&data_root);
+    if records.blocks_apply() {
+        return Err(RestartOwnershipError::Unresolved {
+            what: "upgrade recovery records",
+            detail: records
+                .diagnostic()
+                .unwrap_or_else(|| "upgrade records require reconciliation".to_string()),
+        });
+    }
+
     Ok(RestartPlan {
         mode,
         supervised_exit_code: match mode {
@@ -2485,17 +2498,18 @@ impl UpgradeHandoff {
         }
     }
 
-    /// Serialize to `data_dir/upgrade-handoff.json`.
+    /// Complete a durable replacement of `data_dir/upgrade-handoff.json`.
+    ///
+    /// Keep released diagnostic fields and mark this as legacy helper intent.
+    /// This record does not arm an M2 transaction. Unknown records are preserved.
+    /// The data directory must already exist, as required by the restart plan.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self).map_err(io_other)?)
+        super::journal::write_handoff(path, self)
     }
 
-    /// Parse a handoff file (helper side).
+    /// Parse legacy helper intent; refuse unknown formats and M2 handoffs.
     pub fn read(path: &Path) -> std::io::Result<Self> {
-        serde_json::from_str(&std::fs::read_to_string(path)?).map_err(io_other)
+        serde_json::from_value(super::journal::read_handoff(path)?).map_err(io_other)
     }
 
     /// Backup path the swap created for this target (`x0xd.backup`).
@@ -3827,6 +3841,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn supervised_intent_json_records_the_verified_launchd_domain() {
         // #671: `gui/<uid>` and `user/<uid>` are disjoint, so the intent
@@ -4089,6 +4104,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn handoff_json_round_trips() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5550,6 +5566,7 @@ mod tests {
         assert!(plan.systemd_verified.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn handoff_roundtrips_systemd_verified_unit() {
         let dir = tempfile::tempdir().expect("tempdir");
