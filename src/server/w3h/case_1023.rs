@@ -89,14 +89,15 @@
 //!   enough. A's wait begins at A's first verified join message from J.
 //!   A must show `evidence_pending` at every poll after that, through the
 //!   last gap poll. J must show `awaiting_evidence` at every poll after
-//!   the first poll at which A showed its typed wait, through the last gap
-//!   poll. Each rule needs at least one such poll. The receipt names the
-//!   first poll at which a typed wait was absent. Evidence (red test
-//!   only): J is not admitted during the gap, and A holds none of the
-//!   missing bytes at its end. On `main`, A's
-//!   seal refuses with `OwnerCertMemberPending` naming exactly A's
-//!   digest-only seats, and A and J show no typed state.
-//! - After the gap (red test only, ADR 0111 H3): the X device that holds
+//!   A's wait began (the same anchor as A, not A's first typed poll),
+//!   through the last gap poll. Each rule needs at least one such poll.
+//!   The receipt names the first poll at which a typed wait was absent.
+//!   Evidence (red test and recovery control only): J is not admitted
+//!   during the gap, and A holds none of the missing bytes at its end. On
+//!   `main`, A's seal refuses with `OwnerCertMemberPending` naming exactly
+//!   A's digest-only seats, and A and J show no typed state.
+//! - After the gap (red test and recovery control only, ADR 0111 H3): the
+//!   X device that holds
 //!   every missing certificate comes back and A dials it. If J's attempt
 //!   is still pending, the attempt must resume by itself. Otherwise J
 //!   redeems the same invite again. A must hold every missing certificate
@@ -146,15 +147,28 @@
 //! when its last poll STARTED at or after the bound (`span_reached`). The
 //! rules that count polls "after" an instant also use the poll start.
 //!
-//! Three tests share the scenario:
+//! Four tests share the scenario:
 //! - `w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes`:
 //!   every eligible holder is offline, then one returns. FINAL
 //!   `typed_retryable_wait_then_j_active_after_holder_returns` needs A's
 //!   typed `evidence_pending` and J's typed `awaiting_evidence`, each at
 //!   every poll of its span, no end of J's
 //!   attempt and no terminal refusal during the gap, A's bytes within 60 s
-//!   of the return and J Active after it. RED on `main`. The cause is the
+//!   of the return and J Active after it. RED on `main`. When FINAL fails,
+//!   the receipt has two cause stages (`record_return`). The first is the
 //!   `OwnerCertMemberPending` refusal above, with no typed wait at A or J.
+//!   The second is the recovery: A holds the bytes within 60 s and J
+//!   becomes Active within 120 s. RED needs both causes true. So a failed
+//!   fetch or a failed admission after the return is INFRA, never the
+//!   expected RED.
+//! - `w3h_1023_control_holder_returns_recovers`: the recovery control. It
+//!   runs the same scenario as the red test: the same setup, the same
+//!   720 s gap with every holder offline, the same gap evidence and the
+//!   same return. FINAL `j_active_after_the_holder_returns_after_the_gap`
+//!   needs only the recovery (A's bytes within 60 s, J Active within
+//!   120 s). The typed-wait components are notes only. Expected GREEN on `main`
+//!   and under a correct S5. It proves the recovery path that the red
+//!   test's second cause needs.
 //! - `w3h_1023_restart_one_holder_online_admits`: the control. One X
 //!   device that holds every missing certificate stays online after A's
 //!   restart. A gets the bytes from it and J is admitted. GREEN. The
@@ -240,6 +254,12 @@ enum Arm {
     /// `HOLDER_GAP` the X device that holds every missing certificate
     /// comes back.
     HolderReturns,
+    /// The same scenario as `HolderReturns`: the same setup, the same
+    /// gap with every holder offline and the same return. FINAL is only
+    /// the recovery after the return. This GREEN control proves that the
+    /// recovery path works, so a recovery failure cannot hide in the red
+    /// test.
+    HolderReturnsRecovers,
     /// One X device that holds every missing certificate stays online.
     OneHolderOnline,
     /// O and every X device are offline after A's restart and stay
@@ -252,6 +272,7 @@ impl Arm {
     fn final_name(self) -> &'static str {
         match self {
             Arm::HolderReturns => "typed_retryable_wait_then_j_active_after_holder_returns",
+            Arm::HolderReturnsRecovers => "j_active_after_the_holder_returns_after_the_gap",
             Arm::OneHolderOnline => "j_active_within_180s_after_a_restart",
             Arm::HoldersNeverReturn => "fail_closed_never_admitted_never_silently_dropped",
         }
@@ -1784,12 +1805,14 @@ fn a_typed_visibility(polls: &[PollRecord], a_wait_began: Option<Duration>) -> V
 }
 
 /// ADR 0111 H3 for J: J shows typed `awaiting_evidence` at every poll
-/// after the first poll at which A showed its typed wait, through the
-/// last gap poll.
-fn j_typed_visibility(polls: &[PollRecord]) -> Visibility {
-    match polls.iter().find(|poll| poll.a_typed) {
-        None => Visibility::NoStart("A never showed its typed wait"),
-        Some(first) => continuous_from(polls, first.started, |poll| poll.j_typed),
+/// after A's wait began (`a_wait_began`, the same anchor as A's rule),
+/// through the last gap poll. The first poll after that instant counts
+/// too. The anchor is not A's first typed poll, so a late or absent wait
+/// at A does not move J's start.
+fn j_typed_visibility(polls: &[PollRecord], a_wait_began: Option<Duration>) -> Visibility {
+    match a_wait_began {
+        None => Visibility::NoStart("A never received J's request"),
+        Some(began) => continuous_from(polls, began, |poll| poll.j_typed),
     }
 }
 
@@ -2219,17 +2242,17 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             .get(label)
             .is_some_and(|(active, held)| *active && held.len() == missing.len())
     });
-    // The control keeps this holder online; the red test brings it back
-    // after the gap.
+    // The control keeps this holder online; the red test and its recovery
+    // control bring it back after the gap.
     let full_holder = match arm {
-        Arm::OneHolderOnline | Arm::HolderReturns => Some(
+        Arm::OneHolderOnline | Arm::HolderReturns | Arm::HolderReturnsRecovers => Some(
             full_holder.context("INFRA: no X device holds every certificate that A is missing")?,
         ),
         Arm::HoldersNeverReturn => None,
     };
     let stays_online = match arm {
         Arm::OneHolderOnline => full_holder,
-        Arm::HolderReturns | Arm::HoldersNeverReturn => None,
+        Arm::HolderReturns | Arm::HolderReturnsRecovers | Arm::HoldersNeverReturn => None,
     };
 
     // t1: the setup drop ends, then the holders go offline (no await in
@@ -2315,7 +2338,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // exact seats; the control requires a subset of them.
     let after = seat_view(sim, "A", &home.gid).await?;
     let same_seats = match arm {
-        Arm::HolderReturns | Arm::HoldersNeverReturn => after.digest_only == before.digest_only,
+        Arm::HolderReturns | Arm::HolderReturnsRecovers | Arm::HoldersNeverReturn => {
+            after.digest_only == before.digest_only
+        }
         Arm::OneHolderOnline => after
             .digest_only
             .iter()
@@ -2331,7 +2356,8 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             after.digest_only.keys().collect::<Vec<_>>(),
             before.digest_only.len(),
             match arm {
-                Arm::HolderReturns | Arm::HoldersNeverReturn => "must be equal",
+                Arm::HolderReturns | Arm::HolderReturnsRecovers | Arm::HoldersNeverReturn =>
+                    "must be equal",
                 Arm::OneHolderOnline => "must be a subset",
             }
         ),
@@ -2391,7 +2417,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
     let o_offline = !online(sim, "O")?;
     let holders_ok = match arm {
-        Arm::HolderReturns | Arm::HoldersNeverReturn => {
+        Arm::HolderReturns | Arm::HolderReturnsRecovers | Arm::HoldersNeverReturn => {
             o_offline && online_holders.is_empty() && offline_holders > 0
         }
         Arm::OneHolderOnline => {
@@ -2400,7 +2426,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     };
     receipt.evidence(
         match arm {
-            Arm::HolderReturns | Arm::HoldersNeverReturn => {
+            Arm::HolderReturns | Arm::HolderReturnsRecovers | Arm::HoldersNeverReturn => {
                 "creator_and_every_eligible_holder_offline"
             }
             Arm::OneHolderOnline => "creator_offline_and_exactly_one_eligible_holder_online",
@@ -2424,7 +2450,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         Arm::OneHolderOnline => {
             Some(admitted(sim, "A", "J", &home.gid, joined_at, JOIN_BUDGET).await?)
         }
-        Arm::HolderReturns | Arm::HoldersNeverReturn => {
+        Arm::HolderReturns | Arm::HolderReturnsRecovers | Arm::HoldersNeverReturn => {
             // Every holder is offline: the wait must be typed and must not
             // end at J's 120 s poll deadline (ADR 0111 §8, D64).
             window
@@ -2545,8 +2571,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             }
             j_admitted
         }
-        Arm::HolderReturns => {
-            // Preconditions of the red arm: with every holder offline,
+        Arm::HolderReturns | Arm::HolderReturnsRecovers => {
+            // Preconditions of the red arm and its recovery control: with
+            // every holder offline,
             // nothing can admit J or give A the bytes. Otherwise the
             // scenario broke.
             let gap_admitted = window.admitted.clone();
@@ -2586,6 +2613,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             holder_returns(
                 sim,
                 receipt,
+                arm,
                 Returning {
                     gid: &home.gid,
                     home: &home,
@@ -2610,7 +2638,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     Ok(())
 }
 
-/// What the red arm needs after the gap.
+/// What the red arm and its recovery control need after the gap.
 struct Returning<'a> {
     gid: &'a str,
     home: &'a HomeIds,
@@ -2627,10 +2655,12 @@ struct Returning<'a> {
 }
 
 /// ADR 0111 H3 after the gap: the holder comes back, J retries, A must
-/// hold the bytes within 60 s and J must become Active. Returns FINAL.
+/// hold the bytes within 60 s and J must become Active. Returns FINAL for
+/// `arm` (`record_return`).
 async fn holder_returns(
     sim: &Sim,
     receipt: &mut Receipt,
+    arm: Arm,
     ret: Returning<'_>,
     window: &WaitWindow,
 ) -> Result<bool> {
@@ -2696,8 +2726,8 @@ async fn holder_returns(
     // ADR 0111 H3: each typed wait stays visible at every poll, through
     // the last gap poll. Seen once is not enough.
     let a_visible = a_typed_visibility(&window.records, ret.a_wait_began);
-    let j_visible = j_typed_visibility(&window.records);
-    let parts = [
+    let j_visible = j_typed_visibility(&window.records, ret.a_wait_began);
+    let typed = [
         (
             "a_typed_evidence_pending_every_poll",
             a_visible.ok(),
@@ -2729,6 +2759,8 @@ async fn holder_returns(
                 ),
             },
         ),
+    ];
+    let recovery = [
         (
             "a_holds_within_60s",
             a_holds_ok,
@@ -2750,43 +2782,133 @@ async fn holder_returns(
             ),
         ),
     ];
-    for (name, ok, detail) in &parts {
+    receipt.note(format!("J's states during the gap: {}", window.timeline()));
+    // The cause on `main`: no poll showed either typed wait.
+    let typed_absent = window.first(|poll| poll.a_typed || poll.j_typed).is_none();
+    let summary = format!(
+        "J's attempt end: {}; terminal refusal: {}; A held the bytes after the return: \
+         {}; J active after the return: {}",
+        match &ended_in_gap {
+            Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
+            None => "none during the gap".to_string(),
+        },
+        match &window.terminal_refusal {
+            Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
+            None => "none before the return".to_string(),
+        },
+        a_holds.deadline.text(RETURN_FETCH),
+        j_active.text(RETURN_ADMIT),
+    );
+    let outcome = ReturnOutcome {
+        typed,
+        recovery,
+        refusal: ret.refusal,
+        typed_absent,
+        summary,
+    };
+    Ok(record_return(receipt, arm, &outcome, at(sim)))
+}
+
+/// One FINAL component: its name, whether it passed, and what the case
+/// saw.
+type Component = (&'static str, bool, String);
+
+/// What the case saw after the holder returned.
+struct ReturnOutcome {
+    /// The typed-wait group: A's typed wait and J's typed wait at every
+    /// poll, J's attempt did not end during the gap, and no terminal
+    /// refusal came before the return.
+    typed: [Component; 4],
+    /// The recovery group: A holds every missing certificate within 60 s
+    /// of the return (`a_holds_within_60s`), and J becomes Active within
+    /// 120 s after that (`j_admitted_after_return`).
+    recovery: [Component; 2],
+    /// A's seal refusal naming exactly its digest-only seats, if logged.
+    refusal: Option<String>,
+    /// No poll of the gap showed either typed wait.
+    typed_absent: bool,
+    /// A short text of the gap and the return, for the receipt.
+    summary: String,
+}
+
+/// The cause that the red test names for its typed-wait group.
+const TYPED_WAIT_CAUSE: &str = "every holder offline: A's seal waits on \
+     OwnerCertMemberPending{A's digest-only seats}, but A shows no typed evidence_pending \
+     and J's attempt shows no awaiting_evidence naming them";
+
+/// The cause that the red test names for its recovery group. A recovery
+/// failure is a different defect, so this cause is false then and the
+/// run is INFRA, never the expected RED.
+const RECOVERY_CAUSE: &str = "after the holder returns, recovery succeeds: A holds every \
+     missing certificate within 60 s and J becomes Active within 120 s (a recovery \
+     failure is a different defect, never the expected RED)";
+
+/// Record the components of the return and return FINAL for `arm`.
+///
+/// - `Arm::HolderReturns` (the red test): FINAL needs every component of
+///   both groups. When FINAL fails, the receipt gets two cause stages.
+///   The first is the typed-wait cause: true only when A's seal refusal
+///   was logged and no poll showed a typed wait. The second is the
+///   recovery cause: true only when both recovery components passed.
+///   RED needs every cause stage true (`Receipt::finish`), so a failed
+///   fetch or a failed admission after the return makes the run INFRA.
+/// - `Arm::HolderReturnsRecovers` (the recovery control): FINAL is only
+///   the recovery group. The typed-wait components are notes only. It
+///   records no cause stage.
+///
+/// The other arms do not return a holder. They take the red test's rule.
+fn record_return(receipt: &mut Receipt, arm: Arm, outcome: &ReturnOutcome, at_us: u128) -> bool {
+    let recovers = arm == Arm::HolderReturnsRecovers;
+    for (name, ok, detail) in &outcome.typed {
+        if recovers {
+            receipt.note(format!(
+                "typed-wait component {name} (note only, not FINAL in this control): {ok} \
+                 ({detail})"
+            ));
+        } else {
+            receipt.note(format!("final component {name}: {ok} ({detail})"));
+        }
+    }
+    for (name, ok, detail) in &outcome.recovery {
         receipt.note(format!("final component {name}: {ok} ({detail})"));
     }
-    receipt.note(format!("J's states during the gap: {}", window.timeline()));
-    let passed = parts.iter().all(|(_, ok, _)| *ok);
-    if !passed {
-        // The cause on `main`: no poll showed either typed wait.
-        let typed_absent = window.first(|poll| poll.a_typed || poll.j_typed).is_none();
-        let summary = format!(
-            "J's attempt end: {}; terminal refusal: {}; A held the bytes after the return: \
-             {}; J active after the return: {}",
-            match &ended_in_gap {
-                Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
-                None => "none during the gap".to_string(),
-            },
-            match &window.terminal_refusal {
-                Some((since, how)) => format!("t2+{}s ({how})", since.as_secs()),
-                None => "none before the return".to_string(),
-            },
-            a_holds.deadline.text(RETURN_FETCH),
-            j_active.text(RETURN_ADMIT),
-        );
-        receipt.cause(
-            "every holder offline: A's seal waits on OwnerCertMemberPending{A's digest-only \
-             seats}, but A shows no typed evidence_pending and J's attempt shows no \
-             awaiting_evidence naming them",
-            Some(format!(
-                "{}; {summary}",
-                ret.refusal
-                    .as_deref()
-                    .unwrap_or("no matching seal refusal logged")
-            )),
-            ret.refusal.is_some() && typed_absent,
-            at(sim),
-        );
+    let typed_ok = outcome.typed.iter().all(|(_, ok, _)| *ok);
+    let recovery_ok = outcome.recovery.iter().all(|(_, ok, _)| *ok);
+    match arm {
+        Arm::HolderReturnsRecovers => recovery_ok,
+        Arm::HolderReturns | Arm::OneHolderOnline | Arm::HoldersNeverReturn => {
+            let passed = typed_ok && recovery_ok;
+            if !passed {
+                receipt.cause(
+                    TYPED_WAIT_CAUSE,
+                    Some(format!(
+                        "{}; {}",
+                        outcome
+                            .refusal
+                            .as_deref()
+                            .unwrap_or("no matching seal refusal logged"),
+                        outcome.summary
+                    )),
+                    outcome.refusal.is_some() && outcome.typed_absent,
+                    at_us,
+                );
+                receipt.cause(
+                    RECOVERY_CAUSE,
+                    Some(
+                        outcome
+                            .recovery
+                            .iter()
+                            .map(|(name, ok, detail)| format!("{name}: {ok} ({detail})"))
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ),
+                    recovery_ok,
+                    at_us,
+                );
+            }
+            passed
+        }
     }
-    Ok(passed)
 }
 
 /// The fail-closed control: every holder stays offline for
@@ -2856,8 +2978,8 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
          awaiting_evidence at J whose own digest/digests fields name exactly the \
          missing digests (ADR 0088 §1 L3, §2 item 8; ADR 0111 §8, H3). A's typed wait \
          must show at every poll after A's first verified join message from J, and \
-         J's at every poll after A's first typed poll, through the last gap poll. The \
-         holder returns after the gap in the red test only",
+         J's at every poll after that same instant, through the last gap poll. The \
+         holder returns after the gap in the red test and its recovery control only",
         arm.final_name(),
         POLL.as_secs(),
         HOLDER_GAP.as_secs(),
@@ -2936,6 +3058,21 @@ async fn w3h_1023_control_holders_never_return_fail_closed() -> Result<()> {
         "w3h_1023_control_holders_never_return_fail_closed",
         0x1023_0003,
         Arm::HoldersNeverReturn,
+        Verdict::Green,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1023_control_holder_returns_recovers() -> Result<()> {
+    expect(
+        "w3h_1023_control_holder_returns_recovers",
+        0x1023_0004,
+        Arm::HolderReturnsRecovers,
         Verdict::Green,
     )
     .await
@@ -3073,31 +3210,20 @@ fn polls(a: &[bool], j: &[bool]) -> Vec<PollRecord> {
 
 #[test]
 fn w3h_1023_cont_typed_at_every_poll_passes() {
-    // A's wait begins at t2+2s; A shows its typed wait from the first poll
-    // after that, J from the poll after A's first.
-    let records = polls(&[true; 6], &[false, true, true, true, true, true]);
-    assert_eq!(
-        a_typed_visibility(&records, Some(secs(2))),
-        Visibility::Every {
-            polls: 6,
-            from: secs(5)
-        }
-    );
-    assert_eq!(
-        j_typed_visibility(&records),
-        Visibility::Every {
-            polls: 5,
-            from: secs(10)
-        }
-    );
+    // A's wait begins at t2+2s. A and J show their typed waits from the
+    // first poll after that.
+    let records = polls(&[true; 6], &[true; 6]);
+    let every = Visibility::Every {
+        polls: 6,
+        from: secs(5),
+    };
+    assert_eq!(a_typed_visibility(&records, Some(secs(2))), every);
+    assert_eq!(j_typed_visibility(&records, Some(secs(2))), every);
 }
 
 #[test]
 fn w3h_1023_disappearance_of_a_for_one_poll_fails() {
-    let records = polls(
-        &[true, true, false, true, true],
-        &[false, true, true, true, true],
-    );
+    let records = polls(&[true, true, false, true, true], &[true; 5]);
     assert_eq!(
         a_typed_visibility(&records, Some(secs(2))),
         Visibility::AbsentAt {
@@ -3105,20 +3231,20 @@ fn w3h_1023_disappearance_of_a_for_one_poll_fails() {
             seen: 2
         }
     );
-    assert!(j_typed_visibility(&records).ok());
+    assert!(j_typed_visibility(&records, Some(secs(2))).ok());
 }
 
 #[test]
 fn w3h_1023_disappearance_of_j_for_one_poll_fails() {
     // J's join_state stays pending_authority_commit throughout; that does
     // not stand in for J's typed wait.
-    let records = polls(&[true; 5], &[false, true, true, false, true]);
+    let records = polls(&[true; 5], &[true, true, true, false, true]);
     assert!(a_typed_visibility(&records, Some(secs(2))).ok());
     assert_eq!(
-        j_typed_visibility(&records),
+        j_typed_visibility(&records, Some(secs(2))),
         Visibility::AbsentAt {
             at: secs(20),
-            seen: 2
+            seen: 3
         }
     );
 }
@@ -3133,11 +3259,11 @@ fn w3h_1023_reviewer_seen_once_then_gone_fails_both() {
             seen: 0
         }
     );
-    // A first showed its wait at t2+10s; J is absent at the next poll.
+    // A's wait began at t2+2s; J is absent at the first poll after it.
     assert_eq!(
-        j_typed_visibility(&records),
+        j_typed_visibility(&records, Some(secs(2))),
         Visibility::AbsentAt {
-            at: secs(15),
+            at: secs(5),
             seen: 0
         }
     );
@@ -3145,10 +3271,50 @@ fn w3h_1023_reviewer_seen_once_then_gone_fails_both() {
 
 #[test]
 fn w3h_1023_late_start_of_a_fails() {
-    // A's wait began at t2+2s, but A shows it only from t2+15s.
+    // A's wait began at t2+2s, but A shows it only from t2+15s, and J only
+    // from t2+20s. Both fail at the first poll after t2+2s.
     let records = polls(
         &[false, false, true, true, true],
         &[false, false, false, true, true],
+    );
+    let absent = Visibility::AbsentAt {
+        at: secs(5),
+        seen: 0,
+    };
+    assert_eq!(a_typed_visibility(&records, Some(secs(2))), absent);
+    assert_eq!(j_typed_visibility(&records, Some(secs(2))), absent);
+}
+
+#[test]
+fn w3h_1023_j_missing_first_poll_after_a_wait_began_fails() {
+    // A shows its wait at every poll. J misses only the first poll after
+    // A's wait began (t2+5s) and shows it at every later poll. ADR 0111
+    // H3 needs J's wait from that first poll, so J fails there.
+    let records = polls(&[true; 5], &[false, true, true, true, true]);
+    assert!(a_typed_visibility(&records, Some(secs(2))).ok());
+    let j = j_typed_visibility(&records, Some(secs(2)));
+    assert!(!j.ok());
+    assert_eq!(
+        j,
+        Visibility::AbsentAt {
+            at: secs(5),
+            seen: 0
+        }
+    );
+}
+
+#[test]
+fn w3h_1023_j_anchor_is_a_wait_began_not_a_first_typed_poll() {
+    // A shows its wait only from the 2nd poll; J shows its wait from the
+    // 1st. J's rule starts at A's wait start (t2+2s), not at A's first
+    // typed poll (t2+10s), so J passes with all 4 polls and A fails.
+    let records = polls(&[false, true, true, true], &[true; 4]);
+    assert_eq!(
+        j_typed_visibility(&records, Some(secs(2))),
+        Visibility::Every {
+            polls: 4,
+            from: secs(5)
+        }
     );
     assert_eq!(
         a_typed_visibility(&records, Some(secs(2))),
@@ -3162,26 +3328,134 @@ fn w3h_1023_late_start_of_a_fails() {
 #[test]
 fn w3h_1023_cont_no_start_or_no_polls_fails() {
     let records = polls(&[true; 3], &[true; 3]);
+    // A never received J's request: neither wait has a start.
     assert!(matches!(
         a_typed_visibility(&records, None),
         Visibility::NoStart(_)
     ));
+    assert!(matches!(
+        j_typed_visibility(&records, None),
+        Visibility::NoStart(_)
+    ));
+    // A's wait began at the last poll: no poll STARTED after it.
     assert_eq!(
         a_typed_visibility(&records, Some(secs(15))),
         Visibility::NoPolls { after: secs(15) }
     );
-    // A never typed: J fails as well.
-    let records = polls(&[false; 3], &[true; 3]);
-    assert!(matches!(
-        j_typed_visibility(&records),
-        Visibility::NoStart(_)
-    ));
-    // A typed only at the last poll: no J poll is after it.
-    let records = polls(&[false, false, true], &[true; 3]);
     assert_eq!(
-        j_typed_visibility(&records),
+        j_typed_visibility(&records, Some(secs(15))),
         Visibility::NoPolls { after: secs(15) }
     );
+}
+
+/// A receipt with every precondition true: `setup_done`, one true
+/// evidence stage and a true `request_delivered`.
+#[cfg(test)]
+fn receipt_before_return() -> Receipt {
+    let mut receipt = Receipt::new("w3h_1023_unit", 1);
+    receipt.setup_done(1);
+    receipt.evidence("j_not_admitted_while_every_holder_offline", true, "", 2);
+    receipt.request_delivered("j_join_request_reached_a", true, "", 3);
+    receipt
+}
+
+/// A return outcome: `typed_ok` sets every typed-wait component, and the
+/// recovery components are `a_holds` and `j_admitted`. With `typed_ok`
+/// false, no poll showed a typed wait and A's seal refusal was logged, as
+/// on `main`.
+#[cfg(test)]
+fn return_outcome(typed_ok: bool, a_holds: bool, j_admitted: bool) -> ReturnOutcome {
+    let typed = |name: &'static str| (name, typed_ok, String::new());
+    ReturnOutcome {
+        typed: [
+            typed("a_typed_evidence_pending_every_poll"),
+            typed("j_typed_awaiting_evidence_every_poll"),
+            typed("j_attempt_did_not_end_during_the_gap"),
+            typed("no_terminal_refusal_before_return"),
+        ],
+        recovery: [
+            ("a_holds_within_60s", a_holds, String::new()),
+            ("j_admitted_after_return", j_admitted, String::new()),
+        ],
+        refusal: (!typed_ok).then(|| "OwnerCertMemberPending[x1]".to_string()),
+        typed_absent: !typed_ok,
+        summary: String::new(),
+    }
+}
+
+/// Finish a receipt for `arm` with `outcome`, and return its verdict and
+/// the `ok` field of each serialized cause stage.
+#[cfg(test)]
+fn finish_return(arm: Arm, outcome: &ReturnOutcome) -> (Verdict, Vec<bool>) {
+    let mut receipt = receipt_before_return();
+    let passed = record_return(&mut receipt, arm, outcome, 4);
+    let verdict = receipt.finish(arm.final_name(), passed, 5);
+    let json = serde_json::to_value(&receipt).expect("serialize the receipt");
+    let causes = json["stages"]
+        .as_array()
+        .expect("stages")
+        .iter()
+        .filter(|stage| stage["stage"] == "cause")
+        .map(|stage| stage["ok"].as_bool().expect("cause ok"))
+        .collect();
+    (verdict, causes)
+}
+
+#[test]
+fn w3h_1023_main_shaped_return_is_red() {
+    // `main`: no typed wait, A's seal refusal logged, recovery succeeds.
+    let (verdict, causes) = finish_return(Arm::HolderReturns, &return_outcome(false, true, true));
+    assert_eq!(verdict, Verdict::Red);
+    assert_eq!(causes, vec![true, true]);
+}
+
+#[test]
+fn w3h_1023_recovery_fetch_failure_is_never_the_expected_red() {
+    // `main`-shaped, but A does not hold the bytes within 60 s.
+    let (verdict, causes) = finish_return(Arm::HolderReturns, &return_outcome(false, false, true));
+    assert_ne!(verdict, Verdict::Red);
+    assert_eq!(verdict, Verdict::Infra);
+    // The JSON that the validator reads carries the failed cause.
+    assert_eq!(causes.len(), 2);
+    assert!(causes.contains(&false));
+}
+
+#[test]
+fn w3h_1023_recovery_admission_failure_is_never_the_expected_red() {
+    // `main`-shaped, but J does not become Active after the return.
+    let (verdict, causes) = finish_return(Arm::HolderReturns, &return_outcome(false, true, false));
+    assert_ne!(verdict, Verdict::Red);
+    assert_eq!(verdict, Verdict::Infra);
+    assert_eq!(causes.len(), 2);
+    assert!(causes.contains(&false));
+}
+
+#[test]
+fn w3h_1023_recovers_control_fails_on_fetch_or_admission_failure() {
+    for outcome in [
+        return_outcome(false, false, true),
+        return_outcome(false, true, false),
+        return_outcome(true, false, true),
+        return_outcome(true, true, false),
+    ] {
+        let (verdict, causes) = finish_return(Arm::HolderReturnsRecovers, &outcome);
+        assert_ne!(verdict, Verdict::Green);
+        assert!(causes.is_empty());
+    }
+}
+
+#[test]
+fn w3h_1023_recovers_control_green_when_recovery_succeeds() {
+    // The typed-wait group is a note only in this control: absent typed
+    // waits (as on `main`) do not fail it.
+    for typed_ok in [false, true] {
+        let (verdict, causes) = finish_return(
+            Arm::HolderReturnsRecovers,
+            &return_outcome(typed_ok, true, true),
+        );
+        assert_eq!(verdict, Verdict::Green);
+        assert!(causes.is_empty());
+    }
 }
 
 #[cfg(test)]
