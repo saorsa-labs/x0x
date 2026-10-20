@@ -339,6 +339,34 @@ async fn closes_within(guard: &LiveStreamGuard, bound: Duration) -> Duration {
     started.elapsed()
 }
 
+/// RC12 / Codex P2 (#1388): `LiveStreams::cancel_all` fires every guard
+/// token and empties the registry immediately — the bridge must close on
+/// shutdown, not wait for a later reauth pass.
+#[test]
+fn cancel_all_cancels_guard_and_empties_registry() {
+    let diag = Arc::new(ForwardDiagnostics::default());
+    let live = Arc::new(LiveStreams::new(Arc::clone(&diag)));
+    let guard = live.register(
+        StreamGate::Outbound {
+            peer_agent: AgentId([0x51; 32]),
+            machine: MachineId([0xB0; 32]),
+        },
+        StreamAuthority::PeerTrust,
+    );
+    assert_eq!(live.len(), 1);
+    assert!(!guard.token().is_cancelled());
+
+    live.cancel_all("shutdown");
+
+    assert!(
+        guard.token().is_cancelled(),
+        "cancel_all must fire the live-stream guard token"
+    );
+    assert_eq!(live.len(), 0, "cancel_all must drain the registry");
+    assert_eq!(diag.torn_down_reauth(), 1);
+    assert_eq!(diag.torn_down_reasons().get("shutdown"), Some(&1));
+}
+
 /// WHY (ADR-0074 §4, Q5): revoking the ShareGrant a forward was admitted
 /// under must close that live forward within 5 s. Before slice 3 the grant
 /// was checked only at admission, so the stream outlived the revocation.

@@ -283,6 +283,18 @@ impl LiveStreams {
         true
     }
 
+    /// Cancel every live registration and count each teardown.
+    ///
+    /// Call before stopping the reauth loop so shutdown never leaves a
+    /// bridge without revocation enforcement (ADR-0074 §4 / #1388).
+    pub(crate) fn cancel_all(&self, reason: &'static str) {
+        let entries: Vec<LiveEntry> = self.lock().drain().map(|(_, e)| e).collect();
+        for entry in entries {
+            entry.cancel.cancel();
+            self.diag.record_torn_down(reason);
+        }
+    }
+
     /// Snapshot of live streams for internal reauth/debug (no HTTP route).
     #[allow(dead_code)] // Reserved for diagnostics; no route exposes it yet.
     pub(crate) fn views(&self) -> Vec<LiveStreamView> {

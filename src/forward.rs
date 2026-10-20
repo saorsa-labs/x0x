@@ -2014,6 +2014,10 @@ impl ForwardService {
 
     /// Tear down every listener + the inbound consumer.
     pub fn shutdown(&self) {
+        // Cancel live bridges before stopping reauth (`inbound_token`).
+        // Otherwise shutdown leaves registrations that reauth no longer
+        // guards while the Agent may still be alive (Codex P2 / #1388).
+        self.live.cancel_all("shutdown");
         self.inbound_token.cancel();
         if let Ok(forwards) = self.forwards.lock() {
             for entry in forwards.iter() {
@@ -3387,6 +3391,59 @@ mod tests {
         // Must-fix 1: default config must deny V1.
         assert!(ForwardConfig::default().require_attestation);
         assert!(ForwardConfig::secure().require_attestation);
+    }
+
+    /// RC12 / Codex P2 (#1388): `ForwardService::shutdown` cancels every live
+    /// registration before the inbound/reauth token, so a bridge closes
+    /// immediately while the Agent stays alive.
+    #[tokio::test]
+    async fn shutdown_cancels_live_streams_while_agent_alive() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Explicit paths (incl. absent user.key) so unit runs without
+        // nextest's X0X_HOME — avoids #456 real-home panic in Agent::build.
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_user_key_path(dir.path().join("user.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(agent.clone(), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+
+        let guard = service.live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: AgentId([0x51; 32]),
+                machine: MachineId([0xB0; 32]),
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert_eq!(service.live.len(), 1);
+        assert!(!guard.token().is_cancelled());
+
+        service.shutdown();
+
+        assert!(
+            guard.token().is_cancelled(),
+            "shutdown must cancel live bridge tokens immediately"
+        );
+        assert_eq!(service.live.len(), 0, "shutdown must drain live registry");
+        assert_eq!(service.diagnostics().torn_down_reauth(), 1);
+        assert_eq!(
+            service.diagnostics().torn_down_reasons().get("shutdown"),
+            Some(&1)
+        );
+        // Agent stays alive: do not call agent.shutdown(); Arc still usable.
+        assert!(!agent.shutdown_token().is_cancelled());
+        assert!(!agent.agent_id().as_bytes().is_empty());
     }
 
     #[tokio::test]
