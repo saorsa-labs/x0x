@@ -5023,8 +5023,11 @@ impl NetworkNode {
             .into_iter()
             .map(|conn| PeerOrigin {
                 peer_id: conn.peer_id,
+                // #484/#1380 (review round 2): a dual-stack socket
+                // reports IPv4 peers in v4-mapped form; normalize so the
+                // observed IP compares equal to the seed/announced forms.
                 remote_addr: match conn.remote_addr {
-                    TransportAddr::Udp(addr) => Some(addr),
+                    TransportAddr::Udp(addr) => Some(normalize_v4_mapped_addr(addr)),
                     _ => None,
                 },
                 direct: conn.traversal_method.is_direct(),
@@ -10055,9 +10058,10 @@ mod tests {
 
     #[test]
     fn issue1112_seed_list_content_is_unchanged() {
-        // #1112: the `SeedPeer` restructure carries a pin set per row
-        // and must not change the production seed list. These are the exact
-        // 24 address strings that shipped before the pin column existed
+        // #1112: the seed list's public type is unchanged; pins live in
+        // the separate SEED_PEER_ID_PINS table and must not change the
+        // production seed list. These are the exact 24 address strings
+        // that shipped before pinning existed
         // (ADR-0011: 6 hosts x {443, 5483} x {IPv4, IPv6}).
         const EXPECTED: &[&str] = &[
             "142.93.199.50:443",

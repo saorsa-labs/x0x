@@ -135,24 +135,29 @@ the live fleet keys are verified.
 
 The coordinator/relay hint lists on outgoing machine announcements
 (`select_capability_hints`, `src/lib.rs`) no longer read the self-asserted
-`is_relay`/`is_coordinator` flags as standalone evidence. A candidate must
-be connected over a DIRECT path, and the only address evidence is the one
-the local socket OBSERVED for that connection:
+`is_relay`/`is_coordinator` flags, and no longer read announced addresses
+either (the machine cache's address set is itself fed by connection events,
+so an announced address matching an observed one is a match the peer can
+satisfy itself). A candidate must be connected over a DIRECT path —
+hole-punched and port-predicted paths are excluded, and a relayed
+connection's observed address names the relay, not the peer — and the only
+eligibility evidence is the address the local socket OBSERVED for that
+connection (v4-mapped forms normalized):
 
 - **Operator evidence**: the observed address is a compiled-in seed
   address. A completed QUIC handshake with that source is deployment
   evidence no announcement can forge; no capability flag is consulted.
-- **Community evidence**: the peer asserts the role flag AND one of its
-  announced addresses has the same IP as the observed connection address.
-  The flag is the claim; the observation confirms the claimant really is
-  reachable at the address it advertises. This keeps community relays
-  (ADR 0071 backbone), `--relay` nodes and private fleets
-  (`--no-hard-coded-bootstrap` with operator-configured peers) hinted.
 
-A forged seed address in an announcement buys nothing: eligibility keys on
-the OBSERVED address, never on announced ones. A relayed connection's
-observed address names the relay, not the peer, so relayed paths are never
-evidence.
+**Community narrowing (deliberate, review rounds 1–2).** Community relay
+and coordinator claims — ADR 0071 backbone nodes, `--relay` daemons, and
+private fleets running `--no-hard-coded-bootstrap` with their own peers —
+are NOT hinted in this version. A role claim plus any address match the
+peer can satisfy itself does not independently verify relay service or
+public dialability. Two independent mechanisms would restore them, both
+named by #1112 itself: weighting by observed relay success, or requiring
+an attestation signed by a seed. Choosing between them is an open decision
+(recorded with David); until then the hint lists carry operator-seed
+machines only.
 
 ### Seed key rotation policy
 

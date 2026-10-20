@@ -5536,26 +5536,28 @@ async fn collect_coordinator_hints(
 
 /// #1112: the coordinator / relay hint selection, as a pure function.
 ///
-/// Evidence rules (review round 1: a peer's announcement is a claim, not
-/// evidence — a forged `142.93.199.50:5483` address row must buy nothing):
+/// Evidence rules (review rounds 1 and 2: a peer's announcement is a
+/// claim, not evidence, and the machine cache's address set is itself fed
+/// by connection events, so an announced address matching an observed one
+/// corroborates nothing):
 ///
 /// - Every candidate must be connected over a DIRECT transport path whose
-///   remote address the local socket observed. That observed IP is the
-///   only address this selection trusts.
-/// - **Operator evidence:** the OBSERVED IP is a compiled-in operator seed
-///   IP. The operator fleet runs coordinator and relay roles by
-///   deployment (`.deployment/bootstrap-*.toml`), and possession of the
-///   seed address at the network layer — a completed QUIC handshake with
-///   that source — is deployment-derived evidence no announcement can
-///   forge. No capability flag is consulted for these peers.
-/// - **Community evidence:** the peer self-asserts the role flag AND one
-///   of its announced addresses has the SAME IP as the observed remote
-///   address. The flag is the role claim; the observation-confirmed
-///   address is the corroboration that the claimant really is reachable
-///   at the address it advertises. A flag with no address the local node
-///   has observed buys nothing (the #1112 acceptance rule). This keeps
-///   community relays (ADR 0071 backbone) and private-fleet deployments
-///   (`--no-hard-coded-bootstrap` with operator-configured peers) hinted.
+///   remote address the local socket observed (v4-mapped forms
+///   normalized). That observed IP is the only address evidence.
+/// - **Operator evidence:** the OBSERVED IP is a compiled-in operator
+///   seed IP. The operator fleet runs coordinator and relay roles by
+///   deployment (`.deployment/bootstrap-*.toml`), and a completed QUIC
+///   handshake with that source is deployment-derived evidence no
+///   announcement can forge. No capability flag is consulted.
+///
+/// Community relay/coordinator claims (`is_relay`/`is_coordinator`) are
+/// NOT eligible evidence in this version: the claim plus any
+/// address-match the peer can satisfy itself does not independently
+/// verify relay service or public dialability. Until an independent
+/// mechanism exists (observed relay-success weighting, or a seed-signed
+/// attestation — the two options #1112 itself names), a community peer
+/// is never a hint. That narrowing is deliberate and documented in
+/// `docs/trust-and-connectivity.md`.
 ///
 /// Hints are deduplicated, capped to `MAX_COORDINATOR_HINTS` each, and
 /// returned in stable order. The announcer never hints itself.
@@ -5586,32 +5588,17 @@ fn select_capability_hints(
         let Some(observed_ip) = origin.remote_addr.map(|addr| addr.ip()) else {
             continue;
         };
-        let Some(entry) = cache.get(&mid) else {
-            continue;
-        };
-        // Operator evidence first: the observed transport address IS a
-        // seed address. The peer cannot forge this by announcing anything.
-        let on_operator_host = bootstrap_ips.contains(&observed_ip);
-        // Community evidence: the role claim is corroborated by an
-        // announced address the local socket has confirmed (same IP).
-        let address_confirmed = entry.addresses.iter().any(|addr| addr.ip() == observed_ip);
-        let coordinator =
-            on_operator_host || (address_confirmed && entry.is_coordinator.unwrap_or(false));
-        let relay = on_operator_host || (address_confirmed && entry.is_relay.unwrap_or(false));
-        if !coordinator && !relay {
+        // Operator evidence: the OBSERVED transport address is a seed IP.
+        // The peer cannot forge this by announcing anything, and no
+        // self-asserted capability flag is consulted.
+        if !bootstrap_ips.contains(&observed_ip) {
             continue;
         }
-        if coordinator
-            && !reachable_via.contains(&mid)
-            && reachable_via.len() < MAX_COORDINATOR_HINTS
-        {
+        if !reachable_via.contains(&mid) && reachable_via.len() < MAX_COORDINATOR_HINTS {
             selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             reachable_via.push(mid);
         }
-        if relay
-            && !relay_candidates.contains(&mid)
-            && relay_candidates.len() < MAX_COORDINATOR_HINTS
-        {
+        if !relay_candidates.contains(&mid) && relay_candidates.len() < MAX_COORDINATOR_HINTS {
             selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             relay_candidates.push(mid);
         }
@@ -7834,6 +7821,10 @@ impl Agent {
                 if advert_peer_id == target_peer_id {
                     continue;
                 }
+                // #1112 (review round 2): the advert's roles are the
+                // peer's own declaration — the same self-assertion the
+                // ruling removes elsewhere — so they grant no capability
+                // here. The advert's addresses remain dial hints.
                 merge_helper_hint(
                     &mut helper_hints,
                     advert_peer_id,
@@ -7843,8 +7834,8 @@ impl Agent {
                         .into_iter()
                         .map(|hint| hint.addr)
                         .filter(|addr| is_publicly_advertisable(*addr)),
-                    advert.roles.coordinator || advert.roles.rendezvous,
-                    advert.roles.relay,
+                    false,
+                    false,
                 );
             }
         }
@@ -14746,10 +14737,24 @@ impl Agent {
                         &self.shutdown_token,
                     )
                     .await;
-                all_connected.extend(succeeded.iter().copied());
+                // #1112 (review round 2): the cached-coordinator tier gets
+                // the same pin verdict as the seed tiers — a pinned
+                // address that answered with an identity outside its pin
+                // set never becomes a join candidate, on any join path.
+                let (admitted, _pin_rejected): (Vec<_>, Vec<_>) =
+                    succeeded.into_iter().partition(|(addr, peer_id)| {
+                        !matches!(
+                            network::seed_pin_check(
+                                network::pinned_seed_peer_ids(*addr),
+                                peer_id.0
+                            ),
+                            network::SeedPinVerdict::Mismatch { .. }
+                        )
+                    });
+                all_connected.extend(admitted.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
-                    succeeded.len(),
+                    admitted.len(),
                     coordinator_addrs.len()
                 );
             }
@@ -15537,20 +15542,12 @@ impl Agent {
             return (Vec::new(), Vec::new());
         }
 
-        // #1112 review round 1: a pin mismatch must not tear down a
-        // connection that already existed before this dial — only a
-        // connection this dial itself created. Snapshot the connected set
-        // before any dial starts.
-        let pre_connected: std::sync::Arc<std::collections::HashSet<ant_quic::PeerId>> =
-            std::sync::Arc::new(network.connected_peers().await.into_iter().collect());
-
         let handles: Vec<_> = addrs
             .iter()
             .map(|addr| {
                 let net = network.clone();
                 let addr = *addr;
                 let stop = stop.clone();
-                let pre_connected = std::sync::Arc::clone(&pre_connected);
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
                     // x0x#1321: shutdown can begin after the parent's check.
@@ -15565,18 +15562,24 @@ impl Agent {
                             // #1112: seed pinning on the join path. A seed
                             // address that answers with a PeerId outside its
                             // pin set is a failed hint, not a trust anchor:
-                            // drop the hint and let the other hints carry the
-                            // join. An unpinned address keeps
-                            // trust-on-first-use, as before.
+                            // the hint is dropped and the join continues
+                            // with the other hints. An unpinned address
+                            // keeps trust-on-first-use, as before. No
+                            // connection is torn down on a mismatch
+                            // (review round 2): the dial batch shares one
+                            // snapshot, a concurrently-established
+                            // connection cannot be attributed to this dial,
+                            // and an idle wrong-identity connection is
+                            // bounded by the pool's idle eviction.
                             //
-                            // ant-quic's `connect_addr` performs its own
-                            // transport-level admission (pool insert,
-                            // PeerConnected) before x0x sees the answered
-                            // identity; x0x validates immediately on return,
-                            // before any x0x-side bookkeeping. A pre-existing
-                            // connection to the same peer is left standing
-                            // (review round 1): the mismatched hint is
-                            // dropped, not the legitimate peer.
+                            // Honest limit: ant-quic's `connect_addr`
+                            // performs its own transport-level admission
+                            // (cache write, pool insert, PeerConnected)
+                            // before x0x sees the answered identity; x0x
+                            // validates immediately on return, before any
+                            // x0x-side bookkeeping. Refusing at the
+                            // handshake needs an ant-quic expected-peer
+                            // API (fenced, recorded in the PR).
                             let pins = network::pinned_seed_peer_ids(addr);
                             if let network::SeedPinVerdict::Mismatch { .. } =
                                 network::seed_pin_check(pins, peer_id.0)
@@ -15591,17 +15594,8 @@ impl Agent {
                                     %addr,
                                     answered = %network::hex_prefix(&peer_id.0, 8),
                                     expected,
-                                    pre_existing = pre_connected.contains(&peer_id),
                                     "seed pin mismatch: dropping bootstrap hint (issue #1112)"
                                 );
-                                if !pre_connected.contains(&peer_id) {
-                                    let _ = net
-                                        .disconnect_with_reason(
-                                            &peer_id,
-                                            network::DisconnectReason::PolicyRejection,
-                                        )
-                                        .await;
-                                }
                                 return Err(addr);
                             }
                             tracing::info!("Connected to peer: {}", addr);
@@ -40822,11 +40816,12 @@ mod peer_connected_handler_integration_tests {
 
         #[test]
         fn issue1112_operator_seed_host_is_a_hint_without_self_assertion() {
-            // Evidence side of #1112: a connected machine whose signed
-            // announcement addresses place it on a compiled-in operator seed IP
-            // is a coordinator and relay hint even with no self-asserted flags
-            // — the operator fleet runs both roles by deployment. The announcer
-            // never hints itself.
+            // Evidence side of #1112: a machine whose DIRECT connection the
+            // local socket OBSERVED on a compiled-in operator seed IP is a
+            // coordinator and relay hint even with no self-asserted flags —
+            // the operator fleet runs both roles by deployment. The announcer
+            // never hints itself. A dual-stack socket reports the same peer
+            // v4-mapped; the normalized form must work identically.
             let seed_host = identity::MachineId([0x22; 32]);
             let own = identity::MachineId([0x99; 32]);
             let mut cache = std::collections::HashMap::new();
@@ -40848,15 +40843,17 @@ mod peer_connected_handler_integration_tests {
                 &[
                     issue1112_origin([0x22; 32], "142.93.199.50:5483", true),
                     issue1112_origin([0x99; 32], "142.93.199.50:443", true),
-                    issue1112_origin([0x22; 32], "142.93.199.50:5483", true),
+                    // Same seed host seen v4-mapped on a dual-stack socket
+                    // (review round 2): normalization must keep it a hint.
+                    issue1112_origin([0x55; 32], "[::ffff:65.21.157.229]:5483", true),
                 ],
                 &cache,
                 own,
                 &bootstrap_ip_set(),
                 &skew,
             );
-            assert_eq!(coordinators, vec![seed_host]);
-            assert_eq!(relays, vec![seed_host]);
+            assert!(coordinators.contains(&seed_host));
+            assert!(relays.contains(&seed_host));
             // One bootstrap-classified choice per hint list, none for the
             // self-entry.
             assert_eq!(skew.snapshot().chosen_bootstrap, 2);
@@ -40864,13 +40861,14 @@ mod peer_connected_handler_integration_tests {
         }
 
         #[test]
-        fn issue1112_community_relay_with_confirmed_address_is_a_hint() {
-            // Review round 1: community relays (ADR 0071 backbone) and
-            // private fleets (`--no-hard-coded-bootstrap`, operator-config
-            // peers) keep their hints. The role claim is self-asserted,
-            // but the address it rides on is CONFIRMED: the local socket
-            // observes the direct connection at the same IP the peer
-            // announces. Role claim + confirmed address = eligible.
+        fn issue1112_community_relay_claims_need_independent_evidence() {
+            // Review round 2: a community peer's own is_relay claim plus
+            // an announced address matching the observed connection is NOT
+            // independent evidence — the machine cache's address set is
+            // itself fed by connection events, so the peer can satisfy the
+            // match itself. Until an independent mechanism exists (observed
+            // relay-success weighting or a seed-signed attestation, the two
+            // options #1112 names), a community peer is never a hint.
             let mut cache = std::collections::HashMap::new();
             let community = identity::MachineId([0x33; 32]);
             cache.insert(
@@ -40890,14 +40888,9 @@ mod peer_connected_handler_integration_tests {
                 &bootstrap_ip_set(),
                 &skew,
             );
-            assert_eq!(
-                relays,
-                vec![community],
-                "a relay claim confirmed by the observed address stays a hint"
-            );
             assert!(
-                coordinators.is_empty(),
-                "no coordinator claim, no coordinator hint"
+                relays.is_empty() && coordinators.is_empty(),
+                "a self-asserted role with a self-satisfiable address match is not evidence"
             );
         }
 
