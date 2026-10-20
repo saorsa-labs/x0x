@@ -24,8 +24,8 @@ the zero-window calculator behavior. A minute value too large to represent
 in whole seconds uses `u64::MAX` seconds as the effective bound.
 
 The Unix startup, gossip, fallback and HTTP apply paths record the first
-eligible release beside the
-canonical installed binary. The private `upgrade-rollout-<digest>.json`
+eligible release beside the canonical installed binary. The private
+`upgrade-rollout-<digest>.json`
 receipt binds the actual data and identity roots, MachineId, release version,
 verified manifest digest and archive digest. Duplicate delivery, restart and
 later window changes retain the first choice. Monotonic elapsed time reduces
@@ -44,14 +44,22 @@ The compiled deployment inventory sets a minimum 60-minute window for a
 known or ambiguous production fleet install. An existing receipt below that
 minimum refuses apply and remains intact. Ordinary installs retain an
 explicit zero window. Only the compiled debug test key permits the fleet
-rehearsal exception. Selecting a newer eligible release requires a durable
-supersession record; an older waiter cannot then apply its release.
+rehearsal exception.
+
+Selecting a newer eligible release requires a durable supersession record.
+An older waiter cannot then apply its release. The previous receipt remains
+intact; supersession does not delete it or reset the selected release's wait.
 
 Gossip and fallback discovery share one bounded pending release and continue
-to receive announcements during a wait. HTTP allows one waiting request and
-retains its deferred restart owner after mutation admission. Shutdown or
-dropping a waiting request cancels its permit; a queued worker checks that
-permit after acquiring the install lock, before record writes.
+to receive announcements during a wait. The worker drains a superseded
+operation before starting the newer release. Cancellation is checked after
+the install lock is acquired, before queued work can write records.
+An admitted replacement retains its restart continuation.
+
+HTTP allows one waiting request and retains its deferred restart owner after
+mutation admission. Dropping a waiting request cancels its permit. Queued or
+running blocking work, including service-manager readback, retains that
+request's capacity slot until the worker exits.
 
 `x0x upgrade --apply --now` sends authenticated
 `POST /upgrade/apply?now=true` (D185). It skips only the staging component of
@@ -61,6 +69,8 @@ the final check under the install lock. It does not write a zero-window
 replacement receipt. The CLI uses no total apply-request timeout, with
 connection setup bounded to 30 seconds.
 
+Shutdown closes background intake and withdraws pre-admission writes; it does
+not claim every blocking operation is reaped before shutdown returns.
 Complete host inventory and transaction-bound guide installation remain
 separate M2 work. These staging controls do not establish a protected host
 transaction or authorize guide promotion at host commit.
