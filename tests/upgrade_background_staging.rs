@@ -747,6 +747,57 @@ macro_rules! background_driver_regression_tests {
                     assert!(fixture.observed.try_recv().is_err());
                 }
             }
+
+            #[tokio::test(start_paused = true)]
+            async fn background_supersession_drops_due_guide_download_before_newer_apply() {
+                struct DownloadDrop(UnboundedSender<&'static str>);
+                impl Drop for DownloadDrop {
+                    fn drop(&mut self) { let _ = self.0.send("dropped"); }
+                }
+                let mut fixture = Fixture::new(0);
+                let mut older = fixture.release("9.9.9");
+                older.manifest.skill_url = "inert-guide://controlled-download".into();
+                older.manifest.skill_sha256 = sha2::Sha256::digest(b"superseded guide").into();
+                older.manifest_json = serde_json::to_vec(&older.manifest).unwrap();
+                older.gossip_payload = older.manifest_json.clone();
+                let older_request = fixture.request(&older);
+                let newer = fixture.release("9.9.10");
+                let newer_request = fixture.request(&newer);
+                let (download_tx, mut download) = mpsc::unbounded_channel();
+                let _guide = skill_download_seam::install(async move {
+                    let _drop = DownloadDrop(download_tx.clone());
+                    let _ = download_tx.send("started");
+                    std::future::pending::<Vec<u8>>().await
+                });
+                let (input, driver) = fixture.gossip();
+                let owner = fixture.owner.take().unwrap();
+                let running = async { tokio::join!(owner.run(), driver); };
+                tokio::pin!(running);
+                input.send(older).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.9".into(), SubmitOutcome::Accepted));
+                assert_eq!(event(running.as_mut(), &mut fixture.observed).await,
+                    crate::upgrade::staging::Decision::Due);
+                assert_eq!(event(running.as_mut(), &mut download).await, "started");
+                assert!(fixture.attempts.lock().unwrap().is_empty());
+                let old_path = crate::upgrade::staging::receipt_path(&older_request).unwrap();
+                let old_receipt = std::fs::read(&old_path).unwrap();
+                input.send(newer).unwrap();
+                assert_eq!(event(running.as_mut(), &mut fixture.processed).await,
+                    ("9.9.10".into(), SubmitOutcome::Accepted));
+                assert_eq!(event(running.as_mut(), &mut download).await, "dropped",
+                    "new discovery must cancel the actual pending download future");
+                assert_eq!(event(running.as_mut(), &mut fixture.applied).await, "9.9.10");
+                fixture.stop();
+                finish(running.as_mut()).await;
+                assert_eq!(*fixture.attempts.lock().unwrap(), vec!["9.9.10".to_owned()]);
+                assert_eq!(std::fs::read(fixture.data.join("SKILL.md")).unwrap(), b"original guide");
+                assert_eq!(std::fs::read(old_path).unwrap(), old_receipt);
+                assert!(crate::upgrade::staging_selection::check_request(&older_request).is_err());
+                assert_eq!(crate::upgrade::staging::read_receipt(&newer_request).unwrap().unwrap().chosen_delay,
+                    Duration::ZERO);
+                assert!(download.try_recv().is_err(), "only the superseded release downloaded");
+            }
         }
     };
 }
