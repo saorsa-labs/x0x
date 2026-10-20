@@ -92,6 +92,13 @@ pub(crate) fn parse_source(
             return Err(refusal("ambiguous configured property name"));
         }
         if section != "[Service]" {
+            // Socket units also have Exec properties. Unsupported sections
+            // must not turn executable evidence into an empty result.
+            if key.starts_with("Exec") {
+                return Err(refusal(
+                    "execution property outside supported Service section",
+                ));
+            }
             continue;
         }
         // Check every service value before classifying commands. In particular,
