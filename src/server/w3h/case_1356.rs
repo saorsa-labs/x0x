@@ -26,6 +26,17 @@
 //!   pre-Welcome joiner does not have, and the attempt ends with J not
 //!   active and never marked.
 //!
+//! - `s3_attestation_touches_only_the_subject` (H-S3-d1 in part, D41;
+//!   control, GREEN on the base and with S3). Setup S0 (skewed clocks,
+//!   as `case_818`: four policy changes before the mint), then as above.
+//!   Desired: whatever J's outcome, A and M1 are never marked in the
+//!   [`CATCHUP`] window, M1 reaches A's head (r+2) by gossip, no node's
+//!   state revision passes r+2, and A's and M1's `recovery` objects do not
+//!   change. The ADR's step that copies J's join-carry ATA and injects it
+//!   to M1 needs a DM-injection hook the harness does not have, and an ATA
+//!   the base cannot build; with S3 the case still checks that J's
+//!   recovery acts on J only.
+//!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
 
@@ -35,7 +46,7 @@ use super::control::{create_group, invite, join, members, mesh};
 use super::receipt::{Receipt, Verdict};
 use super::*;
 use anyhow::ensure;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const JOIN_LABELS: &[&str] = &["A", "M1", "M2", "J"];
 const SETUP: Duration = Duration::from_secs(180);
@@ -52,10 +63,25 @@ const CAUSE_ALIGNED: &str = "J is never marked and is not active at the end: the
 /// The WARN line the frontier gate writes when it queues an event.
 const QUEUED_LOG: &str = "queued TreeKEM membership event pending catch-up/replay";
 
+/// S0 step 3: state-only commits before the mint. A rename now moves the
+/// roster clock too (`update_named_group`), so, as in `case_818`, policy
+/// changes make the skew. Two would be enough; four keep a margin.
+const POLICY_CHANGES: [&str; 4] = ["admin_only", "members_only", "admin_only", "members_only"];
+const FINAL_BYSTANDERS: &str =
+    "a_and_m1_never_marked_m1_at_the_seal_no_revision_past_it_recovery_unchanged";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
     /// H-S3-a2: S0′ (aligned clocks), stale invite.
     AlignedJoin,
+    /// H-S3-d1 in part: S0 (skewed clocks); only the bystanders are judged.
+    SkewBystanders,
+}
+
+impl Arm {
+    fn skew(self) -> bool {
+        self == Self::SkewBystanders
+    }
 }
 
 /// The fork-quarantine marker as one node holds it.
@@ -284,12 +310,25 @@ fn at(sim: &Sim) -> u128 {
     sim.fabric().now().as_micros()
 }
 
-/// Join arms: S0′ (aligned) up to J's seal, then [`CATCHUP`].
+/// Join arms: S0 or S0′ up to J's seal, then [`CATCHUP`].
 async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> {
     mesh(sim, JOIN_LABELS).await?;
     let group = create_group(sim, "A").await?;
     for member in ["M1", "M2"] {
         seat(sim, "A", member, &group).await?;
+    }
+    if arm.skew() {
+        for write_access in POLICY_CHANGES {
+            let (code, body) = sim
+                .api(
+                    "A",
+                    Method::PATCH,
+                    &format!("/groups/{group}/policy"),
+                    Some(json!({"write_access": write_access})),
+                )
+                .await?;
+            ensure!(code.is_success(), "policy {write_access}: {code} {body}");
+        }
     }
     settled(sim, &["M1", "M2"], &group, "M1 and M2 hold A's revision").await?;
     let minted = view(sim, "A", &group).await?;
@@ -317,6 +356,8 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     })
     .await?;
 
+    let a_recovery_before = status(sim, "A", &group).await?.map(|st| st.recovery);
+    let m1_recovery_before = status(sim, "M1", &group).await?.map(|st| st.recovery);
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
     join(sim, "J", &link).await?;
     let j_hex = sim.agent_hex("J")?;
@@ -346,9 +387,20 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
         format!("invite base {base}; J {}", stub.describe()),
         at(sim),
     );
+    let (clock_stage, clock_ok) = if arm.skew() {
+        (
+            "seal_roster_clock_at_or_below_the_joiner_seed",
+            sealed.roster_revision <= base,
+        )
+    } else {
+        (
+            "seal_roster_clock_above_the_joiner_seed",
+            sealed.roster_revision > base,
+        )
+    };
     receipt.evidence(
-        "seal_roster_clock_above_the_joiner_seed",
-        sealed.roster_revision > base,
+        clock_stage,
+        clock_ok,
         format!(
             "A at mint state={} roster={}; A after the seal {}",
             minted.state_revision,
@@ -368,6 +420,8 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     );
 
     let mut j_marked: Option<String> = None;
+    let mut bystander_marked: Option<String> = None;
+    let mut max_revision = 0_u64;
     let mut j_seen = false;
     let mut seen = Observations::default();
     let waited = sim
@@ -381,6 +435,24 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
             let Some(j_status) = seen.observe(status_now(s, "J", &group)).await else {
                 return true;
             };
+            let Some(m1) = seen.observe(view_now(s, "M1", &group)).await else {
+                return true;
+            };
+            for (label, node) in [("A", &a), ("M1", &m1)] {
+                if node.marker.is_some() {
+                    bystander_marked.get_or_insert_with(|| {
+                        format!(
+                            "at {} us: {label} {}",
+                            s.fabric().now().as_micros(),
+                            node.describe()
+                        )
+                    });
+                }
+            }
+            max_revision = max_revision
+                .max(a.state_revision)
+                .max(m1.state_revision)
+                .max(j.as_ref().map_or(0, |j| j.state_revision));
             if let Some(j) = j.as_ref() {
                 j_seen = true;
                 if j.marker.is_some() {
@@ -390,7 +462,8 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
                 }
             }
             let membership = j_status.as_ref().and_then(|st| st.membership.as_deref());
-            j_marked.is_none() && caught_up(j.as_ref(), &a, membership)
+            // The bystander control judges the whole window.
+            !arm.skew() && j_marked.is_none() && caught_up(j.as_ref(), &a, membership)
         })
         .await;
     if let Err(error) = waited {
@@ -405,7 +478,22 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     let a = view(sim, "A", &group).await?;
     let j_status = status(sim, "J", &group).await?;
     let membership = j_status.as_ref().and_then(|st| st.membership.clone());
-    let passed = j_marked.is_none() && caught_up(j.as_ref(), &a, membership.as_deref());
+    let m1 = view(sim, "M1", &group).await?;
+    let a_recovery_after = status(sim, "A", &group).await?.map(|st| st.recovery);
+    let m1_recovery_after = status(sim, "M1", &group).await?.map(|st| st.recovery);
+    let j_passed = j_marked.is_none() && caught_up(j.as_ref(), &a, membership.as_deref());
+    let bystanders_passed = bystander_marked.is_none()
+        && m1.state_revision == sealed.state_revision
+        && m1.state_hash == sealed.state_hash
+        && a.state_hash == sealed.state_hash
+        && max_revision <= sealed.state_revision
+        && a_recovery_before == a_recovery_after
+        && m1_recovery_before == m1_recovery_after;
+    let passed = if arm.skew() {
+        bystanders_passed
+    } else {
+        j_passed
+    };
     let j_text = j.as_ref().map_or_else(
         || "has no record (stub dropped)".to_string(),
         View::describe,
@@ -423,6 +511,13 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
          J marked: {j_marked:?}; revision_gap queue WARN lines: {queued}",
         a.describe()
     ));
+    receipt.note(format!(
+        "bystanders: M1 {}; marked: {bystander_marked:?}; max revision {max_revision} \
+         (seal at {}); A recovery {a_recovery_before:?} -> {a_recovery_after:?}; \
+         M1 recovery {m1_recovery_before:?} -> {m1_recovery_after:?}",
+        m1.describe(),
+        sealed.state_revision
+    ));
 
     let to_a = delivered_after(sim, "J", "A", joined_at)?;
     let to_j = delivered_after(sim, "A", "J", joined_at)?;
@@ -432,7 +527,7 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
         format!("frames since the join: J->A={to_a} A->J={to_j}; A lists J"),
         at(sim),
     );
-    if !passed {
+    if !passed && !arm.skew() {
         let active = membership.as_deref() == Some("active");
         receipt.cause(
             CAUSE_ALIGNED,
@@ -444,7 +539,15 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
             at(sim),
         );
     }
-    receipt.finish(FINAL_JOIN, passed, at(sim));
+    receipt.finish(
+        if arm.skew() {
+            FINAL_BYSTANDERS
+        } else {
+            FINAL_JOIN
+        },
+        passed,
+        at(sim),
+    );
     Ok(())
 }
 
@@ -453,6 +556,7 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
     receipt.note("ADR 0109 S3 (#1356); the harness cannot inject DMs, so no ATA is forged.");
     let (labels, final_name) = match arm {
         Arm::AlignedJoin => (JOIN_LABELS, FINAL_JOIN),
+        Arm::SkewBystanders => (JOIN_LABELS, FINAL_BYSTANDERS),
     };
     match Sim::start(case, seed, labels).await {
         Ok(mut sim) => {
@@ -495,6 +599,22 @@ async fn w3h_1356_red_s3_aligned_stale_joiner_catches_up() -> Result<()> {
         0x1356_0001,
         Arm::AlignedJoin,
         Verdict::Red,
+    )
+    .await
+}
+
+/// H-S3-d1 in part (D41): J's recovery never marks, clears or moves A or M1.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1356_control_s3_attestation_touches_only_the_subject() -> Result<()> {
+    expect(
+        "w3h_1356_control_s3_attestation_touches_only_the_subject",
+        0x1356_0002,
+        Arm::SkewBystanders,
+        Verdict::Green,
     )
     .await
 }
