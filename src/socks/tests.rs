@@ -558,3 +558,171 @@ async fn idle_handshake_hits_the_step_deadline() {
     assert_eq!(flags.prepares.load(Ordering::SeqCst), 0);
     assert!(!flags.attempted.load(Ordering::SeqCst));
 }
+
+/// `prepare` never returns. Dropping the future counts as stream cleanup.
+struct StallConnector {
+    started: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+}
+
+struct StallGuard(Arc<AtomicU64>);
+
+impl Drop for StallGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl SocksConnector for StallConnector {
+    async fn prepare(
+        &self,
+        _peer: AgentId,
+        _port: u16,
+    ) -> Result<Box<dyn SocksTunnel>, SocksConnectError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let _guard = StallGuard(Arc::clone(&self.dropped));
+        std::future::pending::<Result<Box<dyn SocksTunnel>, SocksConnectError>>().await
+    }
+}
+
+async fn write_connect_domain(client: &mut TcpStream, host: &str, port: u16) {
+    let host_b = host.as_bytes();
+    let mut msg = vec![VER, 0x01, 0x00, 0x03, host_b.len() as u8];
+    msg.extend_from_slice(host_b);
+    msg.extend_from_slice(&port.to_be_bytes());
+    client.write_all(&msg).await.unwrap();
+    client.flush().await.unwrap();
+}
+
+async fn login(client: &mut TcpStream) {
+    assert_eq!(
+        client_greet(client, &[METHOD_USER_PASS]).await,
+        METHOD_USER_PASS
+    );
+    assert_eq!(client_userpass(client, "x0x", TOKEN).await, 0x00);
+}
+
+fn stall_connector() -> Arc<StallConnector> {
+    Arc::new(StallConnector {
+        started: Arc::new(AtomicU64::new(0)),
+        dropped: Arc::new(AtomicU64::new(0)),
+    })
+}
+
+async fn spawn_stall(connector: Arc<StallConnector>) -> (SocksService, u16) {
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let cfg = SocksConfig {
+        listen: Some(format!("127.0.0.1:{port}").parse().unwrap()),
+    };
+    let service = SocksService::spawn(
+        &cfg,
+        Arc::new(TOKEN.to_string()),
+        connector,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("loopback spawn");
+    (service, port)
+}
+
+async fn wait_until(flag: &AtomicU64, want: u64) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while flag.load(Ordering::SeqCst) < want {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("counter must reach the target within 2s");
+}
+
+/// WHY (Codex P2 / #1505): 32 prepares that never return fill the session
+/// cap. Disconnecting those clients must drop each prepare future and free
+/// the permits before the handshake deadline.
+#[tokio::test]
+async fn stalled_prepare_client_disconnect_releases_session_cap() {
+    let (_peer, host) = peer_host();
+    let stall = stall_connector();
+    let (service, port) = spawn_stall(Arc::clone(&stall)).await;
+    let mut held = Vec::new();
+    for _ in 0..MAX_SOCKS_SESSIONS {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        login(&mut client).await;
+        write_connect_domain(&mut client, &host, 9).await;
+        held.push(client);
+    }
+    wait_until(&stall.started, MAX_SOCKS_SESSIONS as u64).await;
+
+    let mut extra = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut buf = [0u8; 1];
+    let closed = tokio::time::timeout(std::time::Duration::from_millis(500), extra.read(&mut buf))
+        .await
+        .expect("the 33rd session must be refused while prepares are stalled");
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "over-cap session must not stay open: {closed:?}"
+    );
+
+    drop(held);
+    wait_until(&stall.dropped, MAX_SOCKS_SESSIONS as u64).await;
+
+    let admitted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            if client
+                .write_all(&[VER, 0x01, METHOD_USER_PASS])
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let mut method = [0u8; 2];
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                client.read_exact(&mut method),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    assert_eq!(method[0], VER);
+                    break;
+                }
+                _ => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "disconnect during prepare must free a session permit within 2s"
+    );
+    service.shutdown_and_wait().await;
+}
+
+/// Listener cancel during a withheld prepare must drop that future. The
+/// client socket closes without waiting for the 10 second deadline.
+#[tokio::test]
+async fn shutdown_cancels_stalled_prepare() {
+    let (_peer, host) = peer_host();
+    let stall = stall_connector();
+    let (service, port) = spawn_stall(Arc::clone(&stall)).await;
+    let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    login(&mut client).await;
+    write_connect_domain(&mut client, &host, 9).await;
+    wait_until(&stall.started, 1).await;
+
+    let mut buf = [0u8; 1];
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(service.shutdown_and_wait(), client.read(&mut buf))
+    })
+    .await
+    .expect("cancel during prepare must end the session within 2s");
+    assert!(
+        matches!(finished.1, Ok(0) | Err(_)),
+        "cancelled prepare must drop the client socket: {:?}",
+        finished.1
+    );
+    assert_eq!(stall.dropped.load(Ordering::SeqCst), 1);
+}

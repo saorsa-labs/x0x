@@ -48,6 +48,10 @@ pub trait SocksTunnel: Send {
 /// [`SocksConnector::prepare`] must not deliver any bytes to the remote
 /// loopback target until the peer's connect gate allows. A
 /// [`SocksConnectError::NotAllowed`] means the target received zero bytes.
+///
+/// The SOCKS session races `prepare` against listener cancel, client
+/// disconnect, and the 10 second handshake limit. Dropping the future must
+/// release every peer stream and admission permit it opened.
 #[async_trait]
 pub trait SocksConnector: Send + Sync {
     async fn prepare(
@@ -219,9 +223,11 @@ async fn accept_loop(
 
 /// Full SOCKS5 session on a real `TcpStream` (production + integration tests).
 ///
-/// Method negotiation, username/password auth, and the CONNECT read each race
-/// `cancel` and a 10 second limit. Cancel or timeout returns an I/O error and
-/// does not call [`SocksConnector::prepare`].
+/// Method negotiation, username/password auth, the CONNECT read, and
+/// [`SocksConnector::prepare`] each race `cancel` and a 10 second limit.
+/// Cancel or timeout before `prepare` returns an I/O error and does not open
+/// a tunnel. A client hang-up during `prepare` drops that future so the
+/// session permit is released without waiting out the deadline.
 pub async fn handle_tcp_client(
     mut client: TcpStream,
     api_token: &str,
@@ -270,23 +276,68 @@ pub async fn handle_tcp_client(
         flag.store(true, Ordering::SeqCst);
     }
 
-    match connector.prepare(peer, request.port).await {
-        Ok(tunnel) => {
+    // Bound the peer's ForwardV2 reply. Dropping `prepare` is the cleanup
+    // signal: the connector must reset any stream it opened. A client that
+    // has already gone must not hold a session permit for the full deadline.
+    let prepared = {
+        let mut prepare = connector.prepare(peer, request.port);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => PrepareWait::Cancelled,
+            _ = client_disconnected(&client) => PrepareWait::ClientGone,
+            _ = tokio::time::sleep(HANDSHAKE_STEP_TIMEOUT) => PrepareWait::TimedOut,
+            result = &mut prepare => PrepareWait::Ready(result),
+        }
+    };
+    match prepared {
+        PrepareWait::Ready(Ok(tunnel)) => {
             ensure_running(cancel)?;
             write_reply(&mut client, REP_SUCCEEDED).await?;
             tunnel.bridge(client).await;
             Ok(())
         }
-        Err(SocksConnectError::NotAllowed) => {
+        PrepareWait::Ready(Err(SocksConnectError::NotAllowed)) => {
             denied.fetch_add(1, Ordering::Relaxed);
             ensure_running(cancel)?;
             write_reply(&mut client, REP_NOT_ALLOWED).await?;
             Ok(())
         }
-        Err(SocksConnectError::Unreachable) => {
+        PrepareWait::Ready(Err(SocksConnectError::Unreachable)) => {
             ensure_running(cancel)?;
             write_reply(&mut client, REP_HOST_UNREACHABLE).await?;
             Ok(())
+        }
+        PrepareWait::Cancelled => Err(cancelled_err()),
+        PrepareWait::ClientGone => Ok(()),
+        PrepareWait::TimedOut => {
+            ensure_running(cancel)?;
+            write_reply(&mut client, REP_HOST_UNREACHABLE).await?;
+            Ok(())
+        }
+    }
+}
+
+enum PrepareWait {
+    Ready(Result<Box<dyn SocksTunnel>, SocksConnectError>),
+    Cancelled,
+    ClientGone,
+    TimedOut,
+}
+
+/// Completes when `client` is closed or reset.
+///
+/// A byte that arrives early is left in the socket and this wait parks.
+/// SOCKS payload is not consumed before the success reply.
+async fn client_disconnected(client: &TcpStream) {
+    let mut buf = [0u8; 1];
+    loop {
+        match client.peek(&mut buf).await {
+            Ok(0) => return,
+            Ok(_) => std::future::pending::<()>().await,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::task::yield_now().await;
+            }
+            Err(_) => return,
         }
     }
 }

@@ -2090,7 +2090,8 @@ pub enum PrepareSocksError {
 
 /// A peer stream that has cleared the remote connect gate and is ready to bridge.
 pub struct PreparedSocksTunnel {
-    stream: PeerStream,
+    /// `None` after [`Self::bridge`] takes the stream, or when Drop resets it.
+    stream: Option<PeerStream>,
     guard: teardown::LiveStreamGuard,
     /// Outbound admission. Held until [`Self::bridge`] returns.
     admission: Admission,
@@ -2101,24 +2102,28 @@ pub struct PreparedSocksTunnel {
 
 impl PreparedSocksTunnel {
     /// Bridge `client` to the prepared peer stream until either side closes.
-    pub async fn bridge(self, tcp: TcpStream) {
-        let PreparedSocksTunnel {
-            stream,
-            guard,
-            admission,
-            active,
-        } = self;
-        if guard.token().is_cancelled() {
-            let mut stream = stream;
+    pub async fn bridge(mut self, tcp: TcpStream) {
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        if self.guard.token().is_cancelled() {
             teardown::deny_pre_bridge(&mut stream, Some(&tcp));
-            drop(admission);
-            drop(active);
             return;
         }
         let (send, recv) = stream.into_split();
-        bridge(tcp, send, recv, guard.token()).await;
-        drop(admission);
-        drop(active);
+        bridge(tcp, send, recv, self.guard.token()).await;
+        // Admission and the active-stream guard drop with `self`.
+        let _caps = (&self.admission, &self.active);
+    }
+}
+
+impl Drop for PreparedSocksTunnel {
+    fn drop(&mut self) {
+        // A session that won the race after prepare, then lost cancel or the
+        // client, must not leave the admitted QUIC stream open.
+        if let Some(stream) = self.stream.as_mut() {
+            teardown::deny_pre_bridge(stream, None::<&TcpStream>);
+        }
     }
 }
 
@@ -2142,7 +2147,7 @@ async fn prepare_outbound_v2_for_socks(
         Some(true) => {
             fwd_diag.enter_stream();
             Ok(PreparedSocksTunnel {
-                stream: ready.stream,
+                stream: Some(ready.stream),
                 guard: ready.guard,
                 admission,
                 active: StreamLeaveGuard(Arc::clone(fwd_diag)),
@@ -2176,6 +2181,39 @@ enum V2DriveFail {
     Open(Box<NetworkError>),
     /// A stream was opened. The caller resets or drops it.
     AfterOpen(Box<V2AfterOpen>),
+    /// [`PreBridgeReset`] already reset the stream. Nothing remains to close.
+    AlreadyReset,
+}
+
+/// Resets a ForwardV2 stream when preparation is dropped before the caller
+/// takes the stream. A peer that keeps QUIC up and withholds the response
+/// byte must not leave the stream or its admission behind.
+struct PreBridgeReset {
+    stream: Option<PeerStream>,
+}
+
+impl PreBridgeReset {
+    fn arm(stream: PeerStream) -> Self {
+        Self {
+            stream: Some(stream),
+        }
+    }
+
+    fn stream_mut(&mut self) -> Option<&mut PeerStream> {
+        self.stream.as_mut()
+    }
+
+    fn disarm(&mut self) -> Option<PeerStream> {
+        self.stream.take()
+    }
+}
+
+impl Drop for PreBridgeReset {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            teardown::deny_pre_bridge(stream, None::<&TcpStream>);
+        }
+    }
 }
 
 struct V2AfterOpen {
@@ -2204,6 +2242,21 @@ fn v2_after_open(
     }))
 }
 
+/// Hand `held` to the caller, or report that Drop already reset it.
+fn fail_held(
+    held: &mut PreBridgeReset,
+    kind: V2AfterOpenKind,
+    guard: teardown::LiveStreamGuard,
+) -> V2DriveFail {
+    match held.disarm() {
+        Some(stream) => v2_after_open(kind, stream, guard),
+        None => {
+            drop(guard);
+            V2DriveFail::AlreadyReset
+        }
+    }
+}
+
 /// Shared ForwardV2 open, sign, header write, and response read.
 ///
 /// Does not bridge and does not reset the stream. [`try_outbound_v2`] and
@@ -2215,25 +2268,29 @@ async fn open_signed_forward_v2(
     target_port: u16,
     live: &Arc<teardown::LiveStreams>,
 ) -> Result<V2Handshake, V2DriveFail> {
-    let mut stream = match agent
+    let mut held = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
         .await
     {
-        Ok(stream) => stream,
+        Ok(stream) => PreBridgeReset::arm(stream),
         Err(error) => return Err(V2DriveFail::Open(Box::new(error))),
     };
     // ADR-0074 §4: register before the header/response window so a trust
-    // loss while waiting still hits the ≤5 s bound.
+    // loss while waiting still hits the ≤5 s bound. `held` resets the stream
+    // if this future is dropped while the peer withholds the response byte.
+    let Some(machine) = held.stream_mut().map(|stream| stream.peer()) else {
+        return Err(V2DriveFail::AlreadyReset);
+    };
     let guard = live.register(
         teardown::StreamGate::Outbound {
             peer_agent: *peer_agent,
-            machine: stream.peer(),
+            machine,
         },
         teardown::StreamAuthority::PeerTrust,
     );
     agent.stream_reauth_signal().notify_one();
     if guard.token().is_cancelled() {
-        return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
+        return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
     }
 
     // ADR-0043: the V2 attestation is an agent-key signature. A
@@ -2244,12 +2301,12 @@ async fn open_signed_forward_v2(
         .await
     {
         Err(teardown::Cancelled) => {
-            return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
+            return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
         }
         Ok(false) => {
-            return Err(v2_after_open(
+            return Err(fail_held(
+                &mut held,
                 V2AfterOpenKind::SigningGateRefused,
-                stream,
                 guard,
             ));
         }
@@ -2267,41 +2324,61 @@ async fn open_signed_forward_v2(
             .public_key()
             .as_bytes()
             .to_vec(),
-        stream.peer(),
+        machine,
     );
     if let Err(error) = header.sign(agent.identity().agent_keypair()) {
-        return Err(v2_after_open(
+        return Err(fail_held(
+            &mut held,
             V2AfterOpenKind::SignFailed(error),
-            stream,
             guard,
         ));
     }
-    match teardown::wait_cancellable(guard.token(), write_header_v2(stream.send_mut(), &header))
-        .await
-    {
+    let written = {
+        let Some(stream) = held.stream_mut() else {
+            return Err(fail_held(&mut held, V2AfterOpenKind::WriteFailed, guard));
+        };
+        teardown::wait_cancellable(guard.token(), write_header_v2(stream.send_mut(), &header)).await
+    };
+    match written {
         Err(teardown::Cancelled) => {
-            return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
+            return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
         }
-        Ok(Err(_)) => return Err(v2_after_open(V2AfterOpenKind::WriteFailed, stream, guard)),
+        Ok(Err(_)) => return Err(fail_held(&mut held, V2AfterOpenKind::WriteFailed, guard)),
         Ok(Ok(())) => {}
     }
     let mut resp = [0u8; 1];
-    match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
+    let read = {
+        let Some(stream) = held.stream_mut() else {
+            return Err(fail_held(
+                &mut held,
+                V2AfterOpenKind::ReadFailed(std::io::Error::other(
+                    "forward v2 stream already reset",
+                )),
+                guard,
+            ));
+        };
+        teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await
+    };
+    match read {
         Err(teardown::Cancelled) => {
-            return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
+            return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
         }
         Ok(Err(error)) => {
-            return Err(v2_after_open(
+            return Err(fail_held(
+                &mut held,
                 V2AfterOpenKind::ReadFailed(std::io::Error::other(error)),
-                stream,
                 guard,
             ));
         }
         Ok(Ok(())) => {}
     }
     if guard.token().is_cancelled() {
-        return Err(v2_after_open(V2AfterOpenKind::Cancelled, stream, guard));
+        return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
     }
+    let Some(stream) = held.disarm() else {
+        drop(guard);
+        return Err(V2DriveFail::AlreadyReset);
+    };
     Ok(V2Handshake {
         stream,
         guard,
@@ -2330,6 +2407,7 @@ fn map_socks_v2_fail(fail: V2DriveFail, peer_agent: &AgentId) -> PrepareSocksErr
             drop(guard);
             PrepareSocksError::Failed
         }
+        V2DriveFail::AlreadyReset => PrepareSocksError::Failed,
     }
 }
 
@@ -2489,6 +2567,7 @@ fn map_outbound_v2_fail(
                 }
             }
         }
+        V2DriveFail::AlreadyReset => OutboundOutcome::Done,
     }
 }
 
@@ -5351,5 +5430,159 @@ mod tests {
                 .get("trust_rejected"),
             Some(&1)
         );
+    }
+
+    /// WHY (Codex P2 / #1505): a trusted peer that accepts ForwardV2 and
+    /// withholds the response byte must not keep the QUIC stream after the
+    /// SOCKS client disconnects. Cleanup has to beat the 10 second deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn socks_stalled_peer_resets_stream_on_client_disconnect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
+            return;
+        };
+        let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
+            return;
+        };
+        let alice = Arc::new(alice);
+        let bob = Arc::new(bob);
+        link_loopback_pair(&alice, &bob).await;
+
+        let bob_policy = Arc::new(ConnectPolicy::default());
+        let bob_diag = Arc::new(ConnectDiagnostics::new(bob_policy.summary()));
+        let bob_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&bob), bob_policy, bob_diag, true)
+                .expect("bob forwarder"),
+        );
+        let mut bob_v2 = bob_fwd
+            .inbound_acceptors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("bob acceptors")
+            .1;
+
+        let alice_policy = Arc::new(ConnectPolicy::default());
+        let alice_diag = Arc::new(ConnectDiagnostics::new(alice_policy.summary()));
+        let alice_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&alice), alice_policy, alice_diag, true)
+                .expect("alice forwarder"),
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+
+        let (saw_header_tx, saw_header_rx) = tokio::sync::oneshot::channel();
+        let bob_hold = tokio::spawn(async move {
+            let Some(mut stream) = bob_v2.next().await else {
+                return false;
+            };
+            let header = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_header_v2(stream.recv_mut()),
+            )
+            .await;
+            let Ok(Ok(_)) = header else {
+                return false;
+            };
+            let _ = saw_header_tx.send(());
+            let mut buf = [0u8; 1];
+            // Timeout is failure: the opener must reset, not leave us blocked.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.recv_mut().read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) => true,
+                _ => false,
+            }
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("socks probe");
+        let port = probe.local_addr().expect("socks addr").port();
+        drop(probe);
+        let listen: SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .expect("loopback socks listen");
+        let service = crate::socks::SocksService::spawn(
+            &crate::socks::SocksConfig {
+                listen: Some(listen),
+            },
+            Arc::new("socks-rc3-token".to_string()),
+            Arc::new(crate::socks::ForwardSocksConnector::new(Arc::clone(
+                &alice_fwd,
+            ))),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("socks spawn");
+
+        let mut client = TcpStream::connect(listen).await.expect("socks client");
+        client.write_all(&[0x05, 0x01, 0x02]).await.expect("greet");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.expect("method");
+        assert_eq!(method, [0x05, 0x02]);
+        let pass = b"socks-rc3-token";
+        let mut auth = vec![0x01, 3];
+        auth.extend_from_slice(b"x0x");
+        auth.push(u8::try_from(pass.len()).expect("token fits a u8"));
+        auth.extend_from_slice(pass);
+        client.write_all(&auth).await.expect("auth");
+        let mut auth_rep = [0u8; 2];
+        client.read_exact(&mut auth_rep).await.expect("auth reply");
+        assert_eq!(auth_rep, [0x01, 0x00]);
+        let host = format!("{}.x0x", hex::encode(bob.agent_id().as_bytes()));
+        let host_b = host.as_bytes();
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host_b.len() as u8];
+        req.extend_from_slice(host_b);
+        req.extend_from_slice(&9u16.to_be_bytes());
+        client.write_all(&req).await.expect("connect");
+
+        tokio::time::timeout(std::time::Duration::from_secs(8), saw_header_rx)
+            .await
+            .expect("stalled peer must accept the ForwardV2 header")
+            .expect("header signal");
+        assert_eq!(
+            alice_fwd.live.len(),
+            1,
+            "prepare must register the live stream while the reply is withheld"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+
+        drop(client);
+        let reset = tokio::time::timeout(std::time::Duration::from_secs(2), bob_hold)
+            .await
+            .expect("peer must observe the reset within 2s of client disconnect")
+            .expect("bob task");
+        assert!(reset, "withheld ForwardV2 reply must end in a stream reset");
+        assert_eq!(
+            alice_fwd.live.len(),
+            0,
+            "dropped prepare must unregister the stream"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+        assert_eq!(alice_fwd.diagnostics().streams_over_cap(), 0);
+
+        let mut again = TcpStream::connect(listen).await.expect("second client");
+        again
+            .write_all(&[0x05, 0x01, 0x02])
+            .await
+            .expect("second greet");
+        let greeted = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            again.read_exact(&mut method),
+        )
+        .await;
+        assert!(
+            matches!(greeted, Ok(Ok(_))),
+            "listener must still admit a session after the stalled client left: {greeted:?}"
+        );
+
+        service.shutdown_and_wait().await;
+        bob_fwd.shutdown();
+        alice_fwd.shutdown();
+        alice.shutdown().await;
+        bob.shutdown().await;
     }
 }
