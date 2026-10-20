@@ -29,6 +29,8 @@ mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+mod update_check;
+pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
 mod w3h;
@@ -263,34 +265,6 @@ const DM_INBOX_START_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// does exactly that).
 pub async fn run(config: DaemonConfig, options: ServeOptions) -> anyhow::Result<()> {
     serve_with_options(config, options).await?.wait().await
-}
-
-/// CLI `--check-updates`: check the signed release, print its availability, and
-/// return without serving. This path never installs binaries or SKILL.md;
-/// installation belongs to the serving daemon's authenticated apply route.
-pub async fn run_update_check_and_report(
-    config: &DaemonConfig,
-    skip_update_check: bool,
-) -> anyhow::Result<()> {
-    if config.update.enabled && !skip_update_check {
-        let monitor =
-            x0x::upgrade::monitor::UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
-                .map_err(anyhow::Error::msg)?
-                .with_include_prereleases(config.update.include_prereleases);
-        match monitor.check_for_updates().await {
-            Ok(Some(release)) => {
-                println!("x0xd update available: {}", release.manifest.version);
-                println!("Use `x0x upgrade --apply` to install through the running daemon.");
-            }
-            Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
-            Err(e) => return Err(e).context("self-update check failed"),
-        }
-    } else if !config.update.enabled {
-        println!("self-update checks are disabled by configuration");
-    } else {
-        println!("self-update check skipped by --skip-update-check");
-    }
-    Ok(())
 }
 
 /// Resolve where `x0x user-id create` recorded the install's owner.

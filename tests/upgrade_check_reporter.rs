@@ -2,8 +2,8 @@
 
 //! #1370: execute the production report-only decision with inert dependencies.
 //!
-//! The harness copies the exact reporter function, then instruments its two
-//! dependencies: the monitor only returns an available version; the legacy
+//! The harness compiles the complete production reporter module with inert
+//! dependencies: the monitor returns a configured result; the legacy
 //! startup installer overwrites binary and SKILL sentinels. This checks the
 //! reporter's writer decision without downloading or replacing any executable.
 //! It does not claim to test manifest verification or the install transaction.
@@ -12,16 +12,6 @@ use std::path::Path;
 use std::process::Command;
 
 use tempfile::TempDir;
-
-fn reporter_source() -> &'static str {
-    let source = include_str!("../src/server/mod.rs");
-    let start = source
-        .find("pub async fn run_update_check_and_report(")
-        .expect("production reporter entry point");
-    let function = &source[start..];
-    let end = function.find("\n}\n").expect("reporter function end") + 2;
-    &function[..end]
-}
 
 fn run_reporter_fixture(enabled: bool, skip: bool, prereleases: bool, outcome: &str) {
     let scratch = TempDir::new().expect("reporter fixture scratch");
@@ -33,21 +23,25 @@ fn run_reporter_fixture(enabled: bool, skip: bool, prereleases: bool, outcome: &
     std::fs::write(
         &source,
         format!(
-            "{}\n{}\n{}",
+            "{}\nmod reporter {{\n{}\nuse super::anyhow;\n}}\n{}",
             FIXTURE_BEFORE,
-            reporter_source(),
+            include_str!("../src/server/update_check.rs"),
             FIXTURE_AFTER
         ),
     )
     .expect("write reporter fixture source");
     let executable = scratch.path().join("reporter-fixture");
-    let compiled = Command::new("rustc")
+    // Honor an explicit compiler and resolve a rustup proxy in the repository,
+    // so its toolchain selection does not depend on the scratch directory.
+    let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let compiled = Command::new(compiler)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(["--edition=2021", "--crate-name", "upgrade_reporter_fixture"])
         .arg(&source)
         .arg("-o")
         .arg(&executable)
         .output()
-        .expect("compile actual reporter function");
+        .expect("compile complete production reporter module");
     assert!(
         compiled.status.success(),
         "reporter fixture must compile: {}",
@@ -217,7 +211,7 @@ fn main() {
         },
     };
     let skip = args[3].parse().expect("skip");
-    let future = run_update_check_and_report(&config, skip);
+    let future = reporter::run_update_check_and_report(&config, skip);
     let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(NoopWake));
     let mut context = TaskContext::from_waker(&waker);
