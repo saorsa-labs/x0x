@@ -68,7 +68,9 @@ impl Gate {
         // an acknowledged clock tick. Preserve an older undersized receipt
         // byte-for-byte instead of resetting its first-receipt history.
         if let Some(receipt) = staging::read_receipt(&request).map_err(error)? {
-            let _ = policy.check_receipt_window(receipt.window_minutes);
+            policy
+                .check_receipt_window(receipt.window_minutes)
+                .map_err(error)?;
         }
         if journal::read_boot_records(&self.request.data_root).blocks_apply() {
             return Err(UpgradeError::Other(
