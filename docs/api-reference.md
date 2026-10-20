@@ -2578,13 +2578,14 @@ Run a command on **another** agent's machine. Disabled by default; every request
 **The serving daemon owns installation.** `x0x upgrade --apply` sends an
 authenticated `POST /upgrade/apply` through the normal daemon client, using
 the selected `--name` or `--api` and its bearer token. It does not install
-from the CLI process. Bare `x0x upgrade` still refuses installation.
+from the CLI process. Apply fails if no daemon is available.
 
-`x0x upgrade --check` is a read-only GitHub check and needs **no running
-daemon**. `--check` takes precedence over `--apply`. With `--check`,
-`--force` fetches the current manifest regardless of version; it does not
-bypass any daemon apply check. `x0xd --check-updates` also reports only and
-does not install binaries or SKILL.md. See
+Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
+installation. `x0x upgrade --check` is a standalone GitHub release check and
+needs **no running daemon**. `--check` takes precedence over `--apply`;
+`--check --force` fetches the current manifest regardless of version.
+`--force` does not bypass any daemon apply check. `x0xd --check-updates` also
+reports only and does not install binaries or SKILL.md. See
 [docs/upgrade-system.md](upgrade-system.md).
 
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old
