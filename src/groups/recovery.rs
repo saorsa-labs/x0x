@@ -1525,6 +1525,14 @@ impl ReseatJournalV1 {
             .map(|bytes| *blake3::hash(&bytes).as_bytes())
     }
 
+    /// The fork marker of the journalled original record, if any.
+    #[must_use]
+    pub fn original_marker(&self) -> Option<crate::groups::ForkQuarantine> {
+        serde_json::from_slice::<GroupInfo>(&self.live_record)
+            .ok()
+            .and_then(|original| original.fork_quarantine)
+    }
+
     /// §3 step 3: `live` is the staged result of this journal's re-seat,
     /// ready to swap in. A crash can leave the ORIGINAL record under the
     /// group's key with this journal open (before the move aside became
@@ -1534,9 +1542,10 @@ impl ReseatJournalV1 {
     /// - the phase is past [`ReseatPhase::Prepared`]: the original left
     ///   the live map durably before the staged join started;
     /// - the record is not the journalled original (digest);
-    /// - it is the authorised group, uncontained, and its head is past the
-    ///   authorisation's invite base (the re-seat `MemberAdded` seals after
-    ///   that base);
+    /// - it is the authorised group, uncontained (or holding only the
+    ///   journalled original's marker, which the staged record holds until
+    ///   the swap lifts it), and its head is past the authorisation's invite
+    ///   base (the re-seat `MemberAdded` seals after that base);
     /// - this node is Active on it, with keys when the plane is TreeKEM.
     #[must_use]
     pub fn staged_result_ready(&self, live: &GroupInfo, local_hex: &str, has_tree: bool) -> bool {
@@ -1547,7 +1556,7 @@ impl ReseatJournalV1 {
             return false;
         }
         live.stable_group_id() == self.authorisation.fields.group
-            && live.fork_quarantine.is_none()
+            && (live.fork_quarantine.is_none() || live.fork_quarantine == self.original_marker())
             && live.state_revision > self.authorisation.fields.invite_base_revision
             && live.has_active_member(local_hex)
             && (live.secure_plane != crate::mls::SecureGroupPlane::TreeKem || has_tree)

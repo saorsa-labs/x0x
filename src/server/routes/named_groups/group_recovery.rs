@@ -65,11 +65,12 @@ pub(in crate::server) struct S3Runtime {
     /// placeholder. A plain mutex: the roster encoder reads it
     /// synchronously, and it is never held across an await.
     placeheld: std::sync::Mutex<HashMap<String, Placeheld>>,
-    /// §3 (#1533 review): per group (stable ID) with an open re-seat
-    /// journal, the journalled original's fork marker. A plain mutex: the
-    /// ADR 0066 refusals read it synchronously, and it is never held across
-    /// an await.
-    staging: std::sync::Mutex<HashMap<String, StagingShadow>>,
+    /// §3 step 2 (#1533 review): per group (stable ID) with an open re-seat
+    /// journal that is not yet `Swapping`, the journalled original's fork
+    /// marker, which the staged record holds ([`Self::hold_reseat_markers`]).
+    /// A plain mutex: the roster writers read it synchronously, and it is
+    /// never held across an await.
+    staging: std::sync::Mutex<HashMap<String, StagingHold>>,
 }
 
 impl Default for S3Runtime {
@@ -84,28 +85,38 @@ impl Default for S3Runtime {
 }
 
 /// The original containment of a group whose re-seat join is staged
-/// (§3 step 2): it stays in force for every ADR 0066 refusal until the
-/// durable swap closes the journal, or the rollback does.
+/// (§3 step 2). The staged record in the live map holds this marker from
+/// its first roster write until the swap, so every ADR 0066 gate that reads
+/// the record refuses as for the original.
 #[derive(Debug, Clone)]
-struct StagingShadow {
-    /// The spellings of the group: the journal's live key, the stable ID
-    /// and the MLS group ID of the original.
-    aliases: Vec<String>,
+struct StagingHold {
+    /// The stable ID and the MLS group ID of the original.
+    ids: [String; 2],
     marker: x0x::groups::ForkQuarantine,
+}
+
+impl StagingHold {
+    fn covers(&self, info: &GroupInfo) -> bool {
+        self.ids.iter().any(|id| {
+            id.eq_ignore_ascii_case(info.stable_group_id())
+                || id.eq_ignore_ascii_case(&info.mls_group_id)
+        })
+    }
 }
 
 impl S3Runtime {
     /// Follow the group's sidecar: an open re-seat journal whose original
-    /// carries a fork marker keeps that marker in force.
+    /// carries a fork marker holds that marker on the staged record, until
+    /// the journal is `Swapping` (the swap's own roster write lifts it).
     fn refresh_staging(&self, stable: &str, body: Option<&GroupRecoveryV1>) {
-        let shadow = body
+        let hold = body
             .and_then(|body| body.reseat_journal.as_ref())
+            .filter(|journal| journal.phase != ReseatPhase::Swapping)
             .and_then(|journal| {
                 let original = serde_json::from_slice::<GroupInfo>(&journal.live_record).ok()?;
                 let marker = original.fork_quarantine.clone()?;
-                Some(StagingShadow {
-                    aliases: vec![
-                        journal.live_key.clone(),
+                Some(StagingHold {
+                    ids: [
                         original.stable_group_id().to_string(),
                         original.mls_group_id.clone(),
                     ],
@@ -116,9 +127,9 @@ impl S3Runtime {
             .staging
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match shadow {
-            Some(shadow) => {
-                staging.insert(stable.to_string(), shadow);
+        match hold {
+            Some(hold) => {
+                staging.insert(stable.to_string(), hold);
             }
             None => {
                 staging.remove(stable);
@@ -126,13 +137,11 @@ impl S3Runtime {
         }
     }
 
-    /// §3 step 2 (#1533 review): the fork marker of the original record of
-    /// a group (any of `ids`) whose re-seat join is staged. While it is
-    /// `Some`, every ADR 0066 refusal refuses as for the original, whatever
-    /// the live map holds for the group.
-    pub(in crate::server) fn staging_marker(
+    /// The marker the staged re-seat record of `info`'s group holds, if a
+    /// re-seat join for the group is staged.
+    pub(in crate::server) fn held_reseat_marker(
         &self,
-        ids: &[&str],
+        info: &GroupInfo,
     ) -> Option<x0x::groups::ForkQuarantine> {
         let staging = self
             .staging
@@ -140,13 +149,54 @@ impl S3Runtime {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         staging
             .values()
-            .find(|shadow| {
-                shadow
-                    .aliases
-                    .iter()
-                    .any(|alias| ids.iter().any(|id| alias.eq_ignore_ascii_case(id)))
-            })
-            .map(|shadow| shadow.marker.clone())
+            .find(|hold| hold.covers(info))
+            .map(|hold| hold.marker.clone())
+    }
+
+    /// §3 step 2 (#1533 review, the one gate): the staged join runs apart
+    /// from the original's containment. While a re-seat join for a group is
+    /// staged, a record of that group that has no marker gets the
+    /// journalled original's marker. Every roster write applies this before
+    /// the record is visible: the stub install, the ordinary and gated
+    /// persists and the TreeKEM atomic persist. So the staged record (a stub,
+    /// or a seated record that is not yet swapped in) never has less
+    /// containment than the original, and no clear (manual, mandate,
+    /// adoption, S3 retirement) lifts it before the swap. Returns whether a
+    /// record changed.
+    pub(in crate::server) fn hold_reseat_marker(&self, info: &mut GroupInfo) -> bool {
+        if info.fork_quarantine.is_some() {
+            return false;
+        }
+        let Some(marker) = self.held_reseat_marker(info) else {
+            return false;
+        };
+        info.fork_quarantine = Some(marker);
+        true
+    }
+
+    /// [`Self::hold_reseat_marker`] over every record of a roster.
+    pub(in crate::server) fn hold_reseat_markers(
+        &self,
+        roster: &mut HashMap<String, GroupInfo>,
+    ) -> bool {
+        let staging = self
+            .staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        if staging.is_empty() {
+            return changed;
+        }
+        for info in roster
+            .values_mut()
+            .filter(|info| info.fork_quarantine.is_none())
+        {
+            if let Some(hold) = staging.values().find(|hold| hold.covers(info)) {
+                info.fork_quarantine = Some(hold.marker.clone());
+                changed = true;
+            }
+        }
+        changed
     }
 }
 
@@ -396,10 +446,6 @@ fn is_home_policy_group(info: &GroupInfo) -> bool {
 /// admin-armed ATA.
 async fn contained(state: &AppState, info: &GroupInfo) -> bool {
     info.fork_quarantine.is_some()
-        || state
-            .group_recovery
-            .staging_marker(&[info.stable_group_id(), &info.mls_group_id])
-            .is_some()
         || info
             .invite_lineage
             .as_ref()
@@ -4734,10 +4780,11 @@ async fn swap_if_seated(
         return false;
     }
     let expected = journal.record_digest;
-    // §3 step 3 (#1533 review): `Swapping` lifts the legacy overlay, then
-    // the staged record and its tree must be durable in the legacy files
-    // before the journal closes. A crash before that write loads the
-    // original, which rolls back.
+    // §3 step 3 (#1533 review): `Swapping` lifts the legacy overlay and the
+    // marker hold, then one durable roster write puts the staged record in
+    // the legacy files without the original's marker before the journal
+    // closes. A crash before that write loads the original, which rolls
+    // back.
     if journal.phase != ReseatPhase::Swapping {
         let mut marked = false;
         let marked_ref = &mut marked;
@@ -4754,8 +4801,8 @@ async fn swap_if_seated(
             return true;
         }
     }
-    if resave_legacy(state).await != LegacyWrite::Durable {
-        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the swapped-in record is not durable yet; the swap is retried");
+    if !lift_staging_marker(state, stable, journal).await {
+        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the swapped-in record is not durable yet; it keeps the original's marker and the swap is retried");
         return true;
     }
     let retired = RetiredRecordV1 {
@@ -4791,6 +4838,32 @@ async fn swap_if_seated(
         }
     }
     true
+}
+
+/// §3 step 3: the swap's roster write. The staged record (every record of
+/// `stable`) drops the journalled original's marker, which it held since
+/// its first write, and the legacy files get it. The live map changes only
+/// when that write is Durable: a failed or `ReplacedNotDurable` write, or a
+/// crash, keeps the marker. Returns whether the write is Durable.
+async fn lift_staging_marker(state: &AppState, stable: &str, journal: &ReseatJournalV1) -> bool {
+    let held = journal.original_marker();
+    let stable = stable.to_string();
+    // The write runs also when no record holds a marker: it is the swap's
+    // durable legacy write of the staged record.
+    let outcome = super::persist_named_groups_mutation_durable_only(state, move |groups| {
+        for info in groups
+            .values_mut()
+            .filter(|info| info.stable_group_id() == stable)
+        {
+            if held.is_some() && info.fork_quarantine == held {
+                info.fork_quarantine = None;
+                info.reset_fork_evidence_after_quarantine_clear();
+            }
+        }
+        true
+    })
+    .await;
+    matches!(outcome, Ok(super::AtomicWriteOutcome::Durable))
 }
 
 /// Swap in the staged record of `stable` now if it is seated. A no-op when
@@ -5029,7 +5102,11 @@ pub(in crate::server) async fn held_join_state(
         .sidecars
         .get(info.stable_group_id())
         .is_some_and(|body| !body.served_chain.is_empty());
-    if !(armed || (info.fork_quarantine.is_some() && kept_chain)) {
+    // A staged re-seat record's marker is the original's (§3 step 2); its
+    // join is not held, so its poll ends as an ordinary join.
+    let own_marker =
+        info.fork_quarantine.is_some() && state.group_recovery.held_reseat_marker(info).is_none();
+    if !(armed || (own_marker && kept_chain)) {
         return None;
     }
     Some(
@@ -5205,39 +5282,45 @@ mod tests {
     }
 
     /// #1533 review (Codex P1, re-seat containment): while the re-seat join
-    /// is staged, an in-process ADR 0066 refusal still refuses as for the
-    /// original, by any spelling of the group, although the live record
-    /// (here a staged record, Active and with no marker) has no marker. The
-    /// marker goes only when the journal closes (durable swap or rollback).
+    /// is staged (`Prepared` or `Staging`), the one hold gives the staged
+    /// record (here Active and with no marker of its own) the original's
+    /// marker, in a single record or a roster. The hold ends at `Swapping`
+    /// (the swap's own write lifts it) and when the journal closes.
     #[test]
-    fn a_staged_reseat_keeps_the_original_marker_for_every_refusal() -> anyhow::Result<()> {
+    fn a_staged_reseat_record_holds_the_original_marker_until_swapping() -> anyhow::Result<()> {
         let (original, journal, keypair) = pure_reseat(ReseatPhase::Staging)?;
         let key = journal.live_key.clone();
         let stable = original.stable_group_id().to_string();
-        let original_marker = original
-            .fork_quarantine
-            .clone()
-            .expect("contained original");
+        let original_marker = original.fork_quarantine.clone();
         let mut staged = original.clone();
         staged.fork_quarantine = None;
         staged.seal_commit(&keypair, 2_000)?;
         let runtime = S3Runtime::default();
-        let body = GroupRecoveryV1 {
-            reseat_journal: Some(journal),
-            ..GroupRecoveryV1::default()
+        let body_in = |phase| {
+            let mut journal = journal.clone();
+            journal.phase = phase;
+            GroupRecoveryV1 {
+                reseat_journal: Some(journal),
+                ..GroupRecoveryV1::default()
+            }
         };
-        runtime.refresh_staging(&stable, Some(&body));
-        for id in [key.as_str(), stable.as_str()] {
-            let in_force = super::super::marker_in_force(&runtime, id, &staged)
-                .expect("the gate refuses as for the original");
-            assert_eq!(
-                super::super::fork_quarantine_refusal_body(id, &in_force),
-                super::super::fork_quarantine_refusal_body(id, &original_marker),
-                "{id}"
-            );
+        for phase in [ReseatPhase::Prepared, ReseatPhase::Staging] {
+            runtime.refresh_staging(&stable, Some(&body_in(phase)));
+            let mut record = staged.clone();
+            assert!(runtime.hold_reseat_marker(&mut record));
+            assert_eq!(record.fork_quarantine, original_marker);
+            let mut roster = HashMap::from([(key.clone(), staged.clone())]);
+            assert!(runtime.hold_reseat_markers(&mut roster));
+            assert_eq!(roster[&key].fork_quarantine, original_marker);
+            // A record that already has a marker keeps its own.
+            assert!(!runtime.hold_reseat_marker(&mut record));
         }
-        runtime.refresh_staging(&stable, Some(&GroupRecoveryV1::default()));
-        assert!(super::super::marker_in_force(&runtime, &key, &staged).is_none());
+        for body in [body_in(ReseatPhase::Swapping), GroupRecoveryV1::default()] {
+            runtime.refresh_staging(&stable, Some(&body));
+            let mut record = staged.clone();
+            assert!(!runtime.hold_reseat_marker(&mut record));
+            assert!(record.fork_quarantine.is_none());
+        }
         Ok(())
     }
 
@@ -5916,10 +5999,11 @@ mod tests {
         Ok(())
     }
 
-    /// #1533 review (Codex P1, re-seat containment), daemon level: with a
-    /// staged record live (Active, no marker) and the journal open, the
-    /// shared ADR 0066 entry gate and the before-effect re-check refuse as
-    /// for the original; once the journal closes they admit. CI only.
+    /// #1533 review (Codex P1, re-seat containment), daemon level: with the
+    /// journal open, a staged record written with no marker (Active) holds
+    /// the original's, so the shared ADR 0066 entry gate, the before-effect
+    /// re-check and the S3 containment check refuse as for the original.
+    /// Inert (offline agent).
     #[tokio::test]
     async fn staged_reseat_gates_refuse_as_for_the_original() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
@@ -5946,11 +6030,21 @@ mod tests {
         journal.live_record = serde_json::to_vec(&info)?;
         journal.phase = ReseatPhase::Staging;
         assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
-        state
+        let (write_key, record) = (key.clone(), staged);
+        let outcome = super::super::persist_named_groups_mutation(&state, move |groups| {
+            groups.insert(write_key, record);
+            true
+        })
+        .await?;
+        assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
+        let staged = state
             .named_groups
-            .write()
+            .read()
             .await
-            .insert(key.clone(), staged.clone());
+            .get(&key)
+            .cloned()
+            .expect("the staged record is live");
+        assert_eq!(staged.fork_quarantine, info.fork_quarantine);
         assert!(super::super::reject_fork_quarantined(&state, &key, &staged).is_some());
         assert!(
             super::super::reject_fork_quarantine_installed_before_effect(&state, &key, None)
@@ -5958,8 +6052,6 @@ mod tests {
                 .is_some()
         );
         assert!(contained(&state, &staged).await);
-        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = None).await);
-        assert!(super::super::reject_fork_quarantined(&state, &key, &staged).is_none());
         Ok(())
     }
 
@@ -6054,7 +6146,8 @@ mod tests {
             crate::server::delegations::fork_quarantine_marker(&state, &stable).await,
             Some(marker.clone())
         );
-        assert!(contained(&state, &staged).await);
+        let live = state.named_groups.read().await.get(&key).cloned();
+        assert!(contained(&state, &live.expect("the staged record is live")).await);
         // A clear before the swap (the manual clear, a mandate or adoption
         // clear, the S3 retirement) all pass the one clear gate: held.
         let clear_key = key.clone();
@@ -6135,6 +6228,58 @@ mod tests {
             .await
             .map_or(0, |body| body.retired.len());
         assert_eq!(retired, 0, "the staged copy is discarded; nothing retires");
+        Ok(())
+    }
+
+    /// #1533 review (round 3): the staged join still completes while its
+    /// record holds the original's marker. Its Welcome install (the TreeKEM
+    /// atomic persist) succeeds, also for a `next` that dropped the marker
+    /// (an owner-mandate clear in the same `MemberAdded`): the hold gives it
+    /// back, so the persist's marker check sees the same marker and does not
+    /// refuse `fork_quarantined`. The 120 s poll does not hold the staged
+    /// join (`held_join_state`). Inert.
+    #[tokio::test]
+    async fn the_staged_join_installs_its_tree_while_holding_the_marker() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let key = "e8".repeat(16);
+        let group_id = hex::decode(&key)?;
+        let creator = state.agent.agent_id();
+        let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id);
+        let tree = x0x::mls::TreeKemMlsGroup::create(group_id, creator, &seed)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut staged = GroupInfo::new("treekem".to_string(), String::new(), creator, key.clone());
+        staged.migrate_from_v1();
+        staged.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        staged.shared_secret = None;
+        staged.secret_epoch = tree.epoch();
+        staged.security_binding = Some(format!("treekem:epoch={}", tree.epoch()));
+        staged.recompute_state_hash();
+        let mut original = staged.clone();
+        let marker = original_marker(&state, &original);
+        original.fork_quarantine = Some(marker.clone());
+        assert!(open_staging_journal_for_test(&state, &key, &original).await?);
+        // The stub install, then the Welcome install of a `next` with no
+        // marker.
+        let (write_key, record) = (key.clone(), staged.clone());
+        let outcome = super::super::persist_named_groups_mutation(&state, move |groups| {
+            groups.insert(write_key, record);
+            true
+        })
+        .await?;
+        assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
+        super::super::persist_treekem_and_named_groups_atomic_with_info(
+            &state, &key, staged, &tree,
+        )
+        .await?;
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("the staged record is live");
+        assert_eq!(live.fork_quarantine, Some(marker));
+        assert!(held_join_state(&state, &live).await.is_none());
         Ok(())
     }
 
