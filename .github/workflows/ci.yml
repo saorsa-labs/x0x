@@ -486,7 +486,7 @@ jobs:
           X0X_RUNTIME_TIMEOUT_SECONDS: 4800
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
-        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 3 -E 'test(/w3h_1357/)'
+        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 3 --no-fail-fast -E 'test(/w3h_1357/)'
 
       # D196: blocking on the verdict (the same in all 20 reruns, every
       # receipt complete); the per-case distinct-trace counts are printed
