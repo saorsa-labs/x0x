@@ -658,7 +658,7 @@ static TEST_DIAL_PIN_TABLE: std::sync::Mutex<Option<&'static [SeedPeerPin]>> =
 /// the guard drops, so a panicking test cannot leak pins into the next
 /// one.
 #[cfg(test)]
-struct TestPinTableGuard;
+pub(crate) struct TestPinTableGuard;
 
 #[cfg(test)]
 impl TestPinTableGuard {
@@ -677,6 +677,13 @@ impl Drop for TestPinTableGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
+}
+
+/// Test-only accessor for the pin-table override (issue #1112, round 10),
+/// so lib-level tests can fence cache rows against a populated table.
+#[cfg(test)]
+pub(crate) fn override_dial_pins_for_test(pins: &'static [SeedPeerPin]) -> TestPinTableGuard {
+    TestPinTableGuard::set(pins)
 }
 
 /// The pin table the dial seam and the guards read (issue #1112). The
@@ -4904,6 +4911,18 @@ impl NetworkNode {
         })
     }
 
+    /// Whether a live rejection refuses a frame by its SOURCE session
+    /// (#1112, round 10): the entry recorded for the identity names this
+    /// frame's source generation. The generation is per-connection and
+    /// outlives the close of the rejected connection, so frames queued
+    /// before the close — draining after it, when the CURRENT-session
+    /// lookup answers nothing — are still refused.
+    fn seed_pin_rejects_frame(&self, peer_id: &AntPeerId, source_generation: u64) -> bool {
+        self.live_seed_pin_rejections()
+            .iter()
+            .any(|entry| entry.answered == peer_id.0 && entry.generation == Some(source_generation))
+    }
+
     /// [`Self::seed_pin_rejects_current_session`] for callers that hold
     /// only the node: resolves the transport backend first, then adds the
     /// any-connection clause — a frame or admission lookup names a peer,
@@ -6420,15 +6439,17 @@ impl NetworkNode {
                         // Issue #292 invariant B + #1112: a suppressed
                         // peer's gossip frames are not answered, and a
                         // frame off a seed-pin-rejected session is not
-                        // admitted either. The accept loop closes the
-                        // transient inbound, but a frame already delivered
-                        // inside the accept-to-close window must not reach
-                        // the gossip plane either. Checked BEFORE the plane
-                        // gate so a suppressed peer never seeds plane state.
-                        // (DM bytes (0x10/0x11) above stay out of #206/#292
-                        // gossip-plane scope.)
+                        // admitted either — by the CURRENT session, or by
+                        // the frame's SOURCE generation (round 10), which
+                        // outlives the rejected connection's close: frames
+                        // queued before the close drain after it and must
+                        // not reach the gossip plane. Checked BEFORE the
+                        // plane gate so a suppressed peer never seeds plane
+                        // state. (DM bytes (0x10/0x11) above stay out of
+                        // #206/#292 gossip-plane scope.)
                         if GossipStreamType::from_byte(type_byte).is_some()
                             && (plane_node.is_reconnect_suppressed(peer_id.0)
+                                || plane_node.seed_pin_rejects_frame(&peer_id, source_generation)
                                 || plane_node.seed_pin_rejected_session(&peer_id).await)
                         {
                             tracing::warn!(
@@ -11113,6 +11134,64 @@ mod tests {
             "a generation-less entry still refuses a session on its own address"
         );
         joiner.clear_seed_pin_rejection(seed_addr);
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 10 (Codex P2: queued frames bypass rejection after
+    /// disconnect): a gossip frame queued by the peer BEFORE the refusal
+    /// closes the connection drains AFTER the close — when the
+    /// CURRENT-session lookup answers nothing — and must still be
+    /// refused, by its SOURCE generation, which outlives the connection.
+    /// Runtime-RED before the frame-generation term: the pump's guard
+    /// consulted only the current session, so the drained frame reached
+    /// the gossip channels.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue1112_queued_frames_from_a_rejected_session_drain_refused() {
+        let plane = "issue1112-r10-drain";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_134).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        let joiner_peer = joiner.peer_id();
+        let link = joiner.node.read().await.clone().expect("live link");
+        let generation = link
+            .current_connection_generation(&seed_peer)
+            .expect("live generation");
+
+        // The peer queues a Bulk gossip frame (no await yet: the receiver
+        // task cannot run before the test yields).
+        let seed_link = seed.node.read().await.clone().expect("live link");
+        let mut frame = vec![saorsa_gossip_transport::GossipStreamType::Bulk.to_byte()];
+        frame.extend_from_slice(b"queued before the refusal");
+        seed_link.send(&joiner_peer, &frame).await.unwrap();
+
+        // The seam refusal: record the entry naming the live session's
+        // generation, then close the connection. The queued frame stays
+        // queued; the receiver task runs during the awaits below.
+        joiner.record_seed_pin_rejection(seed_addr, seed_peer.0, Some(generation));
+        let _ = link.disconnect(&seed_peer).await;
+
+        // The current-session truth is gone — that is exactly the window
+        // the drained frame rides in — but the frame's source generation
+        // is still refused.
+        assert!(
+            !joiner.seed_pin_rejected_session(&seed_peer).await,
+            "the current-session check alone cannot see the closed session"
+        );
+        assert!(
+            joiner.seed_pin_rejects_frame(&seed_peer, generation),
+            "the frame's source generation is still refused"
+        );
+
+        // End to end: nothing from the rejected session reaches the
+        // gossip channels.
+        match tokio::time::timeout(Duration::from_millis(250), joiner.receive_message()).await {
+            Err(_elapsed) => {}
+            Ok(Ok((peer, stream_type, _))) => panic!(
+                "queued frame from the rejected session reached the gossip plane ({stream_type:?} from {peer:?})"
+            ),
+            Ok(Err(e)) => panic!("gossip receive failed: {e}"),
+        }
 
         joiner.try_shutdown().await.unwrap();
         seed.try_shutdown().await.unwrap();

@@ -5520,6 +5520,25 @@ fn deserialize_machine_announcement(
 /// Used to populate `reachable_via` / `relay_candidates` on outgoing
 /// announcements so that remote peers have concrete targets to dial when
 /// the advertising machine is NAT-locked.
+/// #1112 (round 10): a cached row whose address list names a pinned seed
+/// address that excludes its identity is refused at cache CONSUMPTION —
+/// the join tiers never dial it, whatever wrote the row. The seam evicts
+/// a mismatched identity's row on refusal, but a delayed ant-quic
+/// reachability write (`observe_direct_reachability` off connection
+/// completion) can re-create the row afterwards; this pair check is the
+/// durable fence.
+fn cached_row_pinned_mismatch(
+    peer_id: &ant_quic::PeerId,
+    addresses: &[std::net::SocketAddr],
+) -> bool {
+    addresses.iter().any(|addr| {
+        matches!(
+            network::seed_pin_check(network::pinned_seed_peer_ids(*addr), peer_id.0),
+            network::SeedPinVerdict::Mismatch { .. }
+        )
+    })
+}
+
 async fn collect_coordinator_hints(
     network: &network::NetworkNode,
     machine_cache: &std::sync::Arc<
@@ -14779,6 +14798,16 @@ impl Agent {
         // phase starts no dial, and a cancellation ends its dial batch.
         if let Some(ref cache) = self.bootstrap_cache {
             let coordinators = cache.select_coordinators(6).await;
+            // #1112 (round 10): fence rejected pairs at cache consumption
+            // — the seam evicts a mismatched row, but a delayed ant-quic
+            // reachability write can re-create it; the pair check here is
+            // the durable filter, before any dial is spent.
+            let coordinators: Vec<_> = coordinators
+                .into_iter()
+                .filter(|peer| {
+                    !cached_row_pinned_mismatch(&peer.peer_id, &peer.preferred_addresses())
+                })
+                .collect();
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
                 .iter()
                 .flat_map(|peer| peer.preferred_addresses())
@@ -15407,14 +15436,8 @@ impl Agent {
         // mismatched the identity: the rejection is scoped to that
         // address, and the dial seam plus its bounded backoff refuse the
         // bad address on any later dial.
-        cached_peers.retain(|peer| {
-            !peer.preferred_addresses().into_iter().any(|addr| {
-                matches!(
-                    network::seed_pin_check(network::pinned_seed_peer_ids(addr), peer.peer_id.0),
-                    network::SeedPinVerdict::Mismatch { .. }
-                )
-            })
-        });
+        cached_peers
+            .retain(|peer| !cached_row_pinned_mismatch(&peer.peer_id, &peer.preferred_addresses()));
         if cached_peers.is_empty() || stop.is_cancelled() {
             return;
         }
@@ -40961,6 +40984,39 @@ mod peer_connected_handler_integration_tests {
                 network::SeedPinVerdict::Unpinned,
                 "the other address's pair is untouched by the mismatch"
             );
+        }
+
+        #[test]
+        fn issue1112_cache_consumption_refuses_a_rewritten_row() {
+            // Review round 10 (Codex P2: cache eviction races a pending
+            // transport write): the seam evicts a mismatched identity's
+            // row, but a delayed ant-quic reachability write can
+            // re-create it. The join tiers fence rejected pairs at cache
+            // CONSUMPTION — the row is never dialled, whatever wrote it.
+            // Runtime-RED before the consumption fence: Phase 0 dialled
+            // whatever `select_coordinators` returned.
+            const PINNED_KEY: [u8; 32] = [0xAE; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&PINNED_KEY],
+            }];
+            let _pins = network::override_dial_pins_for_test(&PINS);
+            let rejected = ant_quic::PeerId([0x77; 32]);
+            let pinned_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
+            // The rewritten row (the delayed writer's product).
+            assert!(
+                cached_row_pinned_mismatch(&rejected, &[pinned_addr]),
+                "a re-created row for a mismatching pair is refused at consumption"
+            );
+            // Other addresses, and the pinned member itself, stay eligible.
+            assert!(!cached_row_pinned_mismatch(
+                &rejected,
+                &["203.0.113.9:40000".parse().unwrap()]
+            ));
+            assert!(!cached_row_pinned_mismatch(
+                &ant_quic::PeerId(PINNED_KEY),
+                &[pinned_addr]
+            ));
         }
 
         #[test]
