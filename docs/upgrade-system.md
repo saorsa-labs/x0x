@@ -62,6 +62,10 @@ operation before starting the newer release. Cancellation is checked after
 the install lock is acquired, before queued work can write records.
 An admitted replacement retains its restart continuation.
 
+If staging identity initialization fails, background apply stays disabled
+for that process. Configured release discovery and verified rebroadcast
+continue without an apply owner.
+
 HTTP allows one waiting request and retains its deferred restart owner after
 mutation admission. Dropping a waiting request cancels its permit. Queued or
 running blocking work, including service-manager readback, retains that

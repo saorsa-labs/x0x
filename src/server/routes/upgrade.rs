@@ -635,6 +635,62 @@ pub(in crate::server) struct BackgroundRuntime {
     pub operation_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
+impl BackgroundRuntime {
+    /// Resolve the actual boot context before constructing an apply owner.
+    pub(in crate::server) async fn from_boot(
+        config: &DaemonConfig,
+        api_addr: SocketAddr,
+        shutdown: UpdateShutdown,
+        apply_lock: Arc<Mutex<()>>,
+        #[cfg(unix)] identity_dir: Option<PathBuf>,
+        #[cfg(unix)] machine_id: [u8; 32],
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        let staging = {
+            let identity_root = match identity_dir {
+                Some(path) => path,
+                None => crate::storage::x0x_dir().await?,
+            };
+            StartupStagingContext {
+                install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                identity_root: identity_root.canonicalize()?,
+                machine_id,
+                #[cfg(test)]
+                clock: None,
+                #[cfg(test)]
+                observed: None,
+            }
+        };
+        Ok(Self {
+            config: config.update.clone(),
+            data_dir: config.data_dir.clone(),
+            api_addr,
+            shutdown,
+            apply_lock,
+            #[cfg(unix)]
+            staging,
+            #[cfg(test)]
+            operation_observer: None,
+        })
+    }
+
+    /// Spawn the server's real discovery source under its configured gate.
+    pub(in crate::server) fn spawn_source<F>(
+        enabled: bool,
+        submit: Option<BackgroundSubmit>,
+        source: impl FnOnce(Option<BackgroundSubmit>) -> F,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if !enabled {
+            return None;
+        }
+        // Missing apply authority must not disable configured release relay.
+        Some(tokio::spawn(source(submit)))
+    }
+}
+
 /// Intake results only; Accepted does not acknowledge a durable receipt or
 /// supersession. The owned worker must still complete those record barriers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -978,7 +1034,7 @@ fn background_staging_request(
 /// signed bytes; the shared owner alone performs the potentially long wait.
 pub(in crate::server) async fn run_gossip_update_listener(
     agent: Arc<Agent>,
-    submit: BackgroundSubmit,
+    submit: Option<BackgroundSubmit>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -1041,7 +1097,7 @@ fn verify_gossip_release(payload: &[u8]) -> Option<VerifiedRelease> {
 /// release input and network publication, leaving dedup and submission intact.
 async fn run_gossip_update_driver<S, Publish, PublishFuture>(
     releases: S,
-    submit: BackgroundSubmit,
+    submit: impl Into<Option<BackgroundSubmit>>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     mut publish: Publish,
     mut shutdown: watch::Receiver<bool>,
@@ -1050,6 +1106,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
     Publish: FnMut(Vec<u8>) -> PublishFuture,
     PublishFuture: Future<Output = Result<(), String>>,
 {
+    let submit = submit.into();
     futures::pin_mut!(releases);
     let mut rebroadcasted = HashMap::new();
     loop {
@@ -1088,7 +1145,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
                 _ = shutdown.changed() => return,
             }
         }
-        if let Err(error) = submit.submit(verified) {
+        if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
             tracing::warn!(%error, "Gossip release was not queued");
         }
     }
@@ -1097,7 +1154,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
 pub(in crate::server) async fn run_fallback_github_poll(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
-    submit: BackgroundSubmit,
+    submit: Option<BackgroundSubmit>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -1147,7 +1204,7 @@ pub(in crate::server) async fn run_fallback_github_poll(
 async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFuture>(
     ticks: S,
     mut check: Check,
-    submit: BackgroundSubmit,
+    submit: impl Into<Option<BackgroundSubmit>>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     mut publish: Publish,
     mut shutdown: watch::Receiver<bool>,
@@ -1158,6 +1215,7 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
     Publish: FnMut(Vec<u8>) -> PublishFuture,
     PublishFuture: Future<Output = Result<(), String>>,
 {
+    let submit = submit.into();
     futures::pin_mut!(ticks);
     loop {
         if *shutdown.borrow() || shutdown.has_changed().is_err() {
@@ -1179,7 +1237,10 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
                 continue;
             }
         };
-        if submit.in_retry_backoff(&verified) {
+        if let Some(submit) = submit
+            .as_ref()
+            .filter(|submit| submit.in_retry_backoff(&verified))
+        {
             if let Err(error) = submit.submit(verified) {
                 tracing::warn!(%error, "Fallback release backoff could not be observed");
             }
@@ -1195,7 +1256,7 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
             }
             _ = shutdown.changed() => return,
         }
-        if let Err(error) = submit.submit(verified) {
+        if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
             tracing::warn!(%error, "Fallback release was not queued");
         }
     }
@@ -2022,6 +2083,8 @@ mod tests {
     background_staging_regression_tests!();
     #[cfg(unix)]
     background_driver_regression_tests!();
+    #[cfg(unix)]
+    background_init_regression_tests!();
 
     use super::*;
     use crate::upgrade::restart;
