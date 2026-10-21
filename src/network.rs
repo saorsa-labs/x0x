@@ -2996,18 +2996,23 @@ impl NetworkNode {
         let accept = network_node.spawn_accept_loop();
         let eviction = network_node.spawn_connection_pool_eviction();
         let plane_gatekeeper = network_node.spawn_plane_gatekeeper();
+        let ledger_watcher = network_node.spawn_session_ledger_watcher();
         // Record the handles so `shutdown` can abort and join their endpoint
         // operations before consuming the node. This runs
         // at construction before the node is shared, so there is no contention;
         // if the lock is somehow poisoned, recover the guard rather than panic
         // (the handles are only used for clean teardown).
         match network_node.background_tasks.lock() {
-            Ok(mut tasks) => tasks.extend([receiver, accept, eviction, plane_gatekeeper]),
-            Err(poisoned) => {
-                poisoned
-                    .into_inner()
-                    .extend([receiver, accept, eviction, plane_gatekeeper])
+            Ok(mut tasks) => {
+                tasks.extend([receiver, accept, eviction, plane_gatekeeper, ledger_watcher])
             }
+            Err(poisoned) => poisoned.into_inner().extend([
+                receiver,
+                accept,
+                eviction,
+                plane_gatekeeper,
+                ledger_watcher,
+            ]),
         }
 
         // #368 gate 2: pure-observation churn counters over ant-quic's
@@ -4948,8 +4953,8 @@ impl NetworkNode {
         ledger
             .get(peer)?
             .iter()
-            .find(|(gen, _)| *gen == generation)
-            .map(|(_, addr)| *addr)
+            .find(|(gen, _, _)| *gen == generation)
+            .map(|(_, addr, _)| *addr)
     }
 
     /// Ledger an observed connection (#1112, round 11): the answered
@@ -6701,6 +6706,50 @@ impl NetworkNode {
     /// are registered in `connected_peers`. Inbound peers would complete the
     /// QUIC handshake but never have a reader task spawned, so `recv()` would
     /// never deliver their data.
+    /// #1112 (round 12): always-on lifecycle watcher that ledgers every
+    /// ESTABLISHED connection generation with its session address. This
+    /// is the source-session evidence that survives a connection closing
+    /// BEFORE the receive pump ever sees one of its frames — including
+    /// ant-quic-internal connections, which never pass an x0x seam. A
+    /// broadcast lag is fine: the seams, the accept loop and the pump
+    /// ledger as well; a missed event only narrows the evidence window.
+    /// Skips all work while the pin table is empty.
+    fn spawn_session_ledger_watcher(&self) -> tokio::task::JoinHandle<()> {
+        let node = Arc::clone(&self.node);
+        let ledger = Arc::clone(&self.session_addr_ledger);
+        tokio::spawn(async move {
+            let mut lifecycle = {
+                let guard = node.read().await;
+                guard.as_ref().map(|link| link.subscribe_all_peer_events())
+            };
+            let Some(lifecycle) = lifecycle.as_mut() else {
+                return;
+            };
+            loop {
+                let Ok((peer, event)) = lifecycle.recv().await else {
+                    break;
+                };
+                if !matches!(event, ant_quic::PeerLifecycleEvent::Established { .. })
+                    || dial_pin_table().is_empty()
+                {
+                    continue;
+                }
+                let node_handle = node.read().await.as_ref().cloned();
+                let Some(link) = node_handle else {
+                    break;
+                };
+                if let Some(generation) = link.current_connection_generation(&peer) {
+                    if let Some(addr) = link
+                        .session_connection(&peer)
+                        .and_then(|conn| conn.remote_address())
+                    {
+                        note_session_address_in(&ledger, peer, generation, addr);
+                    }
+                }
+            }
+        })
+    }
+
     fn spawn_accept_loop(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
@@ -7769,27 +7818,65 @@ fn drain_plane_lifecycle(
 
 /// #1112 (round 11): per-peer ledger of (connection generation, observed
 /// address) pairs — the source-session evidence the frame guard reads.
-type SessionAddrLedger = std::collections::HashMap<AntPeerId, Vec<(u64, SocketAddr)>>;
+/// Round 12: entries carry a timestamp and expire, and the ledger has a
+/// global peer bound, so churn cannot grow it without limit.
+type SessionAddrLedger = std::collections::HashMap<AntPeerId, Vec<(u64, SocketAddr, Instant)>>;
+
+/// How long a session-address entry stays readable (#1112 round 12):
+/// generous against queue drainage, bounded against growth.
+const SESSION_ADDR_LEDGER_TTL: Duration = Duration::from_secs(3600);
+
+/// Upper bound on ledgered identities (#1112 round 12). Reached only
+/// after an hour of heavy churn; the oldest-touched peers leave first.
+const SESSION_ADDR_LEDGER_MAX_PEERS: usize = 512;
 
 /// Write into the session-address ledger (#1112, round 11): the address
 /// a connection generation of a peer lives on, kept per peer with the
-/// most recent few generations (generations are never reused).
+/// most recent few generations (generations are never reused, and a
+/// RECONNECT at the same address never deletes an earlier generation's
+/// evidence — queued frames of the old generation still need it, round
+/// 12). Entries expire on [`SESSION_ADDR_LEDGER_TTL`]; the identity count
+/// is bounded by [`SESSION_ADDR_LEDGER_MAX_PEERS`]. A no-op while the
+/// pin table is empty: nothing is pinned, nothing can be evaluated, and
+/// the ledger costs nothing (round 12).
 fn note_session_address_in(
     ledger: &Arc<Mutex<SessionAddrLedger>>,
     peer: AntPeerId,
     generation: u64,
     addr: SocketAddr,
 ) {
+    if dial_pin_table().is_empty() {
+        return;
+    }
     let addr = normalize_v4_mapped_addr(addr);
+    let now = Instant::now();
     let mut ledger = ledger
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let entries = ledger.entry(peer).or_default();
-    entries.retain(|(gen, seen)| *gen != generation && *seen != addr);
-    entries.push((generation, addr));
+    entries.retain(|(gen, _, at)| {
+        *gen != generation && now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL
+    });
+    entries.push((generation, addr, now));
     const PER_PEER_GENERATIONS: usize = 8;
     let excess = entries.len().saturating_sub(PER_PEER_GENERATIONS);
     entries.drain(..excess);
+    if ledger.len() > SESSION_ADDR_LEDGER_MAX_PEERS {
+        // Evict the peer whose newest entry is the oldest.
+        if let Some(oldest) = ledger
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .min_by_key(|(_, v)| {
+                v.iter()
+                    .map(|(_, _, at)| *at)
+                    .max()
+                    .unwrap_or_else(Instant::now)
+            })
+            .map(|(k, _)| *k)
+        {
+            ledger.remove(&oldest);
+        }
+    }
 }
 
 /// Convert ant-quic PeerId to saorsa-gossip PeerId
@@ -7950,7 +8037,16 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             // this path turns healthy gossip degradation into a timeout/log storm.
             let send_result = match checked_generation {
                 Some(generation) => node.send_on_generation(&ant_peer, generation, &buf).await,
-                None => node.send(&ant_peer, &buf).await,
+                // No live session at capture time (#1112 round 12): fail
+                // rather than plain-send — a plain send would ride whatever
+                // connection happens to be current at write time, one the
+                // policy above never examined.
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "gossip send refused: no live session for peer {:?}",
+                        peer
+                    ));
+                }
             };
             send_result.map_err(|e| map_gossip_send_error(e, peer))?;
 
@@ -11274,15 +11370,16 @@ mod tests {
         }];
         let plane = "issue1112-r11-iddial";
         let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_135).await;
-        // Id-based dial with no pin table (TOFU): the seam ledgers the
-        // (generation, address) pair but records no rejection.
+        // Pins are already in force: the LEDGER is active (round 12 gates
+        // ledger writes on a populated table), while the id-based dial
+        // itself still succeeds — the address-dial pin gate does not run
+        // on id-based seams, so the connection exists exactly like an
+        // internal redial's, with no rejection entry.
+        let _pins = TestPinTableGuard::set(&PINS);
         let (_, seed_peer) = joiner
             .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
             .await
             .unwrap();
-        // Pins land AFTER the connection exists — like an internal redial,
-        // the address-dial seam never refused anything.
-        let _pins = TestPinTableGuard::set(&PINS);
 
         let joiner_peer = joiner.peer_id();
         let link = joiner.node.read().await.clone().expect("live link");
@@ -11362,6 +11459,160 @@ mod tests {
 
         joiner.try_shutdown().await.unwrap();
         seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 12 (Codex P2: reconnecting at the same address deleted the
+    /// previous generation's evidence): a reconnect at the SAME address
+    /// must not erase the earlier generation's ledger entry — frames
+    /// queued on the old generation still drain after the reconnect, and
+    /// their evidence is what refuses them. Runtime-RED before the fix:
+    /// the same-address dedup clause removed the old entry on the new
+    /// note.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue1112_same_address_reconnect_keeps_old_generation_evidence() {
+        const NOT_THE_SEED: [u8; 32] = [0xB1; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r12-reconnect";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_137).await;
+        let _pins = TestPinTableGuard::set(&PINS);
+        // Id-based dials for both generations: the address-dial seam
+        // (rightly) refuses this mismatching address while pins are in
+        // force, and the id-based seams leave the ledger evidence.
+        let (_, seed_peer) = joiner
+            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
+            .await
+            .unwrap();
+        let link = joiner.node.read().await.clone().expect("live link");
+        let first = link
+            .current_connection_generation(&seed_peer)
+            .expect("live generation");
+        // A frame queues on the old generation, then the connection
+        // closes and the peer RECONNECTS at the same address.
+        let joiner_peer = joiner.peer_id();
+        let seed_link = seed.node.read().await.clone().expect("live link");
+        let mut frame = vec![saorsa_gossip_transport::GossipStreamType::Bulk.to_byte()];
+        frame.extend_from_slice(b"queued on the old generation");
+        seed_link.send(&joiner_peer, &frame).await.unwrap();
+        let _ = link.disconnect(&seed_peer).await;
+        joiner
+            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
+            .await
+            .unwrap();
+        let second = link
+            .current_connection_generation(&seed_peer)
+            .expect("replacement generation");
+        assert_ne!(first, second);
+
+        // Both generations keep their evidence at the shared address.
+        assert_eq!(
+            joiner.session_addr_for(&seed_peer, first),
+            Some(seed_addr),
+            "a reconnect at the same address must not erase the old generation's evidence"
+        );
+        assert_eq!(joiner.session_addr_for(&seed_peer, second), Some(seed_addr));
+        // The OLD generation's queued frame is refused by the pair
+        // verdict over its own evidence.
+        assert!(joiner.seed_pin_rejects_frame(&seed_peer, first));
+        match tokio::time::timeout(Duration::from_millis(250), joiner.receive_message()).await {
+            Err(_elapsed) => {}
+            Ok(Ok((peer, stream_type, _))) => panic!(
+                "queued frame from the replaced session reached the gossip plane ({stream_type:?} from {peer:?})"
+            ),
+            Ok(Err(e)) => panic!("gossip receive failed: {e}"),
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 12 (Codex P2: the `None`-generation fallback restored the
+    /// unchecked send path): with no live session at capture time, the
+    /// ordinary send FAILS — a plain send would ride whatever connection
+    /// happens to be current at write time, one the policy never
+    /// examined. Runtime-RED before the fix: the fallback called plain
+    /// `send`.
+    #[tokio::test]
+    async fn issue1112_ordinary_send_without_a_live_session_fails() {
+        let plane = "issue1112-r12-nosession";
+        let (seed, joiner, _seed_addr) = issue1112_sim_pair(plane, 11_138).await;
+        // A plane-cleared peer with NO live connection: the hold branches
+        // do not mask the send, so the missing session is the outcome.
+        let peer = seed.peer_id();
+        assert!(!joiner.is_connected(&peer).await);
+        joiner.plane_handle_hello(peer, plane).await;
+
+        let result = joiner
+            .send_to_peer(
+                ant_to_gossip_peer_id(&peer),
+                saorsa_gossip_transport::GossipStreamType::Membership,
+                bytes::Bytes::from_static(b"membership-frame"),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a send with no live session must fail, not ride a later connection unchecked"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 12 (Codex P2 + Claude: the session ledger grows without a
+    /// global bound): writes are no-ops while the pin table is empty
+    /// (production pays nothing today), each peer keeps at most 8
+    /// generations, and the identity count never exceeds the global cap.
+    #[test]
+    fn issue1112_session_ledger_is_bounded_and_dormant_without_pins() {
+        let addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
+        let ledger = Arc::new(Mutex::new(SessionAddrLedger::new()));
+        // No pin table: writes no-op.
+        note_session_address_in(&ledger, test_ant_peer(1), 1, addr);
+        assert!(
+            ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "ledger writes are dormant while nothing is pinned"
+        );
+
+        const NOT_IT: [u8; 32] = [0xB2; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &[&NOT_IT],
+        }];
+        let _pins = TestPinTableGuard::set(&PINS);
+        // Per-peer generation cap (checked before the global loop can
+        // evict this peer as oldest-touched).
+        for generation in 0..20u64 {
+            note_session_address_in(&ledger, test_ant_peer(1), generation, addr);
+        }
+        assert!(
+            ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&test_ant_peer(1))
+                .is_some_and(|entries| entries.len() <= 8),
+            "each peer keeps at most a few generations"
+        );
+        // Global identity cap.
+        let distinct = |n: u32| {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&n.to_le_bytes());
+            ant_quic::PeerId(id)
+        };
+        for n in 0..(SESSION_ADDR_LEDGER_MAX_PEERS as u32 + 64) {
+            note_session_address_in(&ledger, distinct(n), 1, addr);
+        }
+        let ledger = ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            ledger.len() <= SESSION_ADDR_LEDGER_MAX_PEERS,
+            "the identity count stays inside the global cap"
+        );
     }
 
     /// Round 10 (Codex P2: queued frames bypass rejection after

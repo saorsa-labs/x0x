@@ -144,14 +144,21 @@ depend on the `connected_peers()` metadata a freshly materialized
 internal connection may not have registered yet, and every current
 connection of the identity is checked against the pin rows too. A frame
 is additionally refused by its SOURCE session: a session-address ledger
-(recorded at the dial seams, the accept loop and the receive pump, while
-a generation is live) maps the frame's connection generation to the
-address it lived on, so a frame queued before a close and drained after
-it is refused even when the session was never rejected at the dial seam
-(id-based dials, internal redials). Ordinary gossip sends are bound to
-the connection generation they examined: if the peer's connection is
-replaced between the policy check and the write, the send fails instead
-of riding the unchecked replacement. This is
+(recorded at the dial seams, the accept loop, the receive pump while a
+generation is live, and by an always-on lifecycle watcher on every
+ESTABLISHED generation — so a connection that closes before the pump
+ever sees a frame still leaves evidence) maps the frame's connection
+generation to the address it lived on, so a frame queued before a close
+and drained after it is refused even when the session was never rejected
+at the dial seam (id-based dials, internal redials). A reconnect at the
+same address never erases an earlier generation's entry. The ledger is
+bounded (a few generations per peer, an hour per entry, a global identity
+cap) and is dormant — no writes at all — while the pin table is empty.
+Ordinary gossip sends are bound to the connection generation they
+examined: if the peer's connection is replaced between the policy check
+and the write, the send fails instead of riding the unchecked
+replacement, and a send with no live session fails rather than riding
+whatever connection appears next. This is
 what catches an ant-quic-internal coordinator redial of a rejected seed,
 whose connection never passed x0x's dial seam. The guarded-send policy is recomputed
 inside the post-`open_uni` callback, so a rejection that lands while a
