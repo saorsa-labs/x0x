@@ -15,21 +15,25 @@ use crate::identity::AgentId;
 use super::rate_limit::GuiShowRateLimit;
 
 /// How long a pending banner waits for its GUI window to connect.
-const PENDING_FRESHNESS: Duration = Duration::from_secs(60);
+///
+/// The banner stays until the session token TTL, matching a hidden tab
+/// revealed later.
+const PENDING_FRESHNESS: Duration = crate::server::SESSION_TOKEN_TTL;
 
-/// `error.message` prefix when Stop cannot record `local_enabled = false`.
+/// `error.message` prefix when Stop is off in memory but the marker was not saved.
 ///
 /// `gui.block` has no success frame. This prefix marks the existing error
-/// frame so the banner can show it.
-pub const LOCAL_SHOW_DISABLE_FAILED: &str = "could not turn local show off";
+/// frame. Local show is already off.
+pub const LOCAL_SHOW_DISABLE_FAILED: &str = "local show is off, but the stop marker was not saved";
 
 /// Sentence the local-show banner uses to name the recovery path.
 ///
-/// Stop records `[gui_show] local_enabled = false`. The human turns show
-/// back on in the daemon config, then `POST /acl/reload`.
-pub const LOCAL_SHOW_REENABLE: &str = "Set [gui_show] local_enabled = true in the daemon config and POST /acl/reload to turn local show back on.";
+/// Stop writes `gui_show_local_disabled` in the data directory. Deleting
+/// that marker turns local show back on.
+pub const LOCAL_SHOW_REENABLE: &str =
+    "Delete gui_show_local_disabled in the data directory to turn local show back on.";
 
-/// Data-directory marker written when Stop must not create a daemon config.
+/// Data-directory marker Stop writes for this daemon.
 ///
 /// A named instance with no config file is a normal start (`x0xd --name`,
 /// `serve(config)`). Creating `config.toml` that holds only `[gui_show]`
@@ -150,25 +154,40 @@ impl ShowOpener for PlatformOpener {
 fn platform_opener_spawn(url: &str) -> Option<std::io::Result<std::process::Child>> {
     #[cfg(target_os = "macos")]
     {
-        Some(std::process::Command::new("open").arg(url).spawn())
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg(url);
+        silenced_stdio(&mut cmd);
+        Some(cmd.spawn())
     }
     #[cfg(target_os = "linux")]
     {
-        Some(std::process::Command::new("xdg-open").arg(url).spawn())
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url);
+        silenced_stdio(&mut cmd);
+        Some(cmd.spawn())
     }
     #[cfg(target_os = "windows")]
     {
-        Some(
-            std::process::Command::new("cmd")
-                .args(["/C", "start", url])
-                .spawn(),
-        )
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", url]);
+        silenced_stdio(&mut cmd);
+        Some(cmd.spawn())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = url;
         None
     }
+}
+
+/// Discard the opener's stdin, stdout, and stderr.
+///
+/// A failed `xdg-open` prints the URL it was given. That URL contains the
+/// session token, so an inherited stderr would put the token in the daemon log.
+fn silenced_stdio(cmd: &mut std::process::Command) {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 }
 
 /// Display confirmation for one opener. This does not decide how long the
@@ -257,13 +276,13 @@ pub struct GuiShowRuntime {
     /// Daemon TOML that `POST /acl/reload` re-reads. `None` means startup
     /// loaded no file.
     config_path: Mutex<Option<PathBuf>>,
-    /// Daemon config Stop updates when that file already exists.
+    /// Daemon config path a later file can be read from.
     ///
     /// This is the loaded config, or the default config path when startup
-    /// loaded no file. A missing file is not created.
+    /// loaded no file. Stop does not create or modify it.
     write_path: Mutex<Option<PathBuf>>,
     blocked_path: PathBuf,
-    /// `data_dir/gui_show_local_disabled`. Written when no config file exists.
+    /// `data_dir/gui_show_local_disabled`. Stop always writes this marker.
     local_stop_path: PathBuf,
     /// Shows waiting for the GUI window that was opened for each one.
     pending: Mutex<VecDeque<PendingGuiShow>>,
@@ -383,7 +402,7 @@ impl GuiShowRuntime {
         self.set_config(config);
     }
 
-    /// Path Stop uses to record `local_enabled = false`.
+    /// Config path `POST /acl/reload` reads when startup loaded no file.
     pub fn set_write_path(&self, path: Option<PathBuf>) {
         if let Ok(mut guard) = self.write_path.lock() {
             *guard = path;
@@ -406,30 +425,19 @@ impl GuiShowRuntime {
         }
     }
 
-    /// Record `[gui_show] local_enabled = false` and apply it in memory.
+    /// Record that local show is off, then write the data-directory marker.
     ///
     /// This is the Stop control for a local show (`gui.block` of this
     /// daemon's agent). It does not add the agent to `gui_show_blocked`.
-    /// The banner tells the human to set `local_enabled = true` and
-    /// `POST /acl/reload` to turn show back on.
+    /// The banner tells the human to delete `gui_show_local_disabled` in
+    /// the data directory to turn show back on.
     ///
-    /// An existing daemon config is updated in place, and other keys stay.
-    /// When no config file exists, including `serve(config)` with no path,
-    /// the off state is the data-directory marker. Stop does not create a
-    /// config file: a named instance would then refuse to start.
+    /// Show is turned off in memory first, so a marker write failure still
+    /// leaves show off. Stop writes only that marker. It does not create or
+    /// modify the daemon config: a named instance would then refuse to start.
     pub fn disable_local_show(&self) -> Result<(), String> {
-        if let Some(path) = self.config_write_path() {
-            if path.is_file() {
-                self.write_local_enabled_false(&path)?;
-                let _ = self.clear_local_stop();
-                self.remember_local_stop();
-                self.set_config_path(Some(path));
-                return Ok(());
-            }
-        }
-        self.write_local_stop_file()?;
         self.remember_local_stop();
-        Ok(())
+        self.write_local_stop_file()
     }
 
     fn remember_local_stop(&self) {
@@ -438,31 +446,17 @@ impl GuiShowRuntime {
         self.set_config(config);
     }
 
-    fn write_local_enabled_false(&self, path: &Path) -> Result<(), String> {
-        let existing = std::fs::read_to_string(path).map_err(|error| {
-            format!(
-                "{LOCAL_SHOW_DISABLE_FAILED}: failed to read {}: {error}",
-                path.display()
-            )
-        })?;
-        let updated = set_local_enabled_false(&existing).map_err(|error| {
-            format!("{LOCAL_SHOW_DISABLE_FAILED}: {error} ({})", path.display())
-        })?;
-        write_config_atomic(path, updated.as_bytes()).map_err(|error| {
-            format!(
-                "{LOCAL_SHOW_DISABLE_FAILED}: failed to write {}: {error}",
-                path.display()
-            )
-        })
-    }
-
     fn write_local_stop_file(&self) -> Result<(), String> {
-        write_config_atomic(&self.local_stop_path, b"local_enabled = false\n").map_err(|error| {
+        let report = |error: std::io::Error| {
             format!(
                 "{LOCAL_SHOW_DISABLE_FAILED}: failed to write {}: {error}",
                 self.local_stop_path.display()
             )
-        })
+        };
+        if let Some(parent) = self.local_stop_path.parent() {
+            std::fs::create_dir_all(parent).map_err(&report)?;
+        }
+        std::fs::write(&self.local_stop_path, b"local_enabled = false\n").map_err(report)
     }
 
     fn clear_local_stop(&self) -> Result<(), String> {
@@ -509,14 +503,6 @@ impl GuiShowRuntime {
             return false;
         };
         explicit_local_enabled(&text) == Some(true)
-    }
-
-    fn config_write_path(&self) -> Option<PathBuf> {
-        self.write_path
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .or_else(|| self.config_path.lock().ok().and_then(|guard| guard.clone()))
     }
 
     /// Rate-limit gate; `true` means the show may proceed.
@@ -593,6 +579,9 @@ impl GuiShowRuntime {
     }
 }
 
+/// Whether `pending` is still inside the session token TTL.
+///
+/// The banner stays until that TTL, matching a hidden tab revealed later.
 fn pending_is_fresh(pending: &PendingGuiShow, now: Instant) -> bool {
     now.saturating_duration_since(pending.created_at) <= PENDING_FRESHNESS
 }
@@ -672,7 +661,7 @@ pub fn new_request_id() -> String {
 /// Build the origin banner text from locally resolved names (ADR 0083 §5).
 ///
 /// The second sentence tells the human how to turn a local show back on
-/// after Stop. Stop writes `local_enabled = false` through `gui.block`.
+/// after Stop: delete `gui_show_local_disabled` in the data directory.
 pub fn origin_banner(agent_label: &str, machine_label: &str, rider: bool) -> String {
     let opened = if rider {
         format!("Opened by {agent_label} (rider) on {machine_label}")
@@ -693,150 +682,6 @@ fn explicit_local_enabled(text: &str) -> Option<bool> {
         .and_then(toml::Value::as_table)
         .and_then(|gui| gui.get("local_enabled"))
         .and_then(toml::Value::as_bool)
-}
-
-/// Set `[gui_show] local_enabled = false` without dropping other keys.
-///
-/// An empty document becomes a new `[gui_show]` table. Callers use that
-/// only for a config file that already exists. A document that is not
-/// valid TOML is refused, so Stop does not overwrite a broken file.
-fn set_local_enabled_false(text: &str) -> Result<String, String> {
-    if text.trim().is_empty() {
-        return Ok("[gui_show]\nlocal_enabled = false\n".to_string());
-    }
-    let mut table: toml::Table = text
-        .parse()
-        .map_err(|error| format!("daemon config is not valid TOML: {error}"))?;
-    let rewritten = rewrite_local_enabled_line(text);
-    if local_enabled_is_false(&rewritten) {
-        return Ok(rewritten);
-    }
-    let gui = table
-        .entry("gui_show")
-        .or_insert(toml::Value::Table(toml::Table::new()));
-    let Some(gui_table) = gui.as_table_mut() else {
-        return Err("[gui_show] is not a table".to_string());
-    };
-    gui_table.insert("local_enabled".to_string(), toml::Value::Boolean(false));
-    toml::to_string(&table).map_err(|error| format!("could not write daemon config: {error}"))
-}
-
-fn local_enabled_is_false(text: &str) -> bool {
-    let Ok(table) = text.parse::<toml::Table>() else {
-        return false;
-    };
-    table
-        .get("gui_show")
-        .and_then(|value| value.get("local_enabled"))
-        .and_then(toml::Value::as_bool)
-        == Some(false)
-}
-
-/// Line edit that keeps comments and unrelated keys. Returns the original
-/// shape with `local_enabled` forced false inside `[gui_show]`.
-fn rewrite_local_enabled_line(text: &str) -> String {
-    let trailing_nl = text.ends_with('\n');
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let mut section_at = None;
-    let mut section_end = lines.len();
-    for (index, line) in lines.iter().enumerate() {
-        let Some(header) = table_header(line.trim()) else {
-            continue;
-        };
-        if section_at.is_some() {
-            section_end = index;
-            break;
-        }
-        if header == "gui_show" {
-            section_at = Some(index);
-        }
-    }
-    let Some(start) = section_at else {
-        let mut out = text.to_string();
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[gui_show]\nlocal_enabled = false\n");
-        return out;
-    };
-    let mut replaced = false;
-    for line in lines.iter_mut().take(section_end).skip(start + 1) {
-        if local_enabled_assignment(line) {
-            *line = with_local_enabled_false(line);
-            replaced = true;
-            break;
-        }
-    }
-    if !replaced {
-        lines.insert(start + 1, "local_enabled = false".to_string());
-    }
-    let mut out = lines.join("\n");
-    if trailing_nl || !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
-}
-
-fn table_header(trimmed: &str) -> Option<&str> {
-    if trimmed.starts_with('#') || trimmed.starts_with("[[") {
-        return None;
-    }
-    let rest = trimmed.strip_prefix('[')?;
-    let end = rest.find(']')?;
-    let name = rest[..end].trim();
-    if name.is_empty() || name.contains('.') {
-        return None;
-    }
-    Some(name)
-}
-
-fn local_enabled_assignment(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
-    }
-    let Some(rest) = trimmed.strip_prefix("local_enabled") else {
-        return false;
-    };
-    rest.trim_start().starts_with('=')
-}
-
-fn with_local_enabled_false(line: &str) -> String {
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = &line[..indent_len];
-    let trimmed = line.trim_start();
-    let Some(eq) = trimmed.find('=') else {
-        return line.to_string();
-    };
-    let after = trimmed[eq + 1..].trim_start();
-    if let Some(hash) = after.find('#') {
-        format!("{indent}local_enabled = false {}", after[hash..].trim_end())
-    } else {
-        format!("{indent}local_enabled = false")
-    }
-}
-
-fn write_config_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let name = path
-        .file_name()
-        .and_then(|item| item.to_str())
-        .unwrap_or("config.toml");
-    let tmp = path.with_file_name(format!(".{name}.x0x-tmp"));
-    std::fs::write(&tmp, bytes)?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-    Ok(())
 }
 
 /// Short hex id for banner fallbacks (10 chars + ellipsis in the GUI; we
@@ -905,15 +750,12 @@ mod tests {
     fn stop_local_show_persists_disabled_and_reload_reenables() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "log_level = \"info\" # keep\n\n[gui_show]\nremote_enabled = true # stay\nlocal_enabled = true # operator\n\n[other]\nlocal_enabled = true\n",
-        )
-        .expect("write config");
+        let original = "log_level = \"info\" # keep\n\n[gui_show]\nremote_enabled = true # stay\nlocal_enabled = true # operator\n\n[other]\nlocal_enabled = true\n";
+        std::fs::write(&path, original).expect("write config");
         let rt = runtime(dir.path(), Some(path.clone()));
         let daemon = AgentId([2u8; 32]);
         rt.disable_local_show()
-            .expect("stop records local_enabled = false");
+            .expect("stop records the data-dir marker");
         assert!(
             !rt.config().local_enabled,
             "stop applies local_enabled = false in memory"
@@ -928,68 +770,39 @@ mod tests {
             "stop must not create the block file"
         );
         let text = std::fs::read_to_string(&path).expect("config");
+        assert_eq!(text, original, "stop leaves the daemon config unchanged");
         assert!(
-            !dir.path().join(LOCAL_SHOW_STOP_FILE).exists(),
-            "an existing config is the stop record"
+            dir.path().join(LOCAL_SHOW_STOP_FILE).is_file(),
+            "stop writes the data-dir marker"
         );
-        assert!(
-            text.contains("local_enabled = false # operator"),
-            "the gui_show key is updated in place: {text}"
-        );
-        assert!(
-            text.contains("log_level = \"info\" # keep"),
-            "unrelated keys stay: {text}"
-        );
-        assert!(
-            text.contains("remote_enabled = true # stay"),
-            "the other gui_show key stays: {text}"
-        );
-        assert!(
-            text.contains("[other]\nlocal_enabled = true"),
-            "a different table keeps its own local_enabled: {text}"
-        );
-        let turned_on = text.replace(
-            "local_enabled = false # operator",
-            "local_enabled = true # operator",
-        );
-        std::fs::write(&path, turned_on).expect("human edit");
+        std::fs::write(&path, original).expect("human sets local_enabled = true");
         rt.reload_from_disk().expect("reload after re-enable");
         assert!(
             rt.config().local_enabled,
             "POST /acl/reload applies local_enabled = true"
         );
+        assert!(
+            !dir.path().join(LOCAL_SHOW_STOP_FILE).exists(),
+            "reload drops the stop marker"
+        );
+        assert!(rt.config().remote_enabled);
     }
 
     #[test]
     fn stop_merges_into_an_existing_config_without_dropping_network_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "network_id = \"x0x.testnet\"\nlog_level = \"info\"\n",
-        )
-        .expect("write config");
+        let original = "network_id = \"x0x.testnet\"\nlog_level = \"info\"\n";
+        std::fs::write(&path, original).expect("write config");
         let rt = runtime(dir.path(), Some(path.clone()));
-        rt.disable_local_show()
-            .expect("stop updates the existing config");
+        rt.disable_local_show().expect("stop writes the marker");
         let text = std::fs::read_to_string(&path).expect("config");
-        assert!(
-            text.contains("network_id = \"x0x.testnet\""),
-            "network_id stays: {text}"
-        );
-        assert!(
-            text.contains("log_level = \"info\""),
-            "other keys stay: {text}"
-        );
-        assert!(
-            text.contains("local_enabled = false"),
-            "local show is off in the config: {text}"
-        );
-        assert!(!dir.path().join(LOCAL_SHOW_STOP_FILE).exists());
+        assert_eq!(text, original, "stop leaves the daemon config unchanged");
+        assert!(dir.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+        assert!(!rt.config().local_enabled);
         let (parsed, _) =
             crate::server::config::analyze(&text).expect("startup can parse the file");
         assert_eq!(parsed.network_id.as_deref(), Some("x0x.testnet"));
-        assert!(!parsed.gui_show.local_enabled);
         assert!(
             !crate::server::config::named_instance_refuses_startup(
                 true,
@@ -997,6 +810,87 @@ mod tests {
             ),
             "a named instance whose config still has network_id starts"
         );
+
+        #[cfg(unix)]
+        {
+            let link_dir = tempfile::tempdir().expect("tempdir");
+            let target = link_dir.path().join("real-config.toml");
+            let link = link_dir.path().join("config.toml");
+            let linked = "network_id = \"x0x.symlink\"\n# keep this comment\n[gui_show]\nlocal_enabled = true\n";
+            std::fs::write(&target, linked).expect("symlink target");
+            std::os::unix::fs::symlink(&target, &link).expect("symlink config");
+            let linked_rt = runtime(link_dir.path(), Some(link.clone()));
+            linked_rt
+                .disable_local_show()
+                .expect("stop writes the marker and leaves the symlink");
+            let meta = std::fs::symlink_metadata(&link).expect("symlink metadata");
+            assert!(
+                meta.file_type().is_symlink(),
+                "stop leaves the config symlink in place"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("target"),
+                linked,
+                "stop leaves the symlink target unchanged"
+            );
+            assert_eq!(std::fs::read_to_string(&link).expect("link"), linked);
+            assert!(link_dir.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+            assert!(!linked_rt.config().local_enabled);
+            assert!(!linked_rt.is_blocked(&AgentId([2u8; 32])));
+            let (parsed, _) = crate::server::config::analyze(linked).expect("parses");
+            assert_eq!(parsed.network_id.as_deref(), Some("x0x.symlink"));
+            assert!(!crate::server::config::named_instance_refuses_startup(
+                true,
+                parsed.network_id.as_deref()
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_keeps_show_off_when_the_marker_directory_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let original = "log_level = \"info\" # keep\n\n[gui_show]\nlocal_enabled = true\n";
+        std::fs::write(&path, original).expect("write config");
+        let rt = runtime(dir.path(), Some(path.clone()));
+        let saved = std::fs::metadata(dir.path())
+            .expect("data dir metadata")
+            .permissions();
+        struct RestorePerms {
+            path: PathBuf,
+            permissions: std::fs::Permissions,
+        }
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let permissions = self.permissions.clone();
+                let _ = std::fs::set_permissions(&self.path, permissions);
+            }
+        }
+        let _restore = RestorePerms {
+            path: dir.path().to_path_buf(),
+            permissions: saved,
+        };
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let error = rt
+            .disable_local_show()
+            .expect_err("the marker write is reported");
+        assert!(error.starts_with(LOCAL_SHOW_DISABLE_FAILED), "{error}");
+        let marker = dir.path().join(LOCAL_SHOW_STOP_FILE);
+        assert!(error.contains(&marker.display().to_string()), "{error}");
+        assert!(
+            !rt.config().local_enabled,
+            "show is off in memory when the marker write fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("config"),
+            original,
+            "stop leaves the daemon config unchanged"
+        );
+        assert!(!marker.exists(), "a failed marker write leaves no marker");
     }
 
     #[test]
@@ -1210,6 +1104,54 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn opener_silenced_stdio_hides_the_session_url_on_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let record = dir.path().join("stderr-target");
+        let record_path = record.to_str().expect("utf8 temp path");
+        // The child writes a session URL to stderr, records where fd 2 points,
+        // then exits 1. Linux `readlink /dev/fd/2` prints that path. macOS
+        // fdesc nodes are not symlinks, so the same script compares the fd
+        // with `/dev/null` and records that path. `silenced_stdio` is the
+        // production helper; this command does not set stdio itself.
+        let script = r#"
+printf '%s\n' 'http://127.0.0.1/gui?token=SECRETTOKEN' >&2
+target=$(readlink /dev/fd/2 || true)
+if [ -z "$target" ]; then
+  fd_id=$(stat -f '%d:%i' /dev/fd/2)
+  null_id=$(stat -f '%d:%i' /dev/null)
+  if [ "$fd_id" = "$null_id" ]; then
+    target=/dev/null
+  else
+    target=$fd_id
+  fi
+fi
+printf '%s\n' "$target" > "$1"
+exit 1
+"#;
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", script, "sh", record_path]);
+        silenced_stdio(&mut cmd);
+        let child = cmd.spawn().expect("spawn");
+        let pid = child.id();
+        assert!(
+            !opener_displayed(child, OPENER_WAIT),
+            "a launcher that exits nonzero is no_display"
+        );
+        assert!(!process_is_zombie(pid), "the failed opener must be reaped");
+        let recorded = std::fs::read_to_string(&record).expect("fd target");
+        assert_eq!(
+            recorded.trim(),
+            "/dev/null",
+            "stderr must be /dev/null so the session URL cannot enter a daemon log: {recorded}"
+        );
+        assert!(
+            !recorded.contains("token=SECRETTOKEN"),
+            "the failure path must not keep the session URL: {recorded}"
+        );
+    }
+
+    #[cfg(unix)]
     struct KillOnDrop(u32);
 
     #[cfg(unix)]
@@ -1279,6 +1221,33 @@ mod tests {
                 .expect("fresh show")
                 .view,
             "network"
+        );
+    }
+
+    #[test]
+    fn pending_banner_at_61s_is_returned_and_expires_after_session_ttl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let now = Instant::now();
+        let hidden_tab = now.checked_sub(Duration::from_secs(61)).expect("instant");
+        rt.enqueue_pending(pending("hidden-tab", "people", hidden_tab));
+        assert!(
+            rt.take_pending_for_session("agent-socket", now).is_none(),
+            "an agent socket must not take another session's banner"
+        );
+        let kept = rt
+            .take_pending_for_session("hidden-tab", now)
+            .expect("a banner 61s old is still inside the session token TTL");
+        assert_eq!(kept.view, "people");
+        assert_eq!(kept.banner, "Opened by test on test");
+
+        let expired_at = now
+            .checked_sub(crate::server::SESSION_TOKEN_TTL + Duration::from_secs(1))
+            .expect("instant");
+        rt.enqueue_pending(pending("expired", "network", expired_at));
+        assert!(
+            rt.take_pending_for_session("expired", now).is_none(),
+            "a banner older than the session token TTL is stale"
         );
     }
 
@@ -1407,7 +1376,7 @@ mod tests {
         );
         assert!(
             html.contains(LOCAL_SHOW_DISABLE_FAILED),
-            "a failed stop uses the existing error frame"
+            "a marker that was not saved uses the existing error frame"
         );
         let banner = origin_banner("Ada", "desk", false);
         assert!(

@@ -921,9 +921,10 @@ function handleWsMsg(m){
     return;
   }
   if(m.type==='error'){
-    // gui.block has no success frame. An error frame means Stop did not apply.
+    // gui.block has no success frame. This error means show is already off
+    // and the stop marker was not saved. The banner stays up.
     const msg=String(m.message||'');
-    if(msg.indexOf('could not turn local show off')===0){
+    if(msg.indexOf('local show is off, but the stop marker was not saved')===0){
       toast(msg,'error');
     }
     console.warn('ws error:',m.message||m);

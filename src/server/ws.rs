@@ -1037,6 +1037,143 @@ async fn feed_direct_backfill_rows(
     hashes
 }
 
+/// Subscribe to navigation broadcasts (`call.*` and `gui.show`).
+///
+/// `handle_ws_connection` calls this before it inserts the session.
+/// Broadcast does not replay. A `gui.show` sent once the session is visible
+/// stays queued on this receiver.
+fn subscribe_navigation(state: &AppState) -> broadcast::Receiver<super::sse::SseEvent> {
+    state.broadcast_tx.subscribe()
+}
+
+/// ADR-0073: forward `call.*` and `gui.show` onto one session queue.
+///
+/// A hidden tab skips `gui.show`. Call events still forward. `None` means
+/// shutdown has closed admission and the task was not started.
+fn spawn_navigation_forwarder(
+    state: &AppState,
+    mut call_rx: broadcast::Receiver<super::sse::SseEvent>,
+    call_tx: mpsc::Sender<WsOutbound>,
+    call_stats: Arc<WsOutboundStats>,
+    call_slow_close: tokio_util::sync::CancellationToken,
+    call_counted: Arc<AtomicBool>,
+    show_visible: Arc<AtomicBool>,
+) -> Option<tokio::task::AbortHandle> {
+    spawn_ws_task(state, async move {
+        loop {
+            let event = match call_rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let out = match event.event_type.as_str() {
+                "call.incoming" => WsOutbound::CallIncoming { call: event.data },
+                "call.state" => WsOutbound::CallState { call: event.data },
+                "gui.show" => {
+                    if !show_visible.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let view = event
+                        .data
+                        .get("view")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let banner = event
+                        .data
+                        .get("banner")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let agent_id = event
+                        .data
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let machine_id = event
+                        .data
+                        .get("machine_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let rider = event
+                        .data
+                        .get("rider")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let request_id = event
+                        .data
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    WsOutbound::GuiShow {
+                        view,
+                        banner,
+                        agent_id,
+                        machine_id,
+                        rider,
+                        request_id,
+                    }
+                }
+                _ => continue,
+            };
+            if !feed_critical(&call_tx, out, &call_stats, &call_slow_close, &call_counted) {
+                break;
+            }
+        }
+    })
+}
+
+/// Navigation arm plus the session row it protects.
+struct ArmedNavigation {
+    forwarder: tokio::task::AbortHandle,
+    /// `broadcast_tx.receiver_count()` on the line before `ws_sessions.insert`.
+    /// The navigation receiver is already included. Tests use this to fail the
+    /// old insert-then-subscribe order.
+    #[cfg(test)]
+    receivers_at_insert: usize,
+}
+
+/// Subscribe, start the navigation forwarder, then insert `session`.
+///
+/// A spawn failure returns `None` before the insert. The caller must not
+/// abandon a session in that case: nothing was advertised.
+async fn arm_navigation_and_advertise_session(
+    state: &AppState,
+    session: WsSession,
+    outbound_tx: &mpsc::Sender<WsOutbound>,
+    stats: &Arc<WsOutboundStats>,
+    slow_close: &tokio_util::sync::CancellationToken,
+    slow_close_counted: &Arc<AtomicBool>,
+) -> Option<ArmedNavigation> {
+    let call_rx = subscribe_navigation(state);
+    let show_visible = Arc::clone(&session.visible_gui);
+    let forwarder = spawn_navigation_forwarder(
+        state,
+        call_rx,
+        outbound_tx.clone(),
+        Arc::clone(stats),
+        slow_close.clone(),
+        Arc::clone(slow_close_counted),
+        show_visible,
+    )?;
+    // Sample immediately before insert. Subscribe and spawn are above this
+    // line. Moving the insert above them drops `receivers_at_insert` back to
+    // the pre-subscribe count and fails
+    // `visible_gui_subscribes_before_it_is_advertised`.
+    #[cfg(test)]
+    let receivers_at_insert = state.broadcast_tx.receiver_count();
+    let session_id = session.id.clone();
+    state.ws_sessions.write().await.insert(session_id, session);
+    Some(ArmedNavigation {
+        forwarder,
+        #[cfg(test)]
+        receivers_at_insert,
+    })
+}
+
 /// Core WebSocket connection lifecycle.
 async fn handle_ws_connection(
     socket: axum::extract::ws::WebSocket,
@@ -1066,7 +1203,10 @@ async fn handle_ws_connection(
     let slow_close_counted = Arc::new(AtomicBool::new(false));
     let stats = Arc::clone(&state.ws_outbound_stats);
 
-    // Register session
+    // Subscribe and start the gui.show forwarder, then insert. A concurrent
+    // show can observe the session as soon as the insert returns. Broadcast
+    // does not replay, so the receiver must already exist. Do not insert the
+    // session before this call.
     let session = WsSession {
         id: session_id.clone(),
         subscribed_topics: HashSet::new(),
@@ -1075,11 +1215,20 @@ async fn handle_ws_connection(
         gui_session_token: session_token.clone(),
         topic_forwarders: HashMap::new(),
     };
-    state
-        .ws_sessions
-        .write()
-        .await
-        .insert(session_id.clone(), session);
+    let Some(armed) = arm_navigation_and_advertise_session(
+        &state,
+        session,
+        &outbound_tx,
+        &stats,
+        &slow_close,
+        &slow_close_counted,
+    )
+    .await
+    else {
+        // The forwarder was not admitted. The session was not inserted.
+        return;
+    };
+    let call_forwarder = armed.forwarder;
 
     tracing::info!(session_id = %session_id, direct_mode, "WebSocket session opened");
 
@@ -1135,7 +1284,7 @@ async fn handle_ws_connection(
         tracing::debug!(session_id = %writer_session_id, "WebSocket writer stopped");
         let _ = sink_tx.send(ws_tx);
     }) else {
-        abandon_ws_session(&state, &session_id, &[]).await;
+        abandon_ws_session(&state, &session_id, &[call_forwarder]).await;
         return;
     };
 
@@ -1235,93 +1384,12 @@ async fn handle_ws_connection(
             tracing::debug!(session_id = %sid, "Direct message forwarder stopped");
         });
         if admitted.is_none() {
-            abandon_ws_session(&state, &session_id, &[writer_abort]).await;
+            abandon_ws_session(&state, &session_id, &[writer_abort, call_forwarder]).await;
             return;
         }
         admitted
     } else {
         None
-    };
-
-    // ADR-0073: forward `call.*` events from the daemon event channel to
-    // every WS session (plain and direct), so a GUI tab rings.
-    let call_tx = outbound_tx.clone();
-    let call_stats = Arc::clone(&stats);
-    let call_slow_close = slow_close.clone();
-    let call_counted = Arc::clone(&slow_close_counted);
-    let mut call_rx = state.broadcast_tx.subscribe();
-    let show_visible = Arc::clone(&visible_gui);
-    let Some(call_forwarder) = spawn_ws_task(&state, async move {
-        loop {
-            let event = match call_rx.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            };
-            let out = match event.event_type.as_str() {
-                "call.incoming" => WsOutbound::CallIncoming { call: event.data },
-                "call.state" => WsOutbound::CallState { call: event.data },
-                "gui.show" => {
-                    if !show_visible.load(Ordering::Acquire) {
-                        continue;
-                    }
-                    let view = event
-                        .data
-                        .get("view")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let banner = event
-                        .data
-                        .get("banner")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let agent_id = event
-                        .data
-                        .get("agent_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let machine_id = event
-                        .data
-                        .get("machine_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let rider = event
-                        .data
-                        .get("rider")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let request_id = event
-                        .data
-                        .get("request_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    WsOutbound::GuiShow {
-                        view,
-                        banner,
-                        agent_id,
-                        machine_id,
-                        rider,
-                        request_id,
-                    }
-                }
-                _ => continue,
-            };
-            if !feed_critical(&call_tx, out, &call_stats, &call_slow_close, &call_counted) {
-                break;
-            }
-        }
-    }) else {
-        let mut children = vec![writer_abort];
-        if let Some(direct) = direct_handle {
-            children.push(direct);
-        }
-        abandon_ws_session(&state, &session_id, &children).await;
-        return;
     };
 
     // Spawn keepalive pinger (30s interval). The keepalive is the reliable
@@ -1967,9 +2035,9 @@ async fn handle_ws_command(
                 }
             };
             if aid == state.agent.agent_id() {
-                // Local Stop writes `[gui_show] local_enabled = false`.
-                // There is no success frame. A write failure uses the
-                // existing error frame. Re-enable is config plus /acl/reload.
+                // Local Stop writes the data-dir marker and turns show off
+                // in memory. There is no success frame. A marker write
+                // failure uses the existing error frame. Show stays off.
                 if let Err(message) = state.gui_show.disable_local_show() {
                     feed_droppable(tx, WsOutbound::Error { message }, stats);
                 }
@@ -2390,18 +2458,26 @@ mod tests {
             "stop must not use the block list"
         );
         assert!(!dir.path().join("gui_show_blocked.json").exists());
-        let text = std::fs::read_to_string(&path).expect("config");
-        assert!(text.contains("local_enabled = false"), "{text}");
-        std::fs::write(
-            &path,
-            text.replace("local_enabled = false", "local_enabled = true"),
-        )
-        .expect("re-enable");
+        let original = "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n";
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("config"),
+            original,
+            "stop leaves the daemon config unchanged"
+        );
+        assert!(dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .is_file());
+        std::fs::write(&path, original).expect("human sets local_enabled = true");
         state
             .gui_show
             .reload_from_disk()
             .expect("reload turns local show back on");
         assert!(state.gui_show.config().local_enabled);
+        assert!(!dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .exists());
     }
 
     #[tokio::test]
@@ -4037,5 +4113,100 @@ mod tests {
             }
         }
         bodies
+    }
+
+    /// A visible GUI session subscribes to `gui.show` before it is advertised.
+    ///
+    /// `arm_navigation_and_advertise_session` is the order
+    /// `handle_ws_connection` uses: subscribe, spawn the forwarder, sample
+    /// `broadcast_tx.receiver_count()`, then `ws_sessions.insert`. The old
+    /// order inserted first. `receivers_at_insert` then omitted this socket,
+    /// so the assertion fails. Broadcast does not replay.
+    ///
+    /// A second task sends `gui.show` as soon as it sees a visible GUI
+    /// session. The forwarder must place a `GuiShow` frame on that session's
+    /// outbound queue before the deadline.
+    #[tokio::test]
+    async fn visible_gui_subscribes_before_it_is_advertised() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let before = state.broadcast_tx.receiver_count();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+
+        let state_watch = Arc::clone(&state);
+        let watcher = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let visible = state_watch
+                    .ws_sessions
+                    .read()
+                    .await
+                    .values()
+                    .any(WsSession::is_visible_gui);
+                if visible {
+                    let _ = state_watch.broadcast_tx.send(crate::server::sse::SseEvent {
+                        event_type: "gui.show".to_string(),
+                        data: serde_json::json!({
+                            "view": "people",
+                            "banner": "origin",
+                            "agent_id": "aa",
+                            "machine_id": "bb",
+                            "rider": false,
+                            "request_id": "cc",
+                        }),
+                    });
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            test_gui_ws_session("visible-gui"),
+            &outbound_tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("navigation forwarder admitted");
+        assert!(
+            armed.receivers_at_insert > before,
+            "navigation subscribe must raise receiver_count before the session is visible; old insert-then-subscribe order left the count at {before}, saw {}",
+            armed.receivers_at_insert
+        );
+        assert!(
+            state
+                .ws_sessions
+                .read()
+                .await
+                .values()
+                .any(WsSession::is_visible_gui),
+            "production advertise inserts a visible GUI session"
+        );
+
+        let view = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(WsOutbound::GuiShow { view, .. }) => return view,
+                    Some(_) => continue,
+                    None => panic!("outbound queue closed before gui.show"),
+                }
+            }
+        })
+        .await
+        .expect("gui.show missed: visible session had no navigation receiver");
+        assert_eq!(view, "people");
+        armed.forwarder.abort();
+        watcher.abort();
     }
 }

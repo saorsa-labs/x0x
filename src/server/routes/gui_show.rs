@@ -89,7 +89,8 @@ pub(in crate::server) async fn gui_show(
 
     // Mint a fresh session; never put the durable token in the URL.
     // Queue the banner before the opener so a browser that connects during
-    // the launch wait still receives it. A failed launch drops that entry.
+    // the launch wait still receives it. A failed launch drops that entry
+    // and revokes the session so the token is not valid.
     let session = state.sessions.issue(Instant::now());
     let url = show_loopback_url(state.api_address, &session, &route);
     state.gui_show.enqueue_pending(PendingGuiShow {
@@ -109,6 +110,7 @@ pub(in crate::server) async fn gui_show(
     if opened {
         json_outcome(GuiShowOutcome::Opened, machine_id, request_id)
     } else {
+        state.sessions.revoke(&session);
         state.gui_show.drop_pending_for_session(&session);
         json_outcome(GuiShowOutcome::NoDisplay, machine_id, request_id)
     }
@@ -427,6 +429,12 @@ mod tests {
                 .is_none(),
             "a failed opener must drop the banner it queued"
         );
+        assert!(
+            !state
+                .sessions
+                .is_live_for_test(&token, std::time::Instant::now()),
+            "a failed opener must revoke the session it minted"
+        );
         Ok(())
     }
 
@@ -548,10 +556,8 @@ mod tests {
     async fn stop_then_reload_reenables_local_show() -> anyhow::Result<()> {
         let (state, dir) = secure_endpoint_test_state().await?;
         let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n",
-        )?;
+        let original = "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n";
+        std::fs::write(&path, original)?;
         state.gui_show.set_config_path(Some(path.clone()));
         state
             .gui_show
@@ -564,16 +570,24 @@ mod tests {
         assert_eq!(body["outcome"], "disabled", "{body}");
         assert!(body.get("url").is_none(), "{body}");
         assert!(body.get("token").is_none(), "{body}");
-        let text = std::fs::read_to_string(&path)?;
-        assert!(text.contains("local_enabled = false"), "{text}");
-        std::fs::write(
-            &path,
-            text.replace("local_enabled = false", "local_enabled = true"),
-        )?;
+        assert_eq!(
+            std::fs::read_to_string(&path)?,
+            original,
+            "stop leaves the daemon config unchanged"
+        );
+        assert!(dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .is_file());
+        std::fs::write(&path, original)?;
         state
             .gui_show
             .reload_from_disk()
             .map_err(|error| anyhow::anyhow!(error))?;
+        assert!(!dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .exists());
         let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["outcome"], "opened", "{body}");
@@ -611,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acl_reload_reports_gui_config_read_and_toml_errors() -> anyhow::Result<()> {
+    async fn acl_reload_returns_only_the_acl_report() -> anyhow::Result<()> {
         let (state, dir) = secure_endpoint_test_state().await?;
         state.gui_show.set_config(GuiShowConfig {
             local_enabled: true,
@@ -625,24 +639,24 @@ mod tests {
             .with_state(Arc::clone(&state));
 
         let (status, body) = post_reload(&app).await?;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["ok"], json!(false), "{body}");
-        let error = body["gui_show"]["error"].as_str().unwrap_or("");
-        assert!(error.contains("failed to parse GUI config"), "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("gui_show").is_none(), "{body}");
+        assert_eq!(body["ok"], json!(true), "{body}");
         assert!(
             state.gui_show.config().local_enabled,
-            "a TOML error must not replace the last good config"
+            "a TOML error keeps the last good config"
         );
+        assert!(state.gui_show.config().remote_enabled);
 
         state
             .gui_show
             .set_config_path(Some(dir.path().join("missing.toml")));
         let (status, body) = post_reload(&app).await?;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["ok"], json!(false), "{body}");
-        let error = body["gui_show"]["error"].as_str().unwrap_or("");
-        assert!(error.contains("failed to read GUI config"), "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("gui_show").is_none(), "{body}");
+        assert_eq!(body["ok"], json!(true), "{body}");
         assert!(state.gui_show.config().local_enabled);
+        assert!(state.gui_show.config().remote_enabled);
         Ok(())
     }
 

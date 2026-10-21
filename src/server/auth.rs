@@ -546,7 +546,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
 // ── Session-token store ──────────────────────────────────────────────────
 
 /// Lifetime of a browser session token issued by `POST /auth/session`.
-pub(super) const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
+pub(crate) const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
 /// Same value in seconds, surfaced in the `expires_in` JSON field.
 const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
 /// Hard cap on a refreshed session chain (#893): refresh is refused once
@@ -653,6 +653,24 @@ impl SessionStore {
         Ok(fresh)
     }
 
+    /// Remove one session token. An unknown token is left unchanged.
+    ///
+    /// The lookup hashes the candidate and compares with
+    /// [`subtle::ConstantTimeEq`], the same way as [`Self::refresh`].
+    pub(super) fn revoke(&self, token: &str) {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let Ok(mut guard) = self.sessions.lock() else {
+            return;
+        };
+        if let Some(index) = guard
+            .iter()
+            .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
+        {
+            guard.swap_remove(index);
+        }
+    }
+
     /// Original mint time of a live token's refresh chain (tests only).
     #[cfg(test)]
     fn minted_at(&self, token: &str, now: Instant) -> Option<Instant> {
@@ -677,6 +695,12 @@ impl SessionStore {
         // Prune expired first (fail-closed: an expired token is never valid).
         guard.retain(|s| s.expires_at > now);
         guard.iter().any(|s| candidate.ct_eq(&s.token_hash).into())
+    }
+
+    /// Whether `token` is a live session. [`Self::is_valid`] stays private.
+    #[cfg(test)]
+    pub(super) fn is_live_for_test(&self, token: &str, now: std::time::Instant) -> bool {
+        self.is_valid(token, now)
     }
 }
 

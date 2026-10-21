@@ -14,6 +14,7 @@ pub use acl_admin::AclReloadTrigger;
 mod api_watchdog;
 pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
+pub(crate) use auth::SESSION_TOKEN_TTL;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;

@@ -124,11 +124,11 @@ pub(in crate::server) async fn acl_exec_remove(
     admin_result(state.acl_admin.remove_exec(&id).await)
 }
 
-/// POST /acl/reload — re-read both TOML floors, API overlays, and
-/// `[gui_show]`. `200` when every plane applied. `422` when any plane was
-/// rejected. A rejected ACL plane keeps its last good ACL (see
-/// `/diagnostics/{connect,exec}`). A GUI config read or TOML error keeps
-/// the last good `[gui_show]` and is reported on `gui_show.error`.
+/// POST /acl/reload — re-read both TOML floors and API overlays. `200`
+/// when every plane applied. `422` only when an ACL plane was rejected.
+/// A rejected ACL plane keeps its last good ACL (see
+/// `/diagnostics/{connect,exec}`). `[gui_show]` is still re-read and does
+/// not affect this response.
 pub(in crate::server) async fn acl_reload(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
@@ -136,27 +136,18 @@ pub(in crate::server) async fn acl_reload(
     if !actor.is_durable_owner() {
         return forbidden();
     }
-    // ADR 0083 §5: `[gui_show]` is re-read with the ACL floors.
-    let gui_show = state.gui_show.reload_from_disk();
+    let _ = state.gui_show.reload_from_disk();
     let report = state.acl_admin.reload().await;
-    let gui_ok = gui_show.is_ok();
-    let mut value = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(obj) = value.as_object_mut() {
-        let gui_body = match gui_show {
-            Ok(()) => serde_json::json!({ "ok": true }),
-            Err(error) => {
-                obj.insert("ok".to_string(), serde_json::json!(false));
-                serde_json::json!({ "ok": false, "error": error })
-            }
-        };
-        obj.insert("gui_show".to_string(), gui_body);
-    }
-    let status = if report.ok && gui_ok {
+    let status = if report.ok {
         StatusCode::OK
     } else {
         StatusCode::UNPROCESSABLE_ENTITY
     };
-    (status, Json(value)).into_response()
+    (
+        status,
+        Json(serde_json::to_value(report).unwrap_or_default()),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
