@@ -1123,18 +1123,15 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 reader_only,
             },
         )?;
-        // Same hold as REST encrypt. The ratchet has not moved. Do not
-        // edit persist_treekem_snapshot_bound; this return never reaches it.
-        if super::named_groups::self_leave_startup_withholds_ciphertext(
-            &state,
-            &self.group_key,
-            &group,
-        )
-        .await
+        // The same ciphertext boundary as REST encrypt: the self-leave hold
+        // and ADR 0110 §4 (no eligible admin). TreeKEM task-list seals come
+        // through here too. The ratchet has not moved. Do not edit
+        // persist_treekem_snapshot_bound; this return never reaches it.
+        if let Some(hold) =
+            super::named_groups::group_ciphertext_withheld(&state, &self.group_key, Some(&*group))
+                .await
         {
-            return Err(x0x::kv::KvError::SecureRecord(
-                "self-leave exclusion is not complete; ciphertext is withheld".to_string(),
-            ));
+            return Err(x0x::kv::KvError::SecureRecord(hold.reason().to_string()));
         }
         let ciphertext = match group.encrypt_message(&inner) {
             Ok(ciphertext) => ciphertext,

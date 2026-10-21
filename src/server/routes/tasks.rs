@@ -407,14 +407,30 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                     })?;
             match plane {
                 TaskListPlane::Public => Ok(None),
-                TaskListPlane::Gss(info) => x0x::crdt::sealed::seal_gss_task_payload(
-                    &info,
-                    &signing,
-                    kind,
-                    &self.topic,
-                    payload,
-                )
-                .map(Some),
+                TaskListPlane::Gss(info) => {
+                    // The group ciphertext boundary (ADR 0110 §4). The
+                    // TreeKEM arm gets it inside `seal_record`.
+                    if let Some(hold) = super::named_groups::group_ciphertext_withheld(
+                        &state,
+                        info.stable_group_id(),
+                        None,
+                    )
+                    .await
+                    {
+                        return Err(x0x::crdt::CrdtError::Gossip(format!(
+                            "GSS task seal: {}",
+                            hold.reason()
+                        )));
+                    }
+                    x0x::crdt::sealed::seal_gss_task_payload(
+                        &info,
+                        &signing,
+                        kind,
+                        &self.topic,
+                        payload,
+                    )
+                    .map(Some)
+                }
                 TaskListPlane::TreeKem(protector, stable) => {
                     let record_id =
                         x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
