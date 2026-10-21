@@ -1569,10 +1569,16 @@ exit 1
         let listener = html
             .find("addEventListener('visibilitychange'")
             .expect("visibility listener");
-        let listener_src = &html[listener..listener + 180];
+        let listener_src = &html[listener..listener + 420];
+        let refresh_at = listener_src
+            .find("await refreshSession()")
+            .expect("an overdue reveal waits for refresh");
+        let advertise_at = listener_src
+            .find("advertiseGuiVisibility")
+            .expect("hiding the tab must stop advertising a live GUI");
         assert!(
-            listener_src.contains("advertiseGuiVisibility"),
-            "hiding the tab must stop advertising a live GUI: {listener_src}"
+            refresh_at < advertise_at,
+            "visibility is advertised only after an overdue refresh: {listener_src}"
         );
         let onopen = fn_source(html, "ws.onopen=async()", "ws.onclose");
         assert!(
@@ -1592,6 +1598,10 @@ exit 1
         assert!(
             live.contains("guiTabVisible()"),
             "a hidden tab is not a live GUI: {live}"
+        );
+        assert!(
+            live.contains("SESSION_REFRESH_MS"),
+            "an overdue session is not a live GUI: {live}"
         );
         let refresh = fn_source(
             html,
@@ -1623,6 +1633,7 @@ let refreshBody = null;
 async function apiWith() { return refreshBody; }
 const BASE = 'http://127.0.0.1:9';
 let SESSION_TOKEN = 'tok';
+const SESSION_REFRESH_MS = 8*60*1000;
 let sessionExpired = false;
 let sessionRefreshing = false;
 let sessionIssuedAt = 0;
@@ -1648,6 +1659,16 @@ let sessionIssuedAt = 0;
   if (sessionExpired) throw new Error('an unreachable daemon must not expire the session');
   if (sent[sent.length - 1].visible !== true) {
     throw new Error('unreachable refresh cleared visibility: ' + JSON.stringify(sent));
+  }
+  sessionIssuedAt = Date.now() - 11 * 60 * 1000;
+  advertiseGuiVisibility();
+  if (sent[sent.length - 1].visible !== false) {
+    throw new Error('an overdue session advertised a live tab: ' + JSON.stringify(sent));
+  }
+  sessionIssuedAt = Date.now();
+  advertiseGuiVisibility();
+  if (sent[sent.length - 1].visible !== true) {
+    throw new Error('a fresh session must advertise again: ' + JSON.stringify(sent));
   }
   refreshBody = { _http_ok: false, _http_status: 401 };
   await refreshSession();

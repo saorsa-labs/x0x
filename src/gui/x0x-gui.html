@@ -716,7 +716,8 @@ function guiTabVisible(){
 // /gui/show would navigate this tab, and view requests on the dead token
 // answer 401, so a working browser never opens.
 function liveGuiTab(){
-  return !sessionExpired&&guiTabVisible();
+  const overdue=sessionIssuedAt>0&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS;
+  return !sessionExpired&&!overdue&&guiTabVisible();
 }
 function wsUrl(){
   const base=BASE.replace(/^http/,'ws')+'/ws/direct';
@@ -6342,8 +6343,8 @@ if(!applyHashRoute())renderView();
 renderSidebar();
 window.onhashchange=applyHashRoute;
 setInterval(maybeRefreshSession,30000);
-document.addEventListener('visibilitychange',()=>{
-  maybeRefreshSession();
+document.addEventListener('visibilitychange',async()=>{
+  if(document.visibilityState==='visible'&&sessionIssuedAt>0&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)await refreshSession();
   advertiseGuiVisibility();
 });
 

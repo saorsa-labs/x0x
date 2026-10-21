@@ -9,8 +9,8 @@
 //! `state::AppState` are `pub(super)`; everything else is private.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -91,8 +91,12 @@ pub(super) struct WsSession {
     /// A hidden tab keeps it so `gui.visible` can deliver a pending banner.
     gui_session_token: Option<String>,
     /// Bumped on every hide. A delayed reveal must not mark the tab visible
-    /// after a newer hide.
+    /// after a newer hide. The bump and the visibility write share `visible_mu`.
     visible_epoch: Arc<AtomicU64>,
+    /// Serialises a hide with the visibility write that follows a queued show.
+    visible_mu: Mutex<()>,
+    /// Reveals whose opened view is still waiting for a queue slot.
+    reveal_inflight: Arc<AtomicUsize>,
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
     /// The drain owns the `JoinHandle`; this is only the abort handle.
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
@@ -119,6 +123,8 @@ fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
         visible_gui: visible_gui_flag(visible_gui),
         gui_session_token: None,
         visible_epoch: Arc::new(AtomicU64::new(0)),
+        visible_mu: Mutex::new(()),
+        reveal_inflight: Arc::new(AtomicUsize::new(0)),
         topic_forwarders: HashMap::new(),
     }
 }
@@ -1257,6 +1263,8 @@ async fn handle_ws_connection(
         visible_gui: Arc::clone(&visible_gui),
         gui_session_token: session_token.clone(),
         visible_epoch: Arc::new(AtomicU64::new(0)),
+        visible_mu: Mutex::new(()),
+        reveal_inflight: Arc::new(AtomicUsize::new(0)),
         topic_forwarders: HashMap::new(),
     };
     let Some(armed) = arm_navigation_and_advertise_session(
@@ -2087,8 +2095,7 @@ async fn handle_ws_command(
                 };
                 let was_visible = session.is_visible_gui();
                 if !visible {
-                    session.visible_epoch.fetch_add(1, Ordering::AcqRel);
-                    session.set_visible_gui(false);
+                    hide_gui_session(session);
                     None
                 } else if was_visible {
                     None
@@ -2101,54 +2108,65 @@ async fn handle_ws_command(
                     Some((
                         session.gui_session_token(),
                         session.visible_epoch.load(Ordering::Acquire),
-                        Arc::clone(&session.visible_epoch),
+                        Arc::clone(&session.reveal_inflight),
                     ))
                 }
             };
-            if let Some((token, epoch, epoch_cell)) = reveal {
-                let still_current = move || epoch_cell.load(Ordering::Acquire) == epoch;
-                if let Some(token) = token {
-                    if let Some(pending) = state
-                        .gui_show
-                        .take_pending_for_session(&token, std::time::Instant::now())
-                    {
-                        match tx.try_send(outbound_gui_show(pending.clone())) {
-                            Ok(()) => {
-                                if still_current() {
-                                    mark_gui_session_visible(state, session_id).await;
-                                }
-                            }
-                            Err(_) => {
-                                // The queue is full or gone. Hold the show until
-                                // a slot accepts it, and stay hidden so a newer
-                                // navigation cannot land in front of that frame.
-                                let state = Arc::clone(state);
-                                let tx = tx.clone();
-                                let session_id = session_id.to_string();
-                                tokio::spawn(async move {
-                                    let frame = outbound_gui_show(pending.clone());
-                                    if tx.send(frame).await.is_ok() {
-                                        if still_current() {
-                                            mark_gui_session_visible(&state, &session_id).await;
-                                        }
-                                    } else {
-                                        state.gui_show.enqueue_pending(pending);
-                                    }
-                                });
-                            }
+            if let Some((Some(token), epoch, inflight)) = reveal {
+                if let Some(pending) = state
+                    .gui_show
+                    .take_pending_for_session(&token, std::time::Instant::now())
+                {
+                    match tx.try_send(outbound_gui_show(pending.clone())) {
+                        Ok(()) => {
+                            show_gui_session_if_current(state, session_id, epoch).await;
                         }
-                    } else if still_current() {
-                        mark_gui_session_visible(state, session_id).await;
+                        Err(_) => {
+                            // The queue is full or gone. Hold the show until
+                            // a slot accepts it. A second reveal must not
+                            // mark the tab visible while this frame is waiting.
+                            inflight.fetch_add(1, Ordering::AcqRel);
+                            let state = Arc::clone(state);
+                            let tx = tx.clone();
+                            let session_id = session_id.to_string();
+                            tokio::spawn(async move {
+                                let frame = outbound_gui_show(pending.clone());
+                                let sent = tx.send(frame).await.is_ok();
+                                inflight.fetch_sub(1, Ordering::AcqRel);
+                                if sent {
+                                    show_gui_session_if_current(&state, &session_id, epoch).await;
+                                } else {
+                                    state.gui_show.enqueue_pending(pending);
+                                }
+                            });
+                        }
                     }
+                } else if inflight.load(Ordering::Acquire) == 0 {
+                    show_gui_session_if_current(state, session_id, epoch).await;
                 }
             }
         }
     }
 }
 
-async fn mark_gui_session_visible(state: &AppState, session_id: &str) {
+fn hide_gui_session(session: &WsSession) {
+    let _guard = session
+        .visible_mu
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    session.visible_epoch.fetch_add(1, Ordering::AcqRel);
+    session.set_visible_gui(false);
+}
+
+async fn show_gui_session_if_current(state: &AppState, session_id: &str, epoch: u64) {
     if let Some(session) = state.ws_sessions.read().await.get(session_id) {
-        session.set_visible_gui(true);
+        let _guard = session
+            .visible_mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if session.visible_epoch.load(Ordering::Acquire) == epoch {
+            session.set_visible_gui(true);
+        }
     }
 }
 
@@ -2500,6 +2518,8 @@ mod tests {
                 visible_gui: visible_gui_flag(false),
                 gui_session_token: None,
                 visible_epoch: Arc::new(AtomicU64::new(0)),
+                visible_mu: Mutex::new(()),
+                reveal_inflight: Arc::new(AtomicUsize::new(0)),
                 topic_forwarders: HashMap::new(),
             },
         );
@@ -2810,16 +2830,95 @@ mod tests {
             WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
             other => panic!("expected the preserved gui.show, got {other:?}"),
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sessions = state.ws_sessions.read().await;
+        let session = sessions.get("hide-gui").expect("session");
+        assert_eq!(session.reveal_inflight.load(Ordering::Acquire), 0);
+        assert!(
+            !session.is_visible_gui(),
+            "a hide that arrived while the queue was full stays hidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_reveal_stays_hidden_until_the_banner_is_queued() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "reveal-twice";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "reveal-twice").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("reveal-twice")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "reveal-twice",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        handle_ws_command(
+            &state,
+            "reveal-twice",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
         assert!(
             !state
                 .ws_sessions
                 .read()
                 .await
-                .get("hide-gui")
+                .get("reveal-twice")
                 .expect("session")
                 .is_visible_gui(),
-            "a hide that arrived while the queue was full stays hidden"
+            "a second reveal must not mark the tab visible while the banner is still waiting"
+        );
+        assert!(matches!(rx.try_recv(), Ok(WsOutbound::Pong)));
+        match rx.recv().await.expect("opened show still queued") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
+            other => panic!("expected the preserved gui.show, got {other:?}"),
+        }
+        let mut visible = false;
+        for _ in 0..50 {
+            if state
+                .ws_sessions
+                .read()
+                .await
+                .get("reveal-twice")
+                .expect("session")
+                .is_visible_gui()
+            {
+                visible = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            visible,
+            "the tab becomes visible once the opened view is queued"
         );
     }
 
