@@ -733,6 +733,19 @@ impl AutoApplyUpgrader {
         Ok(observed)
     }
 
+    /// Capture guide admission after download, from the independent executable
+    /// observation. The writer must hold this install lock through the fresh
+    /// gate check and rename; this snapshot alone does not authorize a write.
+    #[cfg(unix)]
+    pub(crate) fn guide_staging(
+        &self,
+    ) -> Result<Option<(PathBuf, super::staging_runtime::Gate)>, UpgradeError> {
+        let Some(gate) = &self.staging else {
+            return Ok(None);
+        };
+        Ok(Some((self.install_path()?, gate.clone())))
+    }
+
     #[cfg(unix)]
     pub(crate) fn with_staging_request(mut self, request: super::staging::StagingRequest) -> Self {
         self.staging = Some(super::staging_runtime::Gate {
