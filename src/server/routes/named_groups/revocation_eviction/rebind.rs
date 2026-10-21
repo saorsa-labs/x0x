@@ -1055,7 +1055,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight
+                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
@@ -1068,7 +1068,12 @@ async fn drive_deliveries(state: &Arc<AppState>) {
                 x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
             ) {
                 Some(true) => {
-                    updates.push((*recipient, Some(RecipientDelivery::InFlight)));
+                    updates.push((
+                        *recipient,
+                        Some(RecipientDelivery::InFlight(
+                            super::crypto_exclusion::next_attempt(),
+                        )),
+                    ));
                     spawn_send(state, key.clone(), agent, Arc::clone(&delivery.bytes));
                 }
                 Some(false) => updates.push((*recipient, Some(RecipientDelivery::Lacking))),

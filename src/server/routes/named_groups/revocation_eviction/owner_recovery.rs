@@ -336,7 +336,8 @@ async fn drive_mandates(state: &Arc<AppState>) {
             .mandates
             .iter_mut()
             .filter(|(_, delivery)| {
-                delivery.next_at <= now && delivery.status != RecipientDelivery::InFlight
+                delivery.next_at <= now
+                    && !matches!(delivery.status, RecipientDelivery::InFlight(_))
             })
             .map(|(id, delivery)| {
                 delivery.next_at = now + ORC_RESEND_INTERVAL;
@@ -369,7 +370,7 @@ async fn drive_mandates(state: &Arc<AppState>) {
         {
             Some(true) => {
                 spawn_mandate_send(state, stable.clone(), agent, Arc::clone(&delivery.bytes));
-                RecipientDelivery::InFlight
+                RecipientDelivery::InFlight(super::crypto_exclusion::next_attempt())
             }
             Some(false) => RecipientDelivery::Lacking,
             None => {
@@ -1003,7 +1004,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight
+                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
@@ -1015,7 +1016,12 @@ async fn drive_deliveries(state: &Arc<AppState>) {
                 .verified_registry_supports(&agent, x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1)
             {
                 Some(true) => {
-                    updates.push((*recipient, Some(RecipientDelivery::InFlight)));
+                    updates.push((
+                        *recipient,
+                        Some(RecipientDelivery::InFlight(
+                            super::crypto_exclusion::next_attempt(),
+                        )),
+                    ));
                     spawn_commit_send(state, stable.clone(), agent, Arc::clone(&delivery.bytes));
                 }
                 Some(false) => updates.push((*recipient, Some(RecipientDelivery::Lacking))),
