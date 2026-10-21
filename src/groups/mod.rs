@@ -22,6 +22,7 @@ pub mod kv_context;
 pub mod member;
 pub mod owner_cert;
 pub mod owner_mandate;
+pub mod owner_recovery;
 pub mod policy;
 pub mod public_message;
 pub mod request;

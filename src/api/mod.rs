@@ -532,6 +532,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/owner/groups/:id/recovery-mandate",
+        cli_name: "owner groups recovery-mandate",
+        description: "ADR 0110 §4b(1): owner-sign an OwnerRecoveryMandateV1 promoting one certified member when every admin of an OwnerCertified group is revoked",
+        category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("promoted_agent_id", true, "--promoted")]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/sync/devices",
         cli_name: "sync devices",

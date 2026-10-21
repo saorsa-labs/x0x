@@ -89,10 +89,10 @@ use routes::{
     load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
     machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_machines, owner_riders_issue, owner_riders_list,
-    owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust,
+    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
+    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
+    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
+    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
     recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
     reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
@@ -2660,6 +2660,10 @@ pub async fn serve_with_options(
             post(owner_riders_issue).get(owner_riders_list),
         )
         .route("/owner/riders/:id", delete(owner_riders_revoke))
+        .route(
+            "/owner/groups/:id/recovery-mandate",
+            post(owner_group_recovery_mandate),
+        )
         .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))

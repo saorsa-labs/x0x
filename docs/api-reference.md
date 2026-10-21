@@ -685,7 +685,35 @@ Home encrypts record the sub-agent id as the history row's author.
   `min(cert expiry, token expiry)` — a longer `not_after` answers
   `400` with the bound named.
 
+### Owner recovery of a group (ADR 0110 §4b(1))
 
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/owner/groups/:id/recovery-mandate` | `x0x owner groups recovery-mandate <GROUP_ID> --promoted <AGENT_ID>` | Owner-sign an `OwnerRecoveryMandateV1` for an `OwnerCertified` group whose admins are all revoked |
+
+Body: `{ "promoted_agent_id": <hex agent ID> }`. Requires the durable API
+token and a node that holds the owner's user key U (`~/.x0x/user.key` is
+never auto-generated; `409` without it). The group's admission must be
+`OwnerCertified(U)`.
+
+The mandate names the group ID, the current head, each revoked
+Admin-or-higher Active seat with the hashes of its verified Agent-subject
+revocation records, and the promoted member with its committed certificate
+digest. The daemon sends it to the promoted member over the direct-message
+carrier, only when that member's current verified advert sets
+`owner_recovery_v1`.
+
+- `202 Accepted` — `{"ok": true, "group_id", "state":
+  "waiting_for_recovery_member", "promoted_member", "mandate_id",
+  "parent_head", "parent_revision", "revoked_admins": [...]}`. The state
+  stays on the group's `admin_availability.owner_recovery.owner` until the
+  promoted member commits.
+- `409 Conflict` — `{"ok": false, "error": "recovery_not_needed" |
+  "recovery_member_ineligible" | "recovery_group_quarantined" |
+  "recovery_head_mismatch", "group_id"}`.
+- `403 Forbidden` — a session token, or `recovery_signer_not_owner` (the
+  group's owner is not this node's user key).
+- `404 Not Found` — the group is not known on this node.
 
 ## Owner profile and naming (ADR-0036)
 
@@ -1709,6 +1737,18 @@ every wait. A wait always names its cause; it does not stop silently.
     `{"state": "group_admin_revoked", "revoked_admins": [...], "exit": "group_admin_revoked", "recreate_offer": {"members": [...], "name": "...", "policy": {...}}}`.
     The group stays readable. To continue, a member makes a new group with
     the existing create API and invites the listed members.
+  - In the `OwnerCertified` case the object also has `owner_recovery`:
+    `null`, or `{"owner", "promoted_member", "receiver_upgrade_members"}`.
+    On the owner's node, `owner` is
+    `{"state": "waiting_for_recovery_member" | "waiting_for_receiver_upgrade", "promoted_member", "mandate_id", "parent_head", "advert"}`
+    until the promoted member commits. On the promoted member,
+    `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
+    `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
+    lists each Active member whose current advert lacks bit 7),
+    `waiting_for_member_key_package` or `recovery_not_needed` (the named
+    revocation records have not arrived yet). After the commit,
+    `receiver_upgrade_members` lists the stranded members with
+    `gap_revision`.
 
 **New status codes.**
 
@@ -1718,9 +1758,10 @@ every wait. A wait always names its cause; it does not stop silently.
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
 
-**Wire and capabilities.** The daemon advertises two more ADR 0093
-application bits: `eviction_handoff_v1` (bit 4) and `crypto_exclusion_v1`
-(bit 5). Both new frames ride the direct-message carrier only. They are
+**Wire and capabilities.** The daemon advertises three more ADR 0093
+application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
+(bit 5) and `owner_recovery_v1` (bit 7). The new frames ride the
+direct-message carrier only. They are
 not on the metadata topic and not in a legacy-decoded container:
 
 - `X0XEVH1` — `EvictionHandoffV1`, signed evidence from one admin to the
@@ -1733,7 +1774,22 @@ not on the metadata topic and not in a legacy-decoded container:
   machine and binding revocations just before each send. A capable member
   that asks for TreeKEM catch-up gets held frames on this same carrier.
 
-DM history does not record either frame: they are protocol traffic. A user
+- `X0XORC1` — owner recovery (ADR 0110 §4b(1), bit 7
+  `owner_recovery_v1`). One postcard frame type with two variants: the
+  owner's `OwnerRecoveryMandateV1` (signed by user key U in domain
+  `x0x.owner-recovery.v1`) and the promoted member's `OwnerRecoveryV1`
+  commit (agent signature in domain `x0x.owner-recovery.commit.v1` over the
+  body, which embeds the mandate). The commit removes each revoked admin's
+  seat (with its TreeKEM leaf, with one GSS rotation, or the roster seat
+  alone in a `SignedPublic` group) and makes the promoted member Admin.
+  Receivers accept it only under the §4b(1) rule. Typed refusals:
+  `recovery_not_needed`, `recovery_head_mismatch`,
+  `recovery_signer_not_owner`, `recovery_member_ineligible`,
+  `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
+  member holds the commit while a known Active member's current advert
+  lacks bit 7 (D76).
+
+DM history does not record these frames: they are protocol traffic. A user
 message that only starts with the same letters stays history.
 
 ### Roles
