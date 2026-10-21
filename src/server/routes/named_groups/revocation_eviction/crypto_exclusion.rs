@@ -2069,7 +2069,19 @@ mod daemon_tests {
             "the moved head is durable"
         );
         // Live delivery stops (no old crypto material after the move) and
-        // the row completes from the chain.
+        // the row completes from the chain. The commit's own spawned round
+        // may have deferred the next one; make it due now.
+        for delivery in state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .deliveries
+            .values_mut()
+        {
+            delivery.next_at = Instant::now();
+        }
         drive_deliveries(&state).await;
         super::super::revocation_eviction_pass(&state).await;
         assert!(super::super::persist_obligations(&state).await);
