@@ -2331,10 +2331,11 @@ async fn resume_crypto_exclusions(
             }
             crypto_exclusion::SavedFrameState::Superseded => {
                 // Completion is re-derived from the chain by the next
-                // pass; the obsolete delivery is discarded.
+                // pass; the obsolete delivery is discarded. The frame stays
+                // as §4 catch-up replay evidence (never resent live).
                 row.phase = Phase::CommittedDeliveryPending;
                 row.result_head = Some(result_head);
-                row.outgoing_event = None;
+                row.outgoing_event = Some(frame);
             }
             crypto_exclusion::SavedFrameState::Abandoned => {
                 row.phase = Phase::Pending;
@@ -2742,13 +2743,16 @@ async fn load_persisted_obligations(state: &AppState) {
     resume_crypto_exclusions(state, &mut store, &journals, &mut ce_state).await;
     removal_journal::adopt_journal_removals(&mut store, &journals);
     let mut removals = HashMap::new();
+    let loaded_groups = snapshot_groups(state).await;
     removal_delivery::resume_after_load(
-        &snapshot_groups(state).await,
+        &loaded_groups,
         state.agent.agent_id().as_bytes(),
         &mut store,
         &mut removals,
         &mut ce_state,
     );
+    // §4: the catch-up log survives the restart from the rows' frames.
+    crypto_exclusion::rebuild_catchup_log(&loaded_groups, &store, &mut ce_state);
     for key in journals.keys() {
         if let Some(stored) = store.get_mut(key) {
             if stored.phase == Phase::Prepared {
