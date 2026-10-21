@@ -65,6 +65,11 @@ pub(in crate::server) struct S3Runtime {
     /// placeholder. A plain mutex: the roster encoder reads it
     /// synchronously, and it is never held across an await.
     placeheld: std::sync::Mutex<HashMap<String, Placeheld>>,
+    /// §3 (#1533 review): per group (stable ID) with an open re-seat
+    /// journal, the journalled original's fork marker. A plain mutex: the
+    /// ADR 0066 refusals read it synchronously, and it is never held across
+    /// an await.
+    staging: std::sync::Mutex<HashMap<String, StagingShadow>>,
 }
 
 impl Default for S3Runtime {
@@ -73,7 +78,75 @@ impl Default for S3Runtime {
             inner: tokio::sync::Mutex::new(S3Inner::default()),
             writer: tokio::sync::Mutex::new(()),
             placeheld: std::sync::Mutex::new(HashMap::new()),
+            staging: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+}
+
+/// The original containment of a group whose re-seat join is staged
+/// (§3 step 2): it stays in force for every ADR 0066 refusal until the
+/// durable swap closes the journal, or the rollback does.
+#[derive(Debug, Clone)]
+struct StagingShadow {
+    /// The spellings of the group: the journal's live key, the stable ID
+    /// and the MLS group ID of the original.
+    aliases: Vec<String>,
+    marker: x0x::groups::ForkQuarantine,
+}
+
+impl S3Runtime {
+    /// Follow the group's sidecar: an open re-seat journal whose original
+    /// carries a fork marker keeps that marker in force.
+    fn refresh_staging(&self, stable: &str, body: Option<&GroupRecoveryV1>) {
+        let shadow = body
+            .and_then(|body| body.reseat_journal.as_ref())
+            .and_then(|journal| {
+                let original = serde_json::from_slice::<GroupInfo>(&journal.live_record).ok()?;
+                let marker = original.fork_quarantine.clone()?;
+                Some(StagingShadow {
+                    aliases: vec![
+                        journal.live_key.clone(),
+                        original.stable_group_id().to_string(),
+                        original.mls_group_id.clone(),
+                    ],
+                    marker,
+                })
+            });
+        let mut staging = self
+            .staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match shadow {
+            Some(shadow) => {
+                staging.insert(stable.to_string(), shadow);
+            }
+            None => {
+                staging.remove(stable);
+            }
+        }
+    }
+
+    /// §3 step 2 (#1533 review): the fork marker of the original record of
+    /// a group (any of `ids`) whose re-seat join is staged. While it is
+    /// `Some`, every ADR 0066 refusal refuses as for the original, whatever
+    /// the live map holds for the group.
+    pub(in crate::server) fn staging_marker(
+        &self,
+        ids: &[&str],
+    ) -> Option<x0x::groups::ForkQuarantine> {
+        let staging = self
+            .staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        staging
+            .values()
+            .find(|shadow| {
+                shadow
+                    .aliases
+                    .iter()
+                    .any(|alias| ids.iter().any(|id| alias.eq_ignore_ascii_case(id)))
+            })
+            .map(|shadow| shadow.marker.clone())
     }
 }
 
@@ -323,6 +396,10 @@ fn is_home_policy_group(info: &GroupInfo) -> bool {
 /// admin-armed ATA.
 async fn contained(state: &AppState, info: &GroupInfo) -> bool {
     info.fork_quarantine.is_some()
+        || state
+            .group_recovery
+            .staging_marker(&[info.stable_group_id(), &info.mls_group_id])
+            .is_some()
         || info
             .invite_lineage
             .as_ref()
@@ -460,6 +537,7 @@ where
             .sidecars
             .insert(stable_group_id.to_string(), candidate);
     }
+    runtime.refresh_staging(stable_group_id, inner.sidecars.get(stable_group_id));
     true
 }
 
@@ -621,6 +699,9 @@ async fn load_sidecars(state: &AppState) {
         if body.reseat_journal.is_some() {
             inner.sidecars.insert(stem, body);
         }
+    }
+    for (stable, body) in &inner.sidecars {
+        state.group_recovery.refresh_staging(stable, Some(body));
     }
 }
 
@@ -4442,8 +4523,8 @@ async fn prepare_reseat(
 /// below changes only the live map.
 ///
 /// The roster write runs FIRST. Nothing else is touched until it is
-/// durable, so a failed write leaves the live record, its tree and its
-/// TreeKEM persistence in place (a `NotReplaced` write rolls the map back;
+/// durable, so a failed write leaves the live record and its tree in place
+/// (the TreeKEM files are never removed here) (a `NotReplaced` write rolls the map back;
 /// a `ReplacedNotDurable` one leaves the journal as the only copy, and the
 /// rollback restores from it).
 async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) -> bool {
@@ -4460,8 +4541,12 @@ async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &G
     super::retire_local_group_join_artifacts(state, &aliases).await;
     state.group_card_cache.write().await.remove(group_key);
     state.mls_groups.write().await.remove(group_key);
+    // The TreeKEM files stay (#1533 review): with the legacy overlay they
+    // keep the original record and its tree paired on disk until the
+    // staged join's own atomic persist replaces the tree. Startup loads
+    // them only at restore, and the rollback rewrites them from the
+    // journal copy.
     state.treekem_groups.write().await.remove(group_key);
-    super::remove_treekem_persistence_for_group_id(state, group_key, "adr0109_reseat").await;
     super::save_mls_groups(state).await;
     let mut cache_aliases = aliases;
     cache_aliases.insert(group_key.to_string());
@@ -5068,6 +5153,43 @@ mod tests {
         swapping.phase = ReseatPhase::Swapping;
         let groups = HashMap::from([(key, staged)]);
         assert!(reseat_overlay(&groups, &[swapping], &none).is_none());
+        Ok(())
+    }
+
+    /// #1533 review (Codex P1, re-seat containment): while the re-seat join
+    /// is staged, an in-process ADR 0066 refusal still refuses as for the
+    /// original, by any spelling of the group, although the live record
+    /// (here a staged record, Active and with no marker) has no marker. The
+    /// marker goes only when the journal closes (durable swap or rollback).
+    #[test]
+    fn a_staged_reseat_keeps_the_original_marker_for_every_refusal() -> anyhow::Result<()> {
+        let (original, journal, keypair) = pure_reseat(ReseatPhase::Staging)?;
+        let key = journal.live_key.clone();
+        let stable = original.stable_group_id().to_string();
+        let original_marker = original
+            .fork_quarantine
+            .clone()
+            .expect("contained original");
+        let mut staged = original.clone();
+        staged.fork_quarantine = None;
+        staged.seal_commit(&keypair, 2_000)?;
+        let runtime = S3Runtime::default();
+        let body = GroupRecoveryV1 {
+            reseat_journal: Some(journal),
+            ..GroupRecoveryV1::default()
+        };
+        runtime.refresh_staging(&stable, Some(&body));
+        for id in [key.as_str(), stable.as_str()] {
+            let in_force = super::super::marker_in_force(&runtime, id, &staged)
+                .expect("the gate refuses as for the original");
+            assert_eq!(
+                super::super::fork_quarantine_refusal_body(id, &in_force),
+                super::super::fork_quarantine_refusal_body(id, &original_marker),
+                "{id}"
+            );
+        }
+        runtime.refresh_staging(&stable, Some(&GroupRecoveryV1::default()));
+        assert!(super::super::marker_in_force(&runtime, &key, &staged).is_none());
         Ok(())
     }
 
@@ -5743,6 +5865,53 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    /// #1533 review (Codex P1, re-seat containment), daemon level: with a
+    /// staged record live (Active, no marker) and the journal open, the
+    /// shared ADR 0066 entry gate and the before-effect re-check refuse as
+    /// for the original; once the journal closes they admit. CI only.
+    #[tokio::test]
+    async fn staged_reseat_gates_refuse_as_for_the_original() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let keypair = state.agent.identity().agent_keypair();
+        let (key, mut info, mut journal) = reseat_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let staged = {
+            let mut staged = info.clone();
+            staged.seal_commit(keypair, 2_000)?;
+            staged
+        };
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: info.state_revision,
+            state_hash: "sibling".to_string(),
+            committed_by: local_hex(&state),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        journal.live_record = serde_json::to_vec(&info)?;
+        journal.phase = ReseatPhase::Staging;
+        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), staged.clone());
+        assert!(super::super::reject_fork_quarantined(&state, &key, &staged).is_some());
+        assert!(
+            super::super::reject_fork_quarantine_installed_before_effect(&state, &key, None)
+                .await
+                .is_some()
+        );
+        assert!(contained(&state, &staged).await);
+        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = None).await);
+        assert!(super::super::reject_fork_quarantined(&state, &key, &staged).is_none());
         Ok(())
     }
 

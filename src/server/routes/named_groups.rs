@@ -4445,7 +4445,7 @@ pub(in crate::server) async fn offer_signed_public_kv_catchup(
             None => return,
         };
         if info.withdrawn
-            || info.fork_quarantine.is_some()
+            || fork_marker_in_force(state, group_key, info).is_some()
             || info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
             || info.state_revision != signed_revision.saturating_add(1)
             || !info.has_active_member(&author_hex)
@@ -16951,7 +16951,7 @@ pub(in crate::server) async fn get_named_group(
             // (with its forensic snapshot) — `null` when the group is
             // not quarantined. Strictly local; never set for
             // non-owner-axis groups in this slice.
-            "fork_quarantine": info.fork_quarantine,
+            "fork_quarantine": fork_marker_in_force(&state, &id, &info),
             "home": info.home.as_ref().map(|home| serde_json::json!({
                 "primary_agent": home.primary_agent,
                 "provisioned_at_ms": home.provisioned_at_ms,
@@ -28613,8 +28613,33 @@ pub(in crate::server) fn reject_fork_quarantined(
     group_id: &str,
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let marker = info.fork_quarantine.as_ref()?;
-    Some(reject_fork_quarantined_marker(state, group_id, marker))
+    let marker = fork_marker_in_force(state, group_id, info)?;
+    Some(reject_fork_quarantined_marker(state, group_id, &marker))
+}
+
+/// ADR 0109 §3 step 2 (#1533 review): the fork marker an ADR 0066 refusal
+/// sees for `info`. It is the record's own marker or, while a re-seat join
+/// for the group is staged, the journalled original's marker. So the
+/// staged record (a join stub, or an Active record not yet swapped in)
+/// never acts with less containment than the original until the durable
+/// swap. The staged join's own apply and install paths read the record
+/// itself, not this.
+pub(in crate::server) fn fork_marker_in_force(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+) -> Option<x0x::groups::ForkQuarantine> {
+    marker_in_force(&state.group_recovery, group_id, info)
+}
+
+fn marker_in_force(
+    runtime: &group_recovery::S3Runtime,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+) -> Option<x0x::groups::ForkQuarantine> {
+    // RED STUB (commit A2): the cab42a0 behaviour, the live record only.
+    let _ = (runtime, group_id);
+    info.fork_quarantine.clone()
 }
 
 /// Session tokens cannot inspect a contested roster unless this daemon still
@@ -28626,9 +28651,9 @@ pub(in crate::server) fn reject_fork_quarantined_for_actor(
     info: &x0x::groups::GroupInfo,
     actor: &crate::server::rider_auth::ActorContext,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let marker = info.fork_quarantine.as_ref()?;
+    let marker = fork_marker_in_force(state, group_id, info)?;
     Some(reject_fork_quarantined_marker_for_actor(
-        state, group_id, marker, info, actor,
+        state, group_id, &marker, info, actor,
     ))
 }
 
@@ -28788,8 +28813,14 @@ pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect_fo
 
     let groups = state.named_groups.read().await;
     let (_, live) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
-    let marker = live.fork_quarantine.as_ref()?;
-    if captured.is_some_and(|captured| live.lifecycle_epoch_token().same_marker(captured)) {
+    // ADR 0109 §3 (#1533 review): a re-seat staged since admission brings
+    // the original's marker back into force; it is never the captured one.
+    let staged = live.fork_quarantine.is_none();
+    let marker = fork_marker_in_force(state, group_id, live)?;
+    let marker = &marker;
+    if !staged
+        && captured.is_some_and(|captured| live.lifecycle_epoch_token().same_marker(captured))
+    {
         // Same marker the operation was authorized with. Unreachable for an
         // admitted operation (the entry gate refuses a group that already
         // carries one), and kept as an equality rather than an
