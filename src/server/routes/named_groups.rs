@@ -22346,6 +22346,13 @@ pub(in crate::server) async fn remove_named_group_member(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
+    // ADR 0110 §1a/D135 (#1508 review): re-check the S4 worker's removal
+    // under the lock, on every plane, before any mutation.
+    if let Some(resp) =
+        revocation_eviction::s4_exclusion_cancelled_under_lock(&state, &id, &agent_id_hex).await
+    {
+        return resp;
+    }
     {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(&id) {
@@ -26025,6 +26032,23 @@ pub(in crate::server) fn crash_after_removal_commit_on_this_thread_for_test() {
     CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.set(true));
 }
 
+/// ADR 0110 §5 and §1a/D135: the reply of a TreeKEM removal or ban whose S4
+/// prepare refused the commit, or `None` when the commit may run.
+fn s4_prepare_refusal(
+    prepared: revocation_eviction::removal_journal::RemovalPrepare,
+    not_durable: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    use revocation_eviction::removal_journal::RemovalPrepare;
+    match prepared {
+        RemovalPrepare::NotS4 | RemovalPrepare::Durable => None,
+        RemovalPrepare::NotDurable => Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": not_durable })),
+        )),
+        RemovalPrepare::Cancelled => Some(revocation_eviction::s4_exclusion_cancelled_response()),
+    }
+}
+
 async fn remove_treekem_named_group_member(
     state: Arc<AppState>,
     id: String,
@@ -26177,15 +26201,14 @@ async fn remove_treekem_named_group_member(
     // new epoch commits. A crash after the commit then cannot lose the
     // transition the survivors need: restart classifies the saved event
     // against the chain and delivers it.
-    if revocation_eviction::removal_journal::prepare_committed_removal(
+    let prepared = revocation_eviction::removal_journal::prepare_committed_removal(
         &state,
         &next,
         &agent_id_hex,
         &event,
     )
-    .await
-        == revocation_eviction::removal_journal::RemovalPrepare::NotDurable
-    {
+    .await;
+    if let Some(resp) = s4_prepare_refusal(prepared, "removal event is not durable yet") {
         rollback_treekem_group_after_failed_install(
             &state,
             &id,
@@ -26194,13 +26217,7 @@ async fn remove_treekem_named_group_member(
             &mut guard,
             "member_remove_prepare_not_durable",
         );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "removal event is not durable yet"
-            })),
-        );
+        return resp;
     }
     // ADR 0107 (review r2): inside this removal's critical section, stop
     // every in-flight egress of the member's join artifacts BEFORE the
@@ -29337,6 +29354,13 @@ pub(in crate::server) async fn ban_group_member(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
+    // ADR 0110 §1a/D135 (#1508 review): re-check the S4 worker's ban under
+    // the lock, on every plane, before any mutation.
+    if let Some(resp) =
+        revocation_eviction::s4_exclusion_cancelled_under_lock(&state, &id, &agent_id_hex).await
+    {
+        return resp;
+    }
     let groups = state.named_groups.read().await;
     // #1166 S3: the admin trio runs in the group-access core, under this
     // lock take, before the TreeKEM delegation below.
@@ -29624,6 +29648,37 @@ async fn ban_treekem_group_member(
             ),
         );
     }
+    let event = NamedGroupMetadataEvent::MemberBanned {
+        group_id: event_group_id,
+        revision,
+        actor: caller_hex,
+        agent_id: agent_id_hex.clone(),
+        secret_epoch: None,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    // ADR 0110 §5 (#1508 review): an S4 ban passes the same prepare
+    // barrier as an S4 removal. Its exact event is durable in the prepared
+    // `.evjournal` and the `.evs` row BEFORE the new epoch commits.
+    let prepared = revocation_eviction::removal_journal::prepare_committed_removal(
+        &state,
+        &next,
+        &agent_id_hex,
+        &event,
+    )
+    .await;
+    if let Some(resp) = s4_prepare_refusal(prepared, "ban event is not durable yet") {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_ban_prepare_not_durable",
+        );
+        return resp;
+    }
     // ADR 0107 (review r2): inside this ban's critical section, stop every
     // in-flight egress of the member's join artifacts BEFORE the ban
     // commits, then drop what stays staged AFTER it.
@@ -29632,6 +29687,12 @@ async fn ban_treekem_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        revocation_eviction::removal_journal::abandon_prepared_removal(
+            &state,
+            &next,
+            &agent_id_hex,
+        )
+        .await;
         rollback_treekem_group_after_failed_install(
             &state,
             &id,
@@ -29649,21 +29710,22 @@ async fn ban_treekem_group_member(
         );
     }
     drop(guard);
+    #[cfg(test)]
+    if CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.replace(false)) {
+        // Test-only crash: the transaction is durable, nothing after it ran.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "test crash after commit" })),
+        );
+    }
     // `persist_treekem_and_named_groups_atomic_with_info` already made this
     // exact roster snapshot durable and installed it under the global roster
     // persistence lock.
     let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_banned").await;
 
-    let event = NamedGroupMetadataEvent::MemberBanned {
-        group_id: event_group_id,
-        revision,
-        actor: caller_hex,
-        agent_id: agent_id_hex.clone(),
-        secret_epoch: None,
-        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
-        treekem_epoch: Some(treekem_epoch),
-        commit: Some(commit),
-    };
+    // ADR 0110 §3 and §5: the S4 row moves to `committed_delivery_pending`
+    // and its delivery to each survivor starts before the first publication.
+    revocation_eviction::record_committed_removal(&state, &next, &agent_id_hex, &event).await;
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }

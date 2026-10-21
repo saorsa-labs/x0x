@@ -65,17 +65,23 @@ pub(super) struct SavedRemoval {
     pub(super) result_epoch: Option<u64>,
 }
 
-/// Decode a saved removal event: a `MemberRemoved` that carries its
-/// signed commit. A crypto-only `X0XCE1` frame is not JSON and gives
-/// `None`.
+/// Decode a saved removal event: a `MemberRemoved` or an S4 ban's
+/// `MemberBanned` that carries its signed commit. A crypto-only `X0XCE1`
+/// frame is not JSON and gives `None`.
 pub(super) fn decode_saved_removal(bytes: &[u8]) -> Option<SavedRemoval> {
     let event: NamedGroupMetadataEvent = serde_json::from_slice(bytes).ok()?;
-    let NamedGroupMetadataEvent::MemberRemoved {
+    let (NamedGroupMetadataEvent::MemberRemoved {
         commit: Some(commit),
         treekem_epoch,
         secret_epoch,
         ..
-    } = &event
+    }
+    | NamedGroupMetadataEvent::MemberBanned {
+        commit: Some(commit),
+        treekem_epoch,
+        secret_epoch,
+        ..
+    }) = &event
     else {
         return None;
     };
@@ -631,6 +637,26 @@ mod tests {
         assert_eq!(saved.result_head, "r");
         assert_eq!(saved.result_epoch, Some(3));
         assert!(decode_saved_removal(b"X0XCE1\0frame").is_none());
+    }
+
+    /// #1508 review P1 #4: an S4 ban saves its `MemberBanned` as the
+    /// removal event of its row, so restart can classify and deliver it.
+    #[test]
+    fn a_saved_ban_decodes_like_a_removal() {
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: "g".to_string(),
+            revision: 4,
+            actor: "aa".repeat(32),
+            agent_id: "bb".repeat(32),
+            secret_epoch: None,
+            treekem_commit_b64: Some("Y29tbWl0".to_string()),
+            treekem_epoch: Some(3),
+            commit: Some(commit("p", "r")),
+        };
+        let bytes = serde_json::to_vec(&event).unwrap_or_default();
+        let saved = decode_saved_removal(&bytes).expect("a saved ban decodes");
+        assert_eq!(saved.result_head, "r");
+        assert_eq!(saved.result_epoch, Some(3));
     }
 
     /// The `s4_restart_intake_prepare` crash: the legacy commit landed and

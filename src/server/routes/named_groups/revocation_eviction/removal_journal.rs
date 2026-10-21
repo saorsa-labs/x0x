@@ -41,6 +41,9 @@ pub(in crate::server) enum RemovalPrepare {
     Durable,
     /// The event could not be made durable: do not commit the removal.
     NotDurable,
+    /// The §1a/D135 re-check under the lock cancelled S4's removal: do not
+    /// commit it; reply `409 s4_exclusion_cancelled`.
+    Cancelled,
 }
 
 fn row_key(info: &GroupInfo, target_hex: &str) -> Option<EvictionKey> {
@@ -76,15 +79,21 @@ pub(in crate::server) async fn prepare_committed_removal(
     let Some(key) = row_key(info, target_hex) else {
         return RemovalPrepare::NotS4;
     };
-    let is_s4_removal = {
-        let inner = state.revocation_evictions.inner.lock().await;
-        inner
-            .store
-            .get(&key)
-            .is_some_and(|row| row.phase == Phase::Prepared && row.parent_head.is_some())
-    };
-    if !is_s4_removal {
-        return RemovalPrepare::NotS4;
+    // §1a/D135 (#1508 review): re-check the trigger and its cancellation
+    // under the caller's membership lock, against the current committed
+    // seat, just before the commit.
+    let target = hex::encode(key.target);
+    let seat = state
+        .named_groups
+        .read()
+        .await
+        .values()
+        .find(|group| group.stable_group_id() == key.stable_group_id)
+        .and_then(|group| group.members_v2.get(&target).cloned());
+    match super::locked_removal_state(state, &key, seat.as_ref()).await {
+        super::LockedRemoval::NotS4 => return RemovalPrepare::NotS4,
+        super::LockedRemoval::Cancelled => return RemovalPrepare::Cancelled,
+        super::LockedRemoval::Prepared => {}
     }
     let Ok(bytes) = serde_json::to_vec(event) else {
         return RemovalPrepare::NotDurable;
@@ -304,12 +313,16 @@ mod tests {
 
     /// A two-member TreeKEM group on `state`: the local admin and a seated
     /// target with its KeyPackage, plus one roster-only survivor.
-    async fn seated_target_group(state: &AppState, group_id: &str) -> anyhow::Result<String> {
+    async fn seated_target_group(
+        state: &AppState,
+        group_id: &str,
+    ) -> anyhow::Result<(String, x0x::identity::AgentKeypair)> {
         let admin_id = state.agent.agent_id();
         let group_id_bytes = hex::decode(group_id)?;
         let seed = super::super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
         let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
-        let target_id = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let target_kp = x0x::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
         let target_hex = hex::encode(target_id.as_bytes());
         let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(target_id, &[9u8; 32])?;
         let kp_bytes = prepared.key_package_bytes().to_vec();
@@ -352,7 +365,7 @@ mod tests {
             group_id.to_string(),
             Arc::new(tokio::sync::Mutex::new(admin_group)),
         );
-        Ok(target_hex)
+        Ok((target_hex, target_kp))
     }
 
     /// ADR 0110 §5 crash window (#1357 review): S4 prepared the removal,
@@ -365,7 +378,7 @@ mod tests {
     async fn a_crash_after_the_removal_commit_keeps_the_exact_event() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let group_id = "ab".repeat(16);
-        let target_hex = seated_target_group(&state, &group_id).await?;
+        let (target_hex, _) = seated_target_group(&state, &group_id).await?;
         let target = super::super::super::parse_agent_id_hex(&target_hex)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let (stable, parent_head, next_revision) = {
@@ -448,6 +461,304 @@ mod tests {
             inner.removals.contains_key(&key),
             "restart resumes the delivery to the survivors"
         );
+        Ok(())
+    }
+
+    /// S4's prepare step of `commit_removal` for the row of `target_hex`
+    /// in `group_id`: the row in `store` moves to `prepared` and the
+    /// prepared `.evjournal` and the `.evs` are written. Returns the key.
+    async fn s4_prepare(
+        state: &AppState,
+        group_id: &str,
+        target_hex: &str,
+        store: impl FnOnce(&EvictionKey) -> ObligationStore,
+    ) -> anyhow::Result<EvictionKey> {
+        let target = super::super::super::parse_agent_id_hex(target_hex)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (stable, parent_head, next_revision) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(group_id).expect("group");
+            (
+                info.stable_group_id().to_string(),
+                info.state_hash.clone(),
+                info.state_revision.saturating_add(1),
+            )
+        };
+        let key = EvictionKey::new(stable, *target.as_bytes());
+        let journal = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store = store(&key);
+            let row = inner.store.get_mut(&key).expect("row");
+            row.phase = Phase::Prepared;
+            row.parent_head = Some(parent_head.clone());
+            let journal = super::super::prepared_journal(row, parent_head, next_revision);
+            inner.dirty = true;
+            journal
+        };
+        let journal_path = super::super::evjournal_path(state, &key.stable_group_id);
+        assert!(super::super::write_evjournal(&journal_path, &journal).await);
+        assert!(super::super::persist_obligations(state).await);
+        Ok(key)
+    }
+
+    /// ADR 0110 §5 crash window for an S4 ban (#1508 review P1 #4): the
+    /// TreeKEM ban committed the new epoch and the process died before
+    /// the publication. The ban must pass the same prepare barrier as a
+    /// removal, so a restart still holds the exact `MemberBanned` with its
+    /// TreeKEM commit and delivers it to the survivors.
+    #[tokio::test]
+    async fn a_crash_after_the_ban_commit_keeps_the_exact_event() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "cd".repeat(16);
+        let (target_hex, _) = seated_target_group(&state, &group_id).await?;
+        let key = s4_prepare(&state, &group_id, &target_hex, prepared_store).await?;
+
+        // The ban transaction commits, then the process dies.
+        super::super::super::crash_after_removal_commit_on_this_thread_for_test();
+        let membership_lock = super::super::super::group_membership_lock(&state, &group_id).await;
+        let membership_guard = membership_lock.lock().await;
+        let (status, body) = super::super::super::ban_treekem_group_member(
+            Arc::clone(&state),
+            group_id.clone(),
+            target_hex.clone(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+        )
+        .await;
+        drop(membership_guard);
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "the ban stops at the test crash point: {body:?}"
+        );
+        let committed_head = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("group");
+            assert!(info.is_banned(&target_hex), "the ban transaction committed");
+            info.state_hash.clone()
+        };
+
+        // Restart: the S4 state is reloaded from disk.
+        *state.revocation_evictions.inner.lock().await = super::super::S4Inner::default();
+        super::super::load_persisted_obligations(&state).await;
+
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner.store.get(&key).expect("row survives the restart");
+        assert_eq!(row.phase, Phase::CommittedDeliveryPending);
+        assert_eq!(row.result_head.as_deref(), Some(committed_head.as_str()));
+        let saved = row
+            .outgoing_event
+            .as_deref()
+            .and_then(decode_saved_removal)
+            .expect("the exact MemberBanned survives the crash");
+        assert!(matches!(
+            saved.event,
+            NamedGroupMetadataEvent::MemberBanned {
+                treekem_commit_b64: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            inner.removals.contains_key(&key),
+            "restart resumes the delivery to the survivors"
+        );
+        Ok(())
+    }
+
+    /// ADR 0110 §1a/D135 cancellation race (#1508 review P1 #2): the S4
+    /// worker prepared the expiry removal, and a certificate rebind landed
+    /// while it wrote the journal. The route's reconciliation then ends the
+    /// row (`certificate_valid`). The S4 removal must stop; it must not
+    /// continue as an ordinary removal of the renewed seat.
+    #[tokio::test]
+    async fn a_rebind_during_the_expiry_prepare_keeps_the_renewed_seat() -> anyhow::Result<()> {
+        use x0x::identity::AgentCertificate;
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "ef".repeat(16);
+        let (target_hex, target_kp) = seated_target_group(&state, &group_id).await?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let now_unix = super::super::now_unix_ms() / 1000;
+        let expired =
+            AgentCertificate::issue_with_expiry(&owner, &target_kp, Some(now_unix - 1_000))?;
+        let renewed =
+            AgentCertificate::issue_with_expiry(&owner, &target_kp, Some(now_unix + 86_400))?;
+        let expired_digest = x0x::groups::owner_cert::certificate_digest_hex(&expired);
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            info.set_member_certificate(&target_hex, expired)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            info.recompute_state_hash();
+        }
+        // The worker's eligibility check passed: the row is prepared.
+        let key = s4_prepare(&state, &group_id, &target_hex, |key| {
+            let mut store = ObligationStore::new();
+            store.intake(
+                key,
+                EvictionTrigger::CertificateExpiry {
+                    certificate_digest: expired_digest.clone(),
+                    not_after: now_unix - 1_000,
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            store
+        })
+        .await?;
+
+        // The rebind commit lands before the removal takes the lock.
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group");
+            let member = info.members_v2.get_mut(&target_hex).expect("seat");
+            member.certificate_digest =
+                Some(x0x::groups::owner_cert::certificate_digest_hex(&renewed));
+            member.certificate = Some(renewed);
+            info.recompute_state_hash();
+        }
+
+        let scope = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            super::super::eviction_seal_scope(&inner.store, &key)
+        };
+        let (status, body) = super::super::run_member_route(
+            &state,
+            &group_id,
+            &target_hex,
+            super::super::ManualRequestKind::Remove,
+            scope,
+        )
+        .await;
+        assert_ne!(status, axum::http::StatusCode::OK, "{body:?}");
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&group_id)
+                .expect("group")
+                .has_active_member(&target_hex),
+            "the renewed seat is kept"
+        );
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner.store.get(&key).expect("row");
+        assert_eq!(row.phase, Phase::Terminated);
+        assert_eq!(
+            row.termination,
+            Some(x0x::groups::eviction::TerminationCause::CertificateValid)
+        );
+        Ok(())
+    }
+
+    /// One under-lock cancellation case: the seat of `target_hex` commits
+    /// `old` and the S4 row is prepared for its expiry. Then the committed
+    /// certificate changes to `new` (also expired, so the gate's
+    /// reconciliation keeps the row open and the request reaches the
+    /// membership lock). The worker's `kind` request must stop with
+    /// `409 s4_exclusion_cancelled` and keep the seat.
+    async fn assert_cancelled_under_lock(
+        state: &Arc<AppState>,
+        group_id: &str,
+        target_hex: &str,
+        target_kp: &x0x::identity::AgentKeypair,
+        kind: super::super::ManualRequestKind,
+    ) -> anyhow::Result<()> {
+        use x0x::identity::AgentCertificate;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let now_unix = super::super::now_unix_ms() / 1000;
+        let old = AgentCertificate::issue_with_expiry(&owner, target_kp, Some(now_unix - 2_000))?;
+        let new = AgentCertificate::issue_with_expiry(&owner, target_kp, Some(now_unix - 1_000))?;
+        let old_digest = x0x::groups::owner_cert::certificate_digest_hex(&old);
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(group_id).expect("group");
+            info.set_member_certificate(target_hex, old)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            info.recompute_state_hash();
+        }
+        let key = s4_prepare(state, group_id, target_hex, |key| {
+            let mut store = ObligationStore::new();
+            store.intake(
+                key,
+                EvictionTrigger::CertificateExpiry {
+                    certificate_digest: old_digest.clone(),
+                    not_after: now_unix - 2_000,
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            store
+        })
+        .await?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(group_id).expect("group");
+            let member = info.members_v2.get_mut(target_hex).expect("seat");
+            member.certificate_digest = Some(x0x::groups::owner_cert::certificate_digest_hex(&new));
+            member.certificate = Some(new);
+            info.recompute_state_hash();
+        }
+        let mut scope = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            super::super::eviction_seal_scope(&inner.store, &key)
+        };
+        scope.prepared_removal = true;
+        let (status, body) =
+            super::super::run_member_route(state, group_id, target_hex, kind, scope).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "{kind:?}: {body:?}"
+        );
+        assert_eq!(body["error"], "s4_exclusion_cancelled", "{kind:?}");
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_id).expect("group");
+        assert!(
+            info.has_active_member(target_hex),
+            "{kind:?}: the seat is kept"
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1 #2, every plane: the S4 eligibility re-check runs
+    /// under the membership lock in the remove and ban routes, for GSS and
+    /// TreeKEM groups, and the cancellation is a typed `409`.
+    #[tokio::test]
+    async fn a_cancelled_expiry_removal_stops_under_the_lock_on_every_plane() -> anyhow::Result<()>
+    {
+        use super::super::ManualRequestKind::{Ban, Remove};
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (treekem_target, treekem_kp) = seated_target_group(&state, &"a2".repeat(16)).await?;
+        assert_cancelled_under_lock(
+            &state,
+            &"a2".repeat(16),
+            &treekem_target,
+            &treekem_kp,
+            Remove,
+        )
+        .await?;
+        for (group_id, kind) in [("a3".repeat(16), Remove), ("a4".repeat(16), Ban)] {
+            let admin = state.agent.agent_id();
+            let target_kp = x0x::identity::AgentKeypair::generate()?;
+            let target_hex = hex::encode(target_kp.agent_id().as_bytes());
+            let mut info = GroupInfo::new("s4-gss".into(), String::new(), admin, group_id.clone());
+            info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+            let admin_hex = hex::encode(admin.as_bytes());
+            info.add_member(
+                target_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(admin_hex),
+                None,
+            );
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info);
+            assert_cancelled_under_lock(&state, &group_id, &target_hex, &target_kp, kind).await?;
+        }
         Ok(())
     }
 }
