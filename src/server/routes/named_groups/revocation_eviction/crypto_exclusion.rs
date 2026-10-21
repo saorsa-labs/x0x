@@ -17,23 +17,41 @@
 //!   roster/crypto transaction runs; then the row moves to
 //!   `committed_delivery_pending` and the journal is retired.
 //! - **Delivery** ([`drive_deliveries`]). Per-recipient, capability-gated
-//!   direct metadata delivery only, never the metadata topic and never a
-//!   legacy-decoded container. Each write re-checks roster membership and
-//!   the agent, machine and binding revocations just before it. A
-//!   recipient with unknown support first gets an advert refresh; one whose
-//!   advert lacks the bit is stranded (`waiting_for_receiver_upgrade` with
-//!   the gap revision). Resends stop once the head moves past the result
-//!   (no old crypto material after an epoch change).
-//! - **Restart** ([`resume_after_load`]). A saved frame is resent only
-//!   after the restart sync wait and only while its result is the current
-//!   head. A competing branch on the parent keeps the frame as fork
-//!   evidence and shows `waiting_for_fork_resolution`; nothing is
+//!   direct delivery only, never the metadata topic and never a
+//!   legacy-decoded container. Every physical write goes through the same
+//!   guarded admission as catch-up ([`guarded_admission`]): ADR 0107's
+//!   serving guard (Active, unbanned, unrevoked, certificate-eligible, not
+//!   withdrawn, not quarantined) plus D60 (machine and binding
+//!   revocations), the capability bit and the head rule. The pre-phase
+//!   runs under the group's membership lock; the seam re-checks the same
+//!   inputs immediately before `write_all`. A recipient with unknown
+//!   support first gets an advert refresh; one whose advert lacks the bit
+//!   is stranded (`waiting_for_receiver_upgrade` with the gap revision).
+//!   Resends stop once the head moves past the result (no old crypto
+//!   material after an epoch change). The `InFlight` status of a recipient
+//!   is installed, with a per-attempt token, before its send task starts,
+//!   and a completion writes only over its own token.
+//! - **Restart** (`resume_crypto_exclusions` in the parent). A saved frame
+//!   is resent only after the restart sync wait and only while its result
+//!   is the current head. A competing branch on the parent keeps the frame
+//!   as fork evidence and shows `waiting_for_fork_resolution`; nothing is
 //!   published.
 //! - **Receive** ([`spawn_receipt`]) verifies the frame and the L4 rule and
 //!   installs it atomically. **Catch-up** ([`serve_catchup`]) sends held
-//!   frames to a capable requester on this same carrier.
+//!   frames to a capable requester on this same carrier, only while the
+//!   frame's result is on this node's verified chain.
+//! - **Replay evidence** (§4 catch-up across restart). The frame stays in
+//!   its `.evs` row after completion (the existing `outgoing_event` field;
+//!   no new file or layout), for the newest
+//!   [`x0x::groups::eviction::MAX_REPLAY_FRAMES_PER_GROUP`] completed rows
+//!   of a group. A survivor that installed a received frame attaches it to
+//!   its own completed row. A restart rebuilds the catch-up log from those
+//!   rows ([`rebuild_catchup_log`]), so a survivor that missed the
+//!   transition still catches up after the head moves and this node
+//!   restarts.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +60,7 @@ use tokio::time::Instant;
 use crate as x0x;
 use crate::server::state::AppState;
 use x0x::groups::crypto_exclusion as ce;
-use x0x::groups::eviction::{EvJournalV1, EvictionKey};
+use x0x::groups::eviction::{EvJournalV1, EvictionKey, ObligationStore, Phase};
 use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
@@ -50,8 +68,11 @@ use super::super::{LogHexId, SelfLeaveRekeyStep};
 
 /// A delivery round runs no more often than this per row.
 const CE_RESEND_INTERVAL: Duration = Duration::from_secs(5);
-/// Frames held per group for catch-up serving.
-const CE_LOG_PER_GROUP: usize = 16;
+/// Frames held per group for catch-up serving: the same bound as the
+/// replay frames kept in completed `.evs` rows.
+const CE_LOG_PER_GROUP: usize = x0x::groups::eviction::MAX_REPLAY_FRAMES_PER_GROUP;
+/// The per-exchange bound of one live delivery or catch-up frame write.
+const CE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Frames that arrived ahead of this node's head, waiting for it.
 const CE_STASH_CAP: usize = 64;
 /// A stashed frame is dropped after this long.
@@ -62,8 +83,9 @@ const CE_STASH_TTL: Duration = Duration::from_secs(600);
 pub(super) enum RecipientDelivery {
     /// A send is due.
     Due,
-    /// A send is running.
-    InFlight,
+    /// A send is running. The token names the attempt: only that
+    /// attempt's completion may replace this status.
+    InFlight(u64),
     /// The carrier accepted the frame.
     Sent,
     /// The recipient's current verified advert lacks the bit: stranded
@@ -90,6 +112,9 @@ pub(super) struct CeDelivery {
 #[derive(Debug, Clone)]
 struct CeLogEntry {
     next_revision: u64,
+    /// The frame's result head: it is served only while this head is on
+    /// the verified chain.
+    result_head: String,
     bytes: Arc<Vec<u8>>,
 }
 
@@ -107,6 +132,9 @@ pub(super) struct CeState {
     deliveries: HashMap<EvictionKey, CeDelivery>,
     log: HashMap<String, VecDeque<CeLogEntry>>,
     stash: Vec<StashedFrame>,
+    /// Installed received frames waiting for their row to complete, so the
+    /// frame is kept there as durable replay evidence.
+    replay_pending: HashMap<EvictionKey, Arc<Vec<u8>>>,
     /// Rows whose saved frame meets a competing branch (§3).
     pub(super) fork: BTreeSet<EvictionKey>,
     /// Rows held by the D76 rule, with the holding survivors.
@@ -147,18 +175,212 @@ impl CeState {
         serde_json::Value::Array(entries)
     }
 
-    fn remember(&mut self, stable_group_id: &str, next_revision: u64, bytes: Arc<Vec<u8>>) {
+    fn remember(
+        &mut self,
+        stable_group_id: &str,
+        next_revision: u64,
+        result_head: &str,
+        bytes: Arc<Vec<u8>>,
+    ) {
         let log = self.log.entry(stable_group_id.to_string()).or_default();
         if log.iter().any(|entry| entry.next_revision == next_revision) {
             return;
         }
-        log.push_back(CeLogEntry {
-            next_revision,
-            bytes,
-        });
+        let at = log
+            .iter()
+            .position(|entry| entry.next_revision > next_revision)
+            .unwrap_or(log.len());
+        log.insert(
+            at,
+            CeLogEntry {
+                next_revision,
+                result_head: result_head.to_string(),
+                bytes,
+            },
+        );
         while log.len() > CE_LOG_PER_GROUP {
             log.pop_front();
         }
+    }
+
+    /// The frames held for any of `group_ids` above `from_revision`, oldest
+    /// first, with their result heads.
+    fn catchup_frames(
+        &self,
+        group_ids: &[String],
+        from_revision: u64,
+    ) -> Vec<(String, String, Arc<Vec<u8>>)> {
+        group_ids
+            .iter()
+            .find_map(|id| self.log.get(id).map(|log| (id, log)))
+            .map(|(id, log)| {
+                log.iter()
+                    .filter(|entry| entry.next_revision > from_revision)
+                    .map(|entry| {
+                        (
+                            id.clone(),
+                            entry.result_head.clone(),
+                            Arc::clone(&entry.bytes),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Keep an installed received frame until its row completes (bounded).
+    fn note_replay_pending(&mut self, key: EvictionKey, bytes: Arc<Vec<u8>>) {
+        if self.replay_pending.len() >= CE_STASH_CAP && !self.replay_pending.contains_key(&key) {
+            return;
+        }
+        self.replay_pending.insert(key, bytes);
+    }
+}
+
+/// Attach each installed received frame to its row once the row is
+/// complete, as durable replay evidence for catch-up after a restart.
+/// A row that is gone drops the frame; an open row keeps it waiting (an
+/// open row's `outgoing_event` is a frame this node must deliver, which a
+/// receiver never does). Returns whether the store changed.
+pub(super) fn attach_replay_evidence(ce_state: &mut CeState, store: &mut ObligationStore) -> bool {
+    let mut changed = false;
+    ce_state.replay_pending.retain(|key, bytes| {
+        let Some(row) = store.get_mut(key) else {
+            return false;
+        };
+        match row.phase {
+            Phase::Complete => {
+                if row.outgoing_event.is_none() {
+                    row.outgoing_event = Some(bytes.to_vec());
+                    changed = true;
+                }
+                false
+            }
+            Phase::Terminated => false,
+            Phase::Pending | Phase::Prepared | Phase::CommittedDeliveryPending => true,
+        }
+    });
+    changed
+}
+
+/// §4 catch-up across restart: rebuild the catch-up log from the frames
+/// kept in `.evs` rows. A completed row's frame was verified on the chain
+/// when it completed; an open row's frame counts only when its result is
+/// the head or on the retained chain (never a fork or an unknown branch).
+/// [`serve_catchup`] re-checks the chain before every write.
+pub(super) fn rebuild_catchup_log(
+    groups: &[(String, GroupInfo)],
+    store: &ObligationStore,
+    ce_state: &mut CeState,
+) {
+    let mut frames: Vec<(String, u64, String, Vec<u8>)> = Vec::new();
+    for row in store.rows() {
+        let Some(bytes) = row.outgoing_event.as_deref() else {
+            continue;
+        };
+        let Ok(frame) = ce::decode_frame(bytes) else {
+            continue;
+        };
+        if frame.body.stable_group_id != row.stable_group_id || frame.body.target != row.target {
+            continue;
+        }
+        let result_head = frame.body.commit.state_hash.clone();
+        let keep = match row.phase {
+            Phase::Complete => true,
+            Phase::Terminated => false,
+            Phase::Pending | Phase::Prepared | Phase::CommittedDeliveryPending => groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == row.stable_group_id)
+                .is_some_and(|(_, info)| {
+                    matches!(
+                        classify_saved_frame(info, &frame.body.prior_head, &result_head),
+                        SavedFrameState::CurrentHead | SavedFrameState::Superseded
+                    )
+                }),
+        };
+        if keep {
+            frames.push((
+                row.stable_group_id.clone(),
+                frame.body.next_revision,
+                result_head,
+                bytes.to_vec(),
+            ));
+        }
+    }
+    frames.sort_by_key(|(_, revision, _, _)| *revision);
+    for (stable_group_id, next_revision, result_head, bytes) in frames {
+        ce_state.remember(
+            &stable_group_id,
+            next_revision,
+            &result_head,
+            Arc::new(bytes),
+        );
+    }
+}
+
+// ─── Send attempts (per-attempt tokens) ────────────────────────────────────
+
+static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+
+/// A fresh send-attempt token.
+pub(super) fn next_attempt() -> u64 {
+    NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One planned change to a recipient's status, made from a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RoundUpdate {
+    pub(super) recipient: [u8; 32],
+    /// The status the plan read. A change applies only while the stored
+    /// status is still this one, so a newer write is never overwritten.
+    pub(super) observed: RecipientDelivery,
+    /// The new status; `None` drops the recipient.
+    pub(super) next: Option<RecipientDelivery>,
+}
+
+/// Apply one round's planned updates under the runtime lock. Returns the
+/// `(recipient, attempt)` sends whose `InFlight` status was installed: the
+/// caller starts exactly those, after this returns, so a send can never
+/// complete before its `InFlight` status exists.
+pub(super) fn apply_round(
+    recipients: &mut BTreeMap<[u8; 32], RecipientDelivery>,
+    updates: Vec<RoundUpdate>,
+) -> Vec<([u8; 32], u64)> {
+    let mut started = Vec::new();
+    for update in updates {
+        if recipients.get(&update.recipient) != Some(&update.observed) {
+            continue;
+        }
+        match update.next {
+            Some(status) => {
+                recipients.insert(update.recipient, status);
+                if let RecipientDelivery::InFlight(attempt) = status {
+                    started.push((update.recipient, attempt));
+                }
+            }
+            None => {
+                recipients.remove(&update.recipient);
+            }
+        }
+    }
+    started
+}
+
+/// Record the result of send attempt `attempt`. It writes only over that
+/// attempt's own `InFlight` status; a stale or replaced attempt changes
+/// nothing. Returns whether it wrote.
+pub(super) fn finish_attempt(
+    recipients: &mut BTreeMap<[u8; 32], RecipientDelivery>,
+    recipient: &[u8; 32],
+    attempt: u64,
+    status: RecipientDelivery,
+) -> bool {
+    match recipients.get_mut(recipient) {
+        Some(entry) if *entry == RecipientDelivery::InFlight(attempt) => {
+            *entry = status;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -425,7 +647,12 @@ pub(super) fn new_delivery(
     recipients: Vec<[u8; 32]>,
     resumed: bool,
 ) {
-    ce_state.remember(&key.stable_group_id, next_revision, Arc::clone(&bytes));
+    ce_state.remember(
+        &key.stable_group_id,
+        next_revision,
+        result_head,
+        Arc::clone(&bytes),
+    );
     ce_state.deliveries.insert(
         key.clone(),
         CeDelivery {
@@ -512,13 +739,18 @@ pub(super) fn saved_frame_heads(bytes: &[u8]) -> Option<(String, String, u64)> {
 
 /// One delivery round for every due row: per recipient, re-check the
 /// roster and the agent, machine and binding revocations, then send only
-/// to a recipient whose current verified advert sets the bit.
+/// to a recipient whose current verified advert sets the bit. Each send
+/// runs [`guarded_admission`] again at the physical write.
 pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
     let head_synced = runtime.head_synced(now);
     let due: Vec<(EvictionKey, CeDelivery)> = {
-        let mut inner = runtime.inner.lock().await;
+        let mut guard = runtime.inner.lock().await;
+        let inner = &mut *guard;
+        if attach_replay_evidence(&mut inner.ce, &mut inner.store) {
+            inner.dirty = true;
+        }
         let keys: Vec<EvictionKey> = inner
             .ce
             .deliveries
@@ -560,21 +792,27 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
         if info.state_hash != delivery.result_head {
             // The head moved past the exclusion: never resend old crypto
             // material after an epoch change. Stranded members recover by
-            // the existing guarded recovery path.
+            // catch-up (the frame stays in the catch-up log and the row).
             runtime.inner.lock().await.ce.deliveries.remove(&key);
             continue;
         }
         let active: BTreeSet<[u8; 32]> =
             survivors(&info, &local, &key.target).into_iter().collect();
-        let mut updates: Vec<([u8; 32], Option<RecipientDelivery>)> = Vec::new();
+        let mut updates: Vec<RoundUpdate> = Vec::new();
+        let mut refreshes: Vec<AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
+            let observed = *status;
             if !active.contains(recipient) {
-                updates.push((*recipient, None));
+                updates.push(RoundUpdate {
+                    recipient: *recipient,
+                    observed,
+                    next: None,
+                });
                 continue;
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight
+                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
@@ -582,42 +820,31 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             if !write_allowed(state, &agent).await {
                 continue;
             }
-            match capabilities.verified_registry_supports(
+            let next = match capabilities.verified_registry_supports(
                 &agent,
                 x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
             ) {
-                Some(true) => {
-                    updates.push((*recipient, Some(RecipientDelivery::InFlight)));
-                    spawn_send(state, key.clone(), agent, Arc::clone(&delivery.bytes));
-                }
-                Some(false) => updates.push((*recipient, Some(RecipientDelivery::Lacking))),
+                Some(true) => RecipientDelivery::InFlight(next_attempt()),
+                Some(false) => RecipientDelivery::Lacking,
                 None => {
-                    updates.push((*recipient, Some(RecipientDelivery::Unknown)));
-                    let task_state = Arc::clone(state);
-                    let _spawned = state.spawn_detached(async move {
-                        task_state
-                            .agent
-                            .refresh_application_capability(
-                                agent,
-                                x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
-                            )
-                            .await;
-                    });
+                    refreshes.push(agent);
+                    RecipientDelivery::Unknown
                 }
-            }
+            };
+            updates.push(RoundUpdate {
+                recipient: *recipient,
+                observed,
+                next: Some(next),
+            });
         }
-        let mut inner = runtime.inner.lock().await;
-        if let Some(stored) = inner.ce.deliveries.get_mut(&key) {
-            for (recipient, update) in updates {
-                match update {
-                    Some(status) => {
-                        stored.recipients.insert(recipient, status);
-                    }
-                    None => {
-                        stored.recipients.remove(&recipient);
-                    }
-                }
-            }
+        // Install every status, `InFlight` included, BEFORE any send task
+        // starts: a fast completion can then never be overwritten.
+        let started = {
+            let mut inner = runtime.inner.lock().await;
+            let Some(stored) = inner.ce.deliveries.get_mut(&key) else {
+                continue;
+            };
+            let started = apply_round(&mut stored.recipients, updates);
             if stored
                 .recipients
                 .values()
@@ -626,6 +853,29 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
                 inner.ce.deliveries.remove(&key);
                 inner.dirty = true;
             }
+            started
+        };
+        for (recipient, attempt) in started {
+            spawn_send(
+                state,
+                key.clone(),
+                AgentId(recipient),
+                attempt,
+                delivery.result_head.clone(),
+                Arc::clone(&delivery.bytes),
+            );
+        }
+        for agent in refreshes {
+            let task_state = Arc::clone(state);
+            let _spawned = state.spawn_detached(async move {
+                task_state
+                    .agent
+                    .refresh_application_capability(
+                        agent,
+                        x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+                    )
+                    .await;
+            });
         }
     }
 }
@@ -648,30 +898,103 @@ pub(super) async fn write_allowed(state: &AppState, agent: &AgentId) -> bool {
     })
 }
 
-fn spawn_send(state: &Arc<AppState>, key: EvictionKey, agent: AgentId, bytes: Arc<Vec<u8>>) {
+/// The synchronous seam form of [`write_allowed`]: every lock is taken
+/// with `try_*`, and contention refuses (a retryable withhold).
+fn write_allowed_at_seam(state: &AppState, agent: &AgentId) -> bool {
+    let machine = state
+        .agent
+        .capability_store()
+        .lookup_binding(agent)
+        .map(|binding| binding.machine_id);
+    let revocation_set = state.agent.revocation_set();
+    let Ok(set) = revocation_set.try_read() else {
+        return false;
+    };
+    if set.is_agent_revoked(agent) {
+        return false;
+    }
+    machine.is_none_or(|machine| {
+        !set.is_machine_revoked(&machine) && !set.is_binding_revoked(agent, &machine)
+    })
+}
+
+fn spawn_send(
+    state: &Arc<AppState>,
+    key: EvictionKey,
+    agent: AgentId,
+    attempt: u64,
+    result_head: String,
+    bytes: Arc<Vec<u8>>,
+) {
     let task_state = Arc::clone(state);
     let _spawned = state.spawn_detached(async move {
-        let status = match task_state.agent.send_direct(&agent, bytes.to_vec()).await {
-            Ok(_) => RecipientDelivery::Sent,
-            Err(x0x::dm::DmError::RecipientUpgradeRequired { .. }) => RecipientDelivery::Lacking,
-            Err(error) => {
-                tracing::debug!(%error, "ADR 0110 S4: crypto-only exclusion send failed; retrying");
+        let admission = guarded_admission(
+            &task_state,
+            &key.stable_group_id,
+            &agent,
+            HeadRule::Current(result_head),
+        );
+        let resolve_within =
+            std::cmp::min(x0x::dm::PINNED_RESOLUTION_WAIT, CE_EXCHANGE_TIMEOUT / 2);
+        let exchange = task_state.agent.send_direct_pinned_admitted(
+            &agent,
+            bytes.as_slice(),
+            &admission,
+            resolve_within,
+        );
+        let status = match tokio::time::timeout(CE_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(_)) => RecipientDelivery::Sent,
+            Ok(Err(x0x::dm::DmError::RecipientUpgradeRequired { .. })) => {
+                RecipientDelivery::Lacking
+            }
+            Ok(Err(error)) => {
+                // An admission refusal is a withhold: the next round
+                // re-evaluates the recipient from the current state.
+                tracing::debug!(%error, "ADR 0110 S4: crypto-only exclusion send refused or failed; retrying");
+                RecipientDelivery::Due
+            }
+            Err(_) => {
+                tracing::debug!("ADR 0110 S4: crypto-only exclusion exchange deadline elapsed; retrying");
                 RecipientDelivery::Due
             }
         };
         let mut inner = task_state.revocation_evictions.inner.lock().await;
         if let Some(delivery) = inner.ce.deliveries.get_mut(&key) {
-            if let Some(entry) = delivery.recipients.get_mut(agent.as_bytes()) {
-                *entry = status;
-            }
+            finish_attempt(&mut delivery.recipients, agent.as_bytes(), attempt, status);
         }
     });
 }
 
-// ─── Catch-up (§4) ─────────────────────────────────────────────────────────
+// ─── Guarded egress (§3 L231, §4) ──────────────────────────────────────────
 
-/// The per-exchange bound of one catch-up frame write.
-const CE_CATCHUP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The group-state rule of one frame write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HeadRule {
+    /// Live delivery: the frame's result must still be the current head
+    /// (the epoch has not moved past it).
+    Current(String),
+    /// Catch-up: the frame's result must be on this node's verified chain
+    /// (the current head or a retained commit).
+    OnChain(String),
+}
+
+/// Whether `info` still admits a frame under `rule`. A quarantined or
+/// withdrawn group admits nothing (containment).
+pub(super) fn head_rule_admits(info: &GroupInfo, rule: &HeadRule) -> bool {
+    if info.withdrawn || info.is_fork_quarantined() {
+        return false;
+    }
+    match rule {
+        HeadRule::Current(head) => info.state_hash == *head,
+        HeadRule::OnChain(head) => {
+            info.state_hash == *head
+                || info
+                    .commit_log
+                    .iter()
+                    .any(|retained| retained.commit.state_hash == *head)
+        }
+    }
+}
 
 /// Serve the frames this node holds for the group (any of `group_ids`) above
 /// `from_revision` to a catch-up requester, on the distinct gated carrier
@@ -679,46 +1002,35 @@ const CE_CATCHUP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// gets nothing new: the frame never goes into a legacy-decoded catch-up
 /// page.
 ///
-/// Each write uses ADR 0107's serving guard plus D60 (§3 L231): under the
-/// group's membership lock the requester must be an Active, unbanned,
-/// unrevoked member of a group that is not withdrawn or quarantined, with
-/// no machine or binding revocation, and the seam re-checks the same
-/// inputs immediately before the physical write.
+/// Each write uses [`guarded_admission`] with [`HeadRule::OnChain`].
 pub(in crate::server) async fn serve_catchup(
     state: &Arc<AppState>,
     requester: &AgentId,
     group_ids: &[String],
     from_revision: u64,
 ) {
-    let frames: Vec<(String, Arc<Vec<u8>>)> = {
-        let inner = state.revocation_evictions.inner.lock().await;
-        group_ids
-            .iter()
-            .find_map(|id| inner.ce.log.get(id).map(|log| (id, log)))
-            .map(|(id, log)| {
-                log.iter()
-                    .filter(|entry| entry.next_revision > from_revision)
-                    .map(|entry| (id.clone(), Arc::clone(&entry.bytes)))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let frames = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .ce
+        .catchup_frames(group_ids, from_revision);
     if frames.is_empty() {
         return;
     }
-    for (group_id, bytes) in frames {
-        let admission = catchup_admission(state, &group_id, requester);
-        let resolve_within = std::cmp::min(
-            x0x::dm::PINNED_RESOLUTION_WAIT,
-            CE_CATCHUP_EXCHANGE_TIMEOUT / 2,
-        );
+    for (group_id, result_head, bytes) in frames {
+        let admission =
+            guarded_admission(state, &group_id, requester, HeadRule::OnChain(result_head));
+        let resolve_within =
+            std::cmp::min(x0x::dm::PINNED_RESOLUTION_WAIT, CE_EXCHANGE_TIMEOUT / 2);
         let exchange = state.agent.send_direct_pinned_admitted(
             requester,
             bytes.as_slice(),
             &admission,
             resolve_within,
         );
-        match tokio::time::timeout(CE_CATCHUP_EXCHANGE_TIMEOUT, exchange).await {
+        match tokio::time::timeout(CE_EXCHANGE_TIMEOUT, exchange).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 tracing::debug!(%error, "ADR 0110 S4: crypto-only exclusion catch-up send refused or failed");
@@ -734,42 +1046,65 @@ pub(in crate::server) async fn serve_catchup(
     }
 }
 
-/// The guarded-egress admission of one catch-up frame (§3 L231). The
-/// pre-phase holds the membership lock while it takes ADR 0107's serving
-/// check, the D60 machine/binding check and the capability gate; the seam
-/// re-takes the serving check synchronously before the write.
-fn catchup_admission(
+/// The guarded-egress admission of one frame write to `recipient`, for
+/// live delivery and catch-up alike (§3 L231). The pre-phase holds the
+/// group's membership lock while it takes ADR 0107's serving check
+/// (Active, unbanned, unrevoked, certificate-eligible, not withdrawn, not
+/// quarantined), the D60 machine/binding check, the capability gate and
+/// the head rule. The seam re-takes the serving check, the D60 check and
+/// the head rule synchronously, immediately before the write. The seam of
+/// `send_direct_pinned_admitted` adds this agent's own revocation, pairing
+/// and binding checks.
+pub(super) fn guarded_admission(
     state: &Arc<AppState>,
     group_id: &str,
-    requester: &AgentId,
+    recipient: &AgentId,
+    rule: HeadRule,
 ) -> x0x::dm::ArtifactAdmission {
     use super::super as ng;
     let state = Arc::clone(state);
     let group_id = group_id.to_string();
-    let requester = *requester;
+    let recipient = *recipient;
     Arc::new(move || {
         let state = Arc::clone(&state);
         let group_id = group_id.clone();
+        let rule = rule.clone();
         Box::pin(async move {
-            let requester_hex = hex::encode(requester.as_bytes());
+            let recipient_hex = hex::encode(recipient.as_bytes());
             let lock = ng::group_membership_lock_for_known_group(&state, &group_id).await?;
             let evidence = {
                 let _membership_guard = lock.lock().await;
-                let evidence = ng::join_artifact_serving_check(&state, &group_id, &requester_hex)
+                let evidence = ng::join_artifact_serving_check(&state, &group_id, &recipient_hex)
                     .await
                     .ok()?;
+                let head_ok = {
+                    let roster = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&roster, &group_id)
+                        .is_some_and(|(_, info)| head_rule_admits(info, &rule))
+                };
                 let supported = state.agent.capability_store().verified_registry_supports(
-                    &requester,
+                    &recipient,
                     x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
                 );
-                if supported != Some(true) || !write_allowed(&state, &requester).await {
+                if !head_ok || supported != Some(true) || !write_allowed(&state, &recipient).await {
                     return None;
                 }
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                ng::join_artifact_seam_refusal(&state, &group_id, &requester_hex, evidence)
-                    .is_none()
+                if ng::join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence)
+                    .is_some()
+                {
+                    return false;
+                }
+                if !write_allowed_at_seam(&state, &recipient) {
+                    return false;
+                }
+                let Ok(roster) = state.named_groups.try_read() else {
+                    return false;
+                };
+                crate::server::resolve_group_entry_locked(&roster, &group_id)
+                    .is_some_and(|(_, info)| head_rule_admits(info, &rule))
             });
             Some(seam)
         })
@@ -1038,11 +1373,22 @@ pub(in crate::server) async fn receive(
         "crypto_exclusion",
     )
     .await;
-    state.revocation_evictions.inner.lock().await.ce.remember(
-        &body.stable_group_id,
-        body.next_revision,
-        Arc::new(payload.to_vec()),
-    );
+    {
+        let frame_bytes = Arc::new(payload.to_vec());
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner.ce.remember(
+            &body.stable_group_id,
+            body.next_revision,
+            &body.commit.state_hash,
+            Arc::clone(&frame_bytes),
+        );
+        // Durable replay evidence: kept in this node's own row once it
+        // completes, so catch-up still has the frame after a restart.
+        inner.ce.note_replay_pending(
+            EvictionKey::new(body.stable_group_id.clone(), body.target),
+            frame_bytes,
+        );
+    }
     drop(membership_guard);
     tracing::info!(
         group_id = %LogHexId::group(&group_key),
@@ -1166,8 +1512,8 @@ mod tests {
     fn catchup_log_is_bounded_and_deduplicated() {
         let mut ce_state = CeState::default();
         for revision in 0..(CE_LOG_PER_GROUP as u64 + 4) {
-            ce_state.remember("g", revision, Arc::new(vec![1]));
-            ce_state.remember("g", revision, Arc::new(vec![2]));
+            ce_state.remember("g", revision, "r", Arc::new(vec![1]));
+            ce_state.remember("g", revision, "r", Arc::new(vec![2]));
         }
         let log = ce_state.log.get("g").map(VecDeque::len);
         assert_eq!(log, Some(CE_LOG_PER_GROUP));
@@ -1202,5 +1548,610 @@ mod tests {
         assert_eq!(entries[0]["advert"], "lacking");
         assert_eq!(entries[1]["advert"], "unknown");
         assert!(ce_state.delivering().contains(&key));
+    }
+
+    // ─── #1357 review P2: InFlight installed before the send starts ──────
+
+    /// The old round spawned the send, then wrote `InFlight` after it. A
+    /// send that finished first had its `Sent` overwritten by `InFlight`,
+    /// and the recipient was never retried or completed. Now the round
+    /// installs `InFlight(token)` and returns the sends to start; only the
+    /// same token's completion writes.
+    #[test]
+    fn a_fast_completion_is_never_overwritten_by_in_flight() {
+        let survivor = [5; 32];
+        let mut recipients = BTreeMap::from([(survivor, RecipientDelivery::Due)]);
+        let attempt = next_attempt();
+        let started = apply_round(
+            &mut recipients,
+            vec![RoundUpdate {
+                recipient: survivor,
+                observed: RecipientDelivery::Due,
+                next: Some(RecipientDelivery::InFlight(attempt)),
+            }],
+        );
+        assert_eq!(started, vec![(survivor, attempt)]);
+        // The send completes at once, before anything else runs.
+        assert!(finish_attempt(
+            &mut recipients,
+            &survivor,
+            attempt,
+            RecipientDelivery::Sent
+        ));
+        assert_eq!(recipients.get(&survivor), Some(&RecipientDelivery::Sent));
+        // A late round write planned from the old `Due` snapshot changes
+        // nothing: the stored status is no longer the observed one.
+        let late = apply_round(
+            &mut recipients,
+            vec![RoundUpdate {
+                recipient: survivor,
+                observed: RecipientDelivery::Due,
+                next: Some(RecipientDelivery::InFlight(next_attempt())),
+            }],
+        );
+        assert!(late.is_empty());
+        assert_eq!(recipients.get(&survivor), Some(&RecipientDelivery::Sent));
+    }
+
+    /// A failed send returns the recipient to `Due`, so the next round
+    /// retries it; a stale attempt's completion is ignored.
+    #[test]
+    fn a_failed_attempt_is_retried_and_stale_completions_are_ignored() {
+        let survivor = [6; 32];
+        let mut recipients = BTreeMap::from([(survivor, RecipientDelivery::Due)]);
+        let first = next_attempt();
+        apply_round(
+            &mut recipients,
+            vec![RoundUpdate {
+                recipient: survivor,
+                observed: RecipientDelivery::Due,
+                next: Some(RecipientDelivery::InFlight(first)),
+            }],
+        );
+        assert!(finish_attempt(
+            &mut recipients,
+            &survivor,
+            first,
+            RecipientDelivery::Due
+        ));
+        let second = next_attempt();
+        let started = apply_round(
+            &mut recipients,
+            vec![RoundUpdate {
+                recipient: survivor,
+                observed: RecipientDelivery::Due,
+                next: Some(RecipientDelivery::InFlight(second)),
+            }],
+        );
+        assert_eq!(started, vec![(survivor, second)], "the retry starts");
+        assert!(
+            !finish_attempt(&mut recipients, &survivor, first, RecipientDelivery::Sent),
+            "the first attempt's late completion must not write"
+        );
+        assert_eq!(
+            recipients.get(&survivor),
+            Some(&RecipientDelivery::InFlight(second))
+        );
+        // A recipient dropped from the roster ignores its completion.
+        apply_round(
+            &mut recipients,
+            vec![RoundUpdate {
+                recipient: survivor,
+                observed: RecipientDelivery::InFlight(second),
+                next: None,
+            }],
+        );
+        assert!(!finish_attempt(
+            &mut recipients,
+            &survivor,
+            second,
+            RecipientDelivery::Sent
+        ));
+        assert!(recipients.is_empty());
+    }
+
+    // ─── #1357 review P1: guarded egress head rule ───────────────────────
+
+    #[test]
+    fn live_delivery_needs_the_current_head_and_no_containment() {
+        let mut info = info_with_log("r", &[("p", "r")]);
+        let live = HeadRule::Current("r".to_string());
+        assert!(head_rule_admits(&info, &live));
+        // The head moved (a later epoch): live delivery refuses.
+        info.state_hash = "later".to_string();
+        assert!(!head_rule_admits(&info, &live));
+        // Catch-up still serves a result that is on the chain.
+        assert!(head_rule_admits(&info, &HeadRule::OnChain("r".to_string())));
+        assert!(!head_rule_admits(
+            &info,
+            &HeadRule::OnChain("fork".to_string())
+        ));
+        // Containment: a quarantined or withdrawn group admits nothing.
+        info.state_hash = "r".to_string();
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 1,
+            state_hash: "other".to_string(),
+            committed_by: String::new(),
+            observed_at_ms: 0,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        assert!(!head_rule_admits(&info, &live));
+        assert!(!head_rule_admits(
+            &info,
+            &HeadRule::OnChain("r".to_string())
+        ));
+        info.fork_quarantine = None;
+        info.withdrawn = true;
+        assert!(!head_rule_admits(&info, &live));
+    }
+
+    // ─── #1357 review P1: replay evidence across restart ─────────────────
+
+    fn signed_frame(
+        stable_group_id: &str,
+        prior_head: &str,
+        result_head: &str,
+        next_revision: u64,
+    ) -> Vec<u8> {
+        let kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let commit = x0x::groups::state_commit::GroupStateCommit {
+            group_id: "g".to_string(),
+            revision: next_revision,
+            prev_state_hash: Some(prior_head.to_string()),
+            roster_root: String::new(),
+            policy_hash: String::new(),
+            public_meta_hash: String::new(),
+            security_binding: None,
+            state_hash: result_head.to_string(),
+            withdrawn: false,
+            committed_by: String::new(),
+            committed_at: 0,
+            signer_public_key: String::new(),
+            signature: String::new(),
+        };
+        let body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: stable_group_id.to_string(),
+            actor: *kp.agent_id().as_bytes(),
+            target: [9; 32],
+            prior_head: prior_head.to_string(),
+            prior_revision: next_revision.saturating_sub(1),
+            next_revision,
+            roster_revision: next_revision,
+            removal_proof_hash: [3; 32],
+            crypto: ce::CryptoExclusionCryptoV1::TreeKem {
+                leaf_key_package_hash: "leaf".to_string(),
+                commit: vec![1, 2, 3],
+                next_epoch: 2,
+            },
+            commit: ce::CommitHeaderV1::from(&commit),
+        };
+        let frame = ce::sign(body, &kp).expect("sign");
+        ce::encode_frame(&frame).expect("encode")
+    }
+
+    /// The restart case of the review: the exclusion committed, a survivor
+    /// was offline, the head moved on and this node restarted. The row
+    /// completed (keeping its frame) or is still open with a superseded
+    /// frame; either way the rebuilt catch-up log serves it. A fork frame
+    /// is never served.
+    #[test]
+    fn restart_rebuilds_the_catchup_log_from_row_frames() {
+        let info = info_with_log("later", &[("p", "r"), ("r", "later")]);
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), [9; 32]);
+        let frame = signed_frame(&stable, "p", "r", 5);
+        let groups = vec![("g".to_string(), info)];
+        for complete in [true, false] {
+            let mut store = ObligationStore::new();
+            store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::SelfLeave {
+                    commit_hash: "p".to_string(),
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            let row = store.get_mut(&key).expect("row");
+            row.phase = Phase::CommittedDeliveryPending;
+            row.outgoing_event = Some(frame.clone());
+            if complete {
+                assert!(store.complete(&key, Some("later".into()), Some(3), 1));
+            }
+            let mut ce_state = CeState::default();
+            rebuild_catchup_log(&groups, &store, &mut ce_state);
+            let served = ce_state.catchup_frames(std::slice::from_ref(&stable), 4);
+            assert_eq!(served.len(), 1, "complete={complete}");
+            assert_eq!(served[0].1, "r");
+            assert_eq!(served[0].2.as_slice(), frame.as_slice());
+            assert!(ce_state
+                .catchup_frames(std::slice::from_ref(&stable), 5)
+                .is_empty());
+        }
+        // An open row whose frame meets a competing child is fork evidence.
+        let fork_groups = vec![("g".to_string(), info_with_log("other", &[("p", "other")]))];
+        assert_eq!(fork_groups[0].1.stable_group_id(), stable);
+        let mut store = ObligationStore::new();
+        store.intake(
+            &key,
+            x0x::groups::eviction::EvictionTrigger::SelfLeave {
+                commit_hash: "p".to_string(),
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        store.get_mut(&key).expect("row").outgoing_event = Some(frame);
+        let mut ce_state = CeState::default();
+        rebuild_catchup_log(&fork_groups, &store, &mut ce_state);
+        assert!(ce_state
+            .catchup_frames(std::slice::from_ref(&stable), 0)
+            .is_empty());
+    }
+
+    /// A survivor keeps an installed frame in its own row once that row
+    /// completes, never in an open row (which would make it deliver).
+    #[test]
+    fn received_frame_is_attached_to_the_completed_row_only() {
+        let key = EvictionKey::new("g", [9; 32]);
+        let mut store = ObligationStore::new();
+        store.intake(
+            &key,
+            x0x::groups::eviction::EvictionTrigger::SelfLeave {
+                commit_hash: "p".to_string(),
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        let mut ce_state = CeState::default();
+        ce_state.note_replay_pending(key.clone(), Arc::new(vec![7]));
+        assert!(!attach_replay_evidence(&mut ce_state, &mut store));
+        assert!(store.get(&key).expect("row").outgoing_event.is_none());
+        assert!(store.complete(&key, Some("r".into()), Some(2), 1));
+        assert!(attach_replay_evidence(&mut ce_state, &mut store));
+        assert_eq!(
+            store.get(&key).expect("row").outgoing_event.as_deref(),
+            Some(&[7u8][..])
+        );
+        assert!(ce_state.replay_pending.is_empty());
+    }
+
+    #[test]
+    fn catchup_frames_are_served_oldest_first() {
+        let mut ce_state = CeState::default();
+        ce_state.remember("g", 7, "r7", Arc::new(vec![7]));
+        ce_state.remember("g", 5, "r5", Arc::new(vec![5]));
+        ce_state.remember("g", 6, "r6", Arc::new(vec![6]));
+        let heads: Vec<String> = ce_state
+            .catchup_frames(&["g".to_string()], 5)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(heads, vec!["r6".to_string(), "r7".to_string()]);
+    }
+}
+
+/// Daemon-level tests (an in-process `AppState`; no network). They run in
+/// CI under the isolated test runner.
+#[cfg(test)]
+mod daemon_tests {
+    use super::super::super as ng;
+    use super::*;
+    use anyhow::Result;
+    use base64::Engine as _;
+
+    fn advertise_crypto_exclusion(state: &AppState, peer: AgentId) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::current().bits,
+        };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "verified capability advert"
+        );
+    }
+
+    async fn admit(
+        state: &Arc<AppState>,
+        group_id: &str,
+        recipient: &AgentId,
+        rule: &HeadRule,
+    ) -> Option<x0x::dm::SeamAdmission> {
+        guarded_admission(state, group_id, recipient, rule.clone())().await
+    }
+
+    /// #1357 review P1: live delivery goes through the guarded admission,
+    /// evaluated again at the write. A recipient that was eligible when the
+    /// round scheduled it, then was removed, banned, saw the head (epoch)
+    /// move, or saw the group quarantined, is refused by the seam (after a
+    /// passing pre-phase) and by a fresh pre-phase.
+    #[tokio::test]
+    async fn live_delivery_refuses_a_recipient_that_became_ineligible() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let survivor = AgentId([0x77; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let group_id = "ce".repeat(16);
+        let mut info = GroupInfo::new("ce".into(), String::new(), admin, group_id.clone());
+        info.add_member(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        let rule = HeadRule::Current(info.state_hash.clone());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        advertise_crypto_exclusion(&state, survivor);
+
+        let seam = admit(&state, &stable, &survivor, &rule).await;
+        assert!(
+            seam.is_some_and(|seam| seam()),
+            "an eligible recipient is admitted"
+        );
+
+        type Change = fn(&mut GroupInfo, &str);
+        let changes: [(&str, Change); 4] = [
+            ("removed", |info, member| {
+                info.remove_member(member, None);
+            }),
+            ("banned", |info, member| {
+                info.ban_member(member, None);
+            }),
+            ("head moved", |info, _| {
+                info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.recompute_state_hash();
+            }),
+            ("quarantined", |info, _| {
+                info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                    revision: 1,
+                    state_hash: "other".into(),
+                    committed_by: String::new(),
+                    observed_at_ms: 0,
+                    snapshot: x0x::groups::ForkSnapshot {
+                        terminal_commit: info.terminal_commit_header(),
+                        conflicting_commit: info.terminal_commit_header(),
+                        classification: None,
+                    },
+                    no_anchor: true,
+                });
+            }),
+        ];
+        for (label, change) in changes {
+            // Scheduled while eligible: the pre-phase passes.
+            let seam = admit(&state, &stable, &survivor, &rule)
+                .await
+                .unwrap_or_else(|| panic!("{label}: the pre-phase must admit first"));
+            // The recipient becomes ineligible before the physical write.
+            {
+                let mut groups = state.named_groups.write().await;
+                let stored = groups.get_mut(&group_id).expect("group");
+                change(stored, &survivor_hex);
+            }
+            assert!(!seam(), "{label}: the seam must refuse the write");
+            assert!(
+                admit(&state, &stable, &survivor, &rule).await.is_none(),
+                "{label}: a fresh pre-phase must refuse"
+            );
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+        }
+        Ok(())
+    }
+
+    /// #1357 review P1: crypto-only catch-up survives a restart. The
+    /// exclusion commits while a survivor is offline, the head moves on (so
+    /// live delivery stops and the row completes), and the committer
+    /// restarts. The rebuilt catch-up log still holds the frame, and the
+    /// survivor that missed the transition installs it.
+    #[tokio::test]
+    async fn survivor_catches_up_after_head_move_and_committer_restart() -> Result<()> {
+        let (state, dir) = ng::tests::secure_endpoint_test_state().await?;
+        state
+            .named_group_test_recorders
+            .metadata_publish_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let admin = state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let group_id = "cf".repeat(16);
+        let group_id_bytes = hex::decode(&group_id)?;
+        let seed = ng::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let mut admin_group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), admin, &seed)?;
+        // The leaver.
+        let leaver_kp = x0x::identity::AgentKeypair::generate()?;
+        let leaver = leaver_kp.agent_id();
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(leaver, &[9u8; 32])?;
+        let leaver_kp_bytes = prepared.key_package_bytes().to_vec();
+        admin_group.add_member(leaver, &leaver_kp_bytes)?;
+        // The survivor, offline during the transition.
+        let survivor_seed = [7u8; 32];
+        let survivor = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(survivor, &survivor_seed)?;
+        let survivor_kp_bytes = prepared.key_package_bytes().to_vec();
+        let added = admin_group.add_member(survivor, &survivor_kp_bytes)?;
+        let survivor_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+        let survivor_snapshot = survivor_group.to_snapshot_bytes()?;
+        let epoch = admin_group.epoch();
+
+        let mut info = GroupInfo::new("ce-restart".into(), String::new(), admin, group_id.clone());
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        for (member_hex, kp_bytes) in [
+            (&leaver_hex, &leaver_kp_bytes),
+            (&survivor_hex, &survivor_kp_bytes),
+        ] {
+            info.add_member(
+                member_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(admin_hex.clone()),
+                None,
+            );
+            info.set_member_treekem_key_package(
+                member_hex,
+                base64::engine::general_purpose::STANDARD.encode(kp_bytes),
+            );
+        }
+        info.secret_epoch = epoch;
+        info.security_binding = Some(format!("treekem:epoch={epoch}"));
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state.treekem_groups.write().await.insert(
+            group_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(admin_group)),
+        );
+        let pre_leave = info.clone();
+
+        // The self-leave; the committer seals the retained leaf.
+        let mut leaving = info.clone();
+        leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+        let revision = leaving.roster_revision;
+        leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let leave_commit = leaving.seal_commit(&leaver_kp, ng::now_millis_u64())?;
+        let leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision,
+            actor: leaver_hex.clone(),
+            agent_id: leaver_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(leave_commit),
+        };
+        let applied =
+            ng::apply_named_group_metadata_event(&state, leave.clone(), leaver, true, None).await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        let frame = latest_frame_for_test(&state, &stable)
+            .await
+            .expect("the crypto-only exclusion committed");
+        let result_head = ce::decode_frame(&frame)
+            .map(|frame| frame.body.commit.state_hash)
+            .expect("frame");
+
+        // The head moves on before the survivor returns.
+        {
+            let mut groups = state.named_groups.write().await;
+            let stored = groups.get_mut(&group_id).expect("group");
+            assert_eq!(stored.state_hash, result_head);
+            stored.description = "moved on".into();
+            stored.seal_commit(state.agent.identity().agent_keypair(), ng::now_millis_u64())?;
+            assert_ne!(stored.state_hash, result_head);
+        }
+        assert!(
+            ng::save_named_groups(&state).await,
+            "the moved head is durable"
+        );
+        // Live delivery stops (no old crypto material after the move) and
+        // the row completes from the chain. The commit's own spawned round
+        // may have deferred the next one; make it due now.
+        for delivery in state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .deliveries
+            .values_mut()
+        {
+            delivery.next_at = Instant::now();
+        }
+        drive_deliveries(&state).await;
+        super::super::revocation_eviction_pass(&state).await;
+        assert!(super::super::persist_obligations(&state).await);
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(inner.ce.deliveries.is_empty(), "live delivery stopped");
+            let row = inner
+                .store
+                .get(&EvictionKey::new(stable.clone(), *leaver.as_bytes()))
+                .expect("row");
+            assert_eq!(row.phase, Phase::Complete);
+            assert_eq!(row.outgoing_event.as_deref(), Some(frame.as_slice()));
+        }
+
+        // The committer restarts.
+        let data_dir = dir.path().to_path_buf();
+        let restarted =
+            ng::tests::secure_endpoint_test_state_at(&data_dir, Arc::clone(&state.agent)).await?;
+        let named = restarted.named_groups.read().await.clone();
+        let restored =
+            ng::restore_treekem_groups(&named, restarted.agent.as_ref(), &restarted.treekem_dir)
+                .await;
+        *restarted.treekem_groups.write().await = restored;
+        super::super::load_persisted_obligations(&restarted).await;
+        let served = restarted
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .catchup_frames(std::slice::from_ref(&stable), pre_leave.state_revision);
+        assert_eq!(
+            served
+                .iter()
+                .map(|(_, _, bytes)| bytes.to_vec())
+                .collect::<Vec<_>>(),
+            vec![frame.clone()],
+            "the restarted committer still serves the frame on catch-up"
+        );
+
+        // The survivor returns, takes the self-leave, then the served frame.
+        let (replica, _replica_dir) = ng::tests::secure_endpoint_test_state().await?;
+        replica
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), pre_leave);
+        let survivor_tree =
+            x0x::mls::TreeKemMlsGroup::restore(&survivor_snapshot, survivor, &survivor_seed)?;
+        replica.treekem_groups.write().await.insert(
+            group_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(survivor_tree)),
+        );
+        let replica_leave =
+            ng::apply_named_group_metadata_event(&replica, leave, leaver, true, None).await;
+        assert!(replica_leave.accepted, "{replica_leave:?}");
+        assert_eq!(
+            receive(&replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the survivor installs the exclusion it missed"
+        );
+        assert_eq!(
+            replica
+                .named_groups
+                .read()
+                .await
+                .get(&group_id)
+                .map(|info| info.state_hash.clone()),
+            Some(result_head)
+        );
+        Ok(())
     }
 }

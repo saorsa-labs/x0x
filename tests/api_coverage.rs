@@ -125,6 +125,11 @@ const COVERED: &[CoveredEndpoint] = &[
         "/owner/riders/:id",
         rider_revoked_token_fails_on_next_request
     ),
+    covered!(
+        Post,
+        "/owner/groups/:id/recovery-mandate",
+        owner_group_recovery_mandate_signs_only_when_every_admin_is_revoked
+    ),
     covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────
     covered!(Get, "/presence", "GET /presence"),
@@ -438,6 +443,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Post,
+        "/groups/:id/members/:agent_id/certificate/rebind",
+        self_rebind_route_refuses_another_agents_seat
+    ),
+    covered!(
+        Post,
         "/groups/:id/ban/:agent_id",
         d4_stateful_events_converge_via_signed_commits
     ),
@@ -686,6 +696,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/named_groups/group_recovery.rs",
         include_str!("../src/server/routes/named_groups/group_recovery.rs"),
+    ),
+    // ADR 0110 §4a: the self-rebind route's coverage lives in the
+    // named_groups lib tests.
+    (
+        "src/server/routes/named_groups/tests/adr0110_certificate_rebind.rs",
+        include_str!("../src/server/routes/named_groups/tests/adr0110_certificate_rebind.rs"),
     ),
     // #477: the join-status route's coverage lives in the named_groups
     // lib tests (the wp_b_477 T-matrix: T7 drives the live terminal path).

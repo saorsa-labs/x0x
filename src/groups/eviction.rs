@@ -33,6 +33,17 @@ pub const COMPLETED_EVIDENCE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// first out (D128).
 pub const MAX_COMPACT_RECORDS_PER_GROUP: usize = 4096;
 
+/// At most this many completed rows per group keep their crypto-only
+/// exclusion frame (`outgoing_event`) as replay evidence for ADR 0110 §4
+/// catch-up after a restart, newest first. Older rows drop the frame.
+pub const MAX_REPLAY_FRAMES_PER_GROUP: usize = 16;
+
+/// Whether `bytes` is a crypto-only exclusion frame (`X0XCE1`): the one
+/// saved event a completed row keeps as replay evidence.
+fn is_replay_frame(bytes: &[u8]) -> bool {
+    bytes.starts_with(crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX)
+}
+
 // ─── Timing (D69, D73) ─────────────────────────────────────────────────────
 
 /// The S4 timing values. Every S4 budget reads them from here.
@@ -673,7 +684,12 @@ impl ObligationStore {
         row.waiting = None;
         row.result_head = result_head;
         row.result_epoch = result_epoch;
-        row.outgoing_event = None;
+        // ADR 0110 §4: a crypto-only exclusion frame stays as replay
+        // evidence, so a survivor that missed it can still catch up after
+        // this node restarts. Any other saved event is dropped.
+        if !row.outgoing_event.as_deref().is_some_and(is_replay_frame) {
+            row.outgoing_event = None;
+        }
         row.completed_at_unix_ms = Some(now_unix_ms);
         true
     }
@@ -759,10 +775,19 @@ impl ObligationStore {
             }
         }
         for (_, mut completed) in per_group {
+            completed.sort();
+            // Replay frames: only the newest completed rows keep theirs.
+            let frames_from = completed.len().saturating_sub(MAX_REPLAY_FRAMES_PER_GROUP);
+            for (_, key) in completed.iter().take(frames_from) {
+                if let Some(row) = self.rows.get_mut(key) {
+                    if row.outgoing_event.take().is_some() {
+                        changed = true;
+                    }
+                }
+            }
             if completed.len() <= MAX_COMPACT_RECORDS_PER_GROUP {
                 continue;
             }
-            completed.sort();
             let excess = completed.len() - MAX_COMPACT_RECORDS_PER_GROUP;
             for (_, key) in completed.into_iter().take(excess) {
                 self.rows.remove(&key);
@@ -1302,10 +1327,16 @@ pub const EVS_PREFIX: &[u8] = b"X0XEVICT";
 pub const EVJOURNAL_PREFIX: &[u8] = b"X0XEVJ";
 /// The `.evs` v1 header (10 bytes).
 pub const EVS_HEADER_V1: &[u8; 10] = b"X0XEVICT1\0";
+/// The `.evs` v2 header (10 bytes): the v1 body followed by
+/// [`EvsQueuedBansV2`]. It is written only while a queued manual ban
+/// exists, so a store without one stays v1 and readable by a v1 binary.
+pub const EVS_HEADER_V2: &[u8; 10] = b"X0XEVICT2\0";
 /// The `.evjournal` v1 header (8 bytes).
 pub const EVJOURNAL_HEADER_V1: &[u8; 8] = b"X0XEVJ1\0";
-/// The highest layout version this binary reads, for both files.
+/// The highest `.evjournal` layout version this binary reads.
 pub const SIDECAR_MAX_SUPPORTED_VERSION: u8 = 1;
+/// The highest `.evs` layout version this binary reads.
+pub const EVS_MAX_SUPPORTED_VERSION: u8 = 2;
 
 /// Why an S4 file could not be used (ADR 0108 §5a classification).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1337,6 +1368,28 @@ pub struct EvsBodyV1 {
     pub rows: Vec<ObligationRow>,
 }
 
+/// One manual ban that a non-designated admin accepted with `202 queued`
+/// (ADR 0110 §2 amendment to ADR 0016 §6). It is applied as a ban after
+/// the designated removal, or at this node's fallback time, and it must
+/// survive a restart (ADR 0110 follow-up "a queued manual ban is still
+/// applied after the designated removal").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedBanV1 {
+    /// Stable group ID.
+    pub stable_group_id: String,
+    /// The agent to ban.
+    pub target: [u8; 32],
+    /// When the request was accepted (Unix ms).
+    pub queued_at_unix_ms: u64,
+}
+
+/// The `.evs` v2 extension that follows the v1 body.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EvsQueuedBansV2 {
+    /// Accepted manual bans that are not applied yet.
+    pub queued_bans: Vec<QueuedBanV1>,
+}
+
 /// The frozen v1 `.evjournal` body: one prepared S4 transition (§5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvJournalV1 {
@@ -1355,20 +1408,25 @@ pub struct EvJournalV1 {
     /// Trigger hashes that authorize the transition.
     pub evidence: Vec<[u8; 32]>,
     /// The exact outgoing event: the signed `X0XCE1` frame of a
-    /// crypto-only exclusion. Empty for a seated-target removal, whose
-    /// legacy `MemberRemoved` the unchanged removal path builds and
-    /// publishes inside its own transaction.
+    /// crypto-only exclusion, or the JSON `MemberRemoved` (with its
+    /// TreeKEM commit and signed state commit) of a seated-target
+    /// removal. A seated-target journal is first written empty; the
+    /// removal path rewrites it with the event before the new epoch
+    /// commits. Empty means no event was prepared yet.
     pub outgoing_event: Vec<u8>,
     /// The head the transition produces, when it is known before the
-    /// legacy commit (a crypto-only exclusion). A restart compares it with
-    /// the verified chain to tell a committed result from a competing
-    /// branch (§3).
+    /// legacy commit. A restart compares it with the verified chain to
+    /// tell a committed result from a competing branch (§3).
     pub result_head: Option<String>,
 }
 
 /// Split and check a `<prefix><digit>\0` header. Returns the version and
 /// the body.
-fn split_header<'a>(bytes: &'a [u8], prefix: &[u8]) -> Result<(u8, &'a [u8]), SidecarDecodeError> {
+fn split_header<'a>(
+    bytes: &'a [u8],
+    prefix: &[u8],
+    max_version: u8,
+) -> Result<(u8, &'a [u8]), SidecarDecodeError> {
     let header_len = prefix.len() + 2;
     let Some(found_prefix) = bytes.get(..prefix.len()) else {
         if prefix.starts_with(bytes) && !bytes.is_empty() {
@@ -1393,7 +1451,7 @@ fn split_header<'a>(bytes: &'a [u8], prefix: &[u8]) -> Result<(u8, &'a [u8]), Si
         return Err(SidecarDecodeError::Damaged("missing_nul"));
     }
     let version = version_byte - b'0';
-    if version > SIDECAR_MAX_SUPPORTED_VERSION {
+    if version > max_version {
         return Err(SidecarDecodeError::NewerFormat(version));
     }
     Ok((version, body))
@@ -1460,19 +1518,58 @@ fn decode_exact<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Sideca
 ///
 /// Returns the postcard error when encoding fails.
 pub fn encode_evs(body: &EvsBodyV1) -> Result<Vec<u8>, postcard::Error> {
-    let mut out = EVS_HEADER_V1.to_vec();
+    encode_evs_with_queued_bans(body, &[])
+}
+
+/// Encode the `.evs` sidecar with its queued manual bans. With no queued
+/// ban the file is v1; otherwise it is v2 (the v1 body, then
+/// [`EvsQueuedBansV2`]).
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub fn encode_evs_with_queued_bans(
+    body: &EvsBodyV1,
+    queued_bans: &[QueuedBanV1],
+) -> Result<Vec<u8>, postcard::Error> {
+    if queued_bans.is_empty() {
+        let mut out = EVS_HEADER_V1.to_vec();
+        out.extend(postcard::to_stdvec(body)?);
+        return Ok(out);
+    }
+    let mut out = EVS_HEADER_V2.to_vec();
     out.extend(postcard::to_stdvec(body)?);
+    out.extend(postcard::to_stdvec(&EvsQueuedBansV2 {
+        queued_bans: queued_bans.to_vec(),
+    })?);
     Ok(out)
 }
 
-/// Decode the `.evs` sidecar.
+/// Decode the `.evs` sidecar (the rows only).
 ///
 /// # Errors
 ///
 /// Returns the §5a classification of a file that cannot be used.
 pub fn decode_evs(bytes: &[u8]) -> Result<EvsBodyV1, SidecarDecodeError> {
-    let (_, body) = split_header(bytes, EVS_PREFIX)?;
-    decode_exact(body)
+    decode_evs_with_queued_bans(bytes).map(|(body, _)| body)
+}
+
+/// Decode the `.evs` sidecar with its queued manual bans (empty for v1).
+///
+/// # Errors
+///
+/// Returns the §5a classification of a file that cannot be used.
+pub fn decode_evs_with_queued_bans(
+    bytes: &[u8],
+) -> Result<(EvsBodyV1, Vec<QueuedBanV1>), SidecarDecodeError> {
+    let (version, body) = split_header(bytes, EVS_PREFIX, EVS_MAX_SUPPORTED_VERSION)?;
+    if version == 1 {
+        return decode_exact(body).map(|rows| (rows, Vec::new()));
+    }
+    let (rows, rest) = postcard::take_from_bytes::<EvsBodyV1>(body)
+        .map_err(|_| SidecarDecodeError::Damaged("body_decode"))?;
+    let extension: EvsQueuedBansV2 = decode_exact(rest)?;
+    Ok((rows, extension.queued_bans))
 }
 
 /// Encode one `.evjournal`.
@@ -1492,7 +1589,7 @@ pub fn encode_evjournal(journal: &EvJournalV1) -> Result<Vec<u8>, postcard::Erro
 ///
 /// Returns the §5a classification of a file that cannot be used.
 pub fn decode_evjournal(bytes: &[u8]) -> Result<EvJournalV1, SidecarDecodeError> {
-    let (_, body) = split_header(bytes, EVJOURNAL_PREFIX)?;
+    let (_, body) = split_header(bytes, EVJOURNAL_PREFIX, SIDECAR_MAX_SUPPORTED_VERSION)?;
     decode_exact(body)
 }
 
@@ -1950,8 +2047,40 @@ mod tests {
             Err(SidecarDecodeError::Damaged("missing_nul"))
         );
         let mut newer = bytes;
-        newer[8] = b'2';
-        assert_eq!(decode_evs(&newer), Err(SidecarDecodeError::NewerFormat(2)));
+        newer[8] = b'3';
+        assert_eq!(decode_evs(&newer), Err(SidecarDecodeError::NewerFormat(3)));
+    }
+
+    #[test]
+    fn evs_v2_carries_queued_bans_and_v1_stays_v1() {
+        let body = EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: vec![sample_row()],
+        };
+        let none = encode_evs_with_queued_bans(&body, &[]).expect("encode");
+        assert_eq!(&none[..10], EVS_HEADER_V1);
+        assert_eq!(
+            decode_evs_with_queued_bans(&none).expect("decode"),
+            (body.clone(), Vec::new())
+        );
+        let bans = vec![QueuedBanV1 {
+            stable_group_id: "g".into(),
+            target: [5; 32],
+            queued_at_unix_ms: 42,
+        }];
+        let some = encode_evs_with_queued_bans(&body, &bans).expect("encode");
+        assert_eq!(&some[..10], EVS_HEADER_V2);
+        assert_eq!(
+            decode_evs_with_queued_bans(&some).expect("decode"),
+            (body.clone(), bans)
+        );
+        assert_eq!(decode_evs(&some).expect("decode rows"), body);
+        let mut trailing = some;
+        trailing.push(0);
+        assert_eq!(
+            decode_evs_with_queued_bans(&trailing),
+            Err(SidecarDecodeError::Damaged("trailing_bytes"))
+        );
     }
 
     #[test]
@@ -2199,5 +2328,73 @@ mod tests {
             Some(true)
         );
         assert!(parse_quarantine_pending_name(EVS_FILE_NAME, "other.q-00-11.pending").is_none());
+    }
+
+    /// ADR 0110 §4 (#1357 review P1): completion keeps a crypto-only
+    /// exclusion frame as durable replay evidence in the `.evs` row, and
+    /// drops any other saved event. The row survives an encode/decode
+    /// round trip with the frame.
+    #[test]
+    fn completion_keeps_a_crypto_exclusion_frame_as_replay_evidence() {
+        let mut store = ObligationStore::new();
+        let frame_key = key(1);
+        let other_key = key(2);
+        let mut frame = crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX.to_vec();
+        frame.extend_from_slice(b"frame");
+        for (k, event) in [(&frame_key, frame.clone()), (&other_key, b"{}".to_vec())] {
+            store.intake(k, revocation(1), None, 0, [0; 16]);
+            store.get_mut(k).expect("row").outgoing_event = Some(event);
+            assert!(store.complete(k, Some("r".into()), Some(2), 1));
+        }
+        assert_eq!(
+            store
+                .get(&frame_key)
+                .expect("row")
+                .outgoing_event
+                .as_deref(),
+            Some(frame.as_slice())
+        );
+        assert!(store.get(&other_key).expect("row").outgoing_event.is_none());
+        let body = EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: store.to_rows(),
+        };
+        let decoded = decode_evs(&encode_evs(&body).expect("encode")).expect("decode");
+        let reloaded = ObligationStore::from_rows(decoded.rows);
+        assert_eq!(
+            reloaded
+                .get(&frame_key)
+                .expect("row")
+                .outgoing_event
+                .as_deref(),
+            Some(frame.as_slice())
+        );
+    }
+
+    /// Replay frames are bounded: only the newest
+    /// [`MAX_REPLAY_FRAMES_PER_GROUP`] completed rows of a group keep theirs.
+    #[test]
+    fn retention_keeps_only_the_newest_replay_frames() {
+        let mut store = ObligationStore::new();
+        let mut frame = crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX.to_vec();
+        frame.push(0);
+        let total = MAX_REPLAY_FRAMES_PER_GROUP + 3;
+        for n in 0..total {
+            let k = key(u8::try_from(n + 1).expect("small"));
+            store.intake(&k, revocation(1), None, 0, [0; 16]);
+            store.get_mut(&k).expect("row").outgoing_event = Some(frame.clone());
+            store.complete(&k, None, None, u64::try_from(n).expect("small") + 1);
+        }
+        assert!(store.apply_retention(100));
+        let kept: Vec<u8> = (0..total)
+            .filter(|n| {
+                let k = key(u8::try_from(n + 1).expect("small"));
+                store.get(&k).expect("row").outgoing_event.is_some()
+            })
+            .map(|n| u8::try_from(n).expect("small"))
+            .collect();
+        let expected: Vec<u8> = (3..u8::try_from(total).expect("small")).collect();
+        assert_eq!(kept, expected, "the oldest rows drop their frames");
+        assert!(!store.apply_retention(100), "retention is idempotent");
     }
 }

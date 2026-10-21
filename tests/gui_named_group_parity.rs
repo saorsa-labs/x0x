@@ -103,6 +103,13 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/:id/members/:agent_id",
         "admin flow; GUI currently uses ban rather than direct remove-by-agent",
     ),
+    // ADR 0110 §4a: the agent's certificate self-rebind is an agent
+    // renewal surface driven by the agent or its harness (CLI + REST).
+    (
+        Method::Post,
+        "/groups/:id/members/:agent_id/certificate/rebind",
+        "agent certificate renewal surface (ADR 0110 §4a); exposed via CLI + REST, GUI deferred",
+    ),
     // GET /groups/cards/:id — card inspection UI still deferred. The
     // card-import action below is now wired; inspection-by-id will
     // come with a richer "discovered groups" detail panel.

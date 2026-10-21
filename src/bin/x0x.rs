@@ -685,6 +685,26 @@ enum OwnerSub {
     Machines,
     /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
     Placement,
+    /// Owner actions on named groups (ADR 0110 §4b(1) recovery).
+    Groups {
+        #[command(subcommand)]
+        sub: OwnerGroupsSub,
+    },
+}
+
+/// `x0x owner groups` subcommands.
+#[derive(Subcommand)]
+enum OwnerGroupsSub {
+    /// Sign an owner recovery mandate for a group whose admins are all
+    /// revoked; the promoted member becomes its admin (ADR 0110 §4b(1)).
+    RecoveryMandate {
+        /// Group ID.
+        #[arg(value_name = "GROUP_ID")]
+        group_id: String,
+        /// Hex agent ID of the Active certified member to promote.
+        #[arg(long = "promoted", value_name = "AGENT_ID")]
+        promoted: String,
+    },
 }
 
 /// `x0x move` subcommands (ADR-0043 agent key-move ceremony).
@@ -1691,6 +1711,19 @@ enum GroupSub {
         /// Group ID.
         group_id: String,
     },
+    /// Self-rebind this agent's renewed certificate into its seat before
+    /// the cutoff `not_after − τ` (ADR 0110 §4a).
+    RebindCertificate {
+        /// Group ID.
+        group_id: String,
+        /// This agent's hex ID (the seat to rebind).
+        agent_id: String,
+        /// Renewed certificate, base64 storage encoding (the
+        /// `certificate.storage_b64` of `x0x owner agents issue`). Defaults
+        /// to the daemon's loaded agent certificate.
+        #[arg(long)]
+        certificate: Option<String>,
+    },
     /// Ban a member (admin+).
     Ban {
         /// Group ID.
@@ -2396,6 +2429,12 @@ async fn run(
         },
         Commands::Owner { sub } => match sub {
             None => commands::identity::owner_agents(&client).await,
+            Some(OwnerSub::Groups {
+                sub: OwnerGroupsSub::RecoveryMandate { group_id, promoted },
+            }) => {
+                commands::identity::owner_group_recovery_mandate(&client, &group_id, &promoted)
+                    .await
+            }
             Some(OwnerSub::Agents { sub: None }) => commands::identity::owner_agents(&client).await,
             Some(OwnerSub::Agents {
                 sub:
@@ -2991,6 +3030,19 @@ async fn run(
             }) => commands::group::reseat(&client, &group_id, &agent_id, &reason, &basis).await,
             Some(GroupSub::Recovery { group_id }) => {
                 commands::group::recovery(&client, &group_id).await
+            }
+            Some(GroupSub::RebindCertificate {
+                group_id,
+                agent_id,
+                certificate,
+            }) => {
+                commands::group::rebind_certificate(
+                    &client,
+                    &group_id,
+                    &agent_id,
+                    certificate.as_deref(),
+                )
+                .await
             }
             Some(GroupSub::Ban { group_id, agent_id }) => {
                 commands::group::ban(&client, &group_id, &agent_id).await

@@ -192,6 +192,7 @@ still emits withdrawn cards so stale public listings are superseded.
 |---|---|---|---|
 | PATCH | `/groups/:id/policy` | `x0x group policy` | Update group policy (admin+) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role` | Change a member's role (admin+) |
+| POST | `/groups/:id/members/:agent_id/certificate/rebind` | `x0x group rebind-certificate` | Self-rebind this agent's renewed certificate into its seat before the cutoff (ADR 0110 §4a) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban` | Ban a member (admin+) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban` | Unban a member (admin+) |
 | GET | `/groups/:id/requests` | `x0x group requests` | List join requests (admin+) |

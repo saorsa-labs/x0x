@@ -25,7 +25,7 @@
 //! group or persistence lock (§1). The S4 state lock is never held across
 //! a call into a route handler.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,14 +40,17 @@ use crate as x0x;
 use crate::server::state::AppState;
 use x0x::groups::eviction::{
     self as s4, CommitPermission, EvJournalV1, EvictionKey, EvictionTrigger, EvsBodyV1,
-    IntakeOutcome, ObligationRow, ObligationStore, Phase, RowAction, RowBudget, RowContext,
-    S4Timing, SidecarDecodeError, SidecarState, TerminationCause, VerifiedAgentRevocation,
-    WaitingCause, WaitingState,
+    IntakeOutcome, ObligationRow, ObligationStore, Phase, QueuedBanV1, RowAction, RowBudget,
+    RowContext, S4Timing, SidecarDecodeError, SidecarState, TerminationCause,
+    VerifiedAgentRevocation, WaitingCause, WaitingState,
 };
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
+pub(super) mod owner_recovery;
+pub(super) mod rebind;
 mod removal_delivery;
+pub(super) mod removal_journal;
 
 pub(super) use removal_delivery::record_committed_removal;
 
@@ -57,6 +60,9 @@ const S4_WORKER_TICK: Duration = Duration::from_secs(1);
 
 /// After a failed commit attempt the worker retries no sooner than this.
 const S4_COMMIT_RETRY: Duration = Duration::from_secs(5);
+
+/// Retry interval of a queued ban whose target holds no seat.
+const S4_UNSEATED_BAN_RETRY: Duration = Duration::from_secs(60);
 
 /// A manual request that §2 queued instead of rekeying early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,10 +146,25 @@ struct S4Inner {
     rebuilding: bool,
     /// The `.evs` file exists on disk.
     file_exists: bool,
-    /// The store changed since the last durable write.
+    /// The store changed since the last snapshot a writer took. A writer
+    /// clears it when it takes its snapshot, under this lock, and sets it
+    /// again when its write fails, so a change made while the write is in
+    /// flight is never cleared by that write.
     dirty: bool,
-    /// Rows whose latest material change is not durable yet.
-    not_durable: BTreeSet<EvictionKey>,
+    /// Change counter for [`Self::not_durable`]: each material change of a
+    /// row takes the next value.
+    change_seq: u64,
+    /// Rows whose latest material change is not durable yet, with the
+    /// change counter of that change. A successful write retires only the
+    /// changes its snapshot covered.
+    not_durable: BTreeMap<EvictionKey, u64>,
+    /// §2: per stable group ID, the current head catch-up round.
+    head_rounds: HashMap<String, HeadRound>,
+    /// §2: accepted `202 queued` manual bans, persisted in the `.evs` v2
+    /// extension until the ban is applied.
+    queued_bans: BTreeMap<EvictionKey, u64>,
+    /// The earliest next attempt to apply a queued ban.
+    ban_next_attempt: HashMap<EvictionKey, Instant>,
     /// §2: manual requests queued while this node waits for its rank.
     queued_manual: HashMap<EvictionKey, Vec<QueuedManual>>,
     /// The earliest next commit attempt per row.
@@ -161,9 +182,22 @@ struct S4Inner {
     /// §4: crypto-only exclusion holds, deliveries, catch-up frames and
     /// restart fork evidence.
     ce: crypto_exclusion::CeState,
+    /// §4b(1): owner-recovery mandates, held mandates and commit deliveries.
+    orc: owner_recovery::OrcState,
     /// §3: committed seated-target removals whose saved event is still
     /// being delivered to the survivors.
     removals: HashMap<EvictionKey, removal_delivery::RemovalDelivery>,
+    /// §4a, §4b(2): certificate rebind deliveries, renewals and waits.
+    rebind: rebind::RebindState,
+}
+
+impl S4Inner {
+    /// Record a material change of `key` that is not durable yet.
+    fn mark_not_durable(&mut self, key: &EvictionKey) {
+        self.change_seq = self.change_seq.saturating_add(1);
+        self.not_durable.insert(key.clone(), self.change_seq);
+        self.dirty = true;
+    }
 }
 
 impl Default for S4Runtime {
@@ -186,10 +220,13 @@ impl S4Runtime {
         }
     }
 
-    /// §2 restart rule: no S4 seal before this replica completed a current
-    /// catch-up round. This tree has no explicit "catch-up round complete"
-    /// signal, so the bounded restart sync wait from process start stands
-    /// in for it (D73).
+    /// §2 restart rule, the minimum part only: the bounded restart sync
+    /// wait from process start has elapsed (D73).
+    ///
+    /// This is necessary, not sufficient. ADR 0110 §2 says timeout alone
+    /// must not authorize a seal: [`group_head_synced`] adds a completed
+    /// current catch-up round for the group and no unresolved higher-head
+    /// evidence. Every S4 seal decision uses that per-group check.
     ///
     /// The wait applies on every process start, including a first boot with
     /// no saved `.evs`. ADR 0110 §2 (L191) requires a current catch-up round
@@ -201,6 +238,279 @@ impl S4Runtime {
     fn head_synced(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.boot_instant) >= self.timing.restart_sync_wait
     }
+}
+
+// ─── §2 head catch-up round ───────────────────────────────────────────────
+
+/// Most peers one worker pass asks for a catch-up page, per group. The
+/// pass runs every [`S4_WORKER_TICK`], so a round reaches more peers on
+/// later passes.
+const HEAD_ROUND_PEERS_PER_PASS: usize = 3;
+
+/// §2: one head catch-up round of one group.
+///
+/// A round confirms one local head. It completes when an authenticated
+/// holder answers a catch-up page, after that page is applied, with
+/// exactly the local head (any holder; no quorum). If no holder answers,
+/// the bounded restart sync wait from the round start ends discovery
+/// (D73). A holder that reports a different head is unresolved head
+/// evidence: the round cannot complete, and it restarts (asks again) after
+/// the wait. A new local head starts a new round.
+#[derive(Debug, Clone)]
+struct HeadRound {
+    /// The local head this round confirms.
+    head: String,
+    started: Instant,
+    /// Peers this round asked.
+    asked: BTreeSet<[u8; 32]>,
+    /// A verified holder reported `head` after its page was applied.
+    confirmed: bool,
+    /// Verified holders whose last report named a different head.
+    conflicting: BTreeSet<[u8; 32]>,
+}
+
+impl HeadRound {
+    fn new(head: &str, now: Instant) -> Self {
+        Self {
+            head: head.to_string(),
+            started: now,
+            asked: BTreeSet::new(),
+            confirmed: false,
+            conflicting: BTreeSet::new(),
+        }
+    }
+
+    /// The §2 seal condition for this round. `holders` is the number of
+    /// other members that could hold a later head; `unresolved` is the
+    /// higher-head evidence from [`unresolved_head_evidence`].
+    fn synced(
+        &self,
+        current_head: &str,
+        holders: usize,
+        unresolved: bool,
+        restart_wait_elapsed: bool,
+        now: Instant,
+        wait: Duration,
+    ) -> bool {
+        restart_wait_elapsed
+            && !unresolved
+            && self.head == current_head
+            && self.conflicting.is_empty()
+            && (self.confirmed
+                || holders == 0
+                || now.saturating_duration_since(self.started) >= wait)
+    }
+}
+
+/// Keep the round of one group current and return the peers to ask now.
+/// A new local head starts a new round; a round that met a conflicting
+/// report asks every holder again once the wait has passed.
+fn refresh_head_round(
+    rounds: &mut HashMap<String, HeadRound>,
+    stable_group_id: &str,
+    current_head: &str,
+    holders: &[[u8; 32]],
+    now: Instant,
+    wait: Duration,
+) -> Vec<[u8; 32]> {
+    let round = rounds
+        .entry(stable_group_id.to_string())
+        .or_insert_with(|| HeadRound::new(current_head, now));
+    if round.head != current_head
+        || (!round.conflicting.is_empty() && now.saturating_duration_since(round.started) >= wait)
+    {
+        *round = HeadRound::new(current_head, now);
+    }
+    if round.confirmed {
+        return Vec::new();
+    }
+    let ask: Vec<[u8; 32]> = holders
+        .iter()
+        .filter(|peer| !round.asked.contains(*peer))
+        .take(HEAD_ROUND_PEERS_PER_PASS)
+        .copied()
+        .collect();
+    round.asked.extend(ask.iter().copied());
+    ask
+}
+
+/// Record one verified, applied, non-truncated catch-up page answer.
+fn note_head_report(
+    rounds: &mut HashMap<String, HeadRound>,
+    stable_group_id: &str,
+    current_head: &str,
+    sender: [u8; 32],
+    reported: &str,
+    now: Instant,
+) {
+    let round = rounds
+        .entry(stable_group_id.to_string())
+        .or_insert_with(|| HeadRound::new(current_head, now));
+    if round.head != current_head {
+        *round = HeadRound::new(current_head, now);
+    }
+    if reported == current_head {
+        round.confirmed = true;
+        round.conflicting.remove(&sender);
+    } else {
+        round.conflicting.insert(sender);
+    }
+}
+
+/// Other active members that could hold a later head of `info`: every
+/// active member except this node and the targets of open rows.
+fn head_holders(
+    info: &GroupInfo,
+    local: &[u8; 32],
+    excluded: &BTreeSet<[u8; 32]>,
+) -> Vec<[u8; 32]> {
+    let mut holders: Vec<(bool, [u8; 32])> = info
+        .active_members()
+        .filter_map(|member| {
+            super::parse_agent_id_hex(&member.agent_id)
+                .ok()
+                .map(|agent| (!member.role.at_least(GroupRole::Admin), *agent.as_bytes()))
+        })
+        .filter(|(_, id)| id != local && !excluded.contains(id))
+        .collect();
+    // Admins first: they sign membership commits.
+    holders.sort();
+    holders.dedup();
+    holders.into_iter().map(|(_, id)| id).collect()
+}
+
+/// §2 "no known higher/conflicting head or incomplete replay may remain
+/// unresolved": the existing catch-up machinery's open evidence for one
+/// group. That is a queued membership event that waits for a missing
+/// predecessor or replay, epoch-ahead traffic the epoch-ahead catch-up is
+/// still chasing (#1427), or an open catch-up page stream or replay fence
+/// (#1113).
+async fn unresolved_head_evidence(
+    state: &AppState,
+    group_key: &str,
+    info: &GroupInfo,
+    local_epoch: u64,
+) -> bool {
+    let ids = [
+        group_key.to_string(),
+        info.stable_group_id().to_string(),
+        info.mls_group_id.clone(),
+    ];
+    let queued = {
+        let pending = state.treekem_pending_events.read().await;
+        ids.iter()
+            .any(|id| pending.get(id).is_some_and(|queue| !queue.is_empty()))
+    };
+    if queued {
+        return true;
+    }
+    let ahead = {
+        let targets = state.treekem_epoch_ahead_targets.lock().await;
+        ids.iter().any(|id| {
+            targets
+                .get(id)
+                .is_some_and(|target| target.epoch > local_epoch)
+        })
+    };
+    ahead || super::self_leave_rekey_fence_any_open(&ids)
+}
+
+/// The local TreeKEM epoch of a group, or its saved secret epoch.
+async fn local_epoch_of(state: &AppState, group_key: &str, info: &GroupInfo) -> u64 {
+    super::current_treekem_epoch(state, group_key)
+        .await
+        .unwrap_or(info.secret_epoch)
+}
+
+/// §2: whether this replica may seal in `group_key` now. Requires the
+/// restart minimum, a completed current catch-up round for the current
+/// local head, and no unresolved higher-head evidence. It re-reads the
+/// head and the evidence on every call, so a caller can check just before
+/// a seal.
+pub(super) async fn group_head_synced(state: &AppState, group_key: &str) -> bool {
+    let runtime = &state.revocation_evictions;
+    let now = Instant::now();
+    if !runtime.head_synced(now) {
+        return false;
+    }
+    let Some((key, info)) = ({
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, group_key)
+            .map(|(key, info)| (key.to_string(), info.clone()))
+    }) else {
+        return false;
+    };
+    let local_epoch = local_epoch_of(state, &key, &info).await;
+    let unresolved = unresolved_head_evidence(state, &key, &info, local_epoch).await;
+    let local = *state.agent.agent_id().as_bytes();
+    let inner = runtime.inner.lock().await;
+    let excluded: BTreeSet<[u8; 32]> = inner
+        .store
+        .open_rows_for_group(info.stable_group_id())
+        .map(|row| row.target)
+        .chain(
+            inner
+                .queued_bans
+                .keys()
+                .filter(|key| key.stable_group_id == info.stable_group_id())
+                .map(|key| key.target),
+        )
+        .collect();
+    let holders = head_holders(&info, &local, &excluded).len();
+    inner
+        .head_rounds
+        .get(info.stable_group_id())
+        .is_some_and(|round| {
+            round.synced(
+                &info.state_hash,
+                holders,
+                unresolved,
+                true,
+                now,
+                runtime.timing.restart_sync_wait,
+            )
+        })
+}
+
+/// §2: the catch-up response handler calls this for each verified,
+/// applied, non-truncated page that carries the responder's saved head
+/// (`responder_state_hash`). The sender is an active, unrevoked member;
+/// the handler checked that.
+pub(in crate::server) async fn note_catchup_head(
+    state: &AppState,
+    group_ids: &[String],
+    sender_hex: &str,
+    reported: Option<&str>,
+) {
+    let Some(reported) = reported else {
+        return;
+    };
+    let Ok(sender) = super::parse_agent_id_hex(sender_hex) else {
+        return;
+    };
+    let current = {
+        let groups = state.named_groups.read().await;
+        group_ids.iter().find_map(|id| {
+            crate::server::resolve_group_entry_locked(&groups, id)
+                .map(|(_, info)| (info.stable_group_id().to_string(), info.state_hash.clone()))
+        })
+    };
+    let Some((stable, head)) = current else {
+        return;
+    };
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    // Only groups with S4 work keep a round (the worker pass creates it).
+    if !inner.head_rounds.contains_key(&stable) {
+        return;
+    }
+    note_head_report(
+        &mut inner.head_rounds,
+        &stable,
+        &head,
+        *sender.as_bytes(),
+        reported,
+        Instant::now(),
+    );
 }
 
 /// ADR 0094 host-commit gate (§5). S4 creates or materially writes its
@@ -232,9 +542,12 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         persist_obligations(&state).await;
         dispatch_handoffs(&state).await;
         drive_exclusions(&state).await;
+        drive_queued_bans(&state).await;
         crypto_exclusion::drive_deliveries(&state).await;
         removal_delivery::drive(&state).await;
         crypto_exclusion::retry_stash(&state).await;
+        rebind::drive(&state).await;
+        owner_recovery::drive(&state).await;
         tokio::select! {
             () = notify.notified() => {}
             () = tokio::time::sleep(S4_WORKER_TICK) => {}
@@ -248,12 +561,27 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     let groups = snapshot_groups(state).await;
     let leaves = snapshot_retained_leaves(state, &groups).await;
     let revoked_admins = revoked_admins_in(state, &groups).await;
+    // §2: the open higher-head evidence of each group, read before the S4
+    // state lock (lock order: never hold it across these reads).
+    let mut head_evidence: HashMap<String, bool> = HashMap::new();
+    for (group_key, info) in &groups {
+        if info.withdrawn {
+            continue;
+        }
+        let local_epoch = leaves
+            .epoch(info.stable_group_id())
+            .unwrap_or(info.secret_epoch);
+        head_evidence.insert(
+            info.stable_group_id().to_string(),
+            unresolved_head_evidence(state, group_key, info, local_epoch).await,
+        );
+    }
     let now_unix_ms = now_unix_ms();
     let now_unix = now_unix_ms / 1000;
     let local = *state.agent.agent_id().as_bytes();
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
-    let head_synced = runtime.head_synced(now);
+    let restart_wait_elapsed = runtime.head_synced(now);
     let mut inner = runtime.inner.lock().await;
     let boot_id = runtime.boot_id;
     let mut created = Vec::new();
@@ -263,8 +591,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 .store
                 .intake(&key, trigger, incarnation.as_deref(), now_unix_ms, boot_id);
         if outcome.changed() {
-            inner.dirty = true;
-            inner.not_durable.insert(key.clone());
+            inner.mark_not_durable(&key);
         }
         if matches!(outcome, IntakeOutcome::Created | IntakeOutcome::Reopened) {
             created.push(key);
@@ -301,7 +628,11 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     inner.queued_manual.retain(|key, _| open.contains(key));
     inner.next_attempt.retain(|key, _| open.contains(key));
     inner.attempt_wait.retain(|key, _| open.contains(key));
-    inner.not_durable.retain(|key| open.contains(key));
+    inner.not_durable.retain(|key, _| open.contains(key));
+    let queued_bans: BTreeSet<EvictionKey> = inner.queued_bans.keys().cloned().collect();
+    inner
+        .ban_next_attempt
+        .retain(|key, _| queued_bans.contains(key));
     inner.removals.retain(|key, _| open.contains(key));
     inner.pending_dispatch.retain(|key| open.contains(key));
     inner
@@ -314,6 +645,60 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .iter()
         .map(|(key, info)| (info.stable_group_id(), (key, info)))
         .collect();
+    // §2: one head catch-up round per group with open work. A seal needs
+    // the round for the current head complete and no unresolved evidence;
+    // elapsed time alone never authorizes it.
+    let mut group_synced: HashMap<String, bool> = HashMap::new();
+    let mut head_requests: Vec<(String, x0x::identity::AgentId)> = Vec::new();
+    // A queued ban is a seal too, so its group keeps a round after its row
+    // completed.
+    let round_keys: BTreeSet<EvictionKey> = open
+        .iter()
+        .chain(inner.queued_bans.keys())
+        .cloned()
+        .collect();
+    let open_groups: BTreeSet<String> = round_keys
+        .iter()
+        .map(|key| key.stable_group_id.clone())
+        .collect();
+    inner
+        .head_rounds
+        .retain(|stable, _| open_groups.contains(stable));
+    for stable in &open_groups {
+        let Some((group_key, info)) = by_stable.get(stable.as_str()) else {
+            continue;
+        };
+        let excluded: BTreeSet<[u8; 32]> = round_keys
+            .iter()
+            .filter(|key| &key.stable_group_id == stable)
+            .map(|key| key.target)
+            .collect();
+        let holders = head_holders(info, &local, &excluded);
+        let ask = refresh_head_round(
+            &mut inner.head_rounds,
+            stable,
+            &info.state_hash,
+            &holders,
+            now,
+            runtime.timing.restart_sync_wait,
+        );
+        head_requests.extend(
+            ask.into_iter()
+                .map(|peer| ((*group_key).clone(), x0x::identity::AgentId(peer))),
+        );
+        let unresolved = head_evidence.get(stable).copied().unwrap_or(true);
+        let synced = inner.head_rounds.get(stable).is_some_and(|round| {
+            round.synced(
+                &info.state_hash,
+                holders.len(),
+                unresolved,
+                restart_wait_elapsed,
+                now,
+                runtime.timing.restart_sync_wait,
+            )
+        });
+        group_synced.insert(stable.clone(), synced);
+    }
     for key in open {
         let Some((group_key, info)) = by_stable.get(key.stable_group_id.as_str()) else {
             continue;
@@ -335,7 +720,11 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         // durable elsewhere (the revocation store, the verified chain or a
         // committed certificate), so a memory-only sidecar does not hold
         // the seal. A failed write of a writable sidecar does.
-        let durable = memory_only || !inner.not_durable.contains(&key);
+        let durable = memory_only || !inner.not_durable.contains_key(&key);
+        let head_synced = group_synced
+            .get(&key.stable_group_id)
+            .copied()
+            .unwrap_or(false);
         let ctx = RowContext {
             local,
             active_admins: &active_admins,
@@ -399,6 +788,13 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 inner.ce.holders.insert(key.clone(), holders);
             }
         }
+        // §1a, §4b(2): every admin other than the target is expired; the
+        // row waits for an owner renewal and the admin's self-rebind.
+        if let Some(wait) = rebind::row_override(&inner.rebind, info, &row, target_seated, now_unix)
+        {
+            evaluation.waiting = Some(wait);
+            evaluation.action = RowAction::None;
+        }
         // §2: each observing admin forwards the trigger evidence to every
         // eligible admin once; the dispatch time is recorded before route
         // resolution (T_obs).
@@ -443,6 +839,18 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         inner.dirty = true;
     }
     inner.loaded = true;
+    drop(inner);
+    // §2: ask the round's holders for a catch-up page on the existing
+    // request path. The response handler applies the page with all its
+    // usual checks and then reports the responder's head
+    // ([`note_catchup_head`]). Sends run detached: an offline peer must
+    // not hold the worker.
+    for (group_key, peer) in head_requests {
+        let task_state = Arc::clone(state);
+        let _admitted = state.spawn_detached(async move {
+            super::request_treekem_catchup_page(&task_state, &group_key, &peer).await;
+        });
+    }
 }
 
 /// Drain the intake queue and, when needed, rescan the whole revocation
@@ -841,6 +1249,13 @@ pub(in crate::server) async fn s4_manual_request_gate(
         .position(|id| id == state.agent.agent_id().as_bytes())
         .map(|index| index.saturating_add(1));
     let now_ms = now_unix_ms();
+    if kind == ManualRequestKind::Ban {
+        // §2: an accepted ban must be applied as a ban, after the
+        // designated removal or at this node's fallback time, and must
+        // survive a restart (the `.evs` v2 extension).
+        inner.queued_bans.entry(key.clone()).or_insert(now_ms);
+        inner.dirty = true;
+    }
     inner
         .queued_manual
         .entry(key)
@@ -850,6 +1265,12 @@ pub(in crate::server) async fn s4_manual_request_gate(
             queued_at_unix_ms: now_ms,
         });
     drop(inner);
+    if kind == ManualRequestKind::Ban && !persist_obligations(state).await {
+        tracing::warn!(
+            group_id = %super::LogHexId::group(&stable),
+            "ADR 0110 S4: a queued manual ban is not durable yet; the worker retries the write"
+        );
+    }
     let designated_hex = hex::encode(designated);
     Some((
         StatusCode::ACCEPTED,
@@ -982,7 +1403,7 @@ async fn no_eligible_admin_state(state: &AppState, info: &GroupInfo) -> Option<N
         });
     }
     // §4b(3): derive the end only after a current catch-up round (§2).
-    if !state.revocation_evictions.head_synced(Instant::now()) {
+    if !group_head_synced(state, info.stable_group_id()).await {
         return Some(NoEligibleAdmin::Waiting {
             revoked_admins,
             exit: GROUP_ADMIN_REVOKED,
@@ -1259,6 +1680,20 @@ async fn receive_handoff(state: &Arc<AppState>, sender: x0x::identity::AgentId, 
             }
         }
     }
+    // §4a (D155): a renewal from the seat's own agent after its cutoff.
+    if let Some(bytes) = &handoff.renewed_certificate {
+        if rebind::note_handoff_renewal(
+            state,
+            &handoff.stable_group_id,
+            handoff.target,
+            sender,
+            bytes,
+        )
+        .await
+        {
+            verified_any = true;
+        }
+    }
     // Self-leave and expiry evidence is re-derived from this node's own
     // chain and clock (§1a: a hand-off never shortens another node's
     // expiry budget); the pass below picks it up.
@@ -1312,7 +1747,11 @@ async fn drive_exclusions(state: &Arc<AppState>) {
     for (key, group_key, action) in candidates {
         match action {
             RowAction::CommitRemoval { rank } => {
-                commit_removal(state, &key, &group_key, rank).await;
+                // §4a: with a verified renewal and every member capable,
+                // the expiry worker rebinds instead of removing.
+                if !rebind::try_admin_rebind(state, &key, &group_key).await {
+                    commit_removal(state, &key, &group_key, rank).await;
+                }
             }
             RowAction::SelfLeaveRekey { rank } => {
                 // The responsive self-leave rekey (#1113, PR #1337) already
@@ -1340,6 +1779,19 @@ async fn drive_exclusions(state: &Arc<AppState>) {
 
 async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &str, rank: usize) {
     let target_hex = hex::encode(key.target);
+    // §2: re-read the head and the evidence just before every seal. The
+    // evaluation that allowed this commit may be one pass old.
+    if !group_head_synced(state, group_key).await {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner.attempt_wait.insert(
+            key.clone(),
+            WaitingState::cause(WaitingCause::WaitingForHeadSync),
+        );
+        inner
+            .next_attempt
+            .insert(key.clone(), Instant::now() + S4_WORKER_TICK);
+        return;
+    }
     // §5 transaction order: fsync a prepared `.evjournal` with the
     // evidence and the parent head, then run the unchanged legacy
     // roster/crypto transaction, then fsync the reconciled `.evs`.
@@ -1353,8 +1805,15 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
             None => return,
         }
     };
-    let journal = {
+    let prepared = {
         let mut inner = state.revocation_evictions.inner.lock().await;
+        // §2: an accepted queued ban is applied as a ban by this commit.
+        let kind = if inner.queued_bans.contains_key(key) {
+            ManualRequestKind::Ban
+        } else {
+            ManualRequestKind::Remove
+        };
+        let scope = eviction_seal_scope(&inner.store, key);
         let Some(row) = inner.store.get_mut(key) else {
             return;
         };
@@ -1365,9 +1824,9 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         row.parent_head = Some(parent_head.clone());
         let journal = prepared_journal(row, parent_head, next_revision);
         inner.dirty = true;
-        Some(journal)
+        Some((journal, kind, scope))
     };
-    let Some(journal) = journal else {
+    let Some((journal, kind, scope)) = prepared else {
         return;
     };
     let journal_path = evjournal_path(state, &key.stable_group_id);
@@ -1379,7 +1838,7 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
             row.phase = Phase::Pending;
             row.parent_head = None;
         }
-        inner.not_durable.insert(key.clone());
+        inner.mark_not_durable(key);
         inner
             .next_attempt
             .insert(key.clone(), Instant::now() + S4_COMMIT_RETRY);
@@ -1393,18 +1852,7 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         rank,
         "ADR 0110 S4: excluding a revoked or expired member"
     );
-    let response = super::remove_named_group_member(
-        State(Arc::clone(state)),
-        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
-        Path((group_key.to_string(), target_hex.clone())),
-    )
-    .await
-    .into_response();
-    let status = response.status();
-    let body: serde_json::Value = match axum::body::to_bytes(response.into_body(), 1 << 20).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
-        Err(_) => serde_json::Value::Null,
-    };
+    let (status, body) = run_member_route(state, group_key, &target_hex, kind, scope).await;
     {
         let mut inner = state.revocation_evictions.inner.lock().await;
         if status == StatusCode::OK {
@@ -1414,6 +1862,10 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
             }
             inner.attempt_wait.remove(key);
             inner.queued_manual.remove(key);
+            if kind == ManualRequestKind::Ban {
+                inner.queued_bans.remove(key);
+                inner.ban_next_attempt.remove(key);
+            }
         } else {
             if let Some(row) = inner.store.get_mut(key) {
                 row.phase = Phase::Pending;
@@ -1451,6 +1903,201 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
     remove_file_durably(&journal_path).await;
 }
 
+tokio::task_local! {
+    /// §3: set while the S4 worker runs one removal or ban through the
+    /// existing route, so that route's `OwnerCertified` seal knows which
+    /// other failing seats are open S4 work (see
+    /// [`s4_eviction_seal_tolerates`]).
+    static S4_EVICTION_SEAL: EvictionSealScope;
+}
+
+/// The S4 removal or ban that the current task runs.
+#[derive(Debug, Clone)]
+struct EvictionSealScope {
+    stable_group_id: String,
+    /// The lowercase hex of the excluded target.
+    target_hex: String,
+    /// Lowercase hex of the targets of the group's other open rows.
+    pending_targets: BTreeSet<String>,
+}
+
+fn eviction_seal_scope(store: &ObligationStore, key: &EvictionKey) -> EvictionSealScope {
+    EvictionSealScope {
+        stable_group_id: key.stable_group_id.clone(),
+        target_hex: hex::encode(key.target),
+        pending_targets: store
+            .open_rows_for_group(&key.stable_group_id)
+            .filter(|row| row.target != key.target)
+            .map(|row| hex::encode(row.target))
+            .collect(),
+    }
+}
+
+/// §3 and ADR-0038 B3: an `OwnerCertified` seal normally needs an
+/// all-clean roster. When two or more seats of one group are revoked or
+/// expired, the removal of the first leaves the others failing, and that
+/// seal is refused, so no removal could ever land. ADR 0110 §3 lets Home
+/// and other `OwnerCertified` groups use the `OwnerCertified` engine,
+/// which evicts one member per sealed transition and seals each
+/// transition while the later failing members are still seated
+/// (`seal_commit_evicting`). This returns true, and the caller seals the
+/// same way, only inside an S4 removal or ban whose working copy has
+/// already excluded its target and when every remaining failing seat is
+/// the target of another open S4 row of the same group. Each of those
+/// rows then gets its own transition under its own designation and
+/// timing. Any other failing seat keeps the all-clean refusal.
+pub(in crate::server) fn s4_eviction_seal_tolerates(info: &GroupInfo, failed: &[String]) -> bool {
+    S4_EVICTION_SEAL
+        .try_with(|scope| eviction_seal_tolerates(scope, info, failed))
+        .unwrap_or(false)
+}
+
+fn eviction_seal_tolerates(scope: &EvictionSealScope, info: &GroupInfo, failed: &[String]) -> bool {
+    scope.stable_group_id == info.stable_group_id()
+        && !info
+            .members_v2
+            .get(&scope.target_hex)
+            .is_some_and(|member| is_seated(member.state))
+        && !failed.is_empty()
+        && failed
+            .iter()
+            .all(|hex| scope.pending_targets.contains(&hex.to_ascii_lowercase()))
+}
+
+/// Run the existing signed remove or ban route for an S4 exclusion, under
+/// the S4 eviction scope. Returns the status and the JSON body.
+async fn run_member_route(
+    state: &Arc<AppState>,
+    group_key: &str,
+    target_hex: &str,
+    kind: ManualRequestKind,
+    scope: EvictionSealScope,
+) -> (StatusCode, serde_json::Value) {
+    let actor =
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true });
+    let path = Path((group_key.to_string(), target_hex.to_string()));
+    let route = async {
+        if kind == ManualRequestKind::Ban {
+            super::ban_group_member(State(Arc::clone(state)), actor, path)
+                .await
+                .into_response()
+        } else {
+            super::remove_named_group_member(State(Arc::clone(state)), actor, path)
+                .await
+                .into_response()
+        }
+    };
+    let response = S4_EVICTION_SEAL.scope(scope, route).await;
+    let status = response.status();
+    let body: serde_json::Value = match axum::body::to_bytes(response.into_body(), 1 << 20).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    };
+    (status, body)
+}
+
+/// §2: apply each accepted queued ban whose row no longer has open work:
+/// the designated (or another) admin's removal landed, or the row ended.
+/// The ban runs through the existing ban route, so the target cannot
+/// renew and rejoin. A ban that this node cannot apply yet (not an admin,
+/// head not synced, route refused) stays queued and durable.
+async fn drive_queued_bans(state: &Arc<AppState>) {
+    let now = Instant::now();
+    let due: Vec<EvictionKey> = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .queued_bans
+            .keys()
+            .filter(|key| {
+                inner.store.get(key).is_none_or(|row| !row.phase.is_open())
+                    && inner.ban_next_attempt.get(*key).is_none_or(|at| *at <= now)
+            })
+            .cloned()
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+    let groups = snapshot_groups(state).await;
+    let local = *state.agent.agent_id().as_bytes();
+    let mut changed = false;
+    for key in due {
+        let found = groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == key.stable_group_id);
+        let target_hex = hex::encode(key.target);
+        let settled = found.is_none_or(|(_, info)| {
+            info.withdrawn
+                || info
+                    .members_v2
+                    .get(&target_hex)
+                    .is_some_and(|member| member.state == GroupMemberState::Banned)
+        });
+        if settled {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.queued_bans.remove(&key);
+            inner.ban_next_attempt.remove(&key);
+            inner.dirty = true;
+            changed = true;
+            continue;
+        }
+        let Some((group_key, info)) = found else {
+            continue;
+        };
+        let ready =
+            active_admins_of(info).contains(&local) && group_head_synced(state, group_key).await;
+        if !ready {
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ban_next_attempt
+                .insert(key.clone(), Instant::now() + S4_COMMIT_RETRY);
+            continue;
+        }
+        let scope = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            eviction_seal_scope(&inner.store, &key)
+        };
+        let (status, body) =
+            run_member_route(state, group_key, &target_hex, ManualRequestKind::Ban, scope).await;
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if status == StatusCode::OK {
+            inner.queued_bans.remove(&key);
+            inner.ban_next_attempt.remove(&key);
+            inner.dirty = true;
+            changed = true;
+        } else {
+            tracing::warn!(
+                group_id = %super::LogHexId::group(group_key),
+                target = %super::LogHexId::agent(&target_hex),
+                %status,
+                error = body.get("error").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                "ADR 0110 S4: a queued manual ban could not be applied yet; retrying"
+            );
+            // A TreeKEM ban of a target with no leaf cannot run through
+            // the existing route; it applies once the target is seated
+            // again (a rejoin), so retry slowly while it is not.
+            let seated = info
+                .members_v2
+                .get(&target_hex)
+                .is_some_and(|member| is_seated(member.state));
+            let retry = if seated {
+                S4_COMMIT_RETRY
+            } else {
+                S4_UNSEATED_BAN_RETRY
+            };
+            inner
+                .ban_next_attempt
+                .insert(key.clone(), Instant::now() + retry);
+        }
+    }
+    if changed {
+        persist_obligations(state).await;
+    }
+}
+
 fn prepared_journal(row: &ObligationRow, parent_head: String, next_revision: u64) -> EvJournalV1 {
     let mut txid = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
@@ -1469,8 +2116,8 @@ fn prepared_journal(row: &ObligationRow, parent_head: String, next_revision: u64
         next_revision,
         result_epoch: None,
         evidence,
-        // The legacy removal path builds and publishes the exact event
-        // inside its own transaction; S4 never republishes it.
+        // The legacy removal path adds its exact event before it commits
+        // (`removal_journal::prepare_committed_removal`).
         outgoing_event: Vec::new(),
         result_head: None,
     }
@@ -1574,11 +2221,10 @@ async fn abandon_crypto_exclusion(state: &AppState, key: &EvictionKey) {
             row.result_epoch = None;
             row.outgoing_event = None;
         }
-        inner.not_durable.insert(key.clone());
+        inner.mark_not_durable(key);
         inner
             .next_attempt
             .insert(key.clone(), Instant::now() + S4_COMMIT_RETRY);
-        inner.dirty = true;
     }
     persist_obligations(state).await;
     remove_file_durably(&evjournal_path(state, &key.stable_group_id)).await;
@@ -1689,10 +2335,11 @@ async fn resume_crypto_exclusions(
             }
             crypto_exclusion::SavedFrameState::Superseded => {
                 // Completion is re-derived from the chain by the next
-                // pass; the obsolete delivery is discarded.
+                // pass; the obsolete delivery is discarded. The frame stays
+                // as §4 catch-up replay evidence (never resent live).
                 row.phase = Phase::CommittedDeliveryPending;
                 row.result_head = Some(result_head);
-                row.outgoing_event = None;
+                row.outgoing_event = Some(frame);
             }
             crypto_exclusion::SavedFrameState::Abandoned => {
                 row.phase = Phase::Pending;
@@ -1749,59 +2396,103 @@ fn evjournal_path(state: &AppState, stable_group_id: &str) -> PathBuf {
 /// Write the `.evs` sidecar when the store changed (§5). Returns whether
 /// the store is durable afterwards (memory-only counts as durable for
 /// evidence held elsewhere).
+///
+/// Writers are serialized by `evs_writer`, and the state lock is not held
+/// across the disk I/O, so other tasks change rows while a write runs.
+/// [`begin_persist`] takes the snapshot and clears `dirty` under the state
+/// lock; [`finish_persist`] retires only the changes that snapshot covered.
+/// A change made during the write keeps `dirty` set and stays in
+/// `not_durable`, so it is never reported durable before a later write
+/// covers it.
 async fn persist_obligations(state: &AppState) -> bool {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
-    let (bytes, covered) = {
+    let snapshot = {
         let mut inner = runtime.inner.lock().await;
-        if !inner.dirty {
-            return inner.not_durable.is_empty();
-        }
-        if !inner.sidecar.state.writable() {
-            // Memory-only (ADR 0108 §5a): never rewrite a newer or
-            // unreadable file.
-            inner.dirty = false;
-            return true;
-        }
-        if !host_commit_gate_open(state) {
-            return false;
-        }
-        if inner.store.is_empty() && !inner.file_exists {
-            // Created lazily on the first verified trigger persist.
-            inner.dirty = false;
-            return true;
-        }
-        let body = EvsBodyV1 {
-            rebuilt_from: inner.rebuilt_from.clone(),
-            rows: inner.store.to_rows(),
-        };
-        match s4::encode_evs(&body) {
-            Ok(bytes) => (bytes, inner.not_durable.clone()),
-            Err(error) => {
-                tracing::error!(%error, "ADR 0110 S4: cannot encode the obligation sidecar");
-                return false;
-            }
+        match begin_persist(&mut inner, host_commit_gate_open(state)) {
+            Ok(snapshot) => snapshot,
+            Err(durable) => return durable,
         }
     };
     let path = evs_path(state);
-    let result = write_bytes_durably(&path, &bytes, None).await;
+    let result = write_bytes_durably(&path, &snapshot.bytes, None).await;
+    if let Err(error) = &result {
+        tracing::warn!(
+            %error,
+            path = %path.display(),
+            "ADR 0110 S4: obligation sidecar write failed (waiting_for_durable_intake)"
+        );
+    }
     let mut inner = runtime.inner.lock().await;
-    match result {
-        Ok(()) => {
-            inner.file_exists = true;
+    finish_persist(&mut inner, snapshot.change_seq, result.is_ok())
+}
+
+/// The bytes one `.evs` write puts on disk, and the change counter they
+/// cover.
+struct PersistSnapshot {
+    bytes: Vec<u8>,
+    change_seq: u64,
+}
+
+/// Take the snapshot of one `.evs` write under the state lock. `Err`
+/// carries the durability answer when no write is needed or possible.
+fn begin_persist(inner: &mut S4Inner, gate_open: bool) -> Result<PersistSnapshot, bool> {
+    if !inner.dirty {
+        return Err(inner.not_durable.is_empty());
+    }
+    if !inner.sidecar.state.writable() {
+        // Memory-only (ADR 0108 §5a): never rewrite a newer or
+        // unreadable file.
+        inner.dirty = false;
+        return Err(true);
+    }
+    if !gate_open {
+        return Err(false);
+    }
+    if inner.store.is_empty() && inner.queued_bans.is_empty() && !inner.file_exists {
+        // Created lazily on the first verified trigger persist.
+        inner.dirty = false;
+        return Err(true);
+    }
+    let body = EvsBodyV1 {
+        rebuilt_from: inner.rebuilt_from.clone(),
+        rows: inner.store.to_rows(),
+    };
+    let queued_bans: Vec<QueuedBanV1> = inner
+        .queued_bans
+        .iter()
+        .map(|(key, queued_at_unix_ms)| QueuedBanV1 {
+            stable_group_id: key.stable_group_id.clone(),
+            target: key.target,
+            queued_at_unix_ms: *queued_at_unix_ms,
+        })
+        .collect();
+    match s4::encode_evs_with_queued_bans(&body, &queued_bans) {
+        Ok(bytes) => {
             inner.dirty = false;
-            inner.not_durable.retain(|key| !covered.contains(key));
-            true
+            Ok(PersistSnapshot {
+                bytes,
+                change_seq: inner.change_seq,
+            })
         }
         Err(error) => {
-            tracing::warn!(
-                %error,
-                path = %path.display(),
-                "ADR 0110 S4: obligation sidecar write failed (waiting_for_durable_intake)"
-            );
-            false
+            tracing::error!(%error, "ADR 0110 S4: cannot encode the obligation sidecar");
+            Err(false)
         }
     }
+}
+
+/// Record the result of the write that `begin_persist` prepared. Only the
+/// changes up to `covered_seq` become durable; a failed write leaves the
+/// store dirty for the next writer.
+fn finish_persist(inner: &mut S4Inner, covered_seq: u64, written: bool) -> bool {
+    if !written {
+        inner.dirty = true;
+        return false;
+    }
+    inner.file_exists = true;
+    inner.not_durable.retain(|_, seq| *seq > covered_seq);
+    true
 }
 
 /// Temp write, fsync, atomic rename and directory fsync (§5).
@@ -1966,12 +2657,22 @@ async fn load_persisted_obligations(state: &AppState) {
     let mut rebuilt_from = Vec::new();
     let mut rebuilding = false;
     let mut file_exists = false;
+    let mut queued_bans = BTreeMap::new();
     let mut covered: Vec<([u8; 16], PathBuf)> = Vec::new();
     let mut finalize: Vec<PathBuf> = Vec::new();
     match tokio::fs::read(&path).await {
-        Ok(bytes) => match s4::decode_evs(&bytes) {
-            Ok(body) => {
+        Ok(bytes) => match s4::decode_evs_with_queued_bans(&bytes) {
+            Ok((body, bans)) => {
                 store = ObligationStore::from_rows(body.rows);
+                queued_bans = bans
+                    .into_iter()
+                    .map(|ban| {
+                        (
+                            EvictionKey::new(ban.stable_group_id, ban.target),
+                            ban.queued_at_unix_ms,
+                        )
+                    })
+                    .collect();
                 rebuilt_from = body.rebuilt_from;
                 file_exists = true;
                 finalize.extend(pending.into_iter().map(|(_, copy)| copy));
@@ -2047,14 +2748,18 @@ async fn load_persisted_obligations(state: &AppState) {
     }
     let mut ce_state = crypto_exclusion::CeState::default();
     resume_crypto_exclusions(state, &mut store, &journals, &mut ce_state).await;
+    removal_journal::adopt_journal_removals(&mut store, &journals);
     let mut removals = HashMap::new();
+    let loaded_groups = snapshot_groups(state).await;
     removal_delivery::resume_after_load(
-        &snapshot_groups(state).await,
+        &loaded_groups,
         state.agent.agent_id().as_bytes(),
         &mut store,
         &mut removals,
         &mut ce_state,
     );
+    // §4: the catch-up log survives the restart from the rows' frames.
+    crypto_exclusion::rebuild_catchup_log(&loaded_groups, &store, &mut ce_state);
     for key in journals.keys() {
         if let Some(stored) = store.get_mut(key) {
             if stored.phase == Phase::Prepared {
@@ -2074,6 +2779,7 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.file_exists = file_exists;
     inner.ce = ce_state;
     inner.removals = removals;
+    inner.queued_bans = queued_bans;
     inner.dirty = !journals.is_empty();
 }
 
@@ -2150,6 +2856,9 @@ pub(in crate::server) struct GroupS4Status {
     /// for each Active digest-only seat of an `OwnerCertified` group whose
     /// committed certificate bytes this node lacks.
     pub(in crate::server) certificate_evidence_waits: serde_json::Value,
+    /// `certificate_rebind`: §4a `waiting_for_admin_rebind`, §4b(2) held
+    /// self-rebinds and the renewals this admin holds.
+    pub(in crate::server) certificate_rebind: serde_json::Value,
 }
 
 /// §1a: Active seats whose committed digest has no matching bytes here.
@@ -2181,17 +2890,27 @@ pub(in crate::server) async fn group_status_json(
     state: &AppState,
     info: &GroupInfo,
 ) -> GroupS4Status {
-    let admin_availability = no_eligible_admin_state(state, info)
+    let mut admin_availability = no_eligible_admin_state(state, info)
         .await
         .map_or(serde_json::Value::Null, |derived| {
             no_eligible_admin_json(&derived)
         });
+    if let Some(object) = admin_availability.as_object_mut() {
+        // §4b(1): the owner-recovery progress behind exit `owner_recovery`.
+        object.insert(
+            "owner_recovery".into(),
+            owner_recovery::status_json(state, info.stable_group_id()).await,
+        );
+    }
     let (rows, store) = group_rows_json(state, info).await;
+    let certificate_rebind =
+        rebind::status_json(&state.revocation_evictions.inner.lock().await.rebind, info);
     GroupS4Status {
         rows,
         store,
         admin_availability,
         certificate_evidence_waits: certificate_evidence_waits(info),
+        certificate_rebind,
     }
 }
 
@@ -2206,7 +2925,7 @@ async fn group_rows_json(
         .rows_for_group(stable)
         .map(|row| {
             let key = row.key();
-            let queued: Vec<serde_json::Value> = inner
+            let mut queued: Vec<serde_json::Value> = inner
                 .queued_manual
                 .get(&key)
                 .map(|requests| {
@@ -2221,6 +2940,18 @@ async fn group_rows_json(
                         .collect()
                 })
                 .unwrap_or_default();
+            // A queued ban survives a restart; the in-memory list does not.
+            let listed_ban = inner.queued_manual.get(&key).is_some_and(|requests| {
+                requests
+                    .iter()
+                    .any(|request| request.kind == ManualRequestKind::Ban)
+            });
+            if let (false, Some(queued_at)) = (listed_ban, inner.queued_bans.get(&key)) {
+                queued.push(serde_json::json!({
+                    "request": ManualRequestKind::Ban.as_str(),
+                    "queued_at_unix_ms": queued_at,
+                }));
+            }
             serde_json::json!({
                 "target": hex::encode(row.target),
                 "phase": row.phase.as_str(),
@@ -2256,6 +2987,181 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Codex round 1, item 2: persistence generation ─────────────────
+
+    #[test]
+    fn a_change_made_during_a_write_stays_dirty_and_not_durable() {
+        let mut inner = S4Inner {
+            file_exists: true,
+            ..S4Inner::default()
+        };
+        let first = EvictionKey::new("g".to_string(), [1; 32]);
+        let second = EvictionKey::new("g".to_string(), [2; 32]);
+        inner.mark_not_durable(&first);
+        let snapshot = begin_persist(&mut inner, true).expect("a write is due");
+        // Another task changes rows while the disk write is in flight.
+        inner.mark_not_durable(&first);
+        inner.mark_not_durable(&second);
+        assert!(finish_persist(&mut inner, snapshot.change_seq, true));
+        assert!(inner.dirty, "the newer change still needs a write");
+        assert!(inner.not_durable.contains_key(&first));
+        assert!(inner.not_durable.contains_key(&second));
+        let next = begin_persist(&mut inner, true).expect("the newer change is written");
+        assert!(finish_persist(&mut inner, next.change_seq, true));
+        assert!(!inner.dirty);
+        assert!(inner.not_durable.is_empty());
+        assert_eq!(begin_persist(&mut inner, true).err(), Some(true));
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_store_dirty() {
+        let mut inner = S4Inner {
+            file_exists: true,
+            ..S4Inner::default()
+        };
+        let key = EvictionKey::new("g".to_string(), [1; 32]);
+        inner.mark_not_durable(&key);
+        let snapshot = begin_persist(&mut inner, true).expect("a write is due");
+        assert!(!finish_persist(&mut inner, snapshot.change_seq, false));
+        assert!(inner.dirty);
+        assert!(inner.not_durable.contains_key(&key));
+        assert_eq!(begin_persist(&mut inner, false).err(), Some(false));
+    }
+
+    // ─── Codex round 1, item 4: queued bans survive a restart ──────────
+
+    #[test]
+    fn a_queued_ban_is_written_and_read_back() {
+        let mut inner = S4Inner::default();
+        let key = EvictionKey::new("g".to_string(), [3; 32]);
+        inner.queued_bans.insert(key.clone(), 77);
+        inner.dirty = true;
+        // The store has no row and no file yet: the ban alone creates it.
+        let snapshot = begin_persist(&mut inner, true).expect("the ban is written");
+        let (body, bans) = s4::decode_evs_with_queued_bans(&snapshot.bytes).expect("decode");
+        assert!(body.rows.is_empty());
+        assert_eq!(
+            bans,
+            vec![QueuedBanV1 {
+                stable_group_id: "g".into(),
+                target: [3; 32],
+                queued_at_unix_ms: 77,
+            }]
+        );
+    }
+
+    // ─── Codex round 1, item 3: head sync is not elapsed time ──────────
+
+    #[test]
+    fn elapsed_time_alone_does_not_sync_a_head_with_unresolved_evidence() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let mut rounds = HashMap::new();
+        let holders = [[9; 32]];
+        let asked = refresh_head_round(&mut rounds, "g", "h1", &holders, start, wait);
+        assert_eq!(asked, holders.to_vec());
+        let later = start + wait * 10;
+        let round = rounds.get("g").expect("round");
+        // A stale replica: queued higher-head evidence is still open.
+        assert!(!round.synced("h1", 1, true, true, later, wait));
+        // The restart minimum is necessary.
+        assert!(!round.synced("h1", 1, false, false, later, wait));
+        // No evidence and no answer: the bounded wait ends discovery (D73).
+        assert!(!round.synced("h1", 1, false, true, start, wait));
+        assert!(round.synced("h1", 1, false, true, later, wait));
+        // The round confirms one head only.
+        assert!(!round.synced("h2", 1, false, true, later, wait));
+    }
+
+    #[test]
+    fn a_conflicting_head_report_blocks_the_seal_until_resolved() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let mut rounds = HashMap::new();
+        let holders = [[8; 32], [9; 32]];
+        refresh_head_round(&mut rounds, "g", "h1", &holders, start, wait);
+        note_head_report(&mut rounds, "g", "h1", [8; 32], "higher", start);
+        let later = start + wait * 10;
+        assert!(!rounds
+            .get("g")
+            .expect("round")
+            .synced("h1", 2, false, true, later, wait));
+        // After the wait the round asks every holder again.
+        let again = refresh_head_round(&mut rounds, "g", "h1", &holders, later, wait);
+        assert_eq!(again, holders.to_vec());
+        note_head_report(&mut rounds, "g", "h1", [9; 32], "h1", later);
+        assert!(rounds
+            .get("g")
+            .expect("round")
+            .synced("h1", 2, false, true, later, wait));
+        // A new local head needs a new round.
+        refresh_head_round(&mut rounds, "g", "h2", &holders, later, wait);
+        assert!(!rounds
+            .get("g")
+            .expect("round")
+            .synced("h2", 2, false, true, later, wait));
+    }
+
+    #[test]
+    fn a_confirmed_round_or_no_holder_syncs_at_once() {
+        let wait = Duration::from_secs(13);
+        let now = Instant::now();
+        let mut rounds = HashMap::new();
+        refresh_head_round(&mut rounds, "g", "h1", &[[8; 32]], now, wait);
+        assert!(!rounds
+            .get("g")
+            .expect("round")
+            .synced("h1", 1, false, true, now, wait));
+        note_head_report(&mut rounds, "g", "h1", [8; 32], "h1", now);
+        assert!(rounds
+            .get("g")
+            .expect("round")
+            .synced("h1", 1, false, true, now, wait));
+        let alone = HeadRound::new("h1", now);
+        assert!(alone.synced("h1", 0, false, true, now, wait));
+        assert!(!alone.synced("h1", 0, true, true, now, wait));
+    }
+
+    // ─── Codex round 1, item 1: several revoked OwnerCertified seats ───
+
+    #[test]
+    fn an_s4_removal_seal_tolerates_only_other_open_s4_targets() {
+        let (admin, first, second, other) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+        let mut info = group_with(admin, first);
+        info.add_member(hex::encode(second), GroupRole::Member, None, None);
+        info.add_member(hex::encode(other), GroupRole::Member, None, None);
+        let stable = info.stable_group_id().to_string();
+        let mut store = ObligationStore::new();
+        for (target, hash) in [(first, 7), (second, 8)] {
+            store.intake(
+                &EvictionKey::new(stable.clone(), target),
+                EvictionTrigger::AgentRevocation {
+                    record_hash: [hash; 32],
+                    record_bytes: vec![hash],
+                },
+                None,
+                0,
+                [0; 16],
+            );
+        }
+        let scope = eviction_seal_scope(&store, &EvictionKey::new(stable.clone(), first));
+        let failed_second = vec![hex::encode(second)];
+        // The working copy still seats the target: no tolerance.
+        assert!(!eviction_seal_tolerates(&scope, &info, &failed_second));
+        info.remove_member(&hex::encode(first), Some(hex::encode(admin)));
+        // The second revoked seat is open S4 work: the first removal seals.
+        assert!(eviction_seal_tolerates(&scope, &info, &failed_second));
+        // Any failing seat that is not open S4 work keeps the refusal.
+        let with_other = vec![hex::encode(second), hex::encode(other)];
+        assert!(!eviction_seal_tolerates(&scope, &info, &with_other));
+        assert!(!eviction_seal_tolerates(&scope, &info, &[]));
+        // Outside an S4 removal nothing is tolerated.
+        assert!(!s4_eviction_seal_tolerates(&info, &failed_second));
+        // The second removal then needs no tolerance: its seal is clean.
+        let second_scope = eviction_seal_scope(&store, &EvictionKey::new(stable, second));
+        assert!(second_scope.pending_targets.contains(&hex::encode(first)));
+    }
 
     #[test]
     fn retained_leaves_unknown_group_is_not_tracked() {

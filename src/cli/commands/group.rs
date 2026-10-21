@@ -322,6 +322,29 @@ pub async fn set_role(
     Ok(())
 }
 
+/// `x0x group rebind-certificate` — POST
+/// /groups/:id/members/:agent_id/certificate/rebind (ADR 0110 §4a).
+pub async fn rebind_certificate(
+    client: &DaemonClient,
+    group_id: &str,
+    agent_id: &str,
+    certificate: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut body = json!({});
+    if let Some(certificate) = certificate {
+        body["certificate"] = Value::String(certificate.to_string());
+    }
+    let resp = client
+        .post(
+            &format!("/groups/{group_id}/members/{agent_id}/certificate/rebind"),
+            &body,
+        )
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x group ban` — POST /groups/:id/ban/:agent_id.
 pub async fn ban(client: &DaemonClient, group_id: &str, agent_id: &str) -> Result<()> {
     client.ensure_running().await?;

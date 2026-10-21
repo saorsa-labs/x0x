@@ -11,6 +11,7 @@ mod direct_metadata_lanes;
 mod fair_admission;
 mod group_recovery;
 mod revocation_eviction;
+pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
@@ -20,6 +21,7 @@ pub(in crate::server) use fair_admission::FairAdmission;
 pub(in crate::server) use group_recovery::{
     get_group_recovery, reseat_group_member, run_group_recovery_worker, S3Runtime,
 };
+pub(in crate::server) use revocation_eviction::owner_recovery::sign_recovery_mandate;
 pub(in crate::server) use revocation_eviction::{run_revocation_eviction_worker, S4Runtime};
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
@@ -11229,6 +11231,13 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 from_revision,
             )
             .await;
+            revocation_eviction::rebind::serve_catchup(
+                &serve_state,
+                &requester,
+                &group_ids,
+                from_revision,
+            )
+            .await;
         });
     }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
@@ -11584,6 +11593,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     } else {
         // Record this peer even when another peer's page stream is open.
         // The aggregate fence still decides whether this pass may seal.
+        revocation_eviction::note_catchup_head(
+            state,
+            &fence_ids,
+            &sender_hex,
+            reported_head.as_deref(),
+        )
+        .await;
         self_leave_startup_note_verified_head(
             state,
             &fence_ids,
@@ -16878,6 +16894,7 @@ pub(in crate::server) async fn get_named_group(
             "admin_availability": s4_status.admin_availability,
             "certificate_evidence_waits": s4_status.certificate_evidence_waits,
             "recovery": s3_recovery,
+            "certificate_rebind": s4_status.certificate_rebind,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
@@ -26146,6 +26163,19 @@ async fn leave_treekem_group(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: the next TreeKEM member removal on this thread stops right
+/// after its roster/crypto transaction is durable, as a crash there would
+/// (ADR 0110 §5 crash window).
+#[cfg(test)]
+pub(in crate::server) fn crash_after_removal_commit_on_this_thread_for_test() {
+    CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.set(true));
+}
+
 async fn remove_treekem_named_group_member(
     state: Arc<AppState>,
     id: String,
@@ -26283,6 +26313,46 @@ async fn remove_treekem_named_group_member(
             })),
         );
     }
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: event_group_id,
+        revision,
+        actor: local_agent_hex,
+        agent_id: agent_id_hex.clone(),
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        secret_epoch: None,
+        commit: Some(commit),
+    };
+    // ADR 0110 §5: when S4 runs this removal, the exact outgoing event is
+    // durable in its prepared `.evjournal` and its `.evs` row BEFORE the
+    // new epoch commits. A crash after the commit then cannot lose the
+    // transition the survivors need: restart classifies the saved event
+    // against the chain and delivers it.
+    if revocation_eviction::removal_journal::prepare_committed_removal(
+        &state,
+        &next,
+        &agent_id_hex,
+        &event,
+    )
+    .await
+        == revocation_eviction::removal_journal::RemovalPrepare::NotDurable
+    {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_remove_prepare_not_durable",
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "removal event is not durable yet"
+            })),
+        );
+    }
     // ADR 0107 (review r2): inside this removal's critical section, stop
     // every in-flight egress of the member's join artifacts BEFORE the
     // removal commits, then drop what stays staged AFTER it.
@@ -26291,6 +26361,12 @@ async fn remove_treekem_named_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        revocation_eviction::removal_journal::abandon_prepared_removal(
+            &state,
+            &next,
+            &agent_id_hex,
+        )
+        .await;
         rollback_treekem_group_after_failed_install(
             &state,
             &id,
@@ -26309,24 +26385,21 @@ async fn remove_treekem_named_group_member(
         );
     }
     drop(guard);
+    #[cfg(test)]
+    if CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.replace(false)) {
+        // Test-only crash: the transaction is durable, nothing after it ran.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "test crash after commit" })),
+        );
+    }
 
     save_mls_groups(&state).await;
     let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_removed").await;
 
-    let event = NamedGroupMetadataEvent::MemberRemoved {
-        group_id: event_group_id,
-        revision,
-        actor: local_agent_hex,
-        agent_id: agent_id_hex.clone(),
-        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
-        treekem_epoch: Some(treekem_epoch),
-        secret_epoch: None,
-        commit: Some(commit),
-    };
-    // ADR 0110 §3 and §5: when S4 runs this removal, its obligation row
-    // saves the exact outgoing event durably before the first publication.
-    // A crash or a partition after this point then cannot lose the
-    // exclusion: S4 delivers the saved event to each survivor.
+    // ADR 0110 §3 and §5: the transaction is durable; S4's row moves to
+    // `committed_delivery_pending` and its delivery to each survivor starts
+    // before the first publication.
     revocation_eviction::record_committed_removal(&state, &next, &agent_id_hex, &event).await;
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -28057,10 +28130,20 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         let group_id = info.stable_group_id().to_string();
         let failed = verdict.failed();
         if !failed.is_empty() {
+            let members: Vec<String> = failed.iter().map(|(hex, _)| hex.clone()).collect();
+            // ADR 0110 §3: an S4 removal of one revoked or expired seat may
+            // seal while the group's other open S4 targets still fail; each
+            // gets its own transition (ADR-0038 B3, no prune).
+            if verdict.in_grace().is_empty()
+                && verdict.digest_pending().is_empty()
+                && revocation_eviction::s4_eviction_seal_tolerates(info, &members)
+            {
+                return info.seal_commit_evicting(signing_kp, now_ms);
+            }
             return Err(
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     group_id,
-                    members: failed.iter().map(|(hex, _)| hex.clone()).collect(),
+                    members,
                 },
             );
         }
@@ -45160,6 +45243,7 @@ pub(in crate::server) mod tests {
     mod adr0068_quarantine_pin;
     mod adr0068_task_buffer;
     mod adr0107_stuck_join_rearm;
+    mod adr0110_certificate_rebind;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod home_control_payload_size;

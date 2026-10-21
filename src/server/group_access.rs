@@ -380,6 +380,13 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/:id/display-name",
         level: AccessLevel::JoinSelf,
     },
+    // ADR 0110 §4a: the self-rebind's subject is the daemon's own Active
+    // seat; the handler refuses any other agent's seat.
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/members/:agent_id/certificate/rebind",
+        level: AccessLevel::JoinSelf,
+    },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/state/seal",
@@ -1960,6 +1967,11 @@ mod tests {
             (
                 Method::PUT,
                 "/groups/:id/display-name",
+                AccessLevel::JoinSelf,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/members/:agent_id/certificate/rebind",
                 AccessLevel::JoinSelf,
             ),
             (Method::POST, "/groups/:id/state/seal", AccessLevel::Admin),

@@ -1,0 +1,453 @@
+//! ADR 0110 §5: the prepare barrier of a seated target's removal.
+//!
+//! The §5 order is: the exact outgoing frame goes into a prepared
+//! `.evjournal` and the `.evs` row first, then the legacy roster/crypto
+//! transaction runs, then the row moves to `committed_delivery_pending`
+//! and the journal retires. The crypto-only exclusion has always done
+//! this. A seated-target removal builds its `MemberRemoved` (with the
+//! TreeKEM commit and the signed state commit) inside the legacy removal
+//! path, so that path calls [`prepare_committed_removal`] after it builds
+//! the event and before it commits the new epoch.
+//!
+//! - **Prepare** ([`prepare_committed_removal`]). Only a row that S4
+//!   prepared for this removal changes. The row and the journal get the
+//!   exact event, its result head and its epoch, and both are fsynced. If
+//!   either write fails the removal must not commit.
+//! - **Abandon** ([`abandon_prepared_removal`]). The legacy transaction
+//!   failed after the prepare: the saved event is cleared, so a restart
+//!   never delivers an event that did not commit.
+//! - **Restart** ([`adopt_journal_removals`]). A journal that holds a
+//!   removal event gives that event to its row when the `.evs` row has
+//!   none. `removal_delivery::resume_after_load` then classifies it
+//!   against the verified chain like a crypto-only frame: a landed commit
+//!   is delivered again, an unchanged parent returns the row to `pending`.
+
+use std::collections::HashMap;
+
+use crate as x0x;
+use crate::server::state::AppState;
+use x0x::groups::eviction::{self as s4, EvJournalV1, EvictionKey, ObligationStore, Phase};
+use x0x::groups::GroupInfo;
+
+use super::super::NamedGroupMetadataEvent;
+use super::removal_delivery::decode_saved_removal;
+
+/// The result of [`prepare_committed_removal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum RemovalPrepare {
+    /// S4 did not prepare this removal: the legacy path runs unchanged.
+    NotS4,
+    /// The exact event is durable in the `.evjournal` and the `.evs`.
+    Durable,
+    /// The event could not be made durable: do not commit the removal.
+    NotDurable,
+}
+
+fn row_key(info: &GroupInfo, target_hex: &str) -> Option<EvictionKey> {
+    let target = super::super::parse_agent_id_hex(target_hex).ok()?;
+    Some(EvictionKey::new(
+        info.stable_group_id().to_string(),
+        *target.as_bytes(),
+    ))
+}
+
+/// Read the prepared journal of `key`, when the file holds one for it.
+async fn read_prepared_journal(path: &std::path::Path, key: &EvictionKey) -> Option<EvJournalV1> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    let journal = s4::decode_evjournal(&bytes).ok()?;
+    (journal.stable_group_id == key.stable_group_id && journal.target == key.target)
+        .then_some(journal)
+}
+
+/// §5 step 1 of S4's removal of `target_hex`: save the exact outgoing
+/// `event` in the prepared `.evjournal` and the `.evs` row, and fsync both,
+/// before the legacy transaction commits the new epoch.
+///
+/// `info` is the sealed after-image. The caller holds the group's
+/// membership lock and its TreeKEM lock, and it has not persisted the
+/// transaction yet. On [`RemovalPrepare::NotDurable`] the caller rolls the
+/// removal back and fails it.
+pub(in crate::server) async fn prepare_committed_removal(
+    state: &AppState,
+    info: &GroupInfo,
+    target_hex: &str,
+    event: &NamedGroupMetadataEvent,
+) -> RemovalPrepare {
+    let Some(key) = row_key(info, target_hex) else {
+        return RemovalPrepare::NotS4;
+    };
+    let is_s4_removal = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .store
+            .get(&key)
+            .is_some_and(|row| row.phase == Phase::Prepared && row.parent_head.is_some())
+    };
+    if !is_s4_removal {
+        return RemovalPrepare::NotS4;
+    }
+    let Ok(bytes) = serde_json::to_vec(event) else {
+        return RemovalPrepare::NotDurable;
+    };
+    let Some(saved) = decode_saved_removal(&bytes) else {
+        return RemovalPrepare::NotDurable;
+    };
+    let path = super::evjournal_path(state, &key.stable_group_id);
+    let existing = read_prepared_journal(&path, &key).await;
+    let journal = {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        let Some(row) = inner.store.get_mut(&key) else {
+            return RemovalPrepare::NotS4;
+        };
+        let Some(parent_head) = row.parent_head.clone() else {
+            return RemovalPrepare::NotS4;
+        };
+        if row.phase != Phase::Prepared {
+            return RemovalPrepare::NotS4;
+        }
+        row.result_head = Some(saved.result_head.clone());
+        row.result_epoch = saved.result_epoch;
+        row.outgoing_event = Some(bytes.clone());
+        let mut journal = super::prepared_journal(row, parent_head, info.state_revision);
+        if let Some(existing) = existing {
+            // Keep the transaction identity of the journal S4 wrote first.
+            journal.txid = existing.txid;
+        }
+        journal.result_epoch = saved.result_epoch;
+        journal.result_head = Some(saved.result_head);
+        journal.outgoing_event = bytes;
+        inner.dirty = true;
+        journal
+    };
+    let written = super::write_evjournal(&path, &journal).await;
+    let durable = written && super::persist_obligations(state).await;
+    if durable {
+        return RemovalPrepare::Durable;
+    }
+    tracing::warn!(
+        group_id = %super::super::LogHexId::group(info.stable_group_id()),
+        target = %super::super::LogHexId::agent(target_hex),
+        "ADR 0110 S4: the removal event is not durable; the removal does not commit"
+    );
+    abandon_prepared_removal(state, info, target_hex).await;
+    RemovalPrepare::NotDurable
+}
+
+/// The legacy transaction did not commit after [`prepare_committed_removal`]:
+/// clear the saved event of the still-`prepared` row. The S4 caller then
+/// returns the row to `pending`, persists the `.evs` and retires the
+/// journal.
+pub(in crate::server) async fn abandon_prepared_removal(
+    state: &AppState,
+    info: &GroupInfo,
+    target_hex: &str,
+) {
+    let Some(key) = row_key(info, target_hex) else {
+        return;
+    };
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    let Some(row) = inner.store.get_mut(&key) else {
+        return;
+    };
+    if row.phase != Phase::Prepared {
+        return;
+    }
+    row.result_head = None;
+    row.result_epoch = None;
+    row.outgoing_event = None;
+    inner.dirty = true;
+}
+
+/// §5 restart: give each open row the removal event of its prepared
+/// journal when the `.evs` row lost it or never saved it. The parent head
+/// comes from the journal too, so the classification against the chain
+/// can tell a landed commit from an unchanged parent.
+pub(super) fn adopt_journal_removals(
+    store: &mut ObligationStore,
+    journals: &HashMap<EvictionKey, EvJournalV1>,
+) {
+    for (key, journal) in journals {
+        let Some(saved) = decode_saved_removal(&journal.outgoing_event) else {
+            continue;
+        };
+        let Some(row) = store.get_mut(key) else {
+            continue;
+        };
+        if !row.phase.is_open() || row.outgoing_event.is_some() {
+            continue;
+        }
+        row.parent_head = Some(journal.parent_head.clone());
+        row.result_head = Some(saved.result_head);
+        row.result_epoch = saved.result_epoch;
+        row.outgoing_event = Some(journal.outgoing_event.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
+    use x0x::groups::eviction::EvictionTrigger;
+
+    fn commit(prev: &str, hash: &str) -> x0x::groups::state_commit::GroupStateCommit {
+        x0x::groups::state_commit::GroupStateCommit {
+            group_id: "g".to_string(),
+            revision: 2,
+            prev_state_hash: Some(prev.to_string()),
+            roster_root: String::new(),
+            policy_hash: String::new(),
+            public_meta_hash: String::new(),
+            security_binding: None,
+            state_hash: hash.to_string(),
+            withdrawn: false,
+            committed_by: String::new(),
+            committed_at: 0,
+            signer_public_key: String::new(),
+            signature: String::new(),
+        }
+    }
+
+    fn removal_bytes(prev: &str, hash: &str, target: &[u8; 32]) -> Vec<u8> {
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: "g".to_string(),
+            revision: 2,
+            actor: "a".repeat(64),
+            agent_id: hex::encode(target),
+            treekem_commit_b64: Some("Y29tbWl0".to_string()),
+            treekem_epoch: Some(3),
+            secret_epoch: None,
+            commit: Some(commit(prev, hash)),
+        };
+        serde_json::to_vec(&event).unwrap_or_default()
+    }
+
+    fn prepared_store(key: &EvictionKey) -> ObligationStore {
+        let mut store = ObligationStore::new();
+        store.intake(
+            key,
+            EvictionTrigger::SelfLeave {
+                commit_hash: "p".to_string(),
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        if let Some(row) = store.get_mut(key) {
+            row.phase = Phase::Prepared;
+        }
+        store
+    }
+
+    fn journal(key: &EvictionKey, outgoing_event: Vec<u8>) -> EvJournalV1 {
+        EvJournalV1 {
+            txid: [1; 16],
+            stable_group_id: key.stable_group_id.clone(),
+            target: key.target,
+            parent_head: "p".to_string(),
+            next_revision: 2,
+            result_epoch: Some(3),
+            evidence: Vec::new(),
+            outgoing_event,
+            result_head: Some("r".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_journal_removal_event_is_adopted_by_its_row() {
+        let key = EvictionKey::new("g", [7; 32]);
+        let mut store = prepared_store(&key);
+        let bytes = removal_bytes("p", "r", &key.target);
+        let journals = HashMap::from([(key.clone(), journal(&key, bytes.clone()))]);
+        adopt_journal_removals(&mut store, &journals);
+        let row = store.get(&key).expect("row");
+        assert_eq!(row.outgoing_event.as_deref(), Some(bytes.as_slice()));
+        assert_eq!(row.parent_head.as_deref(), Some("p"));
+        assert_eq!(row.result_head.as_deref(), Some("r"));
+        assert_eq!(row.result_epoch, Some(3));
+    }
+
+    #[test]
+    fn an_empty_or_crypto_journal_is_not_a_removal_event() {
+        let key = EvictionKey::new("g", [7; 32]);
+        let mut store = prepared_store(&key);
+        let journals = HashMap::from([
+            (key.clone(), journal(&key, Vec::new())),
+            (
+                EvictionKey::new("g", [8; 32]),
+                journal(&key, b"X0XCE1\0frame".to_vec()),
+            ),
+        ]);
+        adopt_journal_removals(&mut store, &journals);
+        assert!(store.get(&key).expect("row").outgoing_event.is_none());
+    }
+
+    #[test]
+    fn a_saved_row_event_wins_over_the_journal() {
+        let key = EvictionKey::new("g", [7; 32]);
+        let mut store = prepared_store(&key);
+        let saved = removal_bytes("p", "r", &key.target);
+        if let Some(row) = store.get_mut(&key) {
+            row.outgoing_event = Some(saved.clone());
+        }
+        let journals = HashMap::from([(
+            key.clone(),
+            journal(&key, removal_bytes("p", "other", &key.target)),
+        )]);
+        adopt_journal_removals(&mut store, &journals);
+        assert_eq!(
+            store.get(&key).expect("row").outgoing_event.as_deref(),
+            Some(saved.as_slice())
+        );
+    }
+
+    /// A two-member TreeKEM group on `state`: the local admin and a seated
+    /// target with its KeyPackage, plus one roster-only survivor.
+    async fn seated_target_group(state: &AppState, group_id: &str) -> anyhow::Result<String> {
+        let admin_id = state.agent.agent_id();
+        let group_id_bytes = hex::decode(group_id)?;
+        let seed = super::super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+        let target_id = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let target_hex = hex::encode(target_id.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(target_id, &[9u8; 32])?;
+        let kp_bytes = prepared.key_package_bytes().to_vec();
+        admin_group.add_member(target_id, &kp_bytes)?;
+        let epoch = admin_group.epoch();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+        let mut info = GroupInfo::new(
+            "s4-removal-journal".to_string(),
+            String::new(),
+            admin_id,
+            group_id.to_string(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.add_member(
+            target_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &target_hex,
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &kp_bytes),
+        );
+        let survivor = x0x::identity::AgentKeypair::generate()?.agent_id();
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        info.secret_epoch = epoch;
+        info.security_binding = Some(format!("treekem:epoch={epoch}"));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        state.treekem_groups.write().await.insert(
+            group_id.to_string(),
+            Arc::new(tokio::sync::Mutex::new(admin_group)),
+        );
+        Ok(target_hex)
+    }
+
+    /// ADR 0110 §5 crash window (#1357 review): S4 prepared the removal,
+    /// the legacy roster/crypto transaction committed the new epoch, and
+    /// the process died before the old post-commit save of the outgoing
+    /// event. A restart must still hold the exact `MemberRemoved` with its
+    /// TreeKEM commit and deliver it to the survivors; it must not return
+    /// the row to `pending` with no event.
+    #[tokio::test]
+    async fn a_crash_after_the_removal_commit_keeps_the_exact_event() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "ab".repeat(16);
+        let target_hex = seated_target_group(&state, &group_id).await?;
+        let target = super::super::super::parse_agent_id_hex(&target_hex)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (stable, parent_head, next_revision) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("group");
+            (
+                info.stable_group_id().to_string(),
+                info.state_hash.clone(),
+                info.state_revision.saturating_add(1),
+            )
+        };
+        let key = EvictionKey::new(stable, *target.as_bytes());
+
+        // S4's prepare step, as `commit_removal` runs it.
+        let journal = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store = prepared_store(&key);
+            let row = inner.store.get_mut(&key).expect("row");
+            row.parent_head = Some(parent_head.clone());
+            let journal = super::super::prepared_journal(row, parent_head, next_revision);
+            inner.dirty = true;
+            journal
+        };
+        let journal_path = super::super::evjournal_path(&state, &key.stable_group_id);
+        assert!(super::super::write_evjournal(&journal_path, &journal).await);
+        assert!(super::super::persist_obligations(&state).await);
+
+        // The legacy transaction commits, then the process dies.
+        super::super::super::crash_after_removal_commit_on_this_thread_for_test();
+        let membership_lock = super::super::super::group_membership_lock(&state, &group_id).await;
+        let membership_guard = membership_lock.lock().await;
+        let (status, body) = super::super::super::remove_treekem_named_group_member(
+            Arc::clone(&state),
+            group_id.clone(),
+            target_hex.clone(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+        )
+        .await;
+        drop(membership_guard);
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body:?}"
+        );
+        let committed_head = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("group");
+            assert!(
+                !info.has_active_member(&target_hex),
+                "the legacy transaction committed the removal"
+            );
+            info.state_hash.clone()
+        };
+
+        // Restart: the S4 state is reloaded from disk.
+        *state.revocation_evictions.inner.lock().await = super::super::S4Inner::default();
+        super::super::load_persisted_obligations(&state).await;
+
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner.store.get(&key).expect("row survives the restart");
+        assert_eq!(
+            row.phase,
+            Phase::CommittedDeliveryPending,
+            "the committed removal is still being delivered"
+        );
+        assert_eq!(row.result_head.as_deref(), Some(committed_head.as_str()));
+        let saved = row
+            .outgoing_event
+            .as_deref()
+            .and_then(decode_saved_removal)
+            .expect("the exact MemberRemoved survives the crash");
+        assert!(matches!(
+            saved.event,
+            NamedGroupMetadataEvent::MemberRemoved {
+                treekem_commit_b64: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            inner.removals.contains_key(&key),
+            "restart resumes the delivery to the survivors"
+        );
+        Ok(())
+    }
+}

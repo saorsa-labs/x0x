@@ -773,6 +773,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/messaging.rs",
     "src/server/routes/named_groups.rs",
     "src/server/routes/named_groups/group_recovery.rs",
+    "src/server/routes/named_groups/revocation_eviction/rebind.rs",
     "src/server/routes/network.rs",
     "src/server/routes/owner.rs",
     "src/server/routes/presence.rs",

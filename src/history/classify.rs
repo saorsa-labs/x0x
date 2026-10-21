@@ -98,6 +98,8 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
         || crate::groups::crypto_exclusion::decode_frame(payload).is_ok()
         // ADR 0109 §5: S3 attestation requests and responses, likewise.
         || crate::groups::recovery::decode_message(payload).is_ok()
+        || crate::groups::cert_rebind::decode_frame(payload).is_ok()
+        || crate::groups::owner_recovery::decode_frame(payload).is_ok()
     {
         return DmPayloadClass::Ephemeral;
     }
@@ -234,6 +236,10 @@ mod tests {
         );
         assert_eq!(
             classify_dm_payload(b"X0XCE1 hello"),
+            DmPayloadClass::Durable("text/plain")
+        );
+        assert_eq!(
+            classify_dm_payload(b"X0XCRB1 hello"),
             DmPayloadClass::Durable("text/plain")
         );
     }
