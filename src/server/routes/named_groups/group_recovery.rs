@@ -487,8 +487,20 @@ async fn scan_sidecar_dir(
 ) {
     let mut loaded = HashMap::new();
     let mut faults = HashMap::new();
-    // RED STUB (commit A): 11ff5a0 runs no resume.
-    let _ = sidecar_resume::resume_pending;
+    for (file, step) in sidecar_resume::resume_pending(dir).await {
+        let stem = file
+            .strip_suffix(&format!(".{}", s3::GROUP_RECOVERY_EXTENSION))
+            .unwrap_or(&file)
+            .to_string();
+        tracing::warn!(file = %file, step, "ADR 0109 S3: interrupted sidecar quarantine did not resume; memory-only");
+        faults.insert(
+            stem,
+            SidecarFault::QuarantineFailed {
+                file,
+                step: step.to_string(),
+            },
+        );
+    }
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return (loaded, faults);
     };
@@ -816,9 +828,25 @@ fn reseat_overlay(
     journals: &[ReseatJournalV1],
     placeheld: &HashSet<String>,
 ) -> Option<HashMap<String, GroupInfo>> {
-    // RED STUB (commit A): 11ff5a0 writes the live map as it is.
-    let _ = (groups, journals, placeheld);
-    None
+    let mut view: Option<HashMap<String, GroupInfo>> = None;
+    for journal in journals {
+        if journal.phase == ReseatPhase::Swapping {
+            continue;
+        }
+        let Ok(original) = serde_json::from_slice::<GroupInfo>(&journal.live_record) else {
+            continue;
+        };
+        let stable = original.stable_group_id().to_string();
+        let view = view.get_or_insert_with(|| groups.clone());
+        view.retain(|_, info| info.stable_group_id() != stable);
+        let entry = if placeheld.contains(&stable) {
+            s3_placeholder(&original)
+        } else {
+            original
+        };
+        view.insert(journal.live_key.clone(), entry);
+    }
+    view
 }
 
 /// `info` is the journalled original record (same revision and head), not
@@ -836,9 +864,9 @@ fn is_journalled_original(info: &GroupInfo, journal: &ReseatJournalV1) -> bool {
 /// the original, so the staged state is gone) or the live record is
 /// absent or is the original.
 fn staged_join_lost(journal: &ReseatJournalV1, live: Option<&GroupInfo>, preparing: bool) -> bool {
-    // RED STUB (commit A): the 11ff5a0 rule.
-    let _ = journal;
-    !preparing && live.is_none()
+    !preparing
+        && (journal.phase == ReseatPhase::Staging
+            || live.is_none_or(|info| is_journalled_original(info, journal)))
 }
 
 /// Write `groups[key]` as the sidecar's authoritative record of `stable`
@@ -1260,9 +1288,7 @@ enum Guard {
 /// advert admits an S3 write. Unknown, expired or card-only support sends
 /// nothing.
 fn capability_admits(supported: Option<bool>) -> bool {
-    // RED STUB (commit A): 11ff5a0 gates nothing.
-    let _ = supported;
-    true
+    supported == Some(true)
 }
 
 /// The sync part of [`contained`]: a marker or an owner-armed gap record
@@ -1291,9 +1317,16 @@ fn reseat_write_admits(
     digest: &[u8; 32],
     now_ms: u64,
 ) -> bool {
-    // RED STUB (commit A): the 11ff5a0 write check.
-    let _ = (issuer_contained, issued, digest, now_ms);
-    !info.withdrawn && !info.has_active_member(recipient_hex) && !info.is_banned(recipient_hex)
+    !info.withdrawn
+        && !info.has_active_member(recipient_hex)
+        && !info.is_banned(recipient_hex)
+        && !issuer_contained
+        && issued.iter().any(|entry| {
+            let fields = &entry.authorisation.fields;
+            fields.subject.eq_ignore_ascii_case(recipient_hex)
+                && fields.expires_at_ms > now_ms
+                && entry.authorisation.digest() == *digest
+        })
 }
 
 fn admission(
