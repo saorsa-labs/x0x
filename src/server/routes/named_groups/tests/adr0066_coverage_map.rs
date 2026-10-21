@@ -654,6 +654,15 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
         "POST /groups/:id/quarantine/clear",
         RouteClass::ControlPlane,
     ),
+    // ADR 0109 §3: the admin's manual re-seat of a forked or contained
+    // node. It is a membership operation (a seating commit plus an
+    // authorisation for the subject), and it is the remedy for the fork
+    // itself. Gating it on the fork marker would make the fork permanent,
+    // the same argument as the quarantine clear above.
+    (
+        "POST /groups/:id/members/:agent_id/reseat",
+        RouteClass::ControlPlane,
+    ),
     // The MLS plane's own membership surface.
     ("POST /mls/groups", RouteClass::ControlPlane),
     ("GET /mls/groups", RouteClass::ControlPlane),
@@ -667,6 +676,10 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     // ── Observability ───────────────────────────────────────────────────
     ("GET /diagnostics/groups", RouteClass::Observability),
     ("GET /history/policy", RouteClass::Observability),
+    // ADR 0109 §8: reports the recovery object, the pending requesters and
+    // the re-seats this admin issued. It acts on nothing, and a forked node
+    // must still be able to show that it is forked.
+    ("GET /groups/:id/recovery", RouteClass::Observability),
     // ── Not bound to group authority state ──────────────────────────────
     // The adversarial confidentiality-proof endpoint: it opens an envelope
     // with THIS daemon's own KEM key and reads no group authority state

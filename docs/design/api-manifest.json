@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 211,
+  "endpoint_count": 213,
   "endpoints": [
     {
       "category": "status",
@@ -2531,6 +2531,40 @@
           }
         ],
         "kind": "fields"
+      }
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group reseat",
+      "description": "Re-seat a forked or removed node by hand under a signed authorisation (admin+, ADR 0109 §3)",
+      "method": "POST",
+      "path": "/groups/:id/members/:agent_id/reseat",
+      "request": {
+        "fields": [
+          {
+            "cli": "--reason",
+            "in": "body",
+            "name": "reason",
+            "required": true
+          },
+          {
+            "cli": "--basis",
+            "in": "body",
+            "name": "basis",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group recovery",
+      "description": "Show this node's ADR 0109 recovery state, and on an admin the pending requesters and issued re-seats",
+      "method": "GET",
+      "path": "/groups/:id/recovery",
+      "request": {
+        "kind": "none"
       }
     },
     {
