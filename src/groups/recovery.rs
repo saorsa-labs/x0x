@@ -1645,6 +1645,67 @@ pub fn apply_link_state_only(
     Ok(next)
 }
 
+/// Where a non-joiner stands on a provisional signer's promotion path
+/// (§2 "Verification and signer eligibility").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionalPath {
+    /// The node has not yet applied the link that makes the signer an
+    /// Active admin; every link it applied so far is the ATA's prefix.
+    Pending,
+    /// The applied links are the ATA's prefix and end at (or pass) the
+    /// link that makes the signer an Active admin: the ATA may arm for the
+    /// rest of its sequence.
+    Verified,
+    /// The head left the ATA's sequence, an applied hash differs from the
+    /// prefix, or the whole sequence applied with no promotion: drop it.
+    Unverified,
+}
+
+/// §2: a node that is not a joiner verifies a provisional signer by
+/// applying the promotion path through the ordinary path, ungated. The
+/// ordinary apply path checks every committer against its predecessor
+/// roster; this checks that what it applied is the ATA's own prefix, in
+/// order, and that the signer is now an Active admin on `info`.
+#[must_use]
+pub fn provisional_path(ata: &AdminTerminalAttestation, info: &GroupInfo) -> ProvisionalPath {
+    let fields = &ata.fields;
+    if info.state_revision == fields.from_revision && info.state_hash == fields.from_state_hash {
+        return ProvisionalPath::Pending;
+    }
+    let Some(index) = fields
+        .sequence
+        .iter()
+        .position(|hash| *hash == info.state_hash)
+    else {
+        return ProvisionalPath::Unverified;
+    };
+    let prefix_applied =
+        fields
+            .sequence
+            .iter()
+            .take(index + 1)
+            .enumerate()
+            .all(|(offset, hash)| {
+                let revision = fields
+                    .from_revision
+                    .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX))
+                    .saturating_add(1);
+                info.commit_log.iter().any(|entry| {
+                    entry.commit.revision == revision && entry.commit.state_hash == *hash
+                })
+            });
+    if !prefix_applied {
+        return ProvisionalPath::Unverified;
+    }
+    if signer_is_active_admin(info, &fields.attested_by) {
+        ProvisionalPath::Verified
+    } else if index + 1 >= fields.sequence.len() {
+        ProvisionalPath::Unverified
+    } else {
+        ProvisionalPath::Pending
+    }
+}
+
 /// §2 "Segments": the links of a kept served chain still to apply when
 /// this node's head is `(head_revision, head_state_hash)`. After an earlier
 /// segment the head is inside the chain, so the links up to it are already
@@ -1942,6 +2003,69 @@ mod tests {
         assert_eq!(
             chain_position(&info, info.state_revision + 1, "ahead"),
             ChainPosition::AttesterBehind
+        );
+    }
+
+    #[test]
+    fn provisional_path_verifies_only_the_applied_promotion_prefix() {
+        let admin = keypair();
+        let m1_keys = keypair();
+        let m1 = hex::encode(m1_keys.agent_id().as_bytes());
+        let mut info = signed_group(&admin);
+        info.add_member(
+            m1.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        info.seal_commit(&admin, 1_500).expect("seal add");
+        let base = info.clone();
+        // r+1: a rename; r+2: M1 promoted to admin; r+3: another rename.
+        info.name = "one".to_string();
+        info.seal_commit(&admin, 2_000).expect("seal rename");
+        let after_rename = info.clone();
+        if let Some(member) = info.members_v2.get_mut(&m1) {
+            member.role = GroupRole::Admin;
+        }
+        info.seal_commit(&admin, 3_000).expect("seal promotion");
+        let after_promotion = info.clone();
+        info.name = "two".to_string();
+        info.seal_commit(&admin, 4_000).expect("seal rename");
+        let sequence: Vec<String> = info
+            .commit_log
+            .iter()
+            .filter(|entry| entry.commit.revision > base.state_revision)
+            .map(|entry| entry.commit.state_hash.clone())
+            .collect();
+        assert_eq!(sequence.len(), 3);
+        let mut ata_fields = fields(&m1_keys);
+        ata_fields.from_revision = base.state_revision;
+        ata_fields.from_state_hash = base.state_hash.clone();
+        ata_fields.segment_terminal_revision = info.state_revision;
+        ata_fields.sequence = sequence;
+        let ata = AdminTerminalAttestation::sign(ata_fields, &m1_keys).expect("sign");
+
+        assert_eq!(provisional_path(&ata, &base), ProvisionalPath::Pending);
+        assert_eq!(
+            provisional_path(&ata, &after_rename),
+            ProvisionalPath::Pending
+        );
+        assert_eq!(
+            provisional_path(&ata, &after_promotion),
+            ProvisionalPath::Verified
+        );
+        // A head that left the sequence is dropped.
+        let mut off = after_rename.clone();
+        off.state_hash = "sibling".to_string();
+        assert_eq!(provisional_path(&ata, &off), ProvisionalPath::Unverified);
+        // The whole sequence applied, but the signer was demoted at its end.
+        let mut demoted = info.clone();
+        if let Some(member) = demoted.members_v2.get_mut(&m1) {
+            member.role = GroupRole::Member;
+        }
+        assert_eq!(
+            provisional_path(&ata, &demoted),
+            ProvisionalPath::Unverified
         );
     }
 

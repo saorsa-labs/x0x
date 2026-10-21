@@ -190,6 +190,10 @@ struct SubjectState {
     /// trigger waits [`s3::GATE_STALL`] without progress.
     progress_revision: u64,
     progress_at: Instant,
+    /// §2: a provisional ATA this node (not a joiner) verifies by applying
+    /// its promotion path through the ordinary path, with the head at which
+    /// it last asked the signer for a catch-up page.
+    provisional: Option<(AdminTerminalAttestation, u64)>,
 }
 
 impl SubjectState {
@@ -206,6 +210,7 @@ impl SubjectState {
             last_refusal: None,
             progress_revision: revision,
             progress_at: now,
+            provisional: None,
         }
     }
 
@@ -1257,22 +1262,10 @@ pub(super) async fn apply_join_carry(
         .map(|link| link.commit.state_hash.clone())
         .chain(std::iter::once(terminal.state_hash.clone()))
         .collect();
-    if !ata.agrees_with(&served) {
-        // Two answers for one head that diverge: a conflict (§2).
-        set_view(
-            state,
-            &stable,
-            current.state_revision,
-            SubjectView::Reseat {
-                cause: "attestation_conflict",
-                recovery_ref: RecoveryRef::live_refs(&current).into_iter().next(),
-            },
-        )
-        .await;
-        return false;
-    }
     // Signer eligibility: verified on this node's roster, or provisional
-    // with a promotion path inside the walked served chain.
+    // with a promotion path inside the walked served chain. A provisional
+    // ATA whose path does not verify has no authority at all: it arms
+    // nothing and causes no conflict (§2), so it is checked first.
     let verified = ata.signer_verified_on(&current);
     let armed_from = if verified {
         0
@@ -1293,6 +1286,20 @@ pub(super) async fn apply_join_carry(
             }
         }
     };
+    if !ata.agrees_with(&served) {
+        // Two answers for one head that diverge: a conflict (§2).
+        set_view(
+            state,
+            &stable,
+            current.state_revision,
+            SubjectView::Reseat {
+                cause: "attestation_conflict",
+                recovery_ref: RecoveryRef::live_refs(&current).into_iter().next(),
+            },
+        )
+        .await;
+        return false;
+    }
     // An owner-attested record keeps precedence; an armed record is never
     // re-armed by an ATA.
     let owner_armed = current
@@ -1793,6 +1800,7 @@ async fn subject_tick(state: &Arc<AppState>) {
             .await;
             continue;
         }
+        provisional_tick(state, &key, &info).await;
         let Some(target) = next_target(state, &key, &info, &local, &refs, now).await else {
             continue;
         };
@@ -2252,7 +2260,9 @@ async fn arm_from_response(
         .await
         .and_then(|body| body.active_ata)
     {
-        if active.conflicts_with(&ata) {
+        // A provisional ATA causes no conflict (§2): only a verified
+        // signer's diverging sequence stops automatic catch-up.
+        if active.conflicts_with(&ata) && ata.signer_verified_on(info) {
             set_view(
                 state,
                 &stable,
@@ -2274,18 +2284,45 @@ async fn arm_from_response(
     }
     let verified = ata.signer_verified_on(info);
     if !verified {
+        if pre_welcome {
+            // A joiner verifies a provisional signer only by walking its
+            // kept served chain (`apply_kept_chain` above); it applies no
+            // link by the ordinary path.
+            set_view(
+                state,
+                &stable,
+                info.state_revision,
+                SubjectView::Awaiting {
+                    reason: "provisional_unverified".to_string(),
+                },
+            )
+            .await;
+            return;
+        }
         // A non-joiner verifies a provisional signer's promotion path by
         // applying those links through the ordinary path, ungated; until
-        // then the ATA has no gate authority.
-        set_view(
-            state,
-            &stable,
-            info.state_revision,
-            SubjectView::Awaiting {
-                reason: "provisional_unverified".to_string(),
-            },
-        )
-        .await;
+        // then the ATA has no gate authority (`provisional_tick`).
+        let attested_by = ata.fields.attested_by.clone();
+        let segment_terminal = ata.fields.segment_terminal_revision;
+        {
+            let now = Instant::now();
+            let mut inner = state.group_recovery.inner.lock().await;
+            let subject = inner
+                .subjects
+                .entry(stable.clone())
+                .or_insert_with(|| SubjectState::new(now, info.state_revision));
+            subject.provisional = Some((ata, info.state_revision));
+            if !subject.view.sticky() {
+                subject.view = SubjectView::CatchingUp {
+                    attested_by: attested_by.clone(),
+                    verified: false,
+                    segment_terminal,
+                };
+            }
+        }
+        if let Some(raw) = parse_raw(&attested_by) {
+            let _ = super::request_treekem_catchup_page(state, group_key, &AgentId(raw)).await;
+        }
         return;
     }
     // An owner-attested record keeps precedence (§2 "Arming").
@@ -2322,6 +2359,129 @@ async fn arm_from_response(
     .await;
     if let Some(raw) = parse_raw(&ata.fields.attested_by) {
         let _ = super::request_treekem_catchup_page(state, group_key, &AgentId(raw)).await;
+    }
+}
+
+/// §2 "Verification and signer eligibility", non-joiner: follow a held
+/// provisional ATA. While its promotion path is still applying, ask the
+/// signer for the next catch-up page whenever the head moves. Once the
+/// applied links are the ATA's prefix and the signer is an Active admin
+/// on this node's roster, the ATA arms for the rest of its sequence. A
+/// path that leaves the sequence, an expired arming window or a revoked
+/// signer drops it with `awaiting_attestation {provisional_unverified}`.
+async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) {
+    let stable = info.stable_group_id().to_string();
+    let Some((ata, asked_revision)) = state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get(&stable)
+        .and_then(|subject| subject.provisional.clone())
+    else {
+        return;
+    };
+    let window = u64::try_from(s3::ATA_ARM_WINDOW.as_millis()).unwrap_or(u64::MAX);
+    let expired = now_ms().saturating_sub(ata.fields.issued_at_ms) > window;
+    let signer_revoked = match parse_raw(&ata.fields.attested_by) {
+        Some(raw) => agent_revoked(state, &AgentId(raw)).await,
+        None => true,
+    };
+    let armed_elsewhere = armed_admin_ata(state, info).await.is_some();
+    let path = if expired || signer_revoked {
+        s3::ProvisionalPath::Unverified
+    } else {
+        s3::provisional_path(&ata, info)
+    };
+    let signer = parse_raw(&ata.fields.attested_by).map(AgentId);
+    match path {
+        _ if armed_elsewhere => {
+            // Another, verified ATA armed meanwhile: it governs.
+            clear_provisional(state, &stable).await;
+        }
+        s3::ProvisionalPath::Pending => {
+            if info.state_revision != asked_revision {
+                if let Some(subject) = state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .get_mut(&stable)
+                {
+                    if let Some((_, asked)) = subject.provisional.as_mut() {
+                        *asked = info.state_revision;
+                    }
+                }
+                if let Some(signer) = signer.as_ref() {
+                    let _ = super::request_treekem_catchup_page(state, group_key, signer).await;
+                }
+            }
+        }
+        s3::ProvisionalPath::Unverified => {
+            clear_provisional(state, &stable).await;
+            let mut inner = state.group_recovery.inner.lock().await;
+            if let Some(subject) = inner.subjects.get_mut(&stable) {
+                if !subject.view.sticky() {
+                    subject.view = SubjectView::Awaiting {
+                        reason: "provisional_unverified".to_string(),
+                    };
+                }
+            }
+            drop(inner);
+            tracing::info!(group_id = %LogHexId::group(group_key), expired, signer_revoked, "ADR 0109 S3: provisional ATA dropped; its promotion path did not verify");
+        }
+        s3::ProvisionalPath::Verified => {
+            clear_provisional(state, &stable).await;
+            let owner_armed = info
+                .invite_lineage
+                .as_ref()
+                .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+                .is_some_and(|record| {
+                    record.reason == s3::OWNER_ATTESTED_GAP_REASON
+                        && info.state_revision < record.terminal_revision
+                });
+            if owner_armed {
+                return;
+            }
+            let ata_kept = ata.clone();
+            if !update_sidecar(state, &stable, move |body| {
+                body.active_ata = Some(ata_kept);
+            })
+            .await
+            {
+                return;
+            }
+            set_view(
+                state,
+                &stable,
+                info.state_revision,
+                SubjectView::CatchingUp {
+                    attested_by: ata.fields.attested_by.clone(),
+                    verified: true,
+                    segment_terminal: ata.fields.segment_terminal_revision,
+                },
+            )
+            .await;
+            tracing::info!(group_id = %LogHexId::group(group_key), attested_by = %LogHexId::agent(&ata.fields.attested_by), head = info.state_revision, "ADR 0109 S3: provisional signer verified by its applied promotion path; the ATA arms");
+            if let Some(signer) = signer.as_ref() {
+                let _ = super::request_treekem_catchup_page(state, group_key, signer).await;
+            }
+        }
+    }
+}
+
+async fn clear_provisional(state: &AppState, stable: &str) {
+    if let Some(subject) = state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get_mut(stable)
+    {
+        subject.provisional = None;
     }
 }
 
