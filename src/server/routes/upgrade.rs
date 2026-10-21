@@ -1142,7 +1142,7 @@ async fn update_skill_inner(
             // The earlier Due decision cannot authorize this later write.
             #[cfg(unix)]
             let staged_guide = match upgrader {
-                Some(upgrader) => match upgrader.guide_staging() {
+                Some(upgrader) => match upgrader.guide_staging().await {
                     Ok(staging) => staging,
                     Err(error) => {
                         tracing::warn!(%error, "Guide staging identity changed");
@@ -1152,7 +1152,7 @@ async fn update_skill_inner(
                 None => None,
             };
             #[cfg(unix)]
-            let data_dir = if let Some((_, gate)) = &staged_guide {
+            let data_dir = if let Some((_, gate, _)) = &staged_guide {
                 match data_dir.canonicalize() {
                     Ok(root) if root == gate.request.data_root => gate.request.data_root.as_path(),
                     _ => {
@@ -1190,7 +1190,7 @@ async fn update_skill_inner(
                 #[cfg(unix)]
                 let _install_lock = staged_guide
                     .as_ref()
-                    .map(|(install, _)| crate::upgrade::acquire_host_upgrade_lock(install))
+                    .map(|(install, _, _)| crate::upgrade::acquire_host_upgrade_lock(install))
                     .transpose()?;
                 // Watch value custody orders a shutdown signal against
                 // this short atomic install. A cancelled queued worker
@@ -1207,8 +1207,18 @@ async fn update_skill_inner(
                     ));
                 }
                 #[cfg(unix)]
-                if let Some((install, gate)) = &staged_guide {
-                    gate.require_due(install)?;
+                if let Some((install, gate, identity)) = &staged_guide {
+                    let clock = gate
+                        .clock()
+                        .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))?;
+                    if let crate::upgrade::staging::Decision::Waiting(wait) =
+                        gate.observe_locked_at(install, &clock, identity)?
+                    {
+                        return Err(x0x::upgrade::UpgradeError::Other(format!(
+                            "guide staging is not due; remaining {} seconds",
+                            wait.as_secs()
+                        )));
+                    }
                 }
                 if !caller_alive.load(Ordering::Acquire) {
                     return Err(x0x::upgrade::UpgradeError::Other(
