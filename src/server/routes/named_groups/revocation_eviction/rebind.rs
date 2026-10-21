@@ -25,11 +25,13 @@
 //! - **Delivery** ([`drive`]). Per-recipient, capability-gated direct
 //!   delivery only, never the metadata topic and never a legacy-decoded
 //!   container. Each write re-checks roster membership and the agent,
-//!   machine and binding revocations just before it. **Catch-up**
+//!   machine and binding revocations just before it. A delivery that a
+//!   restart restored waits for the §2 head sync first. **Catch-up**
 //!   ([`serve_catchup`]) sends held frames to a capable requester on the
 //!   same carrier.
 //! - **Receive** ([`spawn_receipt`]) verifies the frame and the §4a L4
-//!   rule and installs it atomically. A verified rebind on the current
+//!   rule, makes the frame durable in the held log ([`replay_log`]), and
+//!   then installs it atomically. A verified rebind on the current
 //!   chain ends that seat's expiry rows with cause `certificate_valid`
 //!   (the S4 pass re-derives it from the roster).
 
@@ -86,6 +88,9 @@ struct Delivery {
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
     started: Instant,
+    /// A restart restored this delivery from the held log: each round
+    /// waits for the group's §2 head sync first (#1508 review F3).
+    resumed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -117,8 +122,8 @@ struct HeldSelfRebind {
 pub(super) struct RebindState {
     /// Keyed by (stable group ID, result head).
     deliveries: HashMap<(String, String), Delivery>,
-    /// Frames held for catch-up; the author's are durable
-    /// ([`replay_log`]).
+    /// Frames held for catch-up; the authored and the received frames are
+    /// durable ([`replay_log`]).
     log: replay_log::HeldLog<CRB_LOG_PER_GROUP>,
     stash: Vec<StashedFrame>,
     /// Verified renewals an admin holds for a seat, from a hand-off.
@@ -134,12 +139,28 @@ fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROU
 }
 
 /// Load the durable rebind frames once, and deliver an authored frame
-/// that is still its group's head again (#1508 review).
+/// that is still its group's head again (#1508 review). A received frame
+/// that a crash stopped before its install goes to the stash: the next
+/// pass receives it again, with every receiver check.
 async fn ensure_restored(state: &AppState) {
-    let resumes = replay_log::ensure_restored(state, replay_log::REBIND_EXTENSION, held).await;
+    let restored = replay_log::ensure_restored(state, replay_log::REBIND_EXTENSION, held).await;
     let local = *state.agent.agent_id().as_bytes();
     let mut inner = state.revocation_evictions.inner.lock().await;
-    for resume in resumes {
+    for bytes in restored.received {
+        // The frame is self-authenticating; its signer is the sender.
+        let Ok(frame) = cr::decode_frame(&bytes) else {
+            continue;
+        };
+        if inner.rebind.stash.len() >= CRB_STASH_CAP {
+            inner.rebind.stash.remove(0);
+        }
+        inner.rebind.stash.push(StashedFrame {
+            sender: AgentId(frame.body.signer),
+            bytes: bytes.to_vec(),
+            at: Instant::now(),
+        });
+    }
+    for resume in restored.resumes {
         let key = (resume.stable_group_id, resume.result_head.clone());
         inner
             .rebind
@@ -154,8 +175,30 @@ async fn ensure_restored(state: &AppState) {
                     .collect(),
                 next_at: Instant::now(),
                 started: Instant::now(),
+                resumed: true,
             });
     }
+}
+
+/// §2 and §3 "re-sync the head before any resend", for the rebind and
+/// owner-recovery deliveries that a restart restored: the groups among
+/// `groups` whose head is synced now. The gate is
+/// [`super::group_head_synced`], the one gate that the removal and
+/// crypto-exclusion resends use
+/// ([`super::crypto_exclusion::resumed_groups_head_synced`]): the restart
+/// minimum, a completed current catch-up round and no unresolved
+/// higher-head or conflicting-head evidence. Call it with no S4 lock held.
+pub(super) async fn restored_groups_head_synced(
+    state: &AppState,
+    groups: BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut synced = BTreeSet::new();
+    for group in groups {
+        if super::group_head_synced(state, &group).await {
+            synced.insert(group);
+        }
+    }
+    synced
 }
 
 fn agent_bytes(hex_id: &str) -> Option<[u8; 32]> {
@@ -379,6 +422,7 @@ async fn commit_locked(
                     .collect(),
                 next_at: Instant::now(),
                 started: Instant::now(),
+                resumed: false,
             },
         );
         let key = EvictionKey::new(next.stable_group_id(), seat);
@@ -1154,16 +1198,31 @@ fn complete_send(
 /// chain can apply.
 async fn drive_deliveries(state: &Arc<AppState>) {
     let now = Instant::now();
-    let due: Vec<((String, String), Delivery)> = {
+    let restored: BTreeSet<String> = {
         let mut inner = state.revocation_evictions.inner.lock().await;
         inner.rebind.deliveries.retain(|_, delivery| {
             now.saturating_duration_since(delivery.started) < CRB_DELIVERY_TTL
         });
+        inner
+            .rebind
+            .deliveries
+            .iter()
+            .filter(|(_, delivery)| delivery.resumed && delivery.next_at <= now)
+            .map(|(key, _)| key.0.clone())
+            .collect()
+    };
+    // #1508 review F3: a restored delivery waits for its group's real
+    // head sync (ADR 0110 §3), not only for the local chain.
+    let synced = restored_groups_head_synced(state, restored).await;
+    let due: Vec<((String, String), Delivery)> = {
+        let mut inner = state.revocation_evictions.inner.lock().await;
         let keys: Vec<(String, String)> = inner
             .rebind
             .deliveries
             .iter()
-            .filter(|(_, delivery)| delivery.next_at <= now)
+            .filter(|(key, delivery)| {
+                delivery.next_at <= now && (!delivery.resumed || synced.contains(&key.0))
+            })
             .map(|(key, _)| key.clone())
             .collect();
         keys.into_iter()
@@ -1547,6 +1606,19 @@ pub(in crate::server) async fn receive(
             return ReceiveOutcome::Refused(refused);
         }
     };
+    // #1508 review F2: the received frame is durable before the roster it
+    // carries is installed, in the held log that the author uses. A
+    // restarted receiver then serves it to a survivor that missed it while
+    // the author is offline. The load runs first, so this write keeps the
+    // frames that a restart restored.
+    ensure_restored(state).await;
+    let frame_bytes = Arc::new(payload.to_vec());
+    let stable = body.stable_group_id.as_str();
+    let at = (body.next_revision, body.commit.state_hash.as_str());
+    let ext = replay_log::REBIND_EXTENSION;
+    if !replay_log::write_received(state, ext, held, stable, at, &frame_bytes).await {
+        return ReceiveOutcome::LocalFailure;
+    }
     let seat_hex = hex::encode(body.seat);
     let next = match ng::apply_stateful_event_with_evidence(
         state,
@@ -1563,6 +1635,7 @@ pub(in crate::server) async fn receive(
     {
         Ok(next) => next,
         Err(error) => {
+            replay_log::rewrite_from_memory(state, ext, held, stable).await;
             tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0110 S4: certificate rebind commit refused: {error}");
             return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::StateMismatch);
         }
@@ -1570,6 +1643,7 @@ pub(in crate::server) async fn receive(
     match ng::persist_named_group_info(state, &group_key, next.clone()).await {
         Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable) => {}
         Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => {
+            // A local fault: the frame stays durable and in the stash.
             return ReceiveOutcome::LocalFailure;
         }
     }
@@ -1580,7 +1654,7 @@ pub(in crate::server) async fn receive(
             &body.stable_group_id,
             body.next_revision,
             &body.commit.state_hash,
-            Arc::new(payload.to_vec()),
+            frame_bytes,
             false,
         );
         let key = EvictionKey::new(body.stable_group_id.clone(), body.seat);
@@ -1722,6 +1796,7 @@ mod tests {
             recipients: recipients.iter().copied().collect(),
             next_at: Instant::now(),
             started: Instant::now(),
+            resumed: false,
         }
     }
 
