@@ -1149,7 +1149,6 @@ struct ArmedNavigation {
 fn queue_pending_gui_show(
     state: &AppState,
     outbound_tx: &mpsc::Sender<WsOutbound>,
-    stats: &Arc<WsOutboundStats>,
     visible: bool,
     session_token: Option<&str>,
 ) -> Option<crate::gui::PendingGuiShow> {
@@ -1160,8 +1159,13 @@ fn queue_pending_gui_show(
     let pending = state
         .gui_show
         .take_pending_for_session(token, std::time::Instant::now())?;
-    feed_droppable(outbound_tx, outbound_gui_show(pending.clone()), stats);
-    Some(pending)
+    match outbound_tx.try_send(outbound_gui_show(pending.clone())) {
+        Ok(()) => Some(pending),
+        Err(_) => {
+            state.gui_show.enqueue_pending(pending);
+            None
+        }
+    }
 }
 
 async fn arm_navigation_and_advertise_session(
@@ -1234,7 +1238,6 @@ async fn handle_ws_connection(
     let opened_show = queue_pending_gui_show(
         &state,
         &outbound_tx,
-        &stats,
         visible_gui.load(Ordering::Acquire),
         session_token.as_deref(),
     );
@@ -2095,13 +2098,36 @@ async fn handle_ws_command(
                     .gui_show
                     .take_pending_for_session(&token, std::time::Instant::now())
                 {
-                    feed_droppable(tx, outbound_gui_show(pending), stats);
-                }
-                if let Some(session) = state.ws_sessions.read().await.get(session_id) {
-                    session.set_visible_gui(true);
+                    match tx.try_send(outbound_gui_show(pending.clone())) {
+                        Ok(()) => mark_gui_session_visible(state, session_id).await,
+                        Err(_) => {
+                            // The queue is full or gone. Hold the show until
+                            // a slot accepts it, and stay hidden so a newer
+                            // navigation cannot land in front of that frame.
+                            let state = Arc::clone(state);
+                            let tx = tx.clone();
+                            let session_id = session_id.to_string();
+                            tokio::spawn(async move {
+                                let frame = outbound_gui_show(pending.clone());
+                                if tx.send(frame).await.is_ok() {
+                                    mark_gui_session_visible(&state, &session_id).await;
+                                } else {
+                                    state.gui_show.enqueue_pending(pending);
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    mark_gui_session_visible(state, session_id).await;
                 }
             }
         }
+    }
+}
+
+async fn mark_gui_session_visible(state: &AppState, session_id: &str) {
+    if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+        session.set_visible_gui(true);
     }
 }
 
@@ -2628,6 +2654,84 @@ mod tests {
             WsOutbound::GuiShow { view, .. } => assert_eq!(view, "people"),
             other => panic!("expected gui.show, got {other:?}"),
         }
+        assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// WHY: a full outbound queue used to drop the opened view after it had
+    /// been taken. The tab was then marked visible, so the banner was gone.
+    #[tokio::test]
+    async fn saturated_queue_keeps_the_opened_show_until_it_fits() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "saturated-session";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "saturated-gui").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("saturated-gui")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "saturated-gui",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(WsOutbound::Pong)),
+            "the filler stays; the opened show is not dropped to make room"
+        );
+        assert!(
+            !state
+                .ws_sessions
+                .read()
+                .await
+                .get("saturated-gui")
+                .expect("session")
+                .is_visible_gui(),
+            "the tab stays hidden until the opened show is queued"
+        );
+        match rx.recv().await.expect("opened show") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
+            other => panic!("expected the preserved gui.show, got {other:?}"),
+        }
+        let visible = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state
+                    .ws_sessions
+                    .read()
+                    .await
+                    .get("saturated-gui")
+                    .expect("session")
+                    .is_visible_gui()
+                {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("visibility follows the queued show");
+        assert!(visible);
         assert!(!state.gui_show.has_pending_session(token));
     }
 
@@ -4275,7 +4379,7 @@ mod tests {
         let slow_close_counted = Arc::new(AtomicBool::new(false));
 
         assert!(
-            queue_pending_gui_show(&state, &outbound_tx, &stats, true, Some(token)).is_some(),
+            queue_pending_gui_show(&state, &outbound_tx, true, Some(token)).is_some(),
             "the opened window's show is taken before the session is visible"
         );
         match outbound_rx.try_recv() {

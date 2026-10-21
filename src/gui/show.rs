@@ -287,9 +287,14 @@ pub struct GuiShowRuntime {
     local_stop_path: PathBuf,
     /// True after this process saved the marker, or found it at startup.
     ///
-    /// A failed marker write leaves this false, so show stays off in memory
-    /// even though the file is absent. Deleting a saved marker clears it.
+    /// Deleting that marker clears it. A failed marker write leaves this
+    /// false: the file is absent, and only [`Self::local_stopped`] keeps
+    /// show off for this process.
     stop_persisted: AtomicBool,
+    /// In-memory Stop. Set before the marker write, so a failed write still
+    /// rejects a later reload of `local_enabled = true`. Cleared only when
+    /// a marker this process saved is deleted.
+    local_stopped: AtomicBool,
     /// Shows waiting for the GUI window that was opened for each one.
     pending: Mutex<VecDeque<PendingGuiShow>>,
 }
@@ -323,6 +328,7 @@ impl GuiShowRuntime {
             blocked_path,
             local_stop_path,
             stop_persisted: AtomicBool::new(false),
+            local_stopped: AtomicBool::new(false),
             pending: Mutex::new(VecDeque::new()),
         };
         // Honour a stop recorded before this process. The marker wins over
@@ -344,7 +350,7 @@ impl GuiShowRuntime {
     pub fn config(&self) -> GuiShowConfig {
         self.lift_stop_if_marker_deleted();
         let mut config = self.config_snapshot();
-        if self.local_stop_path.is_file() {
+        if self.local_stop_in_force() {
             config.local_enabled = false;
         }
         config
@@ -356,17 +362,25 @@ impl GuiShowRuntime {
 
     /// Replace config (tests / acl reload after a successful TOML parse).
     ///
-    /// A stop marker still on disk forces `local_enabled` off in the same
-    /// critical section as the store, so a reload cannot publish `true`
-    /// after Stop has written the marker.
+    /// A stop marker, or an in-memory Stop whose marker write failed, forces
+    /// `local_enabled` off in the same critical section as the store. A
+    /// reload cannot publish `true` after Stop, including when the marker
+    /// file was never created.
     pub fn set_config(&self, mut config: GuiShowConfig) {
         if let Ok(mut guard) = self.config.lock() {
             if self.local_stop_path.is_file() {
                 config.local_enabled = false;
                 self.stop_persisted.store(true, Ordering::SeqCst);
+                self.local_stopped.store(true, Ordering::SeqCst);
+            } else if self.local_stopped.load(Ordering::SeqCst) {
+                config.local_enabled = false;
             }
             *guard = config;
         }
+    }
+
+    fn local_stop_in_force(&self) -> bool {
+        self.local_stopped.load(Ordering::SeqCst) || self.local_stop_path.is_file()
     }
 
     /// Re-read `[gui_show]` from the daemon TOML when a path is known.
@@ -407,6 +421,7 @@ impl GuiShowRuntime {
             return;
         }
         self.stop_persisted.store(true, Ordering::SeqCst);
+        self.local_stopped.store(true, Ordering::SeqCst);
         let mut config = self.config_snapshot();
         config.local_enabled = false;
         self.set_config(config);
@@ -414,9 +429,11 @@ impl GuiShowRuntime {
 
     /// A human deleted a marker this process had saved.
     ///
-    /// A failed marker write never sets `stop_persisted`, so show stays off
-    /// in this process. With a daemon config, the file's `[gui_show]` applies
-    /// again. With no file, local show returns to the default (on).
+    /// A failed marker write sets [`Self::local_stopped`] and leaves
+    /// `stop_persisted` false, so this returns without turning show on.
+    /// With a daemon config, the file's `[gui_show]` applies again once the
+    /// saved marker is gone. With no file, local show returns to the default
+    /// (on).
     fn lift_stop_if_marker_deleted(&self) {
         if self.local_stop_path.is_file() {
             return;
@@ -424,6 +441,7 @@ impl GuiShowRuntime {
         if !self.stop_persisted.swap(false, Ordering::SeqCst) {
             return;
         }
+        self.local_stopped.store(false, Ordering::SeqCst);
         let Some(path) = self.reload_config_path() else {
             let mut config = self.config_snapshot();
             config.local_enabled = true;
@@ -432,11 +450,15 @@ impl GuiShowRuntime {
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
             self.stop_persisted.store(true, Ordering::SeqCst);
+            self.local_stopped.store(true, Ordering::SeqCst);
             return;
         };
         match parse_gui_show_table(&text) {
             Ok(gui_show) => self.set_config(gui_show),
-            Err(_) => self.stop_persisted.store(true, Ordering::SeqCst),
+            Err(_) => {
+                self.stop_persisted.store(true, Ordering::SeqCst);
+                self.local_stopped.store(true, Ordering::SeqCst);
+            }
         }
     }
 
@@ -474,6 +496,7 @@ impl GuiShowRuntime {
     /// leaves show off. Stop writes only that marker. It does not create or
     /// modify the daemon config: a named instance would then refuse to start.
     pub fn disable_local_show(&self) -> Result<(), String> {
+        self.local_stopped.store(true, Ordering::SeqCst);
         self.remember_local_stop();
         let wrote = self.write_local_stop_file();
         if wrote.is_ok() {
@@ -922,6 +945,12 @@ mod tests {
             "stop leaves the daemon config unchanged"
         );
         assert!(!marker.exists(), "a failed marker write leaves no marker");
+        rt.reload_from_disk()
+            .expect("reload reads the unchanged config");
+        assert!(
+            !rt.config().local_enabled,
+            "reload must not turn show on when the marker write failed"
+        );
     }
 
     #[test]
