@@ -553,7 +553,7 @@ jobs:
           --require w3h_1471_forged_card_import_invite
           --expect w3h_1471_forged_card_import_invite=GREEN
           --require w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined
-          --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=RED
+          --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=GREEN
           --require w3h_818_control_ownerless_invite_after_the_removal_joins
           --expect w3h_818_control_ownerless_invite_after_the_removal_joins=GREEN
           --require w3h_1357_red_s4_idle_revocation_one_admin
@@ -577,15 +577,15 @@ jobs:
           --require w3h_1357_control_s4_designated_no_early_sibling
           --expect w3h_1357_control_s4_designated_no_early_sibling=GREEN
           --require w3h_1356_red_s3_aligned_stale_joiner_catches_up
-          --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=RED
+          --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=GREEN
           --require w3h_1356_control_s3_attestation_touches_only_the_subject
           --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
-          --expect w3h_1356_red_s3_forked_node_shows_reseat_required=RED
+          --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
           --require w3h_1356_control_s3_forked_node_not_auto_recovered
           --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
           --require w3h_1356_red_s3_manual_reseat_recovers_forked_node
-          --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=RED
+          --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
