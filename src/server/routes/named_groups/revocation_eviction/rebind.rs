@@ -53,7 +53,10 @@ use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 use x0x::identity::{AgentCertificate, AgentId};
 use x0x::logging::LogHexId;
 
-use super::crypto_exclusion::{write_allowed, RecipientDelivery};
+use super::crypto_exclusion::{
+    apply_round, finish_attempt, guarded_admission_for, head_rule_admits, next_attempt,
+    write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+};
 
 /// A delivery round runs no more often than this per frame.
 const CRB_RESEND_INTERVAL: Duration = Duration::from_secs(5);
@@ -65,8 +68,8 @@ const CRB_LOG_PER_GROUP: usize = 16;
 const CRB_STASH_CAP: usize = 64;
 /// A stashed frame is dropped after this long.
 const CRB_STASH_TTL: Duration = Duration::from_secs(600);
-/// The per-exchange bound of one catch-up frame write.
-const CRB_CATCHUP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The per-exchange bound of one frame write (live delivery and catch-up).
+const CRB_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The public refusal of a self-rebind after the cutoff (D155).
 pub(in crate::server) const REBIND_WINDOW_CLOSED: &str = "rebind_window_closed";
@@ -86,6 +89,9 @@ struct Delivery {
 #[derive(Debug, Clone)]
 struct LogEntry {
     next_revision: u64,
+    /// The frame's result head: catch-up serves it only while it is on
+    /// this node's verified chain ([`HeadRule::OnChain`]).
+    result_head: String,
     bytes: Arc<Vec<u8>>,
 }
 
@@ -129,18 +135,55 @@ pub(super) struct RebindState {
 }
 
 impl RebindState {
-    fn remember(&mut self, stable_group_id: &str, next_revision: u64, bytes: Arc<Vec<u8>>) {
+    fn remember(
+        &mut self,
+        stable_group_id: &str,
+        next_revision: u64,
+        result_head: &str,
+        bytes: Arc<Vec<u8>>,
+    ) {
         let log = self.log.entry(stable_group_id.to_string()).or_default();
         if log.iter().any(|entry| entry.next_revision == next_revision) {
             return;
         }
         log.push_back(LogEntry {
             next_revision,
+            result_head: result_head.to_string(),
             bytes,
         });
         while log.len() > CRB_LOG_PER_GROUP {
             log.pop_front();
         }
+    }
+
+    /// The held frames of the group (any of `group_ids`) above
+    /// `from_revision`, oldest first, with their group ID and result head.
+    fn catchup_frames(
+        &self,
+        group_ids: &[String],
+        from_revision: u64,
+    ) -> Vec<(String, String, Arc<Vec<u8>>)> {
+        let Some((group_id, log)) = group_ids
+            .iter()
+            .find_map(|id| self.log.get(id).map(|log| (id, log)))
+        else {
+            return Vec::new();
+        };
+        let mut entries: Vec<&LogEntry> = log
+            .iter()
+            .filter(|entry| entry.next_revision > from_revision)
+            .collect();
+        entries.sort_by_key(|entry| entry.next_revision);
+        entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    group_id.clone(),
+                    entry.result_head.clone(),
+                    Arc::clone(&entry.bytes),
+                )
+            })
+            .collect()
     }
 }
 
@@ -338,6 +381,7 @@ async fn commit_locked(
         inner.rebind.remember(
             next.stable_group_id(),
             next.state_revision,
+            &next.state_hash,
             Arc::clone(&bytes),
         );
         inner.rebind.deliveries.insert(
@@ -799,8 +843,12 @@ pub(super) async fn note_handoff_renewal(
 /// §4a "The designated admin commits it": at the commit point of an
 /// expiry-only row, commit the rebind instead of `MemberRemoved` when this
 /// node holds a verified renewal for the seat and every other Active
-/// member's current verified advert sets `certificate_rebind_v1`. Returns
-/// whether the rebind committed; on `false` the caller evicts.
+/// member's current verified advert sets `certificate_rebind_v1`.
+///
+/// Returns whether the row was handled here: the rebind committed, or a
+/// rebind is due but this replica's head is not synced (§2), so the row
+/// waits with `waiting_for_head_sync` and retries next tick rather than
+/// evicting. On `false` the caller evicts.
 pub(super) async fn try_admin_rebind(
     state: &Arc<AppState>,
     key: &EvictionKey,
@@ -828,6 +876,18 @@ pub(super) async fn try_admin_rebind(
     }
     let membership_lock = ng::group_membership_lock(state, group_key).await;
     let _membership_guard = membership_lock.lock().await;
+    // The row may have completed or changed while this task waited.
+    let still_pending = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .store
+        .get(key)
+        .is_some_and(|row| row.phase == s4::Phase::Pending && row.expiry_only());
+    if !still_pending {
+        return false;
+    }
     let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
         return false;
     };
@@ -839,27 +899,55 @@ pub(super) async fn try_admin_rebind(
         return false;
     }
     let now_unix = now_unix_ms() / 1000;
+    let mut usable = None;
     for certificate in candidates {
         if precheck_renewal(state, &info, &key.target, &certificate, now_unix)
             .await
-            .is_err()
+            .is_ok()
         {
-            continue;
-        }
-        match commit_locked(state, group_key, &info, key.target, &certificate).await {
-            Ok(_) => return true,
-            Err(error) => {
-                tracing::warn!(
-                    group_id = %LogHexId::group(group_key),
-                    target = %LogHexId::agent(&hex::encode(key.target)),
-                    ?error,
-                    "ADR 0110 S4: admin certificate rebind failed; evicting"
-                );
-                return false;
-            }
+            usable = Some(certificate);
+            break;
         }
     }
-    false
+    let Some(certificate) = usable else {
+        return false;
+    };
+    // §2: re-read the head and the evidence under the membership lock just
+    // before the seal. The 13 s restart wait is only a minimum: a current
+    // catch-up round with no unresolved higher-head evidence is required.
+    // A rebind is due, so an unsynced head waits; it never evicts instead.
+    if !super::group_head_synced(state, group_key).await {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner.attempt_wait.insert(
+            key.clone(),
+            WaitingState::cause(WaitingCause::WaitingForHeadSync),
+        );
+        inner
+            .next_attempt
+            .insert(key.clone(), Instant::now() + super::S4_WORKER_TICK);
+        return true;
+    }
+    match commit_locked(state, group_key, &info, key.target, &certificate).await {
+        Ok(_) => {
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .attempt_wait
+                .remove(key);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_key),
+                target = %LogHexId::agent(&hex::encode(key.target)),
+                ?error,
+                "ADR 0110 S4: admin certificate rebind failed; evicting"
+            );
+            false
+        }
+    }
 }
 
 // ─── Worker ────────────────────────────────────────────────────────────────
@@ -930,6 +1018,11 @@ async fn drive_held(state: &Arc<AppState>) {
             }
             continue;
         }
+        // §2: the held commit is a worker seal on a possibly old view; it
+        // waits for a current catch-up round (re-read under the lock).
+        if !super::group_head_synced(state, &held.group_key).await {
+            continue;
+        }
         match commit_locked(state, &held.group_key, &info, key.target, &held.certificate).await {
             Ok(_) => {}
             Err(CommitError::Refused(refused)) => {
@@ -991,6 +1084,89 @@ async fn prune_admin_waits(state: &AppState) {
 
 // ─── Delivery ──────────────────────────────────────────────────────────────
 
+/// Plan one delivery round from a snapshot of `recipients` (§4a "Egress").
+///
+/// `gate` gives each recipient's write inputs, read before the plan:
+/// `None` when D60 withholds the write this round (agent, machine or
+/// binding revocation), else its `certificate_rebind_v1` support. A
+/// recipient no longer Active (`active`) is dropped. A `Sent` or
+/// `InFlight` recipient is left alone. Every planned change names the
+/// status it read, so [`apply_round`] applies it only while that status is
+/// still stored. Returns the updates and the recipients whose support is
+/// unknown (an advert refresh is due).
+fn plan_round(
+    recipients: &BTreeMap<[u8; 32], RecipientDelivery>,
+    active: &BTreeSet<[u8; 32]>,
+    gate: impl Fn(&[u8; 32]) -> Option<Option<bool>>,
+) -> (Vec<RoundUpdate>, Vec<[u8; 32]>) {
+    let mut updates = Vec::new();
+    let mut refreshes = Vec::new();
+    for (recipient, status) in recipients {
+        let observed = *status;
+        if !active.contains(recipient) {
+            updates.push(RoundUpdate {
+                recipient: *recipient,
+                observed,
+                next: None,
+            });
+            continue;
+        }
+        if matches!(
+            observed,
+            RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+        ) {
+            continue;
+        }
+        let Some(support) = gate(recipient) else {
+            continue;
+        };
+        let next = match support {
+            Some(true) => RecipientDelivery::InFlight(next_attempt()),
+            Some(false) => RecipientDelivery::Lacking,
+            None => {
+                refreshes.push(*recipient);
+                RecipientDelivery::Unknown
+            }
+        };
+        updates.push(RoundUpdate {
+            recipient: *recipient,
+            observed,
+            next: Some(next),
+        });
+    }
+    (updates, refreshes)
+}
+
+/// Install one round's plan into the stored delivery under the runtime
+/// lock. Returns the `(recipient, attempt)` sends to start, after the lock
+/// is released: each one's `InFlight` status exists before its task runs.
+fn install_round(delivery: &mut Delivery, updates: Vec<RoundUpdate>) -> Vec<([u8; 32], u64)> {
+    apply_round(&mut delivery.recipients, updates)
+}
+
+/// Record the result of send attempt `attempt` to `recipient`. Only that
+/// attempt's own `InFlight` status is replaced.
+fn complete_send(
+    rebind: &mut RebindState,
+    key: &(String, String),
+    recipient: &[u8; 32],
+    attempt: u64,
+    status: RecipientDelivery,
+) -> bool {
+    rebind.deliveries.get_mut(key).is_some_and(|delivery| {
+        finish_attempt(&mut delivery.recipients, recipient, attempt, status)
+    })
+}
+
+/// One delivery round for every due frame: per recipient, re-check the
+/// roster and the agent, machine and binding revocations, then send only to
+/// a recipient whose current verified advert sets `certificate_rebind_v1`.
+/// Each send runs the guarded admission again at the physical write.
+///
+/// Live delivery uses [`HeadRule::OnChain`], not the crypto exclusion's
+/// current-head rule: the frame carries no key material (§4a), and a
+/// recipient that missed it needs this link before any later commit on the
+/// chain can apply.
 async fn drive_deliveries(state: &Arc<AppState>) {
     let now = Instant::now();
     let due: Vec<((String, String), Delivery)> = {
@@ -1026,16 +1202,9 @@ async fn drive_deliveries(state: &Arc<AppState>) {
                 .find(|info| info.stable_group_id() == key.0)
                 .cloned()
         };
-        let on_chain = info.as_ref().is_some_and(|info| {
-            !info.withdrawn
-                && info.fork_quarantine.is_none()
-                && (info.state_hash == delivery.result_head
-                    || info
-                        .commit_log
-                        .iter()
-                        .any(|retained| retained.commit.state_hash == delivery.result_head))
-        });
-        let Some(info) = info.filter(|_| on_chain) else {
+        let rule = HeadRule::OnChain(delivery.result_head.clone());
+        let Some(info) = info.filter(|info| head_rule_admits(info, &rule)) else {
+            // Withdrawn, contained, or the frame left the verified chain.
             state
                 .revocation_evictions
                 .inner
@@ -1047,54 +1216,38 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             continue;
         };
         let active: BTreeSet<[u8; 32]> = other_active_members(&info, &local).into_iter().collect();
-        let mut updates: Vec<([u8; 32], Option<RecipientDelivery>)> = Vec::new();
+        let mut gates: HashMap<[u8; 32], Option<Option<bool>>> = HashMap::new();
         for (recipient, status) in &delivery.recipients {
-            if !active.contains(recipient) {
-                updates.push((*recipient, None));
-                continue;
-            }
-            if matches!(
-                status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
-            ) {
+            if !active.contains(recipient)
+                || matches!(
+                    status,
+                    RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+                )
+            {
                 continue;
             }
             let agent = AgentId(*recipient);
-            if !write_allowed(state, &agent).await {
-                continue;
-            }
-            match capabilities.verified_registry_supports(
-                &agent,
-                x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
-            ) {
-                Some(true) => {
-                    updates.push((
-                        *recipient,
-                        Some(RecipientDelivery::InFlight(
-                            super::crypto_exclusion::next_attempt(),
-                        )),
-                    ));
-                    spawn_send(state, key.clone(), agent, Arc::clone(&delivery.bytes));
-                }
-                Some(false) => updates.push((*recipient, Some(RecipientDelivery::Lacking))),
-                None => {
-                    updates.push((*recipient, Some(RecipientDelivery::Unknown)));
-                    refresh_unknown(state, &[(*recipient, None)]);
-                }
-            }
+            let gate = if write_allowed(state, &agent).await {
+                Some(capabilities.verified_registry_supports(
+                    &agent,
+                    x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+                ))
+            } else {
+                None
+            };
+            gates.insert(*recipient, gate);
         }
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        if let Some(stored) = inner.rebind.deliveries.get_mut(&key) {
-            for (recipient, update) in updates {
-                match update {
-                    Some(status) => {
-                        stored.recipients.insert(recipient, status);
-                    }
-                    None => {
-                        stored.recipients.remove(&recipient);
-                    }
-                }
-            }
+        let (updates, refreshes) = plan_round(&delivery.recipients, &active, |recipient| {
+            gates.get(recipient).copied().flatten()
+        });
+        // Install every status, `InFlight` included, BEFORE any send task
+        // starts: a fast completion can then never be overwritten.
+        let started = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            let Some(stored) = inner.rebind.deliveries.get_mut(&key) else {
+                continue;
+            };
+            let started = install_round(stored, updates);
             if stored
                 .recipients
                 .values()
@@ -1102,37 +1255,82 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             {
                 inner.rebind.deliveries.remove(&key);
             }
+            started
+        };
+        for (recipient, attempt) in started {
+            spawn_send(
+                state,
+                key.clone(),
+                AgentId(recipient),
+                attempt,
+                Arc::clone(&delivery.bytes),
+            );
         }
+        let refreshes: Vec<([u8; 32], Option<bool>)> =
+            refreshes.into_iter().map(|id| (id, None)).collect();
+        refresh_unknown(state, &refreshes);
     }
 }
 
-fn spawn_send(state: &Arc<AppState>, key: (String, String), agent: AgentId, bytes: Arc<Vec<u8>>) {
+/// One live send. `key` is (stable group ID, result head). The write goes
+/// through [`guarded_admission_for`] (ADR 0107 serving guard plus D60,
+/// capability bit `certificate_rebind_v1`, [`HeadRule::OnChain`]), which
+/// re-checks under the membership lock and again at the seam.
+fn spawn_send(
+    state: &Arc<AppState>,
+    key: (String, String),
+    agent: AgentId,
+    attempt: u64,
+    bytes: Arc<Vec<u8>>,
+) {
     let task_state = Arc::clone(state);
     let _spawned = state.spawn_detached(async move {
-        let status = match task_state.agent.send_direct(&agent, bytes.to_vec()).await {
-            Ok(_) => RecipientDelivery::Sent,
-            Err(x0x::dm::DmError::RecipientUpgradeRequired { .. }) => RecipientDelivery::Lacking,
-            Err(error) => {
-                tracing::debug!(%error, "ADR 0110 S4: certificate rebind send failed; retrying");
+        let admission = guarded_admission_for(
+            &task_state,
+            &key.0,
+            &agent,
+            HeadRule::OnChain(key.1.clone()),
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        );
+        let resolve_within =
+            std::cmp::min(x0x::dm::PINNED_RESOLUTION_WAIT, CRB_EXCHANGE_TIMEOUT / 2);
+        let exchange = task_state.agent.send_direct_pinned_admitted(
+            &agent,
+            bytes.as_slice(),
+            &admission,
+            resolve_within,
+        );
+        let status = match tokio::time::timeout(CRB_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(_)) => RecipientDelivery::Sent,
+            Ok(Err(x0x::dm::DmError::RecipientUpgradeRequired { .. })) => {
+                RecipientDelivery::Lacking
+            }
+            Ok(Err(error)) => {
+                // An admission refusal is a withhold: the next round
+                // re-evaluates the recipient from the current state.
+                tracing::debug!(%error, "ADR 0110 S4: certificate rebind send refused or failed; retrying");
+                RecipientDelivery::Due
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "ADR 0110 S4: certificate rebind exchange deadline elapsed; retrying"
+                );
                 RecipientDelivery::Due
             }
         };
         let mut inner = task_state.revocation_evictions.inner.lock().await;
-        if let Some(delivery) = inner.rebind.deliveries.get_mut(&key) {
-            if let Some(entry) = delivery.recipients.get_mut(agent.as_bytes()) {
-                *entry = status;
-            }
-        }
+        complete_send(&mut inner.rebind, &key, agent.as_bytes(), attempt, status);
     });
 }
 
 // ─── Catch-up ──────────────────────────────────────────────────────────────
 
 /// Serve the rebind frames this node holds for the group (any of
-/// `group_ids`) above `from_revision` to a catch-up requester, on the
-/// distinct gated carrier only. A requester without a current verified
-/// advert setting `certificate_rebind_v1` gets nothing: the frame never
-/// goes into a legacy-decoded catch-up page. Each write uses ADR 0107's
+/// `group_ids`) above `from_revision`, oldest first, to a catch-up
+/// requester, on the distinct gated carrier only. A requester without a
+/// current verified advert setting `certificate_rebind_v1` gets nothing:
+/// the frame never goes into a legacy-decoded catch-up page. Each write
+/// uses [`guarded_admission_for`] with [`HeadRule::OnChain`]: ADR 0107's
 /// serving guard plus D60 under the membership lock, re-checked at the
 /// seam immediately before the physical write.
 pub(in crate::server) async fn serve_catchup(
@@ -1141,32 +1339,30 @@ pub(in crate::server) async fn serve_catchup(
     group_ids: &[String],
     from_revision: u64,
 ) {
-    let frames: Vec<(String, Arc<Vec<u8>>)> = {
-        let inner = state.revocation_evictions.inner.lock().await;
-        group_ids
-            .iter()
-            .find_map(|id| inner.rebind.log.get(id).map(|log| (id, log)))
-            .map(|(id, log)| {
-                log.iter()
-                    .filter(|entry| entry.next_revision > from_revision)
-                    .map(|entry| (id.clone(), Arc::clone(&entry.bytes)))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    for (group_id, bytes) in frames {
-        let admission = catchup_admission(state, &group_id, requester);
-        let resolve_within = std::cmp::min(
-            x0x::dm::PINNED_RESOLUTION_WAIT,
-            CRB_CATCHUP_EXCHANGE_TIMEOUT / 2,
+    let frames = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .rebind
+        .catchup_frames(group_ids, from_revision);
+    for (group_id, result_head, bytes) in frames {
+        let admission = guarded_admission_for(
+            state,
+            &group_id,
+            requester,
+            HeadRule::OnChain(result_head),
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
         );
+        let resolve_within =
+            std::cmp::min(x0x::dm::PINNED_RESOLUTION_WAIT, CRB_EXCHANGE_TIMEOUT / 2);
         let exchange = state.agent.send_direct_pinned_admitted(
             requester,
             bytes.as_slice(),
             &admission,
             resolve_within,
         );
-        match tokio::time::timeout(CRB_CATCHUP_EXCHANGE_TIMEOUT, exchange).await {
+        match tokio::time::timeout(CRB_EXCHANGE_TIMEOUT, exchange).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 tracing::debug!(%error, "ADR 0110 S4: certificate rebind catch-up send refused or failed");
@@ -1180,44 +1376,6 @@ pub(in crate::server) async fn serve_catchup(
             }
         }
     }
-}
-
-fn catchup_admission(
-    state: &Arc<AppState>,
-    group_id: &str,
-    requester: &AgentId,
-) -> x0x::dm::ArtifactAdmission {
-    use super::super as ng;
-    let state = Arc::clone(state);
-    let group_id = group_id.to_string();
-    let requester = *requester;
-    Arc::new(move || {
-        let state = Arc::clone(&state);
-        let group_id = group_id.clone();
-        Box::pin(async move {
-            let requester_hex = hex::encode(requester.as_bytes());
-            let lock = ng::group_membership_lock_for_known_group(&state, &group_id).await?;
-            let evidence = {
-                let _membership_guard = lock.lock().await;
-                let evidence = ng::join_artifact_serving_check(&state, &group_id, &requester_hex)
-                    .await
-                    .ok()?;
-                let supported = state.agent.capability_store().verified_registry_supports(
-                    &requester,
-                    x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
-                );
-                if supported != Some(true) || !write_allowed(&state, &requester).await {
-                    return None;
-                }
-                evidence
-            };
-            let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                ng::join_artifact_seam_refusal(&state, &group_id, &requester_hex, evidence)
-                    .is_none()
-            });
-            Some(seam)
-        })
-    })
 }
 
 // ─── Receive (§4a "Receiver checks") ───────────────────────────────────────
@@ -1372,6 +1530,20 @@ pub(in crate::server) async fn receive(
                         |_| {},
                     )
                     .await;
+                    // §4a "Effect on S4 rows": a rebind that arrives after
+                    // the seat's removal is refused with
+                    // `rebind_seat_not_active`; the fork evidence above
+                    // is kept either way.
+                    if !info.has_active_member(&hex::encode(body.seat)) {
+                        tracing::info!(
+                            group_id = %LogHexId::group(&group_key),
+                            reason = cr::CertificateRebindRefusal::SeatNotActive.as_str(),
+                            "ADR 0110 S4: certificate rebind refused"
+                        );
+                        return ReceiveOutcome::Refused(
+                            cr::CertificateRebindRefusal::SeatNotActive,
+                        );
+                    }
                 }
                 cr::CertificateRebindRefusal::CertificateEvidenceMissing => {
                     // §1a: fetch the committed bytes, keep the frame.
@@ -1420,6 +1592,7 @@ pub(in crate::server) async fn receive(
         inner.rebind.remember(
             &body.stable_group_id,
             body.next_revision,
+            &body.commit.state_hash,
             Arc::new(payload.to_vec()),
         );
         let key = EvictionKey::new(body.stable_group_id.clone(), body.seat);
@@ -1497,13 +1670,149 @@ mod tests {
     fn catchup_log_is_bounded_and_deduplicated() {
         let mut rebind = RebindState::default();
         for revision in 0..(CRB_LOG_PER_GROUP as u64 + 4) {
-            rebind.remember("g", revision, Arc::new(vec![1]));
-            rebind.remember("g", revision, Arc::new(vec![2]));
+            rebind.remember("g", revision, "h", Arc::new(vec![1]));
+            rebind.remember("g", revision, "h", Arc::new(vec![2]));
         }
         assert_eq!(
             rebind.log.get("g").map(VecDeque::len),
             Some(CRB_LOG_PER_GROUP)
         );
+    }
+
+    /// Catch-up serves frames oldest first with their result heads, even
+    /// when a later frame was remembered first (a stashed receipt).
+    #[test]
+    fn catchup_frames_are_served_oldest_first_with_their_heads() {
+        let mut rebind = RebindState::default();
+        rebind.remember("g", 7, "r7", Arc::new(vec![7]));
+        rebind.remember("g", 5, "r5", Arc::new(vec![5]));
+        rebind.remember("g", 6, "r6", Arc::new(vec![6]));
+        let frames = rebind.catchup_frames(&["other".to_string(), "g".to_string()], 5);
+        let heads: Vec<(String, String)> = frames
+            .iter()
+            .map(|(group, head, _)| (group.clone(), head.clone()))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                ("g".to_string(), "r6".to_string()),
+                ("g".to_string(), "r7".to_string())
+            ]
+        );
+    }
+
+    fn delivery_to(recipients: &[([u8; 32], RecipientDelivery)]) -> Delivery {
+        Delivery {
+            bytes: Arc::new(vec![1]),
+            result_head: "r".to_string(),
+            recipients: recipients.iter().copied().collect(),
+            next_at: Instant::now(),
+            started: Instant::now(),
+        }
+    }
+
+    /// #1357 review P2 (#1508): the old round spawned the send and wrote
+    /// `InFlight` after it, unconditionally. A send that finished first had
+    /// its `Sent` overwritten by `InFlight`, and the recipient was never
+    /// retried or completed. Now the round installs `InFlight(token)` from
+    /// the observed status before any send starts, and only that token's
+    /// completion writes.
+    #[test]
+    fn a_fast_rebind_completion_is_never_overwritten_by_in_flight() {
+        let survivor = [5; 32];
+        let key = ("g".to_string(), "r".to_string());
+        let mut rebind = RebindState::default();
+        rebind.deliveries.insert(
+            key.clone(),
+            delivery_to(&[(survivor, RecipientDelivery::Due)]),
+        );
+        let active = BTreeSet::from([survivor]);
+        let snapshot = rebind.deliveries[&key].recipients.clone();
+        let (updates, refreshes) = plan_round(&snapshot, &active, |_| Some(Some(true)));
+        assert!(refreshes.is_empty());
+        let stale_plan = updates.clone();
+        let started = rebind
+            .deliveries
+            .get_mut(&key)
+            .map(|delivery| install_round(delivery, updates))
+            .unwrap_or_default();
+        let [(recipient, attempt)] = started.as_slice() else {
+            panic!("exactly one send starts: {started:?}");
+        };
+        assert_eq!(*recipient, survivor);
+        assert_eq!(
+            rebind.deliveries[&key].recipients.get(&survivor),
+            Some(&RecipientDelivery::InFlight(*attempt)),
+            "InFlight is installed before the send runs"
+        );
+        // The send completes at once.
+        assert!(complete_send(
+            &mut rebind,
+            &key,
+            &survivor,
+            *attempt,
+            RecipientDelivery::Sent
+        ));
+        // A late write of a plan made from the old `Due` snapshot changes
+        // nothing, and starts no second send.
+        let late = rebind
+            .deliveries
+            .get_mut(&key)
+            .map(|delivery| install_round(delivery, stale_plan))
+            .unwrap_or_default();
+        assert!(late.is_empty());
+        assert_eq!(
+            rebind.deliveries[&key].recipients.get(&survivor),
+            Some(&RecipientDelivery::Sent)
+        );
+        // A stale attempt's completion never writes.
+        assert!(!complete_send(
+            &mut rebind,
+            &key,
+            &survivor,
+            *attempt,
+            RecipientDelivery::Due
+        ));
+    }
+
+    /// A round drops recipients that left the roster, withholds a D60
+    /// refusal without changing its status, leaves `InFlight` and `Sent`
+    /// alone, and marks lacking and unknown support (refresh due).
+    #[test]
+    fn a_round_plans_from_the_gate_and_the_roster() {
+        let (due, gone, withheld, lacking, unknown, busy) =
+            ([1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]);
+        let recipients: BTreeMap<[u8; 32], RecipientDelivery> = [
+            (due, RecipientDelivery::Due),
+            (gone, RecipientDelivery::InFlight(9)),
+            (withheld, RecipientDelivery::Due),
+            (lacking, RecipientDelivery::Unknown),
+            (unknown, RecipientDelivery::Due),
+            (busy, RecipientDelivery::InFlight(8)),
+        ]
+        .into_iter()
+        .collect();
+        let active = BTreeSet::from([due, withheld, lacking, unknown, busy]);
+        let (updates, refreshes) = plan_round(&recipients, &active, |id| match *id {
+            [3, ..] => None,
+            [4, ..] => Some(Some(false)),
+            [5, ..] => Some(None),
+            _ => Some(Some(true)),
+        });
+        assert_eq!(refreshes, vec![unknown]);
+        let next: BTreeMap<[u8; 32], Option<RecipientDelivery>> = updates
+            .iter()
+            .map(|update| (update.recipient, update.next))
+            .collect();
+        assert!(matches!(
+            next.get(&due),
+            Some(Some(RecipientDelivery::InFlight(_)))
+        ));
+        assert_eq!(next.get(&gone), Some(&None));
+        assert_eq!(next.get(&withheld), None);
+        assert_eq!(next.get(&lacking), Some(&Some(RecipientDelivery::Lacking)));
+        assert_eq!(next.get(&unknown), Some(&Some(RecipientDelivery::Unknown)));
+        assert_eq!(next.get(&busy), None);
     }
 
     #[test]
@@ -1545,5 +1854,145 @@ mod tests {
             hex::encode([2u8; 32])
         );
         assert_eq!(status["held_self_rebinds"], serde_json::json!([]));
+    }
+}
+
+/// Daemon-level tests (an in-process `AppState`; no network). They run in
+/// CI under the isolated test runner.
+#[cfg(test)]
+mod daemon_tests {
+    use super::super::super as ng;
+    use super::*;
+    use anyhow::Result;
+
+    fn advertise(state: &AppState, peer: AgentId, bits: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "verified capability advert"
+        );
+    }
+
+    async fn admit(
+        state: &Arc<AppState>,
+        group_id: &str,
+        recipient: &AgentId,
+        rule: &HeadRule,
+    ) -> Option<x0x::dm::SeamAdmission> {
+        guarded_admission_for(
+            state,
+            group_id,
+            recipient,
+            rule.clone(),
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        )()
+        .await
+    }
+
+    /// #1357 review P1 (#1508): rebind delivery and catch-up go through the
+    /// guarded admission with capability bit 6, evaluated again at the
+    /// write. A recipient that advertises only `crypto_exclusion_v1` is
+    /// refused. A recipient that was eligible when the round scheduled it,
+    /// then was removed or banned, or saw the frame leave the chain or the
+    /// group quarantined, is refused by the seam (after a passing
+    /// pre-phase) and by a fresh pre-phase.
+    #[tokio::test]
+    async fn rebind_egress_refuses_a_recipient_that_became_ineligible() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let survivor = AgentId([0x77; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let group_id = "cb".repeat(16);
+        let mut info = GroupInfo::new("cb".into(), String::new(), admin, group_id.clone());
+        info.add_member(
+            survivor_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        let rule = HeadRule::OnChain(info.state_hash.clone());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+
+        // Bit 5 alone is not bit 6: no admission.
+        advertise(
+            &state,
+            survivor,
+            x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+        );
+        assert!(
+            admit(&state, &stable, &survivor, &rule).await.is_none(),
+            "a recipient without certificate_rebind_v1 is refused"
+        );
+        advertise(
+            &state,
+            survivor,
+            x0x::dm::CapabilityRegistry::current().bits,
+        );
+        let seam = admit(&state, &stable, &survivor, &rule).await;
+        assert!(
+            seam.is_some_and(|seam| seam()),
+            "an eligible recipient is admitted"
+        );
+
+        type Change = fn(&mut GroupInfo, &str);
+        let changes: [(&str, Change); 4] = [
+            ("removed", |info, member| {
+                info.remove_member(member, None);
+            }),
+            ("banned", |info, member| {
+                info.ban_member(member, None);
+            }),
+            ("frame left the chain", |info, _| {
+                info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.recompute_state_hash();
+            }),
+            ("quarantined", |info, _| {
+                info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                    revision: 1,
+                    state_hash: "other".into(),
+                    committed_by: String::new(),
+                    observed_at_ms: 0,
+                    snapshot: x0x::groups::ForkSnapshot {
+                        terminal_commit: info.terminal_commit_header(),
+                        conflicting_commit: info.terminal_commit_header(),
+                        classification: None,
+                    },
+                    no_anchor: true,
+                });
+            }),
+        ];
+        for (label, change) in changes {
+            let seam = admit(&state, &stable, &survivor, &rule)
+                .await
+                .unwrap_or_else(|| panic!("{label}: the pre-phase must admit first"));
+            {
+                let mut groups = state.named_groups.write().await;
+                let stored = groups.get_mut(&group_id).expect("group");
+                change(stored, &survivor_hex);
+            }
+            assert!(!seam(), "{label}: the seam must refuse the write");
+            assert!(
+                admit(&state, &stable, &survivor, &rule).await.is_none(),
+                "{label}: a fresh pre-phase must refuse"
+            );
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+        }
+        Ok(())
     }
 }

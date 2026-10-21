@@ -1061,6 +1061,24 @@ pub(super) fn guarded_admission(
     recipient: &AgentId,
     rule: HeadRule,
 ) -> x0x::dm::ArtifactAdmission {
+    guarded_admission_for(
+        state,
+        group_id,
+        recipient,
+        rule,
+        x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+    )
+}
+
+/// [`guarded_admission`] for the frame kind gated on `capability` (ADR
+/// 0093 bit), for example `certificate_rebind_v1` (§4a "Egress").
+pub(super) fn guarded_admission_for(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &AgentId,
+    rule: HeadRule,
+    capability: u64,
+) -> x0x::dm::ArtifactAdmission {
     use super::super as ng;
     let state = Arc::clone(state);
     let group_id = group_id.to_string();
@@ -1082,10 +1100,10 @@ pub(super) fn guarded_admission(
                     crate::server::resolve_group_entry_locked(&roster, &group_id)
                         .is_some_and(|(_, info)| head_rule_admits(info, &rule))
                 };
-                let supported = state.agent.capability_store().verified_registry_supports(
-                    &recipient,
-                    x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
-                );
+                let supported = state
+                    .agent
+                    .capability_store()
+                    .verified_registry_supports(&recipient, capability);
                 if !head_ok || supported != Some(true) || !write_allowed(&state, &recipient).await {
                     return None;
                 }
