@@ -2464,6 +2464,95 @@ Use option 2.
             and "docs/adr/transient/T-self-leave-rekey-committer.md" in out,
         ))
 
+    def _adr0083_text(body: str) -> str:
+        return (
+            "# ADR 0083: Agents Show Their Owner a GUI View\n\n"
+            "- **Status:** Accepted\n\n"
+            "## Context\n\n"
+            "Test context.\n\n"
+            "## Decision\n\n"
+            f"{body}\n\n"
+            "## Consequences\n\n"
+            "Test consequences body.\n\n"
+            "## Validation\n\n"
+            "Test validation body.\n"
+        )
+
+    _0083_before = "\n".join(before for before, _after in adr._PR1512_REPLACEMENTS)
+    _0083_after = _0083_before
+    for _before, _after in adr._PR1512_REPLACEMENTS:
+        _0083_after = _0083_after.replace(_before, _after, 1)
+
+    def _seed_0083(work: Path, text: str) -> None:
+        path = work / adr._PR1512_ADR
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_adr0083_text(_0083_before))
+        _commit_all(work, "accept ADR 0083")
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        path.write_text(text)
+        _commit_all(work, "edit ADR 0083 section 5")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_0083(work, _adr0083_text(_0083_after))
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1512"})
+        results.append(check(
+            "PR 1512: the accepted section 5 passages are the only allowed edit",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_0083(work, _adr0083_text(_0083_after))
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1513"})
+        results.append(check(
+            "PR 1512: a different pull request cannot edit ADR 0083",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and adr._PR1512_ADR in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_0083(work, _adr0083_text(_0083_after))
+        rc, out = _run_validator(work)
+        results.append(check(
+            "PR 1512: the section 5 edit fails when the pull request number is absent",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and adr._PR1512_ADR in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_0083(work, _adr0083_text(_0083_after + "\nExtra sentence.\n"))
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1512"})
+        results.append(check(
+            "PR 1512: any other body edit of ADR 0083 fails",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and adr._PR1512_ADR in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED, with_grounding=False)
+        path = work / "docs/adr/0042-test.md"
+        path.write_text(_ADR_ACCEPTED.replace("Test decision body.", "Changed decision."))
+        _commit_all(work, "edit a different accepted ADR")
+        rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1512"})
+        results.append(check(
+            "PR 1512: pull request 1512 cannot edit a different Accepted ADR",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} passed")
     return 1 if failed else 0

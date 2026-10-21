@@ -175,7 +175,7 @@ On a request that passes §2 and §5, the target machine:
    `HASH_SPACE_APPS` out of `x0x-gui.html` and fails if the two lists diverge.
    Anything else is `invalid_view`. The request is never forwarded to a
    browser with an unchecked route.
-2. **If a GUI tab is live and visible** (it has an open WS), it pushes a
+2. **If a GUI tab is live and visible** (§5), it pushes a
    `gui.show` WS event carrying the validated route and the banner text. The
    GUI navigates in place (`navigated`). No new process or window is created,
    so the human's current tab changes view instead of a new window stealing
@@ -194,12 +194,34 @@ On a request that passes §2 and §5, the target machine:
 
 ### 5. Protecting the human
 
-- **Origin banner.** Every show, whether navigated in place or opened in a new
-  window, displays a non-dismissable-for-3-seconds banner: "Opened by
-  *<agent name or short id>* on *<machine name or short id>*" (with "(rider)"
-  when the provenance flag is set). The names are resolved locally, never
-  taken from the request. The banner has a "Stop shows from this agent"
-  control, which adds the sender to a local `gui_show_blocked` list.
+- **Origin banner.** Every show displays a banner for 3 seconds. The human
+  cannot dismiss it during that time. This applies when the GUI navigates in
+  place and when it opens a new window. The first sentence is "Opened by
+  *<agent name or short id>* on *<machine name or short id>*". The sentence
+  includes "(rider)" when the provenance flag is set. The daemon resolves
+  the names on the target machine. It does not copy them from the request.
+  The second sentence is "Delete gui_show_local_disabled in the data
+  directory to turn local show back on."
+- **Stop.** The banner has a "Stop shows from this agent" control. The
+  control sends `gui.block`.
+  - When the sender is this daemon's own agent, Stop writes
+    `gui_show_local_disabled` in the data directory. Stop does not add that
+    agent to `gui_show_blocked`. A later local show answers `disabled`.
+    The human turns local show back on by deleting that file. A config value
+    `local_enabled = true`, a process restart, or `POST /acl/reload` does
+    not delete the file and does not turn local show back on.
+  - When the sender is another agent, Stop adds that agent to the local
+    `gui_show_blocked` list. A later show from a blocked sender answers
+    `refused`.
+- **Live tab.** A GUI tab is live only while the human can use it. The
+  WebSocket sends the query flag `gui=1` when it connects in that state.
+  The tab sends `gui.visible` when the tab is shown or hidden. A hidden tab
+  omits `gui=1` on the next connect. A session that is due for refresh
+  (8 minutes after it was issued) stays unavailable until that refresh
+  succeeds. The tab does not advertise itself as visible before the refresh
+  succeeds. David Irvine accepted `gui_show_local_disabled`, `gui.visible`,
+  and `gui=1` on 21 Oct 2026 (PR 1512) and ordered this section to match
+  that decision.
 - **Rate limit.** Per requesting `AgentId`: burst 3, then 1 per 20 s, and at
   most 30 per hour per target machine across all senders. Excess requests get
   `rate_limited`. Local and remote shows share the same buckets on the
@@ -212,9 +234,12 @@ On a request that passes §2 and §5, the target machine:
   remote_enabled = true   # accept shows from other owner machines
   ```
 
-  When `remote_enabled = false`, the target answers `disabled`, and activity
-  queries are answered `disabled` (with no timestamp). The settings are read
-  at startup and on `POST /acl/reload`.
+  When `local_enabled` is false, local show answers `disabled`. The file
+  `gui_show_local_disabled` forces that result, including when the config
+  still says `local_enabled = true`. When `remote_enabled = false`, the
+  target answers `disabled`, and activity queries are answered `disabled`
+  (with no timestamp). The daemon reads these settings at startup and on
+  `POST /acl/reload`.
 - **Defaults (decided by David Irvine, 2026-09-28; see Decisions on the open
   questions).**
   - Local show is **on** by default: it is no more than `x0x gui --view`
