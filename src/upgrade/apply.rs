@@ -657,6 +657,38 @@ impl AutoApplyUpgrader {
         Ok(observed)
     }
 
+    /// Capture actual guide policy evidence after download. The writer must
+    /// hold the returned install lock through a fresh observe_locked_at check
+    /// requiring Due and the rename; this snapshot alone authorizes no write.
+    #[cfg(unix)]
+    pub(crate) async fn guide_staging(
+        &self,
+    ) -> Result<
+        Option<(
+            PathBuf,
+            super::staging_runtime::Gate,
+            restart::StagingIdentity,
+        )>,
+        UpgradeError,
+    > {
+        let Some(gate) = &self.staging else {
+            return Ok(None);
+        };
+        self.check_release()?;
+        let install = self.install_path()?;
+        let identity = restart::resolve_staging_identity(
+            self.stop_on_upgrade,
+            &install,
+            self.restart_context.data_dir.as_deref(),
+            self.restart_context.api_addr,
+        )
+        .await
+        .map_err(UpgradeError::from)?;
+        // Drain the actual identity readback before observing cancellation.
+        self.check_release()?;
+        Ok(Some((install, gate.clone(), identity)))
+    }
+
     #[cfg(unix)]
     pub(crate) fn with_staging_request(mut self, request: super::staging::StagingRequest) -> Self {
         self.staging = Some(super::staging_runtime::Gate {

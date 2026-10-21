@@ -39,6 +39,12 @@ that already says the delay is complete. Unknown or damaged records remain
 in place and refuse this apply; they do not block normal daemon startup.
 Shutdown or loss of the task cancels work before mutation admission.
 
+After a guide download, startup resolves the install again and rechecks the
+current staging and probe state under that install's lock. It holds the lock
+through the guide write and rename. A hold recorded before this admission
+keeps the prior guide. This does not defer an admitted guide update to host
+commit; transaction-bound guide promotion remains separate work.
+
 The compiled deployment inventory sets a minimum 60-minute window for a
 known or ambiguous production fleet install. An existing receipt below that
 minimum refuses apply and remains intact. Ordinary installs retain an
