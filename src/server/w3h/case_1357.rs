@@ -971,7 +971,8 @@ impl LateHold {
 
 /// `label`'s persisted S4 row for `target` (the `.evs` sidecar): its first
 /// observation (T_obs), in wall-clock Unix ms. Under W3-H the wall clock
-/// is a fixed base plus virtual time (the shim, #1245). `None` when the
+/// is a fixed base plus virtual time (the shim, #1245); without the shim
+/// it is real time and not comparable with virtual time. `None` when the
 /// sidecar has no row for `target`.
 fn persisted_t_obs(sim: &Sim, label: &str, target: &[u8; 32]) -> Result<Option<u64>> {
     use crate::groups::eviction::{decode_evs, EVS_FILE_NAME};
@@ -1527,8 +1528,17 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let mut reached: Option<String> = None;
     let mut reached_after: Option<Duration> = None;
     let mut seen = Observations::default();
+    // The late arm: the first poll (virtual time after t = 0) at which A's
+    // `.evs` row for B exists. A file read only, so the trace is the same.
+    let mut a_row_seen: Option<Duration> = None;
     let waited = sim
         .until("the survivors reach H", bound, async |s: &Sim| {
+            if late_hold.is_some()
+                && a_row_seen.is_none()
+                && persisted_t_obs(s, "A", b.as_bytes()).is_ok_and(|t_obs| t_obs.is_some())
+            {
+                a_row_seen = Some(s.fabric().now().saturating_sub(started));
+            }
             let Some(now) = seen.observe(views_now(s, survivors, &group, &b)).await else {
                 return true;
             };
@@ -1555,21 +1565,37 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         }
     }
     seen.verify("the survivors reach H")?;
-    // The late arm: A's persisted T_obs, in ms after t = 0, and the
-    // second precondition stage (A's T_obs is at or after R).
+    // The late arm: A's T_obs, in virtual time after t = 0, and the second
+    // precondition stage (A's T_obs is at or after R). With the shim
+    // preloaded, the daemons' wall clock is a fixed base plus virtual time,
+    // so A's persisted `.evs` T_obs is exact. Without the shim (the Test
+    // Suite and Coverage Gate jobs run W3-H cases with no preload), the
+    // daemons stamp real wall time, which does not follow virtual time: a
+    // 9 s virtual release point can pass in about 1 s of real time, and the
+    // `.evs` value is not comparable with R. Then the case uses the first
+    // H-wait poll that saw A's row (a 100 ms virtual-time upper bound).
     let mut late_t_obs: Option<Duration> = None;
     if let Some(hold) = &late_hold {
         let persisted = persisted_t_obs(sim, "A", b.as_bytes())?;
-        late_t_obs = persisted.map(|ms| Duration::from_millis(ms.saturating_sub(zero_ms)));
+        let wall_t_obs = persisted.map(|ms| Duration::from_millis(ms.saturating_sub(zero_ms)));
+        let clock = if sim.shim.is_some() {
+            late_t_obs = wall_t_obs;
+            "shim wall clock (base + virtual time)"
+        } else {
+            late_t_obs =
+                a_row_seen.or(persisted.map(|_| sim.fabric().now().saturating_sub(started)));
+            "first H-wait poll with A's row (shim not preloaded: the .evs wall time is real time)"
+        };
         let release_after = hold.release.saturating_sub(started);
         receipt.evidence(
             "a_t_obs_at_or_after_the_release_point",
             // Wall-clock ms are floored; allow that 1 ms rounding.
             late_t_obs.is_some_and(|t_obs| t_obs + Duration::from_millis(1) >= release_after),
             format!(
-                "A's .evs T_obs for B {:?} after t=0 (raw {persisted:?}, t=0 wall {zero_ms}); \
-                 release point {:?} after t=0; {}",
-                late_t_obs,
+                "A's T_obs for B {late_t_obs:?} after t=0 from the {clock}; .evs T_obs {:?} \
+                 after t=0 (raw {persisted:?}, t=0 wall {zero_ms}); release point {:?} after \
+                 t=0; {}",
+                wall_t_obs,
                 release_after,
                 hold.describe()
             ),
