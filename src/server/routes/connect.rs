@@ -2,17 +2,34 @@
 //!
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
+//!
+//! `POST /forwards` is owner/durable-token only: a named peer resolves
+//! (and pins) locally. The auth middleware refuses session bearers and
+//! riders before any extractor runs (`requires_durable_owner`); the
+//! handler re-checks as defense in depth.
 
 use super::super::api_error;
+use super::super::rider_auth::ActorContext;
 use super::super::state::AppState;
 use crate as x0x;
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+const DURABLE_REQUIRED: &str =
+    "name management requires the durable API token (not a session or rider token)";
+
+fn durable_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "ok": false, "error": DURABLE_REQUIRED })),
+    )
+        .into_response()
+}
 
 // ── Tailnet forwarding (#132 T6) ──────────────────────────────────────────
 
@@ -21,7 +38,9 @@ use std::sync::Arc;
 pub(in crate::server) struct ForwardAddRequest {
     /// Local bind, e.g. `127.0.0.1:8022`.
     local_addr: String,
-    /// Peer agent id (hex).
+    /// Peer agent: hex agent id, or an ADR-0074 agent name
+    /// (`[agent:]<label>.<owner>`). `machine:` names are refused until the
+    /// pinned-MachineId stream check (slice 2) lands.
     peer_agent: String,
     /// Loopback target host on the peer (numeric IP).
     target_host: String,
@@ -31,10 +50,21 @@ pub(in crate::server) struct ForwardAddRequest {
 
 pub(in crate::server) async fn forward_add(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
     Json(req): Json<ForwardAddRequest>,
 ) -> impl IntoResponse {
     use x0x::forward::ForwardSpec;
     use x0x::identity::AgentId;
+    use x0x::names::PeerRef;
+    if !actor.is_durable_owner() {
+        return durable_forbidden();
+    }
+    // Syntax first, before any state is consulted: a malformed peer or a
+    // `machine:` name (fail closed until slice 2) is refused outright.
+    let peer = match PeerRef::parse_forward_peer(&req.peer_agent) {
+        Ok(peer) => peer,
+        Err(e) => return super::names::name_error(&e),
+    };
     let Some(forwarder) = state.forward_service.as_ref() else {
         return api_error(
             StatusCode::CONFLICT,
@@ -55,10 +85,22 @@ pub(in crate::server) async fn forward_add(
         )
         .into_response();
     }
-    let peer_agent_bytes = match x0x::exec::acl::parse_agent_id(&req.peer_agent) {
-        Ok(id) => id,
-        Err(e) => {
-            return api_error(StatusCode::BAD_REQUEST, format!("peer_agent: {e}")).into_response()
+    // ADR-0074 §1: a name resolves locally (pinned at first use) to an
+    // agent id. Resolution adds no trust: the stream below still passes the
+    // identity gate and the peer's connect ACL.
+    let (peer_agent_bytes, name) = match peer {
+        PeerRef::Hex(id) => (id, None),
+        PeerRef::Name(name) => {
+            // Agent-only resolve: check kind before pinning so a bare
+            // label that lands on a machine does not write names.json.
+            let resolved = match super::names::resolve_for_forward(&state, &name).await {
+                Ok(resolved) => resolved,
+                Err(e) => return super::names::name_error(&e),
+            };
+            match x0x::names::require_agent_target(&resolved, &name) {
+                Ok(agent) => (agent, Some(resolved.name)),
+                Err(e) => return super::names::name_error(&e),
+            }
         }
     };
     let spec = ForwardSpec {
@@ -75,6 +117,7 @@ pub(in crate::server) async fn forward_add(
                 "ok": true,
                 "local_addr": bound.to_string(),
                 "peer_agent": hex::encode(peer_agent.as_bytes()),
+                "name": name,
             })),
         )
             .into_response(),
@@ -152,11 +195,17 @@ pub(in crate::server) async fn streams_diagnostics(
             )
         })
         .unwrap_or((0, 0));
+    let socks_denied = state
+        .socks_service
+        .as_ref()
+        .map(x0x::socks::SocksService::denied_count)
+        .unwrap_or(0);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "active_streams": active,
             "connect_failed": connect_failed,
+            "socks_denied": socks_denied,
             "connect": state.connect_diagnostics.snapshot(),
         })),
     )

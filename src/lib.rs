@@ -84,6 +84,8 @@ pub mod revocation;
 /// envelope, and the placement-ledger enforcement checks (B and P).
 pub mod key_move;
 
+pub mod names;
+
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
@@ -105,6 +107,9 @@ pub mod streams;
 
 /// Local port-forwarder over tailnet byte-streams (tailnet Phase 1, #132 T4).
 pub mod forward;
+
+/// SOCKS5 front-end over ForwardV2 (ADR-0074 §3 / #1389).
+pub mod socks;
 
 /// Contact store with trust levels for message filtering.
 pub mod contacts;

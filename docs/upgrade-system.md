@@ -51,9 +51,39 @@ minimum refuses apply and remains intact. Ordinary installs retain an
 explicit zero window. Only the compiled debug test key permits the fleet
 rehearsal exception.
 
+For an undersized fleet receipt, keep the configured binary in normal
+operation. Preserve the receipt and any selection or pending records, with
+their hashes. Changing the window or restarting does not reset the receipt.
+Do not edit or delete it to remove the refusal.
+
+To continue, use the normal verified Unix startup update path when a strictly
+newer eligible stable release is available. That release must pass all current
+guards and must not have its own undersized or conflicting receipt. A new
+receipt records a window of at least 60 minutes; its calculated delay can be
+zero. The old receipt remains unchanged. This is progression to another
+release, not repair of the refused release. If no eligible release is
+available, or unresolved selection, journal, pair or probe state still blocks
+apply, keep the current binary running and retain the evidence for supported
+recovery. This slice provides no command to clear these records.
+
 Selecting a newer eligible release requires a durable supersession record.
 An older waiter cannot then apply its release. The previous receipt remains
 intact; supersession does not delete it or reset the selected release's wait.
+
+This staging gate accepts canonical stable versions only. Setting
+`include_prereleases` does not allow a prerelease through the gate.
+The private `upgrade-selection-<digest>.json` record and its `.pending`
+marker retain the selected release and evidence of an incomplete write.
+An unresolved marker or damaged record refuses apply. The configured binary
+still starts normally.
+
+If this refusal occurs, preserve the selection record, pending marker and
+bound rollout receipt, with their hashes. Check the recorded participant
+roots, release version and digests. Investigate any storage or sync error
+before attempting recovery. Keep the configured binary in normal operation
+while apply remains refused. This slice provides no selection-record repair
+command. Do not delete records or edit their fields to bypass the refusal.
+Complete transaction recovery remains separate M2 work.
 
 Gossip and fallback discovery share one bounded pending release and continue
 to receive announcements during a wait. The worker drains a superseded

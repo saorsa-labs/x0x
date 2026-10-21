@@ -138,6 +138,28 @@ class TraceCheckTest(unittest.TestCase):
             problems = CHECK.check_receipts(d, 1, ['w3h_red=RED'])
             self.assertTrue(any("lacks stages ['cause']" in p for p in problems), problems)
 
+    def test_red_receipt_with_a_failed_recovery_cause_fails(self):
+        # #1364: the red case records the typed-wait cause and the recovery
+        # after the holder returns as two cause stages. A failed recovery
+        # (fetch or admission) is never the expected RED, even when the
+        # receipt claims RED and the typed-wait cause holds.
+        import json
+        for recovery in ('fetch', 'admission'):
+            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as d:
+                body = {'schema': 'w3h.receipt/1', 'case': 'w3h_red', 'verdict': 'RED',
+                        'stages': [
+                            {'stage': 'setup_done'},
+                            {'stage': 'evidence', 'name': 'evidence', 'ok': True},
+                            {'stage': 'request_delivered', 'name': 'delivered', 'ok': True},
+                            {'stage': 'cause', 'expected': 'no typed wait', 'ok': True},
+                            {'stage': 'cause', 'expected': f'recovery {recovery}', 'ok': False},
+                            {'stage': 'final', 'name': 'final', 'passed': False},
+                        ]}
+                self.write(d, 'w3h_red-1.receipt.json', json.dumps(body))
+                problems = CHECK.check_receipts(d, 1, ['w3h_red=RED'])
+                self.assertTrue(any(f"false cause stage 'recovery {recovery}'" in p
+                                    for p in problems), problems)
+
 
 if __name__ == '__main__':
     unittest.main()
