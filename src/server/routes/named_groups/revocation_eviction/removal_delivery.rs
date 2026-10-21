@@ -12,16 +12,18 @@
 //!   and moves to `committed_delivery_pending`. The `.evs` is fsynced
 //!   before the first publication.
 //! - **Delivery** ([`drive`]). The row stays `committed_delivery_pending`
-//!   until every eligible survivor accepted the saved event on the direct
-//!   carrier. Each write re-checks roster membership and the agent,
-//!   machine and binding revocations just before it. Resends stop once the
-//!   head moves past the result: old crypto material is never sent after
-//!   an epoch change.
+//!   until every eligible survivor took the saved event on the pinned
+//!   direct carrier. Each write is guarded egress (§3 L231): ADR 0107's
+//!   serving check, the D60 machine and binding check and the head rule
+//!   run in the pre-phase and again at the write seam. Resends stop once
+//!   the head moves past the result: old crypto material is never sent
+//!   after an epoch change.
 //! - **Restart** ([`resume_after_load`]). A saved event is classified
 //!   against the verified chain like a crypto-only frame. Only an event
-//!   whose result is still the head is resent, and only after the restart
-//!   sync wait (§3 "re-sync the head before any resend"). No second rekey
-//!   runs.
+//!   whose result is still the head is resent, and only after the group's
+//!   head is synced (§2, §3 "re-sync the head before any resend"): the
+//!   restart wait, a completed current catch-up round and no unresolved
+//!   higher-head evidence. No second rekey runs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use x0x::groups::eviction::{EvictionKey, ObligationStore, Phase, WaitingCause, W
 use x0x::groups::GroupInfo;
 
 use super::super::NamedGroupMetadataEvent;
-use super::crypto_exclusion::{self, RecipientDelivery, RoundUpdate, SavedFrameState};
+use super::crypto_exclusion::{self, HeadRule, RecipientDelivery, RoundUpdate, SavedFrameState};
 
 /// A live delivery waits this long before its first send: the legacy
 /// removal path already sent the initial volley.
@@ -49,7 +51,7 @@ pub(super) struct RemovalDelivery {
     event: Arc<NamedGroupMetadataEvent>,
     result_head: String,
     /// The event was saved by an earlier boot: no resend before the
-    /// restart sync wait.
+    /// group's head is synced.
     resumed: bool,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
@@ -303,18 +305,33 @@ pub(super) fn resume_after_load(
 pub(super) async fn drive(state: &Arc<AppState>) {
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
-    let head_synced = runtime.head_synced(now);
+    let candidates: Vec<(EvictionKey, bool)> = runtime
+        .inner
+        .lock()
+        .await
+        .removals
+        .iter()
+        .filter(|(_, delivery)| delivery.next_at <= now)
+        .map(|(key, delivery)| (key.clone(), delivery.resumed))
+        .collect();
+    // §3 "re-sync the head before any resend": a saved event waits for the
+    // group's real head sync, not only the restart wait.
+    let synced = crypto_exclusion::resumed_groups_head_synced(state, &candidates).await;
     let due: Vec<(EvictionKey, RemovalDelivery)> = {
         let mut inner = runtime.inner.lock().await;
-        let keys: Vec<EvictionKey> = inner
-            .removals
-            .iter()
-            .filter(|(_, delivery)| delivery.next_at <= now && (!delivery.resumed || head_synced))
-            .map(|(key, _)| key.clone())
-            .collect();
-        keys.into_iter()
-            .filter_map(|key| {
+        candidates
+            .into_iter()
+            .filter_map(|(key, _)| {
                 let delivery = inner.removals.get_mut(&key)?;
+                if !crypto_exclusion::resend_due(
+                    delivery.next_at,
+                    delivery.resumed,
+                    &synced,
+                    &key,
+                    now,
+                ) {
+                    return None;
+                }
                 delivery.next_at = now + REMOVAL_RESEND_INTERVAL;
                 Some((key, delivery.clone()))
             })
@@ -353,7 +370,6 @@ pub(super) async fn drive(state: &Arc<AppState>) {
         let active: std::collections::BTreeSet<[u8; 32]> =
             survivors(&info, &local, &key.target).into_iter().collect();
         let mut updates: Vec<RoundUpdate> = Vec::new();
-        let mut sends: HashMap<[u8; 32], SendFuture> = HashMap::new();
         for (recipient, status) in &delivery.recipients {
             let observed = *status;
             if !active.contains(recipient) {
@@ -374,26 +390,11 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             if !crypto_exclusion::write_allowed(state, &agent).await {
                 continue;
             }
-            let recipient_hex = hex::encode(recipient);
-            let Some(send) = super::super::named_group_event_send_future(
-                state,
-                &recipient_hex,
-                &delivery.event,
-                "s4-removal",
-            ) else {
-                updates.push(RoundUpdate {
-                    recipient: *recipient,
-                    observed,
-                    next: None,
-                });
-                continue;
-            };
             updates.push(RoundUpdate {
                 recipient: *recipient,
                 observed,
                 next: Some(RecipientDelivery::InFlight(crypto_exclusion::next_attempt())),
             });
-            sends.insert(*recipient, Box::pin(send));
         }
         // Install every status, `InFlight` included, BEFORE any send task
         // starts: a fast completion can then never be overwritten.
@@ -414,30 +415,105 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             started
         };
         for (recipient, attempt) in started {
-            if let Some(send) = sends.remove(&recipient) {
-                spawn_send(state, key.clone(), recipient, attempt, send);
-            }
+            spawn_send(
+                state,
+                key.clone(),
+                recipient,
+                attempt,
+                delivery.result_head.clone(),
+                Arc::clone(&delivery.event),
+            );
         }
     }
 }
 
-/// One built send of the saved removal event.
-type SendFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>;
+/// The bound on one saved-removal exchange (resolution, the pre-phase and
+/// the write).
+const REMOVAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write the saved removal event to `recipient` in ONE guarded exchange
+/// (§3 L231, ADR 0107 serving guard and D60, re-checked at the write
+/// seam): [`crypto_exclusion::guarded_removal_admission`] with
+/// [`HeadRule::Current`] on the pinned direct carrier.
+///
+/// The bytes are the legacy `MemberRemoved` JSON, unchanged, framed as a
+/// normal direct message, so a legacy survivor decodes it. The admission
+/// has no capability gate for the same reason. An event above
+/// `MAX_PAYLOAD_BYTES` is staged as a control blob and its reference, the
+/// same message the legacy path sends, goes through the same guarded
+/// write. Without the reference the recipient cannot name the blob, so a
+/// refused write gives it nothing.
+async fn send_removal(
+    state: &Arc<AppState>,
+    stable_group_id: &str,
+    recipient: &x0x::identity::AgentId,
+    result_head: &str,
+    event: &NamedGroupMetadataEvent,
+) -> Result<(), String> {
+    use super::super::control_blob;
+    let payload = serde_json::to_vec(event).map_err(|e| e.to_string())?;
+    let payload = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        let reference = control_blob::stage_reference(
+            &state.control_blobs,
+            &state.agent,
+            recipient,
+            control_blob::ControlBlobKind::NamedGroupEvent,
+            super::super::named_group_metadata_event_group_id(event),
+            None,
+            payload,
+            None,
+        )
+        .map_err(str::to_string)?;
+        control_blob::encode_message(&control_blob::ControlBlobMessage::Reference { reference })?
+    } else {
+        payload
+    };
+    let admission = crypto_exclusion::guarded_removal_admission(
+        state,
+        stable_group_id,
+        recipient,
+        HeadRule::Current(result_head.to_string()),
+    );
+    let resolve_within = std::cmp::min(
+        x0x::dm::PINNED_RESOLUTION_WAIT,
+        REMOVAL_EXCHANGE_TIMEOUT / 2,
+    );
+    let exchange =
+        state
+            .agent
+            .send_direct_pinned_admitted(recipient, &payload, &admission, resolve_within);
+    match tokio::time::timeout(REMOVAL_EXCHANGE_TIMEOUT, exchange).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("saved removal exchange deadline elapsed".to_string()),
+    }
+}
 
 fn spawn_send(
     state: &Arc<AppState>,
     key: EvictionKey,
     recipient: [u8; 32],
     attempt: u64,
-    send: SendFuture,
+    result_head: String,
+    event: Arc<NamedGroupMetadataEvent>,
 ) {
     let task_state = Arc::clone(state);
     let _spawned = state.spawn_detached(async move {
-        let status = match send.await {
+        let agent = x0x::identity::AgentId(recipient);
+        let sent = send_removal(
+            &task_state,
+            &key.stable_group_id,
+            &agent,
+            &result_head,
+            &event,
+        )
+        .await;
+        let status = match sent {
             Ok(()) => RecipientDelivery::Sent,
             Err(error) => {
-                tracing::debug!(%error, "ADR 0110 S4: saved removal send failed; retrying");
+                // An admission refusal is a withhold: the next round
+                // re-evaluates the recipient from the current state.
+                tracing::debug!(%error, "ADR 0110 S4: saved removal send refused or failed; retrying");
                 RecipientDelivery::Due
             }
         };
@@ -594,5 +670,286 @@ mod tests {
             store.get(&key).expect("row").phase,
             Phase::CommittedDeliveryPending
         );
+    }
+}
+
+#[cfg(test)]
+mod resend_gate_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// #1357 review (Codex P1): a delivery an earlier boot saved is due only
+    /// when its own group is head-synced; a live delivery needs only its
+    /// resend time.
+    #[test]
+    fn a_resumed_delivery_needs_its_group_head_synced() {
+        let now = Instant::now();
+        let key = EvictionKey::new("g".to_string(), [1; 32]);
+        let none = BTreeSet::new();
+        let other: BTreeSet<String> = ["h".to_string()].into();
+        let synced: BTreeSet<String> = ["g".to_string()].into();
+        assert!(crypto_exclusion::resend_due(now, false, &none, &key, now));
+        assert!(!crypto_exclusion::resend_due(now, true, &none, &key, now));
+        assert!(!crypto_exclusion::resend_due(now, true, &other, &key, now));
+        assert!(crypto_exclusion::resend_due(now, true, &synced, &key, now));
+        let later = now + Duration::from_secs(1);
+        assert!(!crypto_exclusion::resend_due(
+            later, true, &synced, &key, now
+        ));
+        assert!(!crypto_exclusion::resend_due(
+            later, false, &synced, &key, now
+        ));
+    }
+}
+
+#[cfg(test)]
+mod daemon_tests {
+    use super::super::super as ng;
+    use super::super::{HeadRound, S4Runtime};
+    use super::*;
+    use anyhow::{Context, Result};
+    use x0x::groups::eviction::S4Timing;
+    use x0x::identity::AgentId;
+
+    /// A test state whose restart sync wait has already elapsed, so only
+    /// the per-group head sync can hold a resend.
+    async fn state_past_restart_wait() -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let (mut state, dir) = ng::tests::secure_endpoint_test_state().await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh test state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        Ok((state, dir))
+    }
+
+    /// One group with the local admin and `survivor` as Active members.
+    async fn insert_group(state: &AppState, group_id: &str, survivor: &AgentId) -> GroupInfo {
+        let admin = state.agent.agent_id();
+        let mut info = GroupInfo::new("s4".into(), String::new(), admin, group_id.to_string());
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        info
+    }
+
+    fn removal_event(group_id: &str, target: &[u8; 32]) -> NamedGroupMetadataEvent {
+        NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.to_string(),
+            revision: 2,
+            actor: String::new(),
+            agent_id: hex::encode(target),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: None,
+        }
+    }
+
+    /// #1357 review (Codex P1 "elapsed time treated as head
+    /// synchronization"): a saved removal that an earlier boot left is not
+    /// resent while the group has unresolved higher-head evidence, even
+    /// though the restart wait has elapsed. Once the evidence resolves, the
+    /// same round resends it.
+    #[tokio::test]
+    async fn resumed_removal_waits_for_unresolved_higher_head_evidence() -> Result<()> {
+        let (state, _dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x51; 32]);
+        let target = [0x52; 32];
+        let group_id = "d4".repeat(16);
+        let info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), target);
+        let scheduled = Instant::now();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            // The head round for the current head has run its course.
+            inner
+                .head_rounds
+                .insert(stable.clone(), HeadRound::new(&info.state_hash, scheduled));
+            inner.removals.insert(
+                key.clone(),
+                new_delivery(
+                    removal_event(&group_id, &target),
+                    info.state_hash.clone(),
+                    vec![*survivor.as_bytes()],
+                    true,
+                    scheduled,
+                ),
+            );
+        }
+        // Higher-head evidence: epoch-ahead traffic the catch-up still chases.
+        state.treekem_epoch_ahead_targets.lock().await.insert(
+            group_id.clone(),
+            ng::EpochAheadTarget {
+                epoch: info.secret_epoch.saturating_add(1),
+                observations: 0,
+            },
+        );
+
+        drive(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let delivery = inner.removals.get(&key).context("delivery kept")?;
+            assert_eq!(
+                delivery.next_at, scheduled,
+                "no resend round while higher-head evidence is unresolved"
+            );
+            assert_eq!(
+                delivery.recipients.get(survivor.as_bytes()),
+                Some(&RecipientDelivery::Due),
+                "nothing was sent to the survivor"
+            );
+        }
+
+        // The evidence resolves: the head is synced and the resend runs.
+        state.treekem_epoch_ahead_targets.lock().await.clear();
+        drive(&state).await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let delivery = inner.removals.get(&key).context("delivery kept")?;
+        assert!(
+            delivery.next_at > scheduled,
+            "the synced group's resend round ran"
+        );
+        assert_ne!(
+            delivery.recipients.get(survivor.as_bytes()),
+            Some(&RecipientDelivery::Due),
+            "the survivor's send started"
+        );
+        Ok(())
+    }
+
+    async fn admit(
+        state: &Arc<AppState>,
+        stable: &str,
+        recipient: &AgentId,
+        rule: &HeadRule,
+    ) -> Option<x0x::dm::SeamAdmission> {
+        crypto_exclusion::guarded_removal_admission(state, stable, recipient, rule.clone())().await
+    }
+
+    /// #1357 review: the saved removal goes through guarded egress. A
+    /// legacy survivor with no capability bit is admitted (it must still get
+    /// the `MemberRemoved` it decodes). A survivor that becomes removed,
+    /// banned, quarantined, sees the head move, or whose machine is revoked
+    /// is refused at the write seam after a passing pre-phase, and by a
+    /// fresh pre-phase.
+    #[tokio::test]
+    async fn removal_delivery_refuses_an_ineligible_recipient() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let survivor = AgentId([0x61; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let group_id = "d5".repeat(16);
+        let info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let rule = HeadRule::Current(info.state_hash.clone());
+        // A legacy advert: a verified machine binding and no application
+        // bits.
+        let machine = x0x::identity::MachineKeypair::generate()?;
+        assert!(
+            state.agent.capability_store().insert(
+                survivor,
+                machine.machine_id(),
+                x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]),
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "verified legacy advert"
+        );
+        assert_eq!(
+            state.agent.capability_store().verified_registry_supports(
+                &survivor,
+                x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1
+            ),
+            Some(false),
+            "the survivor is legacy"
+        );
+
+        let seam = admit(&state, &stable, &survivor, &rule).await;
+        assert!(
+            seam.is_some_and(|seam| seam()),
+            "an eligible legacy survivor is admitted"
+        );
+
+        type Change = fn(&mut GroupInfo, &str);
+        let changes: [(&str, Change); 4] = [
+            ("removed", |info, member| {
+                info.remove_member(member, None);
+            }),
+            ("banned", |info, member| {
+                info.ban_member(member, None);
+            }),
+            ("head moved", |info, _| {
+                info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.recompute_state_hash();
+            }),
+            ("quarantined", |info, _| {
+                info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                    revision: 1,
+                    state_hash: "other".into(),
+                    committed_by: String::new(),
+                    observed_at_ms: 0,
+                    snapshot: x0x::groups::ForkSnapshot {
+                        terminal_commit: info.terminal_commit_header(),
+                        conflicting_commit: info.terminal_commit_header(),
+                        classification: None,
+                    },
+                    no_anchor: true,
+                });
+            }),
+        ];
+        for (label, change) in changes {
+            let seam = admit(&state, &stable, &survivor, &rule)
+                .await
+                .with_context(|| format!("{label}: the pre-phase must admit first"))?;
+            {
+                let mut groups = state.named_groups.write().await;
+                let stored = groups.get_mut(&group_id).context("group")?;
+                change(stored, &survivor_hex);
+            }
+            assert!(!seam(), "{label}: the seam must refuse the write");
+            assert!(
+                admit(&state, &stable, &survivor, &rule).await.is_none(),
+                "{label}: a fresh pre-phase must refuse"
+            );
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+        }
+
+        // D60: the survivor's machine is revoked after the pre-phase.
+        let seam = admit(&state, &stable, &survivor, &rule)
+            .await
+            .context("machine: the pre-phase must admit first")?;
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Machine(machine.machine_id()),
+            machine.public_key(),
+            machine.secret_key(),
+            x0x::groups::owner_cert::restore_clock_now(),
+            Some("s4 removal delivery test".to_string()),
+        )?;
+        state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)?;
+        assert!(!seam(), "machine revoked: the seam must refuse the write");
+        assert!(
+            admit(&state, &stable, &survivor, &rule).await.is_none(),
+            "machine revoked: a fresh pre-phase must refuse"
+        );
+        Ok(())
     }
 }
