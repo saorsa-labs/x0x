@@ -45630,6 +45630,9 @@ pub(in crate::server) mod tests {
             forward_service: None,
             socks_service: None,
             owner_sync,
+            names: Arc::new(
+                x0x::names::NameStore::load(x0x::names::NameStore::path_in(data_dir)).await,
+            ),
             startup_catchup_obligations: std::sync::Mutex::new(HashMap::new()),
             startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
             startup_catchup_backoff_owner: AtomicU64::new(0),
@@ -50350,7 +50353,7 @@ pub(in crate::server) mod tests {
             "trust_level": "known"
         }))
         .context("deserialize ImportCardRequest")?;
-        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+        let response = import_agent_card(State(Arc::clone(&state)), None, Json(req))
             .await
             .into_response();
         let (status, body) = response_json(response).await?;
@@ -50389,7 +50392,7 @@ pub(in crate::server) mod tests {
             "trust_level": "known"
         }))
         .context("deserialize ImportCardRequest")?;
-        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+        let response = import_agent_card(State(Arc::clone(&state)), None, Json(req))
             .await
             .into_response();
         let (status, body) = response_json(response).await?;
@@ -50460,7 +50463,7 @@ pub(in crate::server) mod tests {
             "trust_level": "known"
         }))
         .context("deserialize ImportCardRequest")?;
-        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+        let response = import_agent_card(State(Arc::clone(&state)), None, Json(req))
             .await
             .into_response();
         let (status, body) = response_json(response).await?;
