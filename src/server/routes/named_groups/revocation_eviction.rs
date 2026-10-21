@@ -3570,6 +3570,37 @@ mod tests {
         assert!(!round.synced("h2", 1, false, true, later, wait));
     }
 
+    /// CI DIAG #1546 W3-H `s4_designated_late_observation` (iteration 11):
+    /// the designated admin observes at about W/2 and must seal within the
+    /// rest of W. A round asked each holder once, so one lost request or
+    /// answer left it waiting for the 13 s restart sync wait, longer than
+    /// the time left, and the ranked fallback signed instead. ADR 0110 §2:
+    /// "failure to progress with an available holder is a defect". A holder
+    /// that has not answered is asked again, well inside the wait.
+    #[test]
+    fn a_holder_that_did_not_answer_is_asked_again_inside_the_wait() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let mut rounds = HashMap::new();
+        let holders = [[8; 32], [9; 32]];
+        assert_eq!(
+            refresh_head_round(&mut rounds, "g", "h1", &holders, start, wait),
+            holders.to_vec()
+        );
+        assert!(
+            refresh_head_round(&mut rounds, "g", "h1", &holders, start, wait).is_empty(),
+            "no second ask in the same instant"
+        );
+        // [9; 32] reports a head this node does not have; [8; 32] is silent.
+        note_head_report(&mut rounds, "g", "h1", [9; 32], HeadReport::Unknown, start);
+        let later = start + Duration::from_secs(3);
+        assert_eq!(
+            refresh_head_round(&mut rounds, "g", "h1", &holders, later, wait),
+            vec![[8; 32]],
+            "the silent holder is asked again; the one that answered is not"
+        );
+    }
+
     #[test]
     fn a_conflicting_head_report_blocks_the_seal_until_resolved() {
         let wait = Duration::from_secs(13);
