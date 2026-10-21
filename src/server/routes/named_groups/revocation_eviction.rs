@@ -52,7 +52,7 @@ pub(super) mod rebind;
 mod removal_delivery;
 pub(super) mod removal_journal;
 
-pub(super) use removal_delivery::record_committed_removal;
+pub(super) use removal_delivery::{record_committed_removal, removal_blob_serve_admitted};
 
 /// The worker's idle re-check interval. Budgets and expiry checks run at
 /// least this often; intake wakes the worker at once.
@@ -235,7 +235,7 @@ impl S4Runtime {
     /// prove the local head is current: a node upgraded from a pre-S4
     /// binary loads its saved groups with no `.evs`. Harness arms that
     /// trigger within the wait therefore measure H from the wait's end.
-    fn head_synced(&self, now: Instant) -> bool {
+    fn restart_wait_elapsed(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.boot_instant) >= self.timing.restart_sync_wait
     }
 }
@@ -430,7 +430,7 @@ async fn local_epoch_of(state: &AppState, group_key: &str, info: &GroupInfo) -> 
 pub(super) async fn group_head_synced(state: &AppState, group_key: &str) -> bool {
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
-    if !runtime.head_synced(now) {
+    if !runtime.restart_wait_elapsed(now) {
         return false;
     }
     let Some((key, info)) = ({
@@ -581,7 +581,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     let local = *state.agent.agent_id().as_bytes();
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
-    let restart_wait_elapsed = runtime.head_synced(now);
+    let restart_wait_elapsed = runtime.restart_wait_elapsed(now);
     let mut inner = runtime.inner.lock().await;
     let boot_id = runtime.boot_id;
     let mut created = Vec::new();
@@ -657,9 +657,13 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .chain(inner.queued_bans.keys())
         .cloned()
         .collect();
+    // §4b(1): a held owner-recovery mandate is a seal too, so its group
+    // keeps a round even with no open row; its named admins are excluded.
+    let orc_rounds = inner.orc.head_round_groups();
     let open_groups: BTreeSet<String> = round_keys
         .iter()
         .map(|key| key.stable_group_id.clone())
+        .chain(orc_rounds.keys().cloned())
         .collect();
     inner
         .head_rounds
@@ -672,6 +676,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .iter()
             .filter(|key| &key.stable_group_id == stable)
             .map(|key| key.target)
+            .chain(orc_rounds.get(stable).into_iter().flatten().copied())
             .collect();
         let holders = head_holders(info, &local, &excluded);
         let ask = refresh_head_round(

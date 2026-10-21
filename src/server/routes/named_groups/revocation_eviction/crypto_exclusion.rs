@@ -32,8 +32,9 @@
 //!   is installed, with a per-attempt token, before its send task starts,
 //!   and a completion writes only over its own token.
 //! - **Restart** (`resume_crypto_exclusions` in the parent). A saved frame
-//!   is resent only after the restart sync wait and only while its result
-//!   is the current head. A competing branch on the parent keeps the frame
+//!   is resent only after the group's head is synced
+//!   ([`super::group_head_synced`], not elapsed time alone) and only while
+//!   its result is the current head. A competing branch on the parent keeps the frame
 //!   as fork evidence and shows `waiting_for_fork_resolution`; nothing is
 //!   published.
 //! - **Receive** ([`spawn_receipt`]) verifies the frame and the L4 rule and
@@ -102,7 +103,7 @@ pub(super) struct CeDelivery {
     result_head: String,
     next_revision: u64,
     /// The frame was saved by an earlier boot: no resend before the
-    /// restart sync wait (§3 "re-sync the head before any resend").
+    /// group's head is synced (§3 "re-sync the head before any resend").
     resumed: bool,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
@@ -737,6 +738,42 @@ pub(super) fn saved_frame_heads(bytes: &[u8]) -> Option<(String, String, u64)> {
 
 // ─── Delivery ──────────────────────────────────────────────────────────────
 
+/// §2 and §3 "re-sync the head before any resend": the groups of the
+/// `resumed` candidates whose head is synced now
+/// ([`super::group_head_synced`]: the restart minimum, a completed current
+/// catch-up round and no unresolved higher-head evidence). Elapsed time
+/// alone never releases a resend that an earlier boot saved. Call it with
+/// no S4 lock held.
+pub(super) async fn resumed_groups_head_synced(
+    state: &AppState,
+    candidates: &[(EvictionKey, bool)],
+) -> BTreeSet<String> {
+    let groups: BTreeSet<&str> = candidates
+        .iter()
+        .filter(|(_, resumed)| *resumed)
+        .map(|(key, _)| key.stable_group_id.as_str())
+        .collect();
+    let mut synced = BTreeSet::new();
+    for group in groups {
+        if super::group_head_synced(state, group).await {
+            synced.insert(group.to_string());
+        }
+    }
+    synced
+}
+
+/// Whether a delivery of `key` is due now: its resend time has come and,
+/// for a delivery an earlier boot saved, its group's head is synced.
+pub(super) fn resend_due(
+    next_at: Instant,
+    resumed: bool,
+    synced: &BTreeSet<String>,
+    key: &EvictionKey,
+    now: Instant,
+) -> bool {
+    next_at <= now && (!resumed || synced.contains(&key.stable_group_id))
+}
+
 /// One delivery round for every due row: per recipient, re-check the
 /// roster and the agent, machine and binding revocations, then send only
 /// to a recipient whose current verified advert sets the bit. Each send
@@ -744,23 +781,30 @@ pub(super) fn saved_frame_heads(bytes: &[u8]) -> Option<(String, String, u64)> {
 pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
-    let head_synced = runtime.head_synced(now);
-    let due: Vec<(EvictionKey, CeDelivery)> = {
+    let candidates: Vec<(EvictionKey, bool)> = {
         let mut guard = runtime.inner.lock().await;
         let inner = &mut *guard;
         if attach_replay_evidence(&mut inner.ce, &mut inner.store) {
             inner.dirty = true;
         }
-        let keys: Vec<EvictionKey> = inner
+        inner
             .ce
             .deliveries
             .iter()
-            .filter(|(_, delivery)| delivery.next_at <= now && (!delivery.resumed || head_synced))
-            .map(|(key, _)| key.clone())
-            .collect();
-        keys.into_iter()
-            .filter_map(|key| {
+            .filter(|(_, delivery)| delivery.next_at <= now)
+            .map(|(key, delivery)| (key.clone(), delivery.resumed))
+            .collect()
+    };
+    let synced = resumed_groups_head_synced(state, &candidates).await;
+    let due: Vec<(EvictionKey, CeDelivery)> = {
+        let mut inner = runtime.inner.lock().await;
+        candidates
+            .into_iter()
+            .filter_map(|(key, _)| {
                 let delivery = inner.ce.deliveries.get_mut(&key)?;
+                if !resend_due(delivery.next_at, delivery.resumed, &synced, &key, now) {
+                    return None;
+                }
                 delivery.next_at = now + CE_RESEND_INTERVAL;
                 Some((key, delivery.clone()))
             })
@@ -1061,6 +1105,49 @@ pub(super) fn guarded_admission(
     recipient: &AgentId,
     rule: HeadRule,
 ) -> x0x::dm::ArtifactAdmission {
+    guarded_admission_for(
+        state,
+        group_id,
+        recipient,
+        rule,
+        x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+    )
+}
+
+/// As [`guarded_admission`], gated on the application `capability` bit
+/// instead of `CRYPTO_EXCLUSION_V1`.
+pub(super) fn guarded_admission_for(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &AgentId,
+    rule: HeadRule,
+    capability: u64,
+) -> x0x::dm::ArtifactAdmission {
+    guarded_admission_gated(state, group_id, recipient, rule, Some(capability))
+}
+
+/// As [`guarded_admission`], with no capability gate: the admission of a
+/// saved `MemberRemoved` (§3). That event is the legacy removal event,
+/// which every member decodes, so a legacy survivor without a capability
+/// bit must still receive it. Every other check is the same.
+pub(super) fn guarded_removal_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &AgentId,
+    rule: HeadRule,
+) -> x0x::dm::ArtifactAdmission {
+    guarded_admission_gated(state, group_id, recipient, rule, None)
+}
+
+/// The shared body of the guarded admissions. `capability: None` skips
+/// only the capability gate.
+fn guarded_admission_gated(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &AgentId,
+    rule: HeadRule,
+    capability: Option<u64>,
+) -> x0x::dm::ArtifactAdmission {
     use super::super as ng;
     let state = Arc::clone(state);
     let group_id = group_id.to_string();
@@ -1082,11 +1169,14 @@ pub(super) fn guarded_admission(
                     crate::server::resolve_group_entry_locked(&roster, &group_id)
                         .is_some_and(|(_, info)| head_rule_admits(info, &rule))
                 };
-                let supported = state.agent.capability_store().verified_registry_supports(
-                    &recipient,
-                    x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
-                );
-                if !head_ok || supported != Some(true) || !write_allowed(&state, &recipient).await {
+                let supported = capability.is_none_or(|bit| {
+                    state
+                        .agent
+                        .capability_store()
+                        .verified_registry_supports(&recipient, bit)
+                        == Some(true)
+                });
+                if !head_ok || !supported || !write_allowed(&state, &recipient).await {
                     return None;
                 }
                 evidence
@@ -1690,6 +1780,32 @@ mod tests {
         assert!(!head_rule_admits(&info, &live));
     }
 
+    /// #1357 CI (493c2a6): the live head rule follows the state hash, and
+    /// the state hash commits to the TreeKEM epoch through the security
+    /// binding, not through `secret_epoch`. An epoch bump alone is not a
+    /// head move (the daemon test's old mutation); a production epoch move
+    /// (epoch and binding together) is, and the rule then refuses.
+    #[test]
+    fn an_epoch_move_moves_the_head_through_its_binding() {
+        let admin = AgentId([1; 32]);
+        let mut info = GroupInfo::new("e".into(), String::new(), admin, "ab".repeat(16));
+        info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
+        info.recompute_state_hash();
+        let live = HeadRule::Current(info.state_hash.clone());
+        assert!(head_rule_admits(&info, &live));
+        let mut epoch_only = info.clone();
+        epoch_only.secret_epoch = epoch_only.secret_epoch.saturating_add(1);
+        epoch_only.recompute_state_hash();
+        assert_eq!(epoch_only.state_hash, info.state_hash);
+        assert!(head_rule_admits(&epoch_only, &live));
+        let mut moved = info.clone();
+        moved.secret_epoch = moved.secret_epoch.saturating_add(1);
+        moved.security_binding = Some(format!("treekem:epoch={}", moved.secret_epoch));
+        moved.recompute_state_hash();
+        assert_ne!(moved.state_hash, info.state_hash);
+        assert!(!head_rule_admits(&moved, &live));
+    }
+
     // ─── #1357 review P1: replay evidence across restart ─────────────────
 
     fn signed_frame(
@@ -1916,8 +2032,15 @@ mod daemon_tests {
                 info.ban_member(member, None);
             }),
             ("head moved", |info, _| {
+                // A TreeKEM epoch move as production commits it: the epoch
+                // and its security binding move together, and the binding
+                // is what the state hash commits to (#1357 CI: the epoch
+                // alone left the head unchanged).
+                let before = info.state_hash.clone();
                 info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
                 info.recompute_state_hash();
+                assert_ne!(info.state_hash, before, "the head must move");
             }),
             ("quarantined", |info, _| {
                 info.fork_quarantine = Some(x0x::groups::ForkQuarantine {

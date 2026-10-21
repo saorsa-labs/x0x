@@ -11238,6 +11238,13 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 from_revision,
             )
             .await;
+            revocation_eviction::owner_recovery::serve_catchup(
+                &serve_state,
+                &requester,
+                &group_ids,
+                from_revision,
+            )
+            .await;
         });
     }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
