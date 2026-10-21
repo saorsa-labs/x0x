@@ -18,6 +18,8 @@ pub(in crate::server) use control_blob::{
 };
 pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
 pub(in crate::server) use fair_admission::FairAdmission;
+#[cfg(test)]
+pub(in crate::server) use group_recovery::open_staging_journal_for_test;
 pub(in crate::server) use group_recovery::{
     get_group_recovery, reseat_group_member, run_group_recovery_worker, S3Runtime,
 };
@@ -4445,7 +4447,7 @@ pub(in crate::server) async fn offer_signed_public_kv_catchup(
             None => return,
         };
         if info.withdrawn
-            || fork_marker_in_force(state, group_key, info).is_some()
+            || info.fork_quarantine.is_some()
             || info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
             || info.state_revision != signed_revision.saturating_add(1)
             || !info.has_active_member(&author_hex)
@@ -6145,8 +6147,9 @@ pub(in crate::server) fn store_named_group_info_locked(
 pub(in crate::server) async fn store_named_group_info(
     state: &AppState,
     group_id: &str,
-    info: x0x::groups::GroupInfo,
+    mut info: x0x::groups::GroupInfo,
 ) -> bool {
+    state.group_recovery.hold_reseat_marker(&mut info);
     let mut groups = state.named_groups.write().await;
     // ADR0066-LOOKUP-WAIVER: `group_id` is the exact map key the caller is
     // about to replace below — not a quarantine lookup at all. The scoped
@@ -6360,6 +6363,86 @@ enum PublishNotDurable {
     No,
 }
 
+/// ADR 0109 §3 step 3 (#1533 review): a roster write that changes the live
+/// map only when it is `Durable`. The mutation runs on a private candidate.
+/// The live map takes the candidate's changed records only after a durable
+/// write, and only if none of them changed meanwhile. A `ReplacedNotDurable`
+/// write keeps memory as it was and arms the durability confirmation, so
+/// the next write saves memory again before anything else. The re-seat
+/// swap uses it to lift the staged record's marker.
+pub(in crate::server) async fn persist_named_groups_mutation_durable_only<F>(
+    state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let _gss_publication_guard = state.gss_publication_gate.write().await;
+    if state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
+    {
+        match save_named_groups_checked_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) => state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release),
+            outcome => return outcome,
+        }
+    }
+    let before = state.named_groups.read().await.clone();
+    let mut candidate = before.clone();
+    if !mutate(&mut candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    state.group_recovery.hold_reseat_markers(&mut candidate);
+    enforce_containment_invariant(&mut candidate, &before);
+    let (legacy_json, home_suite_json) =
+        encode_named_groups_store_excluding_pending_stubs(state, &candidate, None).await?;
+    let outcome = save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await;
+    match &outcome {
+        Ok(AtomicWriteOutcome::Durable) => {
+            let mut groups = state.named_groups.write().await;
+            let mut touched: Vec<&String> = before
+                .keys()
+                .chain(candidate.keys())
+                .filter(|key| before.get(*key) != candidate.get(*key))
+                .collect();
+            touched.sort_unstable();
+            touched.dedup();
+            if touched
+                .iter()
+                .any(|key| groups.get(*key) != before.get(*key))
+            {
+                // A record changed meanwhile: keep memory, and save it again
+                // before the next write.
+                drop(groups);
+                state
+                    .named_groups_requires_durability_confirmation
+                    .store(true, Ordering::Release);
+                return Err(std::io::Error::other(
+                    "named-group record changed during a durable-only write",
+                ));
+            }
+            for key in touched {
+                match candidate.get(key) {
+                    Some(record) => {
+                        groups.insert(key.clone(), record.clone());
+                    }
+                    None => {
+                        groups.remove(key);
+                    }
+                }
+            }
+        }
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
+            .named_groups_requires_durability_confirmation
+            .store(true, Ordering::Release),
+        _ => {}
+    }
+    outcome
+}
+
 /// Caller holds P and G. Record replacements retain the existing TreeKEM
 /// rebind journal and pending-stub semantics, but stage all writes privately.
 async fn persist_named_groups_quarantine_clear_gated_unlocked<F>(
@@ -6378,6 +6461,12 @@ where
     };
     let mut candidate = before.clone();
     if !mutate(&mut candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    // ADR 0109 §3 step 2 (#1533 review): no clear lifts the marker a staged
+    // re-seat record holds; only the swap does. A clear that is then a no-op
+    // replaces nothing.
+    if state.group_recovery.hold_reseat_markers(&mut candidate) && candidate == before {
         return Ok(AtomicWriteOutcome::NotReplaced);
     }
     enforce_containment_invariant(&mut candidate, &before);
@@ -6536,6 +6625,9 @@ where
         if !mutate(&mut groups) {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
+        // ADR 0109 §3 step 2: a staged re-seat record holds the original's
+        // marker (`S3Runtime::hold_reseat_marker`).
+        state.group_recovery.hold_reseat_markers(&mut groups);
         // #732 r8 / #1103: ONE of the FIVE containment chokepoints. The others are
         // `persist_named_group_info`'s transaction, the TreeKEM atomic
         // writer's durable candidate, and the scoped entry in
@@ -7081,8 +7173,11 @@ pub(in crate::server) async fn persist_named_group_info(
 async fn persist_named_group_info_inner(
     state: &AppState,
     group_id: &str,
-    info: x0x::groups::GroupInfo,
+    mut info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    // ADR 0109 §3 step 2: a staged re-seat record keeps the original's
+    // marker, so a replacement that dropped it is not a clear.
+    state.group_recovery.hold_reseat_marker(&mut info);
     // #457 r4: the named write and the TreeKEM snapshot rebind are ONE
     // crash-atomic transaction under the persistence lock — the journal
     // (post-mutation named json + rebound envelope) is written FIRST, the
@@ -17076,7 +17171,7 @@ pub(in crate::server) async fn get_named_group(
             // (with its forensic snapshot) — `null` when the group is
             // not quarantined. Strictly local; never set for
             // non-owner-axis groups in this slice.
-            "fork_quarantine": fork_marker_in_force(&state, &id, &info),
+            "fork_quarantine": info.fork_quarantine,
             "home": info.home.as_ref().map(|home| serde_json::json!({
                 "primary_agent": home.primary_agent,
                 "provisioned_at_ms": home.provisioned_at_ms,
@@ -21383,6 +21478,10 @@ pub(super) async fn join_group_via_invite_inner(
                 fork_evidence: None,
                 anchored_gap_refusal: None,
             });
+            // ADR 0109 §3 step 2 (#1533 review): a staged re-seat stub holds
+            // the journalled original's marker from its install (both
+            // install shapes below) until the swap.
+            state.group_recovery.hold_reseat_marker(&mut info);
 
             // ADR-0064 slice 2 (§1b capability predicate): an owner-axis
             // invite whose InviteV4 OWNER COUNTERSIGNATURE just verified
@@ -28740,33 +28839,8 @@ pub(in crate::server) fn reject_fork_quarantined(
     group_id: &str,
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let marker = fork_marker_in_force(state, group_id, info)?;
-    Some(reject_fork_quarantined_marker(state, group_id, &marker))
-}
-
-/// ADR 0109 §3 step 2 (#1533 review): the fork marker an ADR 0066 refusal
-/// sees for `info`. It is the record's own marker or, while a re-seat join
-/// for the group is staged, the journalled original's marker. So the
-/// staged record (a join stub, or an Active record not yet swapped in)
-/// never acts with less containment than the original until the durable
-/// swap. The staged join's own apply and install paths read the record
-/// itself, not this.
-pub(in crate::server) fn fork_marker_in_force(
-    state: &AppState,
-    group_id: &str,
-    info: &x0x::groups::GroupInfo,
-) -> Option<x0x::groups::ForkQuarantine> {
-    marker_in_force(&state.group_recovery, group_id, info)
-}
-
-fn marker_in_force(
-    runtime: &group_recovery::S3Runtime,
-    group_id: &str,
-    info: &x0x::groups::GroupInfo,
-) -> Option<x0x::groups::ForkQuarantine> {
-    info.fork_quarantine
-        .clone()
-        .or_else(|| runtime.staging_marker(&[group_id, info.stable_group_id(), &info.mls_group_id]))
+    let marker = info.fork_quarantine.as_ref()?;
+    Some(reject_fork_quarantined_marker(state, group_id, marker))
 }
 
 /// Session tokens cannot inspect a contested roster unless this daemon still
@@ -28778,9 +28852,9 @@ pub(in crate::server) fn reject_fork_quarantined_for_actor(
     info: &x0x::groups::GroupInfo,
     actor: &crate::server::rider_auth::ActorContext,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let marker = fork_marker_in_force(state, group_id, info)?;
+    let marker = info.fork_quarantine.as_ref()?;
     Some(reject_fork_quarantined_marker_for_actor(
-        state, group_id, &marker, info, actor,
+        state, group_id, marker, info, actor,
     ))
 }
 
@@ -28940,14 +29014,8 @@ pub(in crate::server) async fn reject_fork_quarantine_installed_before_effect_fo
 
     let groups = state.named_groups.read().await;
     let (_, live) = crate::server::resolve_group_entry_locked(&groups, group_id)?;
-    // ADR 0109 §3 (#1533 review): a re-seat staged since admission brings
-    // the original's marker back into force; it is never the captured one.
-    let staged = live.fork_quarantine.is_none();
-    let marker = fork_marker_in_force(state, group_id, live)?;
-    let marker = &marker;
-    if !staged
-        && captured.is_some_and(|captured| live.lifecycle_epoch_token().same_marker(captured))
-    {
+    let marker = live.fork_quarantine.as_ref()?;
+    if captured.is_some_and(|captured| live.lifecycle_epoch_token().same_marker(captured)) {
         // Same marker the operation was authorized with. Unreachable for an
         // admitted operation (the entry gate refuses a group that already
         // carries one), and kept as an equality rather than an
@@ -33660,9 +33728,13 @@ impl std::error::Error for EpochInstalledPersistError {}
 async fn persist_treekem_and_named_groups_atomic_with_info(
     state: &AppState,
     group_id_hex: &str,
-    info: x0x::groups::GroupInfo,
+    mut info: x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
+    // ADR 0109 §3 step 2: the staged re-seat record keeps the original's
+    // marker through its Welcome install (the marker check below then sees
+    // the same marker).
+    state.group_recovery.hold_reseat_marker(&mut info);
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let stable_group_id = info.stable_group_id().to_string();
     #[cfg(test)]
