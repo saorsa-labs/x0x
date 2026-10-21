@@ -189,6 +189,18 @@ struct S4Inner {
     removals: HashMap<EvictionKey, removal_delivery::RemovalDelivery>,
     /// §4a, §4b(2): certificate rebind deliveries, renewals and waits.
     rebind: rebind::RebindState,
+    /// §1a: verified expiry hand-offs kept until this node selects the
+    /// same certificate and its clock passes the raw `not_after`.
+    expiry_handoffs: BTreeMap<EvictionKey, ExpiryHandoff>,
+}
+
+/// A kept §1a expiry hand-off.
+#[derive(Debug, Clone)]
+struct ExpiryHandoff {
+    /// The committed digest that the hand-off names.
+    certificate_digest: String,
+    /// When this node received it.
+    received_unix_ms: u64,
 }
 
 impl S4Inner {
@@ -638,6 +650,32 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         }
         if matches!(outcome, IntakeOutcome::Created | IntakeOutcome::Reopened) {
             created.push(key);
+        }
+    }
+    // §1a: a kept expiry hand-off opens the work once this node selects
+    // the same certificate and its clock has passed the raw `not_after`;
+    // T_obs is that moment, not the own trigger time `not_after + τ`.
+    let handoff_triggers =
+        expiry_handoff_triggers(&mut inner.expiry_handoffs, &groups, now_unix_ms);
+    for (key, trigger, incarnation, observed_ms) in handoff_triggers {
+        let outcome =
+            inner
+                .store
+                .intake(&key, trigger, incarnation.as_deref(), now_unix_ms, boot_id);
+        if outcome.changed() {
+            inner.mark_not_durable(&key);
+        }
+        if matches!(outcome, IntakeOutcome::Created | IntakeOutcome::Reopened) {
+            created.push(key.clone());
+        }
+        if let Some(row) = inner.store.get_mut(&key).filter(|row| row.phase.is_open()) {
+            let earliest = row
+                .earliest_handoff_receipt_unix_ms
+                .map_or(observed_ms, |seen| seen.min(observed_ms));
+            if row.earliest_handoff_receipt_unix_ms != Some(earliest) {
+                row.earliest_handoff_receipt_unix_ms = Some(earliest);
+                inner.dirty = true;
+            }
         }
     }
     for key in created {
@@ -1279,6 +1317,18 @@ pub(in crate::server) async fn s4_manual_request_gate(
     revocation_eviction_pass(state).await;
     let key = EvictionKey::new(stable.clone(), *target.as_bytes());
     let mut inner = state.revocation_evictions.inner.lock().await;
+    // §1a/D135 (#1508 review): the reconciliation above can end the row
+    // of the worker's own prepared removal (a rebind landed while the
+    // journal was written). That removal stops; it never continues as an
+    // ordinary removal of the renewed seat.
+    if s4_prepared_removal_of(&key)
+        && inner.store.get(&key).map(|row| row.phase) != Some(Phase::Prepared)
+    {
+        return Some((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": "s4_exclusion_cancelled" })),
+        ));
+    }
     let row = inner.store.get(&key)?;
     if !row.phase.is_open() {
         return None;
@@ -1742,6 +1792,11 @@ async fn receive_handoff(state: &Arc<AppState>, sender: x0x::identity::AgentId, 
             verified_any = true;
         }
     }
+    // §1a: verify and install the carried certificate, and keep the
+    // hand-off until this node's own clock passes the raw `not_after`.
+    if let Some(expired) = &handoff.expired_certificate {
+        note_expiry_handoff(state, &handoff.stable_group_id, handoff.target, expired).await;
+    }
     // Self-leave and expiry evidence is re-derived from this node's own
     // chain and clock (§1a: a hand-off never shortens another node's
     // expiry budget); the pass below picks it up.
@@ -1761,6 +1816,157 @@ async fn receive_handoff(state: &Arc<AppState>, sender: x0x::identity::AgentId, 
             }
         }
     }
+}
+
+/// §1a hand-off evidence: the hand-off must name the seat's committed
+/// digest. When this node lacks the bytes of that digest-only seat, the
+/// carried bytes must hash to the digest and pass the existing owner
+/// certificate check (signature, owner chain, agent binding; expiry is the
+/// expected result). They are installed through the digest-anchored seat
+/// hydrate. The hand-off is then kept for [`expiry_handoff_triggers`].
+async fn note_expiry_handoff(
+    state: &AppState,
+    stable_group_id: &str,
+    target: [u8; 32],
+    expired: &s4::HandoffExpiredCertificate,
+) {
+    let target_hex = hex::encode(target);
+    let (group_key, install) = {
+        let groups = state.named_groups.read().await;
+        let Some((group_key, info)) = groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == stable_group_id)
+        else {
+            return;
+        };
+        let Some(owner) = info.policy.admission.owner_certified_user_id() else {
+            return;
+        };
+        let Some(member) = info.members_v2.get(&target_hex) else {
+            return;
+        };
+        let committed = member.certificate_digest.clone().or_else(|| {
+            member
+                .certificate
+                .as_ref()
+                .map(x0x::groups::owner_cert::certificate_digest_hex)
+        });
+        if committed.as_deref() != Some(expired.certificate_digest.as_str()) {
+            return;
+        }
+        let install = if member.certificate.is_none() {
+            let Some(cert) = verified_handoff_certificate(owner, &target_hex, expired) else {
+                return;
+            };
+            Some(cert)
+        } else {
+            None
+        };
+        (group_key.clone(), install)
+    };
+    if let Some(cert) = install {
+        let membership = super::group_membership_lock(state, &group_key).await;
+        let _serialized = membership.lock().await;
+        let pairs = vec![(target_hex.clone(), cert)];
+        let outcome = super::persist_named_groups_mutation(state, |groups| {
+            groups
+                .get_mut(&group_key)
+                .is_some_and(|info| info.hydrate_member_certificates(&pairs) > 0)
+        })
+        .await;
+        if let Err(error) = outcome {
+            tracing::warn!(%error, "ADR 0110 S4: hand-off certificate install failed");
+            return;
+        }
+    }
+    let key = EvictionKey::new(stable_group_id.to_string(), target);
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .expiry_handoffs
+        .entry(key)
+        .or_insert_with(|| ExpiryHandoff {
+            certificate_digest: expired.certificate_digest.clone(),
+            received_unix_ms: now_unix_ms(),
+        });
+}
+
+/// The carried certificate of an expiry hand-off, when its bytes hash to
+/// the named digest and it verifies against the owner for `target_hex`.
+fn verified_handoff_certificate(
+    owner: &x0x::identity::UserId,
+    target_hex: &str,
+    expired: &s4::HandoffExpiredCertificate,
+) -> Option<x0x::identity::AgentCertificate> {
+    let bytes = expired.certificate_bytes.as_deref()?;
+    let cert: x0x::identity::AgentCertificate = bincode::deserialize(bytes).ok()?;
+    if x0x::groups::owner_cert::certificate_digest_hex(&cert) != expired.certificate_digest {
+        return None;
+    }
+    let now_unix = now_unix_ms() / 1000;
+    match x0x::groups::owner_cert::verify_cert_against_owner(
+        owner, target_hex, &cert, false, now_unix,
+    ) {
+        Ok(()) | Err(x0x::groups::owner_cert::OwnerCertFailure::Expired) => Some(cert),
+        Err(_) => None,
+    }
+}
+
+/// §1a hand-off timing. A kept hand-off becomes a trigger once this node
+/// selects the certificate it names and its clock has passed the raw
+/// `not_after`; the returned time is T_obs (the later of the receipt and
+/// that moment). A hand-off whose seat or committed certificate changed is
+/// dropped; one still waiting for the clock or for the seat's bytes stays.
+fn expiry_handoff_triggers(
+    kept: &mut BTreeMap<EvictionKey, ExpiryHandoff>,
+    groups: &[(String, GroupInfo)],
+    now_unix_ms: u64,
+) -> Vec<(EvictionKey, EvictionTrigger, Option<String>, u64)> {
+    let now_unix = now_unix_ms / 1000;
+    let mut out = Vec::new();
+    kept.retain(|key, handoff| {
+        let Some(member) = groups
+            .iter()
+            .map(|(_, info)| info)
+            .find(|info| {
+                info.stable_group_id() == key.stable_group_id
+                    && !info.withdrawn
+                    && owner_certified(info)
+            })
+            .and_then(|info| info.members_v2.get(&hex::encode(key.target)))
+            .filter(|member| member.state == GroupMemberState::Active)
+        else {
+            return false;
+        };
+        let Some((digest, not_after)) = selected_certificate_expiry(member) else {
+            // Keep a digest-only seat that still waits for its bytes.
+            return member.certificate.is_none()
+                && member.certificate_digest.as_deref()
+                    == Some(handoff.certificate_digest.as_str());
+        };
+        if digest != handoff.certificate_digest {
+            return false;
+        }
+        if !s4::raw_expiry_passed(not_after, now_unix) {
+            return true;
+        }
+        let observed_ms = handoff
+            .received_unix_ms
+            .max(not_after.saturating_add(1).saturating_mul(1000));
+        out.push((
+            key.clone(),
+            EvictionTrigger::CertificateExpiry {
+                certificate_digest: digest,
+                not_after,
+            },
+            member.treekem_key_package_hash.clone(),
+            observed_ms,
+        ));
+        false
+    });
+    out
 }
 
 // ─── §3 commit ─────────────────────────────────────────────────────────────
@@ -1861,7 +2067,8 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         } else {
             ManualRequestKind::Remove
         };
-        let scope = eviction_seal_scope(&inner.store, key);
+        let mut scope = eviction_seal_scope(&inner.store, key);
+        scope.prepared_removal = true;
         let Some(row) = inner.store.get_mut(key) else {
             return;
         };
@@ -1915,9 +2122,15 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
                 inner.ban_next_attempt.remove(key);
             }
         } else {
+            // §1a/D135: a rebind that landed meanwhile ended the row; a
+            // refused attempt never reopens it.
+            let mut cancelled = true;
             if let Some(row) = inner.store.get_mut(key) {
-                row.phase = Phase::Pending;
-                row.parent_head = None;
+                if row.phase == Phase::Prepared {
+                    row.phase = Phase::Pending;
+                    row.parent_head = None;
+                    cancelled = false;
+                }
             }
             let error = body
                 .get("error")
@@ -1930,7 +2143,7 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
                     key.clone(),
                     WaitingState::cause(WaitingCause::WaitingForMemberKeyPackage),
                 );
-            } else if status != StatusCode::NOT_FOUND {
+            } else if status != StatusCode::NOT_FOUND && !cancelled {
                 tracing::warn!(
                     group_id = %super::LogHexId::group(group_key),
                     target = %super::LogHexId::agent(&target_hex),
@@ -1967,6 +2180,9 @@ struct EvictionSealScope {
     target_hex: String,
     /// Lowercase hex of the targets of the group's other open rows.
     pending_targets: BTreeSet<String>,
+    /// The worker's own removal or ban of a `prepared` row
+    /// ([`commit_removal`]), not a queued ban of an ended row.
+    prepared_removal: bool,
 }
 
 fn eviction_seal_scope(store: &ObligationStore, key: &EvictionKey) -> EvictionSealScope {
@@ -1978,6 +2194,7 @@ fn eviction_seal_scope(store: &ObligationStore, key: &EvictionKey) -> EvictionSe
             .filter(|row| row.target != key.target)
             .map(|row| hex::encode(row.target))
             .collect(),
+        prepared_removal: false,
     }
 }
 
@@ -2010,6 +2227,51 @@ fn eviction_seal_tolerates(scope: &EvictionSealScope, info: &GroupInfo, failed: 
         && failed
             .iter()
             .all(|hex| scope.pending_targets.contains(&hex.to_ascii_lowercase()))
+}
+
+/// Whether the current task runs the worker's own removal or ban of the
+/// `prepared` row `key` ([`commit_removal`]).
+fn s4_prepared_removal_of(key: &EvictionKey) -> bool {
+    S4_EVICTION_SEAL
+        .try_with(|scope| {
+            scope.prepared_removal
+                && scope.stable_group_id == key.stable_group_id
+                && scope.target_hex == hex::encode(key.target)
+        })
+        .unwrap_or(false)
+}
+
+/// §1a/D135 pre-seal re-check of a prepared row against the current
+/// committed seat, run under the membership lock just before the removal
+/// commits. An expiry-only row stays eligible only while the seat's
+/// committed certificate is one that the row names and this node's clock
+/// is past its raw `not_after`. A rebind (a new committed certificate)
+/// cancels it. A renewal never cancels revocation or self-leave work.
+fn exclusion_still_eligible(
+    row: &ObligationRow,
+    member: Option<&x0x::groups::GroupMember>,
+    now_unix: u64,
+) -> bool {
+    let Some(member) = member.filter(|member| row.expiry_only() && is_seated(member.state)) else {
+        return true;
+    };
+    let digest = match (&member.certificate, &member.certificate_digest) {
+        (Some(cert), committed) => {
+            let digest = x0x::groups::owner_cert::certificate_digest_hex(cert);
+            if committed
+                .as_deref()
+                .is_some_and(|committed| committed != digest)
+            {
+                return false;
+            }
+            digest
+        }
+        (None, Some(committed)) => committed.clone(),
+        (None, None) => return false,
+    };
+    row.expired_certificates
+        .get(&digest)
+        .is_some_and(|not_after| s4::raw_expiry_passed(*not_after, now_unix))
 }
 
 /// Run the existing signed remove or ban route for an S4 exclusion, under
@@ -3448,6 +3710,106 @@ mod tests {
             })
             .count();
         assert_eq!(history, 1);
+    }
+
+    /// An `OwnerCertified` group whose seat `target` commits `cert`.
+    fn certified_group(cert: &x0x::identity::AgentCertificate, target: [u8; 32]) -> GroupInfo {
+        let mut info = group_with([1; 32], target);
+        let owner = cert.user_id().expect("owner");
+        info.policy.admission = x0x::groups::policy::GroupAdmission::OwnerCertified(owner);
+        info.set_member_certificate(&hex::encode(target), cert.clone())
+            .expect("certificate");
+        info
+    }
+
+    fn expiring(not_after: u64) -> (x0x::identity::AgentCertificate, [u8; 32]) {
+        let owner = x0x::identity::UserKeypair::generate().expect("owner");
+        let agent = x0x::identity::AgentKeypair::generate().expect("agent");
+        let cert =
+            x0x::identity::AgentCertificate::issue_with_expiry(&owner, &agent, Some(not_after))
+                .expect("cert");
+        (cert, *agent.agent_id().as_bytes())
+    }
+
+    #[test]
+    fn a_rebind_cancels_only_expiry_work_under_the_lock() {
+        let now = 1_000_000;
+        let (old, target) = expiring(now - 10);
+        let info = certified_group(&old, target);
+        let key = EvictionKey::new(info.stable_group_id(), target);
+        let mut store = ObligationStore::new();
+        let expiry = EvictionTrigger::CertificateExpiry {
+            certificate_digest: x0x::groups::owner_cert::certificate_digest_hex(&old),
+            not_after: now - 10,
+        };
+        store.intake(&key, expiry, None, 0, [0; 16]);
+        let seat = info.members_v2.get(&hex::encode(target));
+        let row = store.get(&key).expect("row").clone();
+        assert!(exclusion_still_eligible(&row, seat, now));
+        assert!(
+            !exclusion_still_eligible(&row, seat, now - 20),
+            "raw not_after"
+        );
+        // The rebind commits a renewed certificate into the seat.
+        let mut renewed = seat.expect("seat").clone();
+        renewed.certificate_digest = Some("ab".repeat(32));
+        renewed.certificate = None;
+        assert!(!exclusion_still_eligible(&row, Some(&renewed), now));
+        // A renewal never cancels revocation work on the same key.
+        store.intake(
+            &key,
+            EvictionTrigger::AgentRevocation {
+                record_hash: [3; 32],
+                record_bytes: vec![3],
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        let row = store.get(&key).expect("row");
+        assert!(exclusion_still_eligible(row, Some(&renewed), now));
+    }
+
+    #[test]
+    fn an_expiry_handoff_triggers_at_the_raw_not_after_not_at_tau() {
+        let now = now_unix_ms() / 1000;
+        let (cert, target) = expiring(now - 10);
+        let info = certified_group(&cert, target);
+        let digest = x0x::groups::owner_cert::certificate_digest_hex(&cert);
+        let key = EvictionKey::new(info.stable_group_id(), target);
+        let groups = vec![("k".to_string(), info)];
+        let leaves = RetainedLeaves::default();
+        assert!(
+            derive_triggers(&groups, &leaves, &[], now).is_empty(),
+            "the own trigger waits for not_after + τ"
+        );
+        let handoff = ExpiryHandoff {
+            certificate_digest: digest.clone(),
+            received_unix_ms: (now - 5) * 1000,
+        };
+        let mut kept = BTreeMap::from([(key.clone(), handoff.clone())]);
+        let before = expiry_handoff_triggers(&mut kept, &groups, (now - 20) * 1000);
+        assert!(
+            before.is_empty() && kept.contains_key(&key),
+            "kept until not_after"
+        );
+        let triggers = expiry_handoff_triggers(&mut kept, &groups, now * 1000);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].0, key);
+        assert_eq!(triggers[0].3, (now - 5) * 1000, "T_obs is the receipt");
+        assert!(kept.is_empty());
+        let mut other = BTreeMap::from([(
+            key.clone(),
+            ExpiryHandoff {
+                certificate_digest: "cd".repeat(32),
+                ..handoff
+            },
+        )]);
+        assert!(expiry_handoff_triggers(&mut other, &groups, now * 1000).is_empty());
+        assert!(
+            other.is_empty(),
+            "a hand-off for another certificate is dropped"
+        );
     }
 
     /// ADR 0110 §1a hand-off evidence (#1508 review P2 #5): a verified

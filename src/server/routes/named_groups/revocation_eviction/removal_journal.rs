@@ -39,7 +39,8 @@ pub(in crate::server) enum RemovalPrepare {
     NotS4,
     /// The exact event is durable in the `.evjournal` and the `.evs`.
     Durable,
-    /// The event could not be made durable: do not commit the removal.
+    /// The event could not be made durable, or the §1a/D135 re-check under
+    /// the lock cancelled S4's removal: do not commit the removal.
     NotDurable,
 }
 
@@ -76,13 +77,37 @@ pub(in crate::server) async fn prepare_committed_removal(
     let Some(key) = row_key(info, target_hex) else {
         return RemovalPrepare::NotS4;
     };
-    let is_s4_removal = {
+    // §1a/D135 (#1508 review): re-check the trigger and its cancellation
+    // under the caller's membership lock, against the current committed
+    // seat. A rebind commit takes the same lock, so none can land after
+    // this check and before the removal commits.
+    let target = hex::encode(key.target);
+    let seat = state
+        .named_groups
+        .read()
+        .await
+        .values()
+        .find(|group| group.stable_group_id() == key.stable_group_id)
+        .and_then(|group| group.members_v2.get(&target).cloned());
+    let now_unix = super::now_unix_ms() / 1000;
+    let (is_s4_removal, cancelled) = {
         let inner = state.revocation_evictions.inner.lock().await;
-        inner
-            .store
-            .get(&key)
-            .is_some_and(|row| row.phase == Phase::Prepared && row.parent_head.is_some())
+        match inner.store.get(&key) {
+            Some(row) if row.phase == Phase::Prepared && row.parent_head.is_some() => (
+                true,
+                !super::exclusion_still_eligible(row, seat.as_ref(), now_unix),
+            ),
+            _ => (false, super::s4_prepared_removal_of(&key)),
+        }
     };
+    if cancelled {
+        tracing::info!(
+            group_id = %super::super::LogHexId::group(info.stable_group_id()),
+            target = %super::super::LogHexId::agent(target_hex),
+            "ADR 0110 S4: the expiry removal is cancelled by a renewal; the seat stays"
+        );
+        return RemovalPrepare::NotDurable;
+    }
     if !is_s4_removal {
         return RemovalPrepare::NotS4;
     }

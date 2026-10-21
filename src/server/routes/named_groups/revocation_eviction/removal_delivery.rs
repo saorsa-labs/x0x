@@ -65,17 +65,23 @@ pub(super) struct SavedRemoval {
     pub(super) result_epoch: Option<u64>,
 }
 
-/// Decode a saved removal event: a `MemberRemoved` that carries its
-/// signed commit. A crypto-only `X0XCE1` frame is not JSON and gives
-/// `None`.
+/// Decode a saved removal event: a `MemberRemoved` or an S4 ban's
+/// `MemberBanned` that carries its signed commit. A crypto-only `X0XCE1`
+/// frame is not JSON and gives `None`.
 pub(super) fn decode_saved_removal(bytes: &[u8]) -> Option<SavedRemoval> {
     let event: NamedGroupMetadataEvent = serde_json::from_slice(bytes).ok()?;
-    let NamedGroupMetadataEvent::MemberRemoved {
+    let (NamedGroupMetadataEvent::MemberRemoved {
         commit: Some(commit),
         treekem_epoch,
         secret_epoch,
         ..
-    } = &event
+    }
+    | NamedGroupMetadataEvent::MemberBanned {
+        commit: Some(commit),
+        treekem_epoch,
+        secret_epoch,
+        ..
+    }) = &event
     else {
         return None;
     };
