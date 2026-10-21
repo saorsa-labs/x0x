@@ -685,6 +685,26 @@ enum OwnerSub {
     Machines,
     /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
     Placement,
+    /// Owner actions on named groups (ADR 0110 §4b(1) recovery).
+    Groups {
+        #[command(subcommand)]
+        sub: OwnerGroupsSub,
+    },
+}
+
+/// `x0x owner groups` subcommands.
+#[derive(Subcommand)]
+enum OwnerGroupsSub {
+    /// Sign an owner recovery mandate for a group whose admins are all
+    /// revoked; the promoted member becomes its admin (ADR 0110 §4b(1)).
+    RecoveryMandate {
+        /// Group ID.
+        #[arg(value_name = "GROUP_ID")]
+        group_id: String,
+        /// Hex agent ID of the Active certified member to promote.
+        #[arg(long = "promoted", value_name = "AGENT_ID")]
+        promoted: String,
+    },
 }
 
 /// `x0x move` subcommands (ADR-0043 agent key-move ceremony).
@@ -2390,6 +2410,12 @@ async fn run(
         },
         Commands::Owner { sub } => match sub {
             None => commands::identity::owner_agents(&client).await,
+            Some(OwnerSub::Groups {
+                sub: OwnerGroupsSub::RecoveryMandate { group_id, promoted },
+            }) => {
+                commands::identity::owner_group_recovery_mandate(&client, &group_id, &promoted)
+                    .await
+            }
             Some(OwnerSub::Agents { sub: None }) => commands::identity::owner_agents(&client).await,
             Some(OwnerSub::Agents {
                 sub:

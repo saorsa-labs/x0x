@@ -685,6 +685,24 @@
     },
     {
       "category": "identity",
+      "cli_name": "owner groups recovery-mandate",
+      "description": "ADR 0110 §4b(1): owner-sign an OwnerRecoveryMandateV1 promoting one certified member when every admin of an OwnerCertified group is revoked",
+      "method": "POST",
+      "path": "/owner/groups/:id/recovery-mandate",
+      "request": {
+        "fields": [
+          {
+            "cli": "--promoted",
+            "in": "body",
+            "name": "promoted_agent_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "identity",
       "cli_name": "sync devices",
       "description": "ADR-0041 Tier-1: enrolled owner devices + last-sync status",
       "method": "GET",

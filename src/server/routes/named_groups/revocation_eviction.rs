@@ -47,6 +47,7 @@ use x0x::groups::eviction::{
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
+pub(super) mod owner_recovery;
 pub(super) mod rebind;
 mod removal_delivery;
 pub(super) mod removal_journal;
@@ -181,6 +182,8 @@ struct S4Inner {
     /// §4: crypto-only exclusion holds, deliveries, catch-up frames and
     /// restart fork evidence.
     ce: crypto_exclusion::CeState,
+    /// §4b(1): owner-recovery mandates, held mandates and commit deliveries.
+    orc: owner_recovery::OrcState,
     /// §3: committed seated-target removals whose saved event is still
     /// being delivered to the survivors.
     removals: HashMap<EvictionKey, removal_delivery::RemovalDelivery>,
@@ -544,6 +547,7 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         removal_delivery::drive(&state).await;
         crypto_exclusion::retry_stash(&state).await;
         rebind::drive(&state).await;
+        owner_recovery::drive(&state).await;
         tokio::select! {
             () = notify.notified() => {}
             () = tokio::time::sleep(S4_WORKER_TICK) => {}
@@ -2883,11 +2887,18 @@ pub(in crate::server) async fn group_status_json(
     state: &AppState,
     info: &GroupInfo,
 ) -> GroupS4Status {
-    let admin_availability = no_eligible_admin_state(state, info)
+    let mut admin_availability = no_eligible_admin_state(state, info)
         .await
         .map_or(serde_json::Value::Null, |derived| {
             no_eligible_admin_json(&derived)
         });
+    if let Some(object) = admin_availability.as_object_mut() {
+        // §4b(1): the owner-recovery progress behind exit `owner_recovery`.
+        object.insert(
+            "owner_recovery".into(),
+            owner_recovery::status_json(state, info.stable_group_id()).await,
+        );
+    }
     let (rows, store) = group_rows_json(state, info).await;
     let certificate_rebind =
         rebind::status_json(&state.revocation_evictions.inner.lock().await.rebind, info);

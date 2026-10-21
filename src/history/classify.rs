@@ -97,6 +97,7 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
         || crate::groups::eviction::decode_handoff(payload).is_ok()
         || crate::groups::crypto_exclusion::decode_frame(payload).is_ok()
         || crate::groups::cert_rebind::decode_frame(payload).is_ok()
+        || crate::groups::owner_recovery::decode_frame(payload).is_ok()
     {
         return DmPayloadClass::Ephemeral;
     }

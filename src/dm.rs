@@ -93,7 +93,7 @@ impl CapabilityRegistry {
     /// Bit 6.
     pub const CERTIFICATE_REBIND_V1: u64 = 1 << 6;
     /// ADR 0110 §4b(1): understands `OwnerRecoveryMandateV1` and
-    /// `OwnerRecoveryV1` (`X0XORC1`). Bit 7. Not in [`Self::current`] yet.
+    /// `OwnerRecoveryV1` (`X0XORC1`). Bit 7.
     pub const OWNER_RECOVERY_V1: u64 = 1 << 7;
 
     /// The routes supported by this release's ready receiver.
@@ -106,7 +106,8 @@ impl CapabilityRegistry {
                 | Self::FILE_CONTROL_ACK_V1
                 | Self::EVICTION_HANDOFF_V1
                 | Self::CRYPTO_EXCLUSION_V1
-                | Self::CERTIFICATE_REBIND_V1,
+                | Self::CERTIFICATE_REBIND_V1
+                | Self::OWNER_RECOVERY_V1,
         }
     }
 
@@ -131,6 +132,8 @@ impl CapabilityRegistry {
             Some((Self::CRYPTO_EXCLUSION_V1, "crypto_exclusion_v1"))
         } else if payload.starts_with(crate::groups::cert_rebind::CERTIFICATE_REBIND_PREFIX) {
             Some((Self::CERTIFICATE_REBIND_V1, "certificate_rebind_v1"))
+        } else if payload.starts_with(crate::groups::owner_recovery::OWNER_RECOVERY_PREFIX) {
+            Some((Self::OWNER_RECOVERY_V1, "owner_recovery_v1"))
         } else {
             None
         }

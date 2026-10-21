@@ -125,6 +125,11 @@ const COVERED: &[CoveredEndpoint] = &[
         "/owner/riders/:id",
         rider_revoked_token_fails_on_next_request
     ),
+    covered!(
+        Post,
+        "/owner/groups/:id/recovery-mandate",
+        owner_group_recovery_mandate_signs_only_when_every_admin_is_revoked
+    ),
     covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────
     covered!(Get, "/presence", "GET /presence"),
