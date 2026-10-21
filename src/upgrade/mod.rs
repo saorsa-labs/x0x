@@ -7,6 +7,8 @@
 
 pub mod apply;
 #[cfg(unix)]
+pub(crate) mod fleet_policy;
+#[cfg(unix)]
 mod inventory_accounts;
 pub(crate) mod journal;
 pub mod manifest;
@@ -19,6 +21,7 @@ pub mod rollout;
 pub mod signature;
 pub(crate) mod staging;
 pub(crate) mod staging_runtime;
+pub(crate) mod staging_selection;
 pub mod verification_probe;
 
 #[cfg(unix)]

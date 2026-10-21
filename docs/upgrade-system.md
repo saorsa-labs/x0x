@@ -23,15 +23,16 @@ using the leading 64 bits of the hash and integer arithmetic. It preserves
 the zero-window calculator behavior. A minute value too large to represent
 in whole seconds uses `u64::MAX` seconds as the effective bound.
 
-The Unix startup update check records the first eligible release beside the
-canonical installed binary. The private `upgrade-rollout-<digest>.json`
+The Unix startup, gossip, fallback and HTTP apply paths record the first
+eligible release beside the canonical installed binary. The private
+`upgrade-rollout-<digest>.json`
 receipt binds the actual data and identity roots, MachineId, release version,
 verified manifest digest and archive digest. Duplicate delivery, restart and
 later window changes retain the first choice. Monotonic elapsed time reduces
 the wait; a reboot keeps the last durable remainder and starts a new clock
 epoch. Wall-clock changes do not supply elapsed time.
 
-The startup task releases the apply mutex and install lock while waiting.
+Each waiting operation releases the apply mutex and install lock.
 It waits before writing release content or starting candidate probes, and
 rechecks the receipt and unresolved upgrade records under the install lock.
 Each observation requires a successful record barrier, including a receipt
@@ -45,10 +46,79 @@ through the guide write and rename. A hold recorded before this admission
 keeps the prior guide. This does not defer an admitted guide update to host
 commit; transaction-bound guide promotion remains separate work.
 
-This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
-the fleet minimum, complete host inventory and transaction-bound guide
-installation remain separate M2 work. It does not claim that every apply
-path already honors the configured window.
+The compiled deployment inventory sets a minimum 60-minute window for a
+known or ambiguous production fleet install. An existing receipt below that
+minimum refuses apply and remains intact. Ordinary installs retain an
+explicit zero window. Only the compiled debug test key permits the fleet
+rehearsal exception.
+
+For an undersized fleet receipt, keep the configured binary in normal
+operation. Preserve the receipt and any selection or pending records, with
+their hashes. Changing the window or restarting does not reset the receipt.
+Do not edit or delete it to remove the refusal.
+
+To continue, use the normal verified Unix startup update path when a strictly
+newer eligible stable release is available. That release must pass all current
+guards and must not have its own undersized or conflicting receipt. A new
+receipt records a window of at least 60 minutes; its calculated delay can be
+zero. The old receipt remains unchanged. This is progression to another
+release, not repair of the refused release. If no eligible release is
+available, or unresolved selection, journal, pair or probe state still blocks
+apply, keep the current binary running and retain the evidence for supported
+recovery. This slice provides no command to clear these records.
+
+Selecting a newer eligible release requires a durable supersession record.
+An older waiter cannot then apply its release. The previous receipt remains
+intact; supersession does not delete it or reset the selected release's wait.
+
+This staging gate accepts canonical stable versions only. Setting
+`include_prereleases` does not allow a prerelease through the gate.
+The private `upgrade-selection-<digest>.json` record and its `.pending`
+marker retain the selected release and evidence of an incomplete write.
+An unresolved marker or damaged record refuses apply. The configured binary
+still starts normally.
+
+If this refusal occurs, preserve the selection record, pending marker and
+bound rollout receipt, with their hashes. Check the recorded participant
+roots, release version and digests. Investigate any storage or sync error
+before attempting recovery. Keep the configured binary in normal operation
+while apply remains refused. This slice provides no selection-record repair
+command. Do not delete records or edit their fields to bypass the refusal.
+Complete transaction recovery remains separate M2 work.
+
+Gossip and fallback discovery share one bounded pending release and continue
+to receive announcements during a wait. The worker drains a superseded
+operation before starting the newer release. Cancellation is checked after
+the install lock is acquired, before queued work can write records.
+An admitted replacement retains its restart continuation.
+
+If staging identity initialization fails, background apply stays disabled
+for that process. Configured release discovery and verified rebroadcast
+continue without an apply owner.
+The background owner updates the guide only after staging permits the release.
+Without that owner, these sources leave the installed guide unchanged.
+
+HTTP allows one waiting request and retains its deferred restart owner after
+mutation admission. Dropping a waiting request cancels its permit. Queued or
+running blocking work, including service-manager readback, retains that
+request's capacity slot until the worker exits.
+Each request keeps the release and verified manifest found before its staging
+wait. Later policy checks can refuse that release. The request does not select
+a newer release during the wait.
+
+`x0x upgrade --apply --now` sends authenticated
+`POST /upgrade/apply?now=true` (D185). It skips only the staging component of
+the wait. Receipt barriers, fleet history, supersession, eligibility, holds,
+mandatory probe retry waits and transaction checks still apply, including
+the final check under the install lock. It does not write a zero-window
+replacement receipt. The CLI uses no total apply-request timeout, with
+connection setup bounded to 30 seconds.
+
+Shutdown closes background intake and withdraws pre-admission writes; it does
+not claim every blocking operation is reaped before shutdown returns.
+Complete host inventory and transaction-bound guide installation remain
+separate M2 work. These staging controls do not establish a protected host
+transaction or authorize guide promotion at host commit.
 
 ### Candidate execution probes (M2 S2d)
 
@@ -80,10 +150,12 @@ unknown state.
 A durably recorded timeout or host fault permits at most three fresh retry
 transactions, after 30, 60 and 120 minutes. Retry timers release the apply
 mutex, observe daemon shutdown and reread the record before each attempt.
-HTTP apply returns its refusal without waiting through this backoff. Normal
-startup discovery can resume a pending wait after it verifies the release
-manifest again. Boot identity and monotonic time prevent a wall-clock change
-or daemon restart from shortening the recorded wait.
+HTTP apply includes an existing interrupted retry wait in its staging gate,
+even with `now=true`. A new probe failure still returns its refusal and leaves
+retry ownership with the daemon. Startup and background discovery can resume
+a pending wait after verifying the release manifest again. Boot identity and
+monotonic time prevent a wall-clock change or daemon restart from shortening
+the recorded wait.
 
 Before a terminal record write, a durable
 `x0xd.upgrade-probe.json.pending` marker retains the prior record. It is removed
@@ -485,6 +557,9 @@ no gossip, binds nothing, and takes no instance lock.
 1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
+4. **Authenticated HTTP apply**: Verify the release and wait for staging, then
+   recheck admission under the install lock before replacement. The CLI
+   `upgrade --apply` uses this route; `--now` skips only the staging delay.
 
 Gossip and polling retain a 30-minute in-memory backoff for other apply errors.
 Unix candidate-probe failures additionally use the durable release holds and
