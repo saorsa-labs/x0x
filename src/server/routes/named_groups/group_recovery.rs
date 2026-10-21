@@ -1360,6 +1360,104 @@ pub(super) async fn apply_join_carry(
     true
 }
 
+/// §2: keep a pre-Welcome joiner's walk-valid served chain and its refused
+/// terminal event in the sidecar (once per terminal), so a later verified
+/// ATA from the request path can apply them under rule (b).
+pub(super) async fn keep_served_chain(
+    state: &AppState,
+    current: &GroupInfo,
+    terminal: &GroupStateCommit,
+    chain: &[RetainedCommit],
+    terminal_event: &super::NamedGroupMetadataEvent,
+) {
+    let local = local_hex(state);
+    if current.has_active_member(&local) {
+        return;
+    }
+    let base = x0x::groups::state_commit::AlternateChainBase {
+        group_id: current.stable_group_id(),
+        base_revision: current.state_revision,
+        base_state_hash: &current.state_hash,
+        roster: &x0x::groups::state_commit::roster_projection(&current.members_v2),
+        meta: &current.public_meta(),
+        policy_hash: &x0x::groups::compute_policy_hash(&current.policy),
+    };
+    if x0x::groups::state_commit::validate_alternate_chain(&base, chain, terminal).is_err() {
+        return;
+    }
+    let Ok(event_json) = serde_json::to_vec(terminal_event) else {
+        return;
+    };
+    let stable = current.stable_group_id().to_string();
+    let already = sidecar_snapshot(state, &stable)
+        .await
+        .and_then(|body| body.queued_terminal)
+        .is_some_and(|kept| kept == event_json);
+    if already {
+        return;
+    }
+    let served_json: Vec<Vec<u8>> = chain
+        .iter()
+        .filter_map(|link| serde_json::to_vec(link).ok())
+        .collect();
+    let _ = update_sidecar(state, &stable, move |body| {
+        body.served_chain = served_json;
+        body.queued_terminal = Some(event_json);
+    })
+    .await;
+}
+
+/// §2: a verified ATA from the request path for a pre-Welcome joiner that
+/// kept its served chain and terminal: apply the attested links under rule
+/// (b), then replay the kept terminal through the ordinary apply path.
+/// Returns whether the terminal was replayed.
+async fn apply_kept_chain(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &GroupInfo,
+    ata: &AdminTerminalAttestation,
+) -> bool {
+    let Some(body) = sidecar_snapshot(state, info.stable_group_id()).await else {
+        return false;
+    };
+    let Some(event_json) = body.queued_terminal else {
+        return false;
+    };
+    let Ok(event) = serde_json::from_slice::<super::NamedGroupMetadataEvent>(&event_json) else {
+        return false;
+    };
+    let chain: Vec<RetainedCommit> = body
+        .served_chain
+        .iter()
+        .filter_map(|bytes| serde_json::from_slice(bytes).ok())
+        .collect();
+    let (Some(terminal), Some(actor)) = (
+        super::named_group_metadata_event_commit(&event).cloned(),
+        match &event {
+            super::NamedGroupMetadataEvent::MemberAdded { actor, .. } => parse_raw(actor),
+            _ => None,
+        },
+    ) else {
+        return false;
+    };
+    if chain.is_empty()
+        || !Box::pin(apply_join_carry(state, group_key, &chain, &terminal, ata)).await
+    {
+        return false;
+    }
+    let accepted = Box::pin(super::apply_named_group_metadata_event(
+        state,
+        event,
+        AgentId(actor),
+        true,
+        None,
+    ))
+    .await
+    .accepted;
+    retire_converged(state, group_key).await;
+    accepted
+}
+
 /// The armed admin ATA of `info` (§2 "Arming"): the sidecar's active ATA
 /// while this node's head is on its sequence (or is its `from`) and its
 /// segment terminal is not yet reached.
@@ -2033,6 +2131,12 @@ async fn arm_from_response(
             .await;
             return;
         }
+    }
+    // A pre-Welcome joiner that kept its served chain applies it now.
+    let pre_welcome = !info.has_active_member(&local)
+        && !state.treekem_groups.read().await.contains_key(group_key);
+    if pre_welcome && apply_kept_chain(state, group_key, info, &ata).await {
+        return;
     }
     let verified = ata.signer_verified_on(info);
     if !verified {
