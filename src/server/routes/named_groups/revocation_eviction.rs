@@ -4072,4 +4072,93 @@ mod tests {
         assert!(row.earliest_handoff_receipt_unix_ms.is_some());
         Ok(())
     }
+
+    /// ADR 0110 §1a and §2 (L175) restart (#1508 review gap 3): a verified
+    /// expiry hand-off kept before this node's clock passes the raw
+    /// `not_after` survives a restart. After the restart, T_obs still
+    /// starts at the raw `not_after`, not at the own trigger `not_after + τ`.
+    #[tokio::test]
+    async fn a_kept_expiry_handoff_survives_a_restart() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target_kp = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target_kp.agent_id().as_bytes());
+        let sender = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let not_after = now_unix_ms() / 1000 + 2;
+        let cert = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner,
+            &target_kp,
+            Some(not_after),
+        )?;
+        let digest = x0x::groups::owner_cert::certificate_digest_hex(&cert);
+        let group_id = "a5".repeat(16);
+        let local = state.agent.agent_id();
+        let mut info = GroupInfo::new("s4-kept".into(), String::new(), local, group_id.clone());
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        let local_hex = hex::encode(local.as_bytes());
+        info.add_member(
+            target_hex.clone(),
+            GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+        );
+        info.add_member(
+            hex::encode(sender.as_bytes()),
+            GroupRole::Admin,
+            Some(local_hex),
+            None,
+        );
+        info.set_member_certificate(&target_hex, cert)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state.named_groups.write().await.insert(group_id, info);
+        let handoff = s4::EvictionHandoffV1 {
+            stable_group_id: stable.clone(),
+            target: *target_kp.agent_id().as_bytes(),
+            observed_parent_head: String::new(),
+            revocation_records: Vec::new(),
+            self_leave_commit: None,
+            expired_certificate: Some(s4::HandoffExpiredCertificate {
+                certificate_digest: digest,
+                certificate_bytes: None,
+            }),
+            renewed_certificate: None,
+        };
+        receive_handoff(&state, sender, &s4::encode_handoff(&handoff)?).await;
+        let key = EvictionKey::new(stable, *target_kp.agent_id().as_bytes());
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_none(),
+            "before the raw not_after the hand-off is only kept"
+        );
+
+        // Restart: the S4 state is reloaded from disk.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        while now_unix_ms() / 1000 <= not_after {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        revocation_eviction_pass(&state).await;
+
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner
+            .store
+            .get(&key)
+            .expect("the kept hand-off survives the restart and opens the work");
+        assert_eq!(
+            row.earliest_handoff_receipt_unix_ms,
+            Some((not_after + 1) * 1000),
+            "T_obs is the raw not_after"
+        );
+        Ok(())
+    }
 }
