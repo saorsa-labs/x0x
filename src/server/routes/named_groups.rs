@@ -3629,6 +3629,28 @@ fn named_group_event_delivery_future(
     event: &NamedGroupMetadataEvent,
     label: &'static str,
 ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let send = named_group_event_send_future(state, recipient_hex, event, label)?;
+    let requester = recipient_hex.to_string();
+    Some(async move {
+        if let Err(e) = send.await {
+            tracing::warn!(
+                requester = %LogHexId::agent(&requester),
+                "failed to {label}-direct-deliver named-group event: {e}"
+            );
+        }
+    })
+}
+
+/// As [`named_group_event_delivery_future`], but the future returns the
+/// send result instead of logging it. ADR 0110 §3: the S4 delivery of a
+/// saved removal uses the result to tell a sent recipient from one that
+/// needs a resend.
+pub(in crate::server) fn named_group_event_send_future(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+    label: &'static str,
+) -> Option<impl std::future::Future<Output = Result<(), String>> + Send + 'static> {
     let recipient = match parse_agent_id_hex(recipient_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -3668,9 +3690,8 @@ fn named_group_event_delivery_future(
     let agent = Arc::clone(&state.agent);
     let control_blobs = state.control_blobs.clone();
     let group_id = named_group_metadata_event_group_id(event).to_string();
-    let requester = recipient_hex.to_string();
     Some(async move {
-        let result = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
             control_blob::send_reference(
                 &control_blobs,
                 &agent,
@@ -3699,12 +3720,6 @@ fn named_group_event_delivery_future(
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
-        };
-        if let Err(e) = result {
-            tracing::warn!(
-                requester = %LogHexId::agent(&requester),
-                "failed to {label}-direct-deliver named-group event: {e}"
-            );
         }
     })
 }
@@ -26135,6 +26150,11 @@ async fn remove_treekem_named_group_member(
         secret_epoch: None,
         commit: Some(commit),
     };
+    // ADR 0110 §3 and §5: when S4 runs this removal, its obligation row
+    // saves the exact outgoing event durably before the first publication.
+    // A crash or a partition after this point then cannot lose the
+    // exclusion: S4 delivers the saved event to each survivor.
+    revocation_eviction::record_committed_removal(&state, &next, &agent_id_hex, &event).await;
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }

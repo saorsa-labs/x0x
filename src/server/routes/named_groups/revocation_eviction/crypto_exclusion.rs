@@ -632,7 +632,7 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
 
 /// D60 and §3 inputs at the write: the recipient's agent is not revoked,
 /// and neither its advertised machine nor that agent-machine binding is.
-async fn write_allowed(state: &AppState, agent: &AgentId) -> bool {
+pub(super) async fn write_allowed(state: &AppState, agent: &AgentId) -> bool {
     let machine = state
         .agent
         .capability_store()

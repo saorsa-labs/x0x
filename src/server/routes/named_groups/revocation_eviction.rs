@@ -18,7 +18,8 @@
 //! - §5: the `revocation-evictions.evs` sidecar and the per-group
 //!   `.evjournal` journals, with the ADR 0108 §5a quarantine and rebuild.
 //! - Completion: a row completes only when the verified roster and crypto
-//!   state exclude the target.
+//!   state exclude the target, and the saved event of a committed
+//!   exclusion reached every eligible survivor (`removal_delivery`).
 //!
 //! The revocation-set lock is always released before this module takes a
 //! group or persistence lock (§1). The S4 state lock is never held across
@@ -46,6 +47,9 @@ use x0x::groups::eviction::{
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
+mod removal_delivery;
+
+pub(super) use removal_delivery::record_committed_removal;
 
 /// The worker's idle re-check interval. Budgets and expiry checks run at
 /// least this often; intake wakes the worker at once.
@@ -157,6 +161,9 @@ struct S4Inner {
     /// §4: crypto-only exclusion holds, deliveries, catch-up frames and
     /// restart fork evidence.
     ce: crypto_exclusion::CeState,
+    /// §3: committed seated-target removals whose saved event is still
+    /// being delivered to the survivors.
+    removals: HashMap<EvictionKey, removal_delivery::RemovalDelivery>,
 }
 
 impl Default for S4Runtime {
@@ -226,6 +233,7 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         dispatch_handoffs(&state).await;
         drive_exclusions(&state).await;
         crypto_exclusion::drive_deliveries(&state).await;
+        removal_delivery::drive(&state).await;
         crypto_exclusion::retry_stash(&state).await;
         tokio::select! {
             () = notify.notified() => {}
@@ -267,7 +275,8 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .budgets
             .insert(key, RowBudget::resume(Duration::ZERO, now));
     }
-    let delivering = inner.ce.delivering();
+    let mut delivering = inner.ce.delivering();
+    delivering.extend(inner.removals.keys().cloned());
     if reconcile_completion(&mut inner.store, &groups, &leaves, &delivering, now_unix_ms) {
         inner.dirty = true;
     }
@@ -293,6 +302,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     inner.next_attempt.retain(|key, _| open.contains(key));
     inner.attempt_wait.retain(|key, _| open.contains(key));
     inner.not_durable.retain(|key| open.contains(key));
+    inner.removals.retain(|key, _| open.contains(key));
     inner.pending_dispatch.retain(|key| open.contains(key));
     inner
         .unsupported_handoff
@@ -2034,6 +2044,14 @@ async fn load_persisted_obligations(state: &AppState) {
     }
     let mut ce_state = crypto_exclusion::CeState::default();
     resume_crypto_exclusions(state, &mut store, &journals, &mut ce_state).await;
+    let mut removals = HashMap::new();
+    removal_delivery::resume_after_load(
+        &snapshot_groups(state).await,
+        state.agent.agent_id().as_bytes(),
+        &mut store,
+        &mut removals,
+        &mut ce_state,
+    );
     for key in journals.keys() {
         if let Some(stored) = store.get_mut(key) {
             if stored.phase == Phase::Prepared {
@@ -2052,6 +2070,7 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.rebuilding = rebuilding;
     inner.file_exists = file_exists;
     inner.ce = ce_state;
+    inner.removals = removals;
     inner.dirty = !journals.is_empty();
 }
 
