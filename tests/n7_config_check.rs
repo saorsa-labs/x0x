@@ -127,6 +127,22 @@ fn named_instance_without_any_config_file_still_starts_on_prod() {
     );
 }
 
+/// ADR-0074 §3: `load_config` refuses a non-loopback `[socks] listen`.
+/// This is the binary path. `SocksConfig::validate` alone is not the check.
+#[test]
+fn non_loopback_socks_listen_refuses_check() {
+    let (out, text) = check(
+        "log_level = 'warn'\n[socks]\nlisten = \"0.0.0.0:1080\"\n",
+        &[],
+    );
+    assert!(!out.status.success(), "must fail: {text}");
+    assert!(
+        text.to_ascii_lowercase().contains("loopback"),
+        "refused for the wrong reason: {text}"
+    );
+    assert!(!text.contains("Configuration is valid"), "{text}");
+}
+
 #[test]
 fn clean_config_passes_check() {
     let (out, text) = check(

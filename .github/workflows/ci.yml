@@ -576,6 +576,14 @@ jobs:
           --expect w3h_1357_red_s4_designated_stalled_a_fallback=GREEN
           --require w3h_1357_control_s4_designated_no_early_sibling
           --expect w3h_1357_control_s4_designated_no_early_sibling=GREEN
+          --require w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes
+          --expect w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes=RED
+          --require w3h_1023_restart_one_holder_online_admits
+          --expect w3h_1023_restart_one_holder_online_admits=GREEN
+          --require w3h_1023_control_holders_never_return_fail_closed
+          --expect w3h_1023_control_holders_never_return_fail_closed=GREEN
+          --require w3h_1023_control_holder_returns_recovers
+          --expect w3h_1023_control_holder_returns_recovers=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer

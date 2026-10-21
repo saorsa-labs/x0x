@@ -447,6 +447,11 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) forward: x0x::forward::ForwardConfig,
 
+    /// SOCKS5 front-end (TOML: `[socks]`). Off until `listen` is set.
+    /// Bind address must be loopback (ADR-0074 §3).
+    #[serde(default)]
+    pub socks: x0x::socks::SocksConfig,
+
     /// ADR-0043 agent key-move configuration (TOML: `[key_move]`).
     /// `ceremony_enabled` defaults to **false** — the roaming-move
     /// ceremony is experimental in v1; machine ML-KEM enrollment, the
@@ -599,9 +604,9 @@ pub(super) struct DaemonUpdateConfig {
     #[serde(default = "default_true")]
     pub(super) enabled: bool,
 
-    /// Maximum rollout window in minutes. Default: 0 (immediate — no delay).
-    /// Set to a positive value (e.g. 1440 for 24h) to spread upgrades across
-    /// the fleet using a deterministic hash of the node MachineId.
+    /// Maximum rollout window in minutes. Default: 60 (D183).
+    /// The calculator uses the MachineId and release version to select a
+    /// deterministic delay below this window.
     #[serde(default = "default_rollout_window_minutes")]
     pub(super) rollout_window_minutes: u64,
 
@@ -640,7 +645,7 @@ impl Default for DaemonUpdateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            rollout_window_minutes: 0,
+            rollout_window_minutes: default_rollout_window_minutes(),
             stop_on_upgrade: true,
             fallback_check_interval_minutes: 2880,
             repo: default_update_repo(),
@@ -655,7 +660,7 @@ fn default_true() -> bool {
 }
 
 fn default_rollout_window_minutes() -> u64 {
-    0
+    60
 }
 
 fn default_fallback_check_interval_minutes() -> u64 {
@@ -815,6 +820,7 @@ impl Default for DaemonConfig {
             group_card_republish_interval_secs: None,
             directory_resubscribe_jitter_ms: None,
             forward: x0x::forward::ForwardConfig::default(),
+            socks: x0x::socks::SocksConfig::default(),
             network_id: None,
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
@@ -1316,11 +1322,18 @@ pub(super) struct AppState {
     /// consumer + outbound local-port listeners. `None` when connect is
     /// disabled (no policy) so the daemon runs zero forwarder tasks.
     pub(super) forward_service: Option<Arc<x0x::forward::ForwardService>>,
+    /// ADR-0074 §3 SOCKS5 listener. `None` when `[socks] listen` is unset
+    /// or connect/forward is disabled (SOCKS needs ForwardV2).
+    pub(super) socks_service: Option<x0x::socks::SocksService>,
     /// ADR-0041 Tier-1 owner-state sync service: owns the `SyncV1` stream
     /// acceptor, the owner device set, and the winning versioned records.
     /// `None` when the install has no owner key (ownerless installs sync
     /// nothing and register no acceptor).
     pub(super) owner_sync: Option<Arc<x0x::owner_sync::OwnerSyncService>>,
+    /// ADR-0074 §1 name store: owner petnames and TOFU name pins
+    /// (`<data_dir>/names.json`). An unreadable file refuses every name
+    /// operation (fail closed); hex ids keep working.
+    pub(super) names: Arc<x0x::names::NameStore>,
     /// Per-instance fault-injection cell for `save_named_groups_checked_unlocked`.
     /// Each test that calls `set_save_fault` arms and RAII-clears this; because it
     /// lives on the `AppState` rather than in a process-global static, parallel

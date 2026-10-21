@@ -176,7 +176,9 @@ impl Fixture {
         let owner_allow = if owner_entry {
             vec![ConnectOwnerEntry {
                 description: Some("my machines".to_string()),
-                targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
+                targets: vec![crate::connect::OwnerTarget::Exact(
+                    "127.0.0.1:22".parse().expect("loopback literal"),
+                )],
             }]
         } else {
             Vec::new()
