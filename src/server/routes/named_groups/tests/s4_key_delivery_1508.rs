@@ -187,6 +187,15 @@ async fn class_k_serving_guard_withholds_while_every_admin_seat_is_revoked() -> 
         !refusal.is_some_and(JoinArtifactRefusal::is_definitive),
         "the derived state withholds; staged artifacts are kept"
     );
+    // S4's own guarded deliveries (the owner-recovery mandate and commit,
+    // crypto exclusion, removal, rebind) are the exits from this state:
+    // the recipient half alone must still admit them.
+    assert!(
+        join_artifact_member_check(&state, &group_key, &other_hex)
+            .await
+            .is_ok(),
+        "the S4 exit deliveries are not held by the cover"
+    );
     Ok(())
 }
 
