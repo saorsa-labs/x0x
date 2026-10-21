@@ -43319,7 +43319,10 @@ async fn handle_join_result_message_bound(
                     .pending_adoption_chains
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !chain.is_empty() {
+                // ADR 0109 §2: after an attested join carry the terminal
+                // chains from the new head, so the served chain (anchored
+                // at the old base) is not offered to the adoption arm.
+                if !chain.is_empty() && !attested {
                     chains.insert(expected_key.clone(), chain);
                 }
             }

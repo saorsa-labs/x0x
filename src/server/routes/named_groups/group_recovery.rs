@@ -45,6 +45,9 @@ const TICK: Duration = Duration::from_secs(2);
 const ANSWER_WAIT: Duration = Duration::from_secs(10);
 /// The per-exchange bound of one guarded response write.
 const RESPONSE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The bound on the join carry's capability refresh for a joiner whose
+/// advert is unknown or expired.
+const JOIN_CARRY_CAPABILITY_WAIT: Duration = Duration::from_secs(3);
 /// The grace past an authorisation's expiry before a staged join that has
 /// not landed is abandoned (the join poll is 120 s).
 const STAGING_GRACE: Duration = Duration::from_secs(150);
@@ -1085,7 +1088,25 @@ pub(super) async fn join_carry_attestation(
         return None;
     }
     let member = x0x::identity::AgentId(parse_raw(member_hex)?);
-    if peer_capable(state, &member) != Some(true) {
+    let bit = x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1;
+    let mut supported = state
+        .agent
+        .capability_store()
+        .verified_registry_supports(&member, bit);
+    if supported.is_none() {
+        // Unknown or expired support first asks for an authenticated
+        // advert refresh (ADR 0093), bounded so the fetch is not stalled.
+        let _ = tokio::time::timeout(
+            JOIN_CARRY_CAPABILITY_WAIT,
+            state.agent.refresh_application_capability(member, bit),
+        )
+        .await;
+        supported = state
+            .agent
+            .capability_store()
+            .verified_registry_supports(&member, bit);
+    }
+    if supported != Some(true) {
         return None;
     }
     let info = state.named_groups.read().await.get(group_key).cloned()?;
@@ -1276,9 +1297,14 @@ pub(super) async fn apply_join_carry(
     // in the legacy JSON stores, so a released binary never loads an armed
     // admin record it does not honour (§4).
     let mut next = current.clone();
-    // Rule (b): every attested link before the terminal, state-only. The
-    // promotion prefix of a provisional signer is part of the walked chain.
-    let _ = armed_from;
+    // Rule (b): every attested link before the terminal, state-only. A
+    // provisional signer's promotion prefix (`armed_from` links) was walked
+    // above with every committer checked against its predecessor roster;
+    // it is applied the same way, because the joiner's terminal chains
+    // only through it.
+    if armed_from > 0 {
+        tracing::info!(group_id = %LogHexId::group(&group_key), armed_from, "ADR 0109 S3: provisional signer verified by its promotion path in the served chain");
+    }
     let segment_links = ata.fields.sequence.len().min(chain.len());
     for link in chain.iter().take(segment_links) {
         match s3::apply_link_state_only(&next, link) {
