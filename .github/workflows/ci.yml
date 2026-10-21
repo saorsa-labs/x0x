@@ -824,7 +824,7 @@ jobs:
           # remaining tests' profile data must still be produced. The job
           # still fails on it — see the status merge at the end.
           coverage_test_status=0
-          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- --no-fail-fast --lib -E 'test(/w3h_1357/)' || coverage_test_status=$?
+          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- --no-fail-fast -E 'test(/w3h_1357/)' || coverage_test_status=$?
           disk_snapshot "after coverage compilation"
           # #607: report and ratchet are still ATTEMPTED after a red test
           # pass; their own failures are captured the same way.
