@@ -1800,6 +1800,9 @@ async fn subject_tick(state: &Arc<AppState>) {
             .await;
             continue;
         }
+        if local_state_lost(state, &key, &info, now).await {
+            continue;
+        }
         provisional_tick(state, &key, &info).await;
         let Some(target) = next_target(state, &key, &info, &local, &refs, now).await else {
             continue;
@@ -2470,6 +2473,62 @@ async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupIn
             }
         }
     }
+}
+
+/// §4 "Rebuild source" (D147, D119): a pre-Welcome joiner whose damaged
+/// sidecar was rebuilt lost its kept served chain and terminal. Before S5,
+/// catch-up pages carry membership events only, so a gap that holds a
+/// rename or a role change cannot be re-fetched. When such a node is
+/// admin-armed and makes no progress for `GATE_STALL`, it enters
+/// `readmission_required {cause: local_state_lost}`, with D43's manual
+/// remove and re-invite as the exit. Returns whether the node is in that
+/// state (it then sends no further request: no answer can help).
+async fn local_state_lost(
+    state: &AppState,
+    group_key: &str,
+    info: &GroupInfo,
+    now: Instant,
+) -> bool {
+    let stable = info.stable_group_id();
+    let rebuilt_without_chain = sidecar_snapshot(state, stable).await.is_some_and(|body| {
+        !body.rebuilt_from.is_empty()
+            && body.served_chain.is_empty()
+            && body.queued_terminal.is_none()
+    });
+    if !rebuilt_without_chain {
+        return false;
+    }
+    let pre_welcome = !info.has_active_member(&local_hex(state))
+        && !state.treekem_groups.read().await.contains_key(group_key);
+    if !pre_welcome || armed_admin_ata(state, info).await.is_none() {
+        return false;
+    }
+    let mut inner = state.group_recovery.inner.lock().await;
+    let Some(subject) = inner.subjects.get_mut(stable) else {
+        return false;
+    };
+    if matches!(
+        subject.view,
+        SubjectView::Readmission {
+            cause: "local_state_lost"
+        }
+    ) {
+        return true;
+    }
+    if info.state_revision != subject.progress_revision {
+        subject.progress_revision = info.state_revision;
+        subject.progress_at = now;
+        return false;
+    }
+    if now.saturating_duration_since(subject.progress_at) < s3::GATE_STALL {
+        return false;
+    }
+    subject.view = SubjectView::Readmission {
+        cause: "local_state_lost",
+    };
+    drop(inner);
+    tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the rebuilt sidecar lost the served chain and no page supplies the gap; readmission_required (local_state_lost)");
+    true
 }
 
 async fn clear_provisional(state: &AppState, stable: &str) {
