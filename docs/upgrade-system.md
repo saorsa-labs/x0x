@@ -51,6 +51,21 @@ minimum refuses apply and remains intact. Ordinary installs retain an
 explicit zero window. Only the compiled debug test key permits the fleet
 rehearsal exception.
 
+For an undersized fleet receipt, keep the configured binary in normal
+operation. Preserve the receipt and any selection or pending records, with
+their hashes. Changing the window or restarting does not reset the receipt.
+Do not edit or delete it to remove the refusal.
+
+To continue, use the normal verified Unix startup update path when a strictly
+newer eligible stable release is available. That release must pass all current
+guards and must not have its own undersized or conflicting receipt. A new
+receipt records a window of at least 60 minutes; its calculated delay can be
+zero. The old receipt remains unchanged. This is progression to another
+release, not repair of the refused release. If no eligible release is
+available, or unresolved selection, journal, pair or probe state still blocks
+apply, keep the current binary running and retain the evidence for supported
+recovery. This slice provides no command to clear these records.
+
 Selecting a newer eligible release requires a durable supersession record.
 An older waiter cannot then apply its release. The previous receipt remains
 intact; supersession does not delete it or reset the selected release's wait.
