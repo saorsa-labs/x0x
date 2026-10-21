@@ -724,6 +724,16 @@ async fn set_wait(state: &AppState, stable: &str, wait: Option<(&'static str, Ve
 /// Author and install the `OwnerRecoveryV1` commit for a held mandate.
 async fn try_commit(state: &Arc<AppState>, stable: &str) {
     use super::super as ng;
+    let Some(group_key) = ng::resolve_named_group_storage_key(state, stable).await else {
+        return;
+    };
+    let membership_lock = ng::group_membership_lock(state, &group_key).await;
+    let _membership_guard = membership_lock.lock().await;
+    // Read the held mandate under the membership lock: a concurrent
+    // attempt (the worker pass and the route's own drive both run here)
+    // may have committed it and removed it while this one waited. A
+    // snapshot taken before the lock would author the same recovery again
+    // on whatever head this node then holds.
     let Some(pending) = state
         .revocation_evictions
         .inner
@@ -736,11 +746,6 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
     else {
         return;
     };
-    let Some(group_key) = ng::resolve_named_group_storage_key(state, stable).await else {
-        return;
-    };
-    let membership_lock = ng::group_membership_lock(state, &group_key).await;
-    let _membership_guard = membership_lock.lock().await;
     let Some(info) = state.named_groups.read().await.get(&group_key).cloned() else {
         return;
     };
@@ -775,14 +780,17 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
                     reason = refusal.as_str(),
                     "ADR 0110 S4: owner recovery mandate refused"
                 );
-                state
-                    .revocation_evictions
-                    .inner
-                    .lock()
-                    .await
+                // Drop only the mandate this attempt checked; a newer one
+                // that arrived meanwhile gets its own attempt.
+                let mut inner = state.revocation_evictions.inner.lock().await;
+                if inner
                     .orc
                     .pending
-                    .remove(stable);
+                    .get(stable)
+                    .is_some_and(|held| held.mandate == pending.mandate)
+                {
+                    inner.orc.pending.remove(stable);
+                }
             }
         }
         return;
@@ -2172,6 +2180,130 @@ mod tests {
     /// state through the chained apply.
     #[tokio::test]
     async fn owner_recovery_commit_authors_and_installs_on_signed_public() {
+        let (_dir, state, info, admin_hex) = recovery_fixture().await;
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let local = state.agent.identity().agent_keypair();
+        let local_hex = hex::encode(local.agent_id().as_bytes());
+
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+        // ADR 0110 §2: no seal before a completed current catch-up round.
+        try_commit(&state, &stable).await;
+        let held = state
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .cloned()
+            .unwrap();
+        assert_eq!(held.state_hash, info.state_hash, "no seal before head sync");
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let wait = inner.orc.pending.get(&stable).and_then(|p| p.wait.clone());
+            assert_eq!(
+                wait.map(|(cause, _)| cause),
+                Some(x0x::groups::eviction::WaitingCause::WaitingForHeadSync.as_str())
+            );
+            assert!(inner.orc.head_round_groups().contains_key(&stable));
+        }
+        sync_head(&state, &info).await;
+        try_commit(&state, &stable).await;
+        let committed = state
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            committed.members_v2[&local_hex].role,
+            x0x::groups::GroupRole::Admin
+        );
+        assert_eq!(
+            committed.members_v2[&admin_hex].state,
+            x0x::groups::GroupMemberState::Removed
+        );
+        assert_eq!(committed.state_revision, info.state_revision + 1);
+        let bytes = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .deliveries
+            .get(&stable)
+            .map(|delivery| delivery.bytes.to_vec())
+            .expect("the committed frame is held for delivery");
+        let Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) = orc::decode_frame(&bytes) else {
+            panic!("an X0XORC1 commit frame");
+        };
+        orc::verify_commit_signatures(&frame).unwrap();
+        // The committed frame is held for catch-up serving.
+        let served = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .catchup_frames(std::slice::from_ref(&stable), info.state_revision);
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].1, committed.state_hash);
+        assert_eq!(served[0].2.as_slice(), bytes.as_slice());
+        let revocations = verified_agent_revocations(&state).await;
+        orc::validate_against_parent(&frame.body, &info, 0, &revocations, now_unix()).unwrap();
+
+        // A receiver still on the parent installs the same commit.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(stable.clone(), info.clone());
+        let outcome = receive_commit(&state, local.agent_id(), *frame, &bytes).await;
+        assert_eq!(outcome, ReceiveOutcome::Applied);
+        let installed = state
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .cloned()
+            .unwrap();
+        assert_eq!(installed.state_hash, committed.state_hash);
+        assert_eq!(
+            installed.members_v2[&local_hex].role,
+            x0x::groups::GroupRole::Admin
+        );
+        state.agent.shutdown().await;
+    }
+
+    /// The restart minimum elapses (paused clock) and a holder confirms
+    /// `info`'s head, so `group_head_synced` holds for it.
+    async fn sync_head(state: &Arc<AppState>, info: &GroupInfo) {
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait).await;
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                info.stable_group_id().to_string(),
+                super::super::HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: true,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+    }
+
+    /// One daemon holding a `SignedPublic` `OwnerCertified` group whose only
+    /// admin is revoked; this node's agent is a certified Member and holds
+    /// the owner key. Returns the parent state and the admin's hex ID.
+    async fn recovery_fixture() -> (tempfile::TempDir, Arc<AppState>, GroupInfo, String) {
         let dir = tempfile::tempdir().unwrap();
         let user = x0x::identity::UserKeypair::from_seed(&[0x5F; 32]).unwrap();
         let agent = Arc::new(
@@ -2251,116 +2383,67 @@ mod tests {
             .await
             .verify_and_insert(record, None)
             .unwrap());
-        let local_hex = hex::encode(local.agent_id().as_bytes());
         let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        (dir, state, info, admin_hex)
+    }
 
+    /// #1357 CI (493c2a6): a commit attempt that waited on the membership
+    /// lock while a concurrent attempt committed the mandate must not
+    /// author it again. Before the fix the attempt took its snapshot of the
+    /// held mandate before the lock, so it re-authored the same recovery
+    /// on the head it found (here the restored parent). Daemon-level; CI
+    /// only.
+    #[tokio::test]
+    async fn a_consumed_mandate_is_not_committed_by_a_waiting_attempt() {
+        let (_dir, state, info, _admin_hex) = recovery_fixture().await;
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        sync_head(&state, &info).await;
 
-        // ADR 0110 §2: no seal before a completed current catch-up round.
-        try_commit(&state, &stable).await;
-        let held = state
-            .named_groups
-            .read()
-            .await
-            .get(&stable)
-            .cloned()
-            .unwrap();
-        assert_eq!(held.state_hash, info.state_hash, "no seal before head sync");
-        {
-            let inner = state.revocation_evictions.inner.lock().await;
-            let wait = inner.orc.pending.get(&stable).and_then(|p| p.wait.clone());
-            assert_eq!(
-                wait.map(|(cause, _)| cause),
-                Some(x0x::groups::eviction::WaitingCause::WaitingForHeadSync.as_str())
-            );
-            assert!(inner.orc.head_round_groups().contains_key(&stable));
+        let lock = super::super::super::group_membership_lock(&state, &stable).await;
+        let guard = lock.lock().await;
+        let attempt = {
+            let state = Arc::clone(&state);
+            let stable = stable.clone();
+            tokio::spawn(async move { try_commit(&state, &stable).await })
+        };
+        // Let the attempt run up to the membership lock.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
         }
-        // The restart minimum elapses and a holder confirms this head.
-        tokio::time::pause();
-        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait).await;
+        // A concurrent attempt committed and consumed the mandate.
         state
             .revocation_evictions
             .inner
             .lock()
             .await
-            .head_rounds
-            .insert(
-                stable.clone(),
-                super::super::HeadRound {
-                    head: info.state_hash.clone(),
-                    started: Instant::now(),
-                    asked: BTreeSet::new(),
-                    confirmed: true,
-                    conflicting: BTreeSet::new(),
-                },
-            );
-        try_commit(&state, &stable).await;
-
-        let committed = state
+            .orc
+            .pending
+            .remove(&stable);
+        drop(guard);
+        attempt.await.unwrap();
+        let head = state
             .named_groups
             .read()
             .await
             .get(&stable)
-            .cloned()
-            .unwrap();
+            .map(|info| info.state_hash.clone());
         assert_eq!(
-            committed.members_v2[&local_hex].role,
-            x0x::groups::GroupRole::Admin
+            head.as_deref(),
+            Some(info.state_hash.as_str()),
+            "a consumed mandate is never committed again"
         );
-        assert_eq!(
-            committed.members_v2[&admin_hex].state,
-            x0x::groups::GroupMemberState::Removed
-        );
-        assert_eq!(committed.state_revision, info.state_revision + 1);
-        let bytes = state
+        assert!(!state
             .revocation_evictions
             .inner
             .lock()
             .await
             .orc
             .deliveries
-            .get(&stable)
-            .map(|delivery| delivery.bytes.to_vec())
-            .expect("the committed frame is held for delivery");
-        let Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) = orc::decode_frame(&bytes) else {
-            panic!("an X0XORC1 commit frame");
-        };
-        orc::verify_commit_signatures(&frame).unwrap();
-        // The committed frame is held for catch-up serving.
-        let served = state
-            .revocation_evictions
-            .inner
-            .lock()
-            .await
-            .orc
-            .catchup_frames(std::slice::from_ref(&stable), info.state_revision);
-        assert_eq!(served.len(), 1);
-        assert_eq!(served[0].1, committed.state_hash);
-        assert_eq!(served[0].2.as_slice(), bytes.as_slice());
-        let revocations = verified_agent_revocations(&state).await;
-        orc::validate_against_parent(&frame.body, &info, 0, &revocations, now_unix()).unwrap();
-
-        // A receiver still on the parent installs the same commit.
-        state
-            .named_groups
-            .write()
-            .await
-            .insert(stable.clone(), info.clone());
-        let outcome = receive_commit(&state, local.agent_id(), *frame, &bytes).await;
-        assert_eq!(outcome, ReceiveOutcome::Applied);
-        let installed = state
-            .named_groups
-            .read()
-            .await
-            .get(&stable)
-            .cloned()
-            .unwrap();
-        assert_eq!(installed.state_hash, committed.state_hash);
-        assert_eq!(
-            installed.members_v2[&local_hex].role,
-            x0x::groups::GroupRole::Admin
-        );
+            .contains_key(&stable));
         state.agent.shutdown().await;
     }
 }
