@@ -23,6 +23,9 @@ pub(crate) mod staging;
 pub(crate) mod staging_runtime;
 pub mod verification_probe;
 
+#[cfg(unix)]
+mod inventory_commands;
+
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
