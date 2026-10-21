@@ -70,6 +70,9 @@ HTTP allows one waiting request and retains its deferred restart owner after
 mutation admission. Dropping a waiting request cancels its permit. Queued or
 running blocking work, including service-manager readback, retains that
 request's capacity slot until the worker exits.
+Each request keeps the release and verified manifest found before its staging
+wait. Later policy checks can refuse that release. The request does not select
+a newer release during the wait.
 
 `x0x upgrade --apply --now` sends authenticated
 `POST /upgrade/apply?now=true` (D185). It skips only the staging component of
