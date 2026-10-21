@@ -3101,14 +3101,14 @@ async fn append_synced_journal_line(
     not_after: Option<u64>,
 ) {
     let existing = crate::profile::IssuedCertRecord::load(&path).await;
-    // Already local, unless the local line lacks the expiry the synced
-    // value carries (a line written before #1542); the new line then
-    // supplies it (see `latest_journal_values`).
-    if existing.iter().any(|r| {
-        r.agent_id == agent_hex
-            && r.cert_digest == cert_digest
-            && (r.not_after.is_some() || not_after.is_none())
-    }) {
+    if !synced_line_needed(
+        &existing,
+        &owner_hex,
+        &agent_hex,
+        &cert_digest,
+        issued_at,
+        not_after,
+    ) {
         return;
     }
     let record = synced_journal_line(owner_hex, agent_hex, cert_digest, issued_at, not_after);
@@ -3118,6 +3118,29 @@ async fn append_synced_journal_line(
             "failed to append synced journal line: {e}"
         );
     }
+}
+
+/// Whether a synced journal line must be appended to `existing`.
+///
+/// Not when the line is already local, unless the local line lacks the
+/// expiry the synced value carries (a line written before #1542); the new
+/// line then supplies it (see `latest_journal_values`). Never when this
+/// owner already has a newer issuance for the agent: readers of the
+/// journal (the owner roster) take the last line per agent, so a later
+/// line for an older certificate would roll them back to it.
+fn synced_line_needed(
+    existing: &[crate::profile::IssuedCertRecord],
+    owner_hex: &str,
+    agent_hex: &str,
+    cert_digest: &str,
+    issued_at: u64,
+    not_after: Option<u64>,
+) -> bool {
+    !existing.iter().any(|r| {
+        r.agent_id == agent_hex
+            && ((r.cert_digest == cert_digest && (r.not_after.is_some() || not_after.is_none()))
+                || (r.user_id == owner_hex && r.issued_at > issued_at))
+    })
 }
 
 /// The local journal line for a synced `IssuanceJournal` value. It keeps
