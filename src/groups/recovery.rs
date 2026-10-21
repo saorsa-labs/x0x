@@ -430,15 +430,40 @@ pub fn conflict_gate_sequence(
     conflict: &AdminTerminalAttestation,
     head_state_hash: &str,
 ) -> Option<Vec<String>> {
-    let sequence = &active.fields.sequence;
-    let up_to_head = match sequence.iter().position(|hash| hash == head_state_hash) {
-        Some(at) => sequence.iter().take(at + 1).cloned().collect(),
-        None if active.fields.from_state_hash == head_state_hash => Vec::new(),
-        None => return None,
-    };
+    let up_to_head = applied_prefix(active, head_state_hash)?;
     // Two ATAs recorded as conflicting that turn out to agree still stop
     // catch-up at the head: the record is never read as less containment.
     Some(active.divergence_from(conflict).unwrap_or(up_to_head))
+}
+
+/// The links of `active`'s sequence up to and including the head (empty at
+/// its `from`); `None` when the head is off its chain. As a gate sequence
+/// it admits nothing past the head.
+fn applied_prefix(active: &AdminTerminalAttestation, head_state_hash: &str) -> Option<Vec<String>> {
+    let sequence = &active.fields.sequence;
+    match sequence.iter().position(|hash| hash == head_state_hash) {
+        Some(at) => Some(sequence.iter().take(at + 1).cloned().collect()),
+        None if active.fields.from_state_hash == head_state_hash => Some(Vec::new()),
+        None => None,
+    }
+}
+
+/// The #846 gate sequence of an armed admin ATA on `current`, the node's
+/// own record (§2 "If the signer stops being an active admin after an
+/// applied link, the gate stops there"): the attested sequence while the
+/// signer is an Active admin on `current`, else only the links already
+/// applied, so the gate admits nothing more. `None` when the head is off
+/// the ATA's chain.
+#[must_use]
+pub fn armed_gate_sequence(
+    active: &AdminTerminalAttestation,
+    current: &GroupInfo,
+) -> Option<Vec<String>> {
+    if active.signer_verified_on(current) {
+        applied_prefix(active, &current.state_hash)?;
+        return Some(active.fields.sequence.clone());
+    }
+    applied_prefix(active, &current.state_hash)
 }
 
 /// `agent_hex` is an Active admin (or higher) on `info`'s roster.
@@ -2179,6 +2204,96 @@ mod tests {
             conflict_gate_sequence(&active, &agreeing, "h4"),
             Some(Vec::new())
         );
+    }
+
+    /// §2 "If the signer stops being an active admin after an applied link,
+    /// the gate stops there." Before this rule the gate kept the full
+    /// sequence whatever the applied links did to the signer's seat.
+    #[test]
+    fn gate_stops_when_an_applied_link_demotes_the_signer() {
+        let admin = keypair();
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut current = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ef".repeat(32),
+        );
+        current.state_hash = "h4".to_string();
+        let mut long = fields(&admin);
+        long.sequence = vec!["h5".into(), "h6".into(), "h7".into()];
+        long.segment_terminal_revision = 7;
+        let active = AdminTerminalAttestation::sign(long, &admin).expect("sign");
+        assert!(active.signer_verified_on(&current));
+        assert_eq!(
+            armed_gate_sequence(&active, &current),
+            Some(active.fields.sequence.clone())
+        );
+        // The link to h5 removed the signer's admin seat.
+        current.state_hash = "h5".to_string();
+        current.remove_member(&admin_hex, None);
+        assert!(!active.signer_verified_on(&current));
+        assert_eq!(
+            armed_gate_sequence(&active, &current),
+            Some(vec!["h5".to_string()]),
+            "nothing past the head applies"
+        );
+        // Off the chain: no gate from this ATA.
+        current.state_hash = "z".to_string();
+        assert_eq!(armed_gate_sequence(&active, &current), None);
+    }
+
+    /// §11 `ATA_MAX_LINKS` = 64: a segment of 64 links signs; 65 (and 0)
+    /// does not. A 65-link gap is answered as a 64-link segment and then a
+    /// 1-link segment from the new head.
+    #[test]
+    fn ata_max_links_bounds_a_segment_and_a_65_link_gap_takes_two() {
+        let admin = keypair();
+        let with_links = |count: usize| {
+            let mut segment = fields(&admin);
+            segment.sequence = (0..count).map(|i| format!("s{i}")).collect();
+            segment.segment_terminal_revision = 4 + count as u64;
+            segment
+        };
+        assert!(AdminTerminalAttestation::sign(with_links(ATA_MAX_LINKS), &admin).is_ok());
+        assert_eq!(
+            AdminTerminalAttestation::sign(with_links(ATA_MAX_LINKS + 1), &admin),
+            Err(RecoveryRefusal::BadSegment)
+        );
+        assert_eq!(
+            AdminTerminalAttestation::sign(with_links(0), &admin),
+            Err(RecoveryRefusal::BadSegment)
+        );
+
+        let mut info = signed_group(&admin);
+        let base_revision = info.state_revision;
+        let base_hash = info.state_hash.clone();
+        for step in 0..=ATA_MAX_LINKS {
+            info.name = format!("rename-{step}");
+            info.seal_commit(&admin, 10_000 + step as u64)
+                .expect("seal");
+        }
+        assert_eq!(info.state_revision, base_revision + 65);
+        let (first, first_terminal) = match chain_position(&info, base_revision, &base_hash) {
+            ChainPosition::Behind {
+                sequence,
+                terminal_revision,
+            } => (sequence, terminal_revision),
+            other => panic!("expected Behind, got {other:?}"),
+        };
+        assert_eq!(first.len(), ATA_MAX_LINKS);
+        assert_eq!(first_terminal, base_revision + 64);
+        let mid_hash = first.last().cloned().expect("segment end");
+        match chain_position(&info, first_terminal, &mid_hash) {
+            ChainPosition::Behind {
+                sequence,
+                terminal_revision,
+            } => {
+                assert_eq!(sequence, vec![info.state_hash.clone()]);
+                assert_eq!(terminal_revision, info.state_revision);
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
     }
 
     /// §4 "Placeholder": a non-empty, all-Removed roster, which released

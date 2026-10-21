@@ -2151,7 +2151,9 @@ pub(super) async fn armed_admin_sequence(
         }
     }
     if let Some(ata) = armed_admin_ata(state, info).await {
-        return Some(ata.fields.sequence);
+        // §2: when an applied link left the signer without an Active admin
+        // seat, the gate stops at the head.
+        return s3::armed_gate_sequence(&ata, info).or(Some(Vec::new()));
     }
     exhausted_segment(state, info).await?;
     sidecar_snapshot(state, info.stable_group_id())
@@ -2968,8 +2970,13 @@ async fn arm_from_response(
         .and_then(|body| body.active_ata)
     {
         // A provisional ATA causes no conflict (§2): only a verified
-        // signer's diverging sequence stops automatic catch-up.
-        if active.conflicts_with(&ata) && ata.signer_verified_on(info) {
+        // signer's diverging sequence stops automatic catch-up. An active
+        // ATA whose signer an applied link demoted has stopped (§2) and no
+        // longer attests its remaining links, so it causes none either.
+        if active.conflicts_with(&ata)
+            && ata.signer_verified_on(info)
+            && active.signer_verified_on(info)
+        {
             record_conflict(state, group_key, info, ata).await;
             return;
         }
@@ -3135,7 +3142,9 @@ async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupIn
             let diverges = sidecar_snapshot(state, &stable)
                 .await
                 .and_then(|body| body.active_ata)
-                .is_some_and(|active| active.conflicts_with(&ata));
+                .is_some_and(|active| {
+                    active.conflicts_with(&ata) && active.signer_verified_on(info)
+                });
             if diverges {
                 record_conflict(state, group_key, info, ata).await;
                 return;
