@@ -3,11 +3,25 @@
 use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
 
-/// `x0x forward add --local 127.0.0.1:PORT --peer <hex|name> --target 127.0.0.1 --target-port N [--ephemeral]`
+/// `x0x forward add --local 127.0.0.1:PORT --peer <hex|name> --target 127.0.0.1 --target-port N`
 ///
 /// Registers a local loopback listener that tunnels to a peer's loopback
-/// service. The forward persists across daemon restarts unless `ephemeral`.
+/// service. The forward persists across daemon restarts.
+///
+/// Existing callers keep this signature. [`add_with_ephemeral`] opts a
+/// forward out of persistence.
 pub async fn add(
+    client: &DaemonClient,
+    local_addr: &str,
+    peer: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<()> {
+    add_with_ephemeral(client, local_addr, peer, target_host, target_port, false).await
+}
+
+/// `x0x forward add --ephemeral` — same as [`add`], kept in memory only.
+pub async fn add_with_ephemeral(
     client: &DaemonClient,
     local_addr: &str,
     peer: &str,

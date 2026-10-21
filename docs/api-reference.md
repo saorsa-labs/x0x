@@ -79,7 +79,9 @@ Auth-class labels used throughout this reference:
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
   route, (#1386) `POST /forwards` in every case (including plain hex
-  `peer_agent`), and every `/names*` route. The join-request list,
+  `peer_agent`), `DELETE /forwards/:local_addr` (David, 20 Oct 2026,
+  17:54 BST: a session token or a rider token is refused, the same rule as
+  `POST /forwards`), and every `/names*` route. The join-request list,
   approve and reject are not on this list. They take one class that
   depends on the group: see **Join-request admin (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
@@ -3200,9 +3202,9 @@ In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact addres
 }
 ```
 
-`POST /forwards` and `DELETE /forwards/:local_addr` require the durable owner API token (**durable-owner**). Session and rider tokens receive a typed `403`, including a plain hex `peer_agent` that writes no name or pin, and including a delete of an ephemeral forward. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward and could delete any forward.
+`POST /forwards` and `DELETE /forwards/:local_addr` require the durable owner API token (**durable-owner**). David ruled this for `DELETE /forwards/:local_addr` on 20 Oct 2026 at 17:54 BST: a session token or a rider token receives a typed `403`, the same rule as `POST /forwards`. That includes a plain hex `peer_agent` that writes no name or pin, and a delete of an ephemeral forward. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward and could delete any forward.
 
-`local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
+`local_addr` must be loopback. `target_host` must be a numeric loopback IP (no DNS). `POST /forwards` returns `409` when connect is disabled (no ACL loaded). `DELETE /forwards/:local_addr` still removes the saved record in that state. No running forwarder is required. The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
 
 `peer_agent` also accepts a name (`studio.me`, `agent:studio.bob`, `machine:box.me`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. A machine name opens streams to the one agent that machine's daemon announces. The response carries the canonical `name`, its `kind`, `pinned_machine_id` and `persistent`. Name errors use the codes listed under Names.
 
@@ -3210,7 +3212,7 @@ In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact addres
 
 **Persistence (ADR-0074 §2).** Forwards persist by default in `<data_dir>/forwards.json` (versioned JSON, unknown fields rejected, mode `0600`, written durably). `"ephemeral": true` (`x0x forward add --ephemeral`) keeps a forward in memory only. A persistent forward records `{id, local_addr, name?, kind, pinned_agent_id, pinned_machine_id, target_host, target_port}`, where `id` is the bound `local_addr`. For an agent or hex target, the pinned machine is the machine the agent is bound to when the forward is added; if that is not known yet, a persistent add returns `409` `machine_unknown` (retry once the peer is discovered, or add it as ephemeral). A persistent add returns `503` `forward_store` when `forwards.json` is unreadable or cannot be written, and `409` `forward_store_full` at 1024 forwards. An unreadable file does not block an ephemeral add, and it does not block deletion of a live ephemeral forward. Deleting a persistent forward still returns `503` `forward_store` until the file can be updated. The corrupt file is never overwritten.
 
-At daemon start each persisted forward is re-bound. A named forward is first re-resolved through the name store, where its pin applies, and comes up only if the name still denotes exactly its pinned agent (and, for a machine name, its pinned machine). Otherwise it stays down and is never retargeted: `GET /forwards` lists it with `enabled: false` and an `error` starting with a code — `name_changed` (the name now resolves to another key; delete and re-add the forward to re-pin), a name error code such as `unknown_name`, or `bind_failed` (the port is busy). Forwards that are down are retried every 10 s, so a peer that is discovered after startup comes back without user action; startup never waits for them. An unreadable `forwards.json` restores nothing, is never overwritten, and is reported as `store_error` in `GET /forwards`. When connect is disabled (no ACL loaded) the file is kept but nothing is restored. A persistent add whose record would not load back (for example a non-loopback `target_host`) is refused with `400` `invalid_forward` before the port is bound.
+At daemon start each persisted forward is re-bound. A named forward is first re-resolved through the name store, where its pin applies, and comes up only if the name still denotes exactly its pinned agent (and, for a machine name, its pinned machine). Otherwise it stays down and is never retargeted: `GET /forwards` lists it with `enabled: false` and an `error` starting with a code — `name_changed` (the name now resolves to another key; delete and re-add the forward to re-pin), a name error code such as `unknown_name`, or `bind_failed` (the port is busy). Forwards that are down are retried every 10 s, so a peer that is discovered after startup comes back without user action; startup never waits for them. An unreadable `forwards.json` restores nothing, is never overwritten, and is reported as `store_error` in `GET /forwards`. When connect is disabled (no ACL loaded) the file is kept and nothing is restored. `DELETE /forwards/:local_addr` still removes the saved record. No forwarder is required. A persistent add whose record would not load back (for example a non-loopback `target_host`) is refused with `400` `invalid_forward` before the port is bound.
 
 `GET /forwards` returns:
 

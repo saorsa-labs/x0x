@@ -3308,7 +3308,7 @@ async fn run(
                 target_port,
                 ephemeral,
             } => {
-                commands::forward::add(
+                commands::forward::add_with_ephemeral(
                     &client,
                     &local,
                     &peer,

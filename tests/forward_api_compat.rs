@@ -2,8 +2,9 @@
 //!
 //! An existing `ForwardSpec` literal must compile, `list_forwards` must
 //! still return `Vec<ForwardSpec>`, and `resolve_name_for_forward` must
-//! stay callable. Name, machine pin, and persistence live on
-//! `ForwardBinding` / `ForwardStatus`.
+//! stay callable. `names::require_agent_target` and the five-argument
+//! `cli::commands::forward::add` stay callable too. Name, machine pin,
+//! and persistence live on `ForwardBinding` / `ForwardStatus`.
 
 use std::sync::Arc;
 
@@ -64,6 +65,42 @@ async fn old_forward_spec_literal_and_fns_still_compile() {
     #[allow(deprecated)]
     let resolved = agent.resolve_name_for_forward(&names, None, &name).await;
     assert!(resolved.is_err(), "the old helper still runs: {resolved:?}");
+
+    let agent_resolved = x0x::names::Resolved {
+        name: "agent:compat.me".to_string(),
+        kind: x0x::names::NameKind::Agent,
+        owner: x0x::identity::UserId([4; 32]),
+        agent_id: Some(AgentId([1; 32])),
+        machine_id: None,
+        newly_pinned: false,
+    };
+    #[allow(deprecated)]
+    let kept = x0x::names::require_agent_target(&agent_resolved, &name).expect("old agent target");
+    assert_eq!(kept, AgentId([1; 32]));
+    let machine_name = x0x::names::NameRef::parse("machine:compat.me").expect("machine name");
+    let machine_resolved = x0x::names::Resolved {
+        name: "machine:compat.me".to_string(),
+        kind: x0x::names::NameKind::Machine,
+        owner: x0x::identity::UserId([4; 32]),
+        agent_id: Some(AgentId([1; 32])),
+        machine_id: Some(x0x::identity::MachineId([5; 32])),
+        newly_pinned: false,
+    };
+    #[allow(deprecated)]
+    let refused = x0x::names::require_agent_target(&machine_resolved, &machine_name)
+        .expect_err("old helper still refuses a machine");
+    assert_eq!(refused.code(), "machine_target_unsupported");
+
+    let client = x0x::cli::DaemonClient::new(
+        Some("forward-api-compat"),
+        Some("http://127.0.0.1:9"),
+        x0x::cli::OutputFormat::Json,
+    )
+    .expect("client")
+    .dump_requests(true);
+    x0x::cli::commands::forward::add(&client, "127.0.0.1:9", "ab", "127.0.0.1", 7)
+        .await
+        .expect("old five-argument add");
 
     service.shutdown();
     agent.shutdown().await;

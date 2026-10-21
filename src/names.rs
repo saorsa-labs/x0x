@@ -365,6 +365,26 @@ pub fn forward_target(
     }
 }
 
+/// Refuse a resolution that landed on a machine. Return the agent otherwise.
+///
+/// Existing callers keep this signature. It delegates an agent resolution
+/// to [`forward_target`]. New forward code uses [`forward_target`] directly:
+/// a machine name is a valid forward target and carries its `MachineId` pin.
+///
+/// # Errors
+/// [`NameError::MachineTargetUnsupported`] when the resolution is not an
+/// agent that has an agent id.
+#[deprecated(
+    since = "0.48.1",
+    note = "use `forward_target`; machine names are valid forward targets"
+)]
+pub fn require_agent_target(resolved: &Resolved, name: &NameRef) -> Result<AgentId, NameError> {
+    if resolved.kind != NameKind::Agent || resolved.agent_id.is_none() {
+        return Err(machine_forward_refusal(name));
+    }
+    forward_target(resolved, name).map(|(agent, _pin)| agent)
+}
+
 // ─── Candidates ────────────────────────────────────────────────────────────
 
 /// An agent that claims the owner, with its announced name.

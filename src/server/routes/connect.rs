@@ -345,6 +345,10 @@ pub(in crate::server) async fn forward_list(
 /// DELETE /forwards/:local_addr — tear down a forward by its local bind
 /// addr and delete its persisted record. Durable-owner only: a session
 /// or rider token must not delete the owner's forwards.
+///
+/// Connect disabled (no ACL) leaves no forwarder after restart. The saved
+/// record is still deleted. `POST /forwards` stays `409` in that state:
+/// there is no listener to bind.
 pub(in crate::server) async fn forward_remove(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
@@ -356,12 +360,6 @@ pub(in crate::server) async fn forward_remove(
             Json(serde_json::json!({ "ok": false, "error": DURABLE_REQUIRED })),
         );
     }
-    let Some(forwarder) = state.forward_service.as_ref() else {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "ok": false, "removed": false })),
-        );
-    };
     let Ok(addr): Result<SocketAddr, _> = local_addr.parse() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -371,12 +369,15 @@ pub(in crate::server) async fn forward_remove(
     // Forget the durable record first, including one hidden behind an
     // ephemeral in-memory entry, so a deleted forward never comes back at
     // the next start. A store failure leaves the running forward in place
-    // and reports it.
-    let removed = match remove_persisted(&state.forwards, forwarder, addr).await {
+    // and reports it. No forwarder means connect is disabled: delete the
+    // saved record anyway.
+    let removed = match forget_forward(&state.forwards, state.forward_service.as_ref(), addr).await
+    {
         Ok(removed) => removed,
-        // The rename already dropped the record. The listener is gone too.
-        // Durability is still unconfirmed, so this is not success, and it
-        // is not the pre-rename failure that leaves the listener up.
+        // The rename already dropped the record. A running listener is
+        // stopped too. Durability is still unconfirmed, so this is not
+        // success, and it is not the pre-rename failure that leaves a
+        // listener up.
         Err(e) if e.durability_unconfirmed() => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -413,6 +414,22 @@ pub(in crate::server) async fn forward_remove(
 
 /// How often restored forwards that are down are re-resolved and re-bound.
 pub(in crate::server) const FORWARD_RESTORE_RETRY_SECS: u64 = 10;
+
+/// Delete the saved forward at `addr`.
+///
+/// `forwarder` is absent when connect is disabled. The saved record is
+/// still removed, and there is no listener to stop. A present forwarder
+/// goes through [`remove_persisted`].
+async fn forget_forward(
+    store: &Arc<x0x::forward::store::ForwardStore>,
+    forwarder: Option<&Arc<x0x::forward::ForwardService>>,
+    addr: SocketAddr,
+) -> Result<bool, x0x::forward::store::ForwardStoreError> {
+    match forwarder {
+        Some(forwarder) => remove_persisted(store, forwarder, addr).await,
+        None => store.forget(addr).await,
+    }
+}
 
 /// Delete the durable record at `addr` and the in-memory forward, holding
 /// the lifecycle lock for both. The record is removed even when the live
@@ -1405,5 +1422,30 @@ mod tests {
             .await
             .expect("the restored listener accepts a local client");
         forwarder.shutdown();
+    }
+
+    /// WHY: disabling connect and restarting leaves no forwarder. DELETE
+    /// must still remove the saved record. Returning 409 before `forget`
+    /// leaves the record in `forwards.json`.
+    #[tokio::test]
+    async fn disabled_connect_restart_still_deletes_saved_forward() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let addr = "127.0.0.1:18022".parse().expect("addr");
+        {
+            let store = ForwardStore::load(path.clone()).await;
+            assert!(remember_reg(&store, &hex_spec(addr)).await.expect("save"));
+        }
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
+        assert_eq!(store.records().await.expect("loaded").len(), 1);
+        let removed = forget_forward(&store, None, addr)
+            .await
+            .expect("delete with no forwarder");
+        assert!(removed, "the saved record must be removed");
+        let restarted = ForwardStore::load(path).await;
+        assert!(
+            restarted.records().await.expect("reloaded").is_empty(),
+            "a later start must not see the deleted forward"
+        );
     }
 }
