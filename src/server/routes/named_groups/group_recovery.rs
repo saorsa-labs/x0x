@@ -1647,23 +1647,43 @@ async fn prune_admin_state(state: &AppState) {
     }
 }
 
-async fn subject_tick(state: &Arc<AppState>) {
-    let local = local_hex(state);
-    let groups: Vec<(String, GroupInfo)> = state
-        .named_groups
-        .read()
-        .await
-        .iter()
-        .map(|(key, info)| (key.clone(), info.clone()))
-        .collect();
-    let now = Instant::now();
-    let mut live: HashSet<String> = HashSet::new();
-    for (key, info) in groups {
+/// The groups this tick looks at: every group with a marker or an armed
+/// owner gap, and every group S3 already holds state for. Only those are
+/// cloned (a record can carry a long retained commit log). Also returns
+/// every live group's stable ID.
+async fn tick_groups(state: &AppState) -> (Vec<(String, GroupInfo)>, HashSet<String>) {
+    let held: HashSet<String> = {
+        let inner = state.group_recovery.inner.lock().await;
+        inner
+            .subjects
+            .keys()
+            .chain(inner.sidecars.keys())
+            .chain(inner.sidecar_status.keys())
+            .cloned()
+            .collect()
+    };
+    let groups = state.named_groups.read().await;
+    let mut live = HashSet::new();
+    let mut selected = Vec::new();
+    for (key, info) in groups.iter() {
         if info.withdrawn {
             continue;
         }
+        let stable = info.stable_group_id();
+        live.insert(stable.to_string());
+        if held.contains(stable) || !RecoveryRef::live_refs(info).is_empty() {
+            selected.push((key.clone(), info.clone()));
+        }
+    }
+    (selected, live)
+}
+
+async fn subject_tick(state: &Arc<AppState>) {
+    let local = local_hex(state);
+    let (groups, live) = tick_groups(state).await;
+    let now = Instant::now();
+    for (key, info) in groups {
         let stable = info.stable_group_id().to_string();
-        live.insert(stable.clone());
         let refs = live_refs(state, &info).await;
         let (journal_active, fault) = {
             let inner = state.group_recovery.inner.lock().await;
@@ -1711,13 +1731,7 @@ async fn subject_tick(state: &Arc<AppState>) {
         send_request(state, &info, &local, &refs, target).await;
     }
     // Refresh the cached `recovery` objects for the §5 refusal body.
-    let groups: Vec<(String, GroupInfo)> = state
-        .named_groups
-        .read()
-        .await
-        .iter()
-        .map(|(key, info)| (key.clone(), info.clone()))
-        .collect();
+    let (groups, _) = tick_groups(state).await;
     let mut cache = HashMap::new();
     for (key, info) in &groups {
         if let Some(object) = recovery_json(state, info).await {
