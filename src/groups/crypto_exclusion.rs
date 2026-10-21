@@ -130,8 +130,10 @@ pub enum CryptoExclusionCryptoV1 {
         /// The TreeKEM epoch after the commit.
         next_epoch: u64,
     },
-    /// A GSS rotation for a grandfathered GSS group. This binary does not
-    /// author it yet; receivers refuse it with `crypto_plane_unsupported`.
+    /// One GSS rotation for a grandfathered GSS `MlsEncrypted` group
+    /// (§3 L217). The new secret goes to each remaining Active member in
+    /// the existing sealed `SecureShareDelivered` envelope, never in this
+    /// frame.
     Gss {
         /// The secret epoch after the rotation.
         next_secret_epoch: u64,
@@ -395,11 +397,77 @@ pub fn removal_proof_for(info: &GroupInfo, target_hex: &str) -> Option<[u8; 32]>
     })
 }
 
+/// The GSS security binding of secret epoch `epoch` (as
+/// [`GroupInfo::rotate_shared_secret`] writes it).
+pub use crate::groups::owner_recovery::gss_binding;
+
+fn gss_epoch_of(binding: Option<&str>) -> Option<u64> {
+    binding?.strip_prefix("gss:epoch=")?.parse().ok()
+}
+
+/// Whether `info` is a GSS `MlsEncrypted` group: the plane of the GSS
+/// form of this exclusion.
+#[must_use]
+pub fn is_gss_encrypted(info: &GroupInfo) -> bool {
+    info.secure_plane == crate::mls::SecureGroupPlane::Gss
+        && info.policy.confidentiality == crate::groups::GroupConfidentiality::MlsEncrypted
+}
+
+/// The secret epoch that `info`'s current head commits to: the binding of
+/// the retained head commit. A sealed share can raise the local
+/// `secret_epoch` before the commit of that epoch arrives, so the L4 rule
+/// uses this value, not the local one. Falls back to `secret_epoch` when
+/// the head commit is not retained.
+#[must_use]
+pub fn committed_secret_epoch(info: &GroupInfo) -> u64 {
+    info.commit_log
+        .iter()
+        .rev()
+        .find(|retained| retained.commit.state_hash == info.state_hash)
+        .and_then(|retained| gss_epoch_of(retained.commit.security_binding.as_deref()))
+        .unwrap_or(info.secret_epoch)
+}
+
+/// The GSS form of a "retained cryptographic leaf" (§1, §3 L217): a
+/// Removed member of a GSS `MlsEncrypted` group that still holds the
+/// current secret. That is true when no rotation followed the last
+/// retained commit that seated it as Active: the secret epoch of that
+/// commit is not below the epoch the current head commits to. A removal
+/// that rotated in its own commit (admin remove, ban) is not retained.
+///
+/// A member with no retained seated commit is not retained: this node did
+/// not witness its seat, so it cannot prove which secret the member holds.
+#[must_use]
+pub fn gss_secret_retained(info: &GroupInfo, target_hex: &str) -> bool {
+    if !is_gss_encrypted(info)
+        || info.withdrawn
+        || !info
+            .members_v2
+            .get(target_hex)
+            .is_some_and(|member| member.state == GroupMemberState::Removed)
+    {
+        return false;
+    }
+    let current = committed_secret_epoch(info);
+    info.commit_log
+        .iter()
+        .rev()
+        .find(|retained| {
+            retained
+                .roster
+                .get(target_hex)
+                .is_some_and(|seat| seat.state == GroupMemberState::Active)
+        })
+        .and_then(|retained| gss_epoch_of(retained.commit.security_binding.as_deref()))
+        .is_some_and(|seated_epoch| seated_epoch >= current)
+}
+
 /// The receiver's L4 checks against its current verified parent state
 /// (§4, L249): an Active Admin-or-higher signer that is not the target, the
 /// chained prior removal, the target/leaf binding, the exact next revision
 /// and epoch, unchanged membership, the last-admin invariant and
-/// containment. `current_epoch` is this node's TreeKEM epoch.
+/// containment. `current_epoch` is this node's TreeKEM epoch, or for the
+/// GSS form the [`committed_secret_epoch`] of the parent.
 ///
 /// `is_actor_revoked` is this node's current agent-revocation set (§3
 /// enforcement point 4). The check is part of the acceptance rule, so no
@@ -484,7 +552,18 @@ pub fn validate_against_parent(
             }
             Ok(())
         }
-        CryptoExclusionCryptoV1::Gss { .. } => Err(CryptoExclusionRefusal::CryptoPlaneUnsupported),
+        CryptoExclusionCryptoV1::Gss { next_secret_epoch } => {
+            if !is_gss_encrypted(parent) {
+                return Err(CryptoExclusionRefusal::CryptoPlaneUnsupported);
+            }
+            if *next_secret_epoch != current_epoch.saturating_add(1)
+                || body.commit.security_binding.as_deref()
+                    != Some(gss_binding(*next_secret_epoch).as_str())
+            {
+                return Err(CryptoExclusionRefusal::EpochMismatch);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -682,6 +761,147 @@ mod tests {
             validate_against_parent(&good, &quarantined, 2, |_| false),
             Err(CryptoExclusionRefusal::GroupContained)
         );
+    }
+
+    /// A GSS group in which `target` was seated at secret epoch 0 (a
+    /// retained commit holds that roster) and then self-left.
+    fn gss_group(admin: &AgentKeypair, target: [u8; 32]) -> GroupInfo {
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            "d".to_string(),
+            admin.agent_id(),
+            "cd".repeat(16),
+        );
+        let target_hex = hex::encode(target);
+        info.add_member(
+            target_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        info.seal_commit(admin, 500).expect("seat");
+        info.remove_member(&target_hex, Some(target_hex.clone()));
+        info.recompute_state_hash();
+        info
+    }
+
+    fn gss_body_for(
+        info: &GroupInfo,
+        admin: &AgentKeypair,
+        target: [u8; 32],
+        next_secret_epoch: u64,
+    ) -> CryptoExclusionBodyV1 {
+        let mut next = info.clone();
+        next.secret_epoch = next_secret_epoch;
+        next.security_binding = Some(gss_binding(next_secret_epoch));
+        let commit = next.seal_commit(admin, 1_000).expect("seal");
+        CryptoExclusionBodyV1 {
+            stable_group_id: info.stable_group_id().to_string(),
+            actor: *admin.agent_id().as_bytes(),
+            target,
+            prior_head: info.state_hash.clone(),
+            prior_revision: info.state_revision,
+            next_revision: info.state_revision + 1,
+            roster_revision: info.roster_revision + 1,
+            removal_proof_hash: removal_proof_for(info, &hex::encode(target)).expect("removed"),
+            crypto: CryptoExclusionCryptoV1::Gss { next_secret_epoch },
+            commit: CommitHeaderV1::from(&commit),
+        }
+    }
+
+    /// #1508 review P1 (GSS self-leave): the GSS form of §4 is accepted on
+    /// a GSS group for an already-Removed target when the next secret
+    /// epoch is exactly the committed epoch + 1 and the signed binding
+    /// names it. Each violation is refused with its typed reason.
+    #[test]
+    fn gss_frame_is_accepted_and_each_violation_refused() {
+        let admin = keypair();
+        let target = [9u8; 32];
+        let info = gss_group(&admin, target);
+        let good = gss_body_for(&info, &admin, target, 1);
+        assert_eq!(validate_against_parent(&good, &info, 0, |_| false), Ok(()));
+        let frame = sign(good.clone(), &admin).expect("sign");
+        let decoded = decode_frame(&encode_frame(&frame).expect("encode")).expect("decode");
+        verify_signatures(&decoded).expect("signatures");
+        // The next epoch is not the committed epoch + 1.
+        assert_eq!(
+            validate_against_parent(&good, &info, 1, |_| false),
+            Err(CryptoExclusionRefusal::EpochMismatch)
+        );
+        let skipped = gss_body_for(&info, &admin, target, 2);
+        assert_eq!(
+            validate_against_parent(&skipped, &info, 0, |_| false),
+            Err(CryptoExclusionRefusal::EpochMismatch)
+        );
+        // The signed binding does not name the next epoch.
+        let mut unbound = good.clone();
+        unbound.crypto = CryptoExclusionCryptoV1::Gss {
+            next_secret_epoch: 1,
+        };
+        unbound.commit.security_binding = Some("gss:epoch=7".to_string());
+        assert_eq!(
+            validate_against_parent(&unbound, &info, 0, |_| false),
+            Err(CryptoExclusionRefusal::EpochMismatch)
+        );
+        // The target is seated on the parent.
+        let mut seated = info.clone();
+        if let Some(member) = seated.members_v2.get_mut(&hex::encode(target)) {
+            member.state = GroupMemberState::Active;
+        }
+        assert_eq!(
+            validate_against_parent(&good, &seated, 0, |_| false),
+            Err(CryptoExclusionRefusal::TargetNotRemoved)
+        );
+        // A GSS transition on a TreeKEM group, and on a SignedPublic group.
+        let mut treekem = info.clone();
+        treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
+        assert_eq!(
+            validate_against_parent(&good, &treekem, 0, |_| false),
+            Err(CryptoExclusionRefusal::CryptoPlaneUnsupported)
+        );
+        let mut public = info.clone();
+        public.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        assert_eq!(
+            validate_against_parent(&good, &public, 0, |_| false),
+            Err(CryptoExclusionRefusal::CryptoPlaneUnsupported)
+        );
+    }
+
+    /// #1508 review P1: the GSS "retained leaf". A self-leaver keeps the
+    /// secret until a later commit rotates it; a removal that rotated in
+    /// its own commit never retains it.
+    #[test]
+    fn gss_self_leaver_retains_the_secret_until_a_rotation() {
+        let admin = keypair();
+        let target = [9u8; 32];
+        let target_hex = hex::encode(target);
+        let mut info = gss_group(&admin, target);
+        info.seal_commit(&admin, 600).expect("leave");
+        assert!(gss_secret_retained(&info, &target_hex));
+        assert_eq!(committed_secret_epoch(&info), 0);
+        // A share raises the local epoch before its commit: still retained.
+        info.secret_epoch = 1;
+        assert_eq!(committed_secret_epoch(&info), 0);
+        assert!(gss_secret_retained(&info, &target_hex));
+        info.secret_epoch = 0;
+        let _ = info.rotate_shared_secret();
+        info.seal_commit(&admin, 700).expect("rotate");
+        assert_eq!(committed_secret_epoch(&info), 1);
+        assert!(!gss_secret_retained(&info, &target_hex));
+
+        // An admin removal that rotates in its own commit.
+        let other = [8u8; 32];
+        let other_hex = hex::encode(other);
+        info.add_member(other_hex.clone(), GroupRole::Member, None, None);
+        info.seal_commit(&admin, 800).expect("seat");
+        info.remove_member(&other_hex, Some(hex::encode(admin.agent_id().as_bytes())));
+        let _ = info.rotate_shared_secret();
+        info.seal_commit(&admin, 900).expect("remove");
+        assert!(!gss_secret_retained(&info, &other_hex));
+        // TreeKEM groups use their tree, not this rule.
+        let mut treekem = gss_group(&admin, target);
+        treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
+        assert!(!gss_secret_retained(&treekem, &target_hex));
     }
 
     #[test]
