@@ -274,10 +274,22 @@ fn log_path(state: &AppState, stable_group_id: &str, extension: &str) -> PathBuf
 /// Write `log` durably at `path`. A file with a newer layout is never
 /// rewritten. Returns whether `log` is durable.
 async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
-    // RED STUB (commit A): the f634bed behaviour. The frame stays in
-    // memory only and nothing reaches the disk.
-    let _ = (path, log, encode, super::super::write_bytes_durably);
-    true
+    if let Ok(existing) = tokio::fs::read(path).await {
+        if let Err(SidecarDecodeError::NewerFormat(version)) = decode(&existing) {
+            tracing::warn!(version, path = %path.display(), "ADR 0110 S4: held frame log has a newer layout; the commit does not occur");
+            return false;
+        }
+    }
+    let Ok(bytes) = encode(log) else {
+        return false;
+    };
+    match super::super::write_bytes_durably(path, &bytes, None).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "ADR 0110 S4: held frame log write failed");
+            false
+        }
+    }
 }
 
 /// Read every file with `extension` in `dir`. A damaged file is
