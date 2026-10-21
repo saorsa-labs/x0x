@@ -7,6 +7,8 @@
 
 pub mod apply;
 #[cfg(unix)]
+pub(crate) mod fleet_policy;
+#[cfg(unix)]
 mod inventory_accounts;
 pub(crate) mod journal;
 pub mod manifest;

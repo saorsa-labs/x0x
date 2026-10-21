@@ -184,6 +184,13 @@ jobs:
           X0X_ISOLATION_ROLE: m2-signing-controls
         run: bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
 
+      # Library fleet guards must also use the production key, not the
+      # all-features debug rehearsal key that permits zero-minute windows.
+      - name: M2 production fleet staging controls
+        env:
+          X0X_ISOLATION_ROLE: m2-fleet-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --lib -- -E 'test(fleet_)' --no-tests=fail
+
 
       # Run after the workspace artifact is uploaded so this nextest invocation
       # cannot replace the full-suite results kept above.
