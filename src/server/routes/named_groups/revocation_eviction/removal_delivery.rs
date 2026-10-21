@@ -2,10 +2,12 @@
 //! removal.
 //!
 //! The unchanged legacy removal path builds the signed `MemberRemoved`
-//! (with its TreeKEM commit) inside its own transaction, publishes it once
-//! and resends it on an in-memory schedule. A crash or a partition in that
-//! window loses the event: the TreeKEM commit is not stored anywhere else,
-//! so no survivor can catch up from this node later.
+//! (with its TreeKEM commit or its rotated GSS secret epoch) inside its own
+//! transaction, publishes it once and resends it on an in-memory schedule.
+//! A crash or a partition in that window loses the event: the TreeKEM
+//! commit is not stored anywhere else, and a GSS survivor has no way to
+//! pull the rotated secret, so no survivor can catch up from this node
+//! later.
 //!
 //! - **Save** ([`record_committed_removal`]). When S4 runs the removal,
 //!   its row saves the exact outgoing event, the result head and the epoch,
@@ -23,7 +25,10 @@
 //!   whose result is still the head is resent, and only after the group's
 //!   head is synced (§2, §3 "re-sync the head before any resend"): the
 //!   restart wait, a completed current catch-up round and no unresolved
-//!   higher-head evidence. No second rekey runs.
+//!   higher-head evidence. No second rekey runs. For a GSS `MlsEncrypted`
+//!   removal or ban, the first resumed round also seals the saved epoch's
+//!   secret to each survivor again (`SecureShareDelivered`): the crash may
+//!   have lost the legacy shares, and a survivor cannot pull them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -55,6 +60,9 @@ pub(super) struct RemovalDelivery {
     resumed: bool,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
+    /// A resumed GSS removal or ban: the rotated secret epoch whose shares
+    /// the first round sends again.
+    reshare_epoch: Option<u64>,
 }
 
 /// The parts of a saved removal event that the restart needs.
@@ -124,15 +132,87 @@ fn new_delivery(
             .map(|id| (id, RecipientDelivery::Due))
             .collect(),
         next_at,
+        reshare_epoch: None,
+    }
+}
+
+/// The rotated GSS secret epoch of a saved removal or ban: a
+/// `secret_epoch` with no TreeKEM commit. A TreeKEM commit carries its own
+/// key material, and a `SignedPublic` group has no secret.
+fn gss_secret_epoch(event: &NamedGroupMetadataEvent) -> Option<u64> {
+    match event {
+        NamedGroupMetadataEvent::MemberRemoved {
+            treekem_commit_b64: None,
+            secret_epoch,
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberBanned {
+            treekem_commit_b64: None,
+            secret_epoch,
+            ..
+        } => *secret_epoch,
+        _ => None,
+    }
+}
+
+/// Seal the group secret of `epoch` to each of `recipients` again, with the
+/// existing class-K share delivery (`SecureShareDelivered`, ADR 0107 / D60
+/// admission per write). Nothing is sent when the group's secret epoch is
+/// not `epoch` any more: old key material is never sent after an epoch
+/// change.
+fn redeliver_secret_shares(
+    state: &Arc<AppState>,
+    info: &GroupInfo,
+    recipients: &std::collections::BTreeSet<[u8; 32]>,
+    epoch: u64,
+) {
+    if info.secret_epoch != epoch {
+        return;
+    }
+    let Some(secret) = info
+        .shared_secret
+        .as_deref()
+        .and_then(|secret| <[u8; 32]>::try_from(secret).ok())
+    else {
+        return;
+    };
+    let actor = hex::encode(state.agent.agent_id().as_bytes());
+    for recipient in recipients {
+        let recipient_hex = hex::encode(recipient);
+        let Some(kem) = info
+            .members_v2
+            .get(&recipient_hex)
+            .and_then(|member| member.kem_public_key_b64.as_deref())
+        else {
+            continue;
+        };
+        match super::super::build_secure_share_event(
+            info.stable_group_id(),
+            &recipient_hex,
+            kem,
+            &actor,
+            &secret,
+            epoch,
+        ) {
+            Ok(share) => {
+                super::super::spawn_secure_share_delivery(state, &share);
+            }
+            Err(_) => tracing::warn!(
+                group_id = %super::super::LogHexId::group(info.stable_group_id()),
+                recipient = %super::super::LogHexId::agent(&recipient_hex),
+                "ADR 0110 S4: cannot seal the rotated secret to a survivor again"
+            ),
+        }
     }
 }
 
 // ─── Save (§5) ─────────────────────────────────────────────────────────────
 
-/// Save the exact outgoing `MemberRemoved` of S4's own removal of
-/// `target_hex` from `info` (the committed after-image).
+/// Save the exact outgoing `MemberRemoved` or `MemberBanned` of S4's own
+/// removal or ban of `target_hex` from `info` (the committed after-image).
 ///
-/// The caller is the legacy TreeKEM removal path. It holds the group's
+/// The caller is `RemovalBarrier::committed`, in the legacy removal or ban
+/// route of any plane. It holds the group's
 /// membership lock, its roster/crypto transaction is durable, and it has
 /// not published the event yet. Only a row that S4 prepared for this
 /// removal changes; any other removal returns at once. The `.evs` is
@@ -265,16 +345,16 @@ pub(super) fn resume_after_load(
             ResumeAction::Deliver => {
                 row.phase = Phase::CommittedDeliveryPending;
                 row.result_head = Some(saved.result_head.clone());
-                removals.insert(
-                    key.clone(),
-                    new_delivery(
-                        saved.event,
-                        saved.result_head,
-                        survivors(info, local, &key.target),
-                        true,
-                        Instant::now(),
-                    ),
+                let reshare_epoch = gss_secret_epoch(&saved.event);
+                let mut delivery = new_delivery(
+                    saved.event,
+                    saved.result_head,
+                    survivors(info, local, &key.target),
+                    true,
+                    Instant::now(),
                 );
+                delivery.reshare_epoch = reshare_epoch;
+                removals.insert(key.clone(), delivery);
             }
             ResumeAction::Discard => {
                 row.phase = Phase::CommittedDeliveryPending;
@@ -404,12 +484,13 @@ pub(super) async fn drive(state: &Arc<AppState>) {
         }
         // Install every status, `InFlight` included, BEFORE any send task
         // starts: a fast completion can then never be overwritten.
-        let started = {
+        let (started, reshare_epoch) = {
             let mut inner = runtime.inner.lock().await;
             let Some(stored) = inner.removals.get_mut(&key) else {
                 continue;
             };
             let started = crypto_exclusion::apply_round(&mut stored.recipients, updates);
+            let reshare_epoch = stored.reshare_epoch.take();
             if stored
                 .recipients
                 .values()
@@ -418,8 +499,13 @@ pub(super) async fn drive(state: &Arc<AppState>) {
                 inner.removals.remove(&key);
                 inner.dirty = true;
             }
-            started
+            (started, reshare_epoch)
         };
+        if let Some(epoch) = reshare_epoch {
+            // The head is synced and still the result: the survivors get
+            // the saved epoch's secret again, once per resume.
+            redeliver_secret_shares(state, &info, &active, epoch);
+        }
         for (recipient, attempt) in started {
             spawn_send(
                 state,
