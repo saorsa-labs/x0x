@@ -64,6 +64,8 @@ An admitted replacement retains its restart continuation.
 If staging identity initialization fails, background apply stays disabled
 for that process. Configured release discovery and verified rebroadcast
 continue without an apply owner.
+The background owner updates the guide only after staging permits the release.
+Without that owner, these sources leave the installed guide unchanged.
 
 HTTP waits, complete host inventory and transaction-bound guide installation
 remain separate M2 work. Shutdown closes background intake and withdraws
