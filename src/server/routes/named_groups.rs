@@ -18,6 +18,8 @@ pub(in crate::server) use control_blob::{
 };
 pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
 pub(in crate::server) use fair_admission::FairAdmission;
+#[cfg(test)]
+pub(in crate::server) use group_recovery::open_staging_journal_for_test;
 pub(in crate::server) use group_recovery::{
     get_group_recovery, reseat_group_member, run_group_recovery_worker, S3Runtime,
 };
