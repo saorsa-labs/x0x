@@ -2131,8 +2131,15 @@ mod tests {
                 info.ban_member(member, None);
             }),
             ("head moved", |info, _| {
+                // An epoch move as production commits it: the epoch and its
+                // security binding move together, and the binding is what
+                // the state hash commits to (the epoch alone leaves the
+                // head unchanged).
+                let before = info.state_hash.clone();
                 info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
                 info.recompute_state_hash();
+                assert_ne!(info.state_hash, before, "the head must move");
             }),
             ("quarantined", |info, _| {
                 info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
