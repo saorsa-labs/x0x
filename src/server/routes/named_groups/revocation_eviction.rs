@@ -1324,10 +1324,7 @@ pub(in crate::server) async fn s4_manual_request_gate(
     if s4_prepared_removal_of(&key)
         && inner.store.get(&key).map(|row| row.phase) != Some(Phase::Prepared)
     {
-        return Some((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "ok": false, "error": "s4_exclusion_cancelled" })),
-        ));
+        return Some(s4_exclusion_cancelled_response());
     }
     let row = inner.store.get(&key)?;
     if !row.phase.is_open() {
@@ -2239,6 +2236,82 @@ fn s4_prepared_removal_of(key: &EvictionKey) -> bool {
                 && scope.target_hex == hex::encode(key.target)
         })
         .unwrap_or(false)
+}
+
+/// The typed reply to the worker's cancelled removal or ban (§1a/D135).
+pub(in crate::server) fn s4_exclusion_cancelled_response() -> (StatusCode, Json<serde_json::Value>)
+{
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "ok": false, "error": "s4_exclusion_cancelled" })),
+    )
+}
+
+/// The S4 state of a removal or ban of `key`, read under the caller's
+/// membership lock against the current committed `seat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockedRemoval {
+    /// Not the worker's prepared removal: the legacy path runs unchanged.
+    NotS4,
+    /// The worker's prepared removal, still eligible.
+    Prepared,
+    /// The worker's removal, cancelled: the row ended or a rebind changed
+    /// the seat's committed certificate.
+    Cancelled,
+}
+
+async fn locked_removal_state(
+    state: &AppState,
+    key: &EvictionKey,
+    seat: Option<&x0x::groups::GroupMember>,
+) -> LockedRemoval {
+    let now_unix = now_unix_ms() / 1000;
+    let inner = state.revocation_evictions.inner.lock().await;
+    match inner.store.get(key) {
+        Some(row) if row.phase == Phase::Prepared && row.parent_head.is_some() => {
+            if exclusion_still_eligible(row, seat, now_unix) {
+                LockedRemoval::Prepared
+            } else {
+                LockedRemoval::Cancelled
+            }
+        }
+        _ if s4_prepared_removal_of(key) => LockedRemoval::Cancelled,
+        _ => LockedRemoval::NotS4,
+    }
+}
+
+/// §1a/D135 (#1508 review): the remove and ban routes call this right
+/// after they take the group's membership lock, on every plane. A rebind
+/// commit takes the same lock, so none can land between this check and
+/// the commit. Returns the `409` reply when the worker's removal or ban
+/// is cancelled.
+pub(in crate::server) async fn s4_exclusion_cancelled_under_lock(
+    state: &AppState,
+    group_key: &str,
+    target_hex: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let target = super::parse_agent_id_hex(target_hex).ok()?;
+    let (stable, seat) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_key)?;
+        (
+            info.stable_group_id().to_string(),
+            info.members_v2
+                .get(&hex::encode(target.as_bytes()))
+                .cloned(),
+        )
+    };
+    let key = EvictionKey::new(stable, *target.as_bytes());
+    (locked_removal_state(state, &key, seat.as_ref()).await == LockedRemoval::Cancelled).then(
+        || {
+            tracing::info!(
+                group_id = %super::LogHexId::group(group_key),
+                target = %super::LogHexId::agent(target_hex),
+                "ADR 0110 S4: the expiry removal is cancelled by a renewal; the seat stays"
+            );
+            s4_exclusion_cancelled_response()
+        },
+    )
 }
 
 /// §1a/D135 pre-seal re-check of a prepared row against the current
