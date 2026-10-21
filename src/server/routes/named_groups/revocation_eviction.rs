@@ -48,6 +48,7 @@ use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
 mod removal_delivery;
+pub(super) mod removal_journal;
 
 pub(super) use removal_delivery::record_committed_removal;
 
@@ -1469,8 +1470,8 @@ fn prepared_journal(row: &ObligationRow, parent_head: String, next_revision: u64
         next_revision,
         result_epoch: None,
         evidence,
-        // The legacy removal path builds and publishes the exact event
-        // inside its own transaction; S4 never republishes it.
+        // The legacy removal path adds its exact event before it commits
+        // (`removal_journal::prepare_committed_removal`).
         outgoing_event: Vec::new(),
         result_head: None,
     }
@@ -2044,6 +2045,7 @@ async fn load_persisted_obligations(state: &AppState) {
     }
     let mut ce_state = crypto_exclusion::CeState::default();
     resume_crypto_exclusions(state, &mut store, &journals, &mut ce_state).await;
+    removal_journal::adopt_journal_removals(&mut store, &journals);
     let mut removals = HashMap::new();
     removal_delivery::resume_after_load(
         &snapshot_groups(state).await,

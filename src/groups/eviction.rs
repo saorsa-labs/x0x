@@ -1355,14 +1355,15 @@ pub struct EvJournalV1 {
     /// Trigger hashes that authorize the transition.
     pub evidence: Vec<[u8; 32]>,
     /// The exact outgoing event: the signed `X0XCE1` frame of a
-    /// crypto-only exclusion. Empty for a seated-target removal, whose
-    /// legacy `MemberRemoved` the unchanged removal path builds and
-    /// publishes inside its own transaction.
+    /// crypto-only exclusion, or the JSON `MemberRemoved` (with its
+    /// TreeKEM commit and signed state commit) of a seated-target
+    /// removal. A seated-target journal is first written empty; the
+    /// removal path rewrites it with the event before the new epoch
+    /// commits. Empty means no event was prepared yet.
     pub outgoing_event: Vec<u8>,
     /// The head the transition produces, when it is known before the
-    /// legacy commit (a crypto-only exclusion). A restart compares it with
-    /// the verified chain to tell a committed result from a competing
-    /// branch (§3).
+    /// legacy commit. A restart compares it with the verified chain to
+    /// tell a committed result from a competing branch (§3).
     pub result_head: Option<String>,
 }
 
