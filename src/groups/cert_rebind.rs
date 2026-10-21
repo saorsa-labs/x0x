@@ -442,6 +442,22 @@ pub fn validate_against_parent(
     if is_revoked(&body.signer) || (!signer_is_admin && body.signer != body.seat) {
         return Err(CertificateRebindRefusal::SignerIneligible);
     }
+    // "An eligible current admin" (§2, §4a): an admin that rebinds another
+    // seat must hold a selected certificate that is not expired on this
+    // node's clock (`not_after + τ`, §1a). The seat's own agent signs under
+    // the §4 named exception instead, which is how an expired admin renews
+    // itself (§4b(2)). Missing bytes do not refuse here, as for the local
+    // committer rule: the digest check below still binds the seat.
+    if body.signer != body.seat
+        && parent
+            .members_v2
+            .get(&signer_hex)
+            .and_then(committed_certificate)
+            .and_then(AgentCertificate::not_after)
+            .is_some_and(|not_after| own_expiry_trigger_due(not_after, now_unix))
+    {
+        return Err(CertificateRebindRefusal::SignerIneligible);
+    }
     let Some(seat) = parent
         .members_v2
         .get(&seat_hex)
@@ -790,6 +806,28 @@ mod tests {
         );
     }
 
+    /// §2/§4a "an eligible current admin": an admin whose own selected
+    /// certificate expired on the receiver's clock (`not_after + τ`) may not
+    /// rebind another seat. It may still rebind its own seat (§4b(2)).
+    #[test]
+    fn expired_admin_cannot_rebind_another_seat_but_can_rebind_itself() {
+        let f = fixture();
+        // The fixture's admin certificate expires at NOW + 600.
+        let after_expiry = NOW + 600 + EXPIRY_TOLERANCE_SECS + 1;
+        let other = rebind(&f, &f.admin, &f.member, Some(NOW + 60_000));
+        assert_eq!(
+            validate_against_parent(&other.body, &f.info, after_expiry, |_| false).err(),
+            Some(CertificateRebindRefusal::SignerIneligible)
+        );
+        // Within τ of `not_after` the admin is still eligible.
+        validate_against_parent(&other.body, &f.info, NOW + 600, |_| false)
+            .expect("within tolerance");
+        let own = rebind(&f, &f.admin, &f.admin, Some(NOW + 60_000));
+        let (signer, _) = validate_against_parent(&own.body, &f.info, after_expiry, |_| false)
+            .expect("the expired admin's self-rebind");
+        assert_eq!(signer, RebindSigner::Admin);
+    }
+
     #[test]
     fn revoked_signer_is_refused() {
         let f = fixture();
@@ -868,7 +906,9 @@ mod tests {
     #[test]
     fn expired_renewal_is_invalid() {
         let f = fixture();
-        let frame = rebind(&f, &f.admin, &f.member, Some(NOW + 6000));
+        // A self-rebind: at `late` the admin's own certificate has expired
+        // too, which would refuse an admin signer first.
+        let frame = rebind(&f, &f.member, &f.member, Some(NOW + 6000));
         let late = NOW + 6000 + EXPIRY_TOLERANCE_SECS + 1;
         assert_eq!(
             validate_against_parent(&frame.body, &f.info, late, |_| false).err(),
