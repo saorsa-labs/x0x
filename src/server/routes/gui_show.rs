@@ -583,6 +583,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_without_a_config_file_disables_show_and_creates_no_config() -> anyhow::Result<()>
+    {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        state
+            .gui_show
+            .disable_local_show()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        assert!(!state.gui_show.config().local_enabled);
+        assert!(dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .is_file());
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "stop must not invent a daemon config"
+        );
+        let app = router(Arc::clone(&state));
+        install_capturing_opener(&state);
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "disabled", "{body}");
+        assert!(body.get("url").is_none(), "{body}");
+        assert!(body.get("token").is_none(), "{body}");
+        assert!(body.get("session_token").is_none(), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn acl_reload_reports_gui_config_read_and_toml_errors() -> anyhow::Result<()> {
         let (state, dir) = secure_endpoint_test_state().await?;
         state.gui_show.set_config(GuiShowConfig {

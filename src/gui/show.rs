@@ -25,9 +25,16 @@ pub const LOCAL_SHOW_DISABLE_FAILED: &str = "could not turn local show off";
 
 /// Sentence the local-show banner uses to name the recovery path.
 ///
-/// Stop writes `[gui_show] local_enabled = false`. The human turns show
-/// back on in that file, then `POST /acl/reload`.
+/// Stop records `[gui_show] local_enabled = false`. The human turns show
+/// back on in the daemon config, then `POST /acl/reload`.
 pub const LOCAL_SHOW_REENABLE: &str = "Set [gui_show] local_enabled = true in the daemon config and POST /acl/reload to turn local show back on.";
+
+/// Data-directory marker written when Stop must not create a daemon config.
+///
+/// A named instance with no config file is a normal start (`x0xd --name`,
+/// `serve(config)`). Creating `config.toml` that holds only `[gui_show]`
+/// makes the next start refuse: the file is loaded and has no `network_id`.
+pub(crate) const LOCAL_SHOW_STOP_FILE: &str = "gui_show_local_disabled";
 
 /// How long the daemon waits for a display confirmation.
 ///
@@ -250,10 +257,14 @@ pub struct GuiShowRuntime {
     /// Daemon TOML that `POST /acl/reload` re-reads. `None` means startup
     /// loaded no file.
     config_path: Mutex<Option<PathBuf>>,
-    /// File Stop writes. This is the loaded config, or the default config
-    /// path when startup loaded no file.
+    /// Daemon config Stop updates when that file already exists.
+    ///
+    /// This is the loaded config, or the default config path when startup
+    /// loaded no file. A missing file is not created.
     write_path: Mutex<Option<PathBuf>>,
     blocked_path: PathBuf,
+    /// `data_dir/gui_show_local_disabled`. Written when no config file exists.
+    local_stop_path: PathBuf,
     /// Shows waiting for the GUI window that was opened for each one.
     pending: Mutex<VecDeque<PendingGuiShow>>,
 }
@@ -275,8 +286,9 @@ impl GuiShowRuntime {
         opener: Arc<dyn ShowOpener>,
     ) -> Self {
         let blocked_path = data_dir.join("gui_show_blocked.json");
+        let local_stop_path = data_dir.join(LOCAL_SHOW_STOP_FILE);
         let blocked = load_blocked(&blocked_path);
-        Self {
+        let runtime = Self {
             config: Mutex::new(config),
             rate_limit: Mutex::new(GuiShowRateLimit::default()),
             blocked: Mutex::new(blocked),
@@ -284,8 +296,14 @@ impl GuiShowRuntime {
             config_path: Mutex::new(config_path),
             write_path: Mutex::new(None),
             blocked_path,
+            local_stop_path,
             pending: Mutex::new(VecDeque::new()),
-        }
+        };
+        // Honour a stop recorded before this process. `serve` calls this
+        // again after it attaches the loaded config path, so an explicit
+        // `local_enabled = true` in that file can clear the marker.
+        runtime.apply_persisted_local_stop();
+        runtime
     }
 
     /// Production default: platform opener, no config path.
@@ -307,12 +325,16 @@ impl GuiShowRuntime {
 
     /// Re-read `[gui_show]` from the daemon TOML when a path is known.
     ///
-    /// No path means startup loaded no file. That is not an error, and the
-    /// in-memory config stays as it is. A read failure or a TOML error is
-    /// returned and does not change the in-memory config.
+    /// No path means startup loaded no file. A config created later at the
+    /// write path is read, so the human can turn show back on without a
+    /// restart. A missing write path is not an error, and a side-file stop
+    /// stays in memory. A read failure or a TOML error is returned and does
+    /// not change the in-memory config. `local_enabled = true` in the file
+    /// clears a side-file stop. A file that does not set the key leaves that
+    /// stop in place.
     pub fn reload_from_disk(&self) -> Result<(), String> {
-        let path = self.config_path.lock().ok().and_then(|g| g.clone());
-        let Some(path) = path else {
+        let had_config_path = self.stored_config_path().is_some();
+        let Some(path) = self.reload_config_path() else {
             return Ok(());
         };
         let text = std::fs::read_to_string(&path)
@@ -324,8 +346,41 @@ impl GuiShowRuntime {
         }
         let partial = toml::from_str::<Partial>(&text)
             .map_err(|error| format!("failed to parse GUI config {}: {error}", path.display()))?;
-        self.set_config(partial.gui_show);
+        let explicit = explicit_local_enabled(&text);
+        if explicit == Some(true) {
+            self.clear_local_stop()?;
+        }
+        let mut gui_show = partial.gui_show;
+        if explicit != Some(true) && self.local_stop_path.is_file() {
+            gui_show.local_enabled = false;
+        }
+        self.set_config(gui_show);
+        if !had_config_path {
+            self.set_config_path(Some(path));
+        }
         Ok(())
+    }
+
+    /// Apply a data-directory stop from an earlier process.
+    ///
+    /// An explicit `local_enabled = true` in the loaded daemon config clears
+    /// the marker and leaves show on. Otherwise the marker forces show off,
+    /// including when startup loaded no file (`serve(config)`, or `x0xd
+    /// --name` with no config).
+    pub(crate) fn apply_persisted_local_stop(&self) {
+        if !self.local_stop_path.is_file() {
+            return;
+        }
+        if self.loaded_config_sets_local_enabled_true() {
+            let _ = self.clear_local_stop();
+            let mut config = self.config();
+            config.local_enabled = true;
+            self.set_config(config);
+            return;
+        }
+        let mut config = self.config();
+        config.local_enabled = false;
+        self.set_config(config);
     }
 
     /// Path Stop uses to record `local_enabled = false`.
@@ -356,36 +411,104 @@ impl GuiShowRuntime {
     /// This is the Stop control for a local show (`gui.block` of this
     /// daemon's agent). It does not add the agent to `gui_show_blocked`.
     /// The banner tells the human to set `local_enabled = true` and
-    /// `POST /acl/reload` to turn show back on. The write is the durable
-    /// record: a later start loads the same file.
+    /// `POST /acl/reload` to turn show back on.
+    ///
+    /// An existing daemon config is updated in place, and other keys stay.
+    /// When no config file exists, including `serve(config)` with no path,
+    /// the off state is the data-directory marker. Stop does not create a
+    /// config file: a named instance would then refuse to start.
     pub fn disable_local_show(&self) -> Result<(), String> {
-        let path = self
-            .config_write_path()
-            .ok_or_else(|| format!("{LOCAL_SHOW_DISABLE_FAILED}: no daemon config path is set"))?;
-        let existing = if path.exists() {
-            std::fs::read_to_string(&path).map_err(|error| {
-                format!(
-                    "{LOCAL_SHOW_DISABLE_FAILED}: failed to read {}: {error}",
-                    path.display()
-                )
-            })?
-        } else {
-            String::new()
-        };
+        if let Some(path) = self.config_write_path() {
+            if path.is_file() {
+                self.write_local_enabled_false(&path)?;
+                let _ = self.clear_local_stop();
+                self.remember_local_stop();
+                self.set_config_path(Some(path));
+                return Ok(());
+            }
+        }
+        self.write_local_stop_file()?;
+        self.remember_local_stop();
+        Ok(())
+    }
+
+    fn remember_local_stop(&self) {
+        let mut config = self.config();
+        config.local_enabled = false;
+        self.set_config(config);
+    }
+
+    fn write_local_enabled_false(&self, path: &Path) -> Result<(), String> {
+        let existing = std::fs::read_to_string(path).map_err(|error| {
+            format!(
+                "{LOCAL_SHOW_DISABLE_FAILED}: failed to read {}: {error}",
+                path.display()
+            )
+        })?;
         let updated = set_local_enabled_false(&existing).map_err(|error| {
             format!("{LOCAL_SHOW_DISABLE_FAILED}: {error} ({})", path.display())
         })?;
-        write_config_atomic(&path, updated.as_bytes()).map_err(|error| {
+        write_config_atomic(path, updated.as_bytes()).map_err(|error| {
             format!(
                 "{LOCAL_SHOW_DISABLE_FAILED}: failed to write {}: {error}",
                 path.display()
             )
-        })?;
-        let mut config = self.config();
-        config.local_enabled = false;
-        self.set_config(config);
-        self.set_config_path(Some(path));
-        Ok(())
+        })
+    }
+
+    fn write_local_stop_file(&self) -> Result<(), String> {
+        write_config_atomic(&self.local_stop_path, b"local_enabled = false\n").map_err(|error| {
+            format!(
+                "{LOCAL_SHOW_DISABLE_FAILED}: failed to write {}: {error}",
+                self.local_stop_path.display()
+            )
+        })
+    }
+
+    fn clear_local_stop(&self) -> Result<(), String> {
+        match std::fs::remove_file(&self.local_stop_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "failed to clear persisted local show stop {}: {error}",
+                self.local_stop_path.display()
+            )),
+        }
+    }
+
+    fn stored_config_path(&self) -> Option<PathBuf> {
+        self.config_path.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn stored_write_path(&self) -> Option<PathBuf> {
+        self.write_path.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Config file `POST /acl/reload` should read.
+    ///
+    /// The path startup loaded wins, even when it is missing, so a read
+    /// error is reported. When startup loaded no file, a config the human
+    /// has since created at the write path is the re-enable file.
+    fn reload_config_path(&self) -> Option<PathBuf> {
+        if let Some(path) = self.stored_config_path() {
+            return Some(path);
+        }
+        let write = self.stored_write_path()?;
+        if write.is_file() {
+            Some(write)
+        } else {
+            None
+        }
+    }
+
+    fn loaded_config_sets_local_enabled_true(&self) -> bool {
+        let Some(path) = self.stored_config_path().filter(|path| path.is_file()) else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        explicit_local_enabled(&text) == Some(true)
     }
 
     fn config_write_path(&self) -> Option<PathBuf> {
@@ -559,10 +682,24 @@ pub fn origin_banner(agent_label: &str, machine_label: &str, rider: bool) -> Str
     format!("{opened}. {LOCAL_SHOW_REENABLE}")
 }
 
+/// `Some` when the daemon TOML sets `[gui_show] local_enabled`.
+///
+/// Absent means the key was not set. The serde default is `true`, which
+/// must not wipe a side-file stop.
+fn explicit_local_enabled(text: &str) -> Option<bool> {
+    let table: toml::Table = text.parse().ok()?;
+    table
+        .get("gui_show")
+        .and_then(toml::Value::as_table)
+        .and_then(|gui| gui.get("local_enabled"))
+        .and_then(toml::Value::as_bool)
+}
+
 /// Set `[gui_show] local_enabled = false` without dropping other keys.
 ///
-/// An empty document becomes a new `[gui_show]` table. A document that is
-/// not valid TOML is refused, so Stop does not overwrite a broken file.
+/// An empty document becomes a new `[gui_show]` table. Callers use that
+/// only for a config file that already exists. A document that is not
+/// valid TOML is refused, so Stop does not overwrite a broken file.
 fn set_local_enabled_false(text: &str) -> Result<String, String> {
     if text.trim().is_empty() {
         return Ok("[gui_show]\nlocal_enabled = false\n".to_string());
@@ -792,6 +929,10 @@ mod tests {
         );
         let text = std::fs::read_to_string(&path).expect("config");
         assert!(
+            !dir.path().join(LOCAL_SHOW_STOP_FILE).exists(),
+            "an existing config is the stop record"
+        );
+        assert!(
             text.contains("local_enabled = false # operator"),
             "the gui_show key is updated in place: {text}"
         );
@@ -816,6 +957,189 @@ mod tests {
         assert!(
             rt.config().local_enabled,
             "POST /acl/reload applies local_enabled = true"
+        );
+    }
+
+    #[test]
+    fn stop_merges_into_an_existing_config_without_dropping_network_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "network_id = \"x0x.testnet\"\nlog_level = \"info\"\n",
+        )
+        .expect("write config");
+        let rt = runtime(dir.path(), Some(path.clone()));
+        rt.disable_local_show()
+            .expect("stop updates the existing config");
+        let text = std::fs::read_to_string(&path).expect("config");
+        assert!(
+            text.contains("network_id = \"x0x.testnet\""),
+            "network_id stays: {text}"
+        );
+        assert!(
+            text.contains("log_level = \"info\""),
+            "other keys stay: {text}"
+        );
+        assert!(
+            text.contains("local_enabled = false"),
+            "local show is off in the config: {text}"
+        );
+        assert!(!dir.path().join(LOCAL_SHOW_STOP_FILE).exists());
+        let (parsed, _) =
+            crate::server::config::analyze(&text).expect("startup can parse the file");
+        assert_eq!(parsed.network_id.as_deref(), Some("x0x.testnet"));
+        assert!(!parsed.gui_show.local_enabled);
+        assert!(
+            !crate::server::config::named_instance_refuses_startup(
+                true,
+                parsed.network_id.as_deref()
+            ),
+            "a named instance whose config still has network_id starts"
+        );
+    }
+
+    #[test]
+    fn stop_on_a_named_instance_with_no_config_still_starts() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let default_path = config_dir.path().join("config.toml");
+        let rt = runtime(data.path(), None);
+        rt.set_write_path(Some(default_path.clone()));
+        rt.disable_local_show()
+            .expect("stop persists without creating a config file");
+        assert!(!rt.config().local_enabled);
+        assert!(
+            !default_path.exists(),
+            "stop must not invent a daemon config"
+        );
+        assert!(data.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+
+        let loaded = startup_config_path(None, &default_path);
+        assert!(loaded.is_none(), "startup still sees no config file");
+        assert!(
+            !crate::server::config::named_instance_refuses_startup(loaded.is_some(), None),
+            "a named instance with no config file still starts"
+        );
+
+        let invented = "[gui_show]\nlocal_enabled = false\n";
+        let (parsed, _) = crate::server::config::analyze(invented).expect("the old file parses");
+        assert!(
+            parsed.network_id.is_none(),
+            "a gui_show-only file has no network_id"
+        );
+        assert!(
+            crate::server::config::named_instance_refuses_startup(
+                true,
+                parsed.network_id.as_deref()
+            ),
+            "that file is what makes a named instance refuse to start"
+        );
+
+        let restarted = runtime(data.path(), None);
+        assert!(
+            !restarted.config().local_enabled,
+            "the next start of the same data directory stays stopped"
+        );
+
+        std::fs::write(
+            &default_path,
+            "network_id = \"x0x.testnet\"\n\n[gui_show]\nlocal_enabled = true\n",
+        )
+        .expect("human turns show back on in a real config");
+        let text = std::fs::read_to_string(&default_path).expect("config");
+        let (parsed, _) = crate::server::config::analyze(&text).expect("startup parses it");
+        assert!(
+            !crate::server::config::named_instance_refuses_startup(
+                startup_config_path(None, &default_path).is_some(),
+                parsed.network_id.as_deref(),
+            ),
+            "the re-enable config still has network_id, so the named instance starts"
+        );
+        let reenabled = runtime(data.path(), Some(default_path));
+        assert!(
+            reenabled.config().local_enabled,
+            "explicit local_enabled = true clears the side-file stop on the next start"
+        );
+        assert!(!data.path().join(LOCAL_SHOW_STOP_FILE).exists());
+    }
+
+    #[test]
+    fn stop_without_a_config_path_persists_for_embedded_serve() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(data.path(), None);
+        rt.disable_local_show()
+            .expect("serve(config) has no config path");
+        assert!(!rt.config().local_enabled);
+        assert!(data.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+        assert!(
+            rt.reload_from_disk().is_ok(),
+            "reload with no config file is not an error"
+        );
+        assert!(
+            !rt.config().local_enabled,
+            "reload must not turn show back on when no config sets it true"
+        );
+
+        let restarted = runtime(data.path(), None);
+        assert!(
+            !restarted.config().local_enabled,
+            "the next serve of the same data directory stays stopped"
+        );
+    }
+
+    #[test]
+    fn reload_clears_a_side_file_stop_when_config_sets_local_enabled_true() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let path = config_dir.path().join("config.toml");
+        let rt = runtime(data.path(), None);
+        rt.set_write_path(Some(path.clone()));
+        rt.disable_local_show().expect("side-file stop");
+        assert!(data.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+
+        std::fs::write(&path, "[gui_show]\nlocal_enabled = \n").expect("broken config");
+        let error = rt.reload_from_disk().expect_err("invalid TOML");
+        assert!(error.contains("failed to parse GUI config"), "{error}");
+        assert!(!rt.config().local_enabled);
+        assert!(data.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+
+        std::fs::write(&path, "network_id = \"x0x.testnet\"\n").expect("config without the key");
+        rt.reload_from_disk().expect("reload");
+        assert!(
+            !rt.config().local_enabled,
+            "a config that does not set local_enabled = true leaves the stop in place"
+        );
+        assert!(data.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+        let (parsed, _) = crate::server::config::analyze("network_id = \"x0x.testnet\"\n")
+            .expect("named config parses");
+        assert!(!crate::server::config::named_instance_refuses_startup(
+            true,
+            parsed.network_id.as_deref()
+        ));
+
+        std::fs::write(
+            &path,
+            "network_id = \"x0x.testnet\"\n\n[gui_show]\nlocal_enabled = true\n",
+        )
+        .expect("human re-enable");
+        rt.reload_from_disk()
+            .expect("POST /acl/reload applies local_enabled = true");
+        assert!(rt.config().local_enabled);
+        assert!(
+            !data.path().join(LOCAL_SHOW_STOP_FILE).exists(),
+            "reload drops the side-file stop"
+        );
+
+        let restarted = runtime(data.path(), Some(path.clone()));
+        restarted.set_config(GuiShowConfig {
+            local_enabled: true,
+            remote_enabled: true,
+        });
+        restarted.apply_persisted_local_stop();
+        assert!(
+            restarted.config().local_enabled,
+            "a later start keeps the explicit re-enable"
         );
     }
 
@@ -1102,8 +1426,8 @@ mod tests {
         let html = include_str!("x0x-gui.html");
         let ws_url = fn_source(html, "function wsUrl()", "let ws=");
         assert!(
-            ws_url.contains("guiTabVisible()"),
-            "wsUrl must read real visibility before it sends gui=1: {ws_url}"
+            ws_url.contains("liveGuiTab()"),
+            "wsUrl must read live GUI state before it sends gui=1: {ws_url}"
         );
         assert!(
             !ws_url.contains("return base+'?gui=1';"),
@@ -1112,6 +1436,11 @@ mod tests {
         assert!(
             !ws_url.contains("return base+'?token='+SESSION_TOKEN+'&gui=1';"),
             "a tokenised socket must not always send gui=1: {ws_url}"
+        );
+        let live = fn_source(html, "function liveGuiTab()", "function wsUrl()");
+        assert!(
+            live.contains("guiTabVisible()"),
+            "a hidden tab must not count as a live GUI: {live}"
         );
         let advertise = fn_source(
             html,
@@ -1123,8 +1452,8 @@ mod tests {
             "visibility changes must update the daemon: {advertise}"
         );
         assert!(
-            advertise.contains("guiTabVisible()"),
-            "the update must carry the real visibility: {advertise}"
+            advertise.contains("liveGuiTab()"),
+            "the update must carry live GUI state: {advertise}"
         );
         let listener = html
             .find("addEventListener('visibilitychange'")
@@ -1138,6 +1467,107 @@ mod tests {
         assert!(
             onopen.contains("advertiseGuiVisibility()"),
             "a reconnect must report the visibility at open time: {onopen}"
+        );
+    }
+
+    #[test]
+    fn expired_gui_session_stops_advertising_a_live_tab() {
+        let html = include_str!("x0x-gui.html");
+        let live = fn_source(html, "function liveGuiTab()", "function wsUrl()");
+        assert!(
+            live.contains("!sessionExpired"),
+            "an expired session is not a live GUI: {live}"
+        );
+        assert!(
+            live.contains("guiTabVisible()"),
+            "a hidden tab is not a live GUI: {live}"
+        );
+        let refresh = fn_source(
+            html,
+            "async function refreshSession()",
+            "function maybeRefreshSession()",
+        );
+        let expired_at = refresh
+            .find("sessionExpired=true")
+            .expect("refresh marks the session expired");
+        let clear_at = refresh
+            .find("advertiseGuiVisibility()")
+            .expect("refresh tells the daemon this tab is not a live GUI");
+        assert!(
+            expired_at < clear_at,
+            "the session is expired before the visibility update: {refresh}"
+        );
+        let source = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            r#"
+const document = {
+  visibilityState: 'visible',
+  createElement() { return {}; },
+  getElementById() { return { appendChild() {} }; }
+};
+const sessionStorage = { getItem() { return ''; }, setItem() {}, removeItem() {} };
+const sent = [];
+function wsSend(obj) { sent.push(obj); }
+let refreshBody = null;
+async function apiWith() { return refreshBody; }
+const BASE = 'http://127.0.0.1:9';
+let SESSION_TOKEN = 'tok';
+let sessionExpired = false;
+let sessionRefreshing = false;
+let sessionIssuedAt = 0;
+"#,
+            fn_source(html, "function guiTabVisible()", "function liveGuiTab()"),
+            live,
+            fn_source(
+                html,
+                "function wsUrl()",
+                "function advertiseGuiVisibility()"
+            ),
+            fn_source(html, "function advertiseGuiVisibility()", "let ws="),
+            refresh,
+            r#"
+(async () => {
+  advertiseGuiVisibility();
+  if (!sent[0] || sent[0].visible !== true) {
+    throw new Error('a visible session must advertise: ' + JSON.stringify(sent));
+  }
+  if (!wsUrl().includes('gui=1')) throw new Error('wsUrl dropped gui=1: ' + wsUrl());
+  refreshBody = null;
+  await refreshSession();
+  if (sessionExpired) throw new Error('an unreachable daemon must not expire the session');
+  if (sent[sent.length - 1].visible !== true) {
+    throw new Error('unreachable refresh cleared visibility: ' + JSON.stringify(sent));
+  }
+  refreshBody = { _http_ok: false, _http_status: 401 };
+  await refreshSession();
+  if (!sessionExpired) throw new Error('a rejected refresh must expire the session');
+  const cleared = sent[sent.length - 1];
+  if (!cleared || cleared.type !== 'gui.visible' || cleared.visible !== false) {
+    throw new Error('expiry must clear GUI availability: ' + JSON.stringify(sent));
+  }
+  if (wsUrl().includes('gui=1')) {
+    throw new Error('an expired session must not reconnect as a live GUI: ' + wsUrl());
+  }
+  document.visibilityState = 'visible';
+  advertiseGuiVisibility();
+  if (sent[sent.length - 1].visible !== false) {
+    throw new Error('a later visibility event re-advertised the expired tab: ' + JSON.stringify(sent));
+  }
+})().catch((error) => { console.error(error); process.exit(1); });
+"#
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("expired-session.js");
+        std::fs::write(&script, source).expect("write script");
+        let output = std::process::Command::new("node")
+            .arg(&script)
+            .output()
+            .expect("node runs the GUI session functions");
+        assert!(
+            output.status.success(),
+            "expired session still advertises a live GUI\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

@@ -265,7 +265,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     // the testnet ran on prod). Without any config file, keep unset = prod
     // (install.sh / `x0x daemon start --name` write none) and only warn below.
     if let Some(name) = instance_name.as_ref() {
-        if config_file_loaded && config.network_id.is_none() {
+        if x0x::server::config::named_instance_refuses_startup(
+            config_file_loaded,
+            config.network_id.as_deref(),
+        ) {
             anyhow::bail!(x0x::server::config::named_instance_missing_network_id(
                 name.as_str()
             ));
@@ -420,6 +423,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         connect_policy,
         self_update_enabled,
         daemon_config_path: loaded_config_path.clone(),
+        // Stop merges into this file when it already exists. A missing file
+        // stays missing: the off state goes in the data directory, so a named
+        // instance with no config can still start.
         gui_show_write_path: Some(loaded_config_path.unwrap_or(default_config_path)),
     };
     let handle = x0x::server::serve_with_options(config, options).await?;

@@ -2405,6 +2405,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_without_a_config_path_persists_and_has_no_success_frame() {
+        let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let own = hex::encode(state.agent.agent_id().as_bytes());
+        let cmd = serde_json::json!({
+            "type": "gui.block",
+            "agent_id": own,
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s-embedded", &cmd, &tx, &stats, false).await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "gui.block has no success frame"
+        );
+        assert!(
+            !state.gui_show.config().local_enabled,
+            "stop applies without a daemon config path"
+        );
+        assert!(dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .is_file());
+        assert!(!dir.path().join("config.toml").exists());
+        assert!(!state.gui_show.is_blocked(&state.agent.agent_id()));
+    }
+
+    #[tokio::test]
     async fn other_agent_block_persists_without_a_success_frame() {
         let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
             .await

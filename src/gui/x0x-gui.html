@@ -712,20 +712,26 @@ let SESSION_TOKEN=readSessionToken();
 function guiTabVisible(){
   return document.visibilityState==='visible';
 }
+// An expired session keeps its WebSocket. It must not stay a live GUI:
+// /gui/show would navigate this tab, and view requests on the dead token
+// answer 401, so a working browser never opens.
+function liveGuiTab(){
+  return !sessionExpired&&guiTabVisible();
+}
 function wsUrl(){
   const base=BASE.replace(/^http/,'ws')+'/ws/direct';
-  // gui=1 marks a visible GUI tab. A hidden tab omits it, so the daemon
-  // opens a browser instead of navigating a tab the human cannot see.
-  // Agent clients omit it too.
+  // gui=1 marks a visible GUI tab with a usable session. A hidden tab omits
+  // it, and so does an expired session, so the daemon opens a browser
+  // instead of navigating a tab the human cannot use. Agent clients omit it.
   if(SESSION_TOKEN){
-    return guiTabVisible()
+    return liveGuiTab()
       ? base+'?token='+SESSION_TOKEN+'&gui=1'
       : base+'?token='+SESSION_TOKEN;
   }
-  return guiTabVisible() ? base+'?gui=1' : base;
+  return liveGuiTab() ? base+'?gui=1' : base;
 }
 function advertiseGuiVisibility(){
-  wsSend({type:'gui.visible', visible: guiTabVisible()});
+  wsSend({type:'gui.visible', visible: liveGuiTab()});
 }
 let ws=null;
 const wsSubs=new Set();
@@ -756,6 +762,7 @@ async function refreshSession(){
   }
   if(!r)return; // daemon unreachable: retry on the next tick
   sessionExpired=true;
+  advertiseGuiVisibility();
   const el=document.createElement('div');
   el.className='toast error';
   el.textContent='Session expired — reopen with `x0x gui`';

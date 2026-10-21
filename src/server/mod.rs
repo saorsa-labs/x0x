@@ -1255,6 +1255,10 @@ pub async fn serve_with_options(
                 x0x::gui::GuiShowRuntime::with_defaults(config.gui_show.clone(), &config.data_dir);
             runtime.set_config_path(daemon_config_path);
             runtime.set_write_path(gui_show_write_path);
+            // `with_defaults` applies a side-file stop before the config path
+            // is known. Apply again so an explicit `local_enabled = true` in
+            // the loaded file wins.
+            runtime.apply_persisted_local_stop();
             runtime
         },
         connect_diagnostics,
