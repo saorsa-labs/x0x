@@ -529,8 +529,14 @@ pub(in crate::server) async fn run_startup_update_check(
             x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
         }
         // Staging must precede all release content writes, including the guide.
-        update_skill_while_running(&verified.manifest, &config.data_dir, shutdown_watch.clone())
-            .await;
+        update_skill_while_running(
+            &verified.manifest,
+            &config.data_dir,
+            shutdown_watch.clone(),
+            #[cfg(unix)]
+            Some(&upgrader),
+        )
+        .await;
         match shutdown_watch.as_mut() {
             // Daemon startup check: #1196 — a refusal that is ONLY the not-yet-
             // aged-out systemd start-rate window is waited out (bounded by the
@@ -894,7 +900,14 @@ async fn apply_background_release(
         permit.check()?;
         // Retain the legacy guide update only after rollout is due. This is
         // not candidate health acceptance or the later host-commit promotion.
-        update_skill_inner(&verified.manifest, &runtime.data_dir, Some(shutdown.clone()), Some(permit.clone())).await;
+        update_skill_inner(
+            &verified.manifest,
+            &runtime.data_dir,
+            Some(shutdown.clone()),
+            Some(permit.clone()),
+            #[cfg(unix)]
+            Some(&upgrader),
+        ).await;
         permit.check()?;
         let result = {
             let _guard = tokio::select! {
@@ -1190,16 +1203,31 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
 
 /// Update SKILL.md if the manifest has a different hash.
 async fn update_skill_if_changed(manifest: &ReleaseManifest, data_dir: &std::path::Path) {
-    update_skill_while_running(manifest, data_dir, None).await;
+    update_skill_while_running(
+        manifest,
+        data_dir,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+    .await;
 }
 
 async fn update_skill_while_running(
     manifest: &ReleaseManifest,
     data_dir: &std::path::Path,
     mut shutdown: Option<watch::Receiver<bool>>,
+    #[cfg(unix)] upgrader: Option<&crate::upgrade::apply::AutoApplyUpgrader>,
 ) {
     let writer_shutdown = shutdown.clone();
-    let update = update_skill_inner(manifest, data_dir, writer_shutdown, None);
+    let update = update_skill_inner(
+        manifest,
+        data_dir,
+        writer_shutdown,
+        None,
+        #[cfg(unix)]
+        upgrader,
+    );
     match shutdown.as_mut() {
         Some(shutdown) => {
             if *shutdown.borrow() || shutdown.has_changed().is_err() {
@@ -1254,11 +1282,75 @@ async fn download_skill(url: &str) -> Result<Vec<u8>, reqwest::Error> {
         .map(|bytes| bytes.to_vec())
 }
 
+#[cfg(test)]
+mod skill_install_seam {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{Arc, LazyLock, Mutex},
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Event {
+        Entered,
+        BeforeWrite,
+        Exited,
+    }
+
+    type Observer = Arc<dyn Fn(Event) + Send + Sync>;
+    static OBSERVERS: LazyLock<Mutex<HashMap<PathBuf, Observer>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVERS.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    pub(super) fn install(path: PathBuf, observer: Observer) -> Guard {
+        assert!(OBSERVERS
+            .lock()
+            .unwrap()
+            .insert(path.clone(), observer)
+            .is_none());
+        Guard(path)
+    }
+
+    pub(super) struct Active(Option<Observer>);
+
+    impl Active {
+        pub(super) fn before_write(&self) {
+            if let Some(observer) = &self.0 {
+                observer(Event::BeforeWrite);
+            }
+        }
+    }
+
+    pub(super) fn entered(path: &Path) -> Active {
+        let observer = OBSERVERS.lock().unwrap().get(path).cloned();
+        if let Some(observer) = &observer {
+            observer(Event::Entered);
+        }
+        Active(observer)
+    }
+
+    impl Drop for Active {
+        fn drop(&mut self) {
+            if let Some(observer) = &self.0 {
+                observer(Event::Exited);
+            }
+        }
+    }
+}
+
 async fn update_skill_inner(
     manifest: &ReleaseManifest,
     data_dir: &std::path::Path,
     shutdown: Option<watch::Receiver<bool>>,
     permit: Option<ReleasePermit>,
+    #[cfg(unix)] upgrader: Option<&crate::upgrade::apply::AutoApplyUpgrader>,
 ) {
     if permit
         .as_ref()
@@ -1301,6 +1393,34 @@ async fn update_skill_inner(
                 tracing::warn!("SKILL.md hash mismatch after download");
                 return;
             }
+            // Resolve the independent executable observation after the await.
+            // The earlier Due decision cannot authorize this later write.
+            #[cfg(unix)]
+            let staged_guide = match upgrader {
+                // The release owner drains this actual readback even when
+                // superseded; do not select cancellation around this await.
+                Some(upgrader) => match upgrader.guide_staging().await {
+                    Ok(staging) => staging,
+                    Err(error) => {
+                        tracing::warn!(%error, "Guide staging identity changed");
+                        return;
+                    }
+                },
+                None => None,
+            };
+            #[cfg(unix)]
+            let data_dir = if let Some((_, gate, _)) = &staged_guide {
+                match data_dir.canonicalize() {
+                    Ok(root) if root == gate.request.data_root => gate.request.data_root.as_path(),
+                    _ => {
+                        tracing::warn!("Guide staging data root changed");
+                        return;
+                    }
+                }
+            } else {
+                data_dir
+            };
+            let skill_path = data_dir.join("SKILL.md");
             // The startup check and the startup manifest broadcast can
             // both reach this write concurrently (#1086): stage the
             // verified bytes in a unique temp file and rename it into
@@ -1315,6 +1435,22 @@ async fn update_skill_inner(
             let install = x0x::upgrade::apply::run_owned_blocking_with_permit(
                 permit.as_ref(),
                 move |caller_alive| {
+                    #[cfg(test)]
+                    let observation = skill_install_seam::entered(&skill_path);
+                    if !caller_alive.load(Ordering::Acquire)
+                        || shutdown
+                            .as_ref()
+                            .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+                    {
+                        return Err(x0x::upgrade::UpgradeError::Other(
+                            "guide update cancelled before install lock".into(),
+                        ));
+                    }
+                    #[cfg(unix)]
+                    let _install_lock = staged_guide
+                        .as_ref()
+                        .map(|(install, _, _)| crate::upgrade::acquire_host_upgrade_lock(install))
+                        .transpose()?;
                     // Watch value custody orders a shutdown signal against
                     // this short atomic install. A cancelled queued worker
                     // cannot begin it after its observer has gone away.
@@ -1329,6 +1465,27 @@ async fn update_skill_inner(
                             "guide update cancelled before install".into(),
                         ));
                     }
+                    #[cfg(unix)]
+                    if let Some((install, gate, identity)) = &staged_guide {
+                        let clock = gate.clock().map_err(|error| {
+                            x0x::upgrade::UpgradeError::Other(error.to_string())
+                        })?;
+                        if let crate::upgrade::staging::Decision::Waiting(wait) =
+                            gate.observe_locked_at(install, &clock, identity)?
+                        {
+                            return Err(x0x::upgrade::UpgradeError::Other(format!(
+                                "guide staging is not due; remaining {} seconds",
+                                wait.as_secs()
+                            )));
+                        }
+                    }
+                    if !caller_alive.load(Ordering::Acquire) {
+                        return Err(x0x::upgrade::UpgradeError::Other(
+                            "guide update cancelled after staging check".into(),
+                        ));
+                    }
+                    #[cfg(test)]
+                    observation.before_write();
                     let result = std::fs::write(&tmp_path, &new_contents)
                         .and_then(|()| std::fs::rename(&tmp_path, &skill_path));
                     if result.is_err() {
@@ -1640,6 +1797,11 @@ mod tests {
     ));
     #[cfg(unix)]
     staging_regression_tests!();
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging_guide.rs"
+    ));
+    staging_guide_regression_tests!();
     #[cfg(unix)]
     staging_runtime_regression_tests!();
     #[cfg(unix)]
