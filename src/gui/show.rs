@@ -17,16 +17,23 @@ use super::rate_limit::GuiShowRateLimit;
 /// How long a pending banner waits for its GUI window to connect.
 const PENDING_FRESHNESS: Duration = Duration::from_secs(60);
 
-/// `error.message` when `gui.block` names this daemon's own agent.
+/// `error.message` prefix when Stop cannot record `local_enabled = false`.
 ///
-/// Slice 1 has no unblock path. A self-block would turn local show off
-/// with no API to turn it back on, so the server refuses it and writes
-/// nothing. There is no success frame for `gui.block`.
-pub const SELF_GUI_BLOCK_REFUSED: &str = "cannot block this daemon's own agent";
+/// `gui.block` has no success frame. This prefix marks the existing error
+/// frame so the banner can show it.
+pub const LOCAL_SHOW_DISABLE_FAILED: &str = "could not turn local show off";
 
-/// How long a platform opener may run before a missing successful exit is
-/// `no_display`. Spawn success is not a display: `xdg-open` can start and
-/// then exit nonzero on a headless host.
+/// Sentence the local-show banner uses to name the recovery path.
+///
+/// Stop writes `[gui_show] local_enabled = false`. The human turns show
+/// back on in that file, then `POST /acl/reload`.
+pub const LOCAL_SHOW_REENABLE: &str = "Set [gui_show] local_enabled = true in the daemon config and POST /acl/reload to turn local show back on.";
+
+/// How long the daemon waits for a display confirmation.
+///
+/// This bound is not the opener's lifetime. `xdg-open` can still be running
+/// after it has opened the application. A child that is still running here
+/// counts as `opened` and is not killed.
 const OPENER_WAIT: Duration = Duration::from_secs(2);
 
 /// Pending banner for one freshly opened GUI window (no live WS yet).
@@ -157,31 +164,53 @@ fn platform_opener_spawn(url: &str) -> Option<std::io::Result<std::process::Chil
     }
 }
 
-/// Wait until `child` exits, or until `bound` elapses.
+/// Display confirmation for one opener. This does not decide how long the
+/// process may live, and it does not kill `child`.
 ///
-/// The wait polls `try_wait`, so it does not block in the kernel. A nonzero
-/// exit is not a display. A child still running at `bound` is not a display
-/// either. The child is always reaped: a timeout kills it and waits, so it
-/// cannot stay a zombie.
-fn opener_displayed(mut child: std::process::Child, bound: Duration) -> bool {
+/// A zero exit within `bound` is a display. A nonzero exit is not. A child
+/// that is still running at `bound` is a display: on Linux, `xdg-open` can
+/// remain running after it has opened the application.
+fn opener_display_confirmed(child: &mut std::process::Child, bound: Duration) -> bool {
     let deadline = Instant::now() + bound;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            Ok(None) if Instant::now() >= deadline => return true,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => {
                 let _ = child.wait();
                 return false;
             }
         }
     }
+}
+
+/// Reap `child` when it exits. A child that is still running keeps running.
+///
+/// The wait sits on its own thread so the display decision can return at
+/// [`OPENER_WAIT`] without killing the opener. Dropping `Child` without a
+/// wait would leave a zombie after a later exit.
+fn retain_opener_until_exit(mut child: std::process::Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Err(_) => {
+            let _ = child.wait();
+        }
+        Ok(None) => {
+            let _ = std::thread::Builder::new()
+                .name("x0x-gui-opener".to_string())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+        }
+    }
+}
+
+/// Confirm a display, then hand the process to [`retain_opener_until_exit`].
+fn opener_displayed(mut child: std::process::Child, bound: Duration) -> bool {
+    let confirmed = opener_display_confirmed(&mut child, bound);
+    retain_opener_until_exit(child);
+    confirmed
 }
 
 /// Capturing opener for tests (ADR 0083 validation: invalid_view invokes none).
@@ -218,8 +247,12 @@ pub struct GuiShowRuntime {
     rate_limit: Mutex<GuiShowRateLimit>,
     blocked: Mutex<HashSet<[u8; 32]>>,
     opener: Mutex<Arc<dyn ShowOpener>>,
-    /// Optional daemon TOML path for `POST /acl/reload` re-read.
+    /// Daemon TOML that `POST /acl/reload` re-reads. `None` means startup
+    /// loaded no file.
     config_path: Mutex<Option<PathBuf>>,
+    /// File Stop writes. This is the loaded config, or the default config
+    /// path when startup loaded no file.
+    write_path: Mutex<Option<PathBuf>>,
     blocked_path: PathBuf,
     /// Shows waiting for the GUI window that was opened for each one.
     pending: Mutex<VecDeque<PendingGuiShow>>,
@@ -249,6 +282,7 @@ impl GuiShowRuntime {
             blocked: Mutex::new(blocked),
             opener: Mutex::new(opener),
             config_path: Mutex::new(config_path),
+            write_path: Mutex::new(None),
             blocked_path,
             pending: Mutex::new(VecDeque::new()),
         }
@@ -272,21 +306,32 @@ impl GuiShowRuntime {
     }
 
     /// Re-read `[gui_show]` from the daemon TOML when a path is known.
-    pub fn reload_from_disk(&self) {
+    ///
+    /// No path means startup loaded no file. That is not an error, and the
+    /// in-memory config stays as it is. A read failure or a TOML error is
+    /// returned and does not change the in-memory config.
+    pub fn reload_from_disk(&self) -> Result<(), String> {
         let path = self.config_path.lock().ok().and_then(|g| g.clone());
         let Some(path) = path else {
-            return;
+            return Ok(());
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return;
-        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read GUI config {}: {error}", path.display()))?;
         #[derive(Deserialize)]
         struct Partial {
             #[serde(default)]
             gui_show: GuiShowConfig,
         }
-        if let Ok(partial) = toml::from_str::<Partial>(&text) {
-            self.set_config(partial.gui_show);
+        let partial = toml::from_str::<Partial>(&text)
+            .map_err(|error| format!("failed to parse GUI config {}: {error}", path.display()))?;
+        self.set_config(partial.gui_show);
+        Ok(())
+    }
+
+    /// Path Stop uses to record `local_enabled = false`.
+    pub fn set_write_path(&self, path: Option<PathBuf>) {
+        if let Ok(mut guard) = self.write_path.lock() {
+            *guard = path;
         }
     }
 
@@ -306,16 +351,49 @@ impl GuiShowRuntime {
         }
     }
 
-    /// Block `agent` unless it is this daemon's own agent.
+    /// Record `[gui_show] local_enabled = false` and apply it in memory.
     ///
-    /// A self-block returns `false` and does not create or update the
-    /// persisted list. `true` means another agent was recorded.
-    pub fn block_agent_unless_self(&self, agent: &AgentId, local_agent: &AgentId) -> bool {
-        if agent == local_agent {
-            return false;
-        }
-        self.block_agent(agent);
-        true
+    /// This is the Stop control for a local show (`gui.block` of this
+    /// daemon's agent). It does not add the agent to `gui_show_blocked`.
+    /// The banner tells the human to set `local_enabled = true` and
+    /// `POST /acl/reload` to turn show back on. The write is the durable
+    /// record: a later start loads the same file.
+    pub fn disable_local_show(&self) -> Result<(), String> {
+        let path = self
+            .config_write_path()
+            .ok_or_else(|| format!("{LOCAL_SHOW_DISABLE_FAILED}: no daemon config path is set"))?;
+        let existing = if path.exists() {
+            std::fs::read_to_string(&path).map_err(|error| {
+                format!(
+                    "{LOCAL_SHOW_DISABLE_FAILED}: failed to read {}: {error}",
+                    path.display()
+                )
+            })?
+        } else {
+            String::new()
+        };
+        let updated = set_local_enabled_false(&existing).map_err(|error| {
+            format!("{LOCAL_SHOW_DISABLE_FAILED}: {error} ({})", path.display())
+        })?;
+        write_config_atomic(&path, updated.as_bytes()).map_err(|error| {
+            format!(
+                "{LOCAL_SHOW_DISABLE_FAILED}: failed to write {}: {error}",
+                path.display()
+            )
+        })?;
+        let mut config = self.config();
+        config.local_enabled = false;
+        self.set_config(config);
+        self.set_config_path(Some(path));
+        Ok(())
+    }
+
+    fn config_write_path(&self) -> Option<PathBuf> {
+        self.write_path
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .or_else(|| self.config_path.lock().ok().and_then(|guard| guard.clone()))
     }
 
     /// Rate-limit gate; `true` means the show may proceed.
@@ -469,12 +547,159 @@ pub fn new_request_id() -> String {
 }
 
 /// Build the origin banner text from locally resolved names (ADR 0083 §5).
+///
+/// The second sentence tells the human how to turn a local show back on
+/// after Stop. Stop writes `local_enabled = false` through `gui.block`.
 pub fn origin_banner(agent_label: &str, machine_label: &str, rider: bool) -> String {
-    if rider {
+    let opened = if rider {
         format!("Opened by {agent_label} (rider) on {machine_label}")
     } else {
         format!("Opened by {agent_label} on {machine_label}")
+    };
+    format!("{opened}. {LOCAL_SHOW_REENABLE}")
+}
+
+/// Set `[gui_show] local_enabled = false` without dropping other keys.
+///
+/// An empty document becomes a new `[gui_show]` table. A document that is
+/// not valid TOML is refused, so Stop does not overwrite a broken file.
+fn set_local_enabled_false(text: &str) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Ok("[gui_show]\nlocal_enabled = false\n".to_string());
     }
+    let mut table: toml::Table = text
+        .parse()
+        .map_err(|error| format!("daemon config is not valid TOML: {error}"))?;
+    let rewritten = rewrite_local_enabled_line(text);
+    if local_enabled_is_false(&rewritten) {
+        return Ok(rewritten);
+    }
+    let gui = table
+        .entry("gui_show")
+        .or_insert(toml::Value::Table(toml::Table::new()));
+    let Some(gui_table) = gui.as_table_mut() else {
+        return Err("[gui_show] is not a table".to_string());
+    };
+    gui_table.insert("local_enabled".to_string(), toml::Value::Boolean(false));
+    toml::to_string(&table).map_err(|error| format!("could not write daemon config: {error}"))
+}
+
+fn local_enabled_is_false(text: &str) -> bool {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    table
+        .get("gui_show")
+        .and_then(|value| value.get("local_enabled"))
+        .and_then(toml::Value::as_bool)
+        == Some(false)
+}
+
+/// Line edit that keeps comments and unrelated keys. Returns the original
+/// shape with `local_enabled` forced false inside `[gui_show]`.
+fn rewrite_local_enabled_line(text: &str) -> String {
+    let trailing_nl = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut section_at = None;
+    let mut section_end = lines.len();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(header) = table_header(line.trim()) else {
+            continue;
+        };
+        if section_at.is_some() {
+            section_end = index;
+            break;
+        }
+        if header == "gui_show" {
+            section_at = Some(index);
+        }
+    }
+    let Some(start) = section_at else {
+        let mut out = text.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[gui_show]\nlocal_enabled = false\n");
+        return out;
+    };
+    let mut replaced = false;
+    for line in lines.iter_mut().take(section_end).skip(start + 1) {
+        if local_enabled_assignment(line) {
+            *line = with_local_enabled_false(line);
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        lines.insert(start + 1, "local_enabled = false".to_string());
+    }
+    let mut out = lines.join("\n");
+    if trailing_nl || !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn table_header(trimmed: &str) -> Option<&str> {
+    if trimmed.starts_with('#') || trimmed.starts_with("[[") {
+        return None;
+    }
+    let rest = trimmed.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let name = rest[..end].trim();
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    Some(name)
+}
+
+fn local_enabled_assignment(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    let Some(rest) = trimmed.strip_prefix("local_enabled") else {
+        return false;
+    };
+    rest.trim_start().starts_with('=')
+}
+
+fn with_local_enabled_false(line: &str) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim_start();
+    let Some(eq) = trimmed.find('=') else {
+        return line.to_string();
+    };
+    let after = trimmed[eq + 1..].trim_start();
+    if let Some(hash) = after.find('#') {
+        format!("{indent}local_enabled = false {}", after[hash..].trim_end())
+    } else {
+        format!("{indent}local_enabled = false")
+    }
+}
+
+fn write_config_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let name = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or("config.toml");
+    let tmp = path.with_file_name(format!(".{name}.x0x-tmp"));
+    std::fs::write(&tmp, bytes)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Short hex id for banner fallbacks (10 chars + ellipsis in the GUI; we
@@ -523,28 +748,74 @@ mod tests {
     }
 
     #[test]
-    fn self_block_writes_nothing_and_another_agent_is_stored() {
+    fn another_agent_block_is_stored() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rt = runtime(dir.path(), None);
         let local = AgentId([2u8; 32]);
         let other = AgentId([3u8; 32]);
-        let path = dir.path().join("gui_show_blocked.json");
-        assert!(
-            !rt.block_agent_unless_self(&local, &local),
-            "this daemon's agent must not be blocked from the banner"
-        );
-        assert!(!rt.is_blocked(&local));
-        assert!(
-            !path.exists(),
-            "a refused self-block must not create the block file"
-        );
-        assert!(rt.block_agent_unless_self(&other, &local));
+        rt.block_agent(&other);
         assert!(rt.is_blocked(&other));
         assert!(!rt.is_blocked(&local));
-        let text = std::fs::read_to_string(&path).expect("block file");
+        let text =
+            std::fs::read_to_string(dir.path().join("gui_show_blocked.json")).expect("block file");
         assert!(
             !text.contains(&hex::encode(local.as_bytes())),
             "the persisted list must not contain this daemon's agent: {text}"
+        );
+    }
+
+    #[test]
+    fn stop_local_show_persists_disabled_and_reload_reenables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "log_level = \"info\" # keep\n\n[gui_show]\nremote_enabled = true # stay\nlocal_enabled = true # operator\n\n[other]\nlocal_enabled = true\n",
+        )
+        .expect("write config");
+        let rt = runtime(dir.path(), Some(path.clone()));
+        let daemon = AgentId([2u8; 32]);
+        rt.disable_local_show()
+            .expect("stop records local_enabled = false");
+        assert!(
+            !rt.config().local_enabled,
+            "stop applies local_enabled = false in memory"
+        );
+        assert!(rt.config().remote_enabled);
+        assert!(
+            !rt.is_blocked(&daemon),
+            "stop must not use the per-agent block list"
+        );
+        assert!(
+            !dir.path().join("gui_show_blocked.json").exists(),
+            "stop must not create the block file"
+        );
+        let text = std::fs::read_to_string(&path).expect("config");
+        assert!(
+            text.contains("local_enabled = false # operator"),
+            "the gui_show key is updated in place: {text}"
+        );
+        assert!(
+            text.contains("log_level = \"info\" # keep"),
+            "unrelated keys stay: {text}"
+        );
+        assert!(
+            text.contains("remote_enabled = true # stay"),
+            "the other gui_show key stays: {text}"
+        );
+        assert!(
+            text.contains("[other]\nlocal_enabled = true"),
+            "a different table keeps its own local_enabled: {text}"
+        );
+        let turned_on = text.replace(
+            "local_enabled = false # operator",
+            "local_enabled = true # operator",
+        );
+        std::fs::write(&path, turned_on).expect("human edit");
+        rt.reload_from_disk().expect("reload after re-enable");
+        assert!(
+            rt.config().local_enabled,
+            "POST /acl/reload applies local_enabled = true"
         );
     }
 
@@ -582,28 +853,57 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn opener_still_running_at_the_bound_is_reaped_and_not_a_display() {
-        let child = std::process::Command::new("/bin/sh")
+    fn opener_still_running_at_the_deadline_counts_as_opened_and_is_not_killed() {
+        assert_eq!(
+            OPENER_WAIT,
+            Duration::from_secs(2),
+            "the production display deadline is 2 seconds"
+        );
+        let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 30"])
             .spawn()
             .expect("spawn");
         let pid = child.id();
+        let _guard = KillOnDrop(pid);
         let started = Instant::now();
-        assert!(!opener_displayed(child, Duration::from_millis(200)));
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the wait must stay inside its bound"
+            opener_display_confirmed(&mut child, Duration::from_millis(200)),
+            "an opener still running at the deadline counts as opened"
         );
-        assert!(!process_is_zombie(pid), "a timed-out opener must be reaped");
-        let still = std::process::Command::new("ps")
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "display confirmation returns at its own deadline"
+        );
+        assert!(
+            process_is_running(pid),
+            "display confirmation must not kill the opener"
+        );
+        retain_opener_until_exit(child);
+        assert!(
+            process_is_running(pid),
+            "opener lifetime must not kill a running opener"
+        );
+    }
+
+    #[cfg(unix)]
+    struct KillOnDrop(u32);
+
+    #[cfg(unix)]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("kill")
+                .arg(self.0.to_string())
+                .status();
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: u32) -> bool {
+        std::process::Command::new("ps")
             .args(["-p", &pid.to_string()])
             .output()
-            .expect("ps");
-        assert!(
-            !still.status.success(),
-            "a timed-out opener must not keep running: {}",
-            String::from_utf8_lossy(&still.stdout)
-        );
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     #[cfg(unix)]
@@ -681,11 +981,42 @@ mod tests {
         );
         let rt = runtime(dir.path(), Some(loaded));
         assert!(rt.config().local_enabled);
-        rt.reload_from_disk();
+        rt.reload_from_disk().expect("valid config reloads");
         assert!(
             !rt.config().local_enabled,
             "[gui_show] local_enabled=false in the file startup loaded must apply on reload"
         );
+    }
+
+    #[test]
+    fn reload_reports_a_toml_error_and_keeps_the_previous_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[gui_show]\nlocal_enabled = \n").expect("write");
+        let rt = runtime(dir.path(), Some(path));
+        rt.set_config(GuiShowConfig {
+            local_enabled: true,
+            remote_enabled: false,
+        });
+        let error = rt.reload_from_disk().expect_err("invalid TOML");
+        assert!(error.contains("failed to parse GUI config"), "{error}");
+        assert!(rt.config().local_enabled);
+        assert!(!rt.config().remote_enabled);
+    }
+
+    #[test]
+    fn reload_reports_a_read_error_and_keeps_the_previous_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.toml");
+        let rt = runtime(dir.path(), Some(path));
+        rt.set_config(GuiShowConfig {
+            local_enabled: false,
+            remote_enabled: true,
+        });
+        let error = rt.reload_from_disk().expect_err("missing file");
+        assert!(error.contains("failed to read GUI config"), "{error}");
+        assert!(!rt.config().local_enabled);
+        assert!(rt.config().remote_enabled);
     }
 
     #[test]
@@ -735,21 +1066,31 @@ mod tests {
             "after the wait, Hide clears the banner without gui.block"
         );
         assert!(
-            src.contains("block.hidden=own"),
-            "Stop is hidden when the sender is this daemon's agent: {src}"
+            src.contains("block.hidden=false"),
+            "Stop stays available for a local show: {src}"
         );
         assert!(
-            src.contains("S.get('agentId')"),
-            "the banner must compare the sender with this daemon's agent: {src}"
+            !src.contains("block.hidden=own"),
+            "Stop is not hidden for this daemon's agent: {src}"
+        );
+        assert!(
+            src.contains("type:'gui.block'"),
+            "Stop uses the existing gui.block command: {src}"
         );
         assert!(
             !src.contains("Future shows from this agent will be blocked"),
             "Stop must not claim success before a server reply: {src}"
         );
         assert!(
-            html.contains(SELF_GUI_BLOCK_REFUSED),
-            "a refused self-block uses the existing error frame"
+            html.contains(LOCAL_SHOW_DISABLE_FAILED),
+            "a failed stop uses the existing error frame"
         );
+        let banner = origin_banner("Ada", "desk", false);
+        assert!(
+            banner.contains(LOCAL_SHOW_REENABLE),
+            "the banner says how to turn local show back on: {banner}"
+        );
+        assert!(banner.starts_with("Opened by Ada on desk"));
         assert!(
             html.contains("function guiTabVisible"),
             "the GUI socket must advertise gui=1 only while the tab is visible"

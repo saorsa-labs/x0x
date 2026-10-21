@@ -545,6 +545,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_then_reload_reenables_local_show() -> anyhow::Result<()> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n",
+        )?;
+        state.gui_show.set_config_path(Some(path.clone()));
+        state
+            .gui_show
+            .disable_local_show()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let app = router(Arc::clone(&state));
+        install_capturing_opener(&state);
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "disabled", "{body}");
+        assert!(body.get("url").is_none(), "{body}");
+        assert!(body.get("token").is_none(), "{body}");
+        let text = std::fs::read_to_string(&path)?;
+        assert!(text.contains("local_enabled = false"), "{text}");
+        std::fs::write(
+            &path,
+            text.replace("local_enabled = false", "local_enabled = true"),
+        )?;
+        state
+            .gui_show
+            .reload_from_disk()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "opened", "{body}");
+        assert!(body.get("url").is_none(), "{body}");
+        assert!(body.get("token").is_none(), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acl_reload_reports_gui_config_read_and_toml_errors() -> anyhow::Result<()> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        state.gui_show.set_config(GuiShowConfig {
+            local_enabled: true,
+            remote_enabled: true,
+        });
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[gui_show]\nlocal_enabled = \n")?;
+        state.gui_show.set_config_path(Some(path));
+        let app = axum::Router::new()
+            .route("/acl/reload", post(super::super::acl_reload))
+            .with_state(Arc::clone(&state));
+
+        let (status, body) = post_reload(&app).await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["ok"], json!(false), "{body}");
+        let error = body["gui_show"]["error"].as_str().unwrap_or("");
+        assert!(error.contains("failed to parse GUI config"), "{body}");
+        assert!(
+            state.gui_show.config().local_enabled,
+            "a TOML error must not replace the last good config"
+        );
+
+        state
+            .gui_show
+            .set_config_path(Some(dir.path().join("missing.toml")));
+        let (status, body) = post_reload(&app).await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["ok"], json!(false), "{body}");
+        let error = body["gui_show"]["error"].as_str().unwrap_or("");
+        assert!(error.contains("failed to read GUI config"), "{body}");
+        assert!(state.gui_show.config().local_enabled);
+        Ok(())
+    }
+
+    async fn post_reload(app: &axum::Router) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/acl/reload")
+            .extension(crate::server::rider_auth::ActorContext::Owner { durable: true })
+            .body(axum::body::Body::empty())?;
+        let resp = app.clone().oneshot(req).await?;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await?;
+        Ok((status, serde_json::from_slice(&bytes).unwrap_or_default()))
+    }
+
+    #[tokio::test]
     async fn registry_lists_gui_show() {
         assert!(
             crate::api::ENDPOINTS

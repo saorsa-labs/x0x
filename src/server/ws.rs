@@ -1966,18 +1966,16 @@ async fn handle_ws_command(
                     return;
                 }
             };
-            if !state
-                .gui_show
-                .block_agent_unless_self(&aid, &state.agent.agent_id())
-            {
-                feed_droppable(
-                    tx,
-                    WsOutbound::Error {
-                        message: crate::gui::SELF_GUI_BLOCK_REFUSED.to_string(),
-                    },
-                    stats,
-                );
+            if aid == state.agent.agent_id() {
+                // Local Stop writes `[gui_show] local_enabled = false`.
+                // There is no success frame. A write failure uses the
+                // existing error frame. Re-enable is config plus /acl/reload.
+                if let Err(message) = state.gui_show.disable_local_show() {
+                    feed_droppable(tx, WsOutbound::Error { message }, stats);
+                }
+                return;
             }
+            state.gui_show.block_agent(&aid);
         }
 
         WsInbound::GuiVisible { visible } => {
@@ -2359,10 +2357,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn self_block_is_refused_and_writes_no_entry() {
+    async fn stop_local_show_persists_disabled_and_reload_reenables() {
         let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
             .await
             .expect("test state");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n",
+        )
+        .expect("config");
+        state.gui_show.set_config_path(Some(path.clone()));
         let own = hex::encode(state.agent.agent_id().as_bytes());
         let cmd = serde_json::json!({
             "type": "gui.block",
@@ -2372,20 +2377,31 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
         let stats = WsOutboundStats::default();
         handle_ws_command(&state, "s-self", &cmd, &tx, &stats, false).await;
-        match rx.recv().await.expect("refusal") {
-            WsOutbound::Error { message } => {
-                assert_eq!(message, crate::gui::SELF_GUI_BLOCK_REFUSED);
-            }
-            other => panic!("expected error frame, got {other:?}"),
-        }
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "gui.block has no success frame"
+        );
+        assert!(
+            !state.gui_show.config().local_enabled,
+            "stop applies local_enabled = false"
+        );
         assert!(
             !state.gui_show.is_blocked(&state.agent.agent_id()),
-            "a refused self-block must not be recorded"
+            "stop must not use the block list"
         );
-        assert!(
-            !dir.path().join("gui_show_blocked.json").exists(),
-            "a refused self-block must not create the block file"
-        );
+        assert!(!dir.path().join("gui_show_blocked.json").exists());
+        let text = std::fs::read_to_string(&path).expect("config");
+        assert!(text.contains("local_enabled = false"), "{text}");
+        std::fs::write(
+            &path,
+            text.replace("local_enabled = false", "local_enabled = true"),
+        )
+        .expect("re-enable");
+        state
+            .gui_show
+            .reload_from_disk()
+            .expect("reload turns local show back on");
+        assert!(state.gui_show.config().local_enabled);
     }
 
     #[tokio::test]

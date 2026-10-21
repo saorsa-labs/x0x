@@ -495,6 +495,7 @@ pub async fn serve_with_options(
         connect_policy,
         self_update_enabled,
         daemon_config_path,
+        gui_show_write_path,
     } = options;
     // `--skip-update-check` is process-scoped updater suppression. Compute one
     // effective capability before any updater path is considered, then use it
@@ -1253,6 +1254,7 @@ pub async fn serve_with_options(
             let runtime =
                 x0x::gui::GuiShowRuntime::with_defaults(config.gui_show.clone(), &config.data_dir);
             runtime.set_config_path(daemon_config_path);
+            runtime.set_write_path(gui_show_write_path);
             runtime
         },
         connect_diagnostics,

@@ -419,7 +419,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         exec_policy,
         connect_policy,
         self_update_enabled,
-        daemon_config_path: loaded_config_path,
+        daemon_config_path: loaded_config_path.clone(),
+        gui_show_write_path: Some(loaded_config_path.unwrap_or(default_config_path)),
     };
     let handle = x0x::server::serve_with_options(config, options).await?;
 

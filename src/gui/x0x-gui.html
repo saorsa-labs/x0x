@@ -914,9 +914,10 @@ function handleWsMsg(m){
     return;
   }
   if(m.type==='error'){
-    // gui.block has no success frame. The existing error frame is only a refusal.
-    if(String(m.message||'')==="cannot block this daemon's own agent"){
-      toast('Could not block shows from this agent','error');
+    // gui.block has no success frame. An error frame means Stop did not apply.
+    const msg=String(m.message||'');
+    if(msg.indexOf('could not turn local show off')===0){
+      toast(msg,'error');
     }
     console.warn('ws error:',m.message||m);
   }
@@ -942,8 +943,7 @@ function showGuiShowBanner(text, agentId){
   if(!bar||!label||!block||!hide)return;
   label.textContent=text;
   bar.classList.add('visible');
-  const own=!!agentId&&agentId.toLowerCase()===String(S.get('agentId')||'').toLowerCase();
-  block.hidden=own;
+  block.hidden=false;
   block.disabled=true;
   hide.disabled=true;
   block.onclick=null;
@@ -952,7 +952,6 @@ function showGuiShowBanner(text, agentId){
   showGuiShowBanner._t=setTimeout(()=>{
     hide.disabled=false;
     hide.onclick=hideGuiShowBanner;
-    if(own)return;
     block.disabled=false;
     block.onclick=function(){
       if(!agentId)return;
