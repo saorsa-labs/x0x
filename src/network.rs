@@ -508,15 +508,16 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// ## Seed identity pinning (issue #1112)
 ///
 /// The crate-private `SEED_PEER_ID_PINS` table pins a seed address's
-/// expected PeerIds. A join dial that a pinned address answers with a
-/// PeerId outside the pin set is a failed hint: dropped, never a trust
-/// anchor (see `seed_pin_check` and the join dial in
-/// `Agent::connect_peers_parallel_tracked`). An empty pin set keeps
-/// trust-on-first-use for that hint, exactly as before #1112. The pin set
-/// is per address, never per host: the two listeners on one host are
-/// separate `x0xd` instances with separate machine keys, and a key
-/// rotation pins old and new PeerIds together for the overlap window. The
-/// rotation policy lives in `docs/trust-and-connectivity.md`.
+/// expected PeerIds. A dial that a pinned address answers with a PeerId
+/// outside the pin set is a failed hint: dropped, never a trust anchor
+/// (see `seed_pin_check`; the enforcement seam is
+/// `NetworkNode::connect_addr_with_origin`, and the join paths re-check
+/// the verdict on every tier). An empty pin set keeps trust-on-first-use
+/// for that hint, exactly as before #1112. The pin set is per address,
+/// never per host: the two listeners on one host are separate `x0xd`
+/// instances with separate machine keys, and a key rotation pins old and
+/// new PeerIds together for the overlap window. The rotation policy
+/// lives in `docs/trust-and-connectivity.md`.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     // ── UDP/443 (preferred; traverses WARP / full-tunnel VPN / CGNAT / DPI) ──
     // IPv4
@@ -2507,6 +2508,12 @@ pub struct NetworkNode {
     /// A leaf mutex: never held across an await or another lock.
     seed_pin_rejections:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, SeedPinRejection>>>,
+    /// #1112 (round 11): the address each recently observed connection
+    /// GENERATION of a peer lived on — the source-session evidence the
+    /// frame guard needs when a frame was queued and its connection
+    /// closed before dispatch. Capped per peer (generations are never
+    /// reused); a leaf mutex never held across an await or another lock.
+    session_addr_ledger: Arc<Mutex<SessionAddrLedger>>,
     /// Test-only per-node override of the rejection TTL, so the expiry
     /// path is testable without real-time waits (`#[cfg(test)]`).
     #[cfg(test)]
@@ -2965,6 +2972,7 @@ impl NetworkNode {
             seed_pin_rejections: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            session_addr_ledger: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_seed_pin_rejection_ttl: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -4270,6 +4278,9 @@ impl NetworkNode {
                 }
 
                 let rtt_ms = dur_ms as u32;
+                // #1112 (round 11): leave source-session evidence for the
+                // frame guard.
+                self.note_observed_connection(&node, &peer_conn.peer_id, addr);
                 if let Some(ref cache) = self.bootstrap_cache {
                     cache
                         .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -4459,6 +4470,9 @@ impl NetworkNode {
 
         // Record in bootstrap cache so future connections use the cached address
         let rtt_ms = start.elapsed().as_millis() as u32;
+        // #1112 (round 11): leave source-session evidence for the frame
+        // guard — id-based dials never pass the address-dial seam.
+        self.note_observed_connection(&node, &peer_conn.peer_id, addr);
         if let Some(ref cache) = self.bootstrap_cache {
             cache
                 .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -4606,6 +4620,9 @@ impl NetworkNode {
 
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         let rtt_ms = dur_ms as u32;
+        // #1112 (round 11): leave source-session evidence for the frame
+        // guard — id-based dials never pass the address-dial seam.
+        self.note_observed_connection(&node, &peer_conn.peer_id, addr);
         if let Some(ref cache) = self.bootstrap_cache {
             cache
                 .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -4911,16 +4928,61 @@ impl NetworkNode {
         })
     }
 
+    /// Remember the address a connection GENERATION of `peer` lives on
+    /// (#1112, round 11). Recorded wherever x0x observes a connection —
+    /// the dial seams, the accept loop, and the receive pump while the
+    /// frame's source generation is current — so the frame guard can
+    /// evaluate the pin for a frame's OWN source session after that
+    /// session closes, with no rejection entry needed.
+    fn note_session_address(&self, peer: AntPeerId, generation: u64, addr: SocketAddr) {
+        note_session_address_in(&self.session_addr_ledger, peer, generation, addr);
+    }
+
+    /// The address `generation` of `peer` was observed on, if any
+    /// (#1112, round 11).
+    fn session_addr_for(&self, peer: &AntPeerId, generation: u64) -> Option<SocketAddr> {
+        let ledger = self
+            .session_addr_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ledger
+            .get(peer)?
+            .iter()
+            .find(|(gen, _)| *gen == generation)
+            .map(|(_, addr)| *addr)
+    }
+
+    /// Ledger an observed connection (#1112, round 11): the answered
+    /// peer's CURRENT generation and the address the observation came
+    /// from — the dial seams and the accept loop, so id-based dials and
+    /// inbound connections (which never pass the address-dial seam) leave
+    /// source-session evidence the frame guard can use after the session
+    /// closes.
+    fn note_observed_connection(&self, node: &LinkNode, peer: &AntPeerId, addr: SocketAddr) {
+        if let Some(generation) = node.current_connection_generation(peer) {
+            self.note_session_address(*peer, generation, addr);
+        }
+    }
+
     /// Whether a live rejection refuses a frame by its SOURCE session
-    /// (#1112, round 10): the entry recorded for the identity names this
-    /// frame's source generation. The generation is per-connection and
-    /// outlives the close of the rejected connection, so frames queued
-    /// before the close — draining after it, when the CURRENT-session
-    /// lookup answers nothing — are still refused.
+    /// (#1112, rounds 10-11): either a recorded rejection entry names
+    /// this frame's generation (the address-dial refusal's record, which
+    /// outlives the connection's close), or the session-address ledger
+    /// maps the frame's generation to the address it lived on and the
+    /// TIMELESS pin pair verdict refuses that (identity, address) pair —
+    /// covering id-based dials and internal redials, which never pass the
+    /// address-dial seam and record no entry. Frames queued before a
+    /// close and drained after it are refused on both clauses.
     fn seed_pin_rejects_frame(&self, peer_id: &AntPeerId, source_generation: u64) -> bool {
-        self.live_seed_pin_rejections()
+        if self
+            .live_seed_pin_rejections()
             .iter()
             .any(|entry| entry.answered == peer_id.0 && entry.generation == Some(source_generation))
+        {
+            return true;
+        }
+        self.session_addr_for(peer_id, source_generation)
+            .is_some_and(|addr| seed_pin_mismatch_at(addr, peer_id.0))
     }
 
     /// [`Self::seed_pin_rejects_current_session`] for callers that hold
@@ -6297,6 +6359,26 @@ impl NetworkNode {
                 };
 
                 let recv_result = node_ref.recv_with_generation().await;
+                // #1112 (round 11): while the frame's source generation is
+                // the peer's CURRENT one, remember the address that
+                // generation lives on — the evidence the frame guard needs
+                // if the frame is queued and the session closes before
+                // dispatch. Gated on a populated pin table: nothing to
+                // evaluate while no address is pinned. Done before the
+                // handle drop: the session lookups need the endpoint.
+                if let Ok((peer_id, source_generation, _)) = &recv_result {
+                    if !dial_pin_table().is_empty()
+                        && node_ref.current_connection_generation(peer_id)
+                            == Some(*source_generation)
+                    {
+                        if let Some(addr) = node_ref
+                            .session_connection(peer_id)
+                            .and_then(|conn| conn.remote_address())
+                        {
+                            plane_node.note_session_address(*peer_id, *source_generation, addr);
+                        }
+                    }
+                }
                 // Release this endpoint clone before any channel backpressure.
                 drop(node_handle);
 
@@ -6626,6 +6708,7 @@ impl NetworkNode {
         let reconnect_suppressions = Arc::clone(&self.reconnect_suppressions);
         let connection_pool = Arc::clone(&self.connection_pool);
         let inbound_allowlist = self.config.inbound_allowlist.clone();
+        let session_addr_ledger = Arc::clone(&self.session_addr_ledger);
         #[cfg(test)]
         let suppressed_inbound_probe = Arc::clone(&self.suppressed_inbound_probe);
 
@@ -6725,6 +6808,21 @@ impl NetworkNode {
                             ant_quic::TransportAddr::Udp(addr) => Some(addr),
                             _ => None,
                         };
+                        // #1112 (round 11): inbound connections never pass
+                        // the dial seam — leave source-session evidence
+                        // for the frame guard.
+                        if let Some(addr) = addr {
+                            if let Some(generation) =
+                                node_ref.current_connection_generation(&peer_conn.peer_id)
+                            {
+                                note_session_address_in(
+                                    &session_addr_ledger,
+                                    peer_conn.peer_id,
+                                    generation,
+                                    addr,
+                                );
+                            }
+                        }
                         if let (Some(ref cache), Some(addr)) = (&bootstrap_cache, addr) {
                             if reconnect_suppression_is_live(
                                 reconnect_suppressions.as_ref(),
@@ -7669,6 +7767,31 @@ fn drain_plane_lifecycle(
     }
 }
 
+/// #1112 (round 11): per-peer ledger of (connection generation, observed
+/// address) pairs — the source-session evidence the frame guard reads.
+type SessionAddrLedger = std::collections::HashMap<AntPeerId, Vec<(u64, SocketAddr)>>;
+
+/// Write into the session-address ledger (#1112, round 11): the address
+/// a connection generation of a peer lives on, kept per peer with the
+/// most recent few generations (generations are never reused).
+fn note_session_address_in(
+    ledger: &Arc<Mutex<SessionAddrLedger>>,
+    peer: AntPeerId,
+    generation: u64,
+    addr: SocketAddr,
+) {
+    let addr = normalize_v4_mapped_addr(addr);
+    let mut ledger = ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entries = ledger.entry(peer).or_default();
+    entries.retain(|(gen, seen)| *gen != generation && *seen != addr);
+    entries.push((generation, addr));
+    const PER_PEER_GENERATIONS: usize = 8;
+    let excess = entries.len().saturating_sub(PER_PEER_GENERATIONS);
+    entries.drain(..excess);
+}
+
 /// Convert ant-quic PeerId to saorsa-gossip PeerId
 fn ant_to_gossip_peer_id(ant_id: &AntPeerId) -> GossipPeerId {
     GossipPeerId::new(ant_id.0)
@@ -7794,57 +7917,51 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // below — the peer is already excluded from `gossip_plane_peers`,
         // so there is no overlay view to protect, and a suppressed peer
         // must never receive gossip.
-        let session_pin_rejected = self.seed_pin_rejected_session(&ant_peer).await;
-        if self.is_reconnect_suppressed(ant_peer.0) || session_pin_rejected {
-            debug!(
-                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is reconnect-suppressed or seed-pin-rejected",
-                stream_type,
-                data.len(),
-                peer
-            );
-            return Ok(());
-        }
-
-        // Issue #206: hold gossip sends to peers that have not cleared the
-        // plane gate (hello outstanding / legacy grace). Reported as success
-        // so a briefly-pending same-plane peer is not pruned from overlay
-        // views for what is effectively a sub-second handshake delay; gossip
-        // is loss-tolerant and the frames flow once the peer clears.
-        if !self.plane_gate_allows(&ant_peer) {
-            debug!(
-                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} not plane-cleared",
-                stream_type,
-                data.len(),
-                peer
-            );
-            return Ok(());
-        }
-
-        // Prepare message: [stream_type_byte | data]
-        let mut buf = Vec::with_capacity(1 + data.len());
-        buf.push(stream_type.to_byte());
-        buf.extend_from_slice(&data);
-
-        // Send via ant-quic Node
-        //
-        // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
-        // per-peer sends in a small timeout; a multi-second liveness repair on
-        // this path turns healthy gossip degradation into a timeout/log storm.
         {
             let node = self.require_node().await?;
+            // #1112 (round 11): bind the policy check to the session it
+            // examined. The send below rides THAT generation or none: a
+            // connection replaced between the check and the send fails
+            // (generation superseded) instead of silently riding the new,
+            // unchecked winner.
+            let checked_generation = node.current_connection_generation(&ant_peer);
+            if self.is_reconnect_suppressed(ant_peer.0)
+                || self.seed_pin_rejected_session(&ant_peer).await
+                || !self.plane_gate_allows(&ant_peer)
+            {
+                debug!(
+                    "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is suppressed or not admitted",
+                    stream_type,
+                    data.len(),
+                    peer
+                );
+                return Ok(());
+            }
 
-            node.send(&ant_peer, &buf)
-                .await
-                .map_err(|e| map_gossip_send_error(e, peer))?;
+            // Prepare message: [stream_type_byte | data]
+            let mut buf = Vec::with_capacity(1 + data.len());
+            buf.push(stream_type.to_byte());
+            buf.extend_from_slice(&data);
+
+            // Send via ant-quic Node
+            //
+            // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
+            // per-peer sends in a small timeout; a multi-second liveness repair on
+            // this path turns healthy gossip degradation into a timeout/log storm.
+            let send_result = match checked_generation {
+                Some(generation) => node.send_on_generation(&ant_peer, generation, &buf).await,
+                None => node.send(&ant_peer, &buf).await,
+            };
+            send_result.map_err(|e| map_gossip_send_error(e, peer))?;
+
+            debug!(
+                "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
+                buf.len(),
+                stream_type,
+                peer
+            );
         }
         self.note_connection_pool_activity(ant_peer).await;
-
-        debug!(
-            "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
-            buf.len(),
-            stream_type,
-            peer
-        );
 
         Ok(())
     }
@@ -11134,6 +11251,114 @@ mod tests {
             "a generation-less entry still refuses a session on its own address"
         );
         joiner.clear_seed_pin_rejection(seed_addr);
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 11 (Codex P2: queued frames can bypass pin rejection after
+    /// disconnect, id-based-dial variant): an id-based dial records NO
+    /// rejection entry, so a frame it queues and drains after its close
+    /// slipped past the recorded-entry clause. The session-address ledger
+    /// (recorded at the id-dial seams, the accept loop and the receive
+    /// pump) maps the frame's source generation to its address, and the
+    /// timeless pair verdict refuses it — no manual rejection inserted.
+    /// Runtime-RED before the ledger clause: the drained frame reached
+    /// the gossip channels.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue1112_id_dial_queued_frame_refused_without_a_recorded_entry() {
+        const NOT_THE_SEED: [u8; 32] = [0xAF; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r11-iddial";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_135).await;
+        // Id-based dial with no pin table (TOFU): the seam ledgers the
+        // (generation, address) pair but records no rejection.
+        let (_, seed_peer) = joiner
+            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
+            .await
+            .unwrap();
+        // Pins land AFTER the connection exists — like an internal redial,
+        // the address-dial seam never refused anything.
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        let joiner_peer = joiner.peer_id();
+        let link = joiner.node.read().await.clone().expect("live link");
+        let generation = link
+            .current_connection_generation(&seed_peer)
+            .expect("live generation");
+        // The peer queues a Bulk frame, then the connection closes.
+        let seed_link = seed.node.read().await.clone().expect("live link");
+        let mut frame = vec![saorsa_gossip_transport::GossipStreamType::Bulk.to_byte()];
+        frame.extend_from_slice(b"queued before the close");
+        seed_link.send(&joiner_peer, &frame).await.unwrap();
+        let _ = link.disconnect(&seed_peer).await;
+
+        // No rejection entry was ever recorded...
+        assert!(joiner.live_seed_pin_rejections().is_empty());
+        // ...but the frame's source session is ledgered, and the pair
+        // verdict refuses it.
+        assert_eq!(
+            joiner.session_addr_for(&seed_peer, generation),
+            Some(seed_addr),
+            "the id-dial seam ledgered the source session"
+        );
+        assert!(joiner.seed_pin_rejects_frame(&seed_peer, generation));
+
+        // End to end: nothing from the closed, pin-mismatched session
+        // reaches the gossip channels.
+        match tokio::time::timeout(Duration::from_millis(250), joiner.receive_message()).await {
+            Err(_elapsed) => {}
+            Ok(Ok((peer, stream_type, _))) => panic!(
+                "queued frame from the pin-mismatched session reached the gossip plane ({stream_type:?} from {peer:?})"
+            ),
+            Ok(Err(e)) => panic!("gossip receive failed: {e}"),
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 11 (Codex P2: ordinary gossip sends can bypass the check
+    /// during connection replacement): the ordinary send path binds its
+    /// bytes to the generation it examined — a send pinned to a
+    /// superseded generation fails instead of silently riding the
+    /// replacement connection the policy never checked. Runtime-RED
+    /// before the binding (plain `send` rode whatever connection was
+    /// current at write time).
+    #[tokio::test]
+    async fn issue1112_ordinary_send_binds_to_the_checked_generation() {
+        let plane = "issue1112-r11-bind";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_136).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        let link = joiner.node.read().await.clone().expect("live link");
+        let first = link
+            .current_connection_generation(&seed_peer)
+            .expect("live generation");
+        // A send pinned to the live generation rides it.
+        link.send_on_generation(&seed_peer, first, &[0x00, 0x01])
+            .await
+            .unwrap();
+
+        // Replacement: disconnect, then re-dial — a NEW generation.
+        let _ = link.disconnect(&seed_peer).await;
+        joiner.connect_addr(seed_addr).await.unwrap();
+        let second = link
+            .current_connection_generation(&seed_peer)
+            .expect("replacement generation");
+        assert_ne!(first, second, "the re-dial must be a new generation");
+
+        assert!(
+            link.send_on_generation(&seed_peer, first, &[0x00, 0x01])
+                .await
+                .is_err(),
+            "a send bound to the superseded generation must not ride the replacement"
+        );
+        link.send_on_generation(&seed_peer, second, &[0x00, 0x01])
+            .await
+            .unwrap();
 
         joiner.try_shutdown().await.unwrap();
         seed.try_shutdown().await.unwrap();

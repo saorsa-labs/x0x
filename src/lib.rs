@@ -5511,15 +5511,6 @@ fn deserialize_machine_announcement(
         .deserialize(payload)
 }
 
-/// Compute coordinator / relay hint lists for an announcement.
-///
-/// Delegates the choice to [`select_capability_hints`] (#1112): two
-/// eligibility tiers over the connected set, and never the announcer
-/// itself.
-///
-/// Used to populate `reachable_via` / `relay_candidates` on outgoing
-/// announcements so that remote peers have concrete targets to dial when
-/// the advertising machine is NAT-locked.
 /// #1112 (round 10): a cached row whose address list names a pinned seed
 /// address that excludes its identity is refused at cache CONSUMPTION —
 /// the join tiers never dial it, whatever wrote the row. The seam evicts
@@ -5539,6 +5530,15 @@ fn cached_row_pinned_mismatch(
     })
 }
 
+/// Compute coordinator / relay hint lists for an announcement.
+///
+/// Delegates the choice to [`select_capability_hints`] (#1112): two
+/// eligibility tiers over the connected set, and never the announcer
+/// itself.
+///
+/// Used to populate `reachable_via` / `relay_candidates` on outgoing
+/// announcements so that remote peers have concrete targets to dial when
+/// the advertising machine is NAT-locked.
 async fn collect_coordinator_hints(
     network: &network::NetworkNode,
     machine_cache: &std::sync::Arc<
