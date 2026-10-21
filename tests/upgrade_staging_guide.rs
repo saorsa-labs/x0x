@@ -224,7 +224,10 @@ macro_rules! staging_guide_regression_tests {
                         assert!(matches!(result, Ok(Some(ref version)) if version == "9.9.9"), "{result:?}");
                     }
                 }
-                shutdown.send(true).unwrap();
+                // A completed startup may already have dropped its last
+                // receiver. Any retained retry receiver must still see shutdown;
+                // no receivers is valid cleanup, not a failed cancellation.
+                let _ = shutdown.send(true);
                 loop {
                     let (entered, exited) = *events.counts.lock().unwrap();
                     if entered == exited { break; }
