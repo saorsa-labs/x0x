@@ -381,20 +381,106 @@ pub async fn readback_launchd_policy_offloaded(
     let signals = signals.clone();
     let executable = executable.to_path_buf();
     let argv = argv.to_vec();
-    spawn_readback_offloaded(move || readback_launchd_policy(&signals, &executable, &argv)).await
+    spawn_readback_offloaded(
+        #[cfg(all(test, unix))]
+        executable.clone(),
+        move || readback_launchd_policy(&signals, &executable, &argv),
+    )
+    .await
 }
 
 /// spawn_blocking core of [`readback_launchd_policy_offloaded`], split so the
 /// offload itself is testable with a stand-in readback closure instead of the
 /// real plutil/launchctl subprocesses.
 async fn spawn_readback_offloaded(
+    #[cfg(all(test, unix))] target: PathBuf,
     readback: impl FnOnce() -> LaunchdPolicyReadback + Send + 'static,
 ) -> LaunchdPolicyReadback {
-    match tokio::task::spawn_blocking(readback).await {
+    #[cfg(all(test, unix))]
+    let task = readback_custody_seam::spawn(target, ReadbackKind::Launchd, readback);
+    #[cfg(not(all(test, unix)))]
+    let task = tokio::task::spawn_blocking(readback);
+    match task.await {
         Ok(verdict) => verdict,
         Err(join_err) => LaunchdPolicyReadback::NotGuaranteed {
             detail: format!("launchd policy readback task failed: {join_err}"),
         },
+    }
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadbackKind {
+    Launchd,
+    SystemdPolicy,
+    SystemdIdentity,
+}
+
+/// Target-keyed observations of actual blocking readbacks. Tests may pause at
+/// Entered; the real readback then continues through its existing inert seam.
+#[cfg(all(test, unix))]
+pub(crate) mod readback_custody_seam {
+    use super::ReadbackKind;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ReadbackEvent {
+        Queued,
+        Entered,
+        Exited,
+    }
+    pub(crate) type Hook = Arc<dyn Fn(ReadbackKind, ReadbackEvent) + Send + Sync>;
+
+    fn hooks() -> &'static Mutex<HashMap<PathBuf, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    pub(crate) struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = hooks().lock() {
+                hooks.remove(&self.0);
+            }
+        }
+    }
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        let mut hooks = hooks().lock().expect("readback hooks");
+        assert!(!hooks.contains_key(&target), "duplicate readback hook");
+        hooks.insert(target.clone(), hook);
+        Guard(target)
+    }
+    pub(super) fn capture(target: &Path) -> Option<Hook> {
+        hooks().lock().ok()?.get(target).cloned()
+    }
+    pub(super) fn observe(hook: &Option<Hook>, kind: ReadbackKind, event: ReadbackEvent) {
+        if let Some(hook) = hook {
+            hook(kind, event);
+        }
+    }
+    pub(super) struct Exit(pub Option<Hook>, pub ReadbackKind);
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            observe(&self.0, self.1, ReadbackEvent::Exited);
+        }
+    }
+
+    pub(super) fn spawn<T: Send + 'static>(
+        target: PathBuf,
+        kind: ReadbackKind,
+        readback: impl FnOnce() -> T + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        let hook = capture(&target);
+        let queued_hook = hook.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _exit = Exit(hook.clone(), kind);
+            observe(&hook, kind, ReadbackEvent::Entered);
+            readback()
+        });
+        // Entered may race ahead of this event on an available worker.
+        observe(&queued_hook, kind, ReadbackEvent::Queued);
+        task
     }
 }
 
@@ -1950,9 +2036,15 @@ pub async fn readback_systemd_policy_offloaded(
 ) -> SystemdPolicyReadback {
     let signals = signals.clone();
     let executable = executable.to_path_buf();
+    #[cfg(all(test, unix))]
+    let target = executable.clone();
     let argv = argv.to_vec();
-    tokio::task::spawn_blocking(move || readback_systemd_policy(&signals, &executable, &argv))
-        .await
+    let readback = move || readback_systemd_policy(&signals, &executable, &argv);
+    #[cfg(all(test, unix))]
+    let task = readback_custody_seam::spawn(target, ReadbackKind::SystemdPolicy, readback);
+    #[cfg(not(all(test, unix)))]
+    let task = tokio::task::spawn_blocking(readback);
+    task.await
         .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
             detail: format!("systemd readback task failed: {e}"),
         })
@@ -2338,11 +2430,17 @@ pub(crate) async fn resolve_staging_identity(
     let launchd = readback_launchd_policy_offloaded(&signals, executable, &argv).await;
     let observed_signals = signals.clone();
     let observed_executable = executable.to_path_buf();
-    let systemd = tokio::task::spawn_blocking(move || {
-        readback_systemd_observation(&observed_signals, &observed_executable, &argv)
-    })
-    .await
-    .unwrap_or_else(|error| {
+    let readback =
+        move || readback_systemd_observation(&observed_signals, &observed_executable, &argv);
+    #[cfg(all(test, unix))]
+    let task = readback_custody_seam::spawn(
+        executable.to_path_buf(),
+        ReadbackKind::SystemdIdentity,
+        readback,
+    );
+    #[cfg(not(all(test, unix)))]
+    let task = tokio::task::spawn_blocking(readback);
+    let systemd = task.await.unwrap_or_else(|error| {
         SystemdPolicyReadback::NotGuaranteed {
             detail: format!("systemd readback task failed: {error}"),
         }
@@ -3942,17 +4040,21 @@ mod tests {
         // observable property: on a current_thread runtime the polling thread
         // IS the only runtime worker, so the closure must never see it.
         let runtime_thread = std::thread::current().id();
-        let verdict = spawn_readback_offloaded(move || {
-            assert_ne!(
-                std::thread::current().id(),
-                runtime_thread,
-                "the launchd readback must not run on the async runtime thread"
-            );
-            LaunchdPolicyReadback::Verified {
-                label: TEST_LABEL.to_string(),
-                domain: "gui",
-            }
-        })
+        let verdict = spawn_readback_offloaded(
+            #[cfg(unix)]
+            PathBuf::new(),
+            move || {
+                assert_ne!(
+                    std::thread::current().id(),
+                    runtime_thread,
+                    "the launchd readback must not run on the async runtime thread"
+                );
+                LaunchdPolicyReadback::Verified {
+                    label: TEST_LABEL.to_string(),
+                    domain: "gui",
+                }
+            },
+        )
         .await;
         assert_eq!(
             verdict,
@@ -3970,8 +4072,12 @@ mod tests {
         // path or — worse — verify by accident: the JoinError arm maps to
         // NotGuaranteed, the same fail-closed verdict as every other
         // unread-policy outcome.
-        let verdict =
-            spawn_readback_offloaded(|| panic!("launchctl hung in an unexpected way")).await;
+        let verdict = spawn_readback_offloaded(
+            #[cfg(unix)]
+            PathBuf::new(),
+            || panic!("launchctl hung in an unexpected way"),
+        )
+        .await;
         match verdict {
             LaunchdPolicyReadback::NotGuaranteed { detail } => {
                 assert!(

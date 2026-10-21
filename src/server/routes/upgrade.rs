@@ -11,6 +11,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -20,9 +21,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex};
-use x0x::upgrade::apply::{AutoApplyUpgrader, RestartContext};
+use x0x::upgrade::apply::{AutoApplyUpgrader, ReleasePermit, RestartContext};
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
+use x0x::upgrade::monitor::VerifiedRelease;
 use x0x::upgrade::restart::RestartOwnershipError;
 use x0x::upgrade::signature::verify_manifest_signature;
 use x0x::Agent;
@@ -618,346 +620,644 @@ pub(in crate::server) async fn broadcast_current_manifest(
     }
 }
 
-/// Gossip-based release subscription — the primary update mechanism for x0xd.
-///
-/// When an upgrade attempt fails (e.g. hash mismatch), the failed version is
-/// tracked so it won't block future attempts. A newer release superseding the
-/// failed version will be picked up normally.
-pub(in crate::server) async fn run_gossip_update_listener(
-    agent: Arc<Agent>,
-    config: DaemonUpdateConfig,
-    data_dir: PathBuf,
-    upgrade_apply_lock: Arc<Mutex<()>>,
-    self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
-    api_addr: SocketAddr,
-    shutdown: UpdateShutdown,
-) {
-    let (shutdown, shutdown_watch) = shutdown;
-    let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
-        Ok(sub) => sub,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to subscribe to release topic: {e}");
-            return;
-        }
-    };
+/// One server-owned background worker serves gossip and fallback. Submission
+/// replaces only the latest queued release; an active blocking operation is
+/// cancelled at admission and still awaited before the next release starts.
+pub(in crate::server) struct BackgroundRuntime {
+    pub config: DaemonUpdateConfig,
+    pub data_dir: PathBuf,
+    pub api_addr: SocketAddr,
+    pub shutdown: UpdateShutdown,
+    pub apply_lock: Arc<Mutex<()>>,
+    #[cfg(unix)]
+    pub staging: StartupStagingContext,
+    #[cfg(test)]
+    pub operation_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+}
 
-    // Track rebroadcasted versions with timestamps to prevent exponential gossip storms
-    // while still allowing periodic re-rebroadcast for late-connecting peers.
-    // publish() re-signs the payload with the local agent key, producing a new PlumTree
-    // message ID each time — so PlumTree's transport-layer dedup cannot suppress re-sends.
-    let mut rebroadcasted_versions: HashMap<String, Instant> = HashMap::new();
-
-    // Track versions that failed to *apply* so a release that can never succeed
-    // in this environment (e.g. a locked binary that won't replace) is not
-    // re-downloaded and re-extracted on every gossip receipt. Without this the
-    // gossip path retried indefinitely — the cause of the Windows disk-fill
-    // loop. Mirrors the backoff in run_fallback_github_poll.
-    let mut failed_apply_versions: HashMap<String, Instant> = HashMap::new();
-    const APPLY_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
-
-    while let Some(msg) = release_sub.recv().await {
-        tracing::info!("Received release manifest via gossip");
-
-        // Drop expired backoff entries so the map stays bounded.
-        failed_apply_versions.retain(|_, failed_at| failed_at.elapsed() < APPLY_RETRY_AFTER);
-
-        // Decode wire format: length-prefixed manifest JSON + signature
-        let (manifest_json, sig) = match decode_signed_manifest(&msg.payload) {
-            Ok(parts) => parts,
-            Err(e) => {
-                tracing::warn!(error = %e, "Invalid manifest payload received via gossip");
-                continue;
+impl BackgroundRuntime {
+    /// Resolve the actual boot context before constructing an apply owner.
+    pub(in crate::server) async fn from_boot(
+        config: &DaemonConfig,
+        api_addr: SocketAddr,
+        shutdown: UpdateShutdown,
+        apply_lock: Arc<Mutex<()>>,
+        #[cfg(unix)] identity_dir: Option<PathBuf>,
+        #[cfg(unix)] machine_id: [u8; 32],
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        let staging = {
+            let identity_root = match identity_dir {
+                Some(path) => path,
+                None => crate::storage::x0x_dir().await?,
+            };
+            StartupStagingContext {
+                install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                identity_root: identity_root.canonicalize()?,
+                machine_id,
+                #[cfg(test)]
+                clock: None,
+                #[cfg(test)]
+                observed: None,
             }
         };
+        Ok(Self {
+            config: config.update.clone(),
+            data_dir: config.data_dir.clone(),
+            api_addr,
+            shutdown,
+            apply_lock,
+            #[cfg(unix)]
+            staging,
+            #[cfg(test)]
+            operation_observer: None,
+        })
+    }
 
-        let manifest: ReleaseManifest = match serde_json::from_slice(manifest_json) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "Invalid manifest JSON: {e}");
-                continue;
-            }
-        };
-
-        // Fast-drop stale release-train manifests before ML-DSA verification.
-        // For versions at or below our own, we will neither rebroadcast nor apply
-        // the manifest, so signature work only slows the release-topic drain.
-        if !is_newer(&manifest.version, x0x::VERSION) {
-            tracing::debug!(
-                version = %manifest.version,
-                "Already on v{} or newer, skipping verification and rebroadcast",
-                manifest.version
-            );
-            continue;
+    /// Spawn the server's real discovery source under its configured gate.
+    pub(in crate::server) fn spawn_source<F>(
+        enabled: bool,
+        submit: Option<BackgroundSubmit>,
+        source: impl FnOnce(Option<BackgroundSubmit>) -> F,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if !enabled {
+            return None;
         }
+        // Missing apply authority must not disable configured release relay.
+        Some(tokio::spawn(source(submit)))
+    }
+}
 
-        // Stage 1: verify manifest signature before trusting any newer release.
-        if let Err(e) = verify_manifest_signature(manifest_json, sig) {
-            tracing::warn!(error = %e, "Release manifest signature verification failed");
-            continue;
+/// Intake results only; Accepted does not acknowledge a durable receipt or
+/// supersession. The owned worker must still complete those record barriers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitOutcome {
+    Accepted,
+    Duplicate,
+    Older,
+    Backoff,
+}
+
+#[derive(Default)]
+struct BackgroundSlot {
+    latest: Option<Arc<VerifiedRelease>>,
+    pending: bool,
+    active: Option<ReleasePermit>,
+    failed_at: Option<Instant>,
+    closed: bool,
+}
+
+#[derive(Clone, Default)]
+pub(in crate::server) struct BackgroundSubmit {
+    slot: Arc<std::sync::Mutex<BackgroundSlot>>,
+    wake: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    processed: Option<Arc<dyn Fn(String, SubmitOutcome) + Send + Sync>>,
+}
+
+impl BackgroundSubmit {
+    fn submit(
+        &self,
+        verified: VerifiedRelease,
+    ) -> Result<SubmitOutcome, x0x::upgrade::UpgradeError> {
+        let version = verified.manifest.version.clone();
+        let outcome = self.submit_inner(verified)?;
+        #[cfg(test)]
+        if let Some(processed) = &self.processed {
+            processed(version.clone(), outcome);
         }
+        tracing::debug!(%version, ?outcome, "Background release consumed");
+        Ok(outcome)
+    }
 
-        // Stage 2: reject replayed manifests that have aged past the policy window.
-        // This prevents an attacker from replaying a legitimately signed but
-        // stale manifest onto the gossip network to trigger a long-expired
-        // upgrade path or to keep the fleet churning on yesterday's release.
-        if let Err(e) = x0x::upgrade::monitor::validate_manifest_timestamp(&manifest) {
-            tracing::warn!(error = %e, version = %manifest.version,
-                "Rejecting stale gossip manifest (timestamp too old)");
-            continue;
-        }
-
-        // Rebroadcast with time-windowed dedup: allow re-rebroadcast every 5 minutes
-        // so late-connecting peers (e.g., after a peer restarts) still receive the manifest.
-        // Suppress manifests at or below our own version first; stale release-train
-        // manifests were the source of the fleet PubSub flood in Hunt 12e.
-        let payload_digest = release_manifest_payload_digest(&msg.payload);
-        let rebroadcast_decision = {
-            let mut self_published = self_published_release_manifests.lock().await;
-            decide_release_manifest_rebroadcast(
-                &manifest.version,
-                x0x::VERSION,
-                payload_digest,
-                &mut rebroadcasted_versions,
-                &mut self_published,
-                Instant::now(),
-            )
-        };
-
-        match rebroadcast_decision {
-            ReleaseRebroadcastDecision::Rebroadcast => {
-                tracing::info!(
-                    version = %manifest.version,
-                    "Rebroadcasting verified release manifest v{}",
-                    manifest.version
-                );
-                {
-                    let mut self_published = self_published_release_manifests.lock().await;
-                    self_published.record_payload(&msg.payload, Instant::now());
-                }
-                if let Err(e) = agent.publish(RELEASE_TOPIC, msg.payload.to_vec()).await {
-                    tracing::debug!(error = %e, "Failed to rebroadcast release manifest: {e}");
-                }
-            }
-            ReleaseRebroadcastDecision::SkipNotNewer => {
-                tracing::debug!(
-                    version = %manifest.version,
-                    "Already on v{} or newer, skipping rebroadcast",
-                    manifest.version
-                );
-                continue;
-            }
-            ReleaseRebroadcastDecision::SkipSelfPublished => {
-                tracing::debug!(
-                    version = %manifest.version,
-                    "Skipping rebroadcast of self-published release manifest v{}",
-                    manifest.version
-                );
-            }
-            ReleaseRebroadcastDecision::SkipRecentlyRebroadcasted => {
-                tracing::debug!(
-                    version = %manifest.version,
-                    "Already rebroadcasted v{} recently, skipping",
-                    manifest.version
-                );
-            }
-        }
-
-        // Ignore if we're already on this version or newer
-        if !is_newer(&manifest.version, x0x::VERSION) {
-            tracing::debug!(
-                version = %manifest.version,
-                "Already on latest version {}",
-                manifest.version
-            );
-            continue;
-        }
-
-        // Update SKILL.md if changed (independent of binary update)
-        update_skill_if_changed(&manifest, &data_dir).await;
-
-        // Skip versions that recently failed to apply. A release that can never
-        // succeed here would otherwise re-download and re-extract on every
-        // gossip receipt; the backoff caps that to one attempt per 30 minutes.
-        if let Some(failed_at) = failed_apply_versions.get(&manifest.version) {
-            if failed_at.elapsed() < APPLY_RETRY_AFTER {
-                tracing::debug!(
-                    version = %manifest.version,
-                    "Skipping recently failed upgrade v{} (apply backoff active)",
-                    manifest.version
-                );
-                continue;
-            }
-        }
-
-        tracing::info!(
-            version = %manifest.version,
-            "Applying upgrade immediately"
-        );
-
-        let _upgrade_guard = upgrade_apply_lock.lock().await;
-        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-            .with_stop_on_upgrade(config.stop_on_upgrade)
-            .with_restart_context(listener_restart_context(
-                &data_dir,
-                api_addr,
-                Arc::clone(&shutdown),
+    fn submit_inner(
+        &self,
+        verified: VerifiedRelease,
+    ) -> Result<SubmitOutcome, x0x::upgrade::UpgradeError> {
+        use std::cmp::Ordering as Cmp;
+        let error = |message: &str| x0x::upgrade::UpgradeError::Other(message.into());
+        x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
+        let version = semver::Version::parse(&verified.manifest.version)
+            .map_err(|_| error("invalid background release version"))?;
+        let platform = x0x::upgrade::manifest::current_platform_target()
+            .ok_or(x0x::upgrade::UpgradeError::UnsupportedPlatform)?;
+        verified
+            .manifest
+            .matches_platform(platform)
+            .ok_or(x0x::upgrade::UpgradeError::NoPlatformAsset)?;
+        #[cfg(unix)]
+        if !version.pre.is_empty() || version.to_string() != verified.manifest.version {
+            return Err(error(
+                "background staging requires a canonical stable release",
             ));
-        match upgrader.apply_upgrade_from_manifest(&manifest).await {
-            Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-                tracing::info!(%version, "Successfully upgraded to version {version}");
+        }
+        let mut slot = self
+            .slot
+            .lock()
+            .map_err(|_| error("background owner unavailable"))?;
+        if slot.closed {
+            return Err(error("background owner stopped"));
+        }
+        if let Some(previous) = &slot.latest {
+            let prior = semver::Version::parse(&previous.manifest.version)
+                .map_err(|_| error("invalid selected background release"))?;
+            match version.cmp_precedence(&prior) {
+                Cmp::Less => return Ok(SubmitOutcome::Older),
+                Cmp::Equal => {
+                    if verified.manifest.version != previous.manifest.version
+                        || verified.manifest_json != previous.manifest_json
+                    {
+                        return Err(error("equal-precedence background releases conflict"));
+                    }
+                    if slot.pending || slot.active.is_some() || slot.failed_at.is_none() {
+                        return Ok(SubmitOutcome::Duplicate);
+                    }
+                    if slot
+                        .failed_at
+                        .is_some_and(|failed| failed.elapsed() < Duration::from_secs(30 * 60))
+                    {
+                        return Ok(SubmitOutcome::Backoff);
+                    }
+                }
+                Cmp::Greater => {}
             }
-            Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
-                tracing::warn!(%reason, "Upgrade rolled back");
-                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
+        }
+        if let Some(active) = &slot.active {
+            active.cancel();
+        }
+        slot.latest = Some(Arc::new(verified));
+        slot.pending = true;
+        slot.failed_at = None;
+        drop(slot);
+        self.wake.notify_one();
+        Ok(SubmitOutcome::Accepted)
+    }
+
+    // The fallback used to skip both broadcast and apply for a failed
+    // version. Keep that policy while sharing the bounded failure slot.
+    fn in_retry_backoff(&self, verified: &VerifiedRelease) -> bool {
+        let Ok(slot) = self.slot.lock() else {
+            return false;
+        };
+        !slot.pending
+            && slot.active.is_none()
+            && slot.latest.as_ref().is_some_and(|prior| {
+                prior.manifest.version == verified.manifest.version
+                    && prior.manifest_json == verified.manifest_json
+            })
+            && slot
+                .failed_at
+                .is_some_and(|failed| failed.elapsed() < Duration::from_secs(30 * 60))
+    }
+
+    fn close(&self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.closed = true;
+        slot.pending = false;
+        if let Some(active) = &slot.active {
+            active.cancel();
+        }
+        self.wake.notify_waiters();
+    }
+}
+
+pub(in crate::server) struct BackgroundOwner {
+    submit: BackgroundSubmit,
+    runtime: BackgroundRuntime,
+}
+
+impl Drop for BackgroundOwner {
+    fn drop(&mut self) {
+        self.submit.close();
+    }
+}
+
+pub(in crate::server) fn background_channel(
+    runtime: BackgroundRuntime,
+) -> (BackgroundSubmit, BackgroundOwner) {
+    let submit = BackgroundSubmit::default();
+    (submit.clone(), BackgroundOwner { submit, runtime })
+}
+
+impl BackgroundOwner {
+    pub(in crate::server) async fn run(self) {
+        let mut shutdown = self.runtime.shutdown.1.clone();
+        loop {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                return;
             }
-            Err(e) => {
-                tracing::error!(error = %e, "Upgrade failed: {e}");
-                failed_apply_versions.insert(manifest.version.clone(), Instant::now());
-                schedule_probe_retry(
-                    &upgrader,
-                    &manifest,
-                    Arc::clone(&upgrade_apply_lock),
-                    shutdown_watch.clone(),
-                );
+            let notified = self.submit.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let next = {
+                let Ok(mut slot) = self.submit.slot.lock() else {
+                    return;
+                };
+                if slot.closed {
+                    return;
+                }
+                if slot.pending {
+                    let permit = ReleasePermit::default();
+                    #[cfg(test)]
+                    let permit = {
+                        let mut permit = permit;
+                        permit.observer = self.runtime.operation_observer.clone();
+                        permit
+                    };
+                    slot.active = Some(permit.clone());
+                    slot.pending = false;
+                    slot.latest.clone().map(|release| (release, permit))
+                } else {
+                    None
+                }
+            };
+            let Some((release, permit)) = next else {
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = shutdown.changed() => return,
+                }
+                continue;
+            };
+            // Submissions can cancel the permit and overwrite the single
+            // pending slot. They do not drop this future or spawn more workers.
+            let (_, result) = tokio::select! {
+                result = apply_background_release(&self.runtime, &release, &permit) => result,
+                _ = shutdown.changed() => { permit.cancel(); return; }
+            };
+            {
+                let Ok(mut slot) = self.submit.slot.lock() else {
+                    return;
+                };
+                slot.active = None;
+                if !slot.pending {
+                    slot.failed_at = if matches!(
+                        &result,
+                        Err(_) | Ok(x0x::upgrade::UpgradeResult::RolledBack { .. })
+                    ) {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                }
             }
-            _ => {}
+            match result {
+                Ok(result) => {
+                    tracing::info!(?result, version = %release.manifest.version, "Background apply finished")
+                }
+                Err(error) => {
+                    tracing::warn!(%error, version = %release.manifest.version, "Background apply stopped")
+                }
+            }
         }
     }
 }
 
-/// Background GitHub fallback poll (safety net, every 48h by default).
-/// Also broadcasts discovered manifests to gossip and syncs SKILL.md.
-///
-/// Tracks versions that failed to apply (e.g. due to hash mismatch) and skips
-/// them for 30 minutes before retrying. A newer release superseding the failed
-/// version will be picked up immediately.
+async fn apply_background_release(
+    runtime: &BackgroundRuntime,
+    verified: &VerifiedRelease,
+    permit: &ReleasePermit,
+) -> (
+    AutoApplyUpgrader,
+    Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>,
+) {
+    let upgrader = AutoApplyUpgrader::new("x0xd")
+        .with_stop_on_upgrade(runtime.config.stop_on_upgrade)
+        .with_restart_context(listener_restart_context(
+            &runtime.data_dir,
+            runtime.api_addr,
+            Arc::clone(&runtime.shutdown.0),
+        ))
+        .with_release_permit(permit.clone());
+    #[cfg(unix)]
+    let upgrader = match background_staging_request(runtime, verified) {
+        Ok(request) => {
+            let upgrader = upgrader.with_staging_request(request);
+            #[cfg(test)]
+            let upgrader = upgrader
+                .with_staging_clock(runtime.staging.clock.clone())
+                .with_staging_observer(runtime.staging.observed.clone());
+            upgrader
+        }
+        Err(error) => return (upgrader, Err(error)),
+    };
+    let mut shutdown = runtime.shutdown.1.clone();
+    let result = async {
+        if !runtime.config.enabled {
+            return Err(x0x::upgrade::UpgradeError::Other("background updates disabled".into()));
+        }
+        #[cfg(unix)]
+        upgrader.wait_for_staging(&mut shutdown).await?;
+        permit.check()?;
+        // Retain the legacy guide update only after rollout is due. This is
+        // not candidate health acceptance or the later host-commit promotion.
+        update_skill_inner(
+            &verified.manifest,
+            &runtime.data_dir,
+            Some(shutdown.clone()),
+            Some(permit.clone()),
+            #[cfg(unix)]
+            Some(&upgrader),
+        ).await;
+        permit.check()?;
+        let result = {
+            let _guard = tokio::select! {
+                guard = runtime.apply_lock.lock() => guard,
+                _ = permit.cancelled() => return Err(x0x::upgrade::UpgradeError::Other("background release cancelled".into())),
+                _ = shutdown.changed() => return Err(x0x::upgrade::UpgradeError::Other("background shutdown".into())),
+            };
+            permit.check()?;
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                return Err(x0x::upgrade::UpgradeError::Other("background shutdown".into()));
+            }
+            x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
+            upgrader.apply_upgrade_from_manifest(&verified.manifest).await
+        };
+        if result.is_ok() { return result; }
+        permit.check()?;
+        // A retry remains part of this release's owned future. Never detach a
+        // timer after the listener has superseded its release or stopped.
+        #[cfg(unix)]
+        let install = runtime.staging.install.clone();
+        #[cfg(not(unix))]
+        let install = x0x::upgrade::apply::current_binary_path()?.canonicalize()
+            .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))?;
+        let Some(_retry_owner) = x0x::upgrade::probe_retry::claim_retry(install, verified.manifest.version.clone()) else { return result; };
+        match x0x::upgrade::probe_retry::run_retry_loop(
+            &runtime.apply_lock, &mut shutdown,
+            || async { permit.check()?; upgrader.probe_retry_delay(&verified.manifest.version).await },
+            || async {
+                permit.check()?;
+                x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
+                upgrader.apply_upgrade_from_manifest(&verified.manifest).await
+            },
+        ).await? {
+            Some(value) => Ok(value),
+            None => result,
+        }
+    }.await;
+    (upgrader, result)
+}
+
+#[cfg(unix)]
+fn background_staging_request(
+    runtime: &BackgroundRuntime,
+    verified: &VerifiedRelease,
+) -> Result<crate::upgrade::staging::StagingRequest, x0x::upgrade::UpgradeError> {
+    let platform = x0x::upgrade::manifest::current_platform_target()
+        .ok_or(x0x::upgrade::UpgradeError::UnsupportedPlatform)?;
+    let asset = verified
+        .manifest
+        .matches_platform(platform)
+        .ok_or(x0x::upgrade::UpgradeError::NoPlatformAsset)?;
+    Ok(crate::upgrade::staging::StagingRequest {
+        install: runtime.staging.install.clone(),
+        data_root: runtime
+            .data_dir
+            .canonicalize()
+            .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))?,
+        identity_root: runtime.staging.identity_root.clone(),
+        machine_id: runtime.staging.machine_id,
+        version: verified.manifest.version.clone(),
+        manifest_sha256: Sha256::digest(&verified.manifest_json).into(),
+        archive_sha256: asset.archive_sha256,
+        window_minutes: runtime.config.rollout_window_minutes,
+    })
+}
+
+/// Gossip remains the primary release source. Verification retains the exact
+/// signed bytes; the shared owner alone performs the potentially long wait.
+pub(in crate::server) async fn run_gossip_update_listener(
+    agent: Arc<Agent>,
+    submit: Option<BackgroundSubmit>,
+    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    shutdown: watch::Receiver<bool>,
+) {
+    let subscription = match agent.subscribe(RELEASE_TOPIC).await {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            tracing::warn!(%error, "Failed to subscribe to release topic");
+            return;
+        }
+    };
+    let releases = futures::stream::unfold(subscription, |mut subscription| async move {
+        loop {
+            let message = subscription.recv().await?;
+            if let Some(verified) = verify_gossip_release(&message.payload) {
+                return Some((verified, subscription));
+            }
+        }
+    });
+    run_gossip_update_driver(
+        releases,
+        submit,
+        self_published,
+        move |payload| {
+            let agent = Arc::clone(&agent);
+            async move {
+                agent
+                    .publish(RELEASE_TOPIC, payload)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        },
+        shutdown,
+    )
+    .await;
+}
+
+fn verify_gossip_release(payload: &[u8]) -> Option<VerifiedRelease> {
+    let (json, signature) = decode_signed_manifest(payload).ok()?;
+    let manifest: ReleaseManifest = serde_json::from_slice(json).ok()?;
+    if !is_newer(&manifest.version, x0x::VERSION) {
+        return None;
+    }
+    if let Err(error) = verify_manifest_signature(json, signature) {
+        tracing::warn!(%error, "Release manifest signature verification failed");
+        return None;
+    }
+    if let Err(error) = x0x::upgrade::monitor::validate_manifest_timestamp(&manifest) {
+        tracing::warn!(%error, "Rejecting stale gossip manifest");
+        return None;
+    }
+    Some(VerifiedRelease {
+        manifest,
+        manifest_json: json.to_vec(),
+        signature: signature.to_vec(),
+        gossip_payload: payload.to_vec(),
+    })
+}
+
+/// Production loop after the real signature verifier. Tests replace only
+/// release input and network publication, leaving dedup and submission intact.
+async fn run_gossip_update_driver<S, Publish, PublishFuture>(
+    releases: S,
+    submit: impl Into<Option<BackgroundSubmit>>,
+    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    mut publish: Publish,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    S: Stream<Item = VerifiedRelease>,
+    Publish: FnMut(Vec<u8>) -> PublishFuture,
+    PublishFuture: Future<Output = Result<(), String>>,
+{
+    let submit = submit.into();
+    futures::pin_mut!(releases);
+    let mut rebroadcasted = HashMap::new();
+    loop {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return;
+        }
+        let verified = tokio::select! {
+            release = releases.next() => match release { Some(release) => release, None => return },
+            _ = shutdown.changed() => return,
+        };
+        let decision = {
+            let mut published = self_published.lock().await;
+            decide_release_manifest_rebroadcast(
+                &verified.manifest.version,
+                x0x::VERSION,
+                release_manifest_payload_digest(&verified.gossip_payload),
+                &mut rebroadcasted,
+                &mut published,
+                Instant::now(),
+            )
+        };
+        if decision == ReleaseRebroadcastDecision::SkipNotNewer {
+            continue;
+        }
+        if decision == ReleaseRebroadcastDecision::Rebroadcast {
+            self_published
+                .lock()
+                .await
+                .record_payload(&verified.gossip_payload, Instant::now());
+            // Keep publication bounded; no detached task accumulates while the
+            // owner waits for rollout or another process's canonical lock.
+            tokio::select! {
+                result = tokio::time::timeout(Duration::from_secs(10), publish(verified.gossip_payload.clone())) => {
+                    if !matches!(result, Ok(Ok(()))) { tracing::debug!("Release rebroadcast did not complete"); }
+                }
+                _ = shutdown.changed() => return,
+            }
+        }
+        if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
+            tracing::warn!(%error, "Gossip release was not queued");
+        }
+    }
+}
+
 pub(in crate::server) async fn run_fallback_github_poll(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
-    data_dir: PathBuf,
-    upgrade_apply_lock: Arc<Mutex<()>>,
-    self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
-    api_addr: SocketAddr,
-    shutdown: UpdateShutdown,
+    submit: Option<BackgroundSubmit>,
+    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    shutdown: watch::Receiver<bool>,
 ) {
-    let (shutdown, shutdown_watch) = shutdown;
-    let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
+    let interval = Duration::from_secs(config.fallback_check_interval_minutes.saturating_mul(60));
+    if interval.is_zero() {
+        return;
+    }
+    if tokio::time::Instant::now().checked_add(interval).is_none() {
+        tracing::warn!("Fallback check interval exceeds the monotonic timer range");
+        return;
+    }
     let mut ticker = tokio::time::interval(interval);
-    // Skip first tick: the startup check covers the boot window (it runs
-    // concurrently as a post-bind background task, #1086), so the poll's
-    // first fetch waits one full interval instead of racing it.
-    ticker.tick().await;
-
-    let mut failed_version: Option<(String, Instant)> = None;
-    const RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
-
-    loop {
+    ticker.tick().await; // startup already owns the immediate check
+    let ticks = futures::stream::unfold(ticker, |mut ticker| async move {
         ticker.tick().await;
-        tracing::debug!("Fallback GitHub check");
-
-        // Clear expired failure skip
-        if let Some((_, failed_at)) = &failed_version {
-            if failed_at.elapsed() >= RETRY_AFTER {
-                tracing::info!("Retry timeout elapsed, clearing failed version skip");
-                failed_version = None;
+        Some(((), ticker))
+    });
+    run_fallback_update_driver(
+        ticks,
+        move || {
+            let config = config.clone();
+            async move {
+                let monitor = UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION)
+                    .map_err(x0x::upgrade::UpgradeError::Other)?
+                    .with_include_prereleases(config.include_prereleases);
+                monitor.check_for_updates().await
             }
-        }
+        },
+        submit,
+        self_published,
+        move |payload| {
+            let agent = Arc::clone(&agent);
+            async move {
+                agent
+                    .publish(RELEASE_TOPIC, payload)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        },
+        shutdown,
+    )
+    .await;
+}
 
-        let monitor = match UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION) {
-            Ok(m) => m.with_include_prereleases(config.include_prereleases),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to create upgrade monitor: {e}");
+/// Production ticker/check loop. Tests supply inert ticks and already-verified
+/// monitor results, not a replacement scheduling implementation.
+async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFuture>(
+    ticks: S,
+    mut check: Check,
+    submit: impl Into<Option<BackgroundSubmit>>,
+    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    mut publish: Publish,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    S: Stream<Item = ()>,
+    Check: FnMut() -> CheckFuture,
+    CheckFuture: Future<Output = Result<Option<VerifiedRelease>, x0x::upgrade::UpgradeError>>,
+    Publish: FnMut(Vec<u8>) -> PublishFuture,
+    PublishFuture: Future<Output = Result<(), String>>,
+{
+    let submit = submit.into();
+    futures::pin_mut!(ticks);
+    loop {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return;
+        }
+        tokio::select! {
+            tick = ticks.next() => if tick.is_none() { return; },
+            _ = shutdown.changed() => return,
+        }
+        let checked = tokio::select! {
+            result = check() => result,
+            _ = shutdown.changed() => return,
+        };
+        let verified = match checked {
+            Ok(Some(verified)) => verified,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%error, "Fallback GitHub check failed");
                 continue;
             }
         };
-
-        match monitor.check_for_updates().await {
-            Ok(Some(verified)) => {
-                // Skip versions that recently failed to apply
-                if let Some((ref ver, _)) = failed_version {
-                    if ver == &verified.manifest.version {
-                        tracing::debug!(
-                            version = %verified.manifest.version,
-                            "Skipping recently failed version {}",
-                            verified.manifest.version
-                        );
-                        continue;
-                    }
-                }
-
-                tracing::info!(
-                    new_version = %verified.manifest.version,
-                    "Fallback check: new version found via GitHub"
-                );
-
-                // Update SKILL.md (independent of binary update)
-                update_skill_if_changed(&verified.manifest, &data_dir).await;
-
-                // Broadcast to gossip with timeout — don't let dead peers block upgrade
-                let publish_payload = verified.gossip_payload.clone();
-                let publish_agent = agent.clone();
-                let self_published_for_publish = Arc::clone(&self_published_release_manifests);
-                tokio::spawn(async move {
-                    {
-                        let mut self_published = self_published_for_publish.lock().await;
-                        self_published.record_payload(&publish_payload, Instant::now());
-                    }
-                    match tokio::time::timeout(
-                        Duration::from_secs(10),
-                        publish_agent.publish(RELEASE_TOPIC, publish_payload),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            tracing::debug!("Broadcast discovered release to gossip");
-                        }
-                        Ok(Err(e)) => {
-                            tracing::debug!(error = %e, "Failed to broadcast discovered release: {e}");
-                        }
-                        Err(_) => {
-                            tracing::debug!(
-                                "Gossip broadcast timed out (peers may be unreachable)"
-                            );
-                        }
-                    }
-                });
-
-                let _upgrade_guard = upgrade_apply_lock.lock().await;
-                let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-                    .with_stop_on_upgrade(config.stop_on_upgrade)
-                    .with_restart_context(listener_restart_context(
-                        &data_dir,
-                        api_addr,
-                        Arc::clone(&shutdown),
-                    ));
-                match upgrader
-                    .apply_upgrade_from_manifest(&verified.manifest)
-                    .await
-                {
-                    Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-                        tracing::info!(%version, "Fallback upgrade successful");
-                    }
-                    Ok(x0x::upgrade::UpgradeResult::RolledBack { reason }) => {
-                        tracing::warn!(%reason, "Fallback upgrade rolled back");
-                        failed_version = Some((verified.manifest.version.clone(), Instant::now()));
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Fallback upgrade failed: {e}");
-                        failed_version = Some((verified.manifest.version.clone(), Instant::now()));
-                        schedule_probe_retry(
-                            &upgrader,
-                            &verified.manifest,
-                            Arc::clone(&upgrade_apply_lock),
-                            shutdown_watch.clone(),
-                        );
-                    }
-                    _ => {}
-                }
+        if let Some(submit) = submit
+            .as_ref()
+            .filter(|submit| submit.in_retry_backoff(&verified))
+        {
+            if let Err(error) = submit.submit(verified) {
+                tracing::warn!(%error, "Fallback release backoff could not be observed");
             }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "Fallback GitHub check failed: {e}");
+            continue;
+        }
+        self_published
+            .lock()
+            .await
+            .record_payload(&verified.gossip_payload, Instant::now());
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(10), publish(verified.gossip_payload.clone())) => {
+                if !matches!(result, Ok(Ok(()))) { tracing::debug!("Fallback release broadcast did not complete"); }
             }
+            _ = shutdown.changed() => return,
+        }
+        if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
+            tracing::warn!(%error, "Fallback release was not queued");
         }
     }
 }
@@ -985,6 +1285,7 @@ async fn update_skill_while_running(
         manifest,
         data_dir,
         writer_shutdown,
+        None,
         #[cfg(unix)]
         upgrader,
     );
@@ -1109,8 +1410,15 @@ async fn update_skill_inner(
     manifest: &ReleaseManifest,
     data_dir: &std::path::Path,
     shutdown: Option<watch::Receiver<bool>>,
+    permit: Option<ReleasePermit>,
     #[cfg(unix)] upgrader: Option<&crate::upgrade::apply::AutoApplyUpgrader>,
 ) {
+    if permit
+        .as_ref()
+        .is_some_and(|permit| permit.check().is_err())
+    {
+        return;
+    }
     let skill_path = data_dir.join("SKILL.md");
 
     let local_hash = match tokio::fs::read(&skill_path).await {
@@ -1131,7 +1439,15 @@ async fn update_skill_inner(
 
     tracing::info!("Updating SKILL.md from signed manifest");
 
-    match download_skill(&manifest.skill_url).await {
+    let downloaded = if let Some(permit) = &permit {
+        tokio::select! {
+            result = download_skill(&manifest.skill_url) => result,
+            _ = permit.cancelled() => return,
+        }
+    } else {
+        download_skill(&manifest.skill_url).await
+    };
+    match downloaded {
         Ok(new_contents) => {
             let new_hash: [u8; 32] = Sha256::digest(&new_contents).into();
             if new_hash != manifest.skill_sha256 {
@@ -1142,6 +1458,8 @@ async fn update_skill_inner(
             // The earlier Due decision cannot authorize this later write.
             #[cfg(unix)]
             let staged_guide = match upgrader {
+                // The release owner drains this actual readback even when
+                // superseded; do not select cancellation around this await.
                 Some(upgrader) => match upgrader.guide_staging().await {
                     Ok(staging) => staging,
                     Err(error) => {
@@ -1175,65 +1493,68 @@ async fn update_skill_inner(
                 std::process::id(),
                 SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
-            let install = x0x::upgrade::apply::run_owned_blocking(move |caller_alive| {
-                #[cfg(test)]
-                let observation = skill_install_seam::entered(&skill_path);
-                if !caller_alive.load(Ordering::Acquire)
-                    || shutdown
-                        .as_ref()
-                        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
-                {
-                    return Err(x0x::upgrade::UpgradeError::Other(
-                        "guide update cancelled before install lock".into(),
-                    ));
-                }
-                #[cfg(unix)]
-                let _install_lock = staged_guide
-                    .as_ref()
-                    .map(|(install, _, _)| crate::upgrade::acquire_host_upgrade_lock(install))
-                    .transpose()?;
-                // Watch value custody orders a shutdown signal against
-                // this short atomic install. A cancelled queued worker
-                // cannot begin it after its observer has gone away.
-                let shutdown_value = shutdown.as_ref().map(watch::Receiver::borrow);
-                if !caller_alive.load(Ordering::Acquire)
-                    || shutdown_value.as_ref().is_some_and(|value| **value)
-                    || shutdown
-                        .as_ref()
-                        .is_some_and(|rx| rx.has_changed().is_err())
-                {
-                    return Err(x0x::upgrade::UpgradeError::Other(
-                        "guide update cancelled before install".into(),
-                    ));
-                }
-                #[cfg(unix)]
-                if let Some((install, gate, identity)) = &staged_guide {
-                    let clock = gate
-                        .clock()
-                        .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))?;
-                    if let crate::upgrade::staging::Decision::Waiting(wait) =
-                        gate.observe_locked_at(install, &clock, identity)?
+            let install = x0x::upgrade::apply::run_owned_blocking_with_permit(
+                permit.as_ref(),
+                move |caller_alive| {
+                    #[cfg(test)]
+                    let observation = skill_install_seam::entered(&skill_path);
+                    if !caller_alive.load(Ordering::Acquire)
+                        || shutdown
+                            .as_ref()
+                            .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
                     {
-                        return Err(x0x::upgrade::UpgradeError::Other(format!(
-                            "guide staging is not due; remaining {} seconds",
-                            wait.as_secs()
-                        )));
+                        return Err(x0x::upgrade::UpgradeError::Other(
+                            "guide update cancelled before install lock".into(),
+                        ));
                     }
-                }
-                if !caller_alive.load(Ordering::Acquire) {
-                    return Err(x0x::upgrade::UpgradeError::Other(
-                        "guide update cancelled after staging check".into(),
-                    ));
-                }
-                #[cfg(test)]
-                observation.before_write();
-                let result = std::fs::write(&tmp_path, &new_contents)
-                    .and_then(|()| std::fs::rename(&tmp_path, &skill_path));
-                if result.is_err() {
-                    let _ = std::fs::remove_file(&tmp_path);
-                }
-                result.map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))
-            });
+                    #[cfg(unix)]
+                    let _install_lock = staged_guide
+                        .as_ref()
+                        .map(|(install, _, _)| crate::upgrade::acquire_host_upgrade_lock(install))
+                        .transpose()?;
+                    // Watch value custody orders a shutdown signal against
+                    // this short atomic install. A cancelled queued worker
+                    // cannot begin it after its observer has gone away.
+                    let shutdown_value = shutdown.as_ref().map(watch::Receiver::borrow);
+                    if !caller_alive.load(Ordering::Acquire)
+                        || shutdown_value.as_ref().is_some_and(|value| **value)
+                        || shutdown
+                            .as_ref()
+                            .is_some_and(|rx| rx.has_changed().is_err())
+                    {
+                        return Err(x0x::upgrade::UpgradeError::Other(
+                            "guide update cancelled before install".into(),
+                        ));
+                    }
+                    #[cfg(unix)]
+                    if let Some((install, gate, identity)) = &staged_guide {
+                        let clock = gate.clock().map_err(|error| {
+                            x0x::upgrade::UpgradeError::Other(error.to_string())
+                        })?;
+                        if let crate::upgrade::staging::Decision::Waiting(wait) =
+                            gate.observe_locked_at(install, &clock, identity)?
+                        {
+                            return Err(x0x::upgrade::UpgradeError::Other(format!(
+                                "guide staging is not due; remaining {} seconds",
+                                wait.as_secs()
+                            )));
+                        }
+                    }
+                    if !caller_alive.load(Ordering::Acquire) {
+                        return Err(x0x::upgrade::UpgradeError::Other(
+                            "guide update cancelled after staging check".into(),
+                        ));
+                    }
+                    #[cfg(test)]
+                    observation.before_write();
+                    let result = std::fs::write(&tmp_path, &new_contents)
+                        .and_then(|()| std::fs::rename(&tmp_path, &skill_path));
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                    result.map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))
+                },
+            );
             match install.await {
                 Ok(()) => tracing::info!("SKILL.md updated successfully"),
                 Err(e) => {
@@ -1565,6 +1886,17 @@ mod tests {
     ));
     #[cfg(unix)]
     staging_supersession_regression_tests!();
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_background_staging.rs"
+    ));
+    #[cfg(unix)]
+    background_staging_regression_tests!();
+    #[cfg(unix)]
+    background_driver_regression_tests!();
+    #[cfg(unix)]
+    background_init_regression_tests!();
 
     use super::*;
     use crate::upgrade::restart;
