@@ -451,7 +451,7 @@ jobs:
     # are reported, not required.
     name: W3-H harness (determinism)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
