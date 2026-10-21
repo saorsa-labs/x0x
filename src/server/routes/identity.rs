@@ -1101,10 +1101,11 @@ pub(in crate::server) async fn import_agent_card(
         }
     }
 
-    // ADR-0074 §1 / ADR-0079: a durable owner may bind a petname from a
-    // certified card when the contact is Known or Trusted (see
-    // `bind_owner_from_card`). Unknown and Blocked stay unbound. Session
-    // and rider imports still add the contact — they never write a binding.
+    // ADR 0074 §1 (a deliberately narrower reading): a durable owner may
+    // bind a petname from a certified card when the contact is Known or
+    // Trusted (see `bind_owner_from_card`). Unknown and Blocked stay
+    // unbound. Session and rider imports still add the contact — they
+    // never write a binding.
     let durable = actor
         .as_ref()
         .is_some_and(|axum::extract::Extension(a)| a.is_durable_owner());

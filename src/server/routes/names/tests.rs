@@ -506,7 +506,8 @@ async fn card_import_retry_reports_fsync_error_until_durability_confirms() -> an
     Ok(())
 }
 
-/// WHY: ADR-0079 contact gate — Trusted binds once, the same as Known
+/// WHY: ADR 0074 §1 (a deliberately narrower reading). Trusted binds once,
+/// the same as Known
 /// (covered by `signed_card_import_binds_owner_petname_once`). A later
 /// different user at Trusted onto the same label is `conflict` and does
 /// not rebind.
