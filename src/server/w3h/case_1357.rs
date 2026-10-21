@@ -59,8 +59,10 @@
 //!   revocation does nothing more; after S4 the revocation must not rekey
 //!   a second time.
 //! - `s4_restart_intake_prepare` (RED on `main`, GREEN with S4). Nodes A, B, C. At t = 0
-//!   B revokes its own agent; once A and C hold the record, A is
-//!   crash-stopped and restarted on the same dirs; 100 ms after the
+//!   B revokes its own agent; once A and C hold the record and A's intake
+//!   is durable (its `.evs` row for B exists), A is crash-stopped (still
+//!   at e0, a precondition stage) and restarted on the same dirs; 100 ms
+//!   after the
 //!   restart B sends the revocation again (the duplicate trigger). A must
 //!   still hold the record. Desired: H within the restart sync wait plus
 //!   the completion bound from the restart ([`Bound::Restart`]), with
@@ -309,7 +311,7 @@ struct Arm {
     holders: &'static [&'static str],
     hold: Hold,
     trigger: Trigger,
-    /// Crash A once it holds the trigger, restart it on the same dirs, and
+    /// Crash A once its intake is durable, restart it on the same dirs, and
     /// send B's revocation again 100 ms after the restart.
     restart_a: bool,
     /// D calls the public remove API on B after the trigger.
@@ -1437,10 +1439,21 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // Crash A after durable intake, restart it, then a duplicate trigger.
     let mut duplicate: Option<String> = None;
     if arm.restart_a {
-        sim.within("A's intake is durable", secs(2), async {
-            tokio::time::sleep(secs(1)).await;
+        // Crash A as soon as its intake is durable (its `.evs` row for B
+        // exists), not after a fixed delay: t = 0 is past A's sync wait,
+        // so A could otherwise seal before the crash and the arm would not
+        // test the restart.
+        sim.until("A's intake is durable", EVIDENCE, async |s: &Sim| {
+            persisted_t_obs(s, "A", b.as_bytes()).is_ok_and(|t_obs| t_obs.is_some())
         })
         .await?;
+        let at_crash = view(sim, "A", &group, &b).await?;
+        receipt.evidence(
+            "a_crashes_after_durable_intake_before_any_exclusion",
+            at_crash.epoch == Some(e0),
+            format!("A at the crash: {}", at_crash.describe()),
+            at(sim),
+        );
         sim.stop("A", RestartMode::Crash).await?;
         sim.start_again("A").await?;
         sim.until("A and C reconnect", SETUP, async |s: &Sim| {
