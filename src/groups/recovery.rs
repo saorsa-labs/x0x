@@ -1050,6 +1050,309 @@ pub fn decode_message(payload: &[u8]) -> Result<GroupRecoveryMessageV1, Recovery
     Ok(message)
 }
 
+// ─── §3a The promoted-admin re-seat mandate ────────────────────────────────
+
+/// The promoted-admin re-seat mandate domain (§3a). Distinct from the
+/// invite-secret mandate domain, ADR 0114's repair-mandate domains and the
+/// owner join domain.
+pub const RESEAT_MANDATE_DOMAIN: &[u8] = b"x0x/owner-axis/reseat-mandate-admin/v1";
+
+/// The genesis hash a mandate binds (§3a field 1): BLAKE3 over the
+/// length-prefixed genesis fields, or over the stable ID alone when this
+/// node holds no genesis record.
+#[must_use]
+pub fn genesis_hash(info: &GroupInfo) -> String {
+    let mut out = Preimage::new(b"x0x.group-genesis-hash.v1");
+    match info.genesis.as_ref() {
+        Some(genesis) => {
+            out.str(&genesis.group_id)
+                .str(&genesis.creator_agent_id)
+                .u64(genesis.created_at)
+                .str(&genesis.creation_nonce);
+        }
+        None => {
+            out.str(info.stable_group_id());
+        }
+    }
+    blake3::hash(&out.finish()).to_hex().to_string()
+}
+
+/// The unsigned fields of `ReseatMandateV1`, in preimage order (§3a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReseatMandateFields {
+    /// (1) The owner user ID (hex).
+    pub owner_user_id: String,
+    /// (1) The stable group ID.
+    pub group_id: String,
+    /// (1) [`genesis_hash`] of the group.
+    pub genesis_hash: String,
+    /// (2) The signing admin (hex agent ID).
+    pub signer: String,
+    /// (2) The subject (hex agent ID).
+    pub subject: String,
+    /// (3) The state hash of the commit that first seated the subject.
+    pub seating_commit_hash: String,
+    /// (4) The state hash of the subject's removal commit (the `Removal`
+    /// basis).
+    pub removal_commit_hash: String,
+    /// (5) The parent commit hash the re-seat `MemberAdded` links from.
+    pub parent_commit_hash: String,
+    /// (6) The expected terminal roster projection hash (the roster root
+    /// after the add, not the enclosing state hash).
+    pub terminal_roster_hash: String,
+    /// (7) The re-seat invite's secret hash.
+    pub invite_secret_hash: String,
+    /// (7) The `ReseatAuthorisation` digest (hex).
+    pub authorisation_digest: String,
+    /// (8) The subject's KeyPackage hash.
+    pub key_package_hash: String,
+    /// (8) The native epoch the subject joins at.
+    pub epoch: u64,
+    /// (9) The subject's owner certificate digest.
+    pub certificate_digest: String,
+    /// (10) The policy hash.
+    pub policy_hash: String,
+    /// (11) The exact role the subject receives.
+    pub role: GroupRole,
+    /// The signer's agent public key (hex); its SHA-256 is `signer`.
+    pub signer_public_key: String,
+}
+
+impl ReseatMandateFields {
+    fn preimage(&self) -> Vec<u8> {
+        let role = serde_json::to_string(&self.role).unwrap_or_default();
+        Preimage::new(RESEAT_MANDATE_DOMAIN)
+            .str(&self.owner_user_id)
+            .str(&self.group_id)
+            .str(&self.genesis_hash)
+            .str(&self.signer)
+            .str(&self.subject)
+            .str(&self.seating_commit_hash)
+            .str(&self.removal_commit_hash)
+            .str(&self.parent_commit_hash)
+            .str(&self.terminal_roster_hash)
+            .str(&self.invite_secret_hash)
+            .str(&self.authorisation_digest)
+            .str(&self.key_package_hash)
+            .u64(self.epoch)
+            .str(&self.certificate_digest)
+            .str(&self.policy_hash)
+            .str(&role)
+            .str(&self.signer_public_key)
+            .finish()
+    }
+}
+
+/// A signed promoted-admin re-seat mandate (§3a), carried in a re-seat
+/// `MemberAdded` in place of the owner mandate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReseatMandateV1 {
+    /// The signed fields.
+    pub fields: ReseatMandateFields,
+    /// ML-DSA-65 signature (hex) by the signer's agent key.
+    pub signature: String,
+}
+
+impl ReseatMandateV1 {
+    /// Sign with the admin's agent key.
+    ///
+    /// # Errors
+    ///
+    /// [`RecoveryRefusal::BadSignature`] when the keypair is not the signer.
+    pub fn sign(
+        fields: ReseatMandateFields,
+        keypair: &AgentKeypair,
+    ) -> Result<Self, RecoveryRefusal> {
+        if hex::encode(keypair.agent_id().as_bytes()) != fields.signer
+            || hex::encode(keypair.public_key().as_bytes()) != fields.signer_public_key
+        {
+            return Err(RecoveryRefusal::BadSignature);
+        }
+        let signature = sign_agent(keypair, &fields.preimage())?;
+        Ok(Self { fields, signature })
+    }
+
+    fn verify_signature(&self) -> Result<(), RecoveryRefusal> {
+        verify_agent_signature(
+            &self.fields.signer,
+            &self.fields.signer_public_key,
+            &self.fields.preimage(),
+            &self.signature,
+        )
+    }
+}
+
+/// Why a receiver refuses a re-seat `MemberAdded` (§3a acceptance rule,
+/// checks 1 to 8 in order): `reseat_mandate_invalid {cause}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReseatMandateCause {
+    /// (1) The signature, or `committed_by` is not the signer.
+    Signature,
+    /// (2) The signer holds no current Admin seat at the parent commit.
+    SignerNotAdmin,
+    /// (3) The policy hash or the owner does not match the parent.
+    PolicyMismatch,
+    /// (4) The seating commit is not on the chain or did not seat the subject.
+    NotPreviouslySeated,
+    /// (5) The removal commit is not on the chain, did not remove the
+    /// subject, was not committed by the signer, or a later commit seats,
+    /// bans or revokes the subject.
+    RemovalMismatch,
+    /// (6) The certificate does not match the bound digest or the owner.
+    CertificateInvalid,
+    /// (7) The role is higher than before the removal.
+    RoleRaised,
+    /// (8) The parent, KeyPackage, epoch or roster binding differs from the
+    /// commit.
+    BindingMismatch,
+}
+
+impl ReseatMandateCause {
+    /// The typed cause string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Signature => "signature",
+            Self::SignerNotAdmin => "signer_not_admin",
+            Self::PolicyMismatch => "policy_mismatch",
+            Self::NotPreviouslySeated => "not_previously_seated",
+            Self::RemovalMismatch => "removal_mismatch",
+            Self::CertificateInvalid => "certificate_invalid",
+            Self::RoleRaised => "role_raised",
+            Self::BindingMismatch => "binding_mismatch",
+        }
+    }
+}
+
+/// What a receiver checks a re-seat `MemberAdded` against (§3a).
+pub struct ReseatMandateCheck<'a> {
+    /// The receiver's current verified record (the parent of the commit).
+    pub parent: &'a GroupInfo,
+    /// The signed `MemberAdded` commit.
+    pub commit: &'a crate::groups::state_commit::GroupStateCommit,
+    /// The added agent (hex).
+    pub subject: &'a str,
+    /// The event's KeyPackage hash.
+    pub key_package_hash: Option<&'a str>,
+    /// The event's TreeKEM epoch.
+    pub epoch: Option<u64>,
+    /// The role the commit seats the subject with.
+    pub seated_role: GroupRole,
+    /// The digest of the subject's committed certificate.
+    pub certificate_digest: Option<&'a str>,
+    /// The certificate verifies against the owner: valid, unexpired and
+    /// unrevoked (the caller runs the owner-certificate check).
+    pub certificate_valid: bool,
+    /// The subject's agent is revoked on this receiver.
+    pub subject_revoked: bool,
+}
+
+/// The §3a acceptance rule. Returns the first failed check.
+///
+/// # Errors
+///
+/// The [`ReseatMandateCause`] of the first failed check.
+pub fn verify_reseat_mandate(
+    mandate: &ReseatMandateV1,
+    check: &ReseatMandateCheck<'_>,
+) -> Result<(), ReseatMandateCause> {
+    let fields = &mandate.fields;
+    let parent = check.parent;
+    // 1.
+    if mandate.verify_signature().is_err()
+        || !check
+            .commit
+            .committed_by
+            .eq_ignore_ascii_case(&fields.signer)
+        || !fields.subject.eq_ignore_ascii_case(check.subject)
+    {
+        return Err(ReseatMandateCause::Signature);
+    }
+    // 2.
+    if !signer_is_active_admin(parent, &fields.signer) {
+        return Err(ReseatMandateCause::SignerNotAdmin);
+    }
+    // 3.
+    let owner = parent.policy.admission.owner_certified_user_id();
+    if fields.policy_hash != crate::groups::compute_policy_hash(&parent.policy)
+        || owner.map(|owner| hex::encode(owner.as_bytes())).as_deref()
+            != Some(fields.owner_user_id.as_str())
+        || fields.group_id != parent.stable_group_id()
+        || fields.genesis_hash != genesis_hash(parent)
+    {
+        return Err(ReseatMandateCause::PolicyMismatch);
+    }
+    // 4.
+    let log = &parent.commit_log;
+    let seated_by = |entry: &crate::groups::state_commit::RetainedCommit| {
+        entry
+            .roster
+            .get(check.subject)
+            .is_some_and(|member| member.state == GroupMemberState::Active)
+    };
+    let seating = log
+        .iter()
+        .find(|entry| entry.commit.state_hash == fields.seating_commit_hash);
+    let seating_ok = seating.is_some_and(|entry| {
+        seated_by(entry)
+            && log
+                .iter()
+                .find(|prior| prior.commit.revision.saturating_add(1) == entry.commit.revision)
+                .is_none_or(|prior| !seated_by(prior))
+    });
+    if !seating_ok {
+        return Err(ReseatMandateCause::NotPreviouslySeated);
+    }
+    // 5.
+    let Some(removal) = log
+        .iter()
+        .find(|entry| entry.commit.state_hash == fields.removal_commit_hash)
+    else {
+        return Err(ReseatMandateCause::RemovalMismatch);
+    };
+    let removal_ok = removal_commit_on_chain(
+        parent,
+        check.subject,
+        removal.commit.revision,
+        &removal.commit.state_hash,
+    ) && removal
+        .commit
+        .committed_by
+        .eq_ignore_ascii_case(&fields.signer)
+        && seating.is_some_and(|entry| entry.commit.revision < removal.commit.revision)
+        && log
+            .iter()
+            .filter(|entry| entry.commit.revision > removal.commit.revision)
+            .all(|entry| !entry.roster.contains_key(check.subject))
+        && !check.subject_revoked;
+    if !removal_ok {
+        return Err(ReseatMandateCause::RemovalMismatch);
+    }
+    // 6.
+    if check.certificate_digest != Some(fields.certificate_digest.as_str())
+        || !check.certificate_valid
+    {
+        return Err(ReseatMandateCause::CertificateInvalid);
+    }
+    // 7.
+    let before = role_before_removal(parent, check.subject, removal.commit.revision);
+    let raised = before.is_none_or(|before| !before.at_least(fields.role))
+        || check.seated_role != fields.role;
+    if raised {
+        return Err(ReseatMandateCause::RoleRaised);
+    }
+    // 8.
+    if check.commit.prev_state_hash.as_deref() != Some(fields.parent_commit_hash.as_str())
+        || parent.state_hash != fields.parent_commit_hash
+        || check.key_package_hash != Some(fields.key_package_hash.as_str())
+        || check.epoch != Some(fields.epoch)
+        || check.commit.roster_root != fields.terminal_roster_hash
+    {
+        return Err(ReseatMandateCause::BindingMismatch);
+    }
+    Ok(())
+}
+
 // ─── §4 The S3 sidecar ─────────────────────────────────────────────────────
 
 /// The sidecar directory under the data directory (§4).
@@ -1722,5 +2025,199 @@ mod tests {
         info.security_binding = Some("gss:epoch=2".to_string());
         let commit = info.seal_commit(&admin, 4_000).expect("seal");
         assert_eq!(treekem_epoch_of(&commit), None);
+    }
+    struct OwnerAxis {
+        admin: AgentKeypair,
+        certs: Vec<(String, crate::identity::AgentCertificate)>,
+        subject_hex: String,
+        subject_cert_digest: String,
+        info: GroupInfo,
+        seating_hash: String,
+        removal_hash: String,
+    }
+
+    fn sealed(
+        info: &mut GroupInfo,
+        admin: &AgentKeypair,
+        certs: &[(String, crate::identity::AgentCertificate)],
+        at: u64,
+    ) -> crate::groups::state_commit::GroupStateCommit {
+        let mut evidence = crate::groups::owner_cert::OwnerCertEvidence::new(
+            crate::groups::owner_cert::restore_clock_now(),
+        );
+        for (agent, cert) in certs {
+            evidence.insert_cert(agent.clone(), cert.clone());
+        }
+        let verdict = info.owner_cert_verdict(&evidence);
+        info.seal_commit_with_owner_certs(admin, at, &verdict)
+            .expect("seal")
+            .0
+    }
+
+    fn owner_axis_group() -> OwnerAxis {
+        let owner = crate::identity::UserKeypair::generate().expect("owner");
+        let admin = keypair();
+        let subject = keypair();
+        let admin_cert = crate::identity::AgentCertificate::issue(&owner, &admin).expect("cert");
+        let subject_cert =
+            crate::identity::AgentCertificate::issue(&owner, &subject).expect("cert");
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let subject_hex = hex::encode(subject.agent_id().as_bytes());
+        let mut policy = crate::groups::GroupPolicy::default();
+        policy.admission = crate::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        let mut info = GroupInfo::with_policy(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "cd".repeat(32),
+            policy,
+        );
+        info.set_member_certificate(&admin_hex, admin_cert.clone())
+            .expect("admin cert");
+        let certs = vec![
+            (admin_hex.clone(), admin_cert),
+            (subject_hex.clone(), subject_cert.clone()),
+        ];
+        info.add_member(
+            subject_hex.clone(),
+            GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_certificate(&subject_hex, subject_cert.clone())
+            .expect("subject cert");
+        sealed(&mut info, &admin, &certs, 1_000);
+        let seating_hash = info.state_hash.clone();
+        info.remove_member(&subject_hex, Some(admin_hex));
+        sealed(&mut info, &admin, &certs, 2_000);
+        let removal_hash = info.state_hash.clone();
+        OwnerAxis {
+            admin,
+            certs,
+            subject_hex,
+            subject_cert_digest: crate::groups::owner_cert::certificate_digest_hex(&subject_cert),
+            info,
+            seating_hash,
+            removal_hash,
+        }
+    }
+
+    fn mandate_for(
+        fixture: &OwnerAxis,
+        commit: &crate::groups::state_commit::GroupStateCommit,
+        role: GroupRole,
+    ) -> ReseatMandateV1 {
+        let owner = fixture
+            .info
+            .policy
+            .admission
+            .owner_certified_user_id()
+            .map(|owner| hex::encode(owner.as_bytes()))
+            .expect("owner axis");
+        ReseatMandateV1::sign(
+            ReseatMandateFields {
+                owner_user_id: owner,
+                group_id: fixture.info.stable_group_id().to_string(),
+                genesis_hash: genesis_hash(&fixture.info),
+                signer: hex::encode(fixture.admin.agent_id().as_bytes()),
+                subject: fixture.subject_hex.clone(),
+                seating_commit_hash: fixture.seating_hash.clone(),
+                removal_commit_hash: fixture.removal_hash.clone(),
+                parent_commit_hash: fixture.info.state_hash.clone(),
+                terminal_roster_hash: commit.roster_root.clone(),
+                invite_secret_hash: invite_secret_hash("s"),
+                authorisation_digest: "00".repeat(32),
+                key_package_hash: "kp".to_string(),
+                epoch: 0,
+                certificate_digest: fixture.subject_cert_digest.clone(),
+                policy_hash: crate::groups::compute_policy_hash(&fixture.info.policy),
+                role,
+                signer_public_key: hex::encode(fixture.admin.public_key().as_bytes()),
+            },
+            &fixture.admin,
+        )
+        .expect("sign")
+    }
+
+    #[test]
+    fn reseat_mandate_accepts_a_bound_readmission_and_names_each_failure() {
+        let fixture = owner_axis_group();
+        // The re-seat commit: the subject back as Member, sealed by the admin
+        // on a clone of the parent.
+        let mut next = fixture.info.clone();
+        next.add_member(
+            fixture.subject_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(fixture.admin.agent_id().as_bytes())),
+            None,
+        );
+        let commit = sealed(&mut next, &fixture.admin, &fixture.certs, 3_000);
+        let check = ReseatMandateCheck {
+            parent: &fixture.info,
+            commit: &commit,
+            subject: &fixture.subject_hex,
+            key_package_hash: Some("kp"),
+            epoch: Some(0),
+            seated_role: GroupRole::Member,
+            certificate_digest: Some(&fixture.subject_cert_digest),
+            certificate_valid: true,
+            subject_revoked: false,
+        };
+        let mandate = mandate_for(&fixture, &commit, GroupRole::Member);
+        assert_eq!(verify_reseat_mandate(&mandate, &check), Ok(()));
+
+        let mut tampered = mandate.clone();
+        tampered.fields.epoch = 9;
+        assert_eq!(
+            verify_reseat_mandate(&tampered, &check),
+            Err(ReseatMandateCause::Signature)
+        );
+        let raised = mandate_for(&fixture, &commit, GroupRole::Admin);
+        let raised_check = ReseatMandateCheck {
+            seated_role: GroupRole::Admin,
+            ..check
+        };
+        assert_eq!(
+            verify_reseat_mandate(&raised, &raised_check),
+            Err(ReseatMandateCause::RoleRaised)
+        );
+        let revoked = ReseatMandateCheck {
+            subject_revoked: true,
+            ..check
+        };
+        assert_eq!(
+            verify_reseat_mandate(&mandate, &revoked),
+            Err(ReseatMandateCause::RemovalMismatch)
+        );
+        let bad_cert = ReseatMandateCheck {
+            certificate_valid: false,
+            ..check
+        };
+        assert_eq!(
+            verify_reseat_mandate(&mandate, &bad_cert),
+            Err(ReseatMandateCause::CertificateInvalid)
+        );
+        let other_kp = ReseatMandateCheck {
+            key_package_hash: Some("other"),
+            ..check
+        };
+        assert_eq!(
+            verify_reseat_mandate(&mandate, &other_kp),
+            Err(ReseatMandateCause::BindingMismatch)
+        );
+        // A replay after the subject is seated again fails check 5.
+        let mut reseated = fixture.info.clone();
+        reseated
+            .commit_log
+            .push(crate::groups::state_commit::RetainedCommit::capture(
+                commit.clone(),
+                &next.members_v2,
+                next.public_meta(),
+            ));
+        let replay = ReseatMandateCheck {
+            parent: &reseated,
+            ..check
+        };
+        assert!(verify_reseat_mandate(&mandate, &replay).is_err());
     }
 }
