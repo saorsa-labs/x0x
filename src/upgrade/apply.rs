@@ -30,9 +30,13 @@ type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + 
 async fn inspect_probe_admission(
     install: PathBuf,
     version: String,
+    staged: bool,
 ) -> Result<super::probe::Admission, UpgradeError> {
     tokio::task::spawn_blocking(move || {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
+        if staged {
+            ensure_canonical_install(&install)?;
+        }
         super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))
     })
@@ -45,8 +49,20 @@ async fn probe_retry_delay_for_install(
     install: PathBuf,
     version: String,
 ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+    probe_retry_delay_for_bound_install(install, version, false).await
+}
+
+#[cfg(unix)]
+async fn probe_retry_delay_for_bound_install(
+    install: PathBuf,
+    version: String,
+    staged: bool,
+) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
     tokio::task::spawn_blocking(move || {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
+        if staged {
+            ensure_canonical_install(&install)?;
+        }
         let admission = super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))?;
         // Inspect and read under the same lock. An expired durable
@@ -67,6 +83,19 @@ async fn probe_retry_delay_for_install(
     })
     .await
     .map_err(|error| UpgradeError::Other(format!("probe retry-state worker failed: {error}")))?
+}
+
+/// Recheck the carried canonical identity after waiting for its lock. Record
+/// readers must not follow a changed path while holding the previous lock.
+#[cfg(unix)]
+fn ensure_canonical_install(install: &Path) -> Result<(), UpgradeError> {
+    if std::fs::canonicalize(install)
+        .map_err(|error| UpgradeError::Other(format!("staging install unavailable: {error}")))?
+        != install
+    {
+        return Err(UpgradeError::Other("staging install changed".into()));
+    }
+    Ok(())
 }
 
 /// Arm the HTTP deferred-restart owner before any host mutation (#1447 RC5).
@@ -201,24 +230,39 @@ impl Drop for TempDirGuard {
 /// Once the worker admits, restart ownership lives with the worker's
 /// `on_success` continuation — not with this droppable observer.
 /// `spawn_blocking` itself is not cancelled by Drop.
-struct CallerAliveJoin {
+struct CallerAliveJoin<T> {
     caller_alive: Arc<AtomicBool>,
-    join: JoinHandle<Result<UpgradeResult, UpgradeError>>,
+    join: JoinHandle<Result<T, UpgradeError>>,
 }
 
-impl Future for CallerAliveJoin {
-    type Output = Result<Result<UpgradeResult, UpgradeError>, tokio::task::JoinError>;
+impl<T> Future for CallerAliveJoin<T> {
+    type Output = Result<Result<T, UpgradeError>, tokio::task::JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.join).poll(cx)
     }
 }
 
-impl Drop for CallerAliveJoin {
+impl<T> Drop for CallerAliveJoin<T> {
     fn drop(&mut self) {
         // Signal first: the JoinHandle drop does not stop the blocking worker.
         self.caller_alive.store(false, Ordering::Release);
     }
+}
+
+/// Retain a blocking operation's cancellation flag until its observer returns.
+/// The operation must check the flag at its own mutation admission boundary.
+pub(crate) async fn run_owned_blocking<T, F>(operation: F) -> Result<T, UpgradeError>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> Result<T, UpgradeError> + Send + 'static,
+{
+    let caller_alive = Arc::new(AtomicBool::new(true));
+    let worker_alive = Arc::clone(&caller_alive);
+    let join = tokio::task::spawn_blocking(move || operation(worker_alive));
+    CallerAliveJoin { caller_alive, join }
+        .await
+        .map_err(|error| UpgradeError::Other(format!("upgrade worker failed: {error}")))?
 }
 
 /// Companion + primary replace on the blocking pool.
@@ -370,6 +414,8 @@ pub struct AutoApplyUpgrader {
     http_deferred_restart: bool,
     /// Data directory / API address / shutdown hook for the restart planner.
     restart_context: RestartContext,
+    #[cfg(unix)]
+    staging: Option<super::staging_runtime::Gate>,
 }
 
 impl AutoApplyUpgrader {
@@ -380,6 +426,8 @@ impl AutoApplyUpgrader {
             restart_on_success: true,
             http_deferred_restart: false,
             restart_context: RestartContext::default(),
+            #[cfg(unix)]
+            staging: None,
         }
     }
 
@@ -388,10 +436,139 @@ impl AutoApplyUpgrader {
         self
     }
 
+    /// Select the staged install from the independent executable observation,
+    /// not from the receipt. Carry this path through locks, plan and mutation.
+    /// Legacy unstaged callers and Windows retain their existing raw-path flow.
+    fn install_path(&self) -> Result<PathBuf, UpgradeError> {
+        let observed = current_binary_path()?;
+        #[cfg(unix)]
+        if let Some(gate) = &self.staging {
+            let install = std::fs::canonicalize(&observed).map_err(|error| {
+                UpgradeError::Other(format!("staging install unavailable: {error}"))
+            })?;
+            if install != gate.request.install {
+                return Err(UpgradeError::Other("staging install changed".into()));
+            }
+            return Ok(install);
+        }
+        Ok(observed)
+    }
+
+    /// Capture guide admission after download, from the independent executable
+    /// observation. The writer must hold this install lock through the fresh
+    /// gate check and rename; this snapshot alone does not authorize a write.
+    #[cfg(unix)]
+    pub(crate) fn guide_staging(
+        &self,
+    ) -> Result<Option<(PathBuf, super::staging_runtime::Gate)>, UpgradeError> {
+        let Some(gate) = &self.staging else {
+            return Ok(None);
+        };
+        Ok(Some((self.install_path()?, gate.clone())))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_staging_request(mut self, request: super::staging::StagingRequest) -> Self {
+        self.staging = Some(super::staging_runtime::Gate {
+            request,
+            #[cfg(test)]
+            clock: None,
+            #[cfg(test)]
+            observed: None,
+        });
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_staging_clock(
+        mut self,
+        clock: Option<super::staging_runtime::Clock>,
+    ) -> Self {
+        if let Some(gate) = &mut self.staging {
+            gate.clock = clock;
+        }
+        self
+    }
+
+    /// The existing owned caller retains the wait. No apply mutex or OS lock
+    /// remains held across sleep, and cancellation never resets the receipt.
+    #[cfg(unix)]
+    pub(crate) async fn wait_for_staging(
+        &self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), UpgradeError> {
+        let Some(gate) = &self.staging else {
+            return Ok(());
+        };
+        let install = self.install_path()?;
+        loop {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+            }
+            let gate = gate.clone();
+            let install = install.clone();
+            let worker_shutdown = shutdown.clone();
+            let worker = run_owned_blocking(move |worker_alive| {
+                let _lock = super::acquire_host_upgrade_lock(&install)?;
+                // A queued blocking task outlives a dropped JoinHandle. Recheck
+                // custody after obtaining the lock and before any record I/O.
+                let shutdown_value = worker_shutdown.borrow();
+                if !worker_alive.load(Ordering::Acquire)
+                    || *shutdown_value
+                    || worker_shutdown.has_changed().is_err()
+                {
+                    return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+                }
+                // Measure receipt time after lock acquisition: time spent
+                // queued for that lock must not count as durable rollout wait.
+                let clock = gate
+                    .clock()
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                gate.observe_locked_at(&install, &clock)
+            });
+            let decision = tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Err(UpgradeError::Other("staging cancelled by shutdown".into())),
+                result = worker => result?,
+            };
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+            }
+            #[cfg(test)]
+            if let Some(observed) = self
+                .staging
+                .as_ref()
+                .and_then(|gate| gate.observed.as_ref())
+            {
+                observed(decision.clone());
+            }
+            let super::staging::Decision::Waiting(wait) = decision else {
+                return Ok(());
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait.min(std::time::Duration::from_secs(30))) => {}
+                _ = shutdown.changed() => {
+                    return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+                }
+            }
+        }
+    }
+
     /// Supply the daemon-side restart context (data dir, pre-upgrade API
     /// address, graceful-shutdown hook) used by the transactional handoff.
     pub fn with_restart_context(mut self, context: RestartContext) -> Self {
         self.restart_context = context;
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_staging_observer(
+        mut self,
+        observed: Option<super::staging_runtime::Observer>,
+    ) -> Self {
+        if let Some(gate) = &mut self.staging {
+            gate.observed = observed;
+        }
         self
     }
 
@@ -423,6 +600,8 @@ impl AutoApplyUpgrader {
             restart_on_success: self.restart_on_success,
             http_deferred_restart: self.http_deferred_restart,
             restart_context: self.restart_context.clone(),
+            #[cfg(unix)]
+            staging: self.staging.clone(),
         }
     }
 
@@ -434,9 +613,13 @@ impl AutoApplyUpgrader {
     ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
         #[cfg(unix)]
         {
-            let install = current_binary_path()?;
+            let install = self.install_path()?;
             let version = version.to_owned();
-            probe_retry_delay_for_install(install, version).await
+            if self.staging.is_some() {
+                probe_retry_delay_for_bound_install(install, version, true).await
+            } else {
+                probe_retry_delay_for_install(install, version).await
+            }
         }
         #[cfg(not(unix))]
         {
@@ -454,7 +637,7 @@ impl AutoApplyUpgrader {
     /// be started (helper spawn failure) — the old process keeps running in
     /// both cases.
     pub async fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
-        let target_path = current_binary_path()?;
+        let target_path = self.install_path()?;
         let plan = self.resolve_restart_plan(&target_path).await?;
         self.trigger_restart(&plan, target_version)
     }
@@ -551,7 +734,7 @@ impl AutoApplyUpgrader {
             .matches_platform(platform_target)
             .ok_or(UpgradeError::NoPlatformAsset)?;
 
-        let target_path = current_binary_path()?;
+        let target_path = self.install_path()?;
 
         // ADR-0061 §1 — resolve before mutation. The restart owner, intended
         // exit behaviour, executable/argv and effective roots are resolved and
@@ -571,12 +754,42 @@ impl AutoApplyUpgrader {
             UpgradeError::Other(format!("upgrade record barrier unavailable: {error}"))
         })?;
         #[cfg(unix)]
-        if let super::probe::Admission::Waiting { retry_after } =
-            inspect_probe_admission(target_path.clone(), manifest.version.clone()).await?
+        if let super::probe::Admission::Waiting { retry_after } = inspect_probe_admission(
+            target_path.clone(),
+            manifest.version.clone(),
+            self.staging.is_some(),
+        )
+        .await?
         {
             return Err(UpgradeError::Other(
                 super::probe::ProbeRefusal::Waiting { retry_after }.to_string(),
             ));
+        }
+        #[cfg(unix)]
+        if let Some(gate) = &self.staging {
+            super::monitor::validate_manifest_timestamp(manifest)?;
+            if gate.request.version != manifest.version
+                || gate.request.archive_sha256 != asset.archive_sha256
+                || std::fs::canonicalize(&restart_plan.data_root)
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?
+                    != gate.request.data_root
+            {
+                return Err(UpgradeError::Other(
+                    "staging release or data root changed".into(),
+                ));
+            }
+            let gate = gate.clone();
+            let install = target_path.clone();
+            run_owned_blocking(move |caller_alive| {
+                let _lock = super::acquire_host_upgrade_lock(&install)?;
+                if !caller_alive.load(Ordering::Acquire) {
+                    return Err(UpgradeError::Other(
+                        "staging admission cancelled before record I/O".into(),
+                    ));
+                }
+                gate.require_due(&install)
+            })
+            .await?;
         }
         info!(
             mode = ?restart_plan.mode,
@@ -732,10 +945,19 @@ impl AutoApplyUpgrader {
                 cli: probe_cli,
                 launch: probe_launch,
             };
+            let staging = self.staging.clone();
+            let admitted_manifest = manifest.clone();
             Some(Box::new(move |alive| {
+                if let Some(gate) = &staging {
+                    gate.require_due(&request.install)?;
+                }
                 super::probe::run_before_swap(&request, alive)
                     .map(|_| ())
-                    .map_err(|error| UpgradeError::Other(error.to_string()))
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                if staging.is_some() {
+                    super::monitor::validate_manifest_timestamp(&admitted_manifest)?;
+                }
+                Ok(())
             }))
         };
         #[cfg(not(unix))]
@@ -898,7 +1120,7 @@ impl AutoApplyUpgrader {
 ///
 /// Handles the `/proc/self/exe (deleted)` suffix on Linux.
 pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
-    let exe = std::env::current_exe()
+    let exe = observe_current_executable()
         .map_err(|e| UpgradeError::Other(format!("failed to resolve current executable: {e}")))?;
 
     // On Linux, /proc/self/exe can have " (deleted)" suffix after an upgrade
@@ -908,6 +1130,47 @@ pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
         Ok(PathBuf::from(clean))
     } else {
         Ok(exe)
+    }
+}
+
+fn observe_current_executable() -> std::io::Result<PathBuf> {
+    #[cfg(all(test, unix))]
+    if let Some(path) = current_binary_path_seam::observation() {
+        return Ok(path);
+    }
+    std::env::current_exe()
+}
+
+/// Replace only the raw executable observation, before path resolution. Tests
+/// must keep this thread-local guard on their current-thread async runtime.
+#[cfg(all(test, unix))]
+pub(crate) mod current_binary_path_seam {
+    use std::{cell::RefCell, marker::PhantomData, path::PathBuf, rc::Rc};
+
+    thread_local! {
+        static OBSERVATION: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard {
+        previous: Option<PathBuf>,
+        _thread: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVATION.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+
+    pub(crate) fn install(raw: PathBuf) -> Guard {
+        Guard {
+            previous: OBSERVATION.with(|slot| slot.replace(Some(raw))),
+            _thread: PhantomData,
+        }
+    }
+
+    pub(super) fn observation() -> Option<PathBuf> {
+        OBSERVATION.with(|slot| slot.borrow().clone())
     }
 }
 
