@@ -1644,7 +1644,22 @@ pub struct ForwardService {
     fwd_diag: Arc<ForwardDiagnostics>,
     /// Registered forwards (spec + cancellation) so `shutdown` / `remove` can
     /// tear down individual listeners and `list` can return them.
+    ///
+    /// Also the gate for [`Self::listeners_closed`]: `add_forward` checks that
+    /// flag and publishes its accept-loop [`JoinHandle`](tokio::task::JoinHandle)
+    /// while it holds this lock, and shutdown takes those handles under the
+    /// same lock. A bind that resumes after shutdown cannot publish a listener
+    /// the drain will miss.
     forwards: std::sync::Mutex<Vec<ForwardEntry>>,
+    /// Accept loops for [`Self::add_forward`]. Shutdown awaits these after it
+    /// cancels them, so the bound port is free when shutdown returns.
+    listener_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Set under [`Self::forwards`] before listener tokens are cancelled.
+    listeners_closed: std::sync::atomic::AtomicBool,
+    /// Add, remove, and restore transactions. `None` refuses new ones.
+    /// Shutdown drains the admitted tasks before it cancels listeners, so a
+    /// transaction cannot bind after shutdown has returned.
+    transactions: std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     inbound_token: CancellationToken,
     /// The forwarder-owned protocol acceptors (`ForwardV1`, `ForwardV2`),
     /// moved into their consumer loops by `spawn_inbound`. `None` once the
@@ -1792,6 +1807,9 @@ impl ForwardService {
             live: Arc::new(teardown::LiveStreams::new(Arc::clone(&fwd_diag))),
             fwd_diag,
             forwards: std::sync::Mutex::new(Vec::new()),
+            listener_tasks: std::sync::Mutex::new(Vec::new()),
+            listeners_closed: std::sync::atomic::AtomicBool::new(false),
+            transactions: std::sync::Mutex::new(Some(Vec::new())),
             inbound_token: CancellationToken::new(),
             inbound_acceptors: std::sync::Mutex::new(Some((acceptor_v1, acceptor_v2))),
             inbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_STREAMS)),
@@ -1955,8 +1973,15 @@ impl ForwardService {
     /// `connected`. Returns the bound local address (useful when port = 0).
     ///
     /// # Errors
-    /// `NetworkError` if the local listener cannot be bound.
+    /// `NetworkError` if the local listener cannot be bound, or if the
+    /// forwarder has shut down. A shutdown that wins the race drops the
+    /// socket before this returns; it does not publish a listener.
     pub async fn add_forward(&self, spec: ForwardSpec) -> NetworkResult<SocketAddr> {
+        if self.listeners_closed.load(Ordering::Acquire) {
+            return Err(NetworkError::ConnectionFailed(
+                "forwarder is shut down".to_string(),
+            ));
+        }
         self.ensure_reauth_loop();
         let listener = TcpListener::bind(spec.local_addr).await.map_err(|e| {
             NetworkError::ConnectionFailed(format!("bind {}: {e}", spec.local_addr))
@@ -1970,7 +1995,21 @@ impl ForwardService {
         // was actually opened (and makes two ephemeral forwards collide).
         let mut registered_spec = spec.clone();
         registered_spec.local_addr = bound;
-        if let Ok(mut forwards) = self.forwards.lock() {
+        let accept = {
+            let mut forwards = self
+                .forwards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Shutdown sets `listeners_closed` under this same lock and then
+            // takes `listener_tasks`. Checking here, and publishing the
+            // accept loop before the lock is released, means a bind that
+            // resumes after shutdown cannot keep the port.
+            if self.listeners_closed.load(Ordering::Acquire) {
+                drop(listener);
+                return Err(NetworkError::ConnectionFailed(
+                    "forwarder is shut down".to_string(),
+                ));
+            }
             // A prior disabled entry for this address (restore that failed,
             // then a successful re-add) is replaced.
             forwards.retain(|e| e.spec.local_addr != bound);
@@ -1978,72 +2017,77 @@ impl ForwardService {
                 spec: registered_spec,
                 state: EntryState::Active(cancel.clone()),
             });
-        }
-
-        let agent = Arc::clone(&self.agent);
-        let fwd_diag = Arc::clone(&self.fwd_diag);
-        let outbound_permits = Arc::clone(&self.outbound_permits);
-        let per_peer = Arc::clone(&self.per_peer);
-        let target = OutboundTarget {
-            peer_agent: spec.peer_agent,
-            pinned_machine: spec.pinned_machine,
-            target_host: spec.target_host.clone(),
-            target_port: spec.target_port,
-        };
-        let require_attestation = self.require_attestation;
-        let live = Arc::clone(&self.live);
-        tokio::spawn(async move {
-            tracing::info!(
-                target: "x0x::forward",
-                local = %bound,
-                peer = %hex::encode(target.peer_agent.as_bytes()),
-                "outbound forward listener started"
-            );
-            loop {
-                let (tcp, _) = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    a = listener.accept() => match a {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::warn!(
+            let agent = Arc::clone(&self.agent);
+            let fwd_diag = Arc::clone(&self.fwd_diag);
+            let outbound_permits = Arc::clone(&self.outbound_permits);
+            let per_peer = Arc::clone(&self.per_peer);
+            let target = OutboundTarget {
+                peer_agent: spec.peer_agent,
+                pinned_machine: spec.pinned_machine,
+                target_host: spec.target_host.clone(),
+                target_port: spec.target_port,
+            };
+            let require_attestation = self.require_attestation;
+            let live = Arc::clone(&self.live);
+            let handle = tokio::spawn(async move {
+                tracing::info!(
+                    target: "x0x::forward",
+                    local = %bound,
+                    peer = %hex::encode(target.peer_agent.as_bytes()),
+                    "outbound forward listener started"
+                );
+                loop {
+                    let (tcp, _) = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        a = listener.accept() => match a {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "x0x::forward",
+                                    local = %bound,
+                                    error = %e,
+                                    "accept failed; listener stopping"
+                                );
+                                break;
+                            }
+                        },
+                    };
+                    // FIX 3: cap outbound driven connections. Over-cap TCP
+                    // accepts are dropped (the client sees a refused connection)
+                    // + counted rather than spawning unbounded.
+                    let admission = match admit_to(&outbound_permits, &per_peer, target.peer_agent)
+                    {
+                        Some(a) => a,
+                        None => {
+                            fwd_diag.record_over_cap();
+                            tracing::info!(
                                 target: "x0x::forward",
                                 local = %bound,
-                                error = %e,
-                                "accept failed; listener stopping"
+                                "outbound forward refused: concurrency cap reached — closing local TCP"
                             );
-                            break;
+                            continue;
                         }
-                    },
-                };
-                // FIX 3: cap outbound driven connections. Over-cap TCP
-                // accepts are dropped (the client sees a refused connection)
-                // + counted rather than spawning unbounded.
-                let admission = match admit_to(&outbound_permits, &per_peer, target.peer_agent) {
-                    Some(a) => a,
-                    None => {
-                        fwd_diag.record_over_cap();
-                        tracing::info!(
-                            target: "x0x::forward",
-                            local = %bound,
-                            "outbound forward refused: concurrency cap reached — closing local TCP"
-                        );
-                        continue;
-                    }
-                };
-                let agent = Arc::clone(&agent);
-                let fwd_diag = Arc::clone(&fwd_diag);
-                let live = Arc::clone(&live);
-                let target = target.clone();
-                tokio::spawn(async move {
-                    let _admission = admission;
-                    fwd_diag.enter_stream();
-                    let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
-                    drive_outbound(agent, &target, tcp, require_attestation, &live, &fwd_diag)
-                        .await;
-                });
-            }
-        });
-        Ok(bound)
+                    };
+                    let agent = Arc::clone(&agent);
+                    let fwd_diag = Arc::clone(&fwd_diag);
+                    let live = Arc::clone(&live);
+                    let target = target.clone();
+                    tokio::spawn(async move {
+                        let _admission = admission;
+                        fwd_diag.enter_stream();
+                        let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
+                        drive_outbound(agent, &target, tcp, require_attestation, &live, &fwd_diag)
+                            .await;
+                    });
+                }
+            });
+            self.listener_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(handle);
+            bound
+        };
+        Ok(accept)
     }
 
     /// Register `spec` as a forward that is down for `reason` (ADR-0074 §2:
@@ -2115,18 +2159,163 @@ impl ForwardService {
     }
 
     /// Tear down every listener + the inbound consumer.
+    ///
+    /// This cancels listeners and refuses later binds. It does not wait for
+    /// accept loops to drop their sockets, and it does not drain in-flight
+    /// add, remove, or restore transactions. [`Self::shutdown_and_release`]
+    /// does both, and the daemon shutdown path uses that.
     pub fn shutdown(&self) {
         // Cancel live bridges before stopping reauth (`inbound_token`).
         // Otherwise shutdown leaves registrations that reauth no longer
         // guards while the Agent may still be alive (Codex P2 / #1388).
         self.live.cancel_all("shutdown");
         self.inbound_token.cancel();
-        if let Ok(forwards) = self.forwards.lock() {
-            for entry in forwards.iter() {
-                if let EntryState::Active(cancel) = &entry.state {
-                    cancel.cancel();
-                }
+        self.cancel_listener_tokens();
+    }
+
+    /// Close admission, drain in-flight add/remove/restore transactions,
+    /// cancel every listener, and wait until those accept loops drop their
+    /// sockets.
+    ///
+    /// A transaction still inside `add_forward` when this starts is allowed
+    /// to finish. Its listener is in [`Self::listener_tasks`] before the
+    /// transaction returns, and the cancel below observes it. A bind that
+    /// starts after the cancel finds [`Self::listeners_closed`] and drops
+    /// the socket before publishing a listener.
+    pub(crate) async fn shutdown_and_release(&self) {
+        self.close_and_drain_transactions().await;
+        self.shutdown();
+        self.await_listener_tasks().await;
+    }
+
+    /// Run `work` as one forward transaction. The task stays in
+    /// [`Self::transactions`] until it finishes, including when the caller
+    /// is dropped. [`Self::shutdown_and_release`] awaits it before
+    /// cancelling listeners.
+    ///
+    /// # Errors
+    /// [`ForwardTransactionError::Closed`] when shutdown has already closed
+    /// admission (`work` is not started). [`ForwardTransactionError::Failed`]
+    /// when the task panics.
+    pub(crate) async fn run_transaction<T, F>(&self, work: F) -> Result<T, ForwardTransactionError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = self
+                .transactions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tasks) = guard.as_mut() else {
+                return Err(ForwardTransactionError::Closed);
+            };
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(tokio::spawn(async move {
+                let _ = done_tx.send(work.await);
+            }));
+        }
+        match done_rx.await {
+            Ok(value) => Ok(value),
+            Err(_) => Err(ForwardTransactionError::Failed(
+                "forward transaction ended before it returned".to_string(),
+            )),
+        }
+    }
+
+    /// `true` once [`Self::shutdown_and_release`] has closed transaction
+    /// admission and is waiting for the admitted tasks (or has finished).
+    #[cfg(test)]
+    pub(crate) fn transactions_closed(&self) -> bool {
+        self.transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    async fn close_and_drain_transactions(&self) {
+        let tasks = self
+            .transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// Set the closed flag and cancel active listeners under `forwards`.
+    /// Does not take the accept-loop tasks: [`Self::shutdown`] is
+    /// synchronous and must not detach them. [`Self::await_listener_tasks`]
+    /// takes them under the same lock after this returns.
+    fn cancel_listener_tokens(&self) {
+        let forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.listeners_closed.store(true, Ordering::Release);
+        for entry in forwards.iter() {
+            if let EntryState::Active(cancel) = &entry.state {
+                cancel.cancel();
             }
+        }
+    }
+
+    async fn await_listener_tasks(&self) {
+        // `add_forward` publishes its accept loop while it holds `forwards`,
+        // and only after it has observed `listeners_closed == false`. Taking
+        // the handles under that lock, after shutdown stored `true` under
+        // it, collects every loop that was published and refuses any later
+        // one.
+        let handles = {
+            let _forwards = self
+                .forwards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(
+                &mut *self
+                    .listener_tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let aborts: Vec<_> = handles
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let pending = futures::future::join_all(handles);
+        tokio::pin!(pending);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), pending.as_mut())
+            .await
+            .is_err()
+        {
+            for abort in &aborts {
+                abort.abort();
+            }
+            let _ = pending.await;
+        }
+    }
+}
+
+/// Why [`ForwardService::run_transaction`] did not return the task's value.
+#[derive(Debug)]
+pub(crate) enum ForwardTransactionError {
+    /// Shutdown has closed admission. The task was not started.
+    Closed,
+    /// The transaction task panicked or was aborted.
+    Failed(String),
+}
+
+impl std::fmt::Display for ForwardTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => f.write_str("forward admission is closed"),
+            Self::Failed(error) => write!(f, "forward transaction failed: {error}"),
         }
     }
 }

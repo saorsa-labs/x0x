@@ -176,12 +176,14 @@ enum CommitError {
 /// Bind `spec` and make the store match it, holding the forward lifecycle
 /// lock so this cannot interleave with restore or remove.
 ///
-/// The lock, the listener, and the store write run on a task this future
-/// cannot cancel. Dropping the caller's future (a cancelled request)
-/// detaches that task. It keeps the lock until the listener and the saved
-/// record describe the same forward. Cancelling between the bind and the
-/// rename therefore cannot leave the new listener up while the old target
-/// stays in `forwards.json`.
+/// The lock, the listener, and the store write run on a transaction the
+/// caller cannot cancel. Dropping the caller's future detaches that
+/// transaction. It stays in the forwarder's shutdown registry and keeps
+/// the lock until the listener and the saved record describe the same
+/// forward. Shutdown drains the transaction before it cancels listeners,
+/// so the transaction cannot publish a listener after shutdown returns.
+/// Cancelling between the bind and the rename therefore cannot leave the
+/// new listener up while the old target stays in `forwards.json`.
 ///
 /// An ephemeral spec deletes any durable record at the bound address, so a
 /// disabled persistent forward replaced by `--ephemeral` cannot return on
@@ -201,13 +203,14 @@ async fn commit_forward(
     }
     let store = Arc::clone(store);
     let forwarder = Arc::clone(forwarder);
-    let task = tokio::spawn(async move { commit_forward_locked(&store, &forwarder, spec).await });
-    match task.await {
+    let task_forwarder = Arc::clone(&forwarder);
+    match forwarder
+        .run_transaction(async move { commit_forward_locked(&store, &task_forwarder, spec).await })
+        .await
+    {
         Ok(result) => result,
         Err(error) => Err(CommitError::Store(
-            x0x::forward::store::ForwardStoreError::Write(format!(
-                "forward commit task failed: {error}"
-            )),
+            x0x::forward::store::ForwardStoreError::Write(error.to_string()),
         )),
     }
 }
@@ -318,6 +321,20 @@ pub(in crate::server) async fn forward_remove(
     // and reports it.
     let removed = match remove_persisted(&state.forwards, forwarder, addr).await {
         Ok(removed) => removed,
+        // The rename already dropped the record. The listener is gone too.
+        // Durability is still unconfirmed, so this is not success, and it
+        // is not the pre-rename failure that leaves the listener up.
+        Err(e) if e.durability_unconfirmed() => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "removed": true,
+                    "error": e.to_string(),
+                    "code": "forward_store",
+                })),
+            );
+        }
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -348,11 +365,19 @@ pub(in crate::server) const FORWARD_RESTORE_RETRY_SECS: u64 = 10;
 /// the lifecycle lock for both. The record is removed even when the live
 /// entry is ephemeral, unless the store did not load: an unreadable file
 /// must not block teardown of a live ephemeral forward, and it is never
-/// overwritten. A persistent live entry stays until the file can be updated.
+/// overwritten. A persistent live entry stays until the rename publishes
+/// the deletion. A pre-rename failure leaves it up.
 ///
-/// Like [`commit_forward`], the lock and both steps run on a task the
-/// caller cannot cancel, so a dropped request cannot delete the saved
-/// record and leave the listener, or the reverse.
+/// Like [`commit_forward`], the lock and both steps run on a transaction
+/// the caller cannot cancel. The transaction stays in the forwarder's
+/// shutdown registry, so a dropped request cannot delete the saved record
+/// and leave the listener, or the reverse, and shutdown drains it before
+/// listeners are cancelled.
+///
+/// A failure before the rename leaves the listener in place. A failure
+/// after the rename (`Unconfirmed`) has already removed the record from
+/// memory and from the file: the listener is removed too, and the error
+/// still reports that durability is not confirmed.
 async fn remove_persisted(
     store: &Arc<x0x::forward::store::ForwardStore>,
     forwarder: &Arc<x0x::forward::ForwardService>,
@@ -360,12 +385,17 @@ async fn remove_persisted(
 ) -> Result<bool, x0x::forward::store::ForwardStoreError> {
     let store = Arc::clone(store);
     let forwarder = Arc::clone(forwarder);
-    let task = tokio::spawn(async move { remove_persisted_locked(&store, &forwarder, addr).await });
-    match task.await {
+    let task_forwarder = Arc::clone(&forwarder);
+    match forwarder
+        .run_transaction(
+            async move { remove_persisted_locked(&store, &task_forwarder, addr).await },
+        )
+        .await
+    {
         Ok(result) => result,
-        Err(error) => Err(x0x::forward::store::ForwardStoreError::Write(format!(
-            "forward remove task failed: {error}"
-        ))),
+        Err(error) => Err(x0x::forward::store::ForwardStoreError::Write(
+            error.to_string(),
+        )),
     }
 }
 
@@ -379,12 +409,17 @@ async fn remove_persisted_locked(
         .list_forwards()
         .into_iter()
         .any(|status| status.spec.local_addr == addr && status.spec.persistent);
-    let forgotten = if store.load_error().is_some() && !live_persistent {
-        false
-    } else {
-        store.forget(addr).await?
-    };
-    Ok(forwarder.remove_forward(addr) || forgotten)
+    if store.load_error().is_some() && !live_persistent {
+        return Ok(forwarder.remove_forward(addr));
+    }
+    match store.forget(addr).await {
+        Ok(forgotten) => Ok(forwarder.remove_forward(addr) || forgotten),
+        Err(error) if error.durability_unconfirmed() => {
+            forwarder.remove_forward(addr);
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Bring one persisted forward up, or register it as down with the reason
@@ -478,16 +513,49 @@ where
 
 /// Restore every persisted forward that is not already listening. Returns
 /// how many are still down. Never fails: a corrupt store restores nothing
-/// (and is reported by `GET /forwards`), a bad record stays down.
-pub(in crate::server) async fn restore_forwards(state: &AppState) -> usize {
-    let Some(forwarder) = state.forward_service.as_ref() else {
+/// (and is reported by `GET /forwards`), a bad record stays down. Shutdown
+/// that has closed admission restores nothing.
+///
+/// The install runs as one forward transaction, so shutdown can drain it
+/// before it cancels listeners. A restore that is still between records
+/// when shutdown starts cannot bind a listener after shutdown returns.
+pub(in crate::server) async fn restore_forwards(state: &Arc<AppState>) -> usize {
+    let Some(forwarder) = state.forward_service.clone() else {
         return 0;
     };
-    restore_holding(&state.forwards, forwarder, |record| {
+    let state = Arc::clone(state);
+    let installing = Arc::clone(&forwarder);
+    let store = Arc::clone(&state.forwards);
+    restore_in_transaction(forwarder, store, move |record| {
         let record = record.clone();
-        async move { restore_one(state, forwarder, &record).await }
+        let state = Arc::clone(&state);
+        let forwarder = Arc::clone(&installing);
+        async move { restore_one(state.as_ref(), &forwarder, &record).await }
     })
     .await
+}
+
+/// Install `on_record` on the forwarder's transaction registry.
+async fn restore_in_transaction<F, Fut>(
+    forwarder: Arc<x0x::forward::ForwardService>,
+    store: Arc<x0x::forward::store::ForwardStore>,
+    on_record: F,
+) -> usize
+where
+    F: FnMut(&x0x::forward::store::ForwardRecord) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = bool> + Send + 'static,
+{
+    let installing = Arc::clone(&forwarder);
+    match forwarder
+        .run_transaction(async move { restore_holding(&store, &installing, on_record).await })
+        .await
+    {
+        Ok(down) => down,
+        Err(error) => {
+            tracing::warn!(target: "x0x::forward", "persisted forwards not restored: {error}");
+            0
+        }
+    }
 }
 
 /// GET /streams — active forward-stream count + connect-ACL counters.
@@ -594,6 +662,34 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         drop(listener);
         addr
+    }
+
+    async fn assert_port_released(addr: SocketAddr) {
+        let start = std::time::Instant::now();
+        loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    drop(listener);
+                    return;
+                }
+                Err(error) => {
+                    if start.elapsed() > std::time::Duration::from_secs(2) {
+                        panic!("listener still bound at {addr}: {error}");
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    async fn wait_transactions_closed(forwarder: &ForwardService) {
+        let start = std::time::Instant::now();
+        while !forwarder.transactions_closed() {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("forward admission did not close");
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     fn hex_spec(addr: SocketAddr) -> ForwardSpec {
@@ -851,9 +947,12 @@ mod tests {
     }
 
     /// WHY: a directory fsync that fails after the rename has already
-    /// published the new `forwards.json`. The handler must keep the
-    /// listener. Removing it would let a restart resurrect the forward,
-    /// and a later DELETE would 404 without deleting the saved record.
+    /// published the new `forwards.json`. An add keeps the listener:
+    /// removing it would let a restart resurrect the forward. A delete is
+    /// the other direction. The record is already gone from memory and from
+    /// the file, so the listener is removed too, and the error still
+    /// reports that durability is not confirmed. That is not a pre-rename
+    /// failure, which leaves the listener up.
     #[tokio::test]
     async fn after_rename_failure_keeps_listener_until_durability_is_confirmed() {
         let (agent, _agent_dir) = offline_agent().await;
@@ -897,9 +996,10 @@ mod tests {
             .expect_err("delete must not ACK while the fsync fault is armed");
         assert!(deleted.durability_unconfirmed());
         assert!(
-            forwarder.forward_at(addr).is_some(),
-            "the listener stays until a confirmed delete"
+            forwarder.forward_at(addr).is_none(),
+            "a post-rename delete removes the listener and still reports unconfirmed durability"
         );
+        assert_port_released(addr).await;
         assert!(store.records().await.expect("records").is_empty());
         let disk = ForwardStore::load(path.clone()).await;
         assert!(
@@ -910,15 +1010,94 @@ mod tests {
         drop(seam);
         let removed = remove_persisted(&store, &forwarder, addr)
             .await
-            .expect("confirmed delete");
+            .expect("durability retry");
         assert!(
-            removed,
-            "the live forward is torn down once durability is confirmed"
+            !removed,
+            "the listener was already removed; the retry only confirms durability"
         );
         assert!(forwarder.forward_at(addr).is_none());
         let disk = ForwardStore::load(path).await;
         assert!(disk.records().await.expect("disk").is_empty());
         forwarder.shutdown();
+    }
+
+    /// WHY: shutdown used to return while restore or add was still between
+    /// its await points. That work then bound a listener with a fresh
+    /// cancellation token, so the port stayed open after shutdown. Admission
+    /// closes first, the in-flight transaction is drained, and the listener
+    /// it published is dropped before shutdown returns.
+    #[tokio::test]
+    async fn shutdown_during_restore_and_add_releases_the_listener() {
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
+
+        let restore_addr = free_loopback().await;
+        assert!(store
+            .remember(&hex_spec(restore_addr))
+            .await
+            .expect("remember"));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        store.arm_restore_pause(Arc::clone(&entered), Arc::clone(&release));
+        let store_restore = Arc::clone(&store);
+        let forwarder_restore = Arc::clone(&forwarder);
+        let forwarder_install = Arc::clone(&forwarder);
+        let restore = tokio::spawn(async move {
+            restore_in_transaction(forwarder_restore, store_restore, move |record| {
+                let record = record.clone();
+                let forwarder = Arc::clone(&forwarder_install);
+                async move { install_restored(&forwarder, &record, None).await }
+            })
+            .await
+        });
+        entered.notified().await;
+        let shutting_down = Arc::clone(&forwarder);
+        let shutdown = tokio::spawn(async move {
+            shutting_down.shutdown_and_release().await;
+        });
+        wait_transactions_closed(&forwarder).await;
+        release.notify_one();
+        restore.await.expect("restore task");
+        shutdown.await.expect("shutdown task");
+        assert_port_released(restore_addr).await;
+
+        // A second forwarder: shutdown above closed the first one's admission.
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let add_addr = free_loopback().await;
+        let pause = x0x::storage::arm_durable_rename_pause_for_testing(&path);
+        let store_add = Arc::clone(&store);
+        let forwarder_add = Arc::clone(&forwarder);
+        let spec = hex_spec(add_addr);
+        let add =
+            tokio::spawn(async move { commit_forward(&store_add, &forwarder_add, spec).await });
+        let start = std::time::Instant::now();
+        while !x0x::storage::durable_rename_pause_entered_for_testing(&path) {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("add did not reach the rename");
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            forwarder.forward_at(add_addr).is_some(),
+            "the add has already bound the listener"
+        );
+        let shutting_down = Arc::clone(&forwarder);
+        let shutdown = tokio::spawn(async move {
+            shutting_down.shutdown_and_release().await;
+        });
+        wait_transactions_closed(&forwarder).await;
+        drop(pause);
+        let added = add.await.expect("add task");
+        shutdown.await.expect("shutdown task");
+        assert!(
+            added.is_ok(),
+            "the drained add finishes its store write: {added:?}"
+        );
+        assert_port_released(add_addr).await;
     }
 
     /// WHY: an unreadable `forwards.json` must not block `--ephemeral` adds

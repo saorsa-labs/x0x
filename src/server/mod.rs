@@ -134,7 +134,7 @@ async fn finish_startup_error(
 ) -> anyhow::Error {
     exec_service.shutdown().await;
     if let Some(forward_service) = forward_service {
-        forward_service.shutdown();
+        forward_service.shutdown_and_release().await;
     }
     agent.begin_shutdown();
     let _ = shutdown_notify.send(true);
@@ -3000,7 +3000,12 @@ pub async fn serve_with_options(
         // 0b. Forwarder listeners + inbound consumer (issue #132): stop
         //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
-            forwarder.shutdown();
+            // Drain add/remove/restore before cancelling listeners. A
+            // transaction still inside bind publishes its accept loop
+            // before it returns; the release below then waits for that
+            // socket to drop. A bind that resumes after this cancel is
+            // refused.
+            forwarder.shutdown_and_release().await;
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
         //    Agent's shutdown token and close its tracked-task registry NOW,
