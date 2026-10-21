@@ -28637,9 +28637,9 @@ fn marker_in_force(
     group_id: &str,
     info: &x0x::groups::GroupInfo,
 ) -> Option<x0x::groups::ForkQuarantine> {
-    // RED STUB (commit A2): the cab42a0 behaviour, the live record only.
-    let _ = (runtime, group_id);
-    info.fork_quarantine.clone()
+    info.fork_quarantine
+        .clone()
+        .or_else(|| runtime.staging_marker(&[group_id, info.stable_group_id(), &info.mls_group_id]))
 }
 
 /// Session tokens cannot inspect a contested roster unless this daemon still
