@@ -19,8 +19,11 @@
 //!   never the metadata topic and never a legacy-decoded container. A
 //!   recipient whose advert lacks the bit is stranded
 //!   (`waiting_for_receiver_upgrade` with the gap revision).
-//! - **Receive.** The §4b(1) L4 rule, then the ordinary chained apply with
+//! - **Receive.** The §4b(1) L4 rule, then the frame is made durable in
+//!   the held log ([`replay_log`]), then the ordinary chained apply with
 //!   the roster change as its only mutation, then the crypto removal proof.
+//! - **Restart.** A delivery that a restart restored waits for the §2 head
+//!   sync before each round.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -90,6 +93,9 @@ struct CommitDelivery {
     next_revision: u64,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
+    /// A restart restored this delivery from the held log: each round
+    /// waits for the group's §2 head sync first (#1508 review F3).
+    resumed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +114,7 @@ pub(super) struct OrcState {
     deliveries: HashMap<String, CommitDelivery>,
     stash: Vec<StashedFrame>,
     /// Authored and installed recovery commits, for catch-up serving; the
-    /// author's are durable ([`replay_log`]).
+    /// authored and the received frames are durable ([`replay_log`]).
     log: replay_log::HeldLog<ORC_LOG_PER_GROUP>,
 }
 
@@ -219,12 +225,28 @@ fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROU
 }
 
 /// Load the durable recovery frames once, and deliver an authored commit
-/// that is still its group's head again (#1508 review).
+/// that is still its group's head again (#1508 review). A received commit
+/// that a crash stopped before its install goes to the stash: the next
+/// pass receives it again, with every receiver check.
 async fn ensure_restored(state: &AppState) {
-    let resumes = replay_log::ensure_restored(state, replay_log::RECOVERY_EXTENSION, held).await;
+    let restored = replay_log::ensure_restored(state, replay_log::RECOVERY_EXTENSION, held).await;
     let local = *state.agent.agent_id().as_bytes();
     let mut inner = state.revocation_evictions.inner.lock().await;
-    for resume in resumes {
+    for bytes in restored.received {
+        // The frame is self-authenticating; its actor is the sender.
+        let Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) = orc::decode_frame(&bytes) else {
+            continue;
+        };
+        if inner.orc.stash.len() >= ORC_STASH_CAP {
+            inner.orc.stash.remove(0);
+        }
+        inner.orc.stash.push(StashedFrame {
+            sender: AgentId(frame.body.actor),
+            bytes: bytes.to_vec(),
+            at: Instant::now(),
+        });
+    }
+    for resume in restored.resumes {
         let recipients = survivors(&resume.info, &local, &BTreeSet::new());
         let stable = resume.stable_group_id;
         inner
@@ -240,6 +262,7 @@ async fn ensure_restored(state: &AppState) {
                     .map(|id| (id, RecipientDelivery::Due))
                     .collect(),
                 next_at: Instant::now(),
+                resumed: true,
             });
     }
 }
@@ -1183,6 +1206,7 @@ async fn finish_commit(
                     .map(|id| (id, RecipientDelivery::Due))
                     .collect(),
                 next_at: Instant::now(),
+                resumed: false,
             },
         );
     }
@@ -1205,13 +1229,29 @@ async fn finish_commit(
 
 async fn drive_deliveries(state: &Arc<AppState>) {
     let now = Instant::now();
+    let restored: BTreeSet<String> = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .orc
+            .deliveries
+            .iter()
+            .filter(|(_, delivery)| delivery.resumed && delivery.next_at <= now)
+            .map(|(stable, _)| stable.clone())
+            .collect()
+    };
+    // #1508 review F3: a restored delivery waits for its group's real
+    // head sync (ADR 0110 §3), the gate of the removal and crypto-exclusion
+    // resends, not only for the local chain.
+    let synced = super::rebind::restored_groups_head_synced(state, restored).await;
     let due: Vec<(String, CommitDelivery)> = {
         let mut inner = state.revocation_evictions.inner.lock().await;
         inner
             .orc
             .deliveries
             .iter_mut()
-            .filter(|(_, delivery)| delivery.next_at <= now)
+            .filter(|(stable, delivery)| {
+                delivery.next_at <= now && (!delivery.resumed || synced.contains(*stable))
+            })
             .map(|(id, delivery)| {
                 delivery.next_at = now + ORC_RESEND_INTERVAL;
                 (id.clone(), delivery.clone())
@@ -1485,6 +1525,8 @@ async fn receive_commit(
     if info.state_hash != body.prior_head && info.state_revision < body.prior_revision {
         return ReceiveOutcome::Retained;
     }
+    // Load the held log before the tree lock (#1508 review F2, below).
+    ensure_restored(state).await;
     let kind = orc::crypto_kind(&info);
     let tree = if kind == orc::RecoveryCryptoKind::TreeKem {
         let map = state.treekem_groups.read().await;
@@ -1531,6 +1573,18 @@ async fn receive_commit(
             ReceiveOutcome::Refused(refusal)
         };
     }
+    // #1508 review F2: the received frame is durable before the roster it
+    // carries is installed, in the held log that the author uses. A
+    // restarted receiver then serves it to a survivor that missed it while
+    // the author is offline. The load ran first (above), so this write
+    // keeps the frames that a restart restored.
+    let frame_bytes = Arc::new(payload.to_vec());
+    let ext = replay_log::RECOVERY_EXTENSION;
+    let stable = body.stable_group_id.clone();
+    let at = (body.next_revision, body.commit.state_hash.as_str());
+    if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
+        return ReceiveOutcome::Retained;
+    }
     let commit = body.commit.to_commit();
     let signed_binding = commit.security_binding.clone();
     let roster_revision = body.roster_revision;
@@ -1571,6 +1625,7 @@ async fn receive_commit(
     {
         Ok(next) => next,
         Err(error) => {
+            replay_log::rewrite_from_memory(state, ext, held, &stable).await;
             tracing::info!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery commit refused by the chained apply: {error}");
             return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
         }
@@ -1607,6 +1662,7 @@ async fn receive_commit(
                     guard,
                     "owner_recovery_proof_failed",
                 );
+                replay_log::rewrite_from_memory(state, ext, held, &stable).await;
                 return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
             }
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -1641,7 +1697,8 @@ async fn receive_commit(
     };
     drop(guard);
     if !installed {
-        // A local storage fault, not a sender defect: keep the frame.
+        // A local storage fault, not a sender defect: keep the frame, in
+        // the stash and durable in the held log.
         return ReceiveOutcome::Retained;
     }
     if kind == orc::RecoveryCryptoKind::Gss {
@@ -1674,7 +1731,7 @@ async fn receive_commit(
             &body.stable_group_id,
             body.next_revision,
             &body.commit.state_hash,
-            Arc::new(payload.to_vec()),
+            frame_bytes,
             false,
         );
     }
@@ -1833,6 +1890,7 @@ mod tests {
             next_revision: 2,
             recipients: BTreeMap::from([(recipient, RecipientDelivery::Due)]),
             next_at: Instant::now(),
+            resumed: false,
         }
     }
 
@@ -2598,5 +2656,330 @@ mod tests {
             .deliveries
             .contains_key(&stable));
         state.agent.shutdown().await;
+    }
+}
+
+/// #1508 review (Codex P1 F2 and F3): a received recovery frame survives a
+/// restart of its receiver, and a restored delivery waits for the §2 head
+/// sync. Offline daemons only (no network node), so the tests are inert.
+#[cfg(test)]
+mod restart_tests {
+    use super::super::rebind::restart_tests::{
+        block_install, hold_persisted, insert_group, offline_daemon, set_evidence,
+        state_past_restart_wait, unblock_install, HeadEvidence,
+    };
+    use super::super::{HeadRound, S4Runtime};
+    use super::*;
+    use anyhow::{Context, Result};
+    use x0x::groups::eviction::S4Timing;
+
+    /// The parent of a recovery: a `SignedPublic` `OwnerCertified` group
+    /// whose only admin is revoked, with the author and the receiver as
+    /// certified Members.
+    fn recovery_parent(
+        owner: &x0x::identity::UserKeypair,
+        admin: &x0x::identity::AgentKeypair,
+        members: [&x0x::identity::AgentKeypair; 2],
+    ) -> Result<GroupInfo> {
+        let seat = |agent: &x0x::identity::AgentKeypair,
+                    role: x0x::groups::GroupRole|
+         -> Result<x0x::groups::GroupMember> {
+            let cert = x0x::identity::AgentCertificate::issue(owner, agent)?;
+            let id = hex::encode(agent.agent_id().as_bytes());
+            let mut member = x0x::groups::GroupMember::new_member(id, None, None, 1);
+            member.role = role;
+            member.certificate_digest =
+                Some(x0x::groups::owner_cert::certificate_digest_hex(&cert));
+            member.certificate = Some(cert);
+            Ok(member)
+        };
+        let mut info = GroupInfo::new(
+            "recovery".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "e9".repeat(16),
+        );
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::SignedPublic;
+        info.members_v2.clear();
+        let mut seats = vec![seat(admin, x0x::groups::GroupRole::Admin)?];
+        for member in members {
+            seats.push(seat(member, x0x::groups::GroupRole::Member)?);
+        }
+        for member in seats {
+            info.members_v2.insert(member.agent_id.clone(), member);
+        }
+        info.recompute_state_hash();
+        Ok(info)
+    }
+
+    async fn revoke(state: &AppState, admin: &x0x::identity::AgentKeypair) -> Result<()> {
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(admin.agent_id()),
+            admin.public_key(),
+            admin.secret_key(),
+            1,
+            None,
+        )?;
+        let inserted = state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)?;
+        anyhow::ensure!(inserted, "the admin revocation is held");
+        Ok(())
+    }
+
+    /// The promoted member (offline, holding the owner key) authors the
+    /// recovery; the receiver holds the parent on disk. Returns the
+    /// receiver, the parent, the exact frame, its result head and the
+    /// revoked admin. The author is shut down: it is offline from here on.
+    async fn received_recovery(
+        author_dir: &std::path::Path,
+        receiver_dir: &std::path::Path,
+    ) -> Result<(
+        Arc<AppState>,
+        GroupInfo,
+        Vec<u8>,
+        String,
+        x0x::identity::AgentKeypair,
+    )> {
+        let user = x0x::identity::UserKeypair::from_seed(&[0x6E; 32])?;
+        let mut author = offline_daemon(author_dir, Some(user)).await?;
+        // The author's head sync: the restart minimum is zero and a holder
+        // confirmed the parent head (set below).
+        Arc::get_mut(&mut author)
+            .context("the fresh author state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let receiver = offline_daemon(receiver_dir, None).await?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                receiver.agent.identity().agent_keypair(),
+            ],
+        )?;
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &receiver] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let (status, Json(body)) =
+            sign_recovery_mandate(&author, owner, &stable, &author_hex).await;
+        anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
+        {
+            let mut round = HeadRound::new(&info.state_hash, Instant::now());
+            round.confirmed = true;
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(stable.clone(), round);
+        }
+        try_commit(&author, &stable).await;
+        let committed = author.named_groups.read().await[&stable].clone();
+        anyhow::ensure!(
+            committed.state_revision == info.state_revision + 1,
+            "the author committed the recovery"
+        );
+        let bytes = author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .deliveries[&stable]
+            .bytes
+            .to_vec();
+        author.agent.shutdown().await;
+        Ok((receiver, info, bytes, committed.state_hash, admin))
+    }
+
+    async fn receive_bytes(state: &Arc<AppState>, bytes: &[u8]) -> Result<ReceiveOutcome> {
+        let Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) = orc::decode_frame(bytes) else {
+            anyhow::bail!("an X0XORC1 commit frame");
+        };
+        let sender = AgentId(frame.body.actor);
+        Ok(receive_commit(state, sender, *frame, bytes).await)
+    }
+
+    async fn head_of(state: &AppState, stable: &str) -> Option<String> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(stable)
+            .map(|info| info.state_hash.clone())
+    }
+
+    async fn served(state: &AppState, stable: &str, from: u64) -> Vec<(String, Vec<u8>)> {
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .log
+            .catchup_frames(std::slice::from_ref(&stable.to_string()), from)
+            .into_iter()
+            .map(|(_, head, bytes)| (head, bytes.to_vec()))
+            .collect()
+    }
+
+    /// F2 (a): a survivor installs a recovery, then restarts while the
+    /// author is offline. The restarted survivor serves the exact frame to
+    /// another survivor that asks for catch-up from the parent revision.
+    #[tokio::test]
+    async fn a_restarted_receiver_serves_the_received_recovery_frame() -> Result<()> {
+        let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (receiver, info, bytes, result_head, _admin) =
+            received_recovery(author_dir.path(), receiver_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        assert_eq!(
+            receive_bytes(&receiver, &bytes).await?,
+            ReceiveOutcome::Applied
+        );
+
+        receiver.agent.shutdown().await;
+        drop(receiver);
+        let restarted = offline_daemon(receiver_dir.path(), None).await?;
+        assert_eq!(
+            head_of(&restarted, &stable).await.as_ref(),
+            Some(&result_head),
+            "the installed recovery survived the restart"
+        );
+        ensure_restored(&restarted).await;
+        let frames = served(&restarted, &stable, info.state_revision).await;
+        assert_eq!(
+            frames,
+            vec![(result_head, bytes)],
+            "the restarted receiver serves the exact frame at catch-up"
+        );
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// F2 (b): the frame is durable before the roster it carries is
+    /// installed. The install fails (a crash at that point), the frame is
+    /// on disk, and after the restart the node installs it from its own
+    /// copy and serves it, with the author offline.
+    #[tokio::test]
+    async fn a_crash_before_the_recovery_install_keeps_the_frame_durable() -> Result<()> {
+        let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (receiver, info, bytes, result_head, admin) =
+            received_recovery(author_dir.path(), receiver_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+
+        let blocked = block_install(&receiver).await?;
+        assert_eq!(
+            receive_bytes(&receiver, &bytes).await?,
+            ReceiveOutcome::Retained,
+            "the install failed"
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the roster is not installed"
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::RECOVERY_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 1, "the received frame is durable");
+        assert_eq!(on_disk[0].frame, bytes, "exact bytes");
+        assert_eq!(on_disk[0].result_head, result_head);
+        assert!(!on_disk[0].authored);
+
+        receiver.agent.shutdown().await;
+        drop(receiver);
+        unblock_install(blocked).await?;
+        let restarted = offline_daemon(receiver_dir.path(), None).await?;
+        assert_eq!(
+            head_of(&restarted, &stable).await.as_ref(),
+            Some(&info.state_hash)
+        );
+        // A daemon keeps its verified revocations on disk; this test agent
+        // has no identity directory, so it holds the record again.
+        revoke(&restarted, &admin).await?;
+        ensure_restored(&restarted).await;
+        retry_stash(&restarted).await;
+        assert_eq!(
+            head_of(&restarted, &stable).await.as_ref(),
+            Some(&result_head),
+            "the restarted node installs its durable copy"
+        );
+        let frames = served(&restarted, &stable, info.state_revision).await;
+        assert_eq!(frames, vec![(result_head, bytes)]);
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// F3 (c): a recovery delivery restored after a restart is not resent
+    /// while the group has higher-head or conflicting-head evidence, even
+    /// though the restart wait has elapsed. It uses the same §2 gate as
+    /// the removal and crypto-exclusion deliveries. Once the evidence
+    /// resolves, the same round delivers it.
+    #[tokio::test]
+    async fn a_restored_recovery_delivery_waits_for_the_head_sync() -> Result<()> {
+        let (state, _dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x5B; 32]);
+        let group_id = "c9".repeat(16);
+        let info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let frame = Arc::new(b"X0XORC1\0restored frame".to_vec());
+        let at = (info.state_revision, info.state_hash.as_str());
+        let ext = replay_log::RECOVERY_EXTENSION;
+        assert!(replay_log::write_planned(&state, ext, held, &stable, at, &frame).await);
+        ensure_restored(&state).await;
+        let scheduled = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            let scheduled = inner
+                .orc
+                .deliveries
+                .get(&stable)
+                .context("restored")?
+                .next_at;
+            inner
+                .head_rounds
+                .insert(stable.clone(), HeadRound::new(&info.state_hash, scheduled));
+            scheduled
+        };
+        let held_back = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            let stable = stable.clone();
+            async move {
+                let inner = state.revocation_evictions.inner.lock().await;
+                let delivery = inner.orc.deliveries.get(&stable).cloned();
+                delivery.is_some_and(|delivery| {
+                    delivery.next_at == scheduled
+                        && delivery.recipients.get(survivor.as_bytes())
+                            == Some(&RecipientDelivery::Due)
+                })
+            }
+        };
+        for evidence in [HeadEvidence::Higher, HeadEvidence::Conflicting] {
+            set_evidence(&state, &group_id, &info, evidence, true).await;
+            drive_deliveries(&state).await;
+            assert!(
+                held_back(&state).await,
+                "{evidence:?} head evidence holds the restored delivery"
+            );
+            set_evidence(&state, &group_id, &info, evidence, false).await;
+        }
+        drive_deliveries(&state).await;
+        assert!(
+            !held_back(&state).await,
+            "the synced group's restored delivery ran"
+        );
+        Ok(())
     }
 }

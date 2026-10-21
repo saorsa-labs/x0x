@@ -1,21 +1,27 @@
-//! ADR 0110 §5: the prepare barrier of a seated target's removal.
+//! ADR 0110 §5: the prepare barrier of a seated target's removal or ban.
 //!
 //! The §5 order is: the exact outgoing frame goes into a prepared
 //! `.evjournal` and the `.evs` row first, then the legacy roster/crypto
 //! transaction runs, then the row moves to `committed_delivery_pending`
 //! and the journal retires. The crypto-only exclusion has always done
-//! this. A seated-target removal builds its `MemberRemoved` (with the
-//! TreeKEM commit and the signed state commit) inside the legacy removal
-//! path, so that path calls [`prepare_committed_removal`] after it builds
-//! the event and before it commits the new epoch.
+//! this. A seated-target removal or ban builds its `MemberRemoved` or
+//! `MemberBanned` (with the signed state commit, and the TreeKEM commit
+//! or the rotated GSS secret epoch) inside the legacy route. Every such
+//! route that S4 can run (TreeKEM, GSS `MlsEncrypted` and `SignedPublic`;
+//! remove and ban) goes through the one [`RemovalBarrier`] after it builds
+//! the event and before it persists anything.
 //!
-//! - **Prepare** ([`prepare_committed_removal`]). Only a row that S4
+//! - **Prepare** ([`RemovalBarrier::prepare`]). Only a row that S4
 //!   prepared for this removal changes. The row and the journal get the
 //!   exact event, its result head and its epoch, and both are fsynced. If
-//!   either write fails the removal must not commit.
-//! - **Abandon** ([`abandon_prepared_removal`]). The legacy transaction
+//!   either write fails, or the §1a/D135 re-check cancels the work, the
+//!   removal must not commit.
+//! - **Abandon** ([`RemovalBarrier::abandon`]). The legacy transaction
 //!   failed after the prepare: the saved event is cleared, so a restart
 //!   never delivers an event that did not commit.
+//! - **Committed** ([`RemovalBarrier::committed`]). The transaction is
+//!   durable: the row moves to `committed_delivery_pending` and its
+//!   delivery starts, before the first publication.
 //! - **Restart** ([`adopt_journal_removals`]). A journal that holds a
 //!   removal event gives that event to its row when the `.evs` row has
 //!   none. `removal_delivery::resume_after_load` then classifies it
@@ -23,6 +29,9 @@
 //!   is delivered again, an unchanged parent returns the row to `pending`.
 
 use std::collections::HashMap;
+
+use axum::http::StatusCode;
+use axum::Json;
 
 use crate as x0x;
 use crate::server::state::AppState;
@@ -32,9 +41,97 @@ use x0x::groups::GroupInfo;
 use super::super::NamedGroupMetadataEvent;
 use super::removal_delivery::decode_saved_removal;
 
+/// The reply of a route that the barrier stops.
+type RouteReply = (StatusCode, Json<serde_json::Value>);
+
+/// ADR 0110 §5: the one prepare barrier of every roster removal or ban
+/// that S4 can run, on every plane.
+///
+/// The route builds its exact outgoing event first. Then it calls
+/// [`Self::prepare`], persists its roster/crypto transaction, and calls
+/// [`Self::abandon`] if the persist fails or [`Self::committed`] at once
+/// after it is durable, before any publication. A removal that S4 did not
+/// prepare passes through unchanged.
+#[must_use = "a prepared removal must be abandoned or committed"]
+pub(in crate::server) struct RemovalBarrier {
+    /// S4 prepared this removal and its event is durable.
+    s4: bool,
+}
+
+impl RemovalBarrier {
+    /// §5 step 1: save `event`, the exact outgoing event of the removal or
+    /// ban of `target_hex`, for S4's prepared row. `info` is the sealed
+    /// after-image. The caller holds the group's membership lock and has
+    /// not persisted the transaction yet. On `Err` the caller rolls back
+    /// what it changed in memory and returns the reply.
+    pub(in crate::server) async fn prepare(
+        state: &AppState,
+        info: &GroupInfo,
+        target_hex: &str,
+        event: &NamedGroupMetadataEvent,
+    ) -> Result<Self, RouteReply> {
+        match prepare_committed_removal(state, info, target_hex, event).await {
+            RemovalPrepare::NotS4 => Ok(Self { s4: false }),
+            RemovalPrepare::Durable => Ok(Self { s4: true }),
+            RemovalPrepare::NotDurable => {
+                let error = if matches!(event, NamedGroupMetadataEvent::MemberBanned { .. }) {
+                    "ban event is not durable yet"
+                } else {
+                    "removal event is not durable yet"
+                };
+                Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "ok": false, "error": error })),
+                ))
+            }
+            RemovalPrepare::Cancelled => Err(super::s4_exclusion_cancelled_response()),
+        }
+    }
+
+    /// The transaction did not persist: clear the saved event.
+    pub(in crate::server) async fn abandon(
+        self,
+        state: &AppState,
+        info: &GroupInfo,
+        target_hex: &str,
+    ) {
+        if self.s4 {
+            abandon_prepared_removal(state, info, target_hex).await;
+        }
+    }
+
+    /// §3 and §5: the transaction is durable. S4's row moves to
+    /// `committed_delivery_pending` and its delivery to each survivor
+    /// starts. Call it before the first publication. `info` is the
+    /// committed after-image.
+    ///
+    /// `Err` only in tests: the test crash point after the commit
+    /// (`crash_after_removal_commit_on_this_thread_for_test`).
+    pub(in crate::server) async fn committed(
+        self,
+        state: &AppState,
+        info: &GroupInfo,
+        target_hex: &str,
+        event: &NamedGroupMetadataEvent,
+    ) -> Result<(), RouteReply> {
+        #[cfg(test)]
+        if super::super::CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.replace(false)) {
+            // Test-only crash: the transaction is durable, nothing after it ran.
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "ok": false, "error": "test crash after commit" })),
+            ));
+        }
+        if self.s4 {
+            super::record_committed_removal(state, info, target_hex, event).await;
+        }
+        Ok(())
+    }
+}
+
 /// The result of [`prepare_committed_removal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::server) enum RemovalPrepare {
+enum RemovalPrepare {
     /// S4 did not prepare this removal: the legacy path runs unchanged.
     NotS4,
     /// The exact event is durable in the `.evjournal` and the `.evs`.
@@ -64,13 +161,8 @@ async fn read_prepared_journal(path: &std::path::Path, key: &EvictionKey) -> Opt
 
 /// §5 step 1 of S4's removal of `target_hex`: save the exact outgoing
 /// `event` in the prepared `.evjournal` and the `.evs` row, and fsync both,
-/// before the legacy transaction commits the new epoch.
-///
-/// `info` is the sealed after-image. The caller holds the group's
-/// membership lock and its TreeKEM lock, and it has not persisted the
-/// transaction yet. On [`RemovalPrepare::NotDurable`] the caller rolls the
-/// removal back and fails it.
-pub(in crate::server) async fn prepare_committed_removal(
+/// before the legacy transaction commits (see [`RemovalBarrier::prepare`]).
+async fn prepare_committed_removal(
     state: &AppState,
     info: &GroupInfo,
     target_hex: &str,
@@ -146,11 +238,7 @@ pub(in crate::server) async fn prepare_committed_removal(
 /// clear the saved event of the still-`prepared` row. The S4 caller then
 /// returns the row to `pending`, persists the `.evs` and retires the
 /// journal.
-pub(in crate::server) async fn abandon_prepared_removal(
-    state: &AppState,
-    info: &GroupInfo,
-    target_hex: &str,
-) {
+async fn abandon_prepared_removal(state: &AppState, info: &GroupInfo, target_hex: &str) {
     let Some(key) = row_key(info, target_hex) else {
         return;
     };
@@ -760,5 +848,265 @@ mod tests {
             assert_cancelled_under_lock(&state, &group_id, &target_hex, &target_kp, kind).await?;
         }
         Ok(())
+    }
+
+    /// A test state whose restart sync wait has already elapsed, so a
+    /// resumed delivery waits only for its group's head round.
+    async fn state_past_restart_wait() -> anyhow::Result<(Arc<AppState>, tempfile::TempDir)> {
+        let (mut state, dir) = secure_endpoint_test_state().await?;
+        Arc::get_mut(&mut state)
+            .ok_or_else(|| anyhow::anyhow!("the fresh test state is not shared yet"))?
+            .revocation_evictions = super::super::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: std::time::Duration::ZERO,
+            ..x0x::groups::eviction::S4Timing::default()
+        });
+        Ok((state, dir))
+    }
+
+    /// A GSS-plane group on `state` under `preset`: the local admin, a
+    /// seated target and one survivor with an ML-KEM-768 key. Returns the
+    /// target and the survivor.
+    async fn gss_target_group(
+        state: &AppState,
+        group_id: &str,
+        preset: x0x::groups::GroupPolicyPreset,
+    ) -> anyhow::Result<(String, String)> {
+        let admin = state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let mut info = GroupInfo::with_policy(
+            "s4-gss-barrier".to_string(),
+            String::new(),
+            admin,
+            group_id.to_string(),
+            preset.to_policy(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        let target_hex = hex::encode(
+            x0x::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        info.add_member(
+            target_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let survivor_hex = hex::encode(
+            x0x::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        info.add_member(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        if let Some(member) = info.members_v2.get_mut(&survivor_hex) {
+            member.kem_public_key_b64 = Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &kem.public_bytes,
+            ));
+        }
+        if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
+            let _ = info.rotate_shared_secret();
+        }
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        Ok((target_hex, survivor_hex))
+    }
+
+    /// #1508 review P1 (GSS and SignedPublic bypass the crash barrier):
+    /// S4 prepared the removal or ban of a seated target in a GSS-plane
+    /// group, the roster transaction committed, and the process died
+    /// before the publication. A restart must hold the exact
+    /// `MemberRemoved` or `MemberBanned` and resume its delivery, the
+    /// reconciliation must not complete the row while that delivery runs,
+    /// and in an `MlsEncrypted` group the survivors must get the rotated
+    /// secret again.
+    async fn assert_gss_crash_keeps_the_exact_event(
+        group_id: &str,
+        preset: x0x::groups::GroupPolicyPreset,
+        kind: super::super::ManualRequestKind,
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = state_past_restart_wait().await?;
+        let (target_hex, survivor_hex) = gss_target_group(&state, group_id, preset).await?;
+        let key = s4_prepare(&state, group_id, &target_hex, prepared_store).await?;
+
+        // The roster transaction commits, then the process dies.
+        super::super::super::crash_after_removal_commit_on_this_thread_for_test();
+        let scope = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            super::super::eviction_seal_scope(&inner.store, &key)
+        };
+        let (status, body) =
+            super::super::run_member_route(&state, group_id, &target_hex, kind, scope).await;
+        let (committed_head, committed_epoch, encrypted) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(group_id).expect("group");
+            assert!(
+                !info.has_active_member(&target_hex),
+                "{kind:?}: the roster transaction committed"
+            );
+            (
+                info.state_hash.clone(),
+                info.secret_epoch,
+                info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted,
+            )
+        };
+
+        // Restart: the S4 state is reloaded from disk.
+        *state.revocation_evictions.inner.lock().await = super::super::S4Inner::default();
+        super::super::load_persisted_obligations(&state).await;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("row survives the restart");
+            assert_eq!(row.phase, Phase::CommittedDeliveryPending, "{kind:?}");
+            assert_eq!(row.result_head.as_deref(), Some(committed_head.as_str()));
+            let saved = row
+                .outgoing_event
+                .as_deref()
+                .and_then(decode_saved_removal)
+                .expect("the exact event survives the crash");
+            let expected_epoch = encrypted.then_some(committed_epoch);
+            match (&saved.event, kind) {
+                (
+                    NamedGroupMetadataEvent::MemberRemoved {
+                        treekem_commit_b64: None,
+                        secret_epoch,
+                        ..
+                    },
+                    super::super::ManualRequestKind::Remove,
+                )
+                | (
+                    NamedGroupMetadataEvent::MemberBanned {
+                        treekem_commit_b64: None,
+                        secret_epoch,
+                        ..
+                    },
+                    super::super::ManualRequestKind::Ban,
+                ) => assert_eq!(*secret_epoch, expected_epoch, "{kind:?}"),
+                (event, _) => panic!("{kind:?}: unexpected saved event {event:?}"),
+            }
+            assert!(
+                inner.removals.contains_key(&key),
+                "{kind:?}: restart resumes the delivery to the survivors"
+            );
+
+            // The reconciliation of the next pass keeps the row open.
+            let groups = super::super::snapshot_groups(&state).await;
+            let mut delivering = inner.ce.delivering();
+            delivering.extend(inner.removals.keys().cloned());
+            super::super::reconcile_completion(
+                &mut inner.store,
+                &groups,
+                &super::super::RetainedLeaves::default(),
+                &delivering,
+                super::super::now_unix_ms(),
+            );
+            assert_eq!(
+                inner.store.get(&key).expect("row").phase,
+                Phase::CommittedDeliveryPending,
+                "{kind:?}: no completion while the survivors lack the event"
+            );
+            // The group's head round has run its course.
+            inner.head_rounds.insert(
+                key.stable_group_id.clone(),
+                super::super::HeadRound::new(&committed_head, tokio::time::Instant::now()),
+            );
+        }
+
+        // Checked after the restart, so a removal that skips the barrier
+        // fails on the lost event, not only on the crash point.
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{kind:?}: the route stops at the test crash point: {body:?}"
+        );
+
+        // The resumed delivery also gives each survivor the rotated secret.
+        state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorder poisoned"))?
+            .clear();
+        super::super::removal_delivery::drive(&state).await;
+        let shares: Vec<(String, u64)> = state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorder poisoned"))?
+            .iter()
+            .filter_map(
+                |(_, recipient, payload)| match serde_json::from_slice(payload).ok()? {
+                    NamedGroupMetadataEvent::SecureShareDelivered { secret_epoch, .. } => {
+                        Some((recipient.clone(), secret_epoch))
+                    }
+                    _ => None,
+                },
+            )
+            .collect();
+        if encrypted {
+            assert_eq!(
+                shares,
+                vec![(survivor_hex, committed_epoch)],
+                "{kind:?}: the survivor gets the rotated secret again"
+            );
+        } else {
+            assert!(
+                shares.is_empty(),
+                "{kind:?}: a SignedPublic group has no secret"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_a_gss_removal_commit_keeps_the_exact_event() -> anyhow::Result<()> {
+        assert_gss_crash_keeps_the_exact_event(
+            &"b1".repeat(16),
+            x0x::groups::GroupPolicyPreset::PrivateSecure,
+            super::super::ManualRequestKind::Remove,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_a_gss_ban_commit_keeps_the_exact_event() -> anyhow::Result<()> {
+        assert_gss_crash_keeps_the_exact_event(
+            &"b2".repeat(16),
+            x0x::groups::GroupPolicyPreset::PrivateSecure,
+            super::super::ManualRequestKind::Ban,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_a_signed_public_removal_commit_keeps_the_exact_event(
+    ) -> anyhow::Result<()> {
+        assert_gss_crash_keeps_the_exact_event(
+            &"b3".repeat(16),
+            x0x::groups::GroupPolicyPreset::PublicOpen,
+            super::super::ManualRequestKind::Remove,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_a_signed_public_ban_commit_keeps_the_exact_event() -> anyhow::Result<()>
+    {
+        assert_gss_crash_keeps_the_exact_event(
+            &"b4".repeat(16),
+            x0x::groups::GroupPolicyPreset::PublicOpen,
+            super::super::ManualRequestKind::Ban,
+        )
+        .await
     }
 }

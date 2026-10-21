@@ -8,6 +8,15 @@
 //!   Removed seat, it now builds this signed crypto-only commit instead.
 //!   The roster stays Removed; the chain revision and the TreeKEM epoch
 //!   advance together.
+//! - **GSS** ([`commit_gss`], #1508 review P1). A GSS self-leave changes
+//!   the roster and not the secret, so the leaver keeps the key. Its
+//!   "retained leaf" is the current secret
+//!   ([`ce::gss_secret_retained`]). S4 commits the GSS form (one
+//!   rotation, `next_secret_epoch`) through the same hold, §5 order,
+//!   delivery and restart rules, and seals the new secret to each
+//!   remaining Active member in the existing `SecureShareDelivered`
+//!   envelope (D60 guarded egress). A receiver installs the frame, then
+//!   takes the secret from its share.
 //! - **Hold (D76).** While an Active survivor's current verified advert
 //!   lacks `crypto_exclusion_v1`, the commit does not run. The obligation
 //!   shows `waiting_for_receiver_upgrade`, naming each holding survivor.
@@ -105,6 +114,10 @@ pub(super) struct CeDelivery {
     /// The frame was saved by an earlier boot: no resend before the
     /// group's head is synced (§3 "re-sync the head before any resend").
     resumed: bool,
+    /// A resumed GSS frame: the sealed shares of its secret were not
+    /// durable, so the first synced round seals them again (#1508 review
+    /// P1).
+    gss_shares_pending: bool,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
 }
@@ -638,6 +651,222 @@ pub(in crate::server) async fn commit_locked(
     SelfLeaveRekeyStep::Committed
 }
 
+/// Whether `group_key` is a GSS `MlsEncrypted` group (#1508 review P1).
+pub(super) async fn gss_group(state: &AppState, group_key: &str) -> bool {
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .is_some_and(ce::is_gss_encrypted)
+}
+
+/// Commit the GSS crypto-only exclusion of an already-Removed target that
+/// still holds the current secret (#1508 review P1; ADR 0110 §3 L217, §4).
+/// S4 calls it for a `SelfLeaveRekey` action that the designation, the
+/// durable intake and the head round allow. It takes the membership lock
+/// and re-checks the head, the retained secret and the D76 hold under it.
+///
+/// The §5 order is the TreeKEM one: the exact frame goes into a prepared
+/// `.evjournal` and the `.evs` row first; then the rotated group record is
+/// persisted; then the row moves to `committed_delivery_pending`. The new
+/// secret goes to each remaining Active member in a sealed
+/// `SecureShareDelivered` envelope under the D60 guarded egress, and the
+/// frame under the same guarded, capability-gated delivery.
+pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_key: &str) {
+    use super::super as ng;
+    // §2: re-read the head and the evidence just before the seal.
+    if !super::group_head_synced(state, group_key).await {
+        return;
+    }
+    let local = *state.agent.agent_id().as_bytes();
+    let target_hex = hex::encode(key.target);
+    let membership_lock = ng::group_membership_lock(state, group_key).await;
+    let _membership_guard = membership_lock.lock().await;
+    let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
+        return;
+    };
+    if info.stable_group_id() != key.stable_group_id
+        || info.fork_quarantine.is_some()
+        || !ce::gss_secret_retained(&info, &target_hex)
+        || ng::self_leave_rekey_batch_held()
+        || ng::self_leave_rekey_fence_open(group_key)
+        || ng::self_leave_rekey_fence_open(info.stable_group_id())
+    {
+        return;
+    }
+    let hold = holders(state, &info, &local, &key.target);
+    let held = !hold.is_empty();
+    super::note_receiver_upgrade_hold(state, key, hold).await;
+    if held {
+        return;
+    }
+    let Some(removal_proof) = ce::removal_proof_for(&info, &target_hex) else {
+        return;
+    };
+    let current_epoch = ce::committed_secret_epoch(&info);
+    let mut next = info.clone();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    next.secret_epoch = current_epoch;
+    let (_, next_secret_epoch) = next.rotate_shared_secret();
+    let signing_kp = state.agent.identity().agent_keypair();
+    let commit = match ng::seal_commit_owner_certified(
+        state,
+        &mut next,
+        signing_kp,
+        ng::now_millis_u64(),
+    )
+    .await
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: GSS crypto-only exclusion deferred: seal failed: {error}");
+            return;
+        }
+    };
+    ng::quiesce_member_join_egress(state, group_key, &target_hex).await;
+    // Re-check under the membership lock, after the awaits above.
+    if state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .map(|stored| stored.state_hash.as_str())
+        != Some(info.state_hash.as_str())
+    {
+        return;
+    }
+    let body = ce::CryptoExclusionBodyV1 {
+        stable_group_id: info.stable_group_id().to_string(),
+        actor: local,
+        target: key.target,
+        prior_head: info.state_hash.clone(),
+        prior_revision: info.state_revision,
+        next_revision: commit.revision,
+        roster_revision: next.roster_revision,
+        removal_proof_hash: removal_proof,
+        crypto: ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch },
+        commit: ce::CommitHeaderV1::from(&commit),
+    };
+    // The author runs the receivers' L4 rule on its own frame first.
+    if let Err(refusal) = ce::validate_against_parent(&body, &info, current_epoch, |_| false) {
+        tracing::warn!(group_id = %LogHexId::group(group_key), reason = refusal.as_str(), "ADR 0110 S4: GSS crypto-only exclusion self-check failed");
+        return;
+    }
+    let Some(bytes) = ce::sign(body, signing_kp)
+        .ok()
+        .and_then(|frame| ce::encode_frame(&frame).ok())
+        .filter(|bytes| bytes.len() <= x0x::dm::MAX_PAYLOAD_BYTES)
+    else {
+        return;
+    };
+    // §5: fsync the prepared journal with the exact outgoing frame first.
+    let mut txid = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
+    let journal = EvJournalV1 {
+        txid,
+        stable_group_id: info.stable_group_id().to_string(),
+        target: key.target,
+        parent_head: info.state_hash.clone(),
+        next_revision: commit.revision,
+        result_epoch: Some(next_secret_epoch),
+        evidence: vec![removal_proof],
+        outgoing_event: bytes.clone(),
+        result_head: Some(commit.state_hash.clone()),
+    };
+    if !super::prepare_crypto_exclusion(state, key, &journal, None).await {
+        return;
+    }
+    // The rotated group record. A rename without the directory fsync has
+    // installed the epoch, as in the TreeKEM path.
+    if !matches!(
+        ng::persist_named_group_info(state, group_key, next.clone()).await,
+        Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        super::abandon_crypto_exclusion(state, key).await;
+        tracing::error!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: GSS crypto-only exclusion deferred: persist failed before the epoch was installed");
+        return;
+    }
+    ng::purge_join_artifacts_if_ineligible(state, group_key, &target_hex).await;
+    remove_legacy_mls_member(state, group_key, AgentId(key.target)).await;
+    let recipients = survivors(&next, &local, &key.target);
+    super::committed_crypto_exclusion(
+        state,
+        key,
+        &commit.state_hash,
+        next_secret_epoch,
+        commit.revision,
+        bytes,
+        recipients,
+    )
+    .await;
+    spawn_gss_shares(state, &next, &key.target);
+    tracing::info!(
+        group_id = %LogHexId::group(group_key),
+        target = %LogHexId::agent(&target_hex),
+        secret_epoch = next_secret_epoch,
+        "ADR 0110 S4: GSS crypto-only exclusion committed"
+    );
+    let task_state = Arc::clone(state);
+    let card_key = group_key.to_string();
+    let _spawned = state.spawn_detached(async move {
+        ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
+        drive_deliveries(&task_state).await;
+    });
+}
+
+/// Seal `info`'s current secret to each remaining Active member other
+/// than this node and `target`, each as a D60 guarded class-K delivery.
+fn spawn_gss_shares(state: &Arc<AppState>, info: &GroupInfo, target: &[u8; 32]) {
+    let local = *state.agent.agent_id().as_bytes();
+    for member in info.active_members() {
+        if agent_bytes(&member.agent_id).is_some_and(|id| id != local && id != *target) {
+            spawn_gss_share_to(state, info, &member.agent_id);
+        }
+    }
+}
+
+/// Seal `info`'s current secret to the Active member `recipient_hex`. The
+/// D60 verdict re-checks its eligibility and the epoch at each write. A
+/// member without a roster KEM key cannot get a share; it is logged and
+/// skipped, as in the ban path.
+fn spawn_gss_share_to(state: &Arc<AppState>, info: &GroupInfo, recipient_hex: &str) {
+    use super::super as ng;
+    let Some(secret) = info
+        .shared_secret
+        .as_deref()
+        .and_then(|secret| <[u8; 32]>::try_from(secret).ok())
+    else {
+        return;
+    };
+    let Some(member) = info
+        .active_members()
+        .find(|member| member.agent_id == recipient_hex)
+    else {
+        return;
+    };
+    let Some(kem) = member.kem_public_key_b64.as_deref() else {
+        tracing::warn!(recipient = %LogHexId::agent(recipient_hex), "ADR 0110 S4: no KEM key on record for a survivor; cannot seal the GSS share");
+        return;
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    match ng::build_secure_share_event(
+        info.stable_group_id(),
+        recipient_hex,
+        kem,
+        &local_hex,
+        &secret,
+        info.secret_epoch,
+    ) {
+        Ok(event) => {
+            ng::spawn_secure_share_delivery(state, &event);
+        }
+        Err(_) => {
+            tracing::warn!(recipient = %LogHexId::agent(recipient_hex), "ADR 0110 S4: the GSS share could not be sealed");
+        }
+    }
+}
+
 /// A new delivery for a just-committed frame.
 pub(super) fn new_delivery(
     ce_state: &mut CeState,
@@ -654,6 +883,10 @@ pub(super) fn new_delivery(
         result_head,
         Arc::clone(&bytes),
     );
+    let gss_shares_pending = resumed
+        && ce::decode_frame(&bytes).is_ok_and(|frame| {
+            matches!(frame.body.crypto, ce::CryptoExclusionCryptoV1::Gss { .. })
+        });
     ce_state.deliveries.insert(
         key.clone(),
         CeDelivery {
@@ -661,6 +894,7 @@ pub(super) fn new_delivery(
             result_head: result_head.to_string(),
             next_revision,
             resumed,
+            gss_shares_pending,
             recipients: recipients
                 .into_iter()
                 .map(|id| (id, RecipientDelivery::Due))
@@ -839,6 +1073,12 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             // catch-up (the frame stays in the catch-up log and the row).
             runtime.inner.lock().await.ce.deliveries.remove(&key);
             continue;
+        }
+        if delivery.gss_shares_pending {
+            spawn_gss_shares(state, &info, &key.target);
+            if let Some(stored) = runtime.inner.lock().await.ce.deliveries.get_mut(&key) {
+                stored.gss_shares_pending = false;
+            }
         }
         let active: BTreeSet<[u8; 32]> =
             survivors(&info, &local, &key.target).into_iter().collect();
@@ -1063,7 +1303,13 @@ pub(in crate::server) async fn serve_catchup(
     if frames.is_empty() {
         return;
     }
+    let mut gss_groups = BTreeSet::new();
     for (group_id, result_head, bytes) in frames {
+        if ce::decode_frame(&bytes)
+            .is_ok_and(|frame| matches!(frame.body.crypto, ce::CryptoExclusionCryptoV1::Gss { .. }))
+        {
+            gss_groups.insert(group_id.clone());
+        }
         let admission =
             guarded_admission(state, &group_id, requester, HeadRule::OnChain(result_head));
         let resolve_within =
@@ -1086,6 +1332,23 @@ pub(in crate::server) async fn serve_catchup(
                 );
                 return;
             }
+        }
+    }
+    // #1508 review P1: a GSS frame moves the requester's epoch without the
+    // secret; an admin also seals its current secret to the requester.
+    let requester_hex = hex::encode(requester.as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    for group_id in gss_groups {
+        let info = {
+            let groups = state.named_groups.read().await;
+            crate::server::resolve_group_entry_locked(&groups, &group_id)
+                .map(|(_, info)| info.clone())
+        };
+        if let Some(info) = info.filter(|info| {
+            info.caller_role(&local_hex)
+                .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+        }) {
+            spawn_gss_share_to(state, &info, &requester_hex);
         }
     }
 }
@@ -1331,17 +1594,33 @@ pub(in crate::server) async fn receive(
     if info.state_hash != body.prior_head && info.state_revision < body.prior_revision {
         return ReceiveOutcome::Behind;
     }
-    let tree = {
+    // #1508 review P1: the GSS form has no tree; its epoch is the secret
+    // epoch the parent head commits to.
+    let gss = match body.crypto {
+        ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => Some(next_secret_epoch),
+        ce::CryptoExclusionCryptoV1::TreeKem { .. } => None,
+    };
+    let tree = if gss.is_some() {
+        None
+    } else {
         let map = state.treekem_groups.read().await;
-        map.get(&group_key)
+        let Some(tree) = map
+            .get(&group_key)
             .or_else(|| map.get(info.stable_group_id()))
             .cloned()
-    };
-    let Some(tree) = tree else {
-        return ReceiveOutcome::NotApplicable;
+        else {
+            return ReceiveOutcome::NotApplicable;
+        };
+        Some(tree)
     };
     let commit = body.commit.to_commit();
-    let mut guard = tree.lock().await;
+    let guard = match &tree {
+        Some(tree) => Some(tree.lock().await),
+        None => None,
+    };
+    let current_epoch = guard
+        .as_ref()
+        .map_or_else(|| ce::committed_secret_epoch(&info), |tree| tree.epoch());
     // §3 L231: re-read the revocation set under the membership lock,
     // immediately before the apply, so a revocation that landed since the
     // early check above also refuses the frame.
@@ -1351,7 +1630,7 @@ pub(in crate::server) async fn receive(
         if set.is_agent_revoked(&sender) {
             Err(ce::CryptoExclusionRefusal::ActorIneligible)
         } else {
-            ce::validate_against_parent(&body, &info, guard.epoch(), |actor| {
+            ce::validate_against_parent(&body, &info, current_epoch, |actor| {
                 set.is_agent_revoked(&AgentId(*actor))
             })
         }
@@ -1381,6 +1660,22 @@ pub(in crate::server) async fn receive(
         );
         return ReceiveOutcome::Refused(refusal);
     }
+    let Some(mut guard) = guard else {
+        // There is no tree only for the GSS form.
+        let Some(next_secret_epoch) = gss else {
+            return ReceiveOutcome::NotApplicable;
+        };
+        return install_gss(
+            state,
+            &group_key,
+            &info,
+            &body,
+            &commit,
+            next_secret_epoch,
+            payload,
+        )
+        .await;
+    };
     let ce::CryptoExclusionCryptoV1::TreeKem {
         commit: treekem_commit,
         next_epoch,
@@ -1463,22 +1758,9 @@ pub(in crate::server) async fn receive(
         "crypto_exclusion",
     )
     .await;
-    {
-        let frame_bytes = Arc::new(payload.to_vec());
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        inner.ce.remember(
-            &body.stable_group_id,
-            body.next_revision,
-            &body.commit.state_hash,
-            Arc::clone(&frame_bytes),
-        );
-        // Durable replay evidence: kept in this node's own row once it
-        // completes, so catch-up still has the frame after a restart.
-        inner.ce.note_replay_pending(
-            EvictionKey::new(body.stable_group_id.clone(), body.target),
-            frame_bytes,
-        );
-    }
+    // Durable replay evidence: kept in this node's own row once it
+    // completes, so catch-up still has the frame after a restart.
+    remember_installed(state, &body, payload).await;
     drop(membership_guard);
     tracing::info!(
         group_id = %LogHexId::group(&group_key),
@@ -1489,6 +1771,101 @@ pub(in crate::server) async fn receive(
     ng::replay_pending_treekem_events(state, &group_key).await;
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
+}
+
+/// Install a validated GSS frame (#1508 review P1). The caller holds the
+/// group's membership lock. The chained commit moves the secret epoch and
+/// its binding together; the secret itself comes later in the sealed
+/// `SecureShareDelivered` envelope, as for every GSS rotation. A share
+/// that arrived first is kept.
+async fn install_gss(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &GroupInfo,
+    body: &ce::CryptoExclusionBodyV1,
+    commit: &x0x::groups::GroupStateCommit,
+    next_secret_epoch: u64,
+    payload: &[u8],
+) -> ReceiveOutcome {
+    use super::super as ng;
+    let roster_revision = body.roster_revision;
+    let next = match ng::apply_stateful_event_with_evidence(
+        state,
+        group_key,
+        info,
+        commit,
+        None,
+        false,
+        None,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.roster_revision = ng::adopt_roster_revision(next.roster_revision, roster_revision);
+            if next.secret_epoch < next_secret_epoch {
+                next.shared_secret = None;
+                next.secret_epoch = next_secret_epoch;
+            }
+            next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+        },
+    )
+    .await
+    {
+        Ok(next) => next,
+        Err(error) => {
+            tracing::info!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: GSS crypto-only exclusion commit refused: {error}");
+            return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::BadSignature);
+        }
+    };
+    if !matches!(
+        ng::persist_named_group_info(state, group_key, next.clone()).await,
+        Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        // A local storage fault, not a sender defect: keep the frame.
+        return ReceiveOutcome::LocalFailure;
+    }
+    remove_legacy_mls_member(state, group_key, AgentId(body.target)).await;
+    ng::refresh_group_card_cache_from_info(state, group_key, &next).await;
+    ng::purge_join_artifacts_if_ineligible(state, group_key, &hex::encode(body.target)).await;
+    remember_installed(state, body, payload).await;
+    tracing::info!(
+        group_id = %LogHexId::group(group_key),
+        secret_epoch = next_secret_epoch,
+        "ADR 0110 S4: GSS crypto-only exclusion installed; waiting for the sealed share"
+    );
+    state.agent.s4_revocation_intake().request_reconcile();
+    ReceiveOutcome::Applied
+}
+
+/// Keep an installed frame for catch-up serving, and as durable replay
+/// evidence in this node's own row once that row completes.
+async fn remember_installed(state: &AppState, body: &ce::CryptoExclusionBodyV1, payload: &[u8]) {
+    let frame_bytes = Arc::new(payload.to_vec());
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.ce.remember(
+        &body.stable_group_id,
+        body.next_revision,
+        &body.commit.state_hash,
+        Arc::clone(&frame_bytes),
+    );
+    inner.ce.note_replay_pending(
+        EvictionKey::new(body.stable_group_id.clone(), body.target),
+        frame_bytes,
+    );
+}
+
+/// The GSS plane's legacy local MLS view: the excluded agent is no longer
+/// a recipient (as the ban path does).
+async fn remove_legacy_mls_member(state: &AppState, group_key: &str, target: AgentId) {
+    use super::super as ng;
+    let removed = {
+        let mut mls_groups = state.mls_groups.write().await;
+        match mls_groups.get_mut(group_key) {
+            Some(group) if group.is_member(&target) => group.remove_member(target).await.is_ok(),
+            _ => false,
+        }
+    };
+    if removed {
+        ng::save_mls_groups(state).await;
+    }
 }
 
 /// Test-only: the newest frame this node holds for `stable_group_id`.
@@ -2275,6 +2652,346 @@ mod daemon_tests {
                 .map(|info| info.state_hash.clone()),
             Some(result_head)
         );
+        Ok(())
+    }
+
+    /// A GSS `MlsEncrypted` group on the committer `state` (the only admin)
+    /// with a leaver and the survivor `replica`, and the leaver's signed
+    /// self-leave. The roster that seats both is a retained commit at
+    /// secret epoch 0.
+    struct GssLeave {
+        state: Arc<AppState>,
+        dir: tempfile::TempDir,
+        replica: Arc<AppState>,
+        _replica_dir: tempfile::TempDir,
+        group_id: String,
+        stable: String,
+        leaver: AgentId,
+        leave: ng::NamedGroupMetadataEvent,
+        old_secret: Vec<u8>,
+    }
+
+    async fn gss_leave_fixture() -> Result<GssLeave> {
+        let (mut state, dir) = ng::tests::secure_endpoint_test_state().await?;
+        // Only the per-group head round holds a seal, not the boot wait.
+        anyhow::Context::context(
+            Arc::get_mut(&mut state),
+            "the fresh test state is not shared yet",
+        )?
+        .revocation_evictions = super::super::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..x0x::groups::eviction::S4Timing::default()
+        });
+        state
+            .named_group_test_recorders
+            .metadata_publish_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (replica, replica_dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(replica.agent.agent_id().as_bytes());
+        let survivor_kem = base64::engine::general_purpose::STANDARD
+            .encode(&replica.agent_kem_keypair.public_bytes);
+        let leaver_kp = x0x::identity::AgentKeypair::generate()?;
+        let leaver = leaver_kp.agent_id();
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        let group_id = "c9".repeat(16);
+        let mut info = GroupInfo::new("ce-gss".into(), String::new(), admin, group_id.clone());
+        assert_eq!(info.secure_plane, x0x::mls::SecureGroupPlane::Gss);
+        info.add_member(
+            leaver_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.add_member_with_kem(
+            survivor_hex,
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+            Some(survivor_kem),
+        );
+        info.seal_commit(state.agent.identity().agent_keypair(), ng::now_millis_u64())?;
+        let old_secret = info.shared_secret.clone().expect("GSS secret");
+        let stable = info.stable_group_id().to_string();
+        for target in [&state, &replica] {
+            target
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+        }
+        let mut leaving = info.clone();
+        leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+        let revision = leaving.roster_revision;
+        leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let leave_commit = leaving.seal_commit(&leaver_kp, ng::now_millis_u64())?;
+        let leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision,
+            actor: leaver_hex.clone(),
+            agent_id: leaver_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(leave_commit),
+        };
+        Ok(GssLeave {
+            state,
+            dir,
+            replica,
+            _replica_dir: replica_dir,
+            group_id,
+            stable,
+            leaver,
+            leave,
+            old_secret,
+        })
+    }
+
+    /// Run the S4 worker steps of one tick until the row commits.
+    async fn run_worker(state: &Arc<AppState>) {
+        for _ in 0..3 {
+            super::super::revocation_eviction_pass(state).await;
+            super::super::persist_obligations(state).await;
+            super::super::drive_exclusions(state).await;
+        }
+    }
+
+    /// #1508 review P1: a GSS self-leave changes the roster and not the
+    /// secret, so the leaver keeps the key for later ciphertext. S4 must
+    /// open self-leave work for it, the designated admin must author the
+    /// GSS `CryptoExclusionV1` (one rotation), seal the new secret to the
+    /// survivor, and the survivor must install the frame and then the
+    /// share. The leaver's old secret cannot derive the new message key.
+    #[tokio::test]
+    async fn gss_self_leave_rotates_the_secret_and_the_survivor_installs_it() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        run_worker(&fx.state).await;
+
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the GSS crypto-only exclusion committed");
+        let decoded = ce::decode_frame(&frame).expect("frame");
+        assert_eq!(
+            decoded.body.crypto,
+            ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: 1
+            }
+        );
+        let committed = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        assert_eq!(committed.state_hash, decoded.body.commit.state_hash);
+        assert_eq!(committed.secret_epoch, 1);
+        let new_secret = committed.shared_secret.clone().expect("new secret");
+        assert_ne!(new_secret, fx.old_secret, "the secret rotated");
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("S4 self-leave row");
+            assert_eq!(row.phase, Phase::CommittedDeliveryPending);
+            assert_eq!(row.outgoing_event.as_deref(), Some(frame.as_slice()));
+        }
+        // The new secret is sealed to the survivor only.
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let shares: Vec<(String, String, Vec<u8>)> = fx
+            .state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map(|scheduled| scheduled.clone())
+            .unwrap_or_default();
+        let share: ng::NamedGroupMetadataEvent = shares
+            .iter()
+            .find(|(_, recipient, _)| *recipient == survivor_hex)
+            .and_then(|(_, _, payload)| serde_json::from_slice(payload).ok())
+            .expect("a share for the survivor");
+        assert!(
+            shares
+                .iter()
+                .all(|(_, recipient, _)| *recipient == survivor_hex),
+            "no share for the leaver or the committer"
+        );
+
+        // The survivor takes the leave, the frame, then the share.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        // Success of a share is observed in the stored state.
+        let _ = ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
+        let survivor = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        assert_eq!(survivor.state_hash, committed.state_hash);
+        assert_eq!(survivor.secret_epoch, 1);
+        assert_eq!(
+            survivor.shared_secret.as_deref(),
+            Some(new_secret.as_slice()),
+            "the survivor took the new secret from its share"
+        );
+        assert_eq!(
+            survivor.secure_message_key(),
+            committed.secure_message_key()
+        );
+        // The leaver holds only the old secret.
+        assert_ne!(
+            Some(GroupInfo::derive_message_key(&fx.old_secret, 1, &fx.stable)),
+            committed.secure_message_key(),
+            "the old secret must not derive the new message key"
+        );
+
+        // Completion: the rotation excludes the leaver, so once delivery
+        // ends the row completes from the chain and no new work opens.
+        fx.state.revocation_evictions.inner.lock().await.ce = CeState::default();
+        super::super::revocation_eviction_pass(&fx.state).await;
+        let inner = fx.state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).map(|row| row.phase),
+            Some(Phase::Complete)
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1, §3/§5: a restart after the GSS exclusion committed
+    /// keeps the exact frame in the row and resumes its delivery; the
+    /// rotated secret is durable.
+    #[tokio::test]
+    async fn gss_exclusion_frame_survives_a_committer_restart() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the GSS crypto-only exclusion committed");
+
+        let restarted =
+            ng::tests::secure_endpoint_test_state_at(fx.dir.path(), Arc::clone(&fx.state.agent))
+                .await?;
+        super::super::load_persisted_obligations(&restarted).await;
+        let stored = restarted
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        assert_eq!(stored.secret_epoch, 1, "the rotation is durable");
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let inner = restarted.revocation_evictions.inner.lock().await;
+        let row = inner.store.get(&key).expect("row");
+        assert_eq!(row.phase, Phase::CommittedDeliveryPending);
+        assert_eq!(row.outgoing_event.as_deref(), Some(frame.as_slice()));
+        assert!(
+            inner.ce.delivering().contains(&key),
+            "the saved frame's delivery resumes"
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1: the survivor's receive path refuses a GSS frame
+    /// whose next secret epoch skips one, and one whose target is seated.
+    #[tokio::test]
+    async fn survivor_refuses_a_bad_gss_frame() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let parent = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        let admin_kp = fx.state.agent.identity().agent_keypair();
+        let frame_for = |target: [u8; 32], next_secret_epoch: u64| -> Result<Vec<u8>> {
+            let mut next = parent.clone();
+            next.roster_revision = next.roster_revision.saturating_add(1);
+            next.secret_epoch = next_secret_epoch;
+            next.security_binding = Some(format!("gss:epoch={next_secret_epoch}"));
+            let commit = next.seal_commit(admin_kp, ng::now_millis_u64())?;
+            let target_hex = hex::encode(target);
+            let body = ce::CryptoExclusionBodyV1 {
+                stable_group_id: fx.stable.clone(),
+                actor: *admin_kp.agent_id().as_bytes(),
+                target,
+                prior_head: parent.state_hash.clone(),
+                prior_revision: parent.state_revision,
+                next_revision: commit.revision,
+                roster_revision: next.roster_revision,
+                removal_proof_hash: ce::removal_proof_for(&parent, &target_hex).unwrap_or([0; 32]),
+                crypto: ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch },
+                commit: ce::CommitHeaderV1::from(&commit),
+            };
+            let frame = ce::sign(body, admin_kp).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(ce::encode_frame(&frame)?)
+        };
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame_for(*fx.leaver.as_bytes(), 2)?).await,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::EpochMismatch),
+            "the next secret epoch must be the committed epoch + 1"
+        );
+        let survivor = *fx.replica.agent.agent_id().as_bytes();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame_for(survivor, 1)?).await,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::TargetNotRemoved),
+            "a seated target is refused"
+        );
+        let unchanged = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .map(|info| (info.state_hash.clone(), info.secret_epoch));
+        assert_eq!(unchanged, Some((parent.state_hash.clone(), 0)));
         Ok(())
     }
 }

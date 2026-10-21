@@ -7,6 +7,9 @@
 //! the local commit and before the delivery lost the chain link. Now the
 //! author writes the group's held log with the new frame before the local
 //! commit ([`write_planned`]), and a restart loads it ([`ensure_restored`]).
+//! A receiver does the same before it installs a frame
+//! ([`write_received`]), so a restarted receiver serves the frame to a
+//! survivor that missed it while the author is offline (#1508 review F2).
 //!
 //! - **File.** `<data_dir>/treekem/<stem>.crblog` (rebind) or
 //!   `<stem>.orclog` (owner recovery), with the `.evjournal` stem rule.
@@ -21,9 +24,11 @@
 //!   then history name), and that group starts with an empty log: its
 //!   frames are lost, the load never panics and never uses the damaged
 //!   bytes. A newer layout stays on disk, not loaded. A frame that is not
-//!   on this node's loaded chain is dropped (a crash between the write and
+//!   on this node's loaded chain is not held (a crash between the write and
 //!   the commit). An authored frame that is still the group's head gets
-//!   its delivery again.
+//!   its delivery again. A received frame above the loaded head (a crash
+//!   between the write and the install) is received again: the caller
+//!   puts it through the full receive checks.
 //! - **Retire.** The file holds the group's in-memory log, with the same
 //!   bound, so a frame leaves the file only when that bound drops it.
 
@@ -70,6 +75,16 @@ pub(in super::super) struct ReplayLogV1 {
     pub stable_group_id: String,
     /// The held frames, oldest revision first.
     pub frames: Vec<ReplayFrameV1>,
+}
+
+/// What a restart loaded for the caller to act on.
+#[derive(Default)]
+pub(in super::super) struct Restored {
+    /// Authored frames that are still their group's head: deliver again.
+    pub resumes: Vec<Resume>,
+    /// Received frames above their group's loaded head, durable before a
+    /// crash stopped the install: receive again.
+    pub received: Vec<Arc<Vec<u8>>>,
 }
 
 /// An authored frame that is its group's head after a restart: the
@@ -174,31 +189,33 @@ impl<const CAP: usize> HeldLog<CAP> {
         }
     }
 
-    /// The file of the group after it also holds the authored frame.
+    /// The file of the group after it also holds the frame, with the
+    /// [`Self::remember`] rule.
     fn planned(
         &self,
         stable: &str,
-        revision: u64,
-        head: &str,
+        (revision, head): (u64, &str),
         bytes: &Arc<Vec<u8>>,
+        authored: bool,
     ) -> ReplayLogV1 {
         let mut scratch = Self::default();
         if let Some(log) = self.log.get(stable) {
             scratch.log.insert(stable.to_string(), log.clone());
         }
-        scratch.remember(stable, revision, head, Arc::clone(bytes), true);
+        scratch.remember(stable, revision, head, Arc::clone(bytes), authored);
         scratch.file(stable)
     }
 
     /// Hold the frames of `logs` that are on `groups`' loaded chain again.
-    /// Returns the authored frames that are still their group's head.
+    /// Returns the authored frames that are still their group's head, and
+    /// the received frames above it.
     pub(in super::super) fn restore(
         &mut self,
         logs: Vec<ReplayLogV1>,
         groups: &HashMap<String, GroupInfo>,
-    ) -> Vec<Resume> {
+    ) -> Restored {
         self.restored = true;
-        let mut resumes = Vec::new();
+        let mut restored = Restored::default();
         for log in logs {
             let Some(info) = groups.get(&log.stable_group_id) else {
                 continue;
@@ -208,13 +225,16 @@ impl<const CAP: usize> HeldLog<CAP> {
                 let at_head = frame.next_revision == info.state_revision
                     && frame.result_head == info.state_hash;
                 if !(at_head || frame.next_revision < info.state_revision) {
+                    if !frame.authored && frame.next_revision > info.state_revision {
+                        restored.received.push(Arc::new(frame.frame));
+                    }
                     continue;
                 }
                 let bytes = Arc::new(frame.frame);
                 let (revision, head) = (frame.next_revision, frame.result_head);
                 self.remember(&stable, revision, &head, Arc::clone(&bytes), frame.authored);
                 if at_head && frame.authored {
-                    resumes.push(Resume {
+                    restored.resumes.push(Resume {
                         stable_group_id: stable.clone(),
                         info: info.clone(),
                         next_revision: revision,
@@ -224,7 +244,7 @@ impl<const CAP: usize> HeldLog<CAP> {
                 }
             }
         }
-        resumes
+        restored
     }
 }
 
@@ -356,11 +376,39 @@ pub(in super::super) async fn write_planned<const CAP: usize>(
     extension: &str,
     held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
     stable: &str,
-    (revision, head): (u64, &str),
+    at: (u64, &str),
     bytes: &Arc<Vec<u8>>,
 ) -> bool {
+    write_with(state, extension, held, stable, at, bytes, true).await
+}
+
+/// Before a received frame's state is installed: write the group's log
+/// with the received frame durably, in the same file and layout as an
+/// authored frame (#1508 review F2). On `false` the caller must not
+/// install. If the install then fails for a local fault, the frame stays
+/// in the file; the next receipt or the restart receives it again.
+pub(in super::super) async fn write_received<const CAP: usize>(
+    state: &AppState,
+    extension: &str,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
+    stable: &str,
+    at: (u64, &str),
+    bytes: &Arc<Vec<u8>>,
+) -> bool {
+    write_with(state, extension, held, stable, at, bytes, false).await
+}
+
+async fn write_with<const CAP: usize>(
+    state: &AppState,
+    extension: &str,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
+    stable: &str,
+    at: (u64, &str),
+    bytes: &Arc<Vec<u8>>,
+    authored: bool,
+) -> bool {
     let planned = held(&mut *state.revocation_evictions.inner.lock().await)
-        .planned(stable, revision, head, bytes);
+        .planned(stable, at, bytes, authored);
     write_at(&log_path(state, stable, extension), &planned).await
 }
 
@@ -378,15 +426,15 @@ pub(in super::super) async fn rewrite_from_memory<const CAP: usize>(
 }
 
 /// Load the files once per process, before this node serves catch-up,
-/// delivers or authors a frame of this kind. Returns the frames to
-/// deliver again (empty when another call did the load).
+/// delivers, receives or authors a frame of this kind. Returns the frames
+/// to deliver or receive again (empty when another call did the load).
 pub(in super::super) async fn ensure_restored<const CAP: usize>(
     state: &AppState,
     extension: &str,
     held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
-) -> Vec<Resume> {
+) -> Restored {
     if held(&mut *state.revocation_evictions.inner.lock().await).restored {
-        return Vec::new();
+        return Restored::default();
     }
     let logs = read_all_in(&state.treekem_dir, extension).await;
     let groups: HashMap<String, GroupInfo> = state
@@ -399,7 +447,7 @@ pub(in super::super) async fn ensure_restored<const CAP: usize>(
     let mut inner = state.revocation_evictions.inner.lock().await;
     let log = held(&mut inner);
     if log.restored {
-        return Vec::new();
+        return Restored::default();
     }
     log.restore(logs, &groups)
 }
@@ -441,11 +489,13 @@ pub(in super::super) mod tests {
         let path = dir.path().join(format!("g.{extension}"));
         let mut before = HeldLog::<CAP>::default();
         before.remember(stable, 4, "h4", Arc::new(vec![4]), false);
-        assert!(write_at(&path, &before.planned(stable, 5, "h5", frame)).await);
+        assert!(write_at(&path, &before.planned(stable, (5, "h5"), frame, true)).await);
         // The commit lands, then the process dies: `before` is lost.
         drop(before);
         let mut after = HeldLog::<CAP>::default();
-        let resumes = after.restore(read_all_in(dir.path(), extension).await, groups);
+        let resumes = after
+            .restore(read_all_in(dir.path(), extension).await, groups)
+            .resumes;
         let served = after.catchup_frames(&[stable.to_string()], 4);
         assert_eq!(served.len(), 1, "the frame is missing after the restart");
         assert_eq!(served[0].1, "h5");
@@ -454,12 +504,25 @@ pub(in super::super) mod tests {
 
         // A crash between the write and the commit: revision 6 never
         // landed, so a restart does not serve it.
-        let planned = after.planned(stable, 6, "h6", &Arc::new(vec![6]));
+        let planned = after.planned(stable, (6, "h6"), &Arc::new(vec![6]), true);
         assert!(write_at(&path, &planned).await);
         let mut again = HeldLog::<CAP>::default();
         let _ = again.restore(read_all_in(dir.path(), extension).await, groups);
         assert!(again.catchup_frames(&[stable.to_string()], 5).is_empty());
         resumes
+    }
+
+    /// The frames that the group's held log file holds on disk now (empty
+    /// when the file is missing or cannot be used).
+    pub(in super::super::super) async fn frames_on_disk(
+        state: &AppState,
+        extension: &str,
+        stable: &str,
+    ) -> Vec<ReplayFrameV1> {
+        match tokio::fs::read(log_path(state, stable, extension)).await {
+            Ok(bytes) => decode(&bytes).map(|log| log.frames).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
     }
 
     #[test]

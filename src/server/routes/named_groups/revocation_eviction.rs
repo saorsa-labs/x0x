@@ -38,6 +38,7 @@ use tokio::time::Instant;
 
 use crate as x0x;
 use crate::server::state::AppState;
+use x0x::groups::crypto_exclusion as ce;
 use x0x::groups::eviction::{
     self as s4, CommitPermission, EvJournalV1, EvictionKey, EvictionTrigger, EvsBodyV1,
     IntakeOutcome, ObligationRow, ObligationStore, Phase, QueuedBanV1, RowAction, RowBudget,
@@ -920,7 +921,8 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             evaluation.action = RowAction::None;
         } else if !target_seated
             && row.phase == Phase::Pending
-            && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+            && (info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                || ce::is_gss_encrypted(info))
         {
             let holders = crypto_exclusion::holders(state, info, &local, &key.target);
             if holders.is_empty() {
@@ -1090,6 +1092,10 @@ type TrackedLeaves = (Vec<[u8; 32]>, u64);
 /// Retained TreeKEM leaves per stable group ID: the agent IDs whose leaf
 /// is still in this node's ratchet tree, with the tree epoch. A group whose
 /// tree is busy is skipped for this pass (`None`), never read as empty.
+///
+/// A GSS `MlsEncrypted` group has no tree. Its entry holds the Removed
+/// members that still hold the current secret
+/// ([`ce::gss_secret_retained`], #1508 review P1), with the secret epoch.
 #[derive(Default)]
 struct RetainedLeaves {
     by_group: HashMap<String, Option<TrackedLeaves>>,
@@ -1123,7 +1129,24 @@ async fn snapshot_retained_leaves(
     let mut leaves = RetainedLeaves::default();
     let trees = state.treekem_groups.read().await;
     for (key, info) in groups {
-        if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem || info.withdrawn {
+        if info.withdrawn {
+            continue;
+        }
+        if ce::is_gss_encrypted(info) {
+            let retained = info
+                .members_v2
+                .keys()
+                .filter(|member| ce::gss_secret_retained(info, member))
+                .filter_map(|member| super::parse_agent_id_hex(member).ok())
+                .map(|agent| *agent.as_bytes())
+                .collect();
+            leaves.by_group.insert(
+                info.stable_group_id().to_string(),
+                Some((retained, info.secret_epoch)),
+            );
+            continue;
+        }
+        if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
             continue;
         }
         let stable = info.stable_group_id().to_string();
@@ -1364,7 +1387,9 @@ fn reconcile_completion(
             // `committed_delivery_pending` while its delivery runs.
             continue;
         }
-        if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        // A GSS group completes only once a rotation excludes the target
+        // (#1508 review P1); its entry is never busy.
+        if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem || ce::is_gss_encrypted(info) {
             if !leaves.known(stable) {
                 // The tree was busy; decide on a later pass.
                 continue;
@@ -2213,7 +2238,13 @@ async fn drive_exclusions(state: &Arc<AppState>) {
                     rank,
                     "ADR 0110 S4: scheduling the responsive self-leave rekey"
                 );
-                super::schedule_self_leave_rekey_if_idle(state, &group_key).await;
+                if crypto_exclusion::gss_group(state, &group_key).await {
+                    // #1508 review P1: a GSS group has no #1337 rekey
+                    // pass; S4 commits the GSS `CryptoExclusionV1` itself.
+                    crypto_exclusion::commit_gss(state, &key, &group_key).await;
+                } else {
+                    super::schedule_self_leave_rekey_if_idle(state, &group_key).await;
+                }
                 state
                     .revocation_evictions
                     .inner
@@ -2310,7 +2341,12 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         if status == StatusCode::OK {
             if let Some(row) = inner.store.get_mut(key) {
                 row.phase = Phase::CommittedDeliveryPending;
-                row.result_epoch = body.get("epoch").and_then(serde_json::Value::as_u64);
+                // §5: the removal barrier saved the exact event's epoch; the
+                // reply's `epoch` is the legacy MLS epoch (GSS) or absent
+                // (bans), so it only fills a row the barrier left empty.
+                if row.result_epoch.is_none() {
+                    row.result_epoch = body.get("epoch").and_then(serde_json::Value::as_u64);
+                }
             }
             inner.attempt_wait.remove(key);
             inner.queued_manual.remove(key);
@@ -3081,6 +3117,10 @@ fn finish_persist(inner: &mut S4Inner, covered_seq: u64, written: bool) -> bool 
 }
 
 /// Temp write, fsync, atomic rename and directory fsync (§5).
+///
+/// The temp file is created owner-only (`0600`) before any byte goes in,
+/// whatever the umask: S3/S4 sidecars can hold private key material
+/// (ADR 0012). The rename keeps that mode.
 pub(super) async fn write_bytes_durably(
     path: &FsPath,
     bytes: &[u8],
@@ -3101,11 +3141,11 @@ pub(super) async fn write_bytes_durably(
     };
     let temp = path.with_file_name(format!("{file_name}.tmp-{suffix}"));
     let write = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp).await?;
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
@@ -4001,6 +4041,32 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    /// ADR 0012 (#1533 review): every S3/S4 sidecar can hold private key
+    /// material (the re-seat journal holds a TreeKEM snapshot), so a durable
+    /// write is owner-only under the common umask 022, also when it replaces
+    /// an older world-readable file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_write_is_owner_only_under_umask_022() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: `umask` only swaps the process file-mode mask. nextest
+        // runs each test in its own process.
+        let previous = unsafe { libc::umask(0o022) };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("group.grecov");
+        std::fs::write(&path, b"old").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let written = write_bytes_durably(&path, b"secret", None).await;
+        // SAFETY: as above.
+        unsafe { libc::umask(previous) };
+        written.expect("write");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "sidecar bytes are private");
     }
 
     #[tokio::test]
