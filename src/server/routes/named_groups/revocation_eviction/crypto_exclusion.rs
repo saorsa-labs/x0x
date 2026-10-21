@@ -2277,4 +2277,339 @@ mod daemon_tests {
         );
         Ok(())
     }
+
+    /// A GSS `MlsEncrypted` group on the committer `state` (the only admin)
+    /// with a leaver and the survivor `replica`, and the leaver's signed
+    /// self-leave. The roster that seats both is a retained commit at
+    /// secret epoch 0.
+    struct GssLeave {
+        state: Arc<AppState>,
+        dir: tempfile::TempDir,
+        replica: Arc<AppState>,
+        _replica_dir: tempfile::TempDir,
+        group_id: String,
+        stable: String,
+        leaver: AgentId,
+        leave: ng::NamedGroupMetadataEvent,
+        old_secret: Vec<u8>,
+    }
+
+    async fn gss_leave_fixture() -> Result<GssLeave> {
+        let (mut state, dir) = ng::tests::secure_endpoint_test_state().await?;
+        // Only the per-group head round holds a seal, not the boot wait.
+        if let Some(fresh) = Arc::get_mut(&mut state) {
+            fresh.revocation_evictions =
+                super::super::S4Runtime::new(x0x::groups::eviction::S4Timing {
+                    restart_sync_wait: Duration::ZERO,
+                    ..x0x::groups::eviction::S4Timing::default()
+                });
+        }
+        state
+            .named_group_test_recorders
+            .metadata_publish_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (replica, replica_dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(replica.agent.agent_id().as_bytes());
+        let survivor_kem = base64::engine::general_purpose::STANDARD
+            .encode(&replica.agent_kem_keypair.public_bytes);
+        let leaver_kp = x0x::identity::AgentKeypair::generate()?;
+        let leaver = leaver_kp.agent_id();
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        let group_id = "c9".repeat(16);
+        let mut info = GroupInfo::new("ce-gss".into(), String::new(), admin, group_id.clone());
+        assert_eq!(info.secure_plane, x0x::mls::SecureGroupPlane::Gss);
+        info.add_member(
+            leaver_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.add_member_with_kem(
+            survivor_hex,
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+            Some(survivor_kem),
+        );
+        info.seal_commit(state.agent.identity().agent_keypair(), ng::now_millis_u64())?;
+        let old_secret = info.shared_secret.clone().expect("GSS secret");
+        let stable = info.stable_group_id().to_string();
+        for target in [&state, &replica] {
+            target
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+        }
+        let mut leaving = info.clone();
+        leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+        let revision = leaving.roster_revision;
+        leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let leave_commit = leaving.seal_commit(&leaver_kp, ng::now_millis_u64())?;
+        let leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision,
+            actor: leaver_hex.clone(),
+            agent_id: leaver_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(leave_commit),
+        };
+        Ok(GssLeave {
+            state,
+            dir,
+            replica,
+            _replica_dir: replica_dir,
+            group_id,
+            stable,
+            leaver,
+            leave,
+            old_secret,
+        })
+    }
+
+    /// Run the S4 worker steps of one tick until the row commits.
+    async fn run_worker(state: &Arc<AppState>) {
+        for _ in 0..3 {
+            super::super::revocation_eviction_pass(state).await;
+            super::super::persist_obligations(state).await;
+            super::super::drive_exclusions(state).await;
+        }
+    }
+
+    /// #1508 review P1: a GSS self-leave changes the roster and not the
+    /// secret, so the leaver keeps the key for later ciphertext. S4 must
+    /// open self-leave work for it, the designated admin must author the
+    /// GSS `CryptoExclusionV1` (one rotation), seal the new secret to the
+    /// survivor, and the survivor must install the frame and then the
+    /// share. The leaver's old secret cannot derive the new message key.
+    #[tokio::test]
+    async fn gss_self_leave_rotates_the_secret_and_the_survivor_installs_it() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        run_worker(&fx.state).await;
+
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the GSS crypto-only exclusion committed");
+        let decoded = ce::decode_frame(&frame).expect("frame");
+        assert_eq!(
+            decoded.body.crypto,
+            ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: 1
+            }
+        );
+        let committed = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        assert_eq!(committed.state_hash, decoded.body.commit.state_hash);
+        assert_eq!(committed.secret_epoch, 1);
+        let new_secret = committed.shared_secret.clone().expect("new secret");
+        assert_ne!(new_secret, fx.old_secret, "the secret rotated");
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("S4 self-leave row");
+            assert_eq!(row.phase, Phase::CommittedDeliveryPending);
+            assert_eq!(row.outgoing_event.as_deref(), Some(frame.as_slice()));
+        }
+        // The new secret is sealed to the survivor only.
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let shares: Vec<(String, String, Vec<u8>)> = fx
+            .state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map(|scheduled| scheduled.clone())
+            .unwrap_or_default();
+        let share: ng::NamedGroupMetadataEvent = shares
+            .iter()
+            .find(|(_, recipient, _)| *recipient == survivor_hex)
+            .and_then(|(_, _, payload)| serde_json::from_slice(payload).ok())
+            .expect("a share for the survivor");
+        assert!(
+            shares
+                .iter()
+                .all(|(_, recipient, _)| *recipient == survivor_hex),
+            "no share for the leaver or the committer"
+        );
+
+        // The survivor takes the leave, the frame, then the share.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        let applied =
+            ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
+        assert!(applied.accepted, "the share must install: {applied:?}");
+        let survivor = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        assert_eq!(survivor.state_hash, committed.state_hash);
+        assert_eq!(survivor.secret_epoch, 1);
+        assert_eq!(
+            survivor.secure_message_key(),
+            committed.secure_message_key()
+        );
+        // The leaver holds only the old secret.
+        assert_ne!(
+            Some(GroupInfo::derive_message_key(&fx.old_secret, 1, &fx.stable)),
+            committed.secure_message_key(),
+            "the old secret must not derive the new message key"
+        );
+
+        // Completion: the rotation excludes the leaver, so once delivery
+        // ends the row completes from the chain and no new work opens.
+        fx.state.revocation_evictions.inner.lock().await.ce = CeState::default();
+        super::super::revocation_eviction_pass(&fx.state).await;
+        let inner = fx.state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).map(|row| row.phase),
+            Some(Phase::Complete)
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1, §3/§5: a restart after the GSS exclusion committed
+    /// keeps the exact frame in the row and resumes its delivery; the
+    /// rotated secret is durable.
+    #[tokio::test]
+    async fn gss_exclusion_frame_survives_a_committer_restart() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the GSS crypto-only exclusion committed");
+
+        let restarted =
+            ng::tests::secure_endpoint_test_state_at(fx.dir.path(), Arc::clone(&fx.state.agent))
+                .await?;
+        super::super::load_persisted_obligations(&restarted).await;
+        let stored = restarted
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        assert_eq!(stored.secret_epoch, 1, "the rotation is durable");
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let inner = restarted.revocation_evictions.inner.lock().await;
+        let row = inner.store.get(&key).expect("row");
+        assert_eq!(row.phase, Phase::CommittedDeliveryPending);
+        assert_eq!(row.outgoing_event.as_deref(), Some(frame.as_slice()));
+        assert!(
+            inner.ce.delivering().contains(&key),
+            "the saved frame's delivery resumes"
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1: the survivor's receive path refuses a GSS frame
+    /// whose next secret epoch skips one, and one whose target is seated.
+    #[tokio::test]
+    async fn survivor_refuses_a_bad_gss_frame() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let parent = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        let admin_kp = fx.state.agent.identity().agent_keypair();
+        let frame_for = |target: [u8; 32], next_secret_epoch: u64| -> Result<Vec<u8>> {
+            let mut next = parent.clone();
+            next.roster_revision = next.roster_revision.saturating_add(1);
+            next.secret_epoch = next_secret_epoch;
+            next.security_binding = Some(format!("gss:epoch={next_secret_epoch}"));
+            let commit = next.seal_commit(admin_kp, ng::now_millis_u64())?;
+            let target_hex = hex::encode(target);
+            let body = ce::CryptoExclusionBodyV1 {
+                stable_group_id: fx.stable.clone(),
+                actor: *admin_kp.agent_id().as_bytes(),
+                target,
+                prior_head: parent.state_hash.clone(),
+                prior_revision: parent.state_revision,
+                next_revision: commit.revision,
+                roster_revision: next.roster_revision,
+                removal_proof_hash: ce::removal_proof_for(&parent, &target_hex).unwrap_or([0; 32]),
+                crypto: ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch },
+                commit: ce::CommitHeaderV1::from(&commit),
+            };
+            let frame = ce::sign(body, admin_kp).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(ce::encode_frame(&frame)?)
+        };
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame_for(*fx.leaver.as_bytes(), 2)?).await,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::EpochMismatch),
+            "the next secret epoch must be the committed epoch + 1"
+        );
+        let survivor = *fx.replica.agent.agent_id().as_bytes();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame_for(survivor, 1)?).await,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::TargetNotRemoved),
+            "a seated target is refused"
+        );
+        let unchanged = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .map(|info| (info.state_hash.clone(), info.secret_epoch));
+        assert_eq!(unchanged, Some((parent.state_hash.clone(), 0)));
+        Ok(())
+    }
 }

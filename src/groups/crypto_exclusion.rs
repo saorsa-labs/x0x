@@ -684,6 +684,110 @@ mod tests {
         );
     }
 
+    /// A GSS group in which `target` was seated at secret epoch 0 (a
+    /// retained commit holds that roster) and then self-left.
+    fn gss_group(admin: &AgentKeypair, target: [u8; 32]) -> GroupInfo {
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            "d".to_string(),
+            admin.agent_id(),
+            "cd".repeat(16),
+        );
+        let target_hex = hex::encode(target);
+        info.add_member(
+            target_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        info.seal_commit(admin, 500).expect("seat");
+        info.remove_member(&target_hex, Some(target_hex.clone()));
+        info.recompute_state_hash();
+        info
+    }
+
+    fn gss_body_for(
+        info: &GroupInfo,
+        admin: &AgentKeypair,
+        target: [u8; 32],
+        next_secret_epoch: u64,
+    ) -> CryptoExclusionBodyV1 {
+        let mut next = info.clone();
+        next.secret_epoch = next_secret_epoch;
+        next.security_binding = Some(format!("gss:epoch={next_secret_epoch}"));
+        let commit = next.seal_commit(admin, 1_000).expect("seal");
+        CryptoExclusionBodyV1 {
+            stable_group_id: info.stable_group_id().to_string(),
+            actor: *admin.agent_id().as_bytes(),
+            target,
+            prior_head: info.state_hash.clone(),
+            prior_revision: info.state_revision,
+            next_revision: info.state_revision + 1,
+            roster_revision: info.roster_revision + 1,
+            removal_proof_hash: removal_proof_for(info, &hex::encode(target)).expect("removed"),
+            crypto: CryptoExclusionCryptoV1::Gss { next_secret_epoch },
+            commit: CommitHeaderV1::from(&commit),
+        }
+    }
+
+    /// #1508 review P1 (GSS self-leave): the GSS form of §4 is accepted on
+    /// a GSS group for an already-Removed target when the next secret
+    /// epoch is exactly the committed epoch + 1 and the signed binding
+    /// names it. Each violation is refused with its typed reason.
+    #[test]
+    fn gss_frame_is_accepted_and_each_violation_refused() {
+        let admin = keypair();
+        let target = [9u8; 32];
+        let info = gss_group(&admin, target);
+        let good = gss_body_for(&info, &admin, target, 1);
+        assert_eq!(validate_against_parent(&good, &info, 0, |_| false), Ok(()));
+        let frame = sign(good.clone(), &admin).expect("sign");
+        let decoded = decode_frame(&encode_frame(&frame).expect("encode")).expect("decode");
+        verify_signatures(&decoded).expect("signatures");
+        // The next epoch is not the committed epoch + 1.
+        assert_eq!(
+            validate_against_parent(&good, &info, 1, |_| false),
+            Err(CryptoExclusionRefusal::EpochMismatch)
+        );
+        let skipped = gss_body_for(&info, &admin, target, 2);
+        assert_eq!(
+            validate_against_parent(&skipped, &info, 0, |_| false),
+            Err(CryptoExclusionRefusal::EpochMismatch)
+        );
+        // The signed binding does not name the next epoch.
+        let mut unbound = good.clone();
+        unbound.crypto = CryptoExclusionCryptoV1::Gss {
+            next_secret_epoch: 1,
+        };
+        unbound.commit.security_binding = Some("gss:epoch=7".to_string());
+        assert_eq!(
+            validate_against_parent(&unbound, &info, 0, |_| false),
+            Err(CryptoExclusionRefusal::EpochMismatch)
+        );
+        // The target is seated on the parent.
+        let mut seated = info.clone();
+        if let Some(member) = seated.members_v2.get_mut(&hex::encode(target)) {
+            member.state = GroupMemberState::Active;
+        }
+        assert_eq!(
+            validate_against_parent(&good, &seated, 0, |_| false),
+            Err(CryptoExclusionRefusal::TargetNotRemoved)
+        );
+        // A GSS transition on a TreeKEM group, and on a SignedPublic group.
+        let mut treekem = info.clone();
+        treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
+        assert_eq!(
+            validate_against_parent(&good, &treekem, 0, |_| false),
+            Err(CryptoExclusionRefusal::CryptoPlaneUnsupported)
+        );
+        let mut public = info.clone();
+        public.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        assert_eq!(
+            validate_against_parent(&good, &public, 0, |_| false),
+            Err(CryptoExclusionRefusal::CryptoPlaneUnsupported)
+        );
+    }
+
     #[test]
     fn revoked_actor_is_refused() {
         let admin = keypair();
