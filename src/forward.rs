@@ -2187,7 +2187,7 @@ async fn send_header_to_pinned<W: tokio::io::AsyncWrite + Unpin>(
 
 /// Reset a stream refused at the machine-binding check and count it.
 fn refuse_machine_mismatch(
-    mut stream: PeerStream,
+    stream: &mut PeerStream,
     pinned: MachineId,
     actual: MachineId,
     fwd_diag: &ForwardDiagnostics,
@@ -2202,6 +2202,60 @@ fn refuse_machine_mismatch(
         actual = %hex::encode(actual.as_bytes()),
         "outbound forward refused: stream reached a different machine than pinned (machine_mismatch)"
     );
+}
+
+/// What [`write_pinned_header`] did with the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedHeader {
+    /// `PeerStream::peer()` is the pinned machine (or nothing is pinned)
+    /// and the header frame was written.
+    Sent,
+    /// The stream reaches a different machine. It has been reset, and no
+    /// header version may be tried on it.
+    Refused,
+    /// The write failed. A V2 attempt may fall back to V1.
+    Failed,
+}
+
+/// How a V2 outbound attempt continues after [`PinnedHeader`].
+///
+/// `Stop` is the machine-binding refusal: the attempt is finished, and
+/// [`drive_outbound`] must not open a V1 stream. `Fallback` is only a
+/// failed write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterPin {
+    Continue,
+    Stop,
+    Fallback,
+}
+
+fn after_pin(header: PinnedHeader) -> AfterPin {
+    match header {
+        PinnedHeader::Sent => AfterPin::Continue,
+        PinnedHeader::Refused => AfterPin::Stop,
+        PinnedHeader::Failed => AfterPin::Fallback,
+    }
+}
+
+/// ADR-0074 §1: read [`PeerStream::peer`] and write `frame` only when that
+/// machine is the pin. A mismatch resets the stream and counts
+/// `machine_mismatch`. Callers turn [`PinnedHeader::Refused`] into a
+/// finished attempt ([`AfterPin::Stop`]), never a V1 retry.
+async fn write_pinned_header(
+    stream: &mut PeerStream,
+    pinned: Option<MachineId>,
+    frame: &[u8],
+    fwd_diag: &ForwardDiagnostics,
+) -> PinnedHeader {
+    let actual = stream.peer();
+    match send_header_to_pinned(stream.send_mut(), actual, pinned, frame).await {
+        HeaderSend::Sent => PinnedHeader::Sent,
+        HeaderSend::MachineMismatch { pinned, actual } => {
+            refuse_machine_mismatch(stream, pinned, actual, fwd_diag);
+            PinnedHeader::Refused
+        }
+        HeaderSend::Failed => PinnedHeader::Failed,
+    }
 }
 
 /// Outbound driver: open the peer stream, write the header, read the peer's
@@ -2357,11 +2411,12 @@ async fn try_outbound_v2(
     }
     // ADR-0074 §1: check PeerStream::peer() before any header byte.
     // ADR-0074 §4: cancel during the write resets both halves.
+    // A mismatch is `AfterPin::Stop`: this attempt is finished, and the
+    // caller must not fall back to V1.
     let frame = header.encode();
-    let peer = stream.peer();
-    match teardown::wait_cancellable(
+    let header = match teardown::wait_cancellable(
         guard.token(),
-        send_header_to_pinned(stream.send_mut(), peer, target.pinned_machine, &frame),
+        write_pinned_header(&mut stream, target.pinned_machine, &frame, fwd_diag),
     )
     .await
     {
@@ -2369,12 +2424,12 @@ async fn try_outbound_v2(
             teardown::deny_pre_bridge(&mut stream, Some(&tcp));
             return OutboundOutcome::Done;
         }
-        Ok(HeaderSend::Sent) => {}
-        Ok(HeaderSend::MachineMismatch { pinned, actual }) => {
-            refuse_machine_mismatch(stream, pinned, actual, fwd_diag);
-            return OutboundOutcome::Done;
-        }
-        Ok(HeaderSend::Failed) => {
+        Ok(header) => header,
+    };
+    match after_pin(header) {
+        AfterPin::Continue => {}
+        AfterPin::Stop => return OutboundOutcome::Done,
+        AfterPin::Fallback => {
             // Peer likely reset after unknown V2 protocol byte — fall back.
             return OutboundOutcome::PeerRejectedV2(tcp);
         }
@@ -2443,10 +2498,9 @@ async fn drive_outbound_v1(
         target_port: target.target_port,
     };
     let frame = header.encode();
-    let peer = stream.peer();
-    match teardown::wait_cancellable(
+    let header = match teardown::wait_cancellable(
         guard.token(),
-        send_header_to_pinned(stream.send_mut(), peer, target.pinned_machine, &frame),
+        write_pinned_header(&mut stream, target.pinned_machine, &frame, fwd_diag),
     )
     .await
     {
@@ -2454,12 +2508,11 @@ async fn drive_outbound_v1(
             teardown::deny_pre_bridge(&mut stream, Some(&tcp));
             return;
         }
-        Ok(HeaderSend::Sent) => {}
-        Ok(HeaderSend::MachineMismatch { pinned, actual }) => {
-            refuse_machine_mismatch(stream, pinned, actual, fwd_diag);
-            return;
-        }
-        Ok(HeaderSend::Failed) => return,
+        Ok(header) => header,
+    };
+    match after_pin(header) {
+        AfterPin::Continue => {}
+        AfterPin::Stop | AfterPin::Fallback => return,
     }
     let mut resp = [0u8; 1];
     match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
@@ -4918,13 +4971,29 @@ mod tests {
         }
     }
 
+    fn peer_stream(
+        machine: MachineId,
+        send: crate::network::StreamSend,
+        recv: crate::network::StreamRecv,
+    ) -> PeerStream {
+        PeerStream::new(
+            vec![AgentId([0x44; 32])],
+            machine,
+            StreamProtocol::ForwardV2,
+            send,
+            recv,
+        )
+    }
+
     /// WHY (replaces slice 1's interim refusal of `machine:` forwards):
-    /// machine names are allowed ONLY because the peer check exists. A
-    /// machine-name forward pins its machine, and a stream to the agent
-    /// that then lands on a different machine (the agent moved, or
-    /// discovery changed) is refused at the peer check with zero bytes.
+    /// machine names are allowed only because the peer check exists. The
+    /// check is `PeerStream::peer()`, the same read `try_outbound_v2` and
+    /// `drive_outbound_v1` use. A mismatch resets the stream (the peer sees
+    /// connection reset, not a finished header) and [`after_pin`] says
+    /// stop, so V2 does not fall back to V1. The matching machine is the
+    /// positive control: the same path writes the exact frame and continues.
     #[tokio::test]
-    async fn machine_name_forward_to_the_wrong_machine_is_refused_at_the_peer_check() {
+    async fn machine_pin_uses_peer_stream_and_does_not_fall_back() {
         let box_machine = MachineId([0x11; 32]);
         let elsewhere = MachineId([0x22; 32]);
         let resolved = resolved_machine(AgentId([0x44; 32]), box_machine);
@@ -4932,35 +5001,48 @@ mod tests {
         let (agent, pinned) = crate::names::forward_target(&resolved, &name).expect("target");
         assert_eq!(agent, AgentId([0x44; 32]));
         assert_eq!(pinned, Some(box_machine), "a machine name must pin");
-        let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
-        let outcome =
-            send_header_to_pinned(&mut opener_side, elsewhere, pinned, &signed_frame()).await;
-        assert!(
-            matches!(outcome, HeaderSend::MachineMismatch { .. }),
-            "{outcome:?}"
-        );
-        drop(opener_side);
-        assert!(received(peer_side).await.is_empty());
-        // Counted, so operators can see the refusals.
-        let diag = ForwardDiagnostics::default();
-        diag.record_machine_mismatch();
-        assert_eq!(diag.machine_mismatch(), 1);
-    }
+        assert_eq!(after_pin(PinnedHeader::Refused), AfterPin::Stop);
+        assert_eq!(after_pin(PinnedHeader::Failed), AfterPin::Fallback);
+        assert_eq!(after_pin(PinnedHeader::Sent), AfterPin::Continue);
 
-    /// WHY: the lifted restriction must actually admit the right case — a
-    /// machine-name forward whose stream reaches the pinned machine sends
-    /// its header and proceeds.
-    #[tokio::test]
-    async fn correct_machine_name_forward_is_accepted() {
-        let box_machine = MachineId([0x11; 32]);
-        let resolved = resolved_machine(AgentId([0x44; 32]), box_machine);
-        let name = crate::names::NameRef::parse("machine:box.me").expect("name");
-        let (_, pinned) = crate::names::forward_target(&resolved, &name).expect("target");
-        let frame = signed_frame();
-        let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
-        let outcome = send_header_to_pinned(&mut opener_side, box_machine, pinned, &frame).await;
-        assert!(matches!(outcome, HeaderSend::Sent), "{outcome:?}");
-        drop(opener_side);
-        assert_eq!(received(peer_side).await, frame);
+        let v1 = ForwardHeader {
+            target_host: "127.0.0.1".to_string(),
+            target_port: 22,
+        }
+        .encode();
+        let diag = ForwardDiagnostics::default();
+        for frame in [signed_frame(), v1] {
+            let ((send, recv), (_peer_send, mut peer_recv)) =
+                crate::network::sim::connected_bi_halves().await;
+            let mut stream = peer_stream(elsewhere, send, recv);
+            assert_eq!(stream.peer(), elsewhere);
+            let outcome = write_pinned_header(&mut stream, pinned, &frame, &diag).await;
+            assert_eq!(outcome, PinnedHeader::Refused, "{outcome:?}");
+            assert_eq!(after_pin(outcome), AfterPin::Stop);
+            let err = peer_recv
+                .read_exact(&mut [0u8; 1])
+                .await
+                .expect_err("a reset stream has no header byte");
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+            drop(stream);
+
+            let ((send, recv), (_peer_send, mut peer_recv)) =
+                crate::network::sim::connected_bi_halves().await;
+            let mut stream = peer_stream(box_machine, send, recv);
+            assert_eq!(stream.peer(), box_machine);
+            let before = diag.machine_mismatch();
+            let outcome = write_pinned_header(&mut stream, pinned, &frame, &diag).await;
+            assert_eq!(outcome, PinnedHeader::Sent, "{outcome:?}");
+            assert_eq!(after_pin(outcome), AfterPin::Continue);
+            assert_eq!(diag.machine_mismatch(), before);
+            let mut got = vec![0u8; frame.len()];
+            peer_recv
+                .read_exact(&mut got)
+                .await
+                .expect("the pinned machine receives the header");
+            assert_eq!(got, frame);
+            drop(stream);
+        }
+        assert_eq!(diag.machine_mismatch(), 2);
     }
 }

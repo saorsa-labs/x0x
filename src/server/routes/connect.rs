@@ -176,6 +176,13 @@ enum CommitError {
 /// Bind `spec` and make the store match it, holding the forward lifecycle
 /// lock so this cannot interleave with restore or remove.
 ///
+/// The lock, the listener, and the store write run on a task this future
+/// cannot cancel. Dropping the caller's future (a cancelled request)
+/// detaches that task. It keeps the lock until the listener and the saved
+/// record describe the same forward. Cancelling between the bind and the
+/// rename therefore cannot leave the new listener up while the old target
+/// stays in `forwards.json`.
+///
 /// An ephemeral spec deletes any durable record at the bound address, so a
 /// disabled persistent forward replaced by `--ephemeral` cannot return on
 /// restart. A store failure before the rename removes the listener just
@@ -185,13 +192,31 @@ enum CommitError {
 /// let a restart bring the forward back. An unreadable store does not
 /// block an ephemeral add — there is no usable record to delete.
 async fn commit_forward(
-    store: &x0x::forward::store::ForwardStore,
-    forwarder: &x0x::forward::ForwardService,
+    store: &Arc<x0x::forward::store::ForwardStore>,
+    forwarder: &Arc<x0x::forward::ForwardService>,
     spec: x0x::forward::ForwardSpec,
 ) -> Result<SocketAddr, CommitError> {
     if let Err(e) = store.check(&spec) {
         return Err(CommitError::Store(e));
     }
+    let store = Arc::clone(store);
+    let forwarder = Arc::clone(forwarder);
+    let task = tokio::spawn(async move { commit_forward_locked(&store, &forwarder, spec).await });
+    match task.await {
+        Ok(result) => result,
+        Err(error) => Err(CommitError::Store(
+            x0x::forward::store::ForwardStoreError::Write(format!(
+                "forward commit task failed: {error}"
+            )),
+        )),
+    }
+}
+
+async fn commit_forward_locked(
+    store: &x0x::forward::store::ForwardStore,
+    forwarder: &x0x::forward::ForwardService,
+    spec: x0x::forward::ForwardSpec,
+) -> Result<SocketAddr, CommitError> {
     let _ops = store.lock_ops().await;
     let previous = forwarder
         .list_forwards()
@@ -324,7 +349,27 @@ pub(in crate::server) const FORWARD_RESTORE_RETRY_SECS: u64 = 10;
 /// entry is ephemeral, unless the store did not load: an unreadable file
 /// must not block teardown of a live ephemeral forward, and it is never
 /// overwritten. A persistent live entry stays until the file can be updated.
+///
+/// Like [`commit_forward`], the lock and both steps run on a task the
+/// caller cannot cancel, so a dropped request cannot delete the saved
+/// record and leave the listener, or the reverse.
 async fn remove_persisted(
+    store: &Arc<x0x::forward::store::ForwardStore>,
+    forwarder: &Arc<x0x::forward::ForwardService>,
+    addr: SocketAddr,
+) -> Result<bool, x0x::forward::store::ForwardStoreError> {
+    let store = Arc::clone(store);
+    let forwarder = Arc::clone(forwarder);
+    let task = tokio::spawn(async move { remove_persisted_locked(&store, &forwarder, addr).await });
+    match task.await {
+        Ok(result) => result,
+        Err(error) => Err(x0x::forward::store::ForwardStoreError::Write(format!(
+            "forward remove task failed: {error}"
+        ))),
+    }
+}
+
+async fn remove_persisted_locked(
     store: &x0x::forward::store::ForwardStore,
     forwarder: &x0x::forward::ForwardService,
     addr: SocketAddr,
@@ -680,7 +725,7 @@ mod tests {
         let forwarder = open_forwarder(agent);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = ForwardStore::path_in(dir.path());
-        let store = ForwardStore::load(path.clone()).await;
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
         let addr = free_loopback().await;
         let mut persistent = hex_spec(addr);
         persistent.target_port = 59991;
@@ -723,6 +768,88 @@ mod tests {
         restarted.shutdown();
     }
 
+    /// WHY: cancelling the add after the listener is up and before the
+    /// rename must not leave that listener running against the old saved
+    /// target. The transaction task is detached from the cancelled caller
+    /// and finishes the delete, so a restart does not bring the old forward
+    /// back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_during_ephemeral_replacement_finishes_the_saved_delete() {
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
+        let addr = free_loopback().await;
+        let mut persistent = hex_spec(addr);
+        persistent.target_port = 59991;
+        assert!(store.remember(&persistent).await.expect("remember"));
+        forwarder.add_disabled(persistent.clone(), "name_changed: test".to_string());
+
+        let mut ephemeral = persistent.clone();
+        ephemeral.persistent = false;
+        ephemeral.pinned_machine = None;
+        ephemeral.target_port = 7;
+        let pause = x0x::storage::arm_durable_rename_pause_for_testing(&path);
+        let store_add = Arc::clone(&store);
+        let forwarder_add = Arc::clone(&forwarder);
+        let add =
+            tokio::spawn(
+                async move { commit_forward(&store_add, &forwarder_add, ephemeral).await },
+            );
+        let start = std::time::Instant::now();
+        while !x0x::storage::durable_rename_pause_entered_for_testing(&path) {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("rename did not reach the cancellation point");
+            }
+            tokio::task::yield_now().await;
+        }
+        let live = forwarder.forward_at(addr).expect("listener is already up");
+        assert!(!live.persistent);
+        assert_eq!(live.target_port, 7);
+        let saved = std::fs::read_to_string(&path).expect("forwards.json");
+        assert!(
+            saved.contains("59991"),
+            "the old target is still the saved record while the rename is paused: {saved}"
+        );
+        assert!(
+            store.ops_try_lock().is_none(),
+            "the transaction still holds the lifecycle lock"
+        );
+
+        add.abort();
+        let aborted = add.await.expect_err("the request task must be cancelled");
+        assert!(aborted.is_cancelled());
+        drop(pause);
+
+        let start = std::time::Instant::now();
+        loop {
+            let saved_records = store.records().await.expect("records");
+            let live = forwarder.forward_at(addr);
+            if saved_records.is_empty()
+                && matches!(
+                    &live,
+                    Some(spec) if !spec.persistent && spec.target_port == 7
+                )
+            {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!(
+                    "aborted add left live and saved forwards split: saved={saved_records:?} live={live:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+        let reloaded = ForwardStore::load(path).await;
+        assert!(reloaded.load_error().is_none());
+        assert!(
+            reloaded.records().await.expect("disk").is_empty(),
+            "restart must not bring back the replaced target"
+        );
+        forwarder.shutdown();
+    }
+
     /// WHY: a directory fsync that fails after the rename has already
     /// published the new `forwards.json`. The handler must keep the
     /// listener. Removing it would let a restart resurrect the forward,
@@ -733,7 +860,7 @@ mod tests {
         let forwarder = open_forwarder(agent);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = ForwardStore::path_in(dir.path());
-        let store = ForwardStore::load(path.clone()).await;
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
         let addr = free_loopback().await;
         let spec = hex_spec(addr);
 
@@ -806,7 +933,7 @@ mod tests {
         let path = ForwardStore::path_in(dir.path());
         let original = b"{not json".to_vec();
         std::fs::write(&path, &original).expect("write corrupt store");
-        let store = ForwardStore::load(path.clone()).await;
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
         assert!(store.load_error().is_some());
 
         let addr = free_loopback().await;

@@ -376,6 +376,13 @@ impl ForwardStore {
     }
 
     /// Load `path` (missing ⇒ empty; unreadable/malformed ⇒ fail closed).
+    ///
+    /// A readable file is confirmed the way [`crate::names::NameStore::load`]
+    /// confirms `names.json`: fsync the file, then fsync its directory. A
+    /// previous process may have published the file and then failed that
+    /// directory sync. The records still load, and durability stays pending
+    /// so a later identical [`Self::remember`] retries the sync instead of
+    /// reporting success.
     pub async fn load(path: PathBuf) -> Self {
         let mut store = Self::in_memory();
         store.path = Some(path.clone());
@@ -388,7 +395,18 @@ impl ForwardStore {
             }
         };
         match decode_file(&bytes) {
-            Ok(records) => store.state = tokio::sync::Mutex::new(records),
+            Ok(records) => {
+                store.state = tokio::sync::Mutex::new(records);
+                if let Err(error) = crate::storage::confirm_published_durability(&path).await {
+                    tracing::warn!(
+                        "forward store at {} is loaded but directory sync is not confirmed: {error}",
+                        path.display()
+                    );
+                    store
+                        .pending_durability
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
             Err(e) => {
                 let e = format!("{}: {e}", path.display());
                 tracing::warn!("forward store unreadable, restoring no forwards: {e}");

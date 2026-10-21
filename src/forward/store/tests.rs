@@ -426,3 +426,49 @@ async fn after_rename_failure_keeps_add_and_delete_and_reload_agrees() {
         store.records().await.unwrap()
     );
 }
+
+/// WHY (same contract as [`NameStore::load`]): the test above drops the
+/// fsync fault before reload. A restart while that fault is still active
+/// must keep durability pending, and an identical `remember` must not ACK
+/// until a later sync succeeds.
+#[tokio::test]
+async fn reload_keeps_pending_durability_until_directory_sync() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = ForwardStore::path_in(dir.path());
+    let store = ForwardStore::load(path.clone()).await;
+    let spec = agent_spec(18022);
+    let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
+    let added = store.remember(&spec).await;
+    assert_unconfirmed(&added);
+    assert!(
+        store.pending_durability.load(Ordering::Acquire),
+        "the failed directory sync must stay pending"
+    );
+
+    let reloaded = ForwardStore::load(path.clone()).await;
+    assert!(
+        reloaded.load_error().is_none(),
+        "{:?}",
+        reloaded.load_error()
+    );
+    assert!(
+        reloaded.pending_durability.load(Ordering::Acquire),
+        "reload must not forget an unconfirmed directory sync"
+    );
+    assert_eq!(reloaded.records().await.unwrap(), vec![record(&spec)]);
+    let retry = reloaded.remember(&spec).await;
+    assert_unconfirmed(&retry);
+    assert!(reloaded.pending_durability.load(Ordering::Acquire));
+
+    drop(seam);
+    assert!(
+        !reloaded.remember(&spec).await.unwrap(),
+        "an identical remember ACKs only after the directory sync succeeds"
+    );
+    assert!(
+        !reloaded.pending_durability.load(Ordering::Acquire),
+        "a confirmed directory sync clears the flag"
+    );
+}

@@ -2530,6 +2530,39 @@ pub(crate) fn register(plane: &str, fabric: &Arc<SimFabric>) {
     fabrics.push((plane.to_string(), Arc::downgrade(fabric)));
 }
 
+/// Opener and acceptor halves of one simulated bi-stream.
+///
+/// Tests that enforce [`crate::streams::PeerStream::peer`] use this so
+/// reset and FIN are the stream's own, not a duplex stand-in.
+#[cfg(test)]
+pub(crate) async fn connected_bi_halves() -> (
+    (super::StreamSend, super::StreamRecv),
+    (super::StreamSend, super::StreamRecv),
+) {
+    let fabric = SimFabric::new(0x1387);
+    let opener = PeerId([0xA1; 32]);
+    let acceptor = PeerId([0xB1; 32]);
+    let opener_link = fabric.attach(opener, "127.0.0.1:21001".parse().expect("opener addr"));
+    let acceptor_link = fabric.attach(acceptor, "127.0.0.1:21002".parse().expect("acceptor addr"));
+    opener_link
+        .connect_addr("127.0.0.1:21002".parse().expect("acceptor addr"))
+        .await
+        .expect("sim link");
+    let (send, recv) = opener_link.open_bi(&acceptor).expect("open_bi");
+    let (_peer, peer_send, peer_recv) =
+        tokio::time::timeout(Duration::from_secs(2), acceptor_link.accept_bi())
+            .await
+            .expect("accept timed out")
+            .expect("accept_bi");
+    (
+        (super::StreamSend::Sim(send), super::StreamRecv::Sim(recv)),
+        (
+            super::StreamSend::Sim(peer_send),
+            super::StreamRecv::Sim(peer_recv),
+        ),
+    )
+}
+
 /// Called by `NetworkNode::new` in test builds: a node whose plane has a
 /// registered fabric runs on that fabric instead of binding a socket.
 pub(crate) fn claim(config: &super::NetworkConfig, peer: PeerId) -> Option<Arc<SimLink>> {
