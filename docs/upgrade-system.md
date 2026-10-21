@@ -61,6 +61,10 @@ operation before starting the newer release. Cancellation is checked after
 the install lock is acquired, before queued work can write records.
 An admitted replacement retains its restart continuation.
 
+If staging identity initialization fails, background apply stays disabled
+for that process. Configured release discovery and verified rebroadcast
+continue without an apply owner.
+
 HTTP waits, complete host inventory and transaction-bound guide installation
 remain separate M2 work. Shutdown closes background intake and withdraws
 pre-admission writes; it does not claim every blocking operation is reaped
