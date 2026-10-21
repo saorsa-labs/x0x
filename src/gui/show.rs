@@ -589,6 +589,25 @@ impl GuiShowRuntime {
         }
     }
 
+    /// Keep a queued origin banner when this GUI session token is refreshed.
+    ///
+    /// A hidden tab can refresh before its WebSocket reconnects. The new
+    /// connection presents the new token. The banner stays with that tab.
+    /// Other sessions stay on their own tokens.
+    pub fn rebind_pending_session(&self, from_token: &str, to_token: &str) {
+        if from_token.is_empty() || to_token.is_empty() || from_token == to_token {
+            return;
+        }
+        let Ok(mut queue) = self.pending.lock() else {
+            return;
+        };
+        for item in queue.iter_mut() {
+            if item.session_token == from_token {
+                item.session_token = to_token.to_string();
+            }
+        }
+    }
+
     /// Take the fresh pending show minted for this GUI session token.
     ///
     /// A miss leaves every other pending show in place. Stale entries are
@@ -1513,6 +1532,10 @@ exit 1
             "Stop uses the existing gui.block command: {src}"
         );
         assert!(
+            html.contains(">Stop local shows</button>"),
+            "slice 1 Stop control reads Stop local shows"
+        );
+        assert!(
             !src.contains("Future shows from this agent will be blocked"),
             "Stop must not claim success before a server reply: {src}"
         );
@@ -1608,18 +1631,31 @@ exit 1
             "async function refreshSession()",
             "function maybeRefreshSession()",
         );
-        let expired_at = refresh
-            .find("sessionExpired=true")
+        let (success, failure) = refresh
+            .split_once("sessionExpired=true")
             .expect("refresh marks the session expired");
-        let clear_at = refresh
-            .find("advertiseGuiVisibility()")
-            .expect("refresh tells the daemon this tab is not a live GUI");
+        let before_request = success
+            .split_once("await apiWith")
+            .expect("refresh calls the session endpoint")
+            .0;
         assert!(
-            expired_at < clear_at,
-            "the session is expired before the visibility update: {refresh}"
+            before_request.contains("advertiseGuiVisibility()"),
+            "an overdue refresh clears visibility before the request: {before_request}"
+        );
+        let after_issue = success
+            .split_once("sessionIssuedAt=Date.now()")
+            .expect("refresh records the new issue time")
+            .1;
+        assert!(
+            after_issue.contains("advertiseGuiVisibility()"),
+            "a successful refresh re-advertises visibility: {after_issue}"
+        );
+        assert!(
+            failure.contains("advertiseGuiVisibility()"),
+            "a rejected refresh tells the daemon this tab is not a live GUI: {failure}"
         );
         let source = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             r#"
 const document = {
   visibilityState: 'visible',
@@ -1647,6 +1683,11 @@ let sessionIssuedAt = 0;
             ),
             fn_source(html, "function advertiseGuiVisibility()", "let ws="),
             refresh,
+            fn_source(
+                html,
+                "function maybeRefreshSession()",
+                "function readOwnerToken()"
+            ),
             r#"
 (async () => {
   advertiseGuiVisibility();
@@ -1659,6 +1700,43 @@ let sessionIssuedAt = 0;
   if (sessionExpired) throw new Error('an unreachable daemon must not expire the session');
   if (sent[sent.length - 1].visible !== true) {
     throw new Error('unreachable refresh cleared visibility: ' + JSON.stringify(sent));
+  }
+  sessionIssuedAt = Date.now() - 9 * 60 * 1000;
+  advertiseGuiVisibility();
+  if (sent[sent.length - 1].visible !== false) {
+    throw new Error('an 8-10 minute token must reconnect as hidden: ' + JSON.stringify(sent));
+  }
+  if (wsUrl().includes('gui=1')) {
+    throw new Error('an overdue token must omit gui=1: ' + wsUrl());
+  }
+  refreshBody = { _http_ok: true, session_token: 'refreshed-token' };
+  const beforeRefresh = sent.length;
+  await refreshSession();
+  if (sessionExpired) throw new Error('a successful refresh must not expire the session');
+  if (SESSION_TOKEN !== 'refreshed-token') {
+    throw new Error('refresh did not install the new token: ' + SESSION_TOKEN);
+  }
+  const readvertised = sent[sent.length - 1];
+  if (sent.length === beforeRefresh || !readvertised || readvertised.type !== 'gui.visible' || readvertised.visible !== true) {
+    throw new Error('a successful refresh must re-advertise visible:true: ' + JSON.stringify(sent));
+  }
+  if (!wsUrl().includes('gui=1')) {
+    throw new Error('a refreshed visible tab must count as a live GUI: ' + wsUrl());
+  }
+  sent.length = 0;
+  sessionIssuedAt = Date.now() - 9 * 60 * 1000;
+  refreshBody = null;
+  await maybeRefreshSession();
+  if (sent.length !== 1 || !sent[0] || sent[0].type !== 'gui.visible' || sent[0].visible !== false) {
+    throw new Error('a periodic retry must hide an overdue tab before refresh: ' + JSON.stringify(sent));
+  }
+  refreshBody = { _http_ok: true, session_token: 'retried-token' };
+  await maybeRefreshSession();
+  if (sent[0].visible !== false || sent.length < 2 || sent[sent.length - 1].visible !== true) {
+    throw new Error('the next periodic retry must restore visible:true after success: ' + JSON.stringify(sent));
+  }
+  if (SESSION_TOKEN !== 'retried-token') {
+    throw new Error('periodic retry did not install the new token: ' + SESSION_TOKEN);
   }
   sessionIssuedAt = Date.now() - 11 * 60 * 1000;
   advertiseGuiVisibility();

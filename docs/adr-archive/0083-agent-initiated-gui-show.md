@@ -202,8 +202,8 @@ On a request that passes §2 and §5, the target machine:
   the names on the target machine. It does not copy them from the request.
   The second sentence is "Delete gui_show_local_disabled in the data
   directory to turn local show back on."
-- **Stop.** The banner has a "Stop shows from this agent" control. The
-  control sends `gui.block`.
+- **Stop.** The banner control reads "Stop local shows". Slice 1 has only
+  local senders. The control sends `gui.block`.
   - When the sender is this daemon's own agent, Stop writes
     `gui_show_local_disabled` in the data directory. Stop does not add that
     agent to `gui_show_blocked`. A later local show answers `disabled`.
@@ -219,9 +219,14 @@ On a request that passes §2 and §5, the target machine:
   omits `gui=1` on the next connect. A session that is due for refresh
   (8 minutes after it was issued) stays unavailable until that refresh
   succeeds. The tab does not advertise itself as visible before the refresh
-  succeeds. David Irvine accepted `gui_show_local_disabled`, `gui.visible`,
-  and `gui=1` on 21 Oct 2026 (PR 1512) and ordered this section to match
-  that decision.
+  succeeds. After that refresh succeeds, the same tab sends `gui.visible`
+  with visible true. A pending origin banner stays with the tab when the
+  session token is refreshed. A hidden tab that refreshes before its
+  WebSocket reconnects still receives that banner. David Irvine accepted
+  `gui_show_local_disabled`, the `gui.show`, `gui.block` and `gui.visible`
+  WebSocket frames, the `gui=1` query flag, and the `[gui_show]` config
+  table on 21 Oct 2026 (PR 1512). He ordered this section to match that
+  decision.
 - **Rate limit.** Per requesting `AgentId`: burst 3, then 1 per 20 s, and at
   most 30 per hour per target machine across all senders. Excess requests get
   `rate_limited`. Local and remote shows share the same buckets on the

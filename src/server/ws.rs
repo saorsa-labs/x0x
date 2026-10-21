@@ -288,7 +288,7 @@ enum WsInbound {
     SendDirect { agent_id: String, payload: String },
     #[serde(rename = "ping")]
     Ping,
-    /// ADR 0083: origin-banner "Stop shows from this agent".
+    /// ADR 0083: origin-banner "Stop local shows" (slice 1).
     #[serde(rename = "gui.block")]
     GuiBlock { agent_id: String },
     /// ADR 0083: the GUI tab reports whether it is actually visible.
@@ -1174,6 +1174,23 @@ fn queue_pending_gui_show(
         Err(_) => {
             state.gui_show.enqueue_pending(pending);
             None
+        }
+    }
+}
+
+/// Point a hidden GUI socket at the token from `POST /auth/session/refresh`.
+///
+/// The pending banner is rebound in that same refresh. A socket that is
+/// already open still looks the banner up by the token it connected with,
+/// so that token has to move too.
+pub(super) async fn rebind_gui_ws_tokens(state: &AppState, from_token: &str, to_token: &str) {
+    if from_token.is_empty() || to_token.is_empty() || from_token == to_token {
+        return;
+    }
+    let mut sessions = state.ws_sessions.write().await;
+    for session in sessions.values_mut() {
+        if session.gui_session_token.as_deref() == Some(from_token) {
+            session.gui_session_token = Some(to_token.to_string());
         }
     }
 }
@@ -2697,6 +2714,137 @@ mod tests {
             other => panic!("expected gui.show, got {other:?}"),
         }
         assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// A hidden tab refreshes its session before the WebSocket reconnects.
+    /// The banner was minted for the original token. The new connection
+    /// must still receive it (ADR 0083 §5).
+    #[tokio::test]
+    async fn hidden_tab_refresh_before_reconnect_keeps_the_pending_banner() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-refresh".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by other on other".to_string(),
+            agent_id: "cc".repeat(32),
+            machine_id: "dd".repeat(32),
+            rider: false,
+            request_id: "req-other".to_string(),
+            session_token: "other-tab".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("refresh body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("refresh json");
+        let fresh = json["session_token"]
+            .as_str()
+            .expect("new session token")
+            .to_string();
+        assert_ne!(fresh, old);
+        assert!(
+            !state.gui_show.has_pending_session(&old),
+            "the original token must not keep the banner after refresh"
+        );
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let opened = queue_pending_gui_show(&state, &tx, true, Some(&fresh));
+        assert!(
+            opened.is_some(),
+            "the reconnect with the refreshed token must take the banner"
+        );
+        match rx.recv().await.expect("banner") {
+            WsOutbound::GuiShow { view, banner, .. } => {
+                assert_eq!(view, "people");
+                assert!(
+                    banner.contains("Opened by test on test"),
+                    "the refreshed tab must still show the origin banner: {banner}"
+                );
+            }
+            other => panic!("expected gui.show, got {other:?}"),
+        }
+        assert!(
+            state.gui_show.has_pending_session("other-tab"),
+            "another tab's banner must stay queued"
+        );
+    }
+
+    /// The socket is already open and hidden when refresh runs. `gui.visible`
+    /// then looks up the token stored on that socket.
+    #[tokio::test]
+    async fn open_hidden_socket_keeps_the_banner_across_refresh() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-open".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "hidden-refresh").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("hidden-refresh")
+            .expect("session")
+            .gui_session_token = Some(old.clone());
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(
+            &state,
+            "hidden-refresh",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        match rx.recv().await.expect("banner") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "people"),
+            other => panic!("expected gui.show, got {other:?}"),
+        }
     }
 
     /// WHY: a full outbound queue used to drop the opened view after it had

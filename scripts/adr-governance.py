@@ -756,8 +756,8 @@ _PR1512_STOP_AFTER = (
     "  the names on the target machine. It does not copy them from the request.\n"
     "  The second sentence is \"Delete gui_show_local_disabled in the data\n"
     "  directory to turn local show back on.\"\n"
-    "- **Stop.** The banner has a \"Stop shows from this agent\" control. The\n"
-    "  control sends `gui.block`.\n"
+    "- **Stop.** The banner control reads \"Stop local shows\". Slice 1 has only\n"
+    "  local senders. The control sends `gui.block`.\n"
     "  - When the sender is this daemon's own agent, Stop writes\n"
     "    `gui_show_local_disabled` in the data directory. Stop does not add that\n"
     "    agent to `gui_show_blocked`. A later local show answers `disabled`.\n"
@@ -773,9 +773,14 @@ _PR1512_STOP_AFTER = (
     "  omits `gui=1` on the next connect. A session that is due for refresh\n"
     "  (8 minutes after it was issued) stays unavailable until that refresh\n"
     "  succeeds. The tab does not advertise itself as visible before the refresh\n"
-    "  succeeds. David Irvine accepted `gui_show_local_disabled`, `gui.visible`,\n"
-    "  and `gui=1` on 21 Oct 2026 (PR 1512) and ordered this section to match\n"
-    "  that decision."
+    "  succeeds. After that refresh succeeds, the same tab sends `gui.visible`\n"
+    "  with visible true. A pending origin banner stays with the tab when the\n"
+    "  session token is refreshed. A hidden tab that refreshes before its\n"
+    "  WebSocket reconnects still receives that banner. David Irvine accepted\n"
+    "  `gui_show_local_disabled`, the `gui.show`, `gui.block` and `gui.visible`\n"
+    "  WebSocket frames, the `gui=1` query flag, and the `[gui_show]` config\n"
+    "  table on 21 Oct 2026 (PR 1512). He ordered this section to match that\n"
+    "  decision."
 )
 _PR1512_CONFIG_BEFORE = (
     "  When `remote_enabled = false`, the target answers `disabled`, and activity\n"
@@ -797,18 +802,33 @@ _PR1512_REPLACEMENTS = (
 )
 
 
+def _pr1512_landing_push() -> bool:
+    """Whether this run is the main-branch push that lands PR 1512.
+
+    The push workflow sets ``GITHUB_EVENT_NAME`` and ``GITHUB_BEFORE``.
+    It does not set ``GITHUB_PR_NUMBER``. A zero ``before`` is a new
+    branch, not this landing.
+    """
+    if os.environ.get("GITHUB_EVENT_NAME", "").strip() != "push":
+        return False
+    before = os.environ.get("GITHUB_BEFORE", "").strip()
+    return bool(before) and set(before) != {"0"}
+
+
 def pr1512_section5_edit_allowed(name: str, snapshot: bytes, head: bytes) -> bool:
     """Whether this Accepted ADR edit is the PR 1512 section 5 update.
 
-    True only when *name* is ADR 0083, ``GITHUB_PR_NUMBER`` is ``1512``,
-    and the only byte change is the three passages David ordered on
-    21 Oct 2026. A status edit or any other body edit returns false.
-    A missing number, any other number, and any other path stay immutable.
+    True when *name* is ADR 0083 and the only byte change is the three
+    passages David ordered on 21 Oct 2026. The pull-request workflow
+    allows that for ``GITHUB_PR_NUMBER`` ``1512``. The main push workflow
+    has no pull request number, so the same bytes are also allowed on
+    that landing push. A status edit or any other body edit returns
+    false. Any other path, number, or event stays immutable.
     """
     if name != _PR1512_ADR:
         return False
     number = os.environ.get("GITHUB_PR_NUMBER", "").strip()
-    if number != _PR1512_PULL_REQUEST:
+    if number != _PR1512_PULL_REQUEST and not (number == "" and _pr1512_landing_push()):
         return False
     try:
         old = snapshot.decode("utf-8")

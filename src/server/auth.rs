@@ -289,14 +289,21 @@ pub(super) async fn refresh_session(
         );
     }
     match state.sessions.refresh(&bearer, Instant::now()) {
-        Ok(token) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "session_token": token,
-                "expires_in": SESSION_TOKEN_TTL_SECS,
-            })),
-        )
-            .into_response(),
+        Ok(token) => {
+            // The GUI may refresh before the socket reconnects. The pending
+            // banner and any hidden socket still holding this token must
+            // follow the new token, or the view opens with no origin banner.
+            state.gui_show.rebind_pending_session(&bearer, &token);
+            super::ws::rebind_gui_ws_tokens(&state, &bearer, &token).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "session_token": token,
+                    "expires_in": SESSION_TOKEN_TTL_SECS,
+                })),
+            )
+                .into_response()
+        }
         Err(SessionRefreshError::Unknown) => session_refresh_refused(
             StatusCode::UNAUTHORIZED,
             "session token is invalid or expired; reopen with `x0x gui`",

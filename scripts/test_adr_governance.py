@@ -2529,6 +2529,35 @@ Use option 2.
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         _init_repo(work)
+        _seed_0083(work, _adr0083_text(_0083_after))
+        parent = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=work, text=True
+        ).strip()
+        rc, out = _run_validator(
+            work,
+            {"GITHUB_EVENT_NAME": "push", "GITHUB_BEFORE": parent},
+        )
+        results.append(check(
+            "PR 1512: a push lands the exact section 5 edit without a pull request number",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+        path = work / adr._PR1512_ADR
+        path.write_text(_adr0083_text(_0083_after + "\nExtra sentence.\n"))
+        _commit_all(work, "edit ADR 0083 again")
+        rc, out = _run_validator(
+            work,
+            {"GITHUB_EVENT_NAME": "push", "GITHUB_BEFORE": parent},
+        )
+        results.append(check(
+            "PR 1512: a push with any other ADR 0083 edit fails",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and adr._PR1512_ADR in out,
+        ))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
         _seed_0083(work, _adr0083_text(_0083_after + "\nExtra sentence.\n"))
         rc, out = _run_validator(work, {"GITHUB_PR_NUMBER": "1512"})
         results.append(check(

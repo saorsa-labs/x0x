@@ -580,7 +580,7 @@ tr:hover td{background:rgba(255,255,255,.01)}
 <div id="gui-show-banner" role="status" aria-live="polite">
   <span class="banner-text" id="gui-show-banner-text"></span>
   <button type="button" class="banner-dismiss" id="gui-show-banner-dismiss" disabled>Hide</button>
-  <button type="button" id="gui-show-banner-block" disabled>Stop shows from this agent</button>
+  <button type="button" id="gui-show-banner-block" disabled>Stop local shows</button>
 </div>
 
 <div id="app">
@@ -753,12 +753,17 @@ async function refreshSession(){
   // concurrent call would present a revoked token and read as "expired".
   if(!SESSION_TOKEN||sessionExpired||sessionRefreshing)return;
   sessionRefreshing=true;
+  // An overdue token is not a live tab. Say so before the request, or
+  // /gui/show still navigates this tab while the refresh is in flight.
+  advertiseGuiVisibility();
   const r=await apiWith(SESSION_TOKEN,'/auth/session/refresh',{method:'POST'});
   sessionRefreshing=false;
   if(r&&r._http_ok&&r.session_token){
     SESSION_TOKEN=r.session_token;
     sessionIssuedAt=Date.now();
     try{sessionStorage.setItem('x0x_session_token',SESSION_TOKEN);sessionStorage.setItem('x0x_session_issued_at',String(sessionIssuedAt))}catch(e){}
+    // The pre-request advertisement was visible:false. The new token is live.
+    advertiseGuiVisibility();
     return;
   }
   if(!r)return; // daemon unreachable: retry on the next tick
@@ -770,7 +775,7 @@ async function refreshSession(){
   document.getElementById('toasts').appendChild(el);
 }
 function maybeRefreshSession(){
-  if(document.visibilityState==='visible'&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)refreshSession();
+  if(document.visibilityState==='visible'&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)return refreshSession();
 }
 
 // Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
