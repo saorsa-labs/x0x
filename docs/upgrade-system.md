@@ -55,6 +55,21 @@ Selecting a newer eligible release requires a durable supersession record.
 An older waiter cannot then apply its release. The previous receipt remains
 intact; supersession does not delete it or reset the selected release's wait.
 
+This staging gate accepts canonical stable versions only. Setting
+`include_prereleases` does not allow a prerelease through the gate.
+The private `upgrade-selection-<digest>.json` record and its `.pending`
+marker retain the selected release and evidence of an incomplete write.
+An unresolved marker or damaged record refuses apply. The configured binary
+still starts normally.
+
+If this refusal occurs, preserve the selection record, pending marker and
+bound rollout receipt, with their hashes. Check the recorded participant
+roots, release version and digests. Investigate any storage or sync error
+before attempting recovery. Keep the configured binary in normal operation
+while apply remains refused. This slice provides no selection-record repair
+command. Do not delete records or edit their fields to bypass the refusal.
+Complete transaction recovery remains separate M2 work.
+
 This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
 complete host inventory and transaction-bound guide
 installation remain separate M2 work. It does not claim that every apply
