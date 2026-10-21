@@ -2310,7 +2310,12 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         if status == StatusCode::OK {
             if let Some(row) = inner.store.get_mut(key) {
                 row.phase = Phase::CommittedDeliveryPending;
-                row.result_epoch = body.get("epoch").and_then(serde_json::Value::as_u64);
+                // §5: the removal barrier saved the exact event's epoch; the
+                // reply's `epoch` is the legacy MLS epoch (GSS) or absent
+                // (bans), so it only fills a row the barrier left empty.
+                if row.result_epoch.is_none() {
+                    row.result_epoch = body.get("epoch").and_then(serde_json::Value::as_u64);
+                }
             }
             inner.attempt_wait.remove(key);
             inner.queued_manual.remove(key);
