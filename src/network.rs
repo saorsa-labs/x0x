@@ -590,13 +590,17 @@ pub(crate) fn seed_pin_check(expected: &[&[u8; 32]], answered: [u8; 32]) -> Seed
 }
 
 /// The pin set for `addr` within `pins`; empty when the row is unpinned
-/// or the address is not a pinned row.
+/// or the address is not a pinned row. Both sides are v4-mapped-normalized
+/// (#484/#1380 rule, review round 2): a pin configured as
+/// `[::ffff:142.93.199.50]:443` must answer for a dial to
+/// `142.93.199.50:443` and vice versa.
 fn pinned_peer_ids_in(pins: &[SeedPeerPin], addr: SocketAddr) -> &'static [&'static [u8; 32]] {
+    let addr = normalize_v4_mapped_addr(addr);
     pins.iter()
         .find(|pin| {
             pin.addr
                 .parse::<SocketAddr>()
-                .is_ok_and(|pin_addr| pin_addr == addr)
+                .is_ok_and(|pin_addr| normalize_v4_mapped_addr(pin_addr) == addr)
         })
         .map_or(&[], |pin| pin.expected_peer_ids)
 }
@@ -10168,6 +10172,28 @@ mod tests {
         // The production table ships unpinned (see the list-content test).
         let first_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
         assert!(pinned_seed_peer_ids(first_seed).is_empty());
+        // Review round 2: v4-mapped and plain forms of the same address
+        // resolve to the same pin row.
+        let table = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &PIN,
+        }];
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.7:5483".parse().unwrap()),
+            &PIN[..]
+        );
+        assert_eq!(
+            pinned_peer_ids_in(&table, "[::ffff:198.51.100.7]:5483".parse().unwrap()),
+            &PIN[..]
+        );
+        let mapped_table = [SeedPeerPin {
+            addr: "[::ffff:198.51.100.7]:5483",
+            expected_peer_ids: &PIN,
+        }];
+        assert_eq!(
+            pinned_peer_ids_in(&mapped_table, "198.51.100.7:5483".parse().unwrap()),
+            &PIN[..]
+        );
     }
 
     #[test]

@@ -131,33 +131,36 @@ old. A pin that no longer matches a live seed key would silently drop that
 seed for every client. Pinning is a deliberate operator change, made when
 the live fleet keys are verified.
 
-### Capability hints use observed evidence, not announcements (#1112)
+### Capability hints: an observed operator tier, plus the ADR-0071 tiers (#1112)
 
 The coordinator/relay hint lists on outgoing machine announcements
-(`select_capability_hints`, `src/lib.rs`) no longer read the self-asserted
-`is_relay`/`is_coordinator` flags, and no longer read announced addresses
-either (the machine cache's address set is itself fed by connection events,
-so an announced address matching an observed one is a match the peer can
-satisfy itself). A candidate must be connected over a DIRECT path —
-hole-punched and port-predicted paths are excluded, and a relayed
-connection's observed address names the relay, not the peer — and the only
-eligibility evidence is the address the local socket OBSERVED for that
-connection (v4-mapped forms normalized):
+(`select_capability_hints`, `src/lib.rs`) keep ADR 0071's Accepted
+community eligibility unchanged — the announcement's `is_relay`/
+`is_coordinator` flags, which the ADR records as the shipped mechanism
+(the bootstrap fleet, `--relay` opt-in nodes, and nodes whose #398
+`AnnouncementAssistSnapshot` gating proved public reachability) — and add
+one verified tier:
 
-- **Operator evidence**: the observed address is a compiled-in seed
-  address. A completed QUIC handshake with that source is deployment
-  evidence no announcement can forge; no capability flag is consulted.
+- **Operator tier (new, #1112):** a peer connected over a DIRECT path
+  whose OBSERVED remote address (v4-mapped forms normalized) is a
+  compiled-in seed IP is a coordinator and relay hint with no capability
+  flag consulted at all. A completed QUIC handshake with that source is
+  deployment-derived evidence no announcement can forge: listing a seed
+  IP in an announcement buys nothing.
 
-**Community narrowing (deliberate, review rounds 1–2).** Community relay
-and coordinator claims — ADR 0071 backbone nodes, `--relay` daemons, and
-private fleets running `--no-hard-coded-bootstrap` with their own peers —
-are NOT hinted in this version. A role claim plus any address match the
-peer can satisfy itself does not independently verify relay service or
-public dialability. Two independent mechanisms would restore them, both
-named by #1112 itself: weighting by observed relay success, or requiring
-an attestation signed by a seed. Choosing between them is an open decision
-(recorded with David); until then the hint lists carry operator-seed
-machines only.
+Identities rejected by a seed-pin mismatch are excluded from every tier.
+A relayed connection's observed address names the relay, not the peer, so
+it is never operator-tier evidence.
+
+**Open decision (recorded with David).** David's 20 Oct 2026 #1112
+ruling says to ignore self-asserted relay/coordinator flags; ADR 0071
+(Accepted) records those same flags as the shipped community eligibility.
+Superseding the ADR is David's call, not this PR's: until he decides, the
+ADR's community tiers stand and the ruling is implemented where it adds
+verification without removing Accepted behaviour (the observed operator
+tier, and the seed pins). Two independent evidence mechanisms would let
+the flags retire without narrowing — observed relay-success weighting, or
+an attestation signed by a seed (both named by #1112 itself).
 
 ### Seed key rotation policy
 

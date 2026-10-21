@@ -786,6 +786,12 @@ pub struct Agent {
         std::sync::Arc<tokio::sync::broadcast::Sender<VerifiedCertificate>>,
     /// ADR-0035 metering: relay/coordinator selection-skew counters.
     pub(crate) selection_skew: std::sync::Arc<SelectionSkew>,
+    /// #1112: identities a seed-pin mismatch rejected. Grown only by the
+    /// join dial verdicts; read by hint selection and join-candidate
+    /// assembly so a rejected identity cannot return through the cache
+    /// (a leaf mutex: never held across an await or another lock).
+    pub(crate) seed_pin_rejected:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
     /// This daemon's live `(user_id, agent_certificate)` pair, served to
     /// blob fetchers by the responder task.
     pub(crate) own_cert_pair: announce_blob::SharedCertPair,
@@ -5498,10 +5504,9 @@ fn deserialize_machine_announcement(
 
 /// Compute coordinator / relay hint lists for an announcement.
 ///
-/// Delegates the choice to [`select_capability_hints`] (#1112): hints name
-/// only machines the local node is DIRECTLY connected to, and eligibility
-/// comes from what the local transport OBSERVED about the connection —
-/// never from the peer's own announcement alone.
+/// Delegates the choice to [`select_capability_hints`] (#1112): two
+/// eligibility tiers over the connected set, and never the announcer
+/// itself.
 ///
 /// Used to populate `reachable_via` / `relay_candidates` on outgoing
 /// announcements so that remote peers have concrete targets to dial when
@@ -5512,6 +5517,7 @@ async fn collect_coordinator_hints(
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
     own_machine_id: identity::MachineId,
+    seed_pin_rejected: &std::collections::HashSet<[u8; 32]>,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
     let origins = network.connected_peer_origins().await;
@@ -5530,42 +5536,41 @@ async fn collect_coordinator_hints(
         &cache,
         own_machine_id,
         &bootstrap_ips,
+        seed_pin_rejected,
         selection_skew,
     )
 }
 
 /// #1112: the coordinator / relay hint selection, as a pure function.
 ///
-/// Evidence rules (review rounds 1 and 2: a peer's announcement is a
-/// claim, not evidence, and the machine cache's address set is itself fed
-/// by connection events, so an announced address matching an observed one
-/// corroborates nothing):
+/// Two eligibility tiers:
 ///
-/// - Every candidate must be connected over a DIRECT transport path whose
-///   remote address the local socket observed (v4-mapped forms
-///   normalized). That observed IP is the only address evidence.
-/// - **Operator evidence:** the OBSERVED IP is a compiled-in operator
-///   seed IP. The operator fleet runs coordinator and relay roles by
-///   deployment (`.deployment/bootstrap-*.toml`), and a completed QUIC
-///   handshake with that source is deployment-derived evidence no
-///   announcement can forge. No capability flag is consulted.
+/// - **Operator tier (new, #1112):** the peer is connected over a DIRECT
+///   path whose OBSERVED remote IP (v4-mapped forms normalized) is a
+///   compiled-in seed IP. The operator fleet runs coordinator and relay
+///   roles by deployment, and a completed QUIC handshake with that source
+///   is deployment-derived evidence no announcement can forge. No
+///   capability flag is consulted for these peers, and a pin-mismatched
+///   identity never qualifies.
+/// - **Community tier (ADR 0071, unchanged):** the pre-#1112 rule — the
+///   announcement's `is_coordinator`/`is_relay`, which ADR 0071 records
+///   as the shipped eligibility mechanism (the bootstrap fleet, `--relay`
+///   opt-in nodes, and nodes whose #398 `AnnouncementAssistSnapshot`
+///   gating proved public reachability). Removing this tier would change
+///   network behaviour against an Accepted ADR; whether David's 20 Oct
+///   2026 "ignore self-asserted flags" ruling should supersede it is an
+///   open decision recorded with David (see the PR and
+///   `docs/trust-and-connectivity.md`) — until he decides, the ADR stands.
 ///
-/// Community relay/coordinator claims (`is_relay`/`is_coordinator`) are
-/// NOT eligible evidence in this version: the claim plus any
-/// address-match the peer can satisfy itself does not independently
-/// verify relay service or public dialability. Until an independent
-/// mechanism exists (observed relay-success weighting, or a seed-signed
-/// attestation — the two options #1112 itself names), a community peer
-/// is never a hint. That narrowing is deliberate and documented in
-/// `docs/trust-and-connectivity.md`.
-///
-/// Hints are deduplicated, capped to `MAX_COORDINATOR_HINTS` each, and
-/// returned in stable order. The announcer never hints itself.
+/// Identities rejected by a seed-pin mismatch are excluded from both
+/// tiers. Hints are deduplicated, capped to `MAX_COORDINATOR_HINTS` each,
+/// and returned in stable order. The announcer never hints itself.
 fn select_capability_hints(
     origins: &[network::PeerOrigin],
     cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
     own_machine_id: identity::MachineId,
     bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
+    seed_pin_rejected: &std::collections::HashSet<[u8; 32]>,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
     /// Upper bound on hint list length. Keeps the signed payload small and
@@ -5577,28 +5582,39 @@ fn select_capability_hints(
 
     for origin in origins {
         let mid = identity::MachineId(origin.peer_id.0);
-        if mid == own_machine_id {
+        if mid == own_machine_id || seed_pin_rejected.contains(&origin.peer_id.0) {
             continue;
         }
-        // A relayed path's observed address names the relay, not the peer;
-        // a non-UDP path exposes no address at all. Neither is evidence.
-        if !origin.direct {
-            continue;
-        }
-        let Some(observed_ip) = origin.remote_addr.map(|addr| addr.ip()) else {
+        // Operator tier: the OBSERVED transport address of a DIRECT path
+        // is a seed IP. The peer cannot forge this by announcing anything.
+        let on_operator_host = origin
+            .direct
+            .then(|| origin.remote_addr.map(|addr| addr.ip()))
+            .flatten()
+            .is_some_and(|observed_ip| bootstrap_ips.contains(&observed_ip));
+        let Some(entry) = cache.get(&mid) else {
+            // No announcement seen: only the operator tier can qualify.
+            if on_operator_host {
+                selection_skew.record(SelectionChoice::Bootstrap);
+                reachable_via.push(mid);
+                relay_candidates.push(mid);
+            }
             continue;
         };
-        // Operator evidence: the OBSERVED transport address is a seed IP.
-        // The peer cannot forge this by announcing anything, and no
-        // self-asserted capability flag is consulted.
-        if !bootstrap_ips.contains(&observed_ip) {
-            continue;
-        }
-        if !reachable_via.contains(&mid) && reachable_via.len() < MAX_COORDINATOR_HINTS {
+        // Community tier (ADR 0071): the announcement flags, unchanged.
+        let coordinator = on_operator_host || entry.is_coordinator == Some(true);
+        let relay = on_operator_host || entry.is_relay == Some(true);
+        if coordinator
+            && !reachable_via.contains(&mid)
+            && reachable_via.len() < MAX_COORDINATOR_HINTS
+        {
             selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             reachable_via.push(mid);
         }
-        if !relay_candidates.contains(&mid) && relay_candidates.len() < MAX_COORDINATOR_HINTS {
+        if relay
+            && !relay_candidates.contains(&mid)
+            && relay_candidates.len() < MAX_COORDINATOR_HINTS
+        {
             selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             relay_candidates.push(mid);
         }
@@ -5782,6 +5798,9 @@ struct HeartbeatContext {
     last_revocation_generation: std::sync::atomic::AtomicU64,
     /// Heartbeat tick counter for the periodic revocation fallback.
     heartbeat_tick: std::sync::atomic::AtomicU64,
+    /// #1112: identities a seed-pin mismatch rejected (excluded from the
+    /// heartbeat's coordinator/relay hints).
+    seed_pin_rejected: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
     /// L3 retirement flip: publish the legacy V2 announce set only when true.
     legacy_announce: bool,
     /// ADR-0035 metering: relay/coordinator selection-skew counters.
@@ -5900,6 +5919,11 @@ impl HeartbeatContext {
                 self.network.as_ref(),
                 &self.machine_cache,
                 self.identity.machine_id(),
+                &self
+                    .seed_pin_rejected
+                    .lock()
+                    .map(|rejected| rejected.clone())
+                    .unwrap_or_default(),
                 &self.selection_skew,
             )
             .await
@@ -7821,10 +7845,8 @@ impl Agent {
                 if advert_peer_id == target_peer_id {
                     continue;
                 }
-                // #1112 (review round 2): the advert's roles are the
-                // peer's own declaration — the same self-assertion the
-                // ruling removes elsewhere — so they grant no capability
-                // here. The advert's addresses remain dial hints.
+                // ADR 0071 (review round 3): the advert's roles are the
+                // Accepted eligibility mechanism — restored unchanged.
                 merge_helper_hint(
                     &mut helper_hints,
                     advert_peer_id,
@@ -7834,8 +7856,8 @@ impl Agent {
                         .into_iter()
                         .map(|hint| hint.addr)
                         .filter(|addr| is_publicly_advertisable(*addr)),
-                    false,
-                    false,
+                    advert.roles.coordinator || advert.roles.rendezvous,
+                    advert.roles.relay,
                 );
             }
         }
@@ -7848,17 +7870,15 @@ impl Agent {
             if candidate.machine_id == target.machine_id || candidate.machine_id.0 == [0u8; 32] {
                 continue;
             }
-            // #1112: the machine cache's is_relay / is_coordinator fields
-            // are the peer's own announcement claims, so they no longer set
-            // assist-capability hints. The addresses are still useful as
-            // dial hints for the peer-authenticated ladder.
+            // ADR 0071 (review round 3): the machine cache's flag fields
+            // are the Accepted eligibility mechanism — restored unchanged.
             merge_helper_hint(
                 &mut helper_hints,
                 ant_quic::PeerId(candidate.machine_id.0),
                 "machine_discovery_cache",
                 candidate.addresses.iter().copied(),
-                false,
-                false,
+                candidate.is_coordinator == Some(true),
+                candidate.is_relay == Some(true),
             );
         }
 
@@ -12738,6 +12758,11 @@ impl Agent {
                 network.as_ref(),
                 &self.machine_discovery_cache,
                 self.machine_id(),
+                &self
+                    .seed_pin_rejected
+                    .lock()
+                    .map(|rejected| rejected.clone())
+                    .unwrap_or_default(),
                 &self.selection_skew,
             )
             .await
@@ -15040,6 +15065,7 @@ impl Agent {
                 legacy_announce: self.legacy_announce,
                 self_name: std::sync::Arc::clone(&self.self_name),
                 self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+                seed_pin_rejected: std::sync::Arc::clone(&self.seed_pin_rejected),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -15532,6 +15558,9 @@ impl Agent {
         Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
         Vec<std::net::SocketAddr>,
     ) {
+        // #1112 (review round 3): identities a pin mismatch rejects are
+        // remembered so they cannot return through the cache tiers.
+        let seed_pin_rejected = std::sync::Arc::clone(&self.seed_pin_rejected);
         use tokio::time::{timeout, Duration};
 
         // Per-connection timeout prevents hanging when connecting to
@@ -15548,6 +15577,7 @@ impl Agent {
                 let net = network.clone();
                 let addr = *addr;
                 let stop = stop.clone();
+                let seed_pin_rejected = std::sync::Arc::clone(&seed_pin_rejected);
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
                     // x0x#1321: shutdown can begin after the parent's check.
@@ -15596,6 +15626,9 @@ impl Agent {
                                     expected,
                                     "seed pin mismatch: dropping bootstrap hint (issue #1112)"
                                 );
+                                if let Ok(mut rejected) = seed_pin_rejected.lock() {
+                                    rejected.insert(peer_id.0);
+                                }
                                 return Err(addr);
                             }
                             tracing::info!("Connected to peer: {}", addr);
@@ -18953,6 +18986,7 @@ impl Agent {
             runtime: std::sync::Arc::clone(runtime),
             network: std::sync::Arc::clone(network),
             selection_skew: std::sync::Arc::clone(&self.selection_skew),
+            seed_pin_rejected: std::sync::Arc::clone(&self.seed_pin_rejected),
             interval_secs: self.heartbeat_interval_secs,
             cache: std::sync::Arc::clone(&self.identity_discovery_cache),
             machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
@@ -20174,6 +20208,7 @@ impl Agent {
             identity: std::sync::Arc::clone(&self.identity),
             runtime,
             network,
+            seed_pin_rejected: std::sync::Arc::clone(&self.seed_pin_rejected),
             interval_secs: self.heartbeat_interval_secs,
             cache: std::sync::Arc::clone(&self.identity_discovery_cache),
             machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
@@ -22498,6 +22533,9 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             selection_skew: std::sync::Arc::new(SelectionSkew::default()),
+            seed_pin_rejected: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             kv_snapshot_leases: std::sync::Mutex::new(KvSnapshotRegistry::default()),
             shutdown_serialize: tokio::sync::Mutex::new(()),
             kv_shutdown_drain: std::sync::Mutex::new(None),
@@ -40744,12 +40782,13 @@ mod peer_connected_handler_integration_tests {
         }
 
         #[test]
-        fn issue1112_forged_seed_address_buys_nothing() {
-            // Review round 1 acceptance: a connected attacker signs an
-            // announcement listing an operator seed IP and asserts both
-            // capability flags. The OBSERVED connection address is its own,
-            // nowhere near a seed IP, and matches none of its announced
-            // addresses — no evidence, no hint, either list.
+        fn issue1112_forged_seed_address_grants_no_operator_tier() {
+            // Review rounds 1-3: an announcement's address list is a claim,
+            // not evidence. A peer that lists operator seed IPs but asserts
+            // no capability flags, observed from its own address, gains
+            // nothing: the operator tier keys on the OBSERVED address, and
+            // the community tier (ADR 0071) still needs the peer's own
+            // flag claim.
             let mut cache = std::collections::HashMap::new();
             let forger = identity::MachineId([0x11; 32]);
             cache.insert(
@@ -40760,58 +40799,58 @@ mod peer_connected_handler_integration_tests {
                         "142.93.199.50:5483".parse().unwrap(),
                         "147.182.234.192:443".parse().unwrap(),
                     ],
-                    Some(true),
-                    Some(true),
+                    None,
+                    None,
                 ),
             );
             let skew = SelectionSkew::default();
+            let no_rejections: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[issue1112_origin([0x11; 32], "203.0.113.10:52000", true)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &no_rejections,
                 &skew,
             );
             assert!(
                 relays.is_empty() && coordinators.is_empty(),
-                "a forged seed address in an announcement must not produce a hint"
+                "a forged seed address in an announcement must not grant the operator tier"
             );
         }
 
         #[test]
-        fn issue1112_self_asserted_relay_flag_alone_is_not_a_hint() {
-            // Acceptance (#1112): a peer that self-announces is_relay (or
-            // is_coordinator) with no address the local socket has observed
-            // is not preferred as a relay/coordinator hint. The announced
-            // address is a claim; the observed connection comes from
-            // somewhere else entirely.
+        fn issue1112_community_flag_eligibility_is_adr_0071_unchanged() {
+            // Review round 3: ADR 0071 (Accepted) records the announcement
+            // flags as the shipped community eligibility mechanism
+            // (bootstrap fleet, --relay opt-in, #398-gated public
+            // reachability). This PR must not narrow that behaviour —
+            // whether the ruling should supersede the ADR is with David.
             let mut cache = std::collections::HashMap::new();
-            let liar = identity::MachineId([0x11; 32]);
+            let community = identity::MachineId([0x11; 32]);
             cache.insert(
-                liar,
+                community,
                 issue1112_machine(
-                    liar,
+                    community,
                     &["203.0.113.10:5483".parse().unwrap()],
                     Some(true),
                     Some(true),
                 ),
             );
             let skew = SelectionSkew::default();
+            let no_rejections: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[issue1112_origin([0x11; 32], "198.51.100.99:52000", true)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &no_rejections,
                 &skew,
             );
-            assert!(
-                relays.is_empty(),
-                "a self-asserted is_relay must not become a relay hint"
-            );
-            assert!(
-                coordinators.is_empty(),
-                "a self-asserted is_coordinator must not become a coordinator hint"
-            );
+            assert_eq!(coordinators, vec![community]);
+            assert_eq!(relays, vec![community]);
         }
 
         #[test]
@@ -40839,6 +40878,8 @@ mod peer_connected_handler_integration_tests {
                 issue1112_machine(own, &["142.93.199.50:443".parse().unwrap()], None, None),
             );
             let skew = SelectionSkew::default();
+            let no_rejections: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[
                     issue1112_origin([0x22; 32], "142.93.199.50:5483", true),
@@ -40850,6 +40891,7 @@ mod peer_connected_handler_integration_tests {
                 &cache,
                 own,
                 &bootstrap_ip_set(),
+                &no_rejections,
                 &skew,
             );
             assert!(coordinators.contains(&seed_host));
@@ -40861,44 +40903,40 @@ mod peer_connected_handler_integration_tests {
         }
 
         #[test]
-        fn issue1112_community_relay_claims_need_independent_evidence() {
-            // Review round 2: a community peer's own is_relay claim plus
-            // an announced address matching the observed connection is NOT
-            // independent evidence — the machine cache's address set is
-            // itself fed by connection events, so the peer can satisfy the
-            // match itself. Until an independent mechanism exists (observed
-            // relay-success weighting or a seed-signed attestation, the two
-            // options #1112 names), a community peer is never a hint.
+        fn issue1112_pin_rejected_identity_is_never_a_hint() {
+            // Review round 3: an identity a seed-pin mismatch rejected must
+            // not return through the cache tiers — not even the operator
+            // tier, whose observed seed-IP evidence it genuinely holds.
             let mut cache = std::collections::HashMap::new();
-            let community = identity::MachineId([0x33; 32]);
+            let rejected_seed = identity::MachineId([0x33; 32]);
             cache.insert(
-                community,
-                issue1112_machine(
-                    community,
-                    &["198.51.100.7:5483".parse().unwrap()],
-                    Some(true),
-                    Some(false),
-                ),
+                rejected_seed,
+                issue1112_machine(rejected_seed, &[], None, None),
             );
+            let mut rejected: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
+            rejected.insert([0x33; 32]);
             let skew = SelectionSkew::default();
             let (coordinators, relays) = select_capability_hints(
-                &[issue1112_origin([0x33; 32], "198.51.100.7:41234", true)],
+                &[issue1112_origin([0x33; 32], "142.93.199.50:5483", true)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &rejected,
                 &skew,
             );
             assert!(
                 relays.is_empty() && coordinators.is_empty(),
-                "a self-asserted role with a self-satisfiable address match is not evidence"
+                "a pin-rejected identity must not become a hint on any tier"
             );
         }
 
         #[test]
-        fn issue1112_relayed_origin_is_never_a_hint() {
+        fn issue1112_relayed_origin_grants_no_operator_tier() {
             // A relayed path's observed address names the relay, not the
-            // peer — it is no evidence about the peer, whatever the peer
-            // announces or asserts.
+            // peer — it is never OPERATOR-tier evidence, whatever the peer
+            // announces. The community tier (ADR 0071) still applies on
+            // its own flags, exactly as before #1112.
             let mut cache = std::collections::HashMap::new();
             let relayed = identity::MachineId([0x44; 32]);
             cache.insert(
@@ -40906,21 +40944,24 @@ mod peer_connected_handler_integration_tests {
                 issue1112_machine(
                     relayed,
                     &["142.93.199.50:5483".parse().unwrap()],
-                    Some(true),
-                    Some(true),
+                    None,
+                    None,
                 ),
             );
             let skew = SelectionSkew::default();
+            let no_rejections: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[issue1112_origin([0x44; 32], "142.93.199.50:5483", false)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &no_rejections,
                 &skew,
             );
             assert!(
                 relays.is_empty() && coordinators.is_empty(),
-                "a relayed origin is evidence about the relay, not the peer"
+                "a relayed observation of a seed IP is evidence about the relay, not the peer"
             );
         }
     }
