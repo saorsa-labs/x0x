@@ -18,7 +18,7 @@ x0x distributes signed release information and can update the daemon. An update 
 
 A downloaded file, successful process start or healthy API response proves only one part of a safe update.
 
-Today a daemon with updates disabled does not verify or record `x0x/release` manifests. The gossip listener, the startup GitHub check and the fallback poll stay off unless `self_update_enabled` and `[update] enabled` are both true (`src/server/mod.rs` L1885, L1984–L1985 and L2031–L2034). Checked on `main` `125db4c5`. The proposed section below starts verify-only listening for notify-only daemons. The topic stays `x0x/release`. A failed staging-identity init is a different case. Updates stay enabled, discovery continues, and apply stays off (`docs/upgrade-system.md` L94–L96).
+Today a daemon with updates disabled does not verify or record `x0x/release` manifests. Checked on `main` `125db4c5`. All three gates are in `src/server/mod.rs`: the startup GitHub check (L1883–L1885), the gossip listener (L1981–L1985), and the fallback poll (L2029–L2034). Each stays off unless `self_update_enabled` and `[update] enabled` are both true. The proposed section below starts verify-only listening for notify-only daemons. The topic stays `x0x/release`. A failed staging-identity init is a different case. Updates stay enabled, discovery continues, and apply stays off (`docs/upgrade-system.md` L94–L96).
 
 ## Decision
 
@@ -128,7 +128,7 @@ What is missing is a signal for the machines that do not auto-update. Today an i
 - A durable hold, an undersized fleet receipt, or an unresolved selection or journal record refuses apply. The old binary keeps running and reports nothing unless asked. Receipts and unresolved selection or journal records are `docs/upgrade-system.md` L54–L86. Durable probe holds are L124–L149.
 - A split or package-managed CLI outside the declared install stays outside the upgrade transaction (ADR 0094, host transaction). The daemon can still update itself. That CLI is reported not upgraded, with reinstall guidance.
 
-`GET /diagnostics/upgrade` already exists. It returns the local version, the update policy and the version-policy digest. The body has no `disposition` or `state` field (`src/server/routes/network.rs`, `upgrade_diagnostics`). The health verdict leaves an available update as `ok` (`src/server/health_verdict.rs` L897–L899). `x0x doctor` reads that route and treats a body with no `update_available` as up to date, so the process exits zero (`src/cli/commands/daemon.rs`, `check_upgrade_state`). `GET /owner/machines` exists. `this_machine` carries this daemon's version and digest. Remote rows have no version field (`src/server/routes/owner.rs` L745–L751).
+`GET /diagnostics/upgrade` already exists. It returns the local version, the update policy and the version-policy digest. The body has no `disposition`, `state` or `cli_status` field (`src/server/routes/network.rs`, `upgrade_diagnostics`). The health verdict leaves an available update as `ok` (`src/server/health_verdict.rs` L897–L899). `x0x doctor` reads that route and treats a body with no `update_available` as up to date, so the process exits zero (`src/cli/commands/daemon.rs`, `check_upgrade_state`). `GET /owner/machines` exists. `this_machine` carries this daemon's version and digest (`src/server/routes/owner.rs` L789). Remote rows have no version field (L779).
 
 The silent case is an install that cannot or will not take the update. Auto-update, notify-only and staged rollout are separate choices.
 
@@ -156,20 +156,22 @@ enum CliStatus {
 }
 enum CliLocation { SplitPath, PackageManaged }
 enum UpdateState {
-    Current,
+    NotChecked, // no verified manifest yet, or the subscription failed with nothing stored
+    Current,    // only after a verified manifest shows this build is the newest
     Waiting { version: Version, due_in_secs: u64 },
     Held { version: Version, cause: HoldCause },        // D188–D190 classes
     Refused { version: Version, reason: RefusalReason }, // receipt, selection, journal
-    Behind { latest: Version, first_seen: Timestamp },  // NotifyOnly, or Refused for too long
+    Behind { latest: Version, first_seen: Timestamp },  // threshold is an open question
 }
 ```
 
 1. **Notify-only daemons still listen.** Notify-only daemons subscribe to `x0x/release` and verify manifests. That set is embedders, `update.enabled = false`, `--skip-update-check`, and managed Windows. Each one records the newest verified version and never stages or applies it. This is a behaviour change on an unchanged topic, framing, key and signature context, so it is not a wire change. Embedders get this through the same daemon code path, with no new embedder API. Each subscribed daemon spends ML-DSA-65 verify CPU on the manifest (#656) and parses a release payload it previously ignored, which is a larger attack surface.
-2. **Show it locally.** `GET /diagnostics/upgrade` returns `disposition`, `state` and `cli_status`. Those fields are additive on the route that already returns the version and policy digest. `/health` reports degraded with reason `update_behind` once `Behind` lasts longer than a set period. `x0x doctor --json` exits non-zero in that case. A local `system.update_behind` event fires once per newly seen version. All of this is additive local API.
-3. **Show the local machine.** `GET /owner/machines` returns `disposition`, `state` and `cli_status` for the local machine only, on `this_machine`. Remote rows stay as they are today (`src/server/routes/owner.rs` L745–L751).
+2. **Show it locally.** `GET /diagnostics/upgrade` returns `disposition`, `state` and `cli_status`. Those fields are additive on the route that already returns the version and policy digest. `Current` is allowed only after a verified manifest shows this build is the newest. Startup with no release evidence, and a failed subscription that stored nothing, report `NotChecked`. `/health` reports degraded with reason `update_behind` once `Behind` lasts longer than a set period. `x0x doctor --json` exits non-zero in that case. A local `system.update_behind` event fires once per newly seen version. All of this is additive local API. The implementation that adds `update_behind` changes the comment in `src/server/health_verdict.rs` around L897 and the doctor exit in the same change. That comment says an available update stays `ok`, and doctor exits zero. `update_behind` makes `/health` degraded, so the exit must follow that reason.
+3. **Show the local machine.** `GET /owner/machines` returns `disposition`, `state` and `cli_status` for the local machine only, on `this_machine` (`src/server/routes/owner.rs` L789). Remote rows stay as they are today (L779).
 4. **CLI status is separate.** The daemon keeps `AutoApply` or `NotifyOnly` on its own terms. A split or package-managed CLI outside the declared install gets `cli_status` `CannotApply`. ADR 0094 leaves that CLI outside the upgrade transaction, and the daemon can still apply. `NotifyReason` lists daemon reasons only: `Embedder`, `DisabledByConfig`, `SkippedThisRun` and `ManagedWindows`.
 5. **Peers on older builds.** Keep feature-level negotiation through ADR 0093 capability bits. Do not infer support from version strings (0093 option 2, rejected). Sends that need a bit the peer lacks fail with `recipient_upgrade_required`, as they do now. Below a hard wire break (saorsa-gossip ADR-014 RejectV1), old peers simply are not supported. A minimum version comes from D35 once census data exists, and D96 ties topic-fetch retirement to it. This proposal sets no number.
 6. **Urgent releases.** No signed urgency field, since that would be a wire change. Owners use D185 `now=true`, and later the M4 owner policy.
+7. **Warning history is durable and local.** For each verified version the daemon persists `first_seen` and whether `system.update_behind` was already emitted. `first_seen` is the wall-clock time of the first verified sighting, and it is the timestamp `Behind` reports. The threshold age uses monotonic elapsed time. The record stores that elapsed remainder and the boot epoch. A restart loads the remainder and starts a new monotonic epoch. It keeps `first_seen` and the emitted flag. A wall-clock jump does not change the elapsed age, does not rewrite `first_seen`, and does not clear the emitted flag. Duplicate delivery of a recorded version keeps the stored `first_seen` and does not emit again. A restart does not block escalation: age already past the threshold stays `Behind`, and age still short can still reach `Behind`. A restart does not repeat an event that the record already marks emitted. This record is local. It is not an owner-sync value and not a release-manifest field. Notify-only daemons may write it. They still never stage or apply the release.
 
 ### Deferred: remote update status
 
@@ -185,8 +187,11 @@ Carrying disposition, state or the running version to other owned machines needs
 
 ### Validation
 
-- A notify-only daemon receives a newer signed manifest over gossip. It records the newest verified version, never stages or applies it, and reports `Behind`.
-- A hold, a refused receipt and a disabled config each map to the right state. The `Behind` threshold flips `/health` and the `doctor` exit code.
+- A notify-only daemon receives a newer signed manifest over gossip. It records the newest verified version in the local warning history, never stages or applies the release, and reports `Behind` once the threshold is reached.
+- Startup with no release evidence reports `NotChecked`, not `Current`. A failed subscription that stored no manifest does the same.
+- A hold, a refused receipt and a disabled config each map to the right state. The `Behind` threshold flips `/health` to degraded with reason `update_behind`, and `x0x doctor` exits non-zero. The same implementation changes `src/server/health_verdict.rs` around L897 and that doctor exit together.
+- Restart loads `first_seen` and the emitted-event flag. A version that already emitted `system.update_behind` does not emit again. `Behind` reached before restart is still `Behind`. Age that has not reached the threshold can still reach it after restart.
+- A duplicate manifest for a recorded version does not reset `first_seen` and does not emit a second event.
 - `GET /owner/machines` shows `disposition`, `state` and `cli_status` on `this_machine`. Remote rows stay unchanged.
 - A split or package-managed CLI reports `CannotApply`. The daemon disposition stays `AutoApply` or `NotifyOnly` on the daemon's own terms, and an `AutoApply` daemon can still apply.
 - Old released binaries still decode the unchanged manifest.
@@ -196,6 +201,8 @@ Carrying disposition, state or the running version to other owned machines needs
 - Is the `Behind` threshold one release, or N days? Should it vary by disposition?
 - Should a repeated `Refused` state escalate to `Behind`, or stay separate?
 - Can x0xd tell that a binary was built from source rather than released? There is no evidence that it can.
+- Does `update.gossip_updates = false` also turn off verify-only listening on `x0x/release`?
+- D35 says embedders do not auto-update. This proposal has them subscribe and pay the ML-DSA-65 verify cost (#656). Is that cost acceptable for embedders?
 
 ### Couldn't verify
 
