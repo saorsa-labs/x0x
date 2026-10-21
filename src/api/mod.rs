@@ -1420,6 +1420,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/groups/:id/members/:agent_id/certificate/rebind",
+        cli_name: "group rebind-certificate",
+        description: "Self-rebind this agent's renewed certificate into its seat before the cutoff (ADR 0110 §4a)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body("certificate", false)]),
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/groups/:id/ban/:agent_id",
         cli_name: "group ban",
         description: "Ban a member (admin+)",

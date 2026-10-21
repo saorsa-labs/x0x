@@ -92,7 +92,7 @@ use routes::{
     owner_agents_issue, owner_agents_revoke, owner_machines, owner_riders_issue, owner_riders_list,
     owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
     presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust,
+    publish_group_card_to_discovery, put_kv_value, quick_trust, rebind_member_certificate,
     recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
     reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
@@ -2755,6 +2755,10 @@ pub async fn serve_with_options(
         .route(
             "/groups/:id/members/:agent_id/role",
             patch(update_member_role),
+        )
+        .route(
+            "/groups/:id/members/:agent_id/certificate/rebind",
+            post(rebind_member_certificate),
         )
         .route("/groups/:id/ban/:agent_id", post(ban_group_member))
         .route("/groups/:id/ban/:agent_id", delete(unban_group_member))

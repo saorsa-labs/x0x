@@ -438,6 +438,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Post,
+        "/groups/:id/members/:agent_id/certificate/rebind",
+        self_rebind_route_refuses_another_agents_seat
+    ),
+    covered!(
+        Post,
         "/groups/:id/ban/:agent_id",
         d4_stateful_events_converge_via_signed_commits
     ),
@@ -670,6 +675,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/named_groups/tests/owner_mandate.rs",
         include_str!("../src/server/routes/named_groups/tests/owner_mandate.rs"),
+    ),
+    // ADR 0110 §4a: the self-rebind route's coverage lives in the
+    // named_groups lib tests.
+    (
+        "src/server/routes/named_groups/tests/adr0110_certificate_rebind.rs",
+        include_str!("../src/server/routes/named_groups/tests/adr0110_certificate_rebind.rs"),
     ),
     // #477: the join-status route's coverage lives in the named_groups
     // lib tests (the wp_b_477 T-matrix: T7 drives the live terminal path).

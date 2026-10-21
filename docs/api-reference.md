@@ -1470,6 +1470,7 @@ token. A session token is refused before the body is read.
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
+| POST | `/groups/:id/members/:agent_id/certificate/rebind` | `x0x group rebind-certificate <group_id> <agent_id> [--certificate <b64>]` | Self-rebind this agent's renewed certificate into its own seat (ADR 0110 §4a). See [Certificate rebind](#certificate-rebind-adr-0110-4a) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
 | GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires a local admin seat. Token class: [join-request admin](#authentication-and-token-classes) (#1347). A session token is accepted, except on a Home or an `OwnerCertified` group, which needs the durable API token |
@@ -1735,6 +1736,75 @@ not on the metadata topic and not in a legacy-decoded container:
 
 DM history does not record either frame: they are protocol traffic. A user
 message that only starts with the same letters stays history.
+
+### Certificate rebind (ADR 0110 §4a)
+
+In an `OwnerCertified` group, a renewed certificate keeps a member's seat
+only through a `CertificateRebindV1` commit. The commit changes only that
+seat's committed certificate and digest. Role, membership, TreeKEM leaf and
+epoch do not change. An announced renewal alone does not keep a seat.
+
+`POST /groups/:id/members/:agent_id/certificate/rebind` is the agent's
+self-rebind. `:agent_id` must be this daemon's own agent. Body (optional):
+
+```json
+{"certificate": "<base64 storage encoding, the certificate.storage_b64 of POST /owner/agents/issue>"}
+```
+
+Without a body the daemon uses its loaded agent certificate. The
+**cutoff** is `not_after − τ` (τ = 300 s) of the seat's committed
+certificate, on this daemon's clock.
+
+| Case | Status | Body |
+|---|---|---|
+| Before the cutoff, every other Active member's current verified advert sets `certificate_rebind_v1` | `200 OK` | `{"ok": true, "group_id", "agent_id", "certificate_digest", "not_after", "state_revision", "state_hash"}` |
+| After the cutoff | `409 Conflict` | `{"ok": false, "error": "rebind_window_closed", "state": "waiting_for_admin_rebind", "designated_admin", "renewal_digest", "handed_to": [...]}`. The daemon sends the renewal to every eligible admin in an `EvictionHandoffV1`. At expiry the designated admin commits the rebind instead of the removal. |
+| Another Active member's advert does not set `certificate_rebind_v1` (lacking or unknown) | `409 Conflict` | `{"ok": false, "error": "waiting_for_receiver_upgrade", "named": [...]}`. Rebinding is off; at expiry the seat is evicted. |
+| Every other admin's certificate is expired (§4b(2)) and this agent is an admin | as above | The self-rebind runs after the cutoff too. A known Active member whose current advert lacks the bit holds it: `409` with `waiting_for_receiver_upgrade` and `named`; the held rebind commits when the hold lifts. Unknown or offline members do not hold it. |
+| `:agent_id` is another agent, or this agent is revoked | `403 Forbidden` | `{"error": "rebind_signer_ineligible"}` |
+| The seat is not Active | `409 Conflict` | `{"error": "rebind_seat_not_active"}` |
+| The renewal does not verify against the group owner for this agent, is expired, or the group has no owner | `422` | `{"error": "rebind_certificate_invalid"}` |
+| The renewal's `not_after` is not later than the committed one | `422` | `{"error": "rebind_not_later"}` |
+
+Receivers refuse a frame with the same typed reasons, plus
+`rebind_digest_mismatch` when the seat's committed digest is not the old
+digest in the frame. Receivers do not enforce the cutoff.
+
+`GET /groups/:id` adds:
+
+```json
+"certificate_rebind": {
+  "waiting_for_admin_rebind": [
+    {
+      "cause": "waiting_for_admin_rebind",
+      "agent_id": "<64-hex agent id>",
+      "designated_admin": "<64-hex agent id>",
+      "old_certificate_digest": "<hex digest>",
+      "renewal_digest": "<hex digest>",
+      "since_unix_ms": 1788091300000
+    }
+  ],
+  "held_self_rebinds": [
+    {"cause": "waiting_for_receiver_upgrade", "agent_id": "<64-hex>", "named": ["<64-hex>"]}
+  ],
+  "held_renewals": ["<64-hex agent id>"]
+}
+```
+
+`waiting_for_admin_rebind` ends when a rebind or a removal for the seat
+lands. `held_renewals` lists the seats for which this admin holds a
+verified renewal from a hand-off. A verified rebind ends the seat's expiry
+row with `termination_cause` `certificate_valid`. While every admin other
+than the target is expired, the row shows `waiting_for_admin_certificate_renewal`
+naming those admins, or `waiting_for_receiver_upgrade` while a §4b(2)
+self-rebind is held.
+
+**Wire.** `X0XCRB1` — `CertificateRebindV1`, signed in domain
+`x0x.certificate-rebind.v1`, capability `certificate_rebind_v1` (bit 6). It
+rides the direct-message carrier only, to members whose current verified
+advert sets bit 6, with the same per-send revocation checks as
+`CryptoExclusionV1`. It carries no key material. A capable member that asks
+for TreeKEM catch-up gets held frames on this carrier.
 
 ### Roles
 
