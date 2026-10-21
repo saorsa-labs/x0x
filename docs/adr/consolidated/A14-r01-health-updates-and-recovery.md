@@ -101,15 +101,15 @@ Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05
 
 **Status: Proposed (not accepted), needs David's ruling on the additive local API fields.**
 
-Date: 2026-10-21. Wire change: none. Do not add a version field to `x0x/release` announcements. David's 20 Oct 2026 ruling on #1383 keeps that data local.
+Date: 2026-10-21. Wire change: none. The `x0x/release` topic, framing, key and signature context stay the same. Owner-sync records stay the same. David's 20 Oct 2026 ruling on #1383 keeps version data off release announcements.
 
-The public API change is additive and local. It adds fields on `GET /diagnostics/upgrade`, one `/health` reason, a non-zero `x0x doctor --json` exit, one local event, and fields on `GET /owner/machines`. David's 20 Oct rulings on #1383 and #1384 cover the local version-policy digest and the still-null embedder minimum. These field and enum names still need his ruling.
+The public API change is additive and local. It adds `disposition` and `state` on `GET /diagnostics/upgrade` and on the local `this_machine` object of `GET /owner/machines`, one `/health` reason, a non-zero `x0x doctor --json` exit, and one local event. Remote census rows stay as they are. David's 20 Oct rulings on #1383 and #1384 cover the local version-policy digest and the still-null embedder minimum. These field and enum names still need his ruling.
 
 Checked against `main` commit `125db4c5` on 21 Oct 2026.
 
 ### Problem
 
-Daemons run old builds and nobody notices. Worked example: David's Mac ran x0xd 0.45.0 while the latest release was v0.48.1 (17 Oct 2026). Self-update had been switched off by a `--skip-update-check` guard, so the daemon never applied a release and never said it was behind. Nobody noticed until a person checked the version by hand. It was upgraded to 0.48.1 on 21 Oct 2026 (PID 35881, same agent_id, 23 peers). Under this design that Mac would have reported `Behind` on `/health`, `x0x doctor` and the owner's `/owner/machines` view from the first signed release announcement it received after 0.45.0.
+Daemons run old builds and nobody notices. Worked example: David's Mac ran x0xd 0.45.0 while the latest release was v0.48.1 (17 Oct 2026). Self-update had been switched off by a `--skip-update-check` guard, so the daemon never applied a release and never said it was behind. Nobody noticed until a person checked the version by hand. It was upgraded to 0.48.1 on 21 Oct 2026 (PID 35881, same agent_id, 23 peers). Under this design David would have seen `Behind` on that Mac's own `/health` and `x0x doctor` from the first signed release announcement it received after 0.45.0.
 
 How releases reach users is mostly settled already:
 
@@ -140,7 +140,7 @@ The silent case is an install that cannot or will not take the update. Auto-upda
 
 ### Decision (proposed)
 
-Every install gets exactly one update disposition and one update state. Both are derived from facts the daemon already has, and shown locally and in the owner's census.
+Every install gets exactly one update disposition and one update state. Both are derived from facts the daemon already has, and shown on that machine.
 
 ```rust
 enum UpdateDisposition {
@@ -157,24 +157,28 @@ enum UpdateState {
 }
 ```
 
-1. **Notify-only installs still listen.** Every daemon, embedders included, subscribes to `x0x/release` and verifies manifests. It records the newest verified version it has seen and never applies it. This is behaviour only. The topic, framing, key and signature context stay the same.
+1. **Notify-only installs still listen.** Notify-only installs subscribe to `x0x/release` and verify manifests. That set is embedders, `update.enabled = false`, `--skip-update-check`, managed Windows, and a CLI outside the install. Each one records the newest verified version and never stages or applies it. This is a behaviour change on an unchanged topic, framing, key and signature context, so it is not a wire change. Embedders get this through the same daemon code path, with no new embedder API.
 2. **Show it locally.** `GET /diagnostics/upgrade` returns `disposition` and `state`. Those two fields are additive on the route that already returns the version and policy digest. `/health` reports degraded with reason `update_behind` once `Behind` lasts longer than a set period. `x0x doctor --json` exits non-zero in that case. A local `system.update_behind` event fires once per newly seen version. All of this is additive local API.
-3. **Show it to the owner.** The `/owner/machines` census (#1352, over owner-sync, already ruled) carries each machine's disposition and state. Today only `this_machine` carries a version. Remote rows have no version. The proposal sends disposition and state over owner-sync, with no new announcement field and no new capability bit. That is how David would have seen his Mac stuck on 0.45.0 from another machine.
+3. **Show the local machine.** `GET /owner/machines` returns `disposition` and `state` for the local machine only, on `this_machine`. Remote rows stay as they are today (`src/server/routes/owner.rs` L745–L751).
 4. **Peers on older builds.** Keep feature-level negotiation through ADR 0093 capability bits. Do not infer support from version strings (0093 option 2, rejected). Sends that need a bit the peer lacks fail with `recipient_upgrade_required`, as they do now. Below a hard wire break (saorsa-gossip ADR-014 RejectV1), old peers simply are not supported. A minimum version comes from D35 once census data exists, and D96 ties topic-fetch retirement to it. This proposal sets no number.
 5. **Urgent releases.** No signed urgency field, since that would be a wire change. Owners use D185 `now=true`, and later the M4 owner policy.
 
+### Deferred: remote update status
+
+Carrying disposition, state or version to other owned machines needs an owner-sync protocol extension. `SyncKind` and `SyncValue` in `src/owner_sync.rs` are closed enums with no update-status payload, and an unknown kind is rejected. That extension is a wire change and needs its own ruling from David. This proposal leaves remote rows unchanged.
+
 ### Consequences
 
-- Drift stops being silent without changing the wire or the update path.
+- Drift stops being silent. The wire stays the same. Notify-only installs verify a release and do not apply it.
 - Embedders and opted-out users keep control and see when they are behind.
 - There is more API surface to keep stable. `Behind` thresholds become one more number to choose.
 - It does not fix drift by itself. Someone still has to act on the signal, either an owner or, later, an M4 policy agent.
 
 ### Validation
 
-- A notify-only daemon receives a newer signed manifest over gossip. It records the manifest, never stages or writes files, and reports `Behind`.
+- A notify-only daemon receives a newer signed manifest over gossip. It records the newest verified version, never stages or applies it, and reports `Behind`.
 - A hold, a refused receipt and a disabled config each map to the right state. The `Behind` threshold flips `/health` and the `doctor` exit code.
-- The census shows two owned machines, one of them behind.
+- `GET /owner/machines` shows `disposition` and `state` on `this_machine`. Remote rows stay unchanged.
 - Old released binaries still decode the unchanged manifest.
 
 ### Open questions
@@ -185,7 +189,7 @@ enum UpdateState {
 
 ### Couldn't verify
 
-- Whether a daemon with updates disabled already verifies or records gossip manifests. Checked on `main` `125db4c5`: it does not. The gossip listener, the startup GitHub check and the fallback poll stay off unless `self_update_enabled` and `[update] enabled` are both true (`src/server/mod.rs` L1885, L1984–L1985 and L2031–L2034). A failed staging-identity init is a different case. Updates stay enabled, discovery continues, and apply stays off for that process (`docs/upgrade-system.md` L94–L96).
+- Whether a daemon with updates disabled already verifies or records gossip manifests. Checked on `main` `125db4c5`: today it does not. The gossip listener, the startup GitHub check and the fallback poll stay off unless `self_update_enabled` and `[update] enabled` are both true (`src/server/mod.rs` L1885, L1984–L1985 and L2031–L2034). Decision item 1 changes that behaviour for notify-only installs. The topic stays `x0x/release`. A failed staging-identity init is a different case. Updates stay enabled, discovery continues, and apply stays off for that process (`docs/upgrade-system.md` L94–L96).
 - ant-node's README says "critical security updates can override with shorter delay windows" and that the network keeps a "minimum online node threshold". Only the README and docs.rs were read, not the code behind them.
 
 [All 15 ADRs](README.md)
