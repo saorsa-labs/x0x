@@ -610,6 +610,10 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
         "PATCH /groups/:id/members/:agent_id/role",
         RouteClass::ControlPlane,
     ),
+    (
+        "POST /groups/:id/members/:agent_id/certificate/rebind",
+        RouteClass::ControlPlane,
+    ),
     ("PATCH /groups/:id/policy", RouteClass::ControlPlane),
     ("POST /groups/:id/ban/:agent_id", RouteClass::ControlPlane),
     ("DELETE /groups/:id/ban/:agent_id", RouteClass::ControlPlane),

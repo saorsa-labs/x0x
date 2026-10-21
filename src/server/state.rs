@@ -1239,6 +1239,8 @@ pub(super) struct AppState {
     /// Directory holding `<group_id>.snap` snapshots and `<group_id>.journal`
     /// TreeKEM persistence journals (mode 0600).
     pub(super) treekem_dir: PathBuf,
+    /// ADR 0110 S4: revocation-eviction obligations and budgets.
+    pub(super) revocation_evictions: super::routes::named_groups::S4Runtime,
     /// Active WebSocket sessions.
     pub(super) ws_sessions: RwLock<HashMap<String, WsSession>>,
     /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).

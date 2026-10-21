@@ -9,12 +9,16 @@
 mod control_blob;
 mod direct_metadata_lanes;
 mod fair_admission;
+mod revocation_eviction;
+pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
 pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
 pub(in crate::server) use fair_admission::FairAdmission;
+pub(in crate::server) use revocation_eviction::owner_recovery::sign_recovery_mandate;
+pub(in crate::server) use revocation_eviction::{run_revocation_eviction_worker, S4Runtime};
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
@@ -3627,6 +3631,28 @@ fn named_group_event_delivery_future(
     event: &NamedGroupMetadataEvent,
     label: &'static str,
 ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let send = named_group_event_send_future(state, recipient_hex, event, label)?;
+    let requester = recipient_hex.to_string();
+    Some(async move {
+        if let Err(e) = send.await {
+            tracing::warn!(
+                requester = %LogHexId::agent(&requester),
+                "failed to {label}-direct-deliver named-group event: {e}"
+            );
+        }
+    })
+}
+
+/// As [`named_group_event_delivery_future`], but the future returns the
+/// send result instead of logging it. ADR 0110 §3: the S4 delivery of a
+/// saved removal uses the result to tell a sent recipient from one that
+/// needs a resend.
+pub(in crate::server) fn named_group_event_send_future(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+    label: &'static str,
+) -> Option<impl std::future::Future<Output = Result<(), String>> + Send + 'static> {
     let recipient = match parse_agent_id_hex(recipient_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -3666,9 +3692,8 @@ fn named_group_event_delivery_future(
     let agent = Arc::clone(&state.agent);
     let control_blobs = state.control_blobs.clone();
     let group_id = named_group_metadata_event_group_id(event).to_string();
-    let requester = recipient_hex.to_string();
     Some(async move {
-        let result = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
             control_blob::send_reference(
                 &control_blobs,
                 &agent,
@@ -3697,12 +3722,6 @@ fn named_group_event_delivery_future(
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
-        };
-        if let Err(e) = result {
-            tracing::warn!(
-                requester = %LogHexId::agent(&requester),
-                "failed to {label}-direct-deliver named-group event: {e}"
-            );
         }
     })
 }
@@ -8802,10 +8821,25 @@ fn verify_authority_attested_member_joined_recovery(
             .get(member_agent_id)
             .and_then(|member| member.added_by.as_deref())
             == Some(authority_agent_id.as_str());
+    // #1357: a member that joined after the attesting commit (every joiner,
+    // for the creator's record) never retains that commit, so "in my
+    // retained log" alone left it unable to hold any earlier member's
+    // package. Once that member's agent is revoked its DMs are dropped and
+    // no removal of its leaf can find the package (ADR 0110 §4b(1), §3).
+    // A commit that predates this node's retained history is accepted too:
+    // its signature, signer, group and binding are still checked below, and
+    // the package must equal the hash this node's verified current roster
+    // commits for the seat, so nothing the roster did not commit to can be
+    // installed. A commit inside the retained window must still be on it.
     let authority_commit_is_accepted = info
         .commit_log
         .iter()
-        .any(|retained| retained.commit == *authority_commit);
+        .any(|retained| retained.commit == *authority_commit)
+        || (authority_commit.revision <= info.state_revision
+            && info
+                .commit_log
+                .first()
+                .is_none_or(|first| authority_commit.revision < first.commit.revision));
     if (!creator_authority && !invited_member_authority)
         || (!member_authenticated && !authority_only_attestation)
         || !package_matches_current_incarnation
@@ -9739,6 +9773,48 @@ async fn recover_member_treekem_key_package(
     let membership_lock = group_membership_lock(state, group_id).await;
     let _membership_guard = membership_lock.lock().await;
     recover_member_treekem_key_package_locked(state, group_id, member_agent_id).await
+}
+
+/// W3-H (#1357, test builds only): whether this node can resolve
+/// `member_agent_id`'s TreeKEM KeyPackage for a removal with no network
+/// step, by the lookup [`resolve_member_treekem_kp_for_removal_locked`]
+/// uses: the roster's current package, or a cached authority-attested
+/// `MemberJoined` that the recovery would install. Read-only.
+#[cfg(test)]
+pub(in crate::server) async fn holds_member_key_package_for_removal(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+) -> bool {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == group_id)
+            })
+            .cloned()
+    };
+    let Some(info) = info else {
+        return false;
+    };
+    let Some(member) = info.members_v2.get(member_agent_id) else {
+        return false;
+    };
+    if current_member_treekem_key_package(member).is_some() {
+        return true;
+    }
+    if member.state == x0x::groups::GroupMemberState::Removed {
+        return false;
+    }
+    let key = join_result_key(group_id, member_agent_id);
+    state
+        .treekem_member_key_packages
+        .get(&key)
+        .await
+        .is_some_and(|event| verify_authority_attested_member_joined_recovery(&info, &event))
 }
 
 async fn recover_member_treekem_key_package_locked(
@@ -11177,6 +11253,37 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
         return;
     }
+    // ADR 0110 §4: crypto-only exclusions in the requested range go to a
+    // capable requester on their own gated carrier, never in this page.
+    if authorized {
+        let serve_state = Arc::clone(state);
+        let requester = *sender;
+        let group_ids = log_keys.clone();
+        let from_revision = request.from_revision;
+        let _spawned = state.spawn_detached(async move {
+            revocation_eviction::crypto_exclusion::serve_catchup(
+                &serve_state,
+                &requester,
+                &group_ids,
+                from_revision,
+            )
+            .await;
+            revocation_eviction::rebind::serve_catchup(
+                &serve_state,
+                &requester,
+                &group_ids,
+                from_revision,
+            )
+            .await;
+            revocation_eviction::owner_recovery::serve_catchup(
+                &serve_state,
+                &requester,
+                &group_ids,
+                from_revision,
+            )
+            .await;
+        });
+    }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
     // promoted admin missing a member's key package; serve this node's cached,
     // self-signed `MemberJoined` for the target (this node witnessed the join).
@@ -11518,6 +11625,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     } else {
         // Record this peer even when another peer's page stream is open.
         // The aggregate fence still decides whether this pass may seal.
+        revocation_eviction::note_catchup_head(
+            state,
+            &fence_ids,
+            &sender_hex,
+            reported_head.as_deref(),
+        )
+        .await;
         self_leave_startup_note_verified_head(
             state,
             &fence_ids,
@@ -15329,6 +15443,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 );
                 return ApplyMetadataResult::REJECTED;
             }
+            // ADR 0110 §4 (D75) and §4b(3) (D126): no admission while
+            // verified revocations cover every admin seat. Reject before
+            // the invite is consumed, so the joiner can retry after the
+            // state clears. No TreeKEM add, Welcome or GSS share is made.
+            if revocation_eviction::s4_withholds_ciphertext(state, &info).await {
+                tracing::info!(
+                    group_id = %resolved_group_key,
+                    member = %LogHexId::agent(&member_agent_id),
+                    "MemberJoined: admission withheld; no eligible admin remains (ADR 0110 §4)"
+                );
+                return ApplyMetadataResult::REJECTED;
+            }
 
             // 7. Idempotent — if the joiner is already active, a replayed
             //    MemberJoined after the inviter committed the add is a no-op and
@@ -16679,6 +16805,8 @@ pub(in crate::server) async fn get_named_group(
     // retained owner-cert-pending joins whose evidence may have landed.
     retry_pending_owner_cert_joins(&state, Some(&id)).await;
     let members = named_group_member_values(&info);
+    // ADR 0110 (D64): the S4 obligations and their typed waits.
+    let s4_status = revocation_eviction::group_status_json(&state, &info).await;
 
     (
         StatusCode::OK,
@@ -16686,6 +16814,11 @@ pub(in crate::server) async fn get_named_group(
             "ok": true,
             "group_id": info.mls_group_id,
             "membership_state": membership_state,
+            "revocation_evictions": s4_status.rows,
+            "revocation_eviction_store": s4_status.store,
+            "admin_availability": s4_status.admin_availability,
+            "certificate_evidence_waits": s4_status.certificate_evidence_waits,
+            "certificate_rebind": s4_status.certificate_rebind,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
@@ -17517,6 +17650,11 @@ pub(in crate::server) async fn send_group_public_message(
     >,
     Json(req): Json<SendGroupMessageRequest>,
 ) -> impl IntoResponse {
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let kind = match req.kind.as_deref().unwrap_or("chat") {
         "chat" => x0x::groups::GroupPublicMessageKind::Chat,
         "announcement" => x0x::groups::GroupPublicMessageKind::Announcement,
@@ -19490,6 +19628,11 @@ pub(in crate::server) async fn create_group_invite(
     body: Bytes,
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp.into_response();
+    }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
         return resp.into_response();
     }
     let req: CreateInviteRequest = match parse_optional_json(&headers, &body) {
@@ -21672,6 +21815,11 @@ pub(in crate::server) async fn add_named_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     // #1116: do not add a member while a revocation carrier is unverified.
     if state
         .agent
@@ -22209,6 +22357,10 @@ pub(in crate::server) async fn remove_named_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // ADR 0110 §4 (D75, D126): see `s4_no_eligible_admin_refusal`.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     // #946 C3: a removed member's refusal window ends (clearing early only
     // keeps a later rejoin retryable longer).
     clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
@@ -22235,11 +22387,30 @@ pub(in crate::server) async fn remove_named_group_member(
             "self-removal is a leave; use DELETE /groups/:id",
         );
     }
+    // ADR 0110 §2: a non-designated admin queues a remove of an S4 target
+    // before its fallback time (`waiting_for_designated_admin`).
+    if let Some(resp) = revocation_eviction::s4_manual_request_gate(
+        &state,
+        &id,
+        &agent_id_hex,
+        revocation_eviction::ManualRequestKind::Remove,
+    )
+    .await
+    {
+        return resp;
+    }
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
+    // ADR 0110 §1a/D135 (#1508 review): re-check the S4 worker's removal
+    // under the lock, on every plane, before any mutation.
+    if let Some(resp) =
+        revocation_eviction::s4_exclusion_cancelled_under_lock(&state, &id, &agent_id_hex).await
+    {
+        return resp;
+    }
     {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(&id) {
@@ -23705,21 +23876,66 @@ fn self_leave_startup_blocks(
     true
 }
 
-pub(in crate::server) async fn self_leave_startup_withholds_ciphertext(
+/// Why this node withholds new ciphertext for one group now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum GroupCiphertextHold {
+    /// The startup self-leave exclusion is not complete: a removed member
+    /// still has a live leaf in this ratchet.
+    SelfLeaveExclusion,
+    /// ADR 0110 §4 (D75) and §4b(3) (D126): verified Agent-subject
+    /// revocations cover every Admin-or-higher Active seat. The revoked
+    /// admins still hold the current epoch keys.
+    NoEligibleAdmin,
+}
+
+impl GroupCiphertextHold {
+    /// The stable refusal text. `NoEligibleAdmin` starts with the ADR 0110
+    /// cause `no_eligible_admin` (D154). A KV error carries it as is; a
+    /// task error adds a plane prefix, so match it with `contains`. The
+    /// REST body names the derived state instead.
+    pub(in crate::server) fn reason(self) -> &'static str {
+        match self {
+            Self::SelfLeaveExclusion => {
+                "self-leave exclusion is not complete; ciphertext is withheld"
+            }
+            Self::NoEligibleAdmin => {
+                "no_eligible_admin: verified revocations cover every admin seat; ciphertext is withheld"
+            }
+        }
+    }
+}
+
+/// THE group ciphertext boundary. Every path that makes new group
+/// ciphertext calls this just before the AEAD or ratchet step: REST
+/// encrypt, the TreeKEM KV seal (and so TreeKEM task-list seals), and the
+/// GSS task-list seal. A `Some` result means: make no ciphertext.
+///
+/// `guard` is the held TreeKEM ratchet, or `None` on the GSS plane (the
+/// self-leave hold is a TreeKEM leaf check).
+///
+/// Lock order: the caller may hold the group membership lock and the
+/// ratchet mutex. This takes the `named_groups` read lock (as
+/// `persist_treekem_snapshot_bound` does under the same guard), releases
+/// it, and then takes only the revocation-set read lock. It never takes a
+/// TreeKEM mutex, so it cannot wait on the ratchet the caller holds.
+pub(in crate::server) async fn group_ciphertext_withheld(
     state: &AppState,
     group_id_hex: &str,
-    guard: &x0x::mls::TreeKemMlsGroup,
-) -> bool {
-    let groups = state.named_groups.read().await;
-    let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) else {
-        return false;
+    guard: Option<&x0x::mls::TreeKemMlsGroup>,
+) -> Option<GroupCiphertextHold> {
+    let info = {
+        let groups = state.named_groups.read().await;
+        let (key, info) = crate::server::resolve_group_entry_locked(&groups, group_id_hex)?;
+        let self_leave_open = self_leave_startup_open(state, key)
+            || self_leave_startup_open(state, info.stable_group_id());
+        if self_leave_open && guard.is_some_and(|guard| removed_member_has_live_leaf(info, guard)) {
+            return Some(GroupCiphertextHold::SelfLeaveExclusion);
+        }
+        info.clone()
     };
-    if !self_leave_startup_open(state, key)
-        && !self_leave_startup_open(state, info.stable_group_id())
-    {
-        return false;
-    }
-    removed_member_has_live_leaf(info, guard)
+    revocation_eviction::s4_withholds_ciphertext(state, &info)
+        .await
+        .then_some(GroupCiphertextHold::NoEligibleAdmin)
 }
 
 async fn self_leave_startup_note_verified_head(
@@ -25297,7 +25513,11 @@ async fn commit_treekem_self_leave_rekey_from(
         }
         return SelfLeaveRekeyStep::Deferred;
     };
-    if designated != state.agent.agent_id() {
+    // ADR 0110 §2: a ranked fallback admin may commit after its fallback
+    // time (`T_obs + W + (r − 1)·Δ`) when the designated admin did not.
+    if designated != state.agent.agent_id()
+        && !revocation_eviction::s4_self_leave_fallback_allowed(state, info.stable_group_id()).await
+    {
         let designated_hex = hex::encode(designated.as_bytes());
         let leaver = removed_member_log_id(&info);
         if self_leave_rekey_log_once(&format!(
@@ -25404,6 +25624,22 @@ async fn commit_treekem_self_leave_rekey_from(
         );
         return SelfLeaveRekeyStep::Deferred;
     };
+    // ADR 0110 §3 and §4: the leaver is already Removed, so its retained
+    // leaf is excluded by the signed crypto-only `CryptoExclusionV1`, gated
+    // per receiver on `crypto_exclusion_v1` and held by the D76 rule. No
+    // repeated `MemberRemoved` is sent on the Removed seat.
+    if revocation_eviction::crypto_exclusion::authoring_enabled() {
+        return revocation_eviction::crypto_exclusion::commit_locked(
+            state,
+            group_key,
+            &info,
+            &mut guard,
+            &leaver_hex,
+            target_agent,
+            &kp_bytes,
+        )
+        .await;
+    }
 
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
@@ -25670,6 +25906,23 @@ async fn rekey_treekem_self_leaves(state: &Arc<AppState>, group_id: &str) {
     }
     let membership_lock = group_membership_lock(state, &group_key).await;
     let _membership_guard = membership_lock.lock().await;
+    // ADR 0110 §4 (D75): this daemon is the committing admin, and every
+    // admin seat is revoked, so it stops sealing. A new rekey epoch would
+    // reach the revoked admins' leaves. A commit already on the local chain
+    // is still published by the resume path: survivors need that link to
+    // follow the chain the owner-recovery commit extends (§4b(1)).
+    if group_ciphertext_withheld(state, &group_key, None)
+        .await
+        .is_some()
+    {
+        if self_leave_rekey_log_once(&format!("s4:{group_key}")) {
+            tracing::info!(
+                group_id = %LogHexId::group(&group_key),
+                "self-leave TreeKEM rekey deferred: no eligible admin remains (ADR 0110 §4)"
+            );
+        }
+        return;
+    }
     let mut committed = 0usize;
     for _ in 0..SELF_LEAVE_REKEY_PASS_LIMIT {
         match commit_next_treekem_self_leave_rekey(state, &group_key).await {
@@ -25886,6 +26139,36 @@ async fn leave_treekem_group(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: the next TreeKEM member removal on this thread stops right
+/// after its roster/crypto transaction is durable, as a crash there would
+/// (ADR 0110 §5 crash window).
+#[cfg(test)]
+pub(in crate::server) fn crash_after_removal_commit_on_this_thread_for_test() {
+    CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.set(true));
+}
+
+/// ADR 0110 §5 and §1a/D135: the reply of a TreeKEM removal or ban whose S4
+/// prepare refused the commit, or `None` when the commit may run.
+fn s4_prepare_refusal(
+    prepared: revocation_eviction::removal_journal::RemovalPrepare,
+    not_durable: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    use revocation_eviction::removal_journal::RemovalPrepare;
+    match prepared {
+        RemovalPrepare::NotS4 | RemovalPrepare::Durable => None,
+        RemovalPrepare::NotDurable => Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": not_durable })),
+        )),
+        RemovalPrepare::Cancelled => Some(revocation_eviction::s4_exclusion_cancelled_response()),
+    }
+}
+
 async fn remove_treekem_named_group_member(
     state: Arc<AppState>,
     id: String,
@@ -26023,6 +26306,39 @@ async fn remove_treekem_named_group_member(
             })),
         );
     }
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: event_group_id,
+        revision,
+        actor: local_agent_hex,
+        agent_id: agent_id_hex.clone(),
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        secret_epoch: None,
+        commit: Some(commit),
+    };
+    // ADR 0110 §5: when S4 runs this removal, the exact outgoing event is
+    // durable in its prepared `.evjournal` and its `.evs` row BEFORE the
+    // new epoch commits. A crash after the commit then cannot lose the
+    // transition the survivors need: restart classifies the saved event
+    // against the chain and delivers it.
+    let prepared = revocation_eviction::removal_journal::prepare_committed_removal(
+        &state,
+        &next,
+        &agent_id_hex,
+        &event,
+    )
+    .await;
+    if let Some(resp) = s4_prepare_refusal(prepared, "removal event is not durable yet") {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_remove_prepare_not_durable",
+        );
+        return resp;
+    }
     // ADR 0107 (review r2): inside this removal's critical section, stop
     // every in-flight egress of the member's join artifacts BEFORE the
     // removal commits, then drop what stays staged AFTER it.
@@ -26031,6 +26347,12 @@ async fn remove_treekem_named_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        revocation_eviction::removal_journal::abandon_prepared_removal(
+            &state,
+            &next,
+            &agent_id_hex,
+        )
+        .await;
         rollback_treekem_group_after_failed_install(
             &state,
             &id,
@@ -26049,20 +26371,22 @@ async fn remove_treekem_named_group_member(
         );
     }
     drop(guard);
+    #[cfg(test)]
+    if CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.replace(false)) {
+        // Test-only crash: the transaction is durable, nothing after it ran.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "test crash after commit" })),
+        );
+    }
 
     save_mls_groups(&state).await;
     let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_removed").await;
 
-    let event = NamedGroupMetadataEvent::MemberRemoved {
-        group_id: event_group_id,
-        revision,
-        actor: local_agent_hex,
-        agent_id: agent_id_hex.clone(),
-        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
-        treekem_epoch: Some(treekem_epoch),
-        secret_epoch: None,
-        commit: Some(commit),
-    };
+    // ADR 0110 §3 and §5: the transaction is durable; S4's row moves to
+    // `committed_delivery_pending` and its delivery to each survivor starts
+    // before the first publication.
+    revocation_eviction::record_committed_removal(&state, &next, &agent_id_hex, &event).await;
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
@@ -26830,6 +27154,16 @@ pub(in crate::server) async fn seal_group_state(
         if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &local_hex) {
             return resp;
         }
+    }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
+    // ADR 0110 §2: a seal that would evict a pending S4 target before
+    // this node's fallback time is deferred (`waiting_for_designated_admin`).
+    if let Some(resp) = revocation_eviction::s4_seal_request_gate(&state, &id).await {
+        return resp;
     }
     // ADR-0038: for an OwnerCertified group the explicit seal is the
     // re-verification point — evict failing members WITH the full rekey
@@ -27782,10 +28116,20 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         let group_id = info.stable_group_id().to_string();
         let failed = verdict.failed();
         if !failed.is_empty() {
+            let members: Vec<String> = failed.iter().map(|(hex, _)| hex.clone()).collect();
+            // ADR 0110 §3: an S4 removal of one revoked or expired seat may
+            // seal while the group's other open S4 targets still fail; each
+            // gets its own transition (ADR-0038 B3, no prune).
+            if verdict.in_grace().is_empty()
+                && verdict.digest_pending().is_empty()
+                && revocation_eviction::s4_eviction_seal_tolerates(info, &members)
+            {
+                return info.seal_commit_evicting(signing_kp, now_ms);
+            }
             return Err(
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     group_id,
-                    members: failed.iter().map(|(hex, _)| hex.clone()).collect(),
+                    members,
                 },
             );
         }
@@ -29108,6 +29452,22 @@ pub(in crate::server) async fn ban_group_member(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // ADR 0110 §4 (D75, D126): see `s4_no_eligible_admin_refusal`.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
+    // ADR 0110 §2: a non-designated admin queues a ban of an S4 target
+    // before its fallback time (`waiting_for_designated_admin`).
+    if let Some(resp) = revocation_eviction::s4_manual_request_gate(
+        &state,
+        &id,
+        &agent_id_hex,
+        revocation_eviction::ManualRequestKind::Ban,
+    )
+    .await
+    {
+        return resp;
+    }
     // #946 C3: a banned member's refusal window ends.
     clear_cert_evidence_stamps_for(&state, &id, Some(&agent_id_hex)).await;
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -29118,6 +29478,13 @@ pub(in crate::server) async fn ban_group_member(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
+    // ADR 0110 §1a/D135 (#1508 review): re-check the S4 worker's ban under
+    // the lock, on every plane, before any mutation.
+    if let Some(resp) =
+        revocation_eviction::s4_exclusion_cancelled_under_lock(&state, &id, &agent_id_hex).await
+    {
+        return resp;
+    }
     let groups = state.named_groups.read().await;
     // #1166 S3: the admin trio runs in the group-access core, under this
     // lock take, before the TreeKEM delegation below.
@@ -29405,6 +29772,37 @@ async fn ban_treekem_group_member(
             ),
         );
     }
+    let event = NamedGroupMetadataEvent::MemberBanned {
+        group_id: event_group_id,
+        revision,
+        actor: caller_hex,
+        agent_id: agent_id_hex.clone(),
+        secret_epoch: None,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    // ADR 0110 §5 (#1508 review): an S4 ban passes the same prepare
+    // barrier as an S4 removal. Its exact event is durable in the prepared
+    // `.evjournal` and the `.evs` row BEFORE the new epoch commits.
+    let prepared = revocation_eviction::removal_journal::prepare_committed_removal(
+        &state,
+        &next,
+        &agent_id_hex,
+        &event,
+    )
+    .await;
+    if let Some(resp) = s4_prepare_refusal(prepared, "ban event is not durable yet") {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "member_ban_prepare_not_durable",
+        );
+        return resp;
+    }
     // ADR 0107 (review r2): inside this ban's critical section, stop every
     // in-flight egress of the member's join artifacts BEFORE the ban
     // commits, then drop what stays staged AFTER it.
@@ -29413,6 +29811,12 @@ async fn ban_treekem_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        revocation_eviction::removal_journal::abandon_prepared_removal(
+            &state,
+            &next,
+            &agent_id_hex,
+        )
+        .await;
         rollback_treekem_group_after_failed_install(
             &state,
             &id,
@@ -29430,21 +29834,22 @@ async fn ban_treekem_group_member(
         );
     }
     drop(guard);
+    #[cfg(test)]
+    if CRASH_AFTER_REMOVAL_COMMIT_FOR_TEST.with(|flag| flag.replace(false)) {
+        // Test-only crash: the transaction is durable, nothing after it ran.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "test crash after commit" })),
+        );
+    }
     // `persist_treekem_and_named_groups_atomic_with_info` already made this
     // exact roster snapshot durable and installed it under the global roster
     // persistence lock.
     let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_banned").await;
 
-    let event = NamedGroupMetadataEvent::MemberBanned {
-        group_id: event_group_id,
-        revision,
-        actor: caller_hex,
-        agent_id: agent_id_hex.clone(),
-        secret_epoch: None,
-        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
-        treekem_epoch: Some(treekem_epoch),
-        commit: Some(commit),
-    };
+    // ADR 0110 §3 and §5: the S4 row moves to `committed_delivery_pending`
+    // and its delivery to each survivor starts before the first publication.
+    revocation_eviction::record_committed_removal(&state, &next, &agent_id_hex, &event).await;
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
@@ -29847,6 +30252,10 @@ pub(in crate::server) async fn approve_join_request(
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
+    // ADR 0110 §4 (D75, D126): see `s4_no_eligible_admin_refusal`.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
         return resp;
     }
     // #1116: approving a join admits a member. Withhold it, do not purge it.
@@ -31739,11 +32148,20 @@ async fn treekem_group_encrypt_for_actor(
     {
         return resp;
     }
-    if self_leave_startup_withholds_ciphertext(state, group_id_hex, &guard).await {
-        return api_error(
-            StatusCode::CONFLICT,
-            "self-leave exclusion is not complete; ciphertext is withheld",
-        );
+    match group_ciphertext_withheld(state, group_id_hex, Some(&*guard)).await {
+        None => {}
+        Some(hold @ GroupCiphertextHold::SelfLeaveExclusion) => {
+            return api_error(StatusCode::CONFLICT, hold.reason());
+        }
+        Some(hold @ GroupCiphertextHold::NoEligibleAdmin) => {
+            // The route refused this state before; this is the race
+            // re-check. Release the ratchet first: the typed body reads
+            // the head-sync state, and that locks this same mutex.
+            drop(guard);
+            return revocation_eviction::s4_no_eligible_admin_refusal(state, group_id_hex)
+                .await
+                .unwrap_or_else(|| api_error(StatusCode::CONFLICT, hold.reason()));
+        }
     }
     let ciphertext = match guard.encrypt_message(&plaintext) {
         Ok(c) => c,
@@ -31942,6 +32360,11 @@ pub(in crate::server) async fn secure_group_encrypt(
     >,
     Json(req): Json<SecureEncryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     // #1166 S2: the entry admission (raw-id lookup 404 with the
@@ -32365,6 +32788,10 @@ pub(in crate::server) async fn secure_group_reseal(
     >,
     Json(req): Json<ResealRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // ADR 0110 §4 (D75, D126): see `s4_no_eligible_admin_refusal`.
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     // #1166 S2: the entry admission (raw-id lookup 404 with the
@@ -40904,6 +41331,11 @@ enum JoinArtifactRefusal {
     /// A lock the synchronous stream-seam check needs was contended (r5,
     /// lifecycle note section 2.7). Retryable: it withholds, never purges.
     SeamContended,
+    /// ADR 0110 §4 (D75) and §4b(3) (D126): verified revocations cover
+    /// every Admin-or-higher Active seat, so key delivery is refused. The
+    /// state is derived and can clear (owner recovery, late evidence), so
+    /// it withholds and never purges.
+    NoEligibleAdmin,
 }
 
 impl JoinArtifactRefusal {
@@ -40922,6 +41354,7 @@ impl JoinArtifactRefusal {
             Self::CertificateInGrace => "certificate_in_grace",
             Self::CertificateVerdictFailed(_) => "certificate_verdict_failed",
             Self::SeamContended => "seam_contended",
+            Self::NoEligibleAdmin => "no_eligible_admin",
         }
     }
 
@@ -41026,8 +41459,25 @@ async fn join_artifact_serving_refusal(
 /// [`join_artifact_serving_refusal`], also returning the owner-certificate
 /// evidence an OwnerCertified verdict was taken over (`Ok(None)` for other
 /// groups), so the stream-seam check can re-take the verdict over the same
-/// snapshot without awaiting (r5, lifecycle note section 2.7).
+/// snapshot without awaiting (r5, lifecycle note section 2.7). Key
+/// material (shares, Welcomes, join results) also waits while no eligible
+/// admin remains ([`join_artifact_no_eligible_admin`]).
 async fn join_artifact_serving_check(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+) -> std::result::Result<Option<x0x::groups::owner_cert::OwnerCertEvidence>, JoinArtifactRefusal> {
+    let evidence = join_artifact_member_check(state, group_id, member_hex).await?;
+    join_artifact_no_eligible_admin(state, group_id).await?;
+    Ok(evidence)
+}
+
+/// The recipient half of [`join_artifact_serving_check`], without the
+/// ADR 0110 §4 hold. S4's own guarded deliveries (crypto exclusion,
+/// removal, rebind, the owner-recovery mandate and commit) use it: they
+/// carry no group key and are the exits from the no-eligible-admin state,
+/// so §4 must not hold them (§4b(1)).
+async fn join_artifact_member_check(
     state: &AppState,
     group_id: &str,
     member_hex: &str,
@@ -41052,14 +41502,37 @@ async fn join_artifact_serving_check(
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) else {
             return Err(JoinArtifactRefusal::UnknownGroup);
         };
-        match join_artifact_record_probe(info, member_hex, revoked, now_unix) {
-            Ok(Some(probe)) => probe,
-            Ok(None) => return Ok(None),
-            Err(refusal) => return Err(refusal),
+        join_artifact_record_probe(info, member_hex, revoked, now_unix)?
+    };
+    let evidence = match probe {
+        None => None,
+        Some(probe) => {
+            let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
+            if let Some(refusal) = join_artifact_verdict_refusal(probe, &evidence, member_hex) {
+                return Err(refusal);
+            }
+            Some(evidence)
         }
     };
-    let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
-    join_artifact_verdict_refusal(probe, &evidence, member_hex).map_or(Ok(Some(evidence)), Err)
+    Ok(evidence)
+}
+
+/// ADR 0110 §4 (D75) and §4b(3) (D126) in the class-K serving guard: no
+/// envelope, Welcome or join result leaves while verified revocations
+/// cover every admin seat. It runs after every definitive refusal (r6),
+/// so it only withholds. Every secure share (approval, rekey, owner
+/// recovery survivors), Welcome and join-result write passes here under
+/// the membership lock, just before the write. After an owner-recovery
+/// commit the cover is gone, so its survivor shares are not held.
+async fn join_artifact_no_eligible_admin(
+    state: &AppState,
+    group_id: &str,
+) -> std::result::Result<(), JoinArtifactRefusal> {
+    // With no ratchet guard, the only hold is `NoEligibleAdmin`.
+    match group_ciphertext_withheld(state, group_id, None).await {
+        Some(_) => Err(JoinArtifactRefusal::NoEligibleAdmin),
+        None => Ok(()),
+    }
 }
 
 /// The record-local guard, plus (OwnerCertified groups only) the
@@ -44764,6 +45237,7 @@ pub(in crate::server) mod tests {
     mod adr0068_quarantine_pin;
     mod adr0068_task_buffer;
     mod adr0107_stuck_join_rearm;
+    mod adr0110_certificate_rebind;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod home_control_payload_size;
@@ -44795,6 +45269,7 @@ pub(in crate::server) mod tests {
     mod r19_cert_carry;
     mod r2_journal_ratchet_regression;
     mod requester_offer;
+    mod s4_key_delivery_1508;
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
     mod wp_c;
@@ -45591,6 +46066,7 @@ pub(in crate::server) mod tests {
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
+            revocation_evictions: S4Runtime::default(),
             ws_sessions: RwLock::new(HashMap::new()),
             ws_topics: RwLock::new(HashMap::new()),
             ws_outbound_stats: Arc::new(WsOutboundStats::default()),

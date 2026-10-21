@@ -11,15 +11,19 @@
 
 pub mod aad;
 pub mod card;
+pub mod cert_rebind;
+pub mod crypto_exclusion;
 pub mod diagnostics;
 pub mod directory;
 pub mod discovery;
+pub mod eviction;
 pub mod invite;
 pub mod kem_envelope;
 pub mod kv_context;
 pub mod member;
 pub mod owner_cert;
 pub mod owner_mandate;
+pub mod owner_recovery;
 pub mod policy;
 pub mod public_message;
 pub mod request;

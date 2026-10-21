@@ -45,6 +45,7 @@ mod case_1105;
 mod case_1161;
 mod case_1191;
 mod case_1256;
+mod case_1357;
 mod case_1427;
 mod case_1471;
 mod case_811;
@@ -690,6 +691,9 @@ impl Sim {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::Layer as _;
         let fabric = SimFabric::new(seed);
+        // #1357: peer-evidence Lookups run as runtime tasks here, never on
+        // blocking workers that would freeze paused virtual time.
+        crate::peer_evidence::set_w3h_inline_lookups(true);
         let plane = format!("w3h-{seed:x}");
         sim::register(&plane, &fabric);
         let (shim, entropy) = match Shim::detect() {
