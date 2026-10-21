@@ -41417,8 +41417,25 @@ async fn join_artifact_serving_refusal(
 /// [`join_artifact_serving_refusal`], also returning the owner-certificate
 /// evidence an OwnerCertified verdict was taken over (`Ok(None)` for other
 /// groups), so the stream-seam check can re-take the verdict over the same
-/// snapshot without awaiting (r5, lifecycle note section 2.7).
+/// snapshot without awaiting (r5, lifecycle note section 2.7). Key
+/// material (shares, Welcomes, join results) also waits while no eligible
+/// admin remains ([`join_artifact_no_eligible_admin`]).
 async fn join_artifact_serving_check(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+) -> std::result::Result<Option<x0x::groups::owner_cert::OwnerCertEvidence>, JoinArtifactRefusal> {
+    let evidence = join_artifact_member_check(state, group_id, member_hex).await?;
+    join_artifact_no_eligible_admin(state, group_id).await?;
+    Ok(evidence)
+}
+
+/// The recipient half of [`join_artifact_serving_check`], without the
+/// ADR 0110 §4 hold. S4's own guarded deliveries (crypto exclusion,
+/// removal, rebind, the owner-recovery mandate and commit) use it: they
+/// carry no group key and are the exits from the no-eligible-admin state,
+/// so §4 must not hold them (§4b(1)).
+async fn join_artifact_member_check(
     state: &AppState,
     group_id: &str,
     member_hex: &str,
@@ -41455,7 +41472,6 @@ async fn join_artifact_serving_check(
             Some(evidence)
         }
     };
-    join_artifact_no_eligible_admin(state, group_id).await?;
     Ok(evidence)
 }
 

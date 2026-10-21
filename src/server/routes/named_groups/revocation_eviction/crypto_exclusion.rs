@@ -1161,7 +1161,7 @@ fn guarded_admission_gated(
             let lock = ng::group_membership_lock_for_known_group(&state, &group_id).await?;
             let evidence = {
                 let _membership_guard = lock.lock().await;
-                let evidence = ng::join_artifact_serving_check(&state, &group_id, &recipient_hex)
+                let evidence = ng::join_artifact_member_check(&state, &group_id, &recipient_hex)
                     .await
                     .ok()?;
                 let head_ok = {
