@@ -5734,6 +5734,90 @@ mod tests {
         }
     }
 
+    /// WHY: the pin has to travel with the listener the daemon restores,
+    /// not only with the header helper. A local client on the restored
+    /// port must be refused before any header byte, and must not fall
+    /// back to V1, when the stream's machine is not the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn listener_refuses_a_wrong_machine_before_any_header_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
+            return;
+        };
+        let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
+            alice.shutdown().await;
+            return;
+        };
+        let alice = Arc::new(alice);
+        let bob = Arc::new(bob);
+        link_loopback_pair(&alice, &bob).await;
+
+        let (target_port, target_bytes, target_cancel) = spawn_counting_target().await;
+        let target = SocketAddr::from(([127, 0, 0, 1], target_port));
+        let bob_policy = allow_exact(&alice, target);
+        let bob_diag = Arc::new(ConnectDiagnostics::new(bob_policy.summary()));
+        let bob_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&bob), bob_policy, bob_diag, true)
+                .expect("bob forwarder"),
+        );
+        bob_fwd.spawn_inbound();
+
+        let alice_policy = Arc::new(ConnectPolicy::default());
+        let alice_diag = Arc::new(ConnectDiagnostics::new(alice_policy.summary()));
+        let alice_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&alice), alice_policy, alice_diag, true)
+                .expect("alice forwarder"),
+        );
+        let wrong = MachineId([0xEE; 32]);
+        assert_ne!(wrong, bob.machine_id());
+        let bound = alice_fwd
+            .add_forward(ForwardSpec {
+                local_addr: "127.0.0.1:0".parse().expect("loopback"),
+                peer_agent: bob.agent_id(),
+                target_host: "127.0.0.1".to_string(),
+                target_port,
+                name: Some("machine:box.me".to_string()),
+                kind: crate::names::NameKind::Machine,
+                pinned_machine: Some(wrong),
+                persistent: true,
+            })
+            .await
+            .expect("listener");
+        let mut client = TcpStream::connect(bound).await.expect("local client");
+        client
+            .write_all(b"secret-target")
+            .await
+            .expect("local write");
+
+        let counted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if alice_fwd.diagnostics().machine_mismatch() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        target_cancel.cancel();
+        alice_fwd.shutdown();
+        bob_fwd.shutdown();
+        alice.shutdown().await;
+        bob.shutdown().await;
+
+        assert!(
+            counted.is_ok(),
+            "the listener must count a pin mismatch from the outbound driver"
+        );
+        assert_eq!(
+            target_bytes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a wrong machine must receive no header and no V1 fallback"
+        );
+    }
+
     fn resolved_machine(agent: AgentId, machine: MachineId) -> crate::names::Resolved {
         crate::names::Resolved {
             name: "machine:box.me".to_string(),

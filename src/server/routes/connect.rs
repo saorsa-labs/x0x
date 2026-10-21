@@ -1311,4 +1311,50 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read"), original);
         forwarder.shutdown();
     }
+
+    /// WHY: a restart has to bind the saved port again, with the pin the
+    /// name still resolves to. Reloading the file is not that listener.
+    #[tokio::test]
+    async fn restored_named_forward_listens_with_its_pin() {
+        let (agent, _dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let addr = free_loopback().await;
+        let mut spec = hex_spec(addr);
+        spec.name = Some("machine:box.me".to_string());
+        spec.kind = NameKind::Machine;
+        {
+            let store = ForwardStore::load(path.clone()).await;
+            assert!(store.remember(&spec).await.expect("save"));
+        }
+        let store = ForwardStore::load(path).await;
+        let records = store.records().await.expect("records");
+        let record = records.first().expect("saved forward");
+        let resolved = x0x::names::Resolved {
+            name: "machine:box.me".to_string(),
+            kind: NameKind::Machine,
+            owner: x0x::identity::UserId([0x33; 32]),
+            agent_id: Some(AgentId([0x55; 32])),
+            machine_id: Some(MachineId([0x11; 32])),
+            newly_pinned: false,
+        };
+        assert!(
+            install_restored(&forwarder, record, Some(Ok(resolved))).await,
+            "restore must bind the saved forward"
+        );
+        let listed = forwarder.list_forwards();
+        assert!(
+            listed.iter().any(|status| {
+                status.spec.local_addr == addr
+                    && status.spec.pinned_machine == Some(MachineId([0x11; 32]))
+                    && status.error.is_none()
+            }),
+            "the restored forward is listening with its pin: {listed:?}"
+        );
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the restored listener accepts a local client");
+        forwarder.shutdown();
+    }
 }
