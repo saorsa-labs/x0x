@@ -986,3 +986,272 @@ macro_rules! background_driver_regression_tests {
         }
     };
 }
+
+// These controls use the production boot resolver and server spawn decision.
+// Only already-verified discovery input and publication are inert fixtures;
+// they do not prove signature verification or real network transport.
+#[allow(unused_macros)]
+macro_rules! background_init_regression_tests {
+    () => {
+        #[cfg(unix)]
+        mod background_init_regressions {
+            use super::*;
+            use std::sync::Mutex as StdMutex;
+
+            #[derive(Default)]
+            struct Observations {
+                started: Vec<&'static str>,
+                published: Vec<(&'static str, Vec<u8>)>,
+                checks: usize,
+            }
+
+            struct Tasks(Vec<tokio::task::JoinHandle<()>>);
+
+            impl Drop for Tasks {
+                fn drop(&mut self) {
+                    for task in &self.0 {
+                        task.abort();
+                    }
+                }
+            }
+
+            fn release(version: &str) -> VerifiedRelease {
+                let mut manifest = manifest_for_this_platform(version);
+                manifest.timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let manifest_json = serde_json::to_vec(&manifest).unwrap();
+                VerifiedRelease {
+                    manifest,
+                    gossip_payload: manifest_json.clone(),
+                    manifest_json,
+                    signature: Vec::new(),
+                }
+            }
+
+            async fn unavailable_identity(looping: bool, gossip: bool, fallback: bool) {
+                let evidence = std::env::var_os("X0X_UPGRADE_STAGING_EVIDENCE_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join(".planning/upgrade-staging-fixtures")
+                    });
+                std::fs::create_dir_all(&evidence).unwrap();
+                let root = tempfile::Builder::new()
+                    .prefix("background-init-")
+                    .tempdir_in(evidence)
+                    .unwrap();
+                let data = root.path().canonicalize().unwrap();
+                let install = data.join("x0xd");
+                std::fs::write(&install, b"owned inert install").unwrap();
+                std::fs::write(data.join("SKILL.md"), b"retained guide").unwrap();
+                let identity = data.join("unavailable-identity");
+                if looping {
+                    std::os::unix::fs::symlink("unavailable-identity", &identity).unwrap();
+                }
+                let expected_error = identity.canonicalize().unwrap_err().kind();
+                let names = || {
+                    let mut names = std::fs::read_dir(&data)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    names
+                };
+                let original_names = names();
+                let _raw =
+                    crate::upgrade::apply::current_binary_path_seam::install(install.clone());
+                let config = DaemonConfig {
+                    data_dir: data.clone(),
+                    update: DaemonUpdateConfig {
+                        enabled: true,
+                        gossip_updates: gossip,
+                        fallback_check_interval_minutes: u64::from(fallback),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let boot = BackgroundRuntime::from_boot(
+                    &config,
+                    SocketAddr::from(([127, 0, 0, 1], 12700)),
+                    (
+                        Arc::new(|| panic!("discovery must not restart")),
+                        shutdown_rx.clone(),
+                    ),
+                    Arc::new(Mutex::new(())),
+                    Some(identity.clone()),
+                    [42; 32],
+                )
+                .await;
+                assert_eq!(
+                    boot.as_ref()
+                        .err()
+                        .expect("real identity resolution must fail")
+                        .downcast_ref::<std::io::Error>()
+                        .expect("filesystem error")
+                        .kind(),
+                    expected_error
+                );
+                // This is the actual failed boot result, not an injected None.
+                // An apply owner cannot be constructed from this result.
+                let submit = boot.ok().map(|runtime| background_channel(runtime).0);
+                assert!(submit.is_none());
+                let published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
+                let observations = Arc::new(StdMutex::new(Observations::default()));
+                let gossip_release = release("9.9.9");
+                let fallback_release = release("9.9.10");
+                let expected_gossip = gossip_release.gossip_payload.clone();
+                let expected_fallback = fallback_release.gossip_payload.clone();
+                let gossip_observations = Arc::clone(&observations);
+                let gossip_published = Arc::clone(&published);
+                let gossip_shutdown = shutdown_rx.clone();
+                let mut tasks = Tasks(Vec::new());
+                let gossip_task = BackgroundRuntime::spawn_source(
+                    config.update.enabled && config.update.gossip_updates,
+                    submit.clone(),
+                    move |submit| async move {
+                        gossip_observations.lock().unwrap().started.push("gossip");
+                        run_gossip_update_driver(
+                            futures::stream::iter([gossip_release.clone(), gossip_release]),
+                            submit,
+                            gossip_published,
+                            move |payload| {
+                                gossip_observations
+                                    .lock()
+                                    .unwrap()
+                                    .published
+                                    .push(("gossip", payload));
+                                std::future::ready(Ok(()))
+                            },
+                            gossip_shutdown,
+                        )
+                        .await;
+                    },
+                );
+                let gossip_spawned = gossip_task.is_some();
+                tasks.0.extend(gossip_task);
+                let fallback_observations = Arc::clone(&observations);
+                let fallback_task = BackgroundRuntime::spawn_source(
+                    config.update.enabled && config.update.fallback_check_interval_minutes > 0,
+                    submit,
+                    move |submit| async move {
+                        fallback_observations
+                            .lock()
+                            .unwrap()
+                            .started
+                            .push("fallback");
+                        let check_observations = Arc::clone(&fallback_observations);
+                        let mut next_release = Some(fallback_release);
+                        run_fallback_update_driver(
+                            futures::stream::iter([()]),
+                            move || {
+                                check_observations.lock().unwrap().checks += 1;
+                                std::future::ready(Ok(next_release.take()))
+                            },
+                            submit,
+                            published,
+                            move |payload| {
+                                fallback_observations
+                                    .lock()
+                                    .unwrap()
+                                    .published
+                                    .push(("fallback", payload));
+                                std::future::ready(Ok(()))
+                            },
+                            shutdown_rx,
+                        )
+                        .await;
+                    },
+                );
+                let fallback_spawned = fallback_task.is_some();
+                tasks.0.extend(fallback_task);
+                // Finite input drains each actual spawned driver. The Drop
+                // guard aborts only these inert tasks on an assertion unwind.
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while tasks.0.iter().any(|task| !task.is_finished()) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "discovery task drain bound"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                for task in tasks.0.drain(..) {
+                    task.await.unwrap();
+                }
+                drop(shutdown_tx);
+                assert_eq!(
+                    names(),
+                    original_names,
+                    "no apply/guide/record writes without authority"
+                );
+                assert_eq!(std::fs::read(&install).unwrap(), b"owned inert install");
+                assert_eq!(
+                    std::fs::read(data.join("SKILL.md")).unwrap(),
+                    b"retained guide"
+                );
+                assert_eq!(identity.canonicalize().unwrap_err().kind(), expected_error);
+                let observed = observations.lock().unwrap();
+                assert_eq!(
+                    (gossip_spawned, fallback_spawned),
+                    (gossip, fallback),
+                    "failed apply initialization must retain each configured discovery source"
+                );
+                assert_eq!(
+                    observed
+                        .started
+                        .iter()
+                        .filter(|name| **name == "gossip")
+                        .count(),
+                    usize::from(gossip)
+                );
+                assert_eq!(
+                    observed
+                        .started
+                        .iter()
+                        .filter(|name| **name == "fallback")
+                        .count(),
+                    usize::from(fallback)
+                );
+                assert_eq!(observed.checks, usize::from(fallback));
+                let expected_publications = [
+                    (gossip, ("gossip", expected_gossip)),
+                    (fallback, ("fallback", expected_fallback)),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, publication)| enabled.then_some(publication))
+                .collect::<Vec<_>>();
+                assert_eq!(
+                    observed.published.len(),
+                    expected_publications.len(),
+                    "duplicate gossip input must not republish"
+                );
+                for expected in expected_publications {
+                    assert!(observed.published.contains(&expected));
+                }
+            }
+
+            #[tokio::test]
+            async fn background_init_missing_identity_keeps_discovery_and_gossip_dedup() {
+                unavailable_identity(false, true, true).await;
+            }
+
+            #[tokio::test]
+            async fn background_init_unresolvable_identity_keeps_discovery_and_gossip_dedup() {
+                unavailable_identity(true, true, true).await;
+            }
+
+            #[tokio::test]
+            async fn background_init_disabled_sources_stay_disabled_without_apply_authority() {
+                unavailable_identity(false, false, false).await;
+            }
+
+            #[tokio::test]
+            async fn background_init_each_source_retains_its_independent_enable_gate() {
+                unavailable_identity(false, false, true).await;
+                unavailable_identity(false, true, false).await;
+            }
+        }
+    };
+}
