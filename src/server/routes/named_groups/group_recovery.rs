@@ -1359,7 +1359,10 @@ pub(super) async fn apply_join_carry(
             record.reason == s3::OWNER_ATTESTED_GAP_REASON
                 && current.state_revision < record.terminal_revision
         });
-    if owner_armed || armed_admin_ata(state, &current).await.is_some() {
+    if owner_armed
+        || armed_admin_ata(state, &current).await.is_some()
+        || conflict_recorded(state, &stable).await
+    {
         return false;
     }
     // The armed admin record lives in the S3 sidecar (`active_ata`), never
@@ -1584,6 +1587,17 @@ pub(super) async fn armed_admin_sequence(
     state: &AppState,
     info: &GroupInfo,
 ) -> Option<Vec<String>> {
+    // §2 "Conflict": a recorded conflict narrows the gate to the common
+    // prefix of the two ATAs; nothing past it applies.
+    if let Some(body) = sidecar_snapshot(state, info.stable_group_id()).await {
+        if let (Some(active), Some(conflict)) =
+            (body.active_ata.as_ref(), body.attestation_conflict.as_ref())
+        {
+            if let Some(sequence) = s3::conflict_gate_sequence(active, conflict, &info.state_hash) {
+                return Some(sequence);
+            }
+        }
+    }
     if let Some(ata) = armed_admin_ata(state, info).await {
         return Some(ata.fields.sequence);
     }
@@ -1629,10 +1643,14 @@ pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
         return;
     };
     let stable = info.stable_group_id().to_string();
-    let Some(ata) = sidecar_snapshot(state, &stable)
-        .await
-        .and_then(|body| body.active_ata)
-    else {
+    let Some(body) = sidecar_snapshot(state, &stable).await else {
+        return;
+    };
+    // §2 "Conflict": the conflict and its ATA stay until a re-seat.
+    if body.attestation_conflict.is_some() {
+        return;
+    }
+    let Some(ata) = body.active_ata else {
         return;
     };
     let terminal_hash = ata.fields.sequence.last().cloned().unwrap_or_default();
@@ -1823,6 +1841,11 @@ async fn subject_tick(state: &Arc<AppState>) {
         if journal_active || fault {
             continue;
         }
+        if conflict_recorded(state, &stable).await {
+            // After a restart the view is re-derived from the durable
+            // conflict (§2 "Conflict", §8).
+            show_conflict(state, &info).await;
+        }
         if retire_marker_attested(state, &key, &info).await {
             continue;
         }
@@ -1900,10 +1923,14 @@ async fn retire_marker_attested(state: &Arc<AppState>, group_key: &str, info: &G
         return false;
     };
     let stable = info.stable_group_id().to_string();
-    let Some(ata) = sidecar_snapshot(state, &stable)
-        .await
-        .and_then(|body| body.active_ata)
-    else {
+    let Some(body) = sidecar_snapshot(state, &stable).await else {
+        return false;
+    };
+    // §2 "Conflict": automatic recovery stops; nothing retires.
+    if body.attestation_conflict.is_some() {
+        return false;
+    }
+    let Some(ata) = body.active_ata else {
         return false;
     };
     let applied = info.commit_log.iter().any(|entry| {
@@ -2271,6 +2298,74 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
     }
 }
 
+/// §2 "Conflict": this node holds a recorded attestation conflict.
+async fn conflict_recorded(state: &AppState, stable: &str) -> bool {
+    sidecar_snapshot(state, stable)
+        .await
+        .is_some_and(|body| body.attestation_conflict.is_some())
+}
+
+/// Show `reseat_required {attestation_conflict}` unless a re-seat is
+/// already under way.
+async fn show_conflict(state: &AppState, info: &GroupInfo) {
+    let stable = info.stable_group_id().to_string();
+    let now = Instant::now();
+    let mut inner = state.group_recovery.inner.lock().await;
+    let subject = inner
+        .subjects
+        .entry(stable)
+        .or_insert_with(|| SubjectState::new(now, info.state_revision));
+    if matches!(
+        subject.view,
+        SubjectView::ReseatInProgress { .. }
+            | SubjectView::Reseat {
+                cause: "attestation_conflict",
+                ..
+            }
+    ) {
+        return;
+    }
+    subject.view = SubjectView::Reseat {
+        cause: "attestation_conflict",
+        recovery_ref: RecoveryRef::live_refs(info).into_iter().next(),
+    };
+}
+
+/// §2 "Conflict": two valid ATAs for this node's chain diverge. Record the
+/// second one beside the active ATA so the catch-up gate stops at their
+/// common prefix ([`s3::conflict_gate_sequence`]), and enter
+/// `reseat_required {attestation_conflict}`. The record only adds
+/// containment, so when its durable write fails it is still held in
+/// memory (the gate honours it now, and the next sidecar write carries
+/// it).
+async fn record_conflict(
+    state: &AppState,
+    group_key: &str,
+    info: &GroupInfo,
+    conflict: AdminTerminalAttestation,
+) {
+    let stable = info.stable_group_id().to_string();
+    let kept = conflict.clone();
+    if !update_sidecar(state, &stable, move |body| {
+        body.attestation_conflict = Some(kept);
+    })
+    .await
+    {
+        tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the attestation conflict is not durable yet; it is held in memory");
+        let _writer = state.group_recovery.writer.lock().await;
+        let mut inner = state.group_recovery.inner.lock().await;
+        if !inner.sidecar_status.contains_key(&stable) {
+            inner
+                .sidecars
+                .entry(stable.clone())
+                .or_default()
+                .attestation_conflict = Some(conflict);
+        }
+    }
+    show_conflict(state, info).await;
+    tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: conflicting admin attestations; automatic catch-up stops at their common prefix (reseat_required)");
+}
+
 /// A refusal moves the round to the next target at once; the last one
 /// ends the round.
 fn advance_round(subject: &mut SubjectState, now: Instant, from_pending: bool) {
@@ -2309,6 +2404,11 @@ async fn arm_from_response(
         tracing::info!(group_id = %LogHexId::group(group_key), reason = refusal.as_str(), "ADR 0109 S3: ATA refused");
         return;
     }
+    if conflict_recorded(state, &stable).await {
+        // Automatic catch-up stopped at the conflict; no ATA arms again.
+        show_conflict(state, info).await;
+        return;
+    }
     if let Some(active) = sidecar_snapshot(state, &stable)
         .await
         .and_then(|body| body.active_ata)
@@ -2316,16 +2416,7 @@ async fn arm_from_response(
         // A provisional ATA causes no conflict (§2): only a verified
         // signer's diverging sequence stops automatic catch-up.
         if active.conflicts_with(&ata) && ata.signer_verified_on(info) {
-            set_view(
-                state,
-                &stable,
-                info.state_revision,
-                SubjectView::Reseat {
-                    cause: "attestation_conflict",
-                    recovery_ref: RecoveryRef::live_refs(info).into_iter().next(),
-                },
-            )
-            .await;
+            record_conflict(state, group_key, info, ata).await;
             return;
         }
     }
@@ -2487,6 +2578,18 @@ async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupIn
         }
         s3::ProvisionalPath::Verified => {
             clear_provisional(state, &stable).await;
+            if conflict_recorded(state, &stable).await {
+                show_conflict(state, info).await;
+                return;
+            }
+            let diverges = sidecar_snapshot(state, &stable)
+                .await
+                .and_then(|body| body.active_ata)
+                .is_some_and(|active| active.conflicts_with(&ata));
+            if diverges {
+                record_conflict(state, group_key, info, ata).await;
+                return;
+            }
             let owner_armed = info
                 .invite_lineage
                 .as_ref()
@@ -3467,21 +3570,14 @@ async fn consume_reseat(
         authorisation: authorisation.clone(),
         invite: invite_link.clone(),
         record_digest: *blake3::hash(&live_record).as_bytes(),
-        phase: ReseatPhase::Staging,
+        phase: ReseatPhase::Prepared,
         live_key: group_key.to_string(),
         live_record,
         live_tree,
         started_at_ms: now_ms(),
     };
-    if !update_sidecar(state, &stable, move |body| {
-        body.reseat_journal = Some(journal);
-    })
-    .await
-    {
-        drop(membership_guard);
-        refuse_authorisation(state, &stable, info.state_revision, "journal_not_durable").await;
-        return;
-    }
+    // While this process prepares, the worker leaves the `Prepared`
+    // journal alone; after a restart (no entry here) it rolls it back.
     state
         .group_recovery
         .inner
@@ -3489,7 +3585,12 @@ async fn consume_reseat(
         .await
         .staging_live
         .insert(stable.clone());
-    if !move_live_record_aside(state, group_key, &info).await {
+    if let Err(why) = prepare_reseat(state, group_key, &info, journal).await {
+        drop(membership_guard);
+        // The journal (when it became durable) holds the original record
+        // and tree. The rollback closes it only once the original is
+        // durable again; until then the worker retries it.
+        rollback_reseat(state, &stable, why).await;
         state
             .group_recovery
             .inner
@@ -3497,9 +3598,7 @@ async fn consume_reseat(
             .await
             .staging_live
             .remove(&stable);
-        let _ = update_sidecar(state, &stable, |body| body.reseat_journal = None).await;
-        drop(membership_guard);
-        refuse_authorisation(state, &stable, info.state_revision, "live_record_not_moved").await;
+        refuse_authorisation(state, &stable, info.state_revision, why).await;
         return;
     }
     drop(membership_guard);
@@ -3544,7 +3643,7 @@ async fn consume_reseat(
     if !response.status().is_success() {
         let status = response.status();
         tracing::warn!(group_id = %LogHexId::group(group_key), %status, "ADR 0109 S3: the staged join was refused; restoring the live record");
-        restore_live_record(state, &stable, &format!("join_{}", status.as_u16())).await;
+        rollback_reseat(state, &stable, &format!("join_{}", status.as_u16())).await;
     } else {
         // The join can return with the record already Active with keys:
         // swap now rather than at the next worker tick.
@@ -3552,35 +3651,88 @@ async fn consume_reseat(
     }
 }
 
+/// §3 steps 1 and 2 under the membership lock: write the journal
+/// (`Prepared`), move the original record out of the live map, then mark
+/// the journal `Staging`. Each step is durable before the next starts.
+/// On `Err` the caller rolls back with [`rollback_reseat`], which keeps the
+/// journal until the original record is durable again.
+async fn prepare_reseat(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &GroupInfo,
+    journal: ReseatJournalV1,
+) -> Result<(), &'static str> {
+    let stable = info.stable_group_id().to_string();
+    if !update_sidecar(state, &stable, move |body| {
+        body.reseat_journal = Some(journal);
+    })
+    .await
+    {
+        return Err("journal_not_durable");
+    }
+    if !move_live_record_aside(state, group_key, info).await {
+        return Err("live_record_not_moved");
+    }
+    let mut marked = false;
+    let marked_ref = &mut marked;
+    let durable = update_sidecar(state, &stable, move |body| {
+        if let Some(journal) = body.reseat_journal.as_mut() {
+            journal.phase = ReseatPhase::Staging;
+            *marked_ref = true;
+        }
+    })
+    .await;
+    if durable && marked {
+        Ok(())
+    } else {
+        Err("journal_not_durable")
+    }
+}
+
 /// Move the contained live record aside: the same teardown a self-removal
 /// runs, so the staged join starts from no local record. The record and its
 /// tree are already durable in the journal.
+///
+/// The roster write runs FIRST. Nothing else is touched until it is
+/// durable, so a failed write leaves the live record, its tree and its
+/// TreeKEM persistence in place (a `NotReplaced` write rolls the map back;
+/// a `ReplacedNotDurable` one leaves the journal as the only copy, and the
+/// rollback restores from it).
 async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) -> bool {
-    let aliases = super::join_artifact_group_aliases(state, group_key).await;
-    super::retire_local_group_join_artifacts(state, &aliases).await;
-    state.group_card_cache.write().await.remove(group_key);
-    state.mls_groups.write().await.remove(group_key);
-    state.treekem_groups.write().await.remove(group_key);
-    super::remove_treekem_persistence_for_group_id(state, group_key, "adr0109_reseat").await;
     let key = group_key.to_string();
     let durable = matches!(
         super::persist_named_groups_mutation(state, move |groups| groups.remove(&key).is_some())
             .await,
         Ok(super::AtomicWriteOutcome::Durable)
     );
-    if durable {
-        super::save_mls_groups(state).await;
-        let mut cache_aliases = aliases;
-        cache_aliases.insert(group_key.to_string());
-        cache_aliases.insert(info.stable_group_id().to_string());
-        let _ = super::prune_treekem_cache_groups(state, &cache_aliases, "adr0109_reseat").await;
+    if !durable {
+        return false;
     }
-    durable
+    let aliases = super::join_artifact_group_aliases(state, group_key).await;
+    super::retire_local_group_join_artifacts(state, &aliases).await;
+    state.group_card_cache.write().await.remove(group_key);
+    state.mls_groups.write().await.remove(group_key);
+    state.treekem_groups.write().await.remove(group_key);
+    super::remove_treekem_persistence_for_group_id(state, group_key, "adr0109_reseat").await;
+    super::save_mls_groups(state).await;
+    let mut cache_aliases = aliases;
+    cache_aliases.insert(group_key.to_string());
+    cache_aliases.insert(info.stable_group_id().to_string());
+    let _ = super::prune_treekem_cache_groups(state, &cache_aliases, "adr0109_reseat").await;
+    true
 }
 
-/// Restore the journalled live record and close the journal; the node
-/// shows `reseat_required {reseat_failed}` (§3 step 4).
-async fn restore_live_record(state: &Arc<AppState>, stable: &str, why: &str) {
+/// Put the journalled original record back durably, then close the journal;
+/// the node shows `reseat_required {reseat_failed}` (§3 step 4). The
+/// journal stays open, and the worker retries, until the original record
+/// is durable again: only a durable rollback (or a durable swap) closes it.
+///
+/// - `Prepared`: the staged join never started, so a record under the
+///   journal's key is the original (its move aside failed). It is written
+///   again so that it is durable, with its tree untouched.
+/// - otherwise, or with no record under the key: any staging stub goes,
+///   and the record and its tree are restored from the journal.
+async fn rollback_reseat(state: &Arc<AppState>, stable: &str, why: &str) {
     let Some(journal) = sidecar_snapshot(state, stable)
         .await
         .and_then(|body| body.reseat_journal)
@@ -3588,26 +3740,85 @@ async fn restore_live_record(state: &Arc<AppState>, stable: &str, why: &str) {
         return;
     };
     let Ok(record) = serde_json::from_slice::<GroupInfo>(&journal.live_record) else {
-        tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the journalled live record does not decode");
+        tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the journalled live record does not decode; the journal stays");
         return;
     };
     let key = journal.live_key.clone();
     let lock = super::group_membership_lock(state, &key).await;
-    let _membership_guard = lock.lock().await;
-    // Any staging stub under the same key goes first.
-    let stub_key = key.clone();
+    let membership_guard = lock.lock().await;
+    let still_live = if journal.phase == ReseatPhase::Prepared {
+        state.named_groups.read().await.get(&key).cloned()
+    } else {
+        None
+    };
+    let (restored, revision) = match still_live {
+        Some(original) => {
+            let revision = original.state_revision;
+            let durable = matches!(
+                super::persist_named_group_info(state, &key, original).await,
+                Ok(super::AtomicWriteOutcome::Durable)
+            );
+            (durable, revision)
+        }
+        None => (
+            restore_record_from_journal(state, stable, &key, &record, &journal).await,
+            record.state_revision,
+        ),
+    };
+    drop(membership_guard);
+    if !restored {
+        tracing::warn!(group_id = %LogHexId::group(stable), why, "ADR 0109 S3: the re-seat rollback is not durable yet; the journal stays and the worker retries");
+        return;
+    }
+    if !update_sidecar(state, stable, |body| body.reseat_journal = None).await {
+        // The original is durable; closing the journal is retried.
+        return;
+    }
+    let refs = state
+        .named_groups
+        .read()
+        .await
+        .get(&key)
+        .map(RecoveryRef::live_refs)
+        .unwrap_or_default();
+    let now = Instant::now();
+    let mut inner = state.group_recovery.inner.lock().await;
+    inner.staging_live.remove(stable);
+    let subject = inner
+        .subjects
+        .entry(stable.to_string())
+        .or_insert_with(|| SubjectState::new(now, revision));
+    subject.view = SubjectView::Reseat {
+        cause: "reseat_failed",
+        recovery_ref: refs.into_iter().next(),
+    };
+    subject.last_refusal = Some(why.to_string());
+    tracing::warn!(group_id = %LogHexId::group(stable), why, "ADR 0109 S3: re-seat failed; the contained live record is restored");
+}
+
+/// Remove any staging stub under `key`, then write the journalled record
+/// and its tree back in one TreeKEM persist transaction (or the record
+/// alone when it had no tree). Returns whether that write is durable.
+async fn restore_record_from_journal(
+    state: &AppState,
+    stable: &str,
+    key: &str,
+    record: &GroupInfo,
+    journal: &ReseatJournalV1,
+) -> bool {
+    let stub_key = key.to_string();
     let _ = super::persist_named_groups_mutation(state, move |groups| {
         groups.remove(&stub_key).is_some()
     })
     .await;
-    state.treekem_groups.write().await.remove(&key);
-    let restored = match journal.live_tree.as_deref() {
+    state.treekem_groups.write().await.remove(key);
+    match journal.live_tree.as_deref() {
         Some(snapshot) => {
-            match super::restore_local_treekem_group_from_snapshot(state, &record, snapshot) {
+            match super::restore_local_treekem_group_from_snapshot(state, record, snapshot) {
                 Ok(tree) => {
                     let persisted = super::persist_treekem_and_named_groups_atomic_with_info(
                         state,
-                        &key,
+                        key,
                         record.clone(),
                         &tree,
                     )
@@ -3618,7 +3829,7 @@ async fn restore_live_record(state: &Arc<AppState>, stable: &str, why: &str) {
                             .treekem_groups
                             .write()
                             .await
-                            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(tree)));
+                            .insert(key.to_string(), Arc::new(tokio::sync::Mutex::new(tree)));
                     }
                     persisted
                 }
@@ -3629,28 +3840,10 @@ async fn restore_live_record(state: &Arc<AppState>, stable: &str, why: &str) {
             }
         }
         None => matches!(
-            super::persist_named_group_info(state, &key, record.clone()).await,
+            super::persist_named_group_info(state, key, record.clone()).await,
             Ok(super::AtomicWriteOutcome::Durable)
         ),
-    };
-    if !restored {
-        // The journal stays; the next tick retries the restore.
-        return;
     }
-    let _ = update_sidecar(state, stable, |body| body.reseat_journal = None).await;
-    let now = Instant::now();
-    let mut inner = state.group_recovery.inner.lock().await;
-    inner.staging_live.remove(stable);
-    let subject = inner
-        .subjects
-        .entry(stable.to_string())
-        .or_insert_with(|| SubjectState::new(now, record.state_revision));
-    subject.view = SubjectView::Reseat {
-        cause: "reseat_failed",
-        recovery_ref: RecoveryRef::live_refs(&record).into_iter().next(),
-    };
-    subject.last_refusal = Some(why.to_string());
-    tracing::warn!(group_id = %LogHexId::group(stable), why, "ADR 0109 S3: re-seat failed; the contained live record is restored");
 }
 
 /// The live record whose stable id is `stable`, with its map key.
@@ -3662,12 +3855,18 @@ async fn live_record_for(state: &AppState, stable: &str) -> Option<(String, Grou
         .map(|(key, info)| (key.clone(), info.clone()))
 }
 
-/// §3 step 3: when the staged record is Active with keys, swap it in. The
-/// journal closes and the old record is retired (cause `reseat`) in one
-/// sidecar write, and the subject's `reseat_in_progress` view is cleared
-/// with it. Returns whether the record is seated (the swap is done, by
-/// this call or an earlier one, or its durable write failed and the next
-/// tick retries).
+/// §3 step 3: when the staged record is the bound result of this journal
+/// ([`ReseatJournalV1::staged_result_ready`]), swap it in. The journal
+/// closes and the old record is retired (cause `reseat`) in one sidecar
+/// write, with the S3 state of the old record (its ATA, served chain,
+/// queued terminal and any attestation conflict), and the subject's
+/// `reseat_in_progress` view is cleared with it. Returns whether the
+/// record is swapped (by this call or an earlier one, or its durable write
+/// failed and the next tick retries).
+///
+/// A `Prepared` journal, or a record that is still the journalled original
+/// (a crash before the move aside became durable), never swaps: the
+/// original forked record can show this node Active with a tree.
 ///
 /// The worker tick calls this, and so do the staged join's return and the
 /// `recovery` object read, so a reader never sees `reseat_in_progress`
@@ -3683,9 +3882,8 @@ async fn swap_if_seated(
     let local = local_hex(state);
     let seated = match live {
         Some((key, info)) => {
-            info.has_active_member(&local)
-                && (info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
-                    || state.treekem_groups.read().await.contains_key(key))
+            let has_tree = state.treekem_groups.read().await.contains_key(key);
+            journal.staged_result_ready(info, &local, has_tree)
         }
         None => false,
     };
@@ -3697,10 +3895,20 @@ async fn swap_if_seated(
         retired_at_ms: now_ms(),
         record: journal.live_record.clone(),
     };
+    let expected = journal.record_digest;
     let mut swapped = false;
     let swapped_ref = &mut swapped;
     if update_sidecar(state, stable, move |body| {
-        if body.reseat_journal.take().is_some() {
+        let same = body
+            .reseat_journal
+            .as_ref()
+            .is_some_and(|open| open.record_digest == expected);
+        if same {
+            body.reseat_journal = None;
+            body.active_ata = None;
+            body.attestation_conflict = None;
+            body.served_chain.clear();
+            body.queued_terminal = None;
             body.retire(retired);
             *swapped_ref = true;
         }
@@ -3731,18 +3939,33 @@ async fn swap_now_if_seated(state: &AppState, stable: &str) {
     let _ = swap_if_seated(state, stable, live.as_ref(), &journal).await;
 }
 
-/// Swap or fail each staged join (§3 steps 3 and 4).
+/// Swap, fail or roll back each open journal (§3 steps 3 and 4, and the
+/// crash resume "from the journal's phase").
+///
+/// - `Prepared`: unless this process is preparing it right now, the
+///   preparation was interrupted (a crash, or a failed step whose rollback
+///   was not yet durable). Roll it back; it never swaps.
+/// - `Staging`/`Swapping`: swap a bound result; roll back when the staged
+///   join ended, its deadline passed, or its in-memory stub was lost.
 async fn reseat_progress(state: &Arc<AppState>) {
-    let journals: Vec<(String, ReseatJournalV1)> = state
-        .group_recovery
-        .inner
-        .lock()
-        .await
-        .sidecars
-        .iter()
-        .filter_map(|(group, body)| body.reseat_journal.clone().map(|j| (group.clone(), j)))
-        .collect();
+    let (journals, preparing): (Vec<(String, ReseatJournalV1)>, HashSet<String>) = {
+        let inner = state.group_recovery.inner.lock().await;
+        (
+            inner
+                .sidecars
+                .iter()
+                .filter_map(|(group, body)| body.reseat_journal.clone().map(|j| (group.clone(), j)))
+                .collect(),
+            inner.staging_live.clone(),
+        )
+    };
     for (stable, journal) in journals {
+        if journal.phase == ReseatPhase::Prepared {
+            if !preparing.contains(&stable) {
+                rollback_reseat(state, &stable, "reseat_preparation_interrupted").await;
+            }
+            continue;
+        }
         let live = live_record_for(state, &stable).await;
         if swap_if_seated(state, &stable, live.as_ref(), &journal).await {
             continue;
@@ -3771,19 +3994,11 @@ async fn reseat_progress(state: &Arc<AppState>) {
             .expires_at_ms
             .saturating_add(u64::try_from(STAGING_GRACE.as_millis()).unwrap_or(u64::MAX));
         if failed_outcome || now_ms() > deadline {
-            restore_live_record(state, &stable, "staged_join_ended").await;
-        } else if live.is_none()
-            && !state
-                .group_recovery
-                .inner
-                .lock()
-                .await
-                .staging_live
-                .contains(&stable)
-        {
+            rollback_reseat(state, &stable, "staged_join_ended").await;
+        } else if live.is_none() && !preparing.contains(&stable) {
             // The stub is gone with no outcome and no staged join runs in
-            // this process (a restart lost the in-memory stub): restore.
-            restore_live_record(state, &stable, "staged_join_lost").await;
+            // this process (a restart lost the in-memory stub): roll back.
+            rollback_reseat(state, &stable, "staged_join_lost").await;
         }
     }
 }
@@ -4276,6 +4491,342 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await?)?;
         assert_eq!(body["issued_reseats"][0]["subject"], subject.as_str());
         assert!(body["recovery"].is_null());
+        Ok(())
+    }
+
+    /// A SignedPublic group with this node Active, durable on disk, and a
+    /// `Prepared` re-seat journal for it (the journal is not yet written).
+    async fn reseat_fixture(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(String, GroupInfo, ReseatJournalV1)> {
+        let keypair = state.agent.identity().agent_keypair();
+        let local = local_hex(state);
+        let mut info = GroupInfo::with_policy(
+            "adr0109-reseat-journal".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "2109".repeat(16),
+            x0x::groups::GroupPolicy {
+                discoverability: x0x::groups::GroupDiscoverability::Hidden,
+                admission: x0x::groups::GroupAdmission::InviteOnly,
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..x0x::groups::GroupPolicy::default()
+            },
+        );
+        info.seal_commit(keypair, 1_000)?;
+        assert!(info.has_active_member(&local));
+        let key = info.mls_group_id.clone();
+        assert!(matches!(
+            super::super::persist_named_group_info(state, &key, info.clone()).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let authorisation = ReseatAuthorisation::sign(
+            ReseatAuthorisationFields {
+                group: info.stable_group_id().to_string(),
+                subject: local.clone(),
+                basis: ReseatBasis::Removal {
+                    revision: info.state_revision,
+                    state_hash: info.state_hash.clone(),
+                },
+                invite_secret_hash: s3::invite_secret_hash("secret"),
+                invite_base_revision: info.state_revision,
+                invite_base_state_hash: info.state_hash.clone(),
+                signer: local.clone(),
+                signer_public_key: hex::encode(keypair.public_key().as_bytes()),
+                reason_hash: s3::reason_hash("r"),
+                expires_at_ms: u64::MAX / 2,
+            },
+            keypair,
+        )?;
+        let live_record = serde_json::to_vec(&info)?;
+        let journal = ReseatJournalV1 {
+            authorisation,
+            invite: String::new(),
+            record_digest: *blake3::hash(&live_record).as_bytes(),
+            phase: ReseatPhase::Prepared,
+            live_key: key.clone(),
+            live_record,
+            live_tree: None,
+            started_at_ms: now_ms(),
+        };
+        Ok((key, info, journal))
+    }
+
+    async fn on_disk_keys(state: &AppState) -> anyhow::Result<Vec<String>> {
+        let bytes = tokio::fs::read(&state.named_groups_path).await?;
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
+        Ok(map.keys().cloned().collect())
+    }
+
+    async fn open_journal(state: &AppState, stable: &str) -> Option<ReseatJournalV1> {
+        sidecar_snapshot(state, stable)
+            .await
+            .and_then(|body| body.reseat_journal)
+    }
+
+    async fn view_of(state: &AppState, stable: &str) -> Option<SubjectView> {
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(stable)
+            .map(|subject| subject.view.clone())
+    }
+
+    /// Codex P1 (#1533 round 1): a failed roster write while moving the
+    /// live record aside must not lose the original record or close the
+    /// journal. Before the fix the move deleted the tree and its
+    /// persistence first, and the caller then cleared the journal without
+    /// restoring anything.
+    #[tokio::test]
+    async fn failed_reseat_preparation_keeps_the_journal_until_rollback_is_durable(
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        // Both injected roster-write outcomes: `NotReplaced` (1) keeps the
+        // map; `ReplacedNotDurable` (3) leaves the journal as the copy.
+        for fault in [1u8, 3u8] {
+            let (key, info, journal) = reseat_fixture(&state).await?;
+            let stable = info.stable_group_id().to_string();
+            state
+                .group_recovery
+                .inner
+                .lock()
+                .await
+                .staging_live
+                .insert(stable.clone());
+            state.named_groups_save_fault.store(fault, Ordering::SeqCst);
+            let prepared = prepare_reseat(&state, &key, &info, journal).await;
+            assert_eq!(prepared, Err("live_record_not_moved"), "fault {fault}");
+            let open = open_journal(&state, &stable).await;
+            assert!(
+                open.as_ref()
+                    .is_some_and(|journal| journal.phase == ReseatPhase::Prepared),
+                "fault {fault}: the journal (the original's only sure copy) stays open"
+            );
+            // The rollback cannot be durable while the fault holds: the
+            // journal stays and the worker retries.
+            rollback_reseat(&state, &stable, "live_record_not_moved").await;
+            assert!(
+                open_journal(&state, &stable).await.is_some(),
+                "fault {fault}"
+            );
+            state.named_groups_save_fault.store(0, Ordering::SeqCst);
+            state
+                .group_recovery
+                .inner
+                .lock()
+                .await
+                .staging_live
+                .remove(&stable);
+            // The worker's retry: a `Prepared` journal not being prepared in
+            // this process rolls back.
+            reseat_progress(&state).await;
+            assert!(
+                open_journal(&state, &stable).await.is_none(),
+                "fault {fault}"
+            );
+            let live = state.named_groups.read().await.get(&key).cloned();
+            assert_eq!(
+                live.as_ref().map(|record| record.state_hash.clone()),
+                Some(info.state_hash.clone()),
+                "fault {fault}: the original record is live again"
+            );
+            assert!(on_disk_keys(&state).await?.contains(&key), "fault {fault}");
+            assert!(matches!(
+                view_of(&state, &stable).await,
+                Some(SubjectView::Reseat {
+                    cause: "reseat_failed",
+                    ..
+                })
+            ));
+            let retired = sidecar_snapshot(&state, &stable)
+                .await
+                .map_or(0, |body| body.retired.len());
+            assert_eq!(retired, 0, "a rollback retires nothing");
+            state.group_recovery.inner.lock().await.subjects.clear();
+        }
+        Ok(())
+    }
+
+    /// Codex P1 (#1533 round 1): crash at each re-seat phase. Only a staged
+    /// result bound to the journal swaps; the original forked record (live
+    /// because the crash came before its move aside) never does.
+    #[tokio::test]
+    async fn reseat_resume_at_each_phase_never_swaps_the_original() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let keypair = state.agent.identity().agent_keypair();
+        let retired = |state: Arc<AppState>, stable: String| async move {
+            sidecar_snapshot(&state, &stable)
+                .await
+                .map_or(0, |body| body.retired.len())
+        };
+
+        // 1. Crash after the journal, before the move: `Prepared`, the
+        //    original is live and shows this node Active. Before the fix the
+        //    resume closed the journal here as a successful re-seat.
+        let (key, info, journal) = reseat_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
+        resume_journals(&state).await;
+        assert!(open_journal(&state, &stable).await.is_none());
+        assert_eq!(retired(Arc::clone(&state), stable.clone()).await, 0);
+        assert!(matches!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Reseat {
+                cause: "reseat_failed",
+                ..
+            })
+        ));
+        assert!(state.named_groups.read().await.contains_key(&key));
+        state.group_recovery.inner.lock().await.subjects.clear();
+
+        // 2. Crash after the move, before the phase write: `Prepared`, no
+        //    live record. The record comes back from the journal.
+        let (key, info, journal) = reseat_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
+        assert!(move_live_record_aside(&state, &key, &info).await);
+        assert!(!on_disk_keys(&state).await?.contains(&key));
+        resume_journals(&state).await;
+        assert!(open_journal(&state, &stable).await.is_none());
+        assert!(on_disk_keys(&state).await?.contains(&key));
+        assert_eq!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .map(|record| record.state_hash.clone()),
+            Some(info.state_hash.clone())
+        );
+        assert_eq!(retired(Arc::clone(&state), stable.clone()).await, 0);
+        state.group_recovery.inner.lock().await.subjects.clear();
+
+        // 3. `Staging` with the original record under the key (it can only
+        //    get there by a fault): not a swap, the journal stays.
+        let (_key, info, mut journal) = reseat_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        journal.phase = ReseatPhase::Staging;
+        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
+        resume_journals(&state).await;
+        assert!(open_journal(&state, &stable).await.is_some());
+        assert_eq!(retired(Arc::clone(&state), stable.clone()).await, 0);
+
+        // 4. `Staging` with a staged result sealed past the invite base and
+        //    this node Active: the swap retires the original once.
+        let mut staged = info.clone();
+        staged.name = "staged".to_string();
+        staged.seal_commit(keypair, 2_000)?;
+        let staged_key = staged.mls_group_id.clone();
+        state.named_groups.write().await.insert(staged_key, staged);
+        resume_journals(&state).await;
+        assert!(open_journal(&state, &stable).await.is_none());
+        assert_eq!(retired(Arc::clone(&state), stable.clone()).await, 1);
+
+        // 5. `Staging`, the in-memory stub lost in a restart: roll back.
+        let (key, info, mut journal) = reseat_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        journal.phase = ReseatPhase::Staging;
+        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
+        assert!(move_live_record_aside(&state, &key, &info).await);
+        resume_journals(&state).await;
+        assert!(open_journal(&state, &stable).await.is_none());
+        assert!(on_disk_keys(&state).await?.contains(&key));
+        assert!(matches!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Reseat {
+                cause: "reseat_failed",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    /// Codex P1 (#1533 round 1): a conflicting attestation must stop
+    /// application at the common prefix (ADR 0109 §2 "Conflict"). Before
+    /// the fix the conflict changed only the view, and the catch-up gate
+    /// kept the active ATA's full sequence.
+    #[tokio::test]
+    async fn conflicting_attestation_narrows_the_gate_to_the_common_prefix() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut info = GroupInfo::new(
+            "adr0109-conflict".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "3109".repeat(16),
+        );
+        info.add_member(
+            local.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.seal_commit(&admin, 1_000)?;
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        let stable = info.stable_group_id().to_string();
+        let ata = |sequence: &[&str]| {
+            AdminTerminalAttestation::sign(
+                AtaFields {
+                    group: stable.clone(),
+                    subject: local.clone(),
+                    attested_by: admin_hex.clone(),
+                    signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                    from_revision: info.state_revision,
+                    from_state_hash: info.state_hash.clone(),
+                    sequence: sequence.iter().map(|hash| (*hash).to_string()).collect(),
+                    segment_terminal_revision: info.state_revision + sequence.len() as u64,
+                    segment_terminal_epoch: None,
+                    issued_at_ms: now_ms(),
+                },
+                &admin,
+            )
+        };
+        let active = ata(&["a1", "a2", "a3"])?;
+        let kept = active.clone();
+        assert!(update_sidecar(&state, &stable, move |body| body.active_ata = Some(kept)).await);
+        assert_eq!(
+            armed_admin_sequence(&state, &info).await,
+            Some(active.fields.sequence.clone()),
+            "armed: the gate admits the active sequence"
+        );
+        let conflicting = ata(&["a1", "x2"])?;
+        arm_from_response(&state, &key, &info, conflicting).await;
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(
+            body.attestation_conflict.is_some(),
+            "the conflict is durable"
+        );
+        assert_eq!(body.active_ata.as_ref(), Some(&active));
+        assert_eq!(
+            armed_admin_sequence(&state, &info).await,
+            Some(vec!["a1".to_string()]),
+            "nothing past the common prefix applies"
+        );
+        assert!(matches!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Reseat {
+                cause: "attestation_conflict",
+                ..
+            })
+        ));
+        // A later agreeing ATA arms nothing: catch-up stays stopped.
+        let agreeing = ata(&["a1", "a2", "a3"])?;
+        arm_from_response(&state, &key, &info, agreeing).await;
+        assert_eq!(
+            armed_admin_sequence(&state, &info).await,
+            Some(vec!["a1".to_string()])
+        );
         Ok(())
     }
 }

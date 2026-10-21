@@ -382,18 +382,63 @@ impl AdminTerminalAttestation {
             .all(|(attested, served)| attested == served)
     }
 
-    /// Two ATAs for one head conflict when their sequences diverge before
-    /// either ends (§2 "Conflict").
+    /// `other` conflicts with this ATA (§2 "Conflict"): see
+    /// [`Self::divergence_from`].
     #[must_use]
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        self.fields.from_state_hash == other.fields.from_state_hash
-            && !self
-                .fields
-                .sequence
-                .iter()
-                .zip(other.fields.sequence.iter())
-                .all(|(a, b)| a == b)
+        self.divergence_from(other).is_some()
     }
+
+    /// Where `other` leaves this ATA's chain (§2 "Conflict", and "A renewal
+    /// must agree with the remaining sequence"). `other` starts at this
+    /// ATA's `from` or at a hash of its sequence (a renewal or a later
+    /// answer from a head this ATA already moved the node to). When its
+    /// sequence disagrees with the rest of this one before either ends,
+    /// returns the common prefix of THIS ATA's sequence: the hashes both
+    /// attest, which is all that may still apply. `None` when they agree,
+    /// or when `other` starts off this chain.
+    #[must_use]
+    pub fn divergence_from(&self, other: &Self) -> Option<Vec<String>> {
+        let ours = &self.fields.sequence;
+        let start = if other.fields.from_state_hash == self.fields.from_state_hash {
+            0
+        } else {
+            ours.iter()
+                .position(|hash| *hash == other.fields.from_state_hash)?
+                .saturating_add(1)
+        };
+        let rest = ours.get(start..)?;
+        let agree = rest
+            .iter()
+            .zip(other.fields.sequence.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let compared = rest.len().min(other.fields.sequence.len());
+        (agree < compared).then(|| ours.iter().take(start + agree).cloned().collect())
+    }
+}
+
+/// The #846 gate sequence of an admin-armed ATA under a recorded conflict
+/// (§2 "Conflict": "Nothing past the common prefix applies"). While the
+/// node's head is the active ATA's `from` or on its sequence, the gate
+/// admits only the common prefix of the two ATAs; at or past its end it
+/// admits nothing. `None` when the head is off the active ATA's chain
+/// (for example, after a re-seat swapped in another record).
+#[must_use]
+pub fn conflict_gate_sequence(
+    active: &AdminTerminalAttestation,
+    conflict: &AdminTerminalAttestation,
+    head_state_hash: &str,
+) -> Option<Vec<String>> {
+    let sequence = &active.fields.sequence;
+    let up_to_head = match sequence.iter().position(|hash| hash == head_state_hash) {
+        Some(at) => sequence.iter().take(at + 1).cloned().collect(),
+        None if active.fields.from_state_hash == head_state_hash => Vec::new(),
+        None => return None,
+    };
+    // Two ATAs recorded as conflicting that turn out to agree still stop
+    // catch-up at the head: the record is never read as less containment.
+    Some(active.divergence_from(conflict).unwrap_or(up_to_head))
 }
 
 /// `agent_hex` is an Active admin (or higher) on `info`'s roster.
@@ -1401,7 +1446,13 @@ impl std::error::Error for GroupRecoveryDecodeError {}
 /// The phase of a subject's re-seat (§3 steps 1 to 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReseatPhase {
-    /// The journal is durable; the staged join runs.
+    /// The journal is durable and the original record is still live (or
+    /// its move aside is not yet durable). No staged join runs. A resume
+    /// in this phase only rolls back: the record under the group's key is
+    /// the original, never a staged result.
+    Prepared,
+    /// The original record is durably out of the live map (it is kept in
+    /// the journal) and the staged join runs.
     Staging,
     /// The staged record is Active with keys; the swap is due.
     Swapping,
@@ -1412,6 +1463,7 @@ impl ReseatPhase {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Prepared => "prepared",
             Self::Staging => "staging",
             Self::Swapping => "swapping",
         }
@@ -1437,6 +1489,44 @@ pub struct ReseatJournalV1 {
     pub live_tree: Option<Vec<u8>>,
     /// When the journal was written (unix ms).
     pub started_at_ms: u64,
+}
+
+impl ReseatJournalV1 {
+    /// BLAKE3 of a record's JSON, as [`Self::record_digest`] holds it.
+    #[must_use]
+    pub fn digest_record(record: &GroupInfo) -> Option<[u8; 32]> {
+        serde_json::to_vec(record)
+            .ok()
+            .map(|bytes| *blake3::hash(&bytes).as_bytes())
+    }
+
+    /// §3 step 3: `live` is the staged result of this journal's re-seat,
+    /// ready to swap in. A crash can leave the ORIGINAL record under the
+    /// group's key with this journal open (before the move aside became
+    /// durable), and that forked record can show this node Active with a
+    /// tree. So the check binds the result to the journal and to the
+    /// authorisation, not only to the seat:
+    /// - the phase is past [`ReseatPhase::Prepared`]: the original left
+    ///   the live map durably before the staged join started;
+    /// - the record is not the journalled original (digest);
+    /// - it is the authorised group, uncontained, and its head is past the
+    ///   authorisation's invite base (the re-seat `MemberAdded` seals after
+    ///   that base);
+    /// - this node is Active on it, with keys when the plane is TreeKEM.
+    #[must_use]
+    pub fn staged_result_ready(&self, live: &GroupInfo, local_hex: &str, has_tree: bool) -> bool {
+        if self.phase == ReseatPhase::Prepared {
+            return false;
+        }
+        if Self::digest_record(live).is_none_or(|digest| digest == self.record_digest) {
+            return false;
+        }
+        live.stable_group_id() == self.authorisation.fields.group
+            && live.fork_quarantine.is_none()
+            && live.state_revision > self.authorisation.fields.invite_base_revision
+            && live.has_active_member(local_hex)
+            && (live.secure_plane != crate::mls::SecureGroupPlane::TreeKem || has_tree)
+    }
 }
 
 /// One re-seat authorisation an admin issued (§3; issuer only).
@@ -1485,6 +1575,11 @@ pub struct GroupRecoveryV1 {
     pub issued_reseats: Vec<IssuedReseatV1>,
     /// Retired records, newest last, at most [`RETIRED_RECORDS_CAP`].
     pub retired: Vec<RetiredRecordV1>,
+    /// §2 "Conflict": a verified ATA that diverges from `active_ata` on its
+    /// chain. While it is kept, catch-up stops at the common prefix
+    /// ([`conflict_gate_sequence`]), no ATA arms, and the node shows
+    /// `reseat_required {attestation_conflict}`. A re-seat swap clears it.
+    pub attestation_conflict: Option<AdminTerminalAttestation>,
 }
 
 impl GroupRecoveryV1 {
@@ -1499,6 +1594,7 @@ impl GroupRecoveryV1 {
             && self.staging_record.is_none()
             && self.issued_reseats.is_empty()
             && self.retired.is_empty()
+            && self.attestation_conflict.is_none()
     }
 
     /// Keep a retired record, dropping the oldest past the cap.
@@ -1870,6 +1966,176 @@ mod tests {
         assert!(a.conflicts_with(&c));
         assert!(a.agrees_with(&["h5".to_string()]));
         assert!(!a.agrees_with(&["x5".to_string()]));
+    }
+
+    /// §2 "Conflict" and the renewal rule: a later ATA from a head on the
+    /// active chain must agree with the remaining sequence, and the common
+    /// prefix is what may still apply.
+    #[test]
+    fn divergence_reports_the_common_prefix_from_any_head_on_the_chain() {
+        let admin = keypair();
+        let mut long = fields(&admin);
+        long.sequence = vec!["h5".into(), "h6".into(), "h7".into()];
+        long.segment_terminal_revision = 7;
+        let active = AdminTerminalAttestation::sign(long, &admin).expect("sign");
+        // Same head, diverges at the second link: the prefix is [h5].
+        let mut same_head = fields(&admin);
+        same_head.sequence = vec!["h5".into(), "x6".into()];
+        let same_head = AdminTerminalAttestation::sign(same_head, &admin).expect("sign");
+        assert_eq!(active.divergence_from(&same_head), Some(vec!["h5".into()]));
+        // A renewal from h5 that agrees: no conflict.
+        let mut renewal = fields(&admin);
+        renewal.from_revision = 5;
+        renewal.from_state_hash = "h5".into();
+        renewal.sequence = vec!["h6".into(), "h7".into(), "h8".into()];
+        renewal.segment_terminal_revision = 8;
+        let renewal = AdminTerminalAttestation::sign(renewal, &admin).expect("sign");
+        assert_eq!(active.divergence_from(&renewal), None);
+        // A renewal from h5 that disagrees at h7: the prefix is [h5, h6].
+        let mut bad_renewal = fields(&admin);
+        bad_renewal.from_revision = 5;
+        bad_renewal.from_state_hash = "h5".into();
+        bad_renewal.sequence = vec!["h6".into(), "x7".into()];
+        bad_renewal.segment_terminal_revision = 7;
+        let bad_renewal = AdminTerminalAttestation::sign(bad_renewal, &admin).expect("sign");
+        assert_eq!(
+            active.divergence_from(&bad_renewal),
+            Some(vec!["h5".into(), "h6".into()])
+        );
+        assert!(active.conflicts_with(&bad_renewal));
+        // An ATA whose head is off the active chain is not a conflict.
+        let mut off = fields(&admin);
+        off.from_state_hash = "elsewhere".into();
+        let off = AdminTerminalAttestation::sign(off, &admin).expect("sign");
+        assert_eq!(active.divergence_from(&off), None);
+    }
+
+    /// §2 "Conflict": "Nothing past the common prefix applies". Before this
+    /// rule the gate kept the active ATA's full sequence (here h5..h7), so a
+    /// page reaching h6 or h7 still applied after the conflict.
+    #[test]
+    fn conflict_gate_admits_only_the_common_prefix() {
+        let admin = keypair();
+        let mut long = fields(&admin);
+        long.sequence = vec!["h5".into(), "h6".into(), "h7".into()];
+        long.segment_terminal_revision = 7;
+        let active = AdminTerminalAttestation::sign(long, &admin).expect("sign");
+        let mut other = fields(&admin);
+        other.sequence = vec!["h5".into(), "x6".into()];
+        let other = AdminTerminalAttestation::sign(other, &admin).expect("sign");
+        let gate = conflict_gate_sequence(&active, &other, "h4").expect("armed at from");
+        assert_eq!(gate, vec!["h5".to_string()]);
+        assert!(!gate.contains(&"h6".to_string()));
+        // At the end of the prefix the gate admits nothing further.
+        assert_eq!(
+            conflict_gate_sequence(&active, &other, "h5"),
+            Some(vec!["h5".to_string()])
+        );
+        // Past the prefix (applied before the conflict was seen): still
+        // armed, and no next hash links from the head.
+        assert_eq!(
+            conflict_gate_sequence(&active, &other, "h6"),
+            Some(vec!["h5".to_string()])
+        );
+        // Off the chain (another record, e.g. after a re-seat): not armed.
+        assert_eq!(conflict_gate_sequence(&active, &other, "z9"), None);
+        // A recorded pair that agrees still stops at the head.
+        let mut prefix = fields(&admin);
+        prefix.sequence = vec!["h5".into()];
+        prefix.segment_terminal_revision = 5;
+        let agreeing = AdminTerminalAttestation::sign(prefix, &admin).expect("sign");
+        assert_eq!(
+            conflict_gate_sequence(&active, &agreeing, "h6"),
+            Some(vec!["h5".to_string(), "h6".to_string()])
+        );
+        assert_eq!(
+            conflict_gate_sequence(&active, &agreeing, "h4"),
+            Some(Vec::new())
+        );
+    }
+
+    fn journal_fixture(admin: &AgentKeypair, original: &GroupInfo) -> ReseatJournalV1 {
+        let authorisation = ReseatAuthorisation::sign(
+            ReseatAuthorisationFields {
+                group: original.stable_group_id().to_string(),
+                subject: "ab".repeat(32),
+                basis: ReseatBasis::Removal {
+                    revision: 2,
+                    state_hash: "h2".to_string(),
+                },
+                invite_secret_hash: invite_secret_hash("secret"),
+                invite_base_revision: original.state_revision,
+                invite_base_state_hash: original.state_hash.clone(),
+                signer: hex::encode(admin.agent_id().as_bytes()),
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                reason_hash: reason_hash("r"),
+                expires_at_ms: u64::MAX,
+            },
+            admin,
+        )
+        .expect("sign");
+        let live_record = serde_json::to_vec(original).expect("json");
+        ReseatJournalV1 {
+            authorisation,
+            invite: String::new(),
+            record_digest: *blake3::hash(&live_record).as_bytes(),
+            phase: ReseatPhase::Prepared,
+            live_key: original.mls_group_id.clone(),
+            live_record,
+            live_tree: None,
+            started_at_ms: 0,
+        }
+    }
+
+    /// §3 "A crash resumes from the journal's phase": a crash after the
+    /// journal but before the move aside leaves the ORIGINAL forked record
+    /// live, and it shows this node Active. Before the fix the swap checked
+    /// only "Active with a tree", so it closed the journal on the original.
+    #[test]
+    fn swap_binds_the_staged_result_to_the_journal_and_phase() {
+        let admin = keypair();
+        let subject = "ab".repeat(32);
+        let mut original = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ef".repeat(32),
+        );
+        original.add_member(
+            subject.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        original.seal_commit(&admin, 1_000).expect("seal");
+        let mut journal = journal_fixture(&admin, &original);
+        assert!(original.has_active_member(&subject));
+        // Prepared: never a swap, even on an Active record.
+        assert!(!journal.staged_result_ready(&original, &subject, true));
+        // Staging, but the live record is still the journalled original.
+        journal.phase = ReseatPhase::Staging;
+        assert!(!journal.staged_result_ready(&original, &subject, true));
+        // A staged result past the invite base, with this node Active.
+        let mut staged = original.clone();
+        staged.name = "staged".to_string();
+        staged.seal_commit(&admin, 2_000).expect("seal");
+        assert!(journal.staged_result_ready(&staged, &subject, true));
+        // Not past the invite base: not the re-seat's seal.
+        let mut at_base = original.clone();
+        at_base.description = "changed".to_string();
+        assert!(!journal.staged_result_ready(&at_base, &subject, true));
+        // This node not Active: not seated yet.
+        let mut unseated = staged.clone();
+        unseated.remove_member(&subject, None);
+        assert!(!journal.staged_result_ready(&unseated, &subject, true));
+        // Another group: never.
+        let mut other_group = journal.clone();
+        other_group.authorisation.fields.group = "other".to_string();
+        assert!(!other_group.staged_result_ready(&staged, &subject, true));
+        // TreeKEM plane without keys installed: not seated.
+        let mut treekem = staged.clone();
+        treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
+        assert!(!journal.staged_result_ready(&treekem, &subject, false));
     }
 
     #[test]
