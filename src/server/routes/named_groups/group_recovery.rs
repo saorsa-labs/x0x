@@ -87,6 +87,12 @@ struct S3Inner {
     /// Groups (stable ID) whose staged join runs in this process. A journal
     /// with no live record and no entry here was interrupted by a restart.
     staging_live: HashSet<String>,
+    /// The last `recovery` object per group (map key and stable ID), for
+    /// the synchronous ADR 0066 §5 refusal body.
+    recovery_cache: HashMap<String, serde_json::Value>,
+    /// §1 step 2: signed ATAs keyed by `(group, subject, from_state_hash)`,
+    /// reused until [`s3::ATA_ARM_WINDOW`] expires.
+    ata_cache: HashMap<(String, String, String), AdminTerminalAttestation>,
 }
 
 /// A sidecar fault (§4, ADR 0108 §5a): S3 makes no transition for the
@@ -906,8 +912,24 @@ async fn sign_ata(
     sequence: Vec<String>,
     terminal_revision: u64,
 ) -> Option<AdminTerminalAttestation> {
-    if !state.group_recovery.inner.lock().await.responder.may_sign() {
-        return None;
+    let cache_key = (
+        info.stable_group_id().to_string(),
+        subject_hex.to_string(),
+        request.head_state_hash.clone(),
+    );
+    let window = u64::try_from(s3::ATA_ARM_WINDOW.as_millis()).unwrap_or(u64::MAX);
+    {
+        let mut inner = state.group_recovery.inner.lock().await;
+        let now = now_ms();
+        inner
+            .ata_cache
+            .retain(|_, ata| now.saturating_sub(ata.fields.issued_at_ms) < window);
+        if let Some(cached) = inner.ata_cache.get(&cache_key) {
+            return Some(cached.clone());
+        }
+        if !inner.responder.may_sign() {
+            return None;
+        }
     }
     let epoch = info
         .commit_log
@@ -927,7 +949,13 @@ async fn sign_ata(
         segment_terminal_epoch: epoch,
         issued_at_ms: now_ms(),
     };
-    AdminTerminalAttestation::sign(fields, keypair).ok()
+    let ata = AdminTerminalAttestation::sign(fields, keypair).ok()?;
+    let mut inner = state.group_recovery.inner.lock().await;
+    if inner.ata_cache.len() >= 256 {
+        inner.ata_cache.clear();
+    }
+    inner.ata_cache.insert(cache_key, ata.clone());
+    Some(ata)
 }
 
 async fn current_issued_reseat(
@@ -1514,8 +1542,41 @@ async fn subject_tick(state: &Arc<AppState>) {
         };
         send_request(state, &info, &local, &refs, target).await;
     }
+    // Refresh the cached `recovery` objects for the §5 refusal body.
+    let groups: Vec<(String, GroupInfo)> = state
+        .named_groups
+        .read()
+        .await
+        .iter()
+        .map(|(key, info)| (key.clone(), info.clone()))
+        .collect();
+    let mut cache = HashMap::new();
+    for (key, info) in &groups {
+        if let Some(object) = recovery_json(state, info).await {
+            cache.insert(info.stable_group_id().to_string(), object.clone());
+            cache.insert(key.clone(), object);
+        }
+    }
     let mut inner = state.group_recovery.inner.lock().await;
     inner.subjects.retain(|group, _| live.contains(group));
+    inner.recovery_cache = cache;
+}
+
+/// ADR 0109 §8: the `recovery` object for the ADR 0066 §5 refusal body,
+/// from the worker's last refresh (synchronous; `None` under contention or
+/// when S3 holds no state for the group).
+pub(in crate::server) fn cached_recovery_json(
+    state: &AppState,
+    group_id: &str,
+) -> Option<serde_json::Value> {
+    state
+        .group_recovery
+        .inner
+        .try_lock()
+        .ok()?
+        .recovery_cache
+        .get(group_id)
+        .cloned()
 }
 
 /// §2 "Retirement": a marker, with its matching fork evidence, retires
@@ -1596,10 +1657,26 @@ async fn next_target(
         subject.progress_revision = info.state_revision;
         subject.progress_at = now;
     }
-    // A gap record alone asks only after GATE_STALL without progress.
+    // A gap record alone asks only after GATE_STALL without progress; an
+    // armed admin ATA asks for its renewal after ATA_ARMED_LIFETIME.
     let gap_only = !marker && refs.iter().all(|r| matches!(r, RecoveryRef::Gap { .. }));
-    if gap_only && now.saturating_duration_since(subject.progress_at) < s3::GATE_STALL {
-        return None;
+    let admin_armed = refs.iter().any(
+        |r| matches!(r, RecoveryRef::Gap { reason, .. } if reason == s3::ADMIN_ATTESTED_GAP_REASON),
+    );
+    let stall = if admin_armed {
+        s3::ATA_ARMED_LIFETIME
+    } else {
+        s3::GATE_STALL
+    };
+    if gap_only {
+        if now.saturating_duration_since(subject.progress_at) < stall {
+            return None;
+        }
+        if admin_armed && !subject.view.sticky() {
+            subject.view = SubjectView::Awaiting {
+                reason: "renewal_due".to_string(),
+            };
+        }
     }
     if let Some((_, asked_at)) = subject.pending {
         if now.saturating_duration_since(asked_at) < ANSWER_WAIT {
@@ -1984,6 +2061,36 @@ async fn arm_from_response(
     }
 }
 
+/// §4 retention (D148): every ADR 0108 §5a copy of the group's sidecar,
+/// pending or history, with its `txid` and size. Copies are never deleted
+/// automatically.
+async fn quarantined_copies(state: &AppState, stable_group_id: &str) -> Vec<serde_json::Value> {
+    let file = s3::sidecar_file_name(stable_group_id);
+    let Ok(mut entries) = tokio::fs::read_dir(sidecar_dir(state)).await else {
+        return Vec::new();
+    };
+    let mut copies = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix(&format!("{file}.q-")) else {
+            continue;
+        };
+        let (state_label, stem) = match rest.strip_suffix(".pending") {
+            Some(stem) => ("pending", stem),
+            None => ("history", rest),
+        };
+        let txid = stem.split('-').next().unwrap_or_default().to_string();
+        let size = entry.metadata().await.map(|meta| meta.len()).unwrap_or(0);
+        copies.push(serde_json::json!({
+            "file": name,
+            "txid": txid,
+            "state": state_label,
+            "size": size,
+        }));
+    }
+    copies
+}
+
 // ─── §3 The admin's manual re-seat ─────────────────────────────────────────
 
 /// `POST /groups/:id/members/:agent_id/reseat` request body.
@@ -2301,6 +2408,7 @@ pub(in crate::server) async fn get_group_recovery(
         .map(|body| body.rebuilt_from.iter().map(hex::encode).collect())
         .unwrap_or_default();
     drop(inner);
+    let copies = quarantined_copies(&state, &stable).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2312,6 +2420,7 @@ pub(in crate::server) async fn get_group_recovery(
             "sidecar": {
                 "file": s3::sidecar_file_name(&stable),
                 "rebuilt_from": rebuilt_from,
+                "copies": copies,
             },
         })),
     )
