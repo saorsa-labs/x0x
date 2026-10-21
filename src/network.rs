@@ -4121,28 +4121,36 @@ impl NetworkNode {
                 // any bookkeeping or admission. Every address dial (manual
                 // connects, join dials, HyParView bootstrap dials) routes
                 // through here.
-                if let SeedPinVerdict::Mismatch { answered } =
-                    seed_pin_gate(addr, peer_conn.peer_id.0)
-                {
-                    self.record_seed_pin_rejection(peer_conn.peer_id.0);
-                    tracing::warn!(
-                        target: "x0x::connect",
-                        origin,
-                        %addr,
-                        answered = %hex_prefix(&answered, 8),
-                        "seed pin mismatch: refusing the dial (issue #1112)"
-                    );
-                    // No connection teardown here (review round 5): the
-                    // close APIs are identity-scoped, and the same
-                    // identity may hold a valid connection through
-                    // another address. The refusal scopes to THIS hint —
-                    // the dial fails, the identity is recorded, and
-                    // `peer_admission` answers `Suppressed` for it, so
-                    // gossip and keepalives exclude it while any leftover
-                    // transport connection dies by idle eviction.
-                    return Err(NetworkError::ConnectionFailed(format!(
-                        "#1112: seed pin mismatch at {addr}; dial refused ({origin})"
-                    )));
+                match seed_pin_gate(addr, peer_conn.peer_id.0) {
+                    SeedPinVerdict::Mismatch { answered } => {
+                        self.record_seed_pin_rejection(peer_conn.peer_id.0);
+                        tracing::warn!(
+                            target: "x0x::connect",
+                            origin,
+                            %addr,
+                            answered = %hex_prefix(&answered, 8),
+                            "seed pin mismatch: refusing the dial (issue #1112)"
+                        );
+                        // No connection teardown here (review round 5):
+                        // the close APIs are identity-scoped, and the same
+                        // identity may hold a valid connection through
+                        // another address. The refusal scopes to THIS
+                        // hint — the dial fails, the identity is recorded,
+                        // and `peer_admission` answers `Suppressed` for
+                        // it, so gossip and keepalives exclude it while
+                        // any leftover transport connection dies by idle
+                        // eviction. A later MATCH at another pinned
+                        // address clears the record (round 6).
+                        return Err(NetworkError::ConnectionFailed(format!(
+                            "#1112: seed pin mismatch at {addr}; dial refused ({origin})"
+                        )));
+                    }
+                    // A MATCH at a pinned address clears any stale
+                    // rejection for the identity (review round 6): an
+                    // identity that failed one address's pin but succeeds
+                    // at another is not permanently suppressed.
+                    SeedPinVerdict::Match(_) => self.clear_seed_pin_rejection(peer_conn.peer_id.0),
+                    SeedPinVerdict::Unpinned => {}
                 }
 
                 let rtt_ms = dur_ms as u32;
@@ -4591,6 +4599,15 @@ impl NetworkNode {
     fn record_seed_pin_rejection(&self, peer_id: [u8; 32]) {
         if let Ok(mut rejected) = self.seed_pin_rejections.lock() {
             rejected.insert(peer_id);
+        }
+    }
+
+    /// Clear a seed-pin rejection for `peer_id` (#1112 round 6): a later
+    /// dial that MATCHES a pinned address proves a valid path and
+    /// un-suppresses the identity.
+    fn clear_seed_pin_rejection(&self, peer_id: [u8; 32]) {
+        if let Ok(mut rejected) = self.seed_pin_rejections.lock() {
+            rejected.remove(&peer_id);
         }
     }
 
@@ -6075,7 +6092,8 @@ impl NetworkNode {
                         // (DM bytes (0x10/0x11) above stay out of #206/#292
                         // gossip-plane scope.)
                         if GossipStreamType::from_byte(type_byte).is_some()
-                            && plane_node.is_reconnect_suppressed(peer_id.0)
+                            && (plane_node.is_reconnect_suppressed(peer_id.0)
+                                || plane_node.is_seed_pin_rejected(peer_id.0))
                         {
                             tracing::warn!(
                                 target: "x0x::connect",
@@ -7418,9 +7436,9 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // reason as the plane-pending hold below — the peer is already
         // excluded from `gossip_plane_peers`, so there is no overlay view
         // to protect, and a suppressed peer must never receive gossip.
-        if self.is_reconnect_suppressed(ant_peer.0) {
+        if self.is_reconnect_suppressed(ant_peer.0) || self.is_seed_pin_rejected(ant_peer.0) {
             debug!(
-                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is reconnect-suppressed",
+                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is reconnect-suppressed or seed-pin-rejected",
                 stream_type,
                 data.len(),
                 peer
@@ -7523,7 +7541,10 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // the same policy the callback enforces, without allocating a
         // stream first. Still an error with zero bytes admitted — guarded
         // egress never silently holds like the ordinary path's `Ok(())`.
-        if self.is_reconnect_suppressed(ant_peer.0) || !self.plane_gate_allows(&ant_peer) {
+        if self.is_reconnect_suppressed(ant_peer.0)
+            || self.is_seed_pin_rejected(ant_peer.0)
+            || !self.plane_gate_allows(&ant_peer)
+        {
             return Err(anyhow::anyhow!(
                 "gossip plane policy refuses guarded send to peer {:?}",
                 peer

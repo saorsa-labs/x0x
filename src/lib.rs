@@ -5611,17 +5611,23 @@ fn select_capability_hints(
             .then(|| origin.remote_addr.map(network::normalize_v4_mapped_addr))
             .flatten()
             .filter(|observed| seed_addrs.contains(observed));
-        // Round 5: the operator tier validates the PAIR — the observed
-        // address is a seed listener AND the identity is inside that
-        // address's pin set. Inbound connections and
+        // Rounds 5-6: the selector validates the PAIR — the observed
+        // address is a seed listener AND, when pinned, the identity is
+        // inside that address's pin set. Inbound connections and
         // `connect_peer_with_addrs` bypass the dial seam, so the selector
         // cannot assume the seam already rejected a mismatched identity.
-        let on_operator_host = observed_seed_addr.is_some_and(|observed| {
-            !matches!(
+        // A MISMATCH skips BOTH tiers: the community flags must not
+        // rescue an identity the pins rejected at that address.
+        let pin_mismatch_at_seed = observed_seed_addr.is_some_and(|observed| {
+            matches!(
                 network::seed_pin_gate(observed, origin.peer_id.0),
                 network::SeedPinVerdict::Mismatch { .. }
             )
         });
+        if pin_mismatch_at_seed {
+            continue;
+        }
+        let on_operator_host = observed_seed_addr.is_some();
         let Some(entry) = cache.get(&mid) else {
             // No announcement seen: only the operator tier can qualify,
             // under the same deduplication and cap as the tiers below
