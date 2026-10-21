@@ -45628,6 +45628,7 @@ pub(in crate::server) mod tests {
                 x0x::connect::ConnectPolicy::default().summary(),
             )),
             forward_service: None,
+            socks_service: None,
             owner_sync,
             startup_catchup_obligations: std::sync::Mutex::new(HashMap::new()),
             startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),

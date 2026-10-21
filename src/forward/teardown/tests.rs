@@ -224,10 +224,11 @@ impl World {
     /// A connect ACL for `:22` with exact entries for `exact`, plus owner
     /// and grant entries.
     fn acl(&self, exact: &[(AgentId, MachineId)], owner: bool, grant: bool) -> ConnectPolicy {
-        let targets = vec![SSH.parse().unwrap()];
+        let exact_targets = vec![SSH.parse().unwrap()];
+        let owner_targets = vec![crate::connect::OwnerTarget::Exact(SSH.parse().unwrap())];
         let entry = || ConnectOwnerEntry {
             description: None,
-            targets: targets.clone(),
+            targets: owner_targets.clone(),
         };
         ConnectPolicy::Enabled(ConnectAcl {
             loaded_from: self.dir.path().join("connect-acl.toml"),
@@ -238,7 +239,7 @@ impl World {
                     description: None,
                     agent_id: *agent_id,
                     machine_id: *machine_id,
-                    targets: targets.clone(),
+                    targets: exact_targets.clone(),
                 })
                 .collect(),
             owner_allow: if owner { vec![entry()] } else { Vec::new() },
