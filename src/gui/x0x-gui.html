@@ -913,7 +913,13 @@ function handleWsMsg(m){
     onGuiShow(m);
     return;
   }
-  if(m.type==='error'){console.warn('ws error:',m.message||m)}
+  if(m.type==='error'){
+    // gui.block has no success frame. The existing error frame is only a refusal.
+    if(String(m.message||'')==="cannot block this daemon's own agent"){
+      toast('Could not block shows from this agent','error');
+    }
+    console.warn('ws error:',m.message||m);
+  }
 }
 function onGuiShow(m){
   const route=String(m.view||'').replace(/^#\/?/,'').replace(/^\//,'');
@@ -936,6 +942,8 @@ function showGuiShowBanner(text, agentId){
   if(!bar||!label||!block||!hide)return;
   label.textContent=text;
   bar.classList.add('visible');
+  const own=!!agentId&&agentId.toLowerCase()===String(S.get('agentId')||'').toLowerCase();
+  block.hidden=own;
   block.disabled=true;
   hide.disabled=true;
   block.onclick=null;
@@ -944,11 +952,17 @@ function showGuiShowBanner(text, agentId){
   showGuiShowBanner._t=setTimeout(()=>{
     hide.disabled=false;
     hide.onclick=hideGuiShowBanner;
+    if(own)return;
     block.disabled=false;
-    block.onclick=()=>{
-      if(agentId)wsSend({type:'gui.block',agent_id:agentId});
-      hideGuiShowBanner();
-      toast('Future shows from this agent will be blocked','info');
+    block.onclick=function(){
+      if(!agentId)return;
+      if(!ws||ws.readyState!==1){
+        toast('Could not block shows from this agent','error');
+        return;
+      }
+      // No existing socket message confirms a successful gui.block.
+      // Do not hide the banner or report success until one does.
+      wsSend({type:'gui.block',agent_id:agentId});
     };
   },3000);
 }

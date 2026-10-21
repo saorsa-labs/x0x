@@ -2913,6 +2913,8 @@ x0x show groups/<group_id>/board
 
 View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
 
+The origin banner hides "Stop shows from this agent" when the sender is this daemon's agent. A `gui.block` command for that agent returns the existing WebSocket `error` frame (`cannot block this daemon's own agent`) and does not write `gui_show_blocked.json`. `gui.block` has no success frame, so the GUI does not report that Stop succeeded. The daemon queues the origin banner before it starts the platform opener and removes that banner when the opener fails (`no_display`). A GUI tab that connects hidden receives the queued banner when it sends `gui.visible` with `visible: true`.
+
 ## Error handling
 
 Common status codes:

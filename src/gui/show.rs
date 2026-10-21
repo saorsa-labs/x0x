@@ -17,6 +17,13 @@ use super::rate_limit::GuiShowRateLimit;
 /// How long a pending banner waits for its GUI window to connect.
 const PENDING_FRESHNESS: Duration = Duration::from_secs(60);
 
+/// `error.message` when `gui.block` names this daemon's own agent.
+///
+/// Slice 1 has no unblock path. A self-block would turn local show off
+/// with no API to turn it back on, so the server refuses it and writes
+/// nothing. There is no success frame for `gui.block`.
+pub const SELF_GUI_BLOCK_REFUSED: &str = "cannot block this daemon's own agent";
+
 /// How long a platform opener may run before a missing successful exit is
 /// `no_display`. Spawn success is not a display: `xdg-open` can start and
 /// then exit nonzero on a headless host.
@@ -299,6 +306,18 @@ impl GuiShowRuntime {
         }
     }
 
+    /// Block `agent` unless it is this daemon's own agent.
+    ///
+    /// A self-block returns `false` and does not create or update the
+    /// persisted list. `true` means another agent was recorded.
+    pub fn block_agent_unless_self(&self, agent: &AgentId, local_agent: &AgentId) -> bool {
+        if agent == local_agent {
+            return false;
+        }
+        self.block_agent(agent);
+        true
+    }
+
     /// Rate-limit gate; `true` means the show may proceed.
     pub fn try_rate_limit(&self, agent: &AgentId, now: Instant) -> bool {
         self.rate_limit
@@ -353,6 +372,23 @@ impl GuiShowRuntime {
             .iter()
             .position(|item| item.session_token == session_token)?;
         queue.remove(idx)
+    }
+
+    /// Drop one queued banner. Other sessions stay queued.
+    ///
+    /// Used when the platform opener fails after the banner was queued.
+    pub fn drop_pending_for_session(&self, session_token: &str) {
+        if let Ok(mut queue) = self.pending.lock() {
+            queue.retain(|item| item.session_token != session_token);
+        }
+    }
+
+    /// Whether a fresh-or-stale pending show is still queued for `session_token`.
+    pub fn has_pending_session(&self, session_token: &str) -> bool {
+        self.pending
+            .lock()
+            .map(|queue| queue.iter().any(|item| item.session_token == session_token))
+            .unwrap_or(false)
     }
 }
 
@@ -483,6 +519,49 @@ mod tests {
         assert!(
             rt.is_blocked(&daemon),
             "ADR 0083 §5 refuses a blocked sender, including this daemon's agent"
+        );
+    }
+
+    #[test]
+    fn self_block_writes_nothing_and_another_agent_is_stored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let local = AgentId([2u8; 32]);
+        let other = AgentId([3u8; 32]);
+        let path = dir.path().join("gui_show_blocked.json");
+        assert!(
+            !rt.block_agent_unless_self(&local, &local),
+            "this daemon's agent must not be blocked from the banner"
+        );
+        assert!(!rt.is_blocked(&local));
+        assert!(
+            !path.exists(),
+            "a refused self-block must not create the block file"
+        );
+        assert!(rt.block_agent_unless_self(&other, &local));
+        assert!(rt.is_blocked(&other));
+        assert!(!rt.is_blocked(&local));
+        let text = std::fs::read_to_string(&path).expect("block file");
+        assert!(
+            !text.contains(&hex::encode(local.as_bytes())),
+            "the persisted list must not contain this daemon's agent: {text}"
+        );
+    }
+
+    #[test]
+    fn drop_pending_removes_only_the_failed_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let now = Instant::now();
+        rt.enqueue_pending(pending("keep", "people", now));
+        rt.enqueue_pending(pending("drop-me", "network", now));
+        rt.drop_pending_for_session("drop-me");
+        assert!(rt.take_pending_for_session("drop-me", now).is_none());
+        assert_eq!(
+            rt.take_pending_for_session("keep", now)
+                .expect("the other show stays queued")
+                .view,
+            "people"
         );
     }
 
@@ -654,6 +733,22 @@ mod tests {
         assert!(
             src.contains("hide.onclick=hideGuiShowBanner"),
             "after the wait, Hide clears the banner without gui.block"
+        );
+        assert!(
+            src.contains("block.hidden=own"),
+            "Stop is hidden when the sender is this daemon's agent: {src}"
+        );
+        assert!(
+            src.contains("S.get('agentId')"),
+            "the banner must compare the sender with this daemon's agent: {src}"
+        );
+        assert!(
+            !src.contains("Future shows from this agent will be blocked"),
+            "Stop must not claim success before a server reply: {src}"
+        );
+        assert!(
+            html.contains(SELF_GUI_BLOCK_REFUSED),
+            "a refused self-block uses the existing error frame"
         );
         assert!(
             html.contains("function guiTabVisible"),

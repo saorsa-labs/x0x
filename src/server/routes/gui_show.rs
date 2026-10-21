@@ -88,23 +88,28 @@ pub(in crate::server) async fn gui_show(
     }
 
     // Mint a fresh session; never put the durable token in the URL.
-    // The same token keys the pending banner so each opened window gets
-    // its own show when it connects with `gui=1`.
+    // Queue the banner before the opener so a browser that connects during
+    // the launch wait still receives it. A failed launch drops that entry.
     let session = state.sessions.issue(Instant::now());
     let url = show_loopback_url(state.api_address, &session, &route);
-    if state.gui_show.open_url(&url) {
-        state.gui_show.enqueue_pending(PendingGuiShow {
-            view: route,
-            banner,
-            agent_id: agent_hex,
-            machine_id: machine_id.clone(),
-            rider: false,
-            request_id: request_id.clone(),
-            session_token: session.clone(),
-            created_at: Instant::now(),
-        });
+    state.gui_show.enqueue_pending(PendingGuiShow {
+        view: route,
+        banner,
+        agent_id: agent_hex,
+        machine_id: machine_id.clone(),
+        rider: false,
+        request_id: request_id.clone(),
+        session_token: session.clone(),
+        created_at: Instant::now(),
+    });
+    let state_for_open = Arc::clone(&state);
+    let opened = tokio::task::spawn_blocking(move || state_for_open.gui_show.open_url(&url))
+        .await
+        .unwrap_or_default();
+    if opened {
         json_outcome(GuiShowOutcome::Opened, machine_id, request_id)
     } else {
+        state.gui_show.drop_pending_for_session(&session);
         json_outcome(GuiShowOutcome::NoDisplay, machine_id, request_id)
     }
 }
@@ -159,7 +164,7 @@ async fn resolve_banner_labels(state: &AppState) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::{CapturingOpener, GuiShowConfig};
+    use crate::gui::{CapturingOpener, GuiShowConfig, ShowOpener};
     use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -400,6 +405,69 @@ mod tests {
         let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["outcome"], "no_display", "{body}");
+        let urls = cap.urls.lock().expect("urls");
+        assert_eq!(urls.len(), 1, "the opener still receives the URL");
+        let token = urls[0]
+            .split("token=")
+            .nth(1)
+            .unwrap_or("")
+            .split(['&', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string();
+        drop(urls);
+        assert!(
+            !token.is_empty(),
+            "the failed launch still minted a session"
+        );
+        assert!(
+            state
+                .gui_show
+                .take_pending_for_session(&token, std::time::Instant::now())
+                .is_none(),
+            "a failed opener must drop the banner it queued"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_banner_is_queued_before_the_opener_runs() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let weak = Arc::downgrade(&state);
+        let queued = saw.clone();
+        struct Probe {
+            saw: Arc<std::sync::atomic::AtomicBool>,
+            check: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+        }
+        impl ShowOpener for Probe {
+            fn open(&self, url: &str) -> bool {
+                self.saw
+                    .store((self.check)(url), std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+        }
+        state.gui_show.replace_opener_for_test(Arc::new(Probe {
+            saw: queued,
+            check: Arc::new(move |url: &str| {
+                let Some(state) = weak.upgrade() else {
+                    return false;
+                };
+                let Some(token) = url.split("token=").nth(1) else {
+                    return false;
+                };
+                let token = token.split(['&', '#']).next().unwrap_or("");
+                !token.is_empty() && state.gui_show.has_pending_session(token)
+            }),
+        }));
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "opened", "{body}");
+        assert!(
+            saw.load(std::sync::atomic::Ordering::SeqCst),
+            "the banner must already be queued while the opener runs"
+        );
         Ok(())
     }
 

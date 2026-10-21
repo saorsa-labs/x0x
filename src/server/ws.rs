@@ -87,6 +87,9 @@ pub(super) struct WsSession {
     /// ADR 0083: this socket is a visible GUI tab. `gui=1` sets the initial
     /// value. `gui.visible` updates it when the tab is shown or hidden.
     visible_gui: Arc<AtomicBool>,
+    /// Session token from the GUI URL, when this socket presented one.
+    /// A hidden tab keeps it so `gui.visible` can deliver a pending banner.
+    gui_session_token: Option<String>,
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
     /// The drain owns the `JoinHandle`; this is only the abort handle.
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
@@ -111,6 +114,7 @@ fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
         subscribed_topics: HashSet::new(),
         receives_direct: false,
         visible_gui: visible_gui_flag(visible_gui),
+        gui_session_token: None,
         topic_forwarders: HashMap::new(),
     }
 }
@@ -128,6 +132,10 @@ impl WsSession {
     /// The GUI tab reports `document.visibilityState`.
     pub(super) fn set_visible_gui(&self, visible: bool) {
         self.visible_gui.store(visible, Ordering::Release);
+    }
+
+    fn gui_session_token(&self) -> Option<String> {
+        self.gui_session_token.clone()
     }
 }
 
@@ -1064,6 +1072,7 @@ async fn handle_ws_connection(
         subscribed_topics: HashSet::new(),
         receives_direct: direct_mode,
         visible_gui: Arc::clone(&visible_gui),
+        gui_session_token: session_token.clone(),
         topic_forwarders: HashMap::new(),
     };
     state
@@ -1094,18 +1103,7 @@ async fn handle_ws_connection(
                 .gui_show
                 .take_pending_for_session(token, std::time::Instant::now())
             {
-                feed_droppable(
-                    &outbound_tx,
-                    WsOutbound::GuiShow {
-                        view: pending.view,
-                        banner: pending.banner,
-                        agent_id: pending.agent_id,
-                        machine_id: pending.machine_id,
-                        rider: pending.rider,
-                        request_id: pending.request_id,
-                    },
-                    &stats,
-                );
+                feed_droppable(&outbound_tx, outbound_gui_show(pending), &stats);
             }
         }
     }
@@ -1510,6 +1508,18 @@ fn live_topic_message(
         // Raw live gossip plane: outside ADR-0066 row 25, and the one
         // per-frame path that takes no marker lock.
         quarantine: None,
+    }
+}
+
+/// ADR 0083 origin banner for one GUI socket.
+fn outbound_gui_show(pending: crate::gui::PendingGuiShow) -> WsOutbound {
+    WsOutbound::GuiShow {
+        view: pending.view,
+        banner: pending.banner,
+        agent_id: pending.agent_id,
+        machine_id: pending.machine_id,
+        rider: pending.rider,
+        request_id: pending.request_id,
     }
 }
 
@@ -1956,12 +1966,41 @@ async fn handle_ws_command(
                     return;
                 }
             };
-            state.gui_show.block_agent(&aid);
+            if !state
+                .gui_show
+                .block_agent_unless_self(&aid, &state.agent.agent_id())
+            {
+                feed_droppable(
+                    tx,
+                    WsOutbound::Error {
+                        message: crate::gui::SELF_GUI_BLOCK_REFUSED.to_string(),
+                    },
+                    stats,
+                );
+            }
         }
 
         WsInbound::GuiVisible { visible } => {
-            if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+            let token = {
+                let sessions = state.ws_sessions.read().await;
+                let Some(session) = sessions.get(session_id) else {
+                    return;
+                };
+                let was_visible = session.is_visible_gui();
                 session.set_visible_gui(visible);
+                if visible && !was_visible {
+                    session.gui_session_token()
+                } else {
+                    None
+                }
+            };
+            if let Some(token) = token {
+                if let Some(pending) = state
+                    .gui_show
+                    .take_pending_for_session(&token, std::time::Instant::now())
+                {
+                    feed_droppable(tx, outbound_gui_show(pending), stats);
+                }
             }
         }
     }
@@ -2313,9 +2352,119 @@ mod tests {
                 subscribed_topics: HashSet::new(),
                 receives_direct: false,
                 visible_gui: visible_gui_flag(false),
+                gui_session_token: None,
                 topic_forwarders: HashMap::new(),
             },
         );
+    }
+
+    #[tokio::test]
+    async fn self_block_is_refused_and_writes_no_entry() {
+        let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let own = hex::encode(state.agent.agent_id().as_bytes());
+        let cmd = serde_json::json!({
+            "type": "gui.block",
+            "agent_id": own,
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s-self", &cmd, &tx, &stats, false).await;
+        match rx.recv().await.expect("refusal") {
+            WsOutbound::Error { message } => {
+                assert_eq!(message, crate::gui::SELF_GUI_BLOCK_REFUSED);
+            }
+            other => panic!("expected error frame, got {other:?}"),
+        }
+        assert!(
+            !state.gui_show.is_blocked(&state.agent.agent_id()),
+            "a refused self-block must not be recorded"
+        );
+        assert!(
+            !dir.path().join("gui_show_blocked.json").exists(),
+            "a refused self-block must not create the block file"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_agent_block_persists_without_a_success_frame() {
+        let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let other = crate::identity::AgentId([9u8; 32]);
+        let cmd = serde_json::json!({
+            "type": "gui.block",
+            "agent_id": hex::encode(other.as_bytes()),
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s-other", &cmd, &tx, &stats, false).await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "gui.block has no success frame on the existing socket"
+        );
+        assert!(state.gui_show.is_blocked(&other));
+        assert!(dir.path().join("gui_show_blocked.json").exists());
+    }
+
+    #[tokio::test]
+    async fn hidden_tab_receives_pending_banner_when_it_becomes_visible() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "hidden-session-token";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "hidden-gui").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("hidden-gui")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(
+            &state,
+            "hidden-gui",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a tab that stays hidden must not take the banner"
+        );
+        assert!(state.gui_show.has_pending_session(token));
+        handle_ws_command(
+            &state,
+            "hidden-gui",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        match rx.recv().await.expect("banner") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "people"),
+            other => panic!("expected gui.show, got {other:?}"),
+        }
+        assert!(!state.gui_show.has_pending_session(token));
     }
 
     /// Next frame, with a deadline: a missing frame is a FAILURE here, never
