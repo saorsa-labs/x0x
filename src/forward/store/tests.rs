@@ -7,7 +7,7 @@
 use super::*;
 use crate::identity::UserId;
 use crate::names::{
-    resolve_with, AgentCandidate, Candidates, MachineCandidate, NameRef, NameStore,
+    resolve_with, AgentCandidate, BindSource, Candidates, MachineCandidate, NameRef, NameStore,
 };
 
 const NOW: u64 = 1_900_000_000;
@@ -273,6 +273,12 @@ fn agent_candidate(id: u8) -> Candidates {
 #[tokio::test]
 async fn restore_with_a_pin_mismatch_leaves_the_forward_disabled() {
     let names = NameStore::in_memory();
+    // The resolver refuses an unbound owner label (`UnknownName`). `me` is
+    // the local owner and needs no row; `bob` must be bound first.
+    names
+        .bind_owner("bob", OWNER, BindSource::Manual, NOW)
+        .await
+        .unwrap();
     let name = NameRef::parse("agent:studio.bob").unwrap();
     // First use pins agent 0x55 (the forward's pinned agent).
     let first = resolve_with(&names, &name, OWNER, &agent_candidate(0x55), NOW)
