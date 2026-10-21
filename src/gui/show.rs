@@ -343,7 +343,11 @@ impl GuiShowRuntime {
     /// without a new route and without `POST /acl/reload`.
     pub fn config(&self) -> GuiShowConfig {
         self.lift_stop_if_marker_deleted();
-        self.config_snapshot()
+        let mut config = self.config_snapshot();
+        if self.local_stop_path.is_file() {
+            config.local_enabled = false;
+        }
+        config
     }
 
     fn config_snapshot(&self) -> GuiShowConfig {
@@ -351,9 +355,17 @@ impl GuiShowRuntime {
     }
 
     /// Replace config (tests / acl reload after a successful TOML parse).
-    pub fn set_config(&self, config: GuiShowConfig) {
-        if let Ok(mut g) = self.config.lock() {
-            *g = config;
+    ///
+    /// A stop marker still on disk forces `local_enabled` off in the same
+    /// critical section as the store, so a reload cannot publish `true`
+    /// after Stop has written the marker.
+    pub fn set_config(&self, mut config: GuiShowConfig) {
+        if let Ok(mut guard) = self.config.lock() {
+            if self.local_stop_path.is_file() {
+                config.local_enabled = false;
+                self.stop_persisted.store(true, Ordering::SeqCst);
+            }
+            *guard = config;
         }
     }
 
@@ -377,7 +389,7 @@ impl GuiShowRuntime {
             .map_err(|error| format!("failed to read GUI config {}: {error}", path.display()))?;
         let gui_show = parse_gui_show_table(&text)
             .map_err(|error| format!("failed to parse GUI config {}: {error}", path.display()))?;
-        self.set_config(self.config_under_stop_marker(gui_show));
+        self.set_config(gui_show);
         if !had_config_path {
             self.set_config_path(Some(path));
         }
@@ -398,17 +410,6 @@ impl GuiShowRuntime {
         let mut config = self.config_snapshot();
         config.local_enabled = false;
         self.set_config(config);
-    }
-
-    /// The parsed config, forced off while the stop marker is still on disk.
-    fn config_under_stop_marker(&self, mut gui_show: GuiShowConfig) -> GuiShowConfig {
-        if self.local_stop_path.is_file() {
-            gui_show.local_enabled = false;
-            self.stop_persisted.store(true, Ordering::SeqCst);
-        } else {
-            self.stop_persisted.store(false, Ordering::SeqCst);
-        }
-        gui_show
     }
 
     /// A human deleted a marker this process had saved.
@@ -474,9 +475,14 @@ impl GuiShowRuntime {
     /// modify the daemon config: a named instance would then refuse to start.
     pub fn disable_local_show(&self) -> Result<(), String> {
         self.remember_local_stop();
-        self.write_local_stop_file()?;
-        self.stop_persisted.store(true, Ordering::SeqCst);
-        Ok(())
+        let wrote = self.write_local_stop_file();
+        if wrote.is_ok() {
+            self.stop_persisted.store(true, Ordering::SeqCst);
+            // The marker exists now. Store again so a reload that parsed
+            // `local_enabled = true` cannot publish that value afterwards.
+            self.remember_local_stop();
+        }
+        wrote
     }
 
     fn remember_local_stop(&self) {
@@ -1085,6 +1091,63 @@ mod tests {
             restarted.config().local_enabled,
             "a later start with no marker keeps show on"
         );
+    }
+
+    #[test]
+    fn concurrent_reload_cannot_undo_stop() {
+        use std::sync::{Arc, Barrier};
+
+        let data = tempfile::tempdir().expect("tempdir");
+        let path = data.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n",
+        )
+        .expect("config");
+        let rt = Arc::new(runtime(data.path(), Some(path)));
+        rt.set_config(GuiShowConfig {
+            local_enabled: true,
+            remote_enabled: true,
+        });
+        let start = Arc::new(Barrier::new(2));
+        let reload = {
+            let rt = Arc::clone(&rt);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..40 {
+                    rt.reload_from_disk().expect("reload");
+                }
+            })
+        };
+        let stop = {
+            let rt = Arc::clone(&rt);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                rt.disable_local_show().expect("stop");
+            })
+        };
+        reload.join().expect("reload thread");
+        stop.join().expect("stop thread");
+        assert!(
+            data.path().join(LOCAL_SHOW_STOP_FILE).is_file(),
+            "stop still owns the marker"
+        );
+        assert!(
+            !rt.config().local_enabled,
+            "a reload that parsed local_enabled = true must not outlive the marker"
+        );
+        rt.set_config(GuiShowConfig {
+            local_enabled: true,
+            remote_enabled: true,
+        });
+        assert!(
+            !rt.config().local_enabled,
+            "config() keeps show off while the marker exists"
+        );
+        rt.reload_from_disk().expect("reload after stop");
+        assert!(!rt.config().local_enabled);
     }
 
     #[test]

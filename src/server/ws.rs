@@ -1140,6 +1140,30 @@ struct ArmedNavigation {
 ///
 /// A spawn failure returns `None` before the insert. The caller must not
 /// abandon a session in that case: nothing was advertised.
+/// Queue the show this window was opened for, before the session is visible.
+///
+/// Only a visible GUI tab (`gui=1`) may take it, and only the session token
+/// minted into that window's URL. An agent socket leaves every pending show
+/// queued. The returned value is what was queued, so the caller can put it
+/// back when the session is not admitted.
+fn queue_pending_gui_show(
+    state: &AppState,
+    outbound_tx: &mpsc::Sender<WsOutbound>,
+    stats: &Arc<WsOutboundStats>,
+    visible: bool,
+    session_token: Option<&str>,
+) -> Option<crate::gui::PendingGuiShow> {
+    if !visible {
+        return None;
+    }
+    let token = session_token?;
+    let pending = state
+        .gui_show
+        .take_pending_for_session(token, std::time::Instant::now())?;
+    feed_droppable(outbound_tx, outbound_gui_show(pending.clone()), stats);
+    Some(pending)
+}
+
 async fn arm_navigation_and_advertise_session(
     state: &AppState,
     session: WsSession,
@@ -1203,6 +1227,18 @@ async fn handle_ws_connection(
     let slow_close_counted = Arc::new(AtomicBool::new(false));
     let stats = Arc::clone(&state.ws_outbound_stats);
 
+    // Queue this window's pending show before the session is visible.
+    // A newer `gui.show` broadcast is delivered after that frame, so it
+    // cannot be overwritten by the view this window was opened for.
+    // If the forwarder is not admitted, put the pending show back.
+    let opened_show = queue_pending_gui_show(
+        &state,
+        &outbound_tx,
+        &stats,
+        visible_gui.load(Ordering::Acquire),
+        session_token.as_deref(),
+    );
+
     // Subscribe and start the gui.show forwarder, then insert. A concurrent
     // show can observe the session as soon as the insert returns. Broadcast
     // does not replay, so the receiver must already exist. Do not insert the
@@ -1226,6 +1262,9 @@ async fn handle_ws_connection(
     .await
     else {
         // The forwarder was not admitted. The session was not inserted.
+        if let Some(pending) = opened_show {
+            state.gui_show.enqueue_pending(pending);
+        }
         return;
     };
     let call_forwarder = armed.forwarder;
@@ -1242,20 +1281,6 @@ async fn handle_ws_connection(
         },
         &stats,
     );
-
-    // ADR 0083: deliver this window's pending banner. Only a visible GUI
-    // tab (`gui=1`) may take it, and only the session token minted into
-    // that window's URL. An agent socket leaves every pending show queued.
-    if visible_gui.load(Ordering::Acquire) {
-        if let Some(token) = session_token.as_deref() {
-            if let Some(pending) = state
-                .gui_show
-                .take_pending_for_session(token, std::time::Instant::now())
-            {
-                feed_droppable(&outbound_tx, outbound_gui_show(pending), &stats);
-            }
-        }
-    }
 
     // Spawn writer task: outbound_rx → ws_tx. Races BOTH the frame arrival and
     // each socket send against the slow-consumer token — the writer may be
@@ -2047,25 +2072,33 @@ async fn handle_ws_command(
         }
 
         WsInbound::GuiVisible { visible } => {
-            let token = {
+            let reveal = {
                 let sessions = state.ws_sessions.read().await;
                 let Some(session) = sessions.get(session_id) else {
                     return;
                 };
                 let was_visible = session.is_visible_gui();
-                session.set_visible_gui(visible);
-                if visible && !was_visible {
-                    session.gui_session_token()
-                } else {
+                if !visible {
+                    session.set_visible_gui(false);
                     None
+                } else if was_visible {
+                    None
+                } else {
+                    // Stay hidden until the pending frame is queued. A show
+                    // that arrives after that frame must not be overwritten
+                    // by the view this tab was opened for.
+                    session.gui_session_token()
                 }
             };
-            if let Some(token) = token {
+            if let Some(token) = reveal {
                 if let Some(pending) = state
                     .gui_show
                     .take_pending_for_session(&token, std::time::Instant::now())
                 {
                     feed_droppable(tx, outbound_gui_show(pending), stats);
+                }
+                if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+                    session.set_visible_gui(true);
                 }
             }
         }
@@ -4215,6 +4248,102 @@ mod tests {
         .await
         .expect("gui.show missed: visible session had no navigation receiver");
         assert_eq!(view, "people");
+        armed.forwarder.abort();
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_show_is_queued_before_a_newer_navigation() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "opened-window";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+
+        assert!(
+            queue_pending_gui_show(&state, &outbound_tx, &stats, true, Some(token)).is_some(),
+            "the opened window's show is taken before the session is visible"
+        );
+        match outbound_rx.try_recv() {
+            Ok(WsOutbound::GuiShow { view, .. }) => assert_eq!(view, "network"),
+            other => panic!("pending show must already be queued, got {other:?}"),
+        }
+        assert!(
+            !state
+                .ws_sessions
+                .read()
+                .await
+                .values()
+                .any(WsSession::is_visible_gui),
+            "the pending frame is queued before any GUI session is advertised"
+        );
+
+        let state_watch = Arc::clone(&state);
+        let watcher = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let visible = state_watch
+                    .ws_sessions
+                    .read()
+                    .await
+                    .values()
+                    .any(WsSession::is_visible_gui);
+                if visible {
+                    let _ = state_watch.broadcast_tx.send(crate::server::sse::SseEvent {
+                        event_type: "gui.show".to_string(),
+                        data: serde_json::json!({
+                            "view": "people",
+                            "banner": "newer",
+                            "agent_id": "aa",
+                            "machine_id": "bb",
+                            "rider": false,
+                            "request_id": "newer",
+                        }),
+                    });
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            test_gui_ws_session("visible-gui"),
+            &outbound_tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("navigation forwarder admitted");
+        let newer = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(WsOutbound::GuiShow { view, .. }) => return view,
+                    Some(_) => continue,
+                    None => panic!("outbound queue closed"),
+                }
+            }
+        })
+        .await
+        .expect("the newer navigation is delivered after the pending show");
+        assert_eq!(newer, "people");
         armed.forwarder.abort();
         watcher.abort();
     }
