@@ -3065,12 +3065,13 @@ impl OwnerSyncService {
         tokio::spawn(async move {
             let existing = crate::profile::IssuedCertRecord::load(&path).await;
             // Already local, unless the local line lacks the expiry the
-            // synced value carries (a line from before #1357); the new line
+            // synced value carries (a line written before #1542); the new line
             // then supplies it (see `latest_journal_values`).
-            if existing
-                .iter()
-                .any(|r| r.agent_id == agent_hex && r.cert_digest == cert_digest)
-            {
+            if existing.iter().any(|r| {
+                r.agent_id == agent_hex
+                    && r.cert_digest == cert_digest
+                    && (r.not_after.is_some() || not_after.is_none())
+            }) {
                 return;
             }
             let record =
@@ -3106,7 +3107,7 @@ impl OwnerSyncService {
 
 /// The local journal line for a synced `IssuanceJournal` value. It keeps
 /// the value's `not_after`: a line without it would make this device mint
-/// a different value for the same key (#1357, see
+/// a different value for the same key (#1542, see
 /// [`latest_journal_values`]).
 fn synced_journal_line(
     owner_hex: String,
@@ -3120,10 +3121,7 @@ fn synced_journal_line(
         agent_id: agent_hex,
         cert_digest,
         issued_at,
-        not_after: {
-            let _ = not_after;
-            None
-        },
+        not_after,
         // ADR-0039 fields are not part of the Tier-1 sync value: a synced
         // line records the issuance fact (digest, time and expiry); mode
         // defaults to Acp (the pre-ADR-0039 line shape) and no certificate
@@ -3138,7 +3136,7 @@ fn synced_journal_line(
 /// owner-scoped (`owner_hex`), latest `issued_at` per agent, later lines
 /// winning ties.
 ///
-/// #1357: a digest names exactly one certificate, so its `not_after` is
+/// #1542: a digest names exactly one certificate, so its `not_after` is
 /// fixed. A line with the same digest but no `not_after` (a synced line
 /// written before the expiry travelled with it) does not replace a known
 /// expiry. Otherwise two owner devices mint `Some` and `None` for the same
@@ -3149,13 +3147,16 @@ fn latest_journal_values(
     owner_hex: &str,
 ) -> BTreeMap<String, SyncValue> {
     let mut latest: BTreeMap<String, crate::profile::IssuedCertRecord> = BTreeMap::new();
-    for record in lines {
+    for mut record in lines {
         if record.user_id != owner_hex {
             continue;
         }
         if let Some(old) = latest.get(&record.agent_id) {
             if record.issued_at < old.issued_at {
                 continue;
+            }
+            if record.cert_digest == old.cert_digest {
+                record.not_after = record.not_after.or(old.not_after);
             }
         }
         latest.insert(record.agent_id.clone(), record);
@@ -5513,7 +5514,7 @@ mod home_pointer_election_tests {
     }
 }
 
-/// #1357: an `IssuanceJournal` value must survive the sync round trip, or
+/// #1542: an `IssuanceJournal` value must survive the sync round trip, or
 /// two owner devices re-mint it in turn without end.
 #[cfg(test)]
 mod issuance_journal_sync_tests {
