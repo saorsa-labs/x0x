@@ -1172,7 +1172,12 @@ impl ReseatMandateV1 {
         Ok(Self { fields, signature })
     }
 
-    fn verify_signature(&self) -> Result<(), RecoveryRefusal> {
+    /// The signature verifies under a key whose SHA-256 is the signer.
+    ///
+    /// # Errors
+    ///
+    /// [`RecoveryRefusal::BadSignature`].
+    pub fn verify_signature(&self) -> Result<(), RecoveryRefusal> {
         verify_agent_signature(
             &self.fields.signer,
             &self.fields.signer_public_key,
