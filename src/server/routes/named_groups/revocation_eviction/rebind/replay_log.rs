@@ -462,6 +462,19 @@ pub(in super::super) mod tests {
         resumes
     }
 
+    /// The frames that the group's held log file holds on disk now (empty
+    /// when the file is missing or cannot be used).
+    pub(in super::super::super) async fn frames_on_disk(
+        state: &AppState,
+        extension: &str,
+        stable: &str,
+    ) -> Vec<ReplayFrameV1> {
+        match tokio::fs::read(log_path(state, stable, extension)).await {
+            Ok(bytes) => decode(&bytes).map(|log| log.frames).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     #[test]
     fn a_held_frame_log_round_trips_and_a_flipped_byte_is_damaged() {
         let log = ReplayLogV1 {
