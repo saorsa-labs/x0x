@@ -29,7 +29,7 @@ pub async fn owner_add(client: &DaemonClient, label: &str, user_id: &str) -> Res
 
 /// `x0x names owner rm LABEL` — remove an owner petname and its pins.
 pub async fn owner_remove(client: &DaemonClient, label: &str) -> Result<()> {
-    let resp = client.delete(&format!("/names/owners/{label}")).await?;
+    let resp = client.delete(&owner_remove_path(label)?).await?;
     print_value(client.format(), &resp);
     Ok(())
 }
@@ -45,9 +45,30 @@ pub async fn machine_label(client: &DaemonClient, name: &str, machine_id: &str) 
 
 /// `x0x names unpin NAME` — drop a pin (canonical `agent:`/`machine:` name).
 pub async fn unpin(client: &DaemonClient, name: &str) -> Result<()> {
-    let resp = client.delete(&format!("/names/pins/{name}")).await?;
+    let resp = client.delete(&unpin_path(name)?).await?;
     print_value(client.format(), &resp);
     Ok(())
+}
+
+/// Owner-label path. The label is checked before the path exists, so a
+/// value such as `../../contacts/<id>` never becomes a DELETE URL.
+fn owner_remove_path(label: &str) -> Result<String> {
+    crate::names::validate_label(label)
+        .map_err(|error| anyhow::anyhow!("invalid owner label: {error}"))?;
+    Ok(format!("/names/owners/{label}"))
+}
+
+/// Pin path. The name is checked before the path exists, so a value such
+/// as `../../contacts/<id>` never becomes a DELETE URL.
+fn unpin_path(name: &str) -> Result<String> {
+    let parsed = crate::names::NameRef::parse(name)
+        .map_err(|error| anyhow::anyhow!("invalid pin name: {error}"))?;
+    if parsed.kind.is_none() {
+        return Err(anyhow::anyhow!(
+            "invalid pin name: {name:?}: a pin key needs agent: or machine:"
+        ));
+    }
+    Ok(format!("/names/pins/{name}"))
 }
 
 fn resolve_body(name: &str) -> serde_json::Value {
@@ -81,6 +102,29 @@ mod tests {
         assert_eq!(
             machine_label_body("machine:box.bob", "cd"),
             serde_json::json!({ "name": "machine:box.bob", "machine_id": "cd" })
+        );
+    }
+
+    /// WHY: `names owner rm ../../contacts/<id>` must fail before reqwest
+    /// normalises that path into `DELETE /contacts/<id>`. The unpin sibling
+    /// has the same check.
+    #[test]
+    fn owner_remove_and_unpin_reject_path_traversal_before_the_url() {
+        let traversal = "../../contacts/ab";
+        let owner_err = owner_remove_path(traversal).expect_err("owner path");
+        assert!(
+            !owner_err.to_string().contains("/names/owners/"),
+            "rejected before the URL: {owner_err}"
+        );
+        let pin_err = unpin_path(traversal).expect_err("pin path");
+        assert!(
+            !pin_err.to_string().contains("/names/pins/"),
+            "rejected before the URL: {pin_err}"
+        );
+        assert_eq!(owner_remove_path("bob").unwrap(), "/names/owners/bob");
+        assert_eq!(
+            unpin_path("agent:studio.bob").unwrap(),
+            "/names/pins/agent:studio.bob"
         );
     }
 }

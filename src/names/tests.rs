@@ -722,6 +722,10 @@ async fn first_use_pins_the_name() {
 async fn pin_mismatch_is_refused_and_the_pin_is_kept() {
     let store = NameStore::in_memory();
     let owner = UserId([5; 32]);
+    store
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await
+        .unwrap();
     resolve_with(
         &store,
         &name("studio.bob"),
@@ -745,7 +749,9 @@ async fn pin_mismatch_is_refused_and_the_pin_is_kept() {
             current: hex::encode([2u8; 32]),
         }
     );
-    // Same id under a different owner key is also a mismatch.
+    // A user id that is not the bound owner is refused inside the pin
+    // transaction. The existing pin stays. A direct pin of that other
+    // user is still `pin_mismatch`.
     let err = resolve_with(
         &store,
         &name("studio.bob"),
@@ -755,6 +761,17 @@ async fn pin_mismatch_is_refused_and_the_pin_is_kept() {
     )
     .await
     .unwrap_err();
+    assert_eq!(err.code(), "unknown_name");
+    let err = store
+        .pin(
+            "agent:studio.bob",
+            UserId([6; 32]),
+            [1; 32],
+            BindSource::FirstUse,
+            NOW + 2,
+        )
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), "pin_mismatch");
     let pin = store.get_pin("agent:studio.bob").await.unwrap().unwrap();
     assert_eq!((pin.id, pin.owner), ([1; 32], owner), "pin unchanged");
@@ -846,6 +863,52 @@ async fn bare_name_is_ambiguous_kind_despite_an_existing_pin() {
         .unwrap();
     assert_eq!(prefixed.kind, NameKind::Machine);
     assert!(!prefixed.newly_pinned);
+}
+
+/// WHY: a resolve that already read the owner must not pin after a
+/// concurrent unbind. The owner is rechecked inside the pin transaction.
+#[tokio::test]
+async fn unbind_during_resolve_does_not_leave_a_pin_for_the_old_owner() {
+    let store = std::sync::Arc::new(NameStore::in_memory());
+    let owner = UserId([5; 32]);
+    store
+        .bind_owner("bob", owner, BindSource::Manual, NOW)
+        .await
+        .unwrap();
+    let gate = store.arm_pin_interleave();
+    let resolver_store = std::sync::Arc::clone(&store);
+    let resolver = tokio::spawn(async move {
+        resolve_with(
+            &resolver_store,
+            &name("studio.bob"),
+            owner,
+            &agent_only(vec![verified_agent(1, "studio")]),
+            NOW,
+        )
+        .await
+    });
+    let start = std::time::Instant::now();
+    while !gate.entered.load(std::sync::atomic::Ordering::SeqCst) {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("resolve did not reach the pin transaction");
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(store.unbind_owner("bob").await.unwrap());
+    gate.release
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    gate.wake.notify_waiters();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), resolver)
+        .await
+        .expect("resolve finished")
+        .expect("resolve task")
+        .expect_err("unbound owner must not pin");
+    assert_eq!(err.code(), "unknown_name", "{err}");
+    assert!(store.owner("bob").await.unwrap().is_none());
+    assert!(
+        store.get_pin("agent:studio.bob").await.unwrap().is_none(),
+        "a late pin must not restore a name for an unbound owner"
+    );
 }
 
 /// WHY: two bare resolves that see different single-kind snapshots must

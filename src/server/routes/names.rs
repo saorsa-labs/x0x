@@ -333,14 +333,15 @@ pub(in crate::server) async fn names_unpin(
     }
 }
 
-/// Bind an owner petname from an imported card (ADR-0074 §1).
+/// Bind an owner petname from an imported card (ADR-0074 §1, ADR-0079).
 ///
-/// Trust level does not narrow the bind. Held ADR 0079 is not applied, so
-/// an Unknown contact binds the same way as Known or Trusted. Only a
-/// **signed** (already verified) card that carries both `user_id` and
-/// `owner_name` may bind, and only when a local discovery/cache
-/// [`AgentCertificate`] for the card's agent chains to that claimed
-/// `user_id` (valid, unexpired, unrevoked) via
+/// The card's label is applied only when `trust` is Known or Trusted and
+/// that user has no petname yet. Unknown and Blocked return `null` and
+/// write nothing. An explicit local bind (`POST /names/owners`) is a
+/// separate path and still works. Only a **signed** (already verified)
+/// card that carries both `user_id` and `owner_name` may bind, and only
+/// when a local discovery/cache [`AgentCertificate`] for the card's agent
+/// chains to that claimed `user_id` (valid, unexpired, unrevoked) via
 /// [`x0x::owner_trust::certificate_chains_to_owner`]. A bare `card.user_id`
 /// is never trusted alone: no cert → `unverified_owner`, import still
 /// succeeds. The label is the card's `owner_name` as a DNS label
@@ -354,8 +355,16 @@ pub(in crate::server) async fn names_unpin(
 pub(in crate::server) async fn bind_owner_from_card(
     state: &AppState,
     card: &x0x::groups::card::AgentCard,
+    trust: x0x::contacts::TrustLevel,
 ) -> serde_json::Value {
-    if card.signature.is_none() {
+    // Known and Trusted may bind. Unknown and Blocked return null and
+    // leave the label unbound.
+    if card.signature.is_none()
+        || !matches!(
+            trust,
+            x0x::contacts::TrustLevel::Known | x0x::contacts::TrustLevel::Trusted
+        )
+    {
         return serde_json::Value::Null;
     }
     let (Some(user_hex), Some(owner_name)) = (&card.user_id, &card.owner_name) else {
