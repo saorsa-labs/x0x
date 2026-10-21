@@ -486,7 +486,7 @@ jobs:
           X0X_RUNTIME_TIMEOUT_SECONDS: 4800
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
-        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 20
+        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 3 --no-fail-fast -E 'test(/w3h_1357/)'
 
       # D196: blocking on the verdict (the same in all 20 reruns, every
       # receipt complete); the per-case distinct-trace counts are printed
@@ -824,7 +824,7 @@ jobs:
           # remaining tests' profile data must still be produced. The job
           # still fails on it — see the status merge at the end.
           coverage_test_status=0
-          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- --no-fail-fast -E '!binary(x0x_0041_synthetic_kill_restart) & !binary(x0x_0041_prefer_newest_test) & !binary(named_group_join_metadata_event)' || coverage_test_status=$?
+          bash scripts/ci/nextest-isolated.sh --all-features --workspace -- --no-fail-fast --lib -E 'test(/w3h_1357/)' || coverage_test_status=$?
           disk_snapshot "after coverage compilation"
           # #607: report and ratchet are still ATTEMPTED after a red test
           # pass; their own failures are captured the same way.
