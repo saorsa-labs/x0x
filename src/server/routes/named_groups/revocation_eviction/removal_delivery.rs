@@ -35,7 +35,7 @@ use x0x::groups::eviction::{EvictionKey, ObligationStore, Phase, WaitingCause, W
 use x0x::groups::GroupInfo;
 
 use super::super::NamedGroupMetadataEvent;
-use super::crypto_exclusion::{self, RecipientDelivery, SavedFrameState};
+use super::crypto_exclusion::{self, RecipientDelivery, RoundUpdate, SavedFrameState};
 
 /// A live delivery waits this long before its first send: the legacy
 /// removal path already sent the initial volley.
@@ -352,15 +352,21 @@ pub(super) async fn drive(state: &Arc<AppState>) {
         }
         let active: std::collections::BTreeSet<[u8; 32]> =
             survivors(&info, &local, &key.target).into_iter().collect();
-        let mut updates: Vec<([u8; 32], Option<RecipientDelivery>)> = Vec::new();
+        let mut updates: Vec<RoundUpdate> = Vec::new();
+        let mut sends: HashMap<[u8; 32], SendFuture> = HashMap::new();
         for (recipient, status) in &delivery.recipients {
+            let observed = *status;
             if !active.contains(recipient) {
-                updates.push((*recipient, None));
+                updates.push(RoundUpdate {
+                    recipient: *recipient,
+                    observed,
+                    next: None,
+                });
                 continue;
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight
+                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
@@ -375,24 +381,28 @@ pub(super) async fn drive(state: &Arc<AppState>) {
                 &delivery.event,
                 "s4-removal",
             ) else {
-                updates.push((*recipient, None));
+                updates.push(RoundUpdate {
+                    recipient: *recipient,
+                    observed,
+                    next: None,
+                });
                 continue;
             };
-            updates.push((*recipient, Some(RecipientDelivery::InFlight)));
-            spawn_send(state, key.clone(), *recipient, send);
+            updates.push(RoundUpdate {
+                recipient: *recipient,
+                observed,
+                next: Some(RecipientDelivery::InFlight(crypto_exclusion::next_attempt())),
+            });
+            sends.insert(*recipient, Box::pin(send));
         }
-        let mut inner = runtime.inner.lock().await;
-        if let Some(stored) = inner.removals.get_mut(&key) {
-            for (recipient, update) in updates {
-                match update {
-                    Some(status) => {
-                        stored.recipients.insert(recipient, status);
-                    }
-                    None => {
-                        stored.recipients.remove(&recipient);
-                    }
-                }
-            }
+        // Install every status, `InFlight` included, BEFORE any send task
+        // starts: a fast completion can then never be overwritten.
+        let started = {
+            let mut inner = runtime.inner.lock().await;
+            let Some(stored) = inner.removals.get_mut(&key) else {
+                continue;
+            };
+            let started = crypto_exclusion::apply_round(&mut stored.recipients, updates);
             if stored
                 .recipients
                 .values()
@@ -401,15 +411,26 @@ pub(super) async fn drive(state: &Arc<AppState>) {
                 inner.removals.remove(&key);
                 inner.dirty = true;
             }
+            started
+        };
+        for (recipient, attempt) in started {
+            if let Some(send) = sends.remove(&recipient) {
+                spawn_send(state, key.clone(), recipient, attempt, send);
+            }
         }
     }
 }
+
+/// One built send of the saved removal event.
+type SendFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>;
 
 fn spawn_send(
     state: &Arc<AppState>,
     key: EvictionKey,
     recipient: [u8; 32],
-    send: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+    attempt: u64,
+    send: SendFuture,
 ) {
     let task_state = Arc::clone(state);
     let _spawned = state.spawn_detached(async move {
@@ -422,9 +443,7 @@ fn spawn_send(
         };
         let mut inner = task_state.revocation_evictions.inner.lock().await;
         if let Some(delivery) = inner.removals.get_mut(&key) {
-            if let Some(entry) = delivery.recipients.get_mut(&recipient) {
-                *entry = status;
-            }
+            crypto_exclusion::finish_attempt(&mut delivery.recipients, &recipient, attempt, status);
         }
     });
 }

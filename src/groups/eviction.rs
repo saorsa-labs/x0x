@@ -33,6 +33,17 @@ pub const COMPLETED_EVIDENCE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// first out (D128).
 pub const MAX_COMPACT_RECORDS_PER_GROUP: usize = 4096;
 
+/// At most this many completed rows per group keep their crypto-only
+/// exclusion frame (`outgoing_event`) as replay evidence for ADR 0110 §4
+/// catch-up after a restart, newest first. Older rows drop the frame.
+pub const MAX_REPLAY_FRAMES_PER_GROUP: usize = 16;
+
+/// Whether `bytes` is a crypto-only exclusion frame (`X0XCE1`): the one
+/// saved event a completed row keeps as replay evidence.
+fn is_replay_frame(bytes: &[u8]) -> bool {
+    bytes.starts_with(crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX)
+}
+
 // ─── Timing (D69, D73) ─────────────────────────────────────────────────────
 
 /// The S4 timing values. Every S4 budget reads them from here.
@@ -673,7 +684,12 @@ impl ObligationStore {
         row.waiting = None;
         row.result_head = result_head;
         row.result_epoch = result_epoch;
-        row.outgoing_event = None;
+        // ADR 0110 §4: a crypto-only exclusion frame stays as replay
+        // evidence, so a survivor that missed it can still catch up after
+        // this node restarts. Any other saved event is dropped.
+        if !row.outgoing_event.as_deref().is_some_and(is_replay_frame) {
+            row.outgoing_event = None;
+        }
         row.completed_at_unix_ms = Some(now_unix_ms);
         true
     }
@@ -759,10 +775,19 @@ impl ObligationStore {
             }
         }
         for (_, mut completed) in per_group {
+            completed.sort();
+            // Replay frames: only the newest completed rows keep theirs.
+            let frames_from = completed.len().saturating_sub(MAX_REPLAY_FRAMES_PER_GROUP);
+            for (_, key) in completed.iter().take(frames_from) {
+                if let Some(row) = self.rows.get_mut(key) {
+                    if row.outgoing_event.take().is_some() {
+                        changed = true;
+                    }
+                }
+            }
             if completed.len() <= MAX_COMPACT_RECORDS_PER_GROUP {
                 continue;
             }
-            completed.sort();
             let excess = completed.len() - MAX_COMPACT_RECORDS_PER_GROUP;
             for (_, key) in completed.into_iter().take(excess) {
                 self.rows.remove(&key);
@@ -2199,5 +2224,73 @@ mod tests {
             Some(true)
         );
         assert!(parse_quarantine_pending_name(EVS_FILE_NAME, "other.q-00-11.pending").is_none());
+    }
+
+    /// ADR 0110 §4 (#1357 review P1): completion keeps a crypto-only
+    /// exclusion frame as durable replay evidence in the `.evs` row, and
+    /// drops any other saved event. The row survives an encode/decode
+    /// round trip with the frame.
+    #[test]
+    fn completion_keeps_a_crypto_exclusion_frame_as_replay_evidence() {
+        let mut store = ObligationStore::new();
+        let frame_key = key(1);
+        let other_key = key(2);
+        let mut frame = crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX.to_vec();
+        frame.extend_from_slice(b"frame");
+        for (k, event) in [(&frame_key, frame.clone()), (&other_key, b"{}".to_vec())] {
+            store.intake(k, revocation(1), None, 0, [0; 16]);
+            store.get_mut(k).expect("row").outgoing_event = Some(event);
+            assert!(store.complete(k, Some("r".into()), Some(2), 1));
+        }
+        assert_eq!(
+            store
+                .get(&frame_key)
+                .expect("row")
+                .outgoing_event
+                .as_deref(),
+            Some(frame.as_slice())
+        );
+        assert!(store.get(&other_key).expect("row").outgoing_event.is_none());
+        let body = EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: store.to_rows(),
+        };
+        let decoded = decode_evs(&encode_evs(&body).expect("encode")).expect("decode");
+        let reloaded = ObligationStore::from_rows(decoded.rows);
+        assert_eq!(
+            reloaded
+                .get(&frame_key)
+                .expect("row")
+                .outgoing_event
+                .as_deref(),
+            Some(frame.as_slice())
+        );
+    }
+
+    /// Replay frames are bounded: only the newest
+    /// [`MAX_REPLAY_FRAMES_PER_GROUP`] completed rows of a group keep theirs.
+    #[test]
+    fn retention_keeps_only_the_newest_replay_frames() {
+        let mut store = ObligationStore::new();
+        let mut frame = crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX.to_vec();
+        frame.push(0);
+        let total = MAX_REPLAY_FRAMES_PER_GROUP + 3;
+        for n in 0..total {
+            let k = key(u8::try_from(n + 1).expect("small"));
+            store.intake(&k, revocation(1), None, 0, [0; 16]);
+            store.get_mut(&k).expect("row").outgoing_event = Some(frame.clone());
+            store.complete(&k, None, None, u64::try_from(n).expect("small") + 1);
+        }
+        assert!(store.apply_retention(100));
+        let kept: Vec<u8> = (0..total)
+            .filter(|n| {
+                let k = key(u8::try_from(n + 1).expect("small"));
+                store.get(&k).expect("row").outgoing_event.is_some()
+            })
+            .map(|n| u8::try_from(n).expect("small"))
+            .collect();
+        let expected: Vec<u8> = (3..u8::try_from(total).expect("small")).collect();
+        assert_eq!(kept, expected, "the oldest rows drop their frames");
+        assert!(!store.apply_retention(100), "retention is idempotent");
     }
 }
