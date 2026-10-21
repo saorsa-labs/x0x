@@ -579,6 +579,8 @@ async fn apply_replacements_with_permit(
         // Take every host lock before any backup/replace. Nested perform_upgrade
         // locks would deadlock; finish_* assumes the caller already holds them.
         let _companion_lock = if let Some((ref x0x_upgrader, _)) = companion {
+            #[cfg(test)]
+            tests::acknowledge_host_lock_attempt(x0x_upgrader.target_path());
             match super::acquire_host_upgrade_lock(x0x_upgrader.target_path()) {
                 Ok(lock) => Some(lock),
                 Err(e) => {
@@ -596,6 +598,8 @@ async fn apply_replacements_with_permit(
             ));
         }
 
+        #[cfg(test)]
+        tests::acknowledge_host_lock_attempt(upgrader.target_path());
         let _daemon_lock = super::acquire_host_upgrade_lock(upgrader.target_path())?;
         if !worker_alive.load(Ordering::Acquire) {
             return Err(UpgradeError::Other(
@@ -3201,12 +3205,51 @@ mod tests {
         holder.join().expect("lock holder thread");
     }
 
-    /// Hold a host lock, prove the offload submitted, abort the caller, then
+    static HOST_LOCK_ATTEMPTS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, tokio::sync::oneshot::Sender<()>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    struct HostLockAttemptGuard(PathBuf);
+
+    impl Drop for HostLockAttemptGuard {
+        fn drop(&mut self) {
+            HOST_LOCK_ATTEMPTS
+                .lock()
+                .expect("host lock attempt hooks")
+                .remove(&self.0);
+        }
+    }
+
+    fn observe_host_lock_attempt(
+        target: &Path,
+    ) -> (HostLockAttemptGuard, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        assert!(HOST_LOCK_ATTEMPTS
+            .lock()
+            .expect("host lock attempt hooks")
+            .insert(target.to_path_buf(), sender)
+            .is_none());
+        (HostLockAttemptGuard(target.to_path_buf()), receiver)
+    }
+
+    // Each acknowledgement is tied to one fixture path. It fires immediately
+    // before the real lock call, with no intervening cancellation check. Thus
+    // the held lock keeps custody even if the caller cancels after this send.
+    pub(super) fn acknowledge_host_lock_attempt(target: &Path) {
+        let sender = HOST_LOCK_ATTEMPTS
+            .lock()
+            .expect("host lock attempt hooks")
+            .remove(target);
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+
+    /// Hold a host lock, acknowledge the worker's lock attempt, abort, then
     /// release. After cancel the host must not keep replaced bytes without a
     /// restart continuation (Codex P1 on b937a806 / #1447 RC2).
     async fn cancel_while_lock_held_must_not_orphan_restart(hold_companion: bool) {
         use std::fs::OpenOptions;
-        use std::future::{poll_fn, Future};
         use std::time::Duration;
 
         let root = TempDir::new().unwrap();
@@ -3233,6 +3276,7 @@ mod tests {
             .open(&lock_path)
             .expect("open held host lock");
         held.lock().expect("hold host lock");
+        let (_lock_attempt, waiting_rx) = observe_host_lock_attempt(held_target);
 
         let restart_marker = root.path().join("restart-continuation");
         let marker = restart_marker.clone();
@@ -3244,14 +3288,13 @@ mod tests {
                 incoming_cli,
             )
         });
-        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             // Worker-owned continuation: same ownership site as production
             // restart_on_success (RC3). Pre-admission cancel must not run it.
             let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
-            let replacement = apply_replacements_offloaded(
+            apply_replacements_offloaded(
                 upgrade,
                 incoming,
                 semver::Version::new(2, 0, 0),
@@ -3261,27 +3304,18 @@ mod tests {
                 },
                 on_success,
                 None,
-            );
-            tokio::pin!(replacement);
-            let mut waiting_tx = Some(waiting_tx);
-            let result = poll_fn(|cx| {
-                let polled = replacement.as_mut().poll(cx);
-                if polled.is_pending() {
-                    if let Some(tx) = waiting_tx.take() {
-                        let _ = tx.send(());
-                    }
-                }
-                polled
-            })
+            )
             .await?;
-            let _ = result;
             Ok::<_, UpgradeError>(())
         });
 
+        // Pending only proves submission. In the daemon-only case a queued
+        // worker can observe cancellation before its lock call and correctly
+        // remove scratch. Wait until that early-return gate is behind it.
         tokio::time::timeout(Duration::from_secs(3), waiting_rx)
             .await
-            .expect("offload submitted within timeout")
-            .expect("waiting signal");
+            .expect("worker reached held host lock within timeout")
+            .expect("host lock attempt acknowledgement");
         assert_eq!(
             std::fs::read(&primary).unwrap(),
             b"old-daemon",
@@ -3323,6 +3357,9 @@ mod tests {
             !installed || restarted,
             "replacement must not outlive its restart continuation"
         );
+        assert!(!restarted, "pre-admission cancel must not restart");
+        assert!(!primary.with_extension("backup").exists());
+        assert!(!cli.with_extension("backup").exists());
         assert_eq!(std::fs::read(&primary).unwrap(), b"old-daemon");
         if hold_companion {
             assert_eq!(std::fs::read(&cli).unwrap(), b"old-cli");
@@ -3337,6 +3374,81 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_while_companion_lock_held_must_not_orphan_restart() {
         cancel_while_lock_held_must_not_orphan_restart(true).await;
+    }
+
+    /// Force the other legal ordering behind #1537: the worker has entered,
+    /// but cancellation reaches it before the daemon-lock check. Scratch must
+    /// then be removed even while another owner still holds the daemon lock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_before_daemon_lock_releases_scratch_without_mutation() {
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let primary = root.path().join("x0xd");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        let incoming = scratch.join("daemon");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+        let held = super::super::acquire_host_upgrade_lock(&primary).unwrap();
+        let (_lock_attempt, mut lock_attempt) = observe_host_lock_attempt(&primary);
+        let restart_marker = root.path().join("restart-continuation");
+        let marker = restart_marker.clone();
+
+        let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let permit = ReleasePermit {
+            observer: Some(Arc::new(move |entered| {
+                let _ = events.send(entered);
+                if entered {
+                    // Dropping the sender also releases this worker on panic.
+                    let _ = wait.lock().unwrap().recv();
+                }
+            })),
+            ..ReleasePermit::default()
+        };
+        let mut replacement = Box::pin(apply_replacements_with_permit(
+            Upgrader::new(primary.clone(), semver::Version::new(1, 0, 0)),
+            incoming,
+            semver::Version::new(2, 0, 0),
+            None,
+            TempDirGuard {
+                path: scratch.clone(),
+            },
+            Some(Box::new(move || {
+                std::fs::write(marker, b"restart reached").unwrap();
+            })),
+            None,
+            Some(&permit),
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                result = &mut replacement => panic!("worker ended before release: {result:?}"),
+                entered = observed.recv() => assert_eq!(entered, Some(true)),
+            }
+        })
+        .await
+        .expect("worker entered");
+
+        drop(replacement);
+        assert!(scratch.exists(), "paused worker still owns scratch");
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .expect("cancelled worker finished without the daemon lock"),
+            Some(false)
+        );
+        assert!(matches!(
+            lock_attempt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(!scratch.exists(), "finished worker releases scratch");
+        assert_eq!(std::fs::read(&primary).unwrap(), b"old-daemon");
+        assert!(!primary.with_extension("backup").exists());
+        assert!(!restart_marker.exists());
+        drop(held);
     }
 
     /// Live control: with companion lock held then released, both installs and
