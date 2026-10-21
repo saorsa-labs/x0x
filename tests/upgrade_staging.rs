@@ -555,6 +555,7 @@ macro_rules! staging_runtime_regression_tests {
                 ).unwrap();
                 let gate = Gate {
                     request: request.clone(),
+                    skip_staging_delay: false,
                     clock: Some(std::sync::Arc::new(|| Ok(clock("a", 1000)))),
                     observed: None,
                 };

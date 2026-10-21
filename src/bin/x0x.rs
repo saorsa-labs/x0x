@@ -300,6 +300,9 @@ enum Commands {
         /// With --check, only a read-only release check is performed.
         #[arg(long)]
         apply: bool,
+        /// Skip the staging delay. Eligibility, holds and transaction checks still apply.
+        #[arg(long, requires = "apply", conflicts_with = "check")]
+        now: bool,
         /// With --check, fetch the current manifest regardless of version.
         /// Does not bypass the daemon's apply checks.
         #[arg(long)]
@@ -2195,6 +2198,7 @@ async fn run(
             check,
             apply,
             force,
+            ..
         } if *check || !*apply => {
             return commands::upgrade::run(*check, *force).await;
         }
@@ -3232,11 +3236,16 @@ async fn run(
                 .await
             }
         },
-        Commands::Upgrade { .. } => {
+        Commands::Upgrade { now, .. } => {
             // The serving daemon owns installation and its writer lock. The
             // existing client carries the selected instance and bearer token.
             // --force only affects read-only checks; it cannot bypass apply.
-            let response = client.post_empty("/upgrade/apply").await?;
+            let path = if now {
+                "/upgrade/apply?now=true"
+            } else {
+                "/upgrade/apply"
+            };
+            let response = client.post_empty(path).await?;
             x0x::cli::print_value(client.format(), &response);
             Ok(())
         }
@@ -3796,6 +3805,11 @@ async fn purge() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_now_cli.rs"
+    ));
+    upgrade_now_cli_regression_tests!();
     use super::*;
 
     #[test]

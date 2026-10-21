@@ -225,7 +225,7 @@ macro_rules! staging_guide_regression_tests {
                     // Validate the raw fixture through the production reader
                     // and floor policy: an invalid readback is not this proof.
                     let identity = restart::resolve_staging_identity(
-                        true, &install, Some(&data), readback_api_addr,
+                        true, &install, Some(&data), readback_api_addr, None,
                     ).await.unwrap();
                     let policy = crate::upgrade::fleet_policy::effective_staging_window(
                         0, &install, &identity,
