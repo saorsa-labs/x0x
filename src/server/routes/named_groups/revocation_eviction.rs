@@ -3081,6 +3081,10 @@ fn finish_persist(inner: &mut S4Inner, covered_seq: u64, written: bool) -> bool 
 }
 
 /// Temp write, fsync, atomic rename and directory fsync (§5).
+///
+/// The temp file is created owner-only (`0600`) before any byte goes in,
+/// whatever the umask: S3/S4 sidecars can hold private key material
+/// (ADR 0012). The rename keeps that mode.
 async fn write_bytes_durably(
     path: &FsPath,
     bytes: &[u8],
@@ -3101,11 +3105,11 @@ async fn write_bytes_durably(
     };
     let temp = path.with_file_name(format!("{file_name}.tmp-{suffix}"));
     let write = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp).await?;
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
