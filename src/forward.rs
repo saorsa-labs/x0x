@@ -1629,6 +1629,25 @@ struct ForwardEntry {
     state: EntryState,
 }
 
+/// `add_forward` returns this when a `:0` bind lands on a forward that
+/// already owns the address. The caller retries. The colliding listener
+/// stays open until [`ForwardService::release_allocation_holds`].
+const PORT_ALLOCATION_COLLISION: &str = "allocated port belongs to another forward";
+
+pub(crate) fn is_port_allocation_collision(err: &NetworkError) -> bool {
+    matches!(
+        err,
+        NetworkError::ConnectionFailed(message) if message == PORT_ALLOCATION_COLLISION
+    )
+}
+
+/// How [`ForwardService::shutdown_and_release`] finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardShutdownReport {
+    /// Transactions still running when the 2s drain ended. They were aborted.
+    pub abandoned_transactions: usize,
+}
+
 /// Owns the inbound forward consumers + the outbound local listeners.
 ///
 /// The forwarder is the registered acceptor for the `ForwardV1` and
@@ -1655,8 +1674,15 @@ pub struct ForwardService {
     /// Accept loops for [`Self::add_forward`]. Shutdown awaits these after it
     /// cancels them, so the bound port is free when shutdown returns.
     listener_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Ports from a `:0` allocation that matched a saved forward.
+    /// Held so the next allocation cannot take the same port, then released
+    /// when the add finishes or the forwarder shuts down.
+    allocation_holds: std::sync::Mutex<Vec<tokio::net::TcpListener>>,
     /// Set under [`Self::forwards`] before listener tokens are cancelled.
     listeners_closed: std::sync::atomic::AtomicBool,
+    /// Test-only bind addresses, consumed from the front.
+    #[cfg(test)]
+    bind_script: std::sync::Mutex<Vec<SocketAddr>>,
     /// Add, remove, and restore transactions. `None` refuses new ones.
     /// Shutdown drains the admitted tasks before it cancels listeners, so a
     /// transaction cannot bind after shutdown has returned.
@@ -1809,7 +1835,10 @@ impl ForwardService {
             fwd_diag,
             forwards: std::sync::Mutex::new(Vec::new()),
             listener_tasks: std::sync::Mutex::new(Vec::new()),
+            allocation_holds: std::sync::Mutex::new(Vec::new()),
             listeners_closed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            bind_script: std::sync::Mutex::new(Vec::new()),
             transactions: std::sync::Mutex::new(Some(Vec::new())),
             inbound_token: CancellationToken::new(),
             inbound_acceptors: std::sync::Mutex::new(Some((acceptor_v1, acceptor_v2))),
@@ -1969,6 +1998,54 @@ impl ForwardService {
             handle_inbound(stream, &inbound_ctx).await;
         });
     }
+
+    fn next_bind_addr(&self, requested: SocketAddr) -> SocketAddr {
+        #[cfg(test)]
+        {
+            if let Some(addr) = self
+                .bind_script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop()
+            {
+                return addr;
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+        }
+        requested
+    }
+
+    /// Keep `listener` open so a `:0` retry cannot bind this port again.
+    pub(crate) fn hold_allocation(&self, listener: tokio::net::TcpListener) {
+        self.allocation_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(listener);
+    }
+
+    /// Close ports held back from a `:0` allocation.
+    pub(crate) fn release_allocation_holds(&self) {
+        self.allocation_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Next `add_forward` calls bind these addresses, in order, instead of
+    /// the spec address. Used to force a collision with a saved forward.
+    #[cfg(test)]
+    pub(crate) fn script_binds_for_test(&self, addrs: Vec<SocketAddr>) {
+        let mut addrs = addrs;
+        addrs.reverse();
+        *self
+            .bind_script
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = addrs;
+    }
+
     /// Register a local forward: bind `local_addr`, and for each accepted TCP
     /// connection open a peer stream, write the header, and bridge on
     /// `connected`. Returns the bound local address (useful when port = 0).
@@ -1984,12 +2061,31 @@ impl ForwardService {
             ));
         }
         self.ensure_reauth_loop();
-        let listener = TcpListener::bind(spec.local_addr).await.map_err(|e| {
-            NetworkError::ConnectionFailed(format!("bind {}: {e}", spec.local_addr))
-        })?;
+        let bind_addr = self.next_bind_addr(spec.local_addr);
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(format!("bind {bind_addr}: {e}")))?;
         let bound = listener
             .local_addr()
             .map_err(|e| NetworkError::ConnectionFailed(format!("local_addr: {e}")))?;
+        // A kernel-assigned port must not replace a forward that already
+        // owns that address. The listener is held so the retry cannot bind
+        // it again. An explicit address still replaces that entry.
+        if spec.local_addr.port() == 0 {
+            let occupied = {
+                let forwards = self
+                    .forwards
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                forwards.iter().any(|entry| entry.spec.local_addr == bound)
+            };
+            if occupied {
+                self.hold_allocation(listener);
+                return Err(NetworkError::ConnectionFailed(
+                    PORT_ALLOCATION_COLLISION.to_string(),
+                ));
+            }
+        }
         let cancel = CancellationToken::new();
         // Register the kernel-assigned address.  Keeping the requested
         // `:0` here makes list/remove unable to identify the listener that
@@ -2183,10 +2279,21 @@ impl ForwardService {
     /// transaction returns, and the cancel below observes it. A bind that
     /// starts after the cancel finds [`Self::listeners_closed`] and drops
     /// the socket before publishing a listener.
-    pub(crate) async fn shutdown_and_release(&self) {
-        self.close_and_drain_transactions().await;
+    pub(crate) async fn shutdown_and_release(&self) -> ForwardShutdownReport {
+        let abandoned_transactions = self.close_and_drain_transactions().await;
+        self.release_allocation_holds();
         self.shutdown();
         self.await_listener_tasks().await;
+        if abandoned_transactions > 0 {
+            tracing::warn!(
+                target: "x0x::forward",
+                abandoned_transactions,
+                "forward shutdown abandoned in-flight transactions after 2s"
+            );
+        }
+        ForwardShutdownReport {
+            abandoned_transactions,
+        }
     }
 
     /// Run `work` as one forward transaction. The task stays in
@@ -2235,15 +2342,34 @@ impl ForwardService {
             .is_none()
     }
 
-    async fn close_and_drain_transactions(&self) {
+    async fn close_and_drain_transactions(&self) -> usize {
         let tasks = self
             .transactions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap_or_default();
-        for task in tasks {
-            let _ = task.await;
+        let abort_handles: Vec<_> = tasks
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let pending = futures::future::join_all(tasks);
+        tokio::pin!(pending);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), pending.as_mut())
+            .await
+            .is_err()
+        {
+            let abandoned = abort_handles
+                .iter()
+                .filter(|handle| !handle.is_finished())
+                .count();
+            for handle in &abort_handles {
+                handle.abort();
+            }
+            let _ = pending.await;
+            abandoned
+        } else {
+            0
         }
     }
 

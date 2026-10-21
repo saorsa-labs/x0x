@@ -225,10 +225,48 @@ async fn commit_forward_locked(
         .list_forwards()
         .into_iter()
         .find(|status| status.spec.local_addr == spec.local_addr);
-    let bound = forwarder
-        .add_forward(spec.clone())
-        .await
-        .map_err(CommitError::Bind)?;
+    let allocating = spec.local_addr.port() == 0;
+    let mut allocations = 0u32;
+    let bound = loop {
+        allocations += 1;
+        if allocations > 8 {
+            forwarder.release_allocation_holds();
+            return Err(CommitError::Bind(
+                x0x::error::NetworkError::ConnectionFailed(
+                    "could not allocate a port that is not a saved forward".to_string(),
+                ),
+            ));
+        }
+        match forwarder.add_forward(spec.clone()).await {
+            Err(error) if allocating && x0x::forward::is_port_allocation_collision(&error) => {
+                continue;
+            }
+            Err(error) => {
+                forwarder.release_allocation_holds();
+                return Err(CommitError::Bind(error));
+            }
+            Ok(bound) if allocating => {
+                let saved = match store.records().await {
+                    Ok(records) => records,
+                    Err(error) => {
+                        forwarder.remove_forward(bound);
+                        forwarder.release_allocation_holds();
+                        return Err(CommitError::Store(error));
+                    }
+                };
+                if saved.iter().any(|record| record.local_addr == bound) {
+                    forwarder.remove_forward(bound);
+                    if let Ok(hold) = tokio::net::TcpListener::bind(bound).await {
+                        forwarder.hold_allocation(hold);
+                    }
+                    continue;
+                }
+                break bound;
+            }
+            Ok(bound) => break bound,
+        }
+    };
+    forwarder.release_allocation_holds();
     let mut registered = spec;
     registered.local_addr = bound;
     let persisted = if registered.persistent {
@@ -1104,6 +1142,80 @@ mod tests {
             "the drained add finishes its store write: {added:?}"
         );
         assert_port_released(add_addr).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_a_stalled_store_write() {
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
+        let addr = free_loopback().await;
+        let pause = x0x::storage::arm_durable_rename_pause_for_testing(&path);
+        let store_add = Arc::clone(&store);
+        let forwarder_add = Arc::clone(&forwarder);
+        let add = tokio::spawn(async move {
+            commit_forward(&store_add, &forwarder_add, hex_spec(addr)).await
+        });
+        let start = std::time::Instant::now();
+        while !x0x::storage::durable_rename_pause_entered_for_testing(&path) {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("add did not reach the rename");
+            }
+            tokio::task::yield_now().await;
+        }
+        let started = std::time::Instant::now();
+        let report = forwarder.shutdown_and_release().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "shutdown must not wait out a stalled store write: {elapsed:?}"
+        );
+        assert!(
+            report.abandoned_transactions >= 1,
+            "the stalled transaction is reported: {report:?}"
+        );
+        assert_port_released(addr).await;
+        drop(pause);
+        let _ = add.await;
+    }
+
+    #[tokio::test]
+    async fn allocated_port_does_not_erase_a_saved_forward() {
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let store = Arc::new(ForwardStore::load(path).await);
+        let saved_addr = free_loopback().await;
+        let saved = hex_spec(saved_addr);
+        assert!(store.remember(&saved).await.expect("remember saved"));
+        forwarder.add_disabled(saved, "name_changed".to_string());
+        let fresh = free_loopback().await;
+        forwarder.script_binds_for_test(vec![saved_addr, fresh]);
+        let mut spec = hex_spec(SocketAddr::from(([127, 0, 0, 1], 0)));
+        spec.persistent = true;
+        let bound = commit_forward(&store, &forwarder, spec)
+            .await
+            .expect("allocation skips the saved port");
+        assert_eq!(bound, fresh);
+        let records = store.records().await.expect("records");
+        assert!(
+            records.iter().any(|record| record.local_addr == saved_addr),
+            "the saved forward is still on disk: {records:?}"
+        );
+        assert!(records.iter().any(|record| record.local_addr == fresh));
+        let listed = forwarder.list_forwards();
+        assert!(
+            listed
+                .iter()
+                .any(|status| { status.spec.local_addr == saved_addr && status.error.is_some() }),
+            "the disabled forward stays listed: {listed:?}"
+        );
+        assert!(listed
+            .iter()
+            .any(|status| status.spec.local_addr == fresh && status.error.is_none()));
     }
 
     /// WHY: an unreadable `forwards.json` must not block `--ephemeral` adds
