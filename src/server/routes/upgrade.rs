@@ -1889,6 +1889,8 @@ mod tests {
     background_staging_regression_tests!();
     #[cfg(unix)]
     background_driver_regression_tests!();
+    #[cfg(unix)]
+    background_init_regression_tests!();
 
     use super::*;
     use crate::upgrade::restart;
