@@ -1458,39 +1458,132 @@ enum NoEligibleAdmin {
     },
 }
 
+/// The revoked seats of a group whose verified revocations cover every
+/// Admin-or-higher Active seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevokedAdminCover {
+    /// Every Admin-or-higher Active seat, sorted. All are revoked.
+    admins: Vec<[u8; 32]>,
+    /// Every revoked Active seat.
+    members: BTreeSet<[u8; 32]>,
+}
+
+/// §4 (D75): the cover test. `is_revoked` answers for one agent from the
+/// verified revocation set. Returns `None` for a withdrawn group, for a
+/// genuinely admin-empty roster (ADR 0088 §2 item 3), or when one admin
+/// seat is not revoked.
+fn revoked_admin_cover(
+    info: &GroupInfo,
+    is_revoked: impl Fn(&[u8; 32]) -> bool,
+) -> Option<RevokedAdminCover> {
+    if info.withdrawn {
+        return None;
+    }
+    let mut admins = active_admins_of(info);
+    if admins.is_empty() || !admins.iter().all(&is_revoked) {
+        return None;
+    }
+    admins.sort();
+    admins.dedup();
+    let members: BTreeSet<[u8; 32]> = info
+        .active_members()
+        .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
+        .map(|agent| *agent.as_bytes())
+        .filter(&is_revoked)
+        .collect();
+    Some(RevokedAdminCover { admins, members })
+}
+
+/// The cover of `info` under this node's verified revocation set. It takes
+/// only the revocation-set read lock.
+async fn revoked_admin_cover_now(state: &AppState, info: &GroupInfo) -> Option<RevokedAdminCover> {
+    let revocation_set = state.agent.revocation_set();
+    let set = revocation_set.read().await;
+    revoked_admin_cover(info, |id| {
+        set.is_agent_revoked(&x0x::identity::AgentId(*id))
+    })
+}
+
+/// §4 (D75) and §4b(3) (D126) at the ciphertext boundary: true while
+/// verified Agent-subject revocations cover every Admin-or-higher Active
+/// seat of `info`. Every seal and publication path asks this through
+/// `group_ciphertext_withheld`, just before it makes ciphertext.
+///
+/// Both derived states (`Waiting` and `GroupAdminRevoked`) refuse, so this
+/// does not derive which one applies. That needs the head-sync check,
+/// which locks the group's TreeKEM mutex (`local_epoch_of`). A seal holds
+/// that mutex, so the boundary must not call it. This function takes only
+/// the revocation-set read lock. No path holds the revocation-set write
+/// lock while it waits for a group, membership or TreeKEM lock.
+pub(in crate::server) async fn s4_withholds_ciphertext(state: &AppState, info: &GroupInfo) -> bool {
+    revoked_admin_cover_now(state, info).await.is_some()
+}
+
+#[cfg(test)]
+mod revoked_admin_cover_tests {
+    use super::*;
+    use x0x::identity::AgentId;
+
+    /// Creator `[1; 32]` (Owner), Admin `[2; 32]`, Member `[3; 32]`.
+    fn group() -> GroupInfo {
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            AgentId([1; 32]),
+            "ab".repeat(16),
+        );
+        info.migrate_from_v1();
+        info.add_member(
+            hex::encode([2; 32]),
+            GroupRole::Admin,
+            Some(hex::encode([1; 32])),
+            None,
+        );
+        info.add_member(
+            hex::encode([3; 32]),
+            GroupRole::Member,
+            Some(hex::encode([1; 32])),
+            None,
+        );
+        info
+    }
+
+    #[test]
+    fn every_admin_seat_revoked_is_a_cover() {
+        let revoked: BTreeSet<[u8; 32]> = [[2; 32], [1; 32], [3; 32]].into();
+        let cover = revoked_admin_cover(&group(), |id| revoked.contains(id))
+            .expect("Owner and Admin are both revoked");
+        assert_eq!(cover.admins, vec![[1; 32], [2; 32]]);
+        assert_eq!(cover.members, revoked);
+    }
+
+    #[test]
+    fn one_unrevoked_admin_seat_is_no_cover() {
+        let revoked: BTreeSet<[u8; 32]> = [[1; 32], [3; 32]].into();
+        assert_eq!(
+            revoked_admin_cover(&group(), |id| revoked.contains(id)),
+            None
+        );
+        assert_eq!(revoked_admin_cover(&group(), |_| false), None);
+    }
+
+    #[test]
+    fn a_withdrawn_group_is_no_cover() {
+        let mut info = group();
+        info.withdrawn = true;
+        assert_eq!(revoked_admin_cover(&info, |_| true), None);
+    }
+}
+
 /// Derive the state from the verified revocation records and the verified
 /// head. It is not signed: a later head with an eligible admin clears it
 /// (§4b(3) "late evidence").
 async fn no_eligible_admin_state(state: &AppState, info: &GroupInfo) -> Option<NoEligibleAdmin> {
-    if info.withdrawn {
-        return None;
-    }
-    let admins = active_admins_of(info);
-    if admins.is_empty() {
-        // A genuinely admin-empty roster stays ADR 0088 §2 item 3.
-        return None;
-    }
-    let (revoked, revoked_members): (Vec<[u8; 32]>, BTreeSet<[u8; 32]>) = {
-        let revocation_set = state.agent.revocation_set();
-        let set = revocation_set.read().await;
-        let revoked: Vec<[u8; 32]> = admins
-            .iter()
-            .copied()
-            .filter(|id| set.is_agent_revoked(&x0x::identity::AgentId(*id)))
-            .collect();
-        let members: BTreeSet<[u8; 32]> = info
-            .active_members()
-            .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
-            .map(|agent| *agent.as_bytes())
-            .filter(|id| set.is_agent_revoked(&x0x::identity::AgentId(*id)))
-            .collect();
-        (revoked, members)
-    };
-    if revoked.len() != admins.len() {
-        return None;
-    }
-    let mut revoked_admins: Vec<String> = revoked.iter().map(hex::encode).collect();
-    revoked_admins.sort();
+    let RevokedAdminCover {
+        admins: revoked,
+        members: revoked_members,
+    } = revoked_admin_cover_now(state, info).await?;
+    let revoked_admins: Vec<String> = revoked.iter().map(hex::encode).collect();
     if owner_certified(info) {
         return Some(NoEligibleAdmin::Waiting {
             revoked_admins,
@@ -1552,7 +1645,7 @@ fn no_eligible_admin_json(state: &NoEligibleAdmin) -> serde_json::Value {
 /// invites, seals and key delivery are refused with the typed state, so no
 /// new message reaches a revoked key. Returns the refusal, or `None`.
 pub(in crate::server) async fn s4_no_eligible_admin_refusal(
-    state: &Arc<AppState>,
+    state: &AppState,
     group_key: &str,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     let info = {

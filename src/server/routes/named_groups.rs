@@ -23818,21 +23818,66 @@ fn self_leave_startup_blocks(
     true
 }
 
-pub(in crate::server) async fn self_leave_startup_withholds_ciphertext(
+/// Why this node withholds new ciphertext for one group now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum GroupCiphertextHold {
+    /// The startup self-leave exclusion is not complete: a removed member
+    /// still has a live leaf in this ratchet.
+    SelfLeaveExclusion,
+    /// ADR 0110 §4 (D75) and §4b(3) (D126): verified Agent-subject
+    /// revocations cover every Admin-or-higher Active seat. The revoked
+    /// admins still hold the current epoch keys.
+    NoEligibleAdmin,
+}
+
+impl GroupCiphertextHold {
+    /// The stable refusal text. `NoEligibleAdmin` starts with the ADR 0110
+    /// cause `no_eligible_admin` (D154). A KV error carries it as is; a
+    /// task error adds a plane prefix, so match it with `contains`. The
+    /// REST body names the derived state instead.
+    pub(in crate::server) fn reason(self) -> &'static str {
+        match self {
+            Self::SelfLeaveExclusion => {
+                "self-leave exclusion is not complete; ciphertext is withheld"
+            }
+            Self::NoEligibleAdmin => {
+                "no_eligible_admin: verified revocations cover every admin seat; ciphertext is withheld"
+            }
+        }
+    }
+}
+
+/// THE group ciphertext boundary. Every path that makes new group
+/// ciphertext calls this just before the AEAD or ratchet step: REST
+/// encrypt, the TreeKEM KV seal (and so TreeKEM task-list seals), and the
+/// GSS task-list seal. A `Some` result means: make no ciphertext.
+///
+/// `guard` is the held TreeKEM ratchet, or `None` on the GSS plane (the
+/// self-leave hold is a TreeKEM leaf check).
+///
+/// Lock order: the caller may hold the group membership lock and the
+/// ratchet mutex. This takes the `named_groups` read lock (as
+/// `persist_treekem_snapshot_bound` does under the same guard), releases
+/// it, and then takes only the revocation-set read lock. It never takes a
+/// TreeKEM mutex, so it cannot wait on the ratchet the caller holds.
+pub(in crate::server) async fn group_ciphertext_withheld(
     state: &AppState,
     group_id_hex: &str,
-    guard: &x0x::mls::TreeKemMlsGroup,
-) -> bool {
-    let groups = state.named_groups.read().await;
-    let Some((key, info)) = crate::server::resolve_group_entry_locked(&groups, group_id_hex) else {
-        return false;
+    guard: Option<&x0x::mls::TreeKemMlsGroup>,
+) -> Option<GroupCiphertextHold> {
+    let info = {
+        let groups = state.named_groups.read().await;
+        let (key, info) = crate::server::resolve_group_entry_locked(&groups, group_id_hex)?;
+        let self_leave_open = self_leave_startup_open(state, key)
+            || self_leave_startup_open(state, info.stable_group_id());
+        if self_leave_open && guard.is_some_and(|guard| removed_member_has_live_leaf(info, guard)) {
+            return Some(GroupCiphertextHold::SelfLeaveExclusion);
+        }
+        info.clone()
     };
-    if !self_leave_startup_open(state, key)
-        && !self_leave_startup_open(state, info.stable_group_id())
-    {
-        return false;
-    }
-    removed_member_has_live_leaf(info, guard)
+    revocation_eviction::s4_withholds_ciphertext(state, &info)
+        .await
+        .then_some(GroupCiphertextHold::NoEligibleAdmin)
 }
 
 async fn self_leave_startup_note_verified_head(
@@ -32020,11 +32065,20 @@ async fn treekem_group_encrypt_for_actor(
     {
         return resp;
     }
-    if self_leave_startup_withholds_ciphertext(state, group_id_hex, &guard).await {
-        return api_error(
-            StatusCode::CONFLICT,
-            "self-leave exclusion is not complete; ciphertext is withheld",
-        );
+    match group_ciphertext_withheld(state, group_id_hex, Some(&*guard)).await {
+        None => {}
+        Some(hold @ GroupCiphertextHold::SelfLeaveExclusion) => {
+            return api_error(StatusCode::CONFLICT, hold.reason());
+        }
+        Some(hold @ GroupCiphertextHold::NoEligibleAdmin) => {
+            // The route refused this state before; this is the race
+            // re-check. Release the ratchet first: the typed body reads
+            // the head-sync state, and that locks this same mutex.
+            drop(guard);
+            return revocation_eviction::s4_no_eligible_admin_refusal(state, group_id_hex)
+                .await
+                .unwrap_or_else(|| api_error(StatusCode::CONFLICT, hold.reason()));
+        }
     }
     let ciphertext = match guard.encrypt_message(&plaintext) {
         Ok(c) => c,

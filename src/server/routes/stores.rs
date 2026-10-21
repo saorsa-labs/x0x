@@ -1123,18 +1123,15 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 reader_only,
             },
         )?;
-        // Same hold as REST encrypt. The ratchet has not moved. Do not
-        // edit persist_treekem_snapshot_bound; this return never reaches it.
-        if super::named_groups::self_leave_startup_withholds_ciphertext(
-            &state,
-            &self.group_key,
-            &group,
-        )
-        .await
+        // The same ciphertext boundary as REST encrypt: the self-leave hold
+        // and ADR 0110 §4 (no eligible admin). TreeKEM task-list seals come
+        // through here too. The ratchet has not moved. Do not edit
+        // persist_treekem_snapshot_bound; this return never reaches it.
+        if let Some(hold) =
+            super::named_groups::group_ciphertext_withheld(&state, &self.group_key, Some(&*group))
+                .await
         {
-            return Err(x0x::kv::KvError::SecureRecord(
-                "self-leave exclusion is not complete; ciphertext is withheld".to_string(),
-            ));
+            return Err(x0x::kv::KvError::SecureRecord(hold.reason().to_string()));
         }
         let ciphertext = match group.encrypt_message(&inner) {
             Ok(ciphertext) => ciphertext,
@@ -7763,5 +7760,142 @@ mod tests {
         // fallback ran for exactly that recipient.
         assert_eq!(body["direct_attempted"], serde_json::json!(1), "{body}");
         assert_eq!(body["published"], serde_json::json!(false), "{body}");
+    }
+
+    // ─── #1508 Codex P1 #1: ADR 0110 §4 at the KV seal boundary ────────
+
+    /// Seed a TreeKEM group with this node as an ordinary Member and a
+    /// foreign Admin seat, and return the Admin's key. The Admin seat is
+    /// roster-only: the §4 cover reads the roster, not the tree.
+    async fn seed_treekem_group_with_foreign_admin(
+        state: &AppState,
+        group_key: &str,
+    ) -> x0x::identity::AgentKeypair {
+        seed_treekem_group(state, group_key).await;
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin key");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(group_key).expect("seeded group");
+        info.members_v2
+            .get_mut(&local_hex)
+            .expect("local seat")
+            .role = x0x::groups::GroupRole::Member;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        info.members_v2.insert(
+            admin_hex.clone(),
+            x0x::groups::GroupMember::new_admin(admin_hex, None, 0),
+        );
+        info.recompute_state_hash();
+        admin
+    }
+
+    /// Insert a verified self-revocation of `subject`.
+    async fn revoke_agent(state: &AppState, subject: &x0x::identity::AgentKeypair) {
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(subject.agent_id()),
+            subject.public_key(),
+            subject.secret_key(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+            Some("test".to_string()),
+        )
+        .expect("sign revocation");
+        let revocation_set = state.agent.revocation_set();
+        assert!(revocation_set
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("self-revocation verifies"));
+    }
+
+    async fn seal_once(
+        state: &Arc<AppState>,
+        group_key: &str,
+    ) -> x0x::kv::Result<x0x::kv::TreeKemKvStoreRecordV1> {
+        use x0x::kv::TreeKemKvProtector;
+        let info = state.named_groups.read().await[group_key].clone();
+        let protector = treekem_store_protector(state, group_key, &info);
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        protector
+            .seal_record(
+                &signing,
+                x0x::kv::KvMutationKind::Delta,
+                &x0x::kv::KvStoreId::new([7; 32]),
+                b"value",
+                false,
+            )
+            .await
+    }
+
+    async fn ratchet_snapshot(state: &AppState, group_key: &str) -> Vec<u8> {
+        let live = state.treekem_groups.read().await[group_key].clone();
+        let guard = live.lock().await;
+        guard.to_snapshot_bytes().expect("snapshot")
+    }
+
+    /// ADR 0110 §4 (D75): the only admin seat is revoked. An active member
+    /// must not publish a KV record under the epoch the revoked admin can
+    /// still decrypt. Red on f634bed: `seal_record` sealed and the ratchet
+    /// moved.
+    #[tokio::test]
+    async fn treekem_kv_seal_is_withheld_while_every_admin_seat_is_revoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e7".repeat(16);
+        let admin = seed_treekem_group_with_foreign_admin(&state, &group_key).await;
+        revoke_agent(&state, &admin).await;
+        let before = ratchet_snapshot(&state, &group_key).await;
+
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            seal_once(&state, &group_key),
+        )
+        .await
+        .expect("the boundary check must not stall the seal");
+        let error = refused.expect_err("no ciphertext while no eligible admin remains");
+        assert!(
+            matches!(&error, x0x::kv::KvError::SecureRecord(reason) if reason.starts_with("no_eligible_admin")),
+            "typed refusal, got {error}"
+        );
+        assert_eq!(
+            before,
+            ratchet_snapshot(&state, &group_key).await,
+            "a refused seal must not advance the send ratchet"
+        );
+    }
+
+    /// No false refusal: the same group, with the admin NOT revoked,
+    /// seals; and a revoked non-admin seat does not refuse either.
+    #[tokio::test]
+    async fn treekem_kv_seal_proceeds_while_an_admin_seat_is_unrevoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e8".repeat(16);
+        let _admin = seed_treekem_group_with_foreign_admin(&state, &group_key).await;
+        let other = x0x::identity::AgentKeypair::generate().expect("member key");
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_key).expect("seeded group");
+            let other_hex = hex::encode(other.agent_id().as_bytes());
+            info.members_v2.insert(
+                other_hex.clone(),
+                x0x::groups::GroupMember::new_member(other_hex, None, None, 0),
+            );
+            info.recompute_state_hash();
+        }
+        revoke_agent(&state, &other).await;
+        let record = seal_once(&state, &group_key)
+            .await
+            .expect("a group with an eligible admin seals");
+        assert_eq!(record.version, 1);
+
+        // A normal group (the local owner, no revocation) seals too.
+        let (plain_state, _plain_dir) = encrypted_store_test_state().await;
+        let plain_key = "e9".repeat(16);
+        seed_treekem_group(&plain_state, &plain_key).await;
+        seal_once(&plain_state, &plain_key)
+            .await
+            .expect("an ordinary group seals");
     }
 }
