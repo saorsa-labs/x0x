@@ -3449,4 +3449,99 @@ mod tests {
             .count();
         assert_eq!(history, 1);
     }
+
+    /// ADR 0110 §1a hand-off evidence (#1508 review P2 #5): a verified
+    /// expiry hand-off carries the bytes of a digest-only seat's committed
+    /// certificate. The receiver verifies and installs them, and its
+    /// observation starts once its clock passes the raw `not_after`, not
+    /// only at its own trigger time `not_after + τ`.
+    #[tokio::test]
+    async fn an_expiry_handoff_installs_its_certificate_and_starts_at_raw_not_after(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target_kp = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target_kp.agent_id().as_bytes());
+        let sender = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let now_unix = now_unix_ms() / 1000;
+        // Past the raw `not_after`, but not past `not_after + τ`.
+        let not_after = now_unix - 10;
+        let cert = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner,
+            &target_kp,
+            Some(not_after),
+        )?;
+        let digest = x0x::groups::owner_cert::certificate_digest_hex(&cert);
+        let group_id = "a1".repeat(16);
+        let stable = {
+            let local = state.agent.agent_id();
+            let mut info =
+                GroupInfo::new("s4-handoff".into(), String::new(), local, group_id.clone());
+            info.policy.admission =
+                x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+            let local_hex = hex::encode(local.as_bytes());
+            info.add_member(
+                target_hex.clone(),
+                GroupRole::Member,
+                Some(local_hex.clone()),
+                None,
+            );
+            info.add_member(
+                hex::encode(sender.as_bytes()),
+                GroupRole::Admin,
+                Some(local_hex),
+                None,
+            );
+            // A digest-only seat: the roster commits the digest only.
+            info.members_v2
+                .get_mut(&target_hex)
+                .expect("seat")
+                .certificate_digest = Some(digest.clone());
+            info.recompute_state_hash();
+            let stable = info.stable_group_id().to_string();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info);
+            stable
+        };
+        let handoff = s4::EvictionHandoffV1 {
+            stable_group_id: stable.clone(),
+            target: *target_kp.agent_id().as_bytes(),
+            observed_parent_head: String::new(),
+            revocation_records: Vec::new(),
+            self_leave_commit: None,
+            expired_certificate: Some(s4::HandoffExpiredCertificate {
+                certificate_digest: digest.clone(),
+                certificate_bytes: Some(bincode::serialize(&cert)?),
+            }),
+            renewed_certificate: None,
+        };
+        let payload = s4::encode_handoff(&handoff)?;
+        receive_handoff(&state, sender, &payload).await;
+
+        let installed = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .and_then(|info| info.members_v2.get(&target_hex))
+            .and_then(|member| member.certificate.clone());
+        assert_eq!(
+            installed.as_ref(),
+            Some(&cert),
+            "the carried bytes are installed"
+        );
+        let key = EvictionKey::new(stable, *target_kp.agent_id().as_bytes());
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner
+            .store
+            .get(&key)
+            .expect("the hand-off opens expiry work at the raw not_after");
+        assert_eq!(row.expired_certificates.get(&digest), Some(&not_after));
+        assert!(row.earliest_handoff_receipt_unix_ms.is_some());
+        Ok(())
+    }
 }
