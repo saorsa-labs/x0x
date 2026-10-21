@@ -8821,10 +8821,25 @@ fn verify_authority_attested_member_joined_recovery(
             .get(member_agent_id)
             .and_then(|member| member.added_by.as_deref())
             == Some(authority_agent_id.as_str());
+    // #1357: a member that joined after the attesting commit (every joiner,
+    // for the creator's record) never retains that commit, so "in my
+    // retained log" alone left it unable to hold any earlier member's
+    // package. Once that member's agent is revoked its DMs are dropped and
+    // no removal of its leaf can find the package (ADR 0110 §4b(1), §3).
+    // A commit that predates this node's retained history is accepted too:
+    // its signature, signer, group and binding are still checked below, and
+    // the package must equal the hash this node's verified current roster
+    // commits for the seat, so nothing the roster did not commit to can be
+    // installed. A commit inside the retained window must still be on it.
     let authority_commit_is_accepted = info
         .commit_log
         .iter()
-        .any(|retained| retained.commit == *authority_commit);
+        .any(|retained| retained.commit == *authority_commit)
+        || (authority_commit.revision <= info.state_revision
+            && info
+                .commit_log
+                .first()
+                .is_none_or(|first| authority_commit.revision < first.commit.revision));
     if (!creator_authority && !invited_member_authority)
         || (!member_authenticated && !authority_only_attestation)
         || !package_matches_current_incarnation

@@ -2049,6 +2049,98 @@ mod tests {
     /// Install a verified advert created at `created_at_unix_ms`. The store
     /// keeps an advert only if it is strictly newer than the held one, so a
     /// test that replaces an advert must give the first an earlier time.
+    /// #1357 W3-H `s4_owner_recovery`: the promoted member waited forever
+    /// for the revoked creator's KeyPackage (`waiting_for_member_key_package`
+    /// naming A). A member that joined after the creator's attesting commit
+    /// never retains it, so it refused the creator's attested recovery
+    /// record and never held the package; once A was revoked its DMs were
+    /// dropped and the leaf could not be removed. A later joiner now accepts
+    /// the record while the attesting commit predates its retained history,
+    /// still bound to the roster's committed package hash; a commit inside
+    /// the retained window must still be on it.
+    #[test]
+    fn a_later_joiner_accepts_the_creators_attested_key_package() {
+        use super::super::super as ng;
+        let creator = x0x::identity::AgentKeypair::generate().unwrap();
+        let creator_hex = hex::encode(creator.agent_id().as_bytes());
+        let gid = "ab".repeat(16);
+        let mut info = GroupInfo::new("g".into(), String::new(), creator.agent_id(), gid.clone());
+        let package = "creator-key-package".to_string();
+        info.set_member_treekem_key_package(&creator_hex, package.clone());
+        let original = ng::NamedGroupMetadataEvent::MemberJoined {
+            group_id: gid.clone(),
+            stable_group_id: Some(info.stable_group_id().to_string()),
+            member_agent_id: creator_hex.clone(),
+            member_public_key_b64: String::new(),
+            role: x0x::groups::GroupRole::Admin,
+            display_name: None,
+            inviter_agent_id: creator_hex.clone(),
+            invite_secret: String::new(),
+            ts_ms: 1,
+            treekem_key_package_b64: Some(package),
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
+            certificate_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: String::new(),
+        };
+        info.security_binding = ng::treekem_recovery_security_binding(0, &original);
+        let creator_commit = info.seal_commit(&creator, 1).unwrap();
+        let record =
+            ng::attest_member_joined_recovery_event(&original, &creator, &creator_commit).unwrap();
+        assert!(
+            ng::verify_authority_attested_member_joined_recovery(&info, &record),
+            "the creator's own view accepts its record"
+        );
+
+        // Later history: a member is seated by a later commit.
+        info.add_member(
+            hex::encode([0x42; 32]),
+            x0x::groups::GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        let later = info.seal_commit(&creator, 2).unwrap();
+        assert!(later.revision > creator_commit.revision);
+
+        // A joiner retains history from its join onwards only.
+        let mut joiner = info.clone();
+        joiner
+            .commit_log
+            .retain(|retained| retained.commit == later);
+        assert_eq!(joiner.commit_log.len(), 1);
+        assert!(
+            ng::verify_authority_attested_member_joined_recovery(&joiner, &record),
+            "a later joiner accepts the creator's attested package"
+        );
+
+        // The roster's committed hash still binds the bytes.
+        let mut rebound = joiner.clone();
+        rebound.set_member_treekem_key_package_hash(&creator_hex, "00".repeat(32));
+        assert!(!ng::verify_authority_attested_member_joined_recovery(
+            &rebound, &record
+        ));
+
+        // Inside the retained window, a commit that is not on it (a sibling
+        // at the same revision) is refused.
+        let mut forked = info.clone();
+        for retained in &mut forked.commit_log {
+            if retained.commit == creator_commit {
+                retained.commit.state_hash = "f0".repeat(32);
+            }
+        }
+        assert!(forked
+            .commit_log
+            .first()
+            .is_some_and(|first| first.commit.revision <= creator_commit.revision));
+        assert!(!ng::verify_authority_attested_member_joined_recovery(
+            &forked, &record
+        ));
+    }
+
     fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
         let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
         capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
