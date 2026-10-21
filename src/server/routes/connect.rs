@@ -362,8 +362,9 @@ async fn disabled_saved_forwards(
 /// that are down (`enabled: false` with an `error`).
 ///
 /// No forwarder means connect is disabled. Saved records are still listed,
-/// each with [`CONNECT_DISABLED_REASON`]. An unreadable store stays an
-/// empty list; `store_error` carries the load failure.
+/// each with `enabled` false and an `error` that starts with
+/// `connect_disabled`. An unreadable store stays an empty list;
+/// `store_error` carries the load failure.
 pub(in crate::server) async fn forward_list(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {

@@ -2177,9 +2177,8 @@ impl ForwardService {
     /// [`Self::add_forward`] with the name, machine pin, and persistence
     /// carried in `binding`.
     ///
-    /// The listener accepts before this returns. A caller that must not
-    /// accept until a later save succeeds uses [`Self::bind_forward`] and
-    /// then [`Self::start_accept`].
+    /// The listener accepts before this returns. That is the contract for
+    /// Rust callers.
     ///
     /// # Errors
     /// Same as [`Self::add_forward`].
