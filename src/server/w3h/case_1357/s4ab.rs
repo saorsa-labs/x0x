@@ -639,6 +639,89 @@ async fn past_sync_wait(sim: &Sim, receipt: &mut Receipt) -> Result<()> {
     Ok(())
 }
 
+/// The ordered pairs of `labels` whose sender holds no pinned binding (the
+/// verified machine a pinned send would use) for the recipient.
+async fn missing_bindings(
+    sim: &Sim,
+    labels: &[&'static str],
+) -> Result<Vec<(&'static str, &'static str)>> {
+    let mut missing = Vec::new();
+    for from in labels {
+        let state = sim.state(from)?;
+        for to in labels.iter().filter(|to| *to != from) {
+            let (id, _) = sim.ids(to)?;
+            if state.agent.pinned_binding_now(&id).await.is_none() {
+                missing.push((*from, *to));
+            }
+        }
+    }
+    Ok(missing)
+}
+
+/// Before t = 0, every node holds a pinned binding for every other node.
+///
+/// A pinned send (rebind delivery, catch-up and the capability refresh)
+/// to an agent with no binding runs a peer-evidence Lookup. That Lookup
+/// runs on a blocking worker that `block_on`s a virtual-time deadline
+/// (#1239). Under paused tokio a blocking task inhibits auto-advance, so
+/// the deadline never fires and the case stalls in real time (it reached
+/// nextest's terminate bound in CI, with and without the shim). In this
+/// Home each device announces once, as it joins, so a node that started
+/// later may hold no binding for an earlier one. Every node announces
+/// again once all are up; a pair that still has no binding is an INFRA
+/// failure, never a hang.
+async fn pinned_bindings_ready(
+    sim: &Sim,
+    labels: &[&'static str],
+    receipt: &mut Receipt,
+) -> Result<()> {
+    let mut announced = Vec::with_capacity(labels.len());
+    for label in labels {
+        let (status, body) = sim
+            .api(
+                label,
+                Method::POST,
+                "/announce",
+                Some(json!({"include_user_identity": true, "human_consent": true})),
+            )
+            .await?;
+        announced.push(format!("{label}: {status} {body}"));
+    }
+    let mut last = Vec::new();
+    let waited = sim
+        .until(
+            "every node holds a pinned binding for every peer",
+            SETUP,
+            async |s: &Sim| match missing_bindings(s, labels).await {
+                Ok(missing) => {
+                    let done = missing.is_empty();
+                    last = missing;
+                    done
+                }
+                Err(_) => false,
+            },
+        )
+        .await;
+    if let Err(error) = waited {
+        if !expired(&error) {
+            return Err(error);
+        }
+    }
+    let ready = last.is_empty();
+    receipt.evidence(
+        "every_node_holds_a_pinned_binding_for_every_peer_before_t0",
+        ready,
+        format!("missing (sender, recipient) {last:?}; announces {announced:?}"),
+        sim.fabric().now().as_micros(),
+    );
+    ensure!(
+        ready,
+        "setup: no pinned binding for (sender, recipient) {last:?}; a pinned send would run a \
+         blocking peer-evidence Lookup that stalls paused virtual time"
+    );
+    Ok(())
+}
+
 /// The rebind request; a typed `409 waiting_for_receiver_upgrade` whose
 /// named members have unknown support (`None`, the route asked for an
 /// advert refresh) is retried with a doubling wait until `budget`.
@@ -754,6 +837,7 @@ async fn rebind_scenario(sim: &mut Sim, run: RebindRun, receipt: &mut Receipt) -
         format!("{before:?}"),
         at(sim),
     );
+    pinned_bindings_ready(sim, THREE, receipt).await?;
     past_sync_wait(sim, receipt).await?;
     match run {
         RebindRun::PreCutoff => {
@@ -1460,10 +1544,13 @@ async fn run2(case: &str, seed: u64, arm: Arm2) -> Receipt {
     ));
     match Sim::empty(case, seed, arm.labels()) {
         Ok(mut sim) => {
+            let fabric = Arc::clone(sim.fabric());
+            let watchdog = real_time_watchdog(case, fabric);
             let outcome = match arm {
                 Arm2::Rebind(run) => rebind_scenario(&mut sim, run, &mut receipt).await,
                 Arm2::Recovery(form) => recovery_scenario(&mut sim, form, &mut receipt).await,
             };
+            watchdog.disarm();
             if let Err(error) = outcome {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
             }
@@ -1478,6 +1565,48 @@ async fn run2(case: &str, seed: u64, arm: Arm2) -> Receipt {
     }
     receipt.emit();
     receipt
+}
+
+/// A case that has not finished after this much real time has stalled.
+const REAL_TIME_STALL: Duration = Duration::from_secs(200);
+
+/// A real-time watchdog for one scenario. A stall in a barrier (virtual
+/// time stops while the runtime waits on a blocking task) otherwise shows
+/// only as nextest's terminate, with no trace. On a stall it prints the
+/// tail of the fabric's trace, so the open barrier is named, and exits the
+/// test process.
+struct Watchdog {
+    disarmed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Watchdog {
+    fn disarm(&self) {
+        self.disarmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn real_time_watchdog(case: &str, fabric: Arc<SimFabric>) -> Watchdog {
+    let disarmed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&disarmed);
+    let case = case.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(REAL_TIME_STALL);
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let trace = fabric.canonical_trace();
+        let tail: Vec<&str> = trace.lines().rev().take(60).collect();
+        println!(
+            "W3H-STALL {case}: no progress after {REAL_TIME_STALL:?} real time; last trace lines \
+             (newest first):"
+        );
+        for line in tail {
+            println!("W3H-STALL {line}");
+        }
+        std::process::exit(101);
+    });
+    Watchdog { disarmed }
 }
 
 async fn expect2(case: &str, seed: u64, arm: Arm2, want: Verdict) -> Result<()> {
