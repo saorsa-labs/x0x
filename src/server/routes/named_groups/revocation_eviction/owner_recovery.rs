@@ -2046,7 +2046,10 @@ mod tests {
         );
     }
 
-    fn advertise(state: &AppState, peer: AgentId, bits: u64) {
+    /// Install a verified advert created at `created_at_unix_ms`. The store
+    /// keeps an advert only if it is strictly newer than the held one, so a
+    /// test that replaces an advert must give the first an earlier time.
+    fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
         let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
         capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
         assert!(
@@ -2054,7 +2057,7 @@ mod tests {
                 peer,
                 x0x::identity::MachineId([4; 32]),
                 capabilities,
-                x0x::dm_capability::now_unix_ms(),
+                created_at_unix_ms,
             ),
             "verified capability advert"
         );
@@ -2099,12 +2102,16 @@ mod tests {
             )
         };
 
-        // An advert with every other S4 bit but not bit 7 is refused.
+        // An advert with every other S4 bit but not bit 7 is refused. It is
+        // 1 s old, so the upgraded advert below is strictly newer (two
+        // inserts in one millisecond would drop the second).
+        let now_ms = x0x::dm_capability::now_unix_ms();
         advertise(
             &state,
             survivor,
             x0x::dm::CapabilityRegistry::current().bits
                 & !x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+            now_ms.saturating_sub(1_000),
         );
         assert!(
             admit(rule.clone())().await.is_none(),
@@ -2115,6 +2122,7 @@ mod tests {
             &state,
             survivor,
             x0x::dm::CapabilityRegistry::current().bits,
+            now_ms,
         );
         let seam = admit(rule.clone())().await;
         assert!(
@@ -2131,8 +2139,15 @@ mod tests {
                 info.ban_member(member, None);
             }),
             ("head moved", |info, _| {
+                // An epoch move as production commits it: the epoch and its
+                // security binding move together, and the binding is what
+                // the state hash commits to (the epoch alone leaves the
+                // head unchanged).
+                let before = info.state_hash.clone();
                 info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
                 info.recompute_state_hash();
+                assert_ne!(info.state_hash, before, "the head must move");
             }),
             ("quarantined", |info, _| {
                 info.fork_quarantine = Some(x0x::groups::ForkQuarantine {

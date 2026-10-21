@@ -1865,7 +1865,10 @@ mod daemon_tests {
     use super::*;
     use anyhow::Result;
 
-    fn advertise(state: &AppState, peer: AgentId, bits: u64) {
+    /// Install a verified advert. The store keeps an advert only when it is
+    /// strictly newer than the held one, so each call passes a later
+    /// `created_at_unix_ms`.
+    fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
         let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
         capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
         assert!(
@@ -1873,7 +1876,7 @@ mod daemon_tests {
                 peer,
                 x0x::identity::MachineId([4; 32]),
                 capabilities,
-                x0x::dm_capability::now_unix_ms(),
+                created_at_unix_ms,
             ),
             "verified capability advert"
         );
@@ -1926,10 +1929,12 @@ mod daemon_tests {
             .insert(group_id.clone(), info.clone());
 
         // Bit 5 alone is not bit 6: no admission.
+        let now_ms = x0x::dm_capability::now_unix_ms();
         advertise(
             &state,
             survivor,
             x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+            now_ms.saturating_sub(1_000),
         );
         assert!(
             admit(&state, &stable, &survivor, &rule).await.is_none(),
@@ -1939,6 +1944,7 @@ mod daemon_tests {
             &state,
             survivor,
             x0x::dm::CapabilityRegistry::current().bits,
+            now_ms,
         );
         let seam = admit(&state, &stable, &survivor, &rule).await;
         assert!(
