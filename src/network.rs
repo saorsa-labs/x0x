@@ -149,14 +149,15 @@ impl SessionConnection {
     }
 
     /// The connection's current remote UDP address (#1112): the address
-    /// the guards compare against rejected seed addresses. `None` on the
-    /// simulated backend, which does not report addresses here; sim-side
-    /// guards therefore rely on the generation clause.
+    /// the guards compare against rejected and pinned seed addresses —
+    /// the winner-map view, which does not depend on the
+    /// `connected_peers()` metadata a freshly materialized internal
+    /// connection may not have registered yet.
     fn remote_address(&self) -> Option<SocketAddr> {
         match self {
             Self::Quic(connection) => Some(connection.remote_address()),
             #[cfg(test)]
-            Self::Sim(_) => None,
+            Self::Sim(connection) => Some(connection.remote_address()),
         }
     }
 
@@ -4909,10 +4910,14 @@ impl NetworkNode {
     /// not a connection, so ANY current connection of the identity on a
     /// rejected address is refused, and so is any current connection on a
     /// pinned address whose pin set excludes the identity (the timeless
-    /// pair verdict, round 8 — independent of backoff entries). Returns
-    /// `false` before the transport read when the pin table is empty and
-    /// no live rejection names the identity, so today's hot paths (no
-    /// pins, nothing rejected) pay nothing.
+    /// pair verdict, round 8 — independent of backoff entries). The
+    /// session check runs whenever pins exist, entry or not (round 9):
+    /// `connected_peers()` metadata can lag a freshly materialized
+    /// internal connection, and the session lookup reads the winner map
+    /// the reader actually uses. Returns `false` before the transport
+    /// read when the pin table is empty and no live rejection names the
+    /// identity, so today's hot paths (no pins, nothing rejected) pay
+    /// nothing.
     async fn seed_pin_rejected_session(&self, peer_id: &AntPeerId) -> bool {
         let has_entries = self.any_live_seed_pin_rejection_for(peer_id.0);
         if dial_pin_table().is_empty() && !has_entries {
@@ -4922,7 +4927,7 @@ impl NetworkNode {
         let Some(node) = node_guard.as_ref() else {
             return false;
         };
-        if has_entries && self.seed_pin_rejects_current_session(node, peer_id) {
+        if self.seed_pin_rejects_current_session(node, peer_id) {
             return true;
         }
         let rejected_addrs: Vec<SocketAddr> = self

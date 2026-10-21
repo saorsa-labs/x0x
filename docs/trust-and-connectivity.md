@@ -137,11 +137,14 @@ completion order. An entry with no generation evidence (the mismatching
 connection closed before capture) stays address-scoped: it refuses a
 session on its own address only, never the identity's sessions elsewhere.
 Independent of every recorded entry, the guards also apply the timeless
-pair verdict to the live connection set: a current connection on a
-pinned address whose pin set excludes the identity is refused with no
-entry at all and after an entry expires — this is what catches an
-ant-quic-internal coordinator redial of a rejected seed, whose connection
-never passed x0x's dial seam. The guarded-send policy is recomputed
+pair verdict to the live session and connection set whenever any pin row
+exists — with no entry and after an entry expires: the session lookup
+reads the winner map the transport reader actually uses, which does not
+depend on the `connected_peers()` metadata a freshly materialized
+internal connection may not have registered yet, and every current
+connection of the identity is checked against the pin rows too. This is
+what catches an ant-quic-internal coordinator redial of a rejected seed,
+whose connection never passed x0x's dial seam. The guarded-send policy is recomputed
 inside the post-`open_uni` callback, so a rejection that lands while a
 stream waits for credit refuses the bytes there. The capability-hint
 selector additionally validates the observed (seed address, identity)
