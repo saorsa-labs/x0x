@@ -249,20 +249,32 @@ impl DaemonClient {
         if self.dump {
             return self.emit_dump("POST", path, None);
         }
-        let request = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .headers(self.auth_headers());
-        let request = if path == "/upgrade/apply" {
-            // The daemon checks the release, downloads the archive and signature
-            // (each download permits 120 s), then verifies and installs them.
-            // Leave time for that work without extending other CLI requests.
-            request.timeout(Duration::from_secs(10 * 60))
-        } else {
-            request
-        };
-        let resp = request.send().await.context("request failed")?;
+        let resp = self
+            .post_empty_request(path)?
+            .send()
+            .await
+            .context("request failed")?;
         self.handle_response(resp).await
+    }
+
+    fn post_empty_request(&self, path: &str) -> Result<reqwest::RequestBuilder> {
+        let endpoint = path.split_once('?').map_or(path, |(endpoint, _)| endpoint);
+        let request = if endpoint == "/upgrade/apply" {
+            // Staging can exceed an hour. A separate client has no total
+            // request timeout; clearing a Request timeout would still inherit
+            // the normal client's 30-second default. Connection setup remains
+            // bounded. The server owns eligibility, holds and cancellation.
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(30))
+                .build()
+                .context("failed to create upgrade HTTP client")?
+                .post(format!("{}{}", self.base_url, path))
+        } else {
+            self.client
+                .post(format!("{}{}", self.base_url, path))
+                .timeout(Duration::from_secs(30))
+        };
+        Ok(request.headers(self.auth_headers()))
     }
 
     /// Send a PATCH request with a JSON body.
@@ -658,6 +670,11 @@ pub fn print_error(msg: &str) {
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_now_timeout.rs"
+    ));
+    upgrade_now_timeout_regression_tests!();
     use super::*;
 
     #[test]

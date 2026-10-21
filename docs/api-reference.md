@@ -2916,6 +2916,18 @@ authenticated `POST /upgrade/apply` through the normal daemon client, using
 the selected `--name` or `--api` and its bearer token. It does not install
 from the CLI process. Apply fails if no daemon is available.
 
+On Unix, apply waits for the durable staging receipt without holding the
+apply mutex or install lock. The optional query `now=true`, sent by
+`x0x upgrade --apply --now`, skips only the staging delay. It retains release
+eligibility, fleet receipt checks, durable holds, probe retry waits and
+transaction checks. It does not reset or discard a receipt. The query
+defaults to `false` and requires the same durable owner token as ordinary
+apply. `--now` requires `--apply` and conflicts with `--check`.
+
+The CLI bounds connection setup to 30 seconds but sets no total timeout for
+these apply requests. A staging wait can exceed an hour. Other CLI requests
+retain their normal timeout.
+
 Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
 installation. `x0x upgrade --check` is a standalone GitHub release check and
 needs **no running daemon**. `--check` takes precedence over `--apply`;

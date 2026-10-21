@@ -172,6 +172,7 @@ Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-ag
 ```bash
 x0x upgrade --check    # read-only: checks GitHub for a signed release (no daemon needed)
 x0x upgrade --apply    # installs through the running daemon's authenticated POST /upgrade/apply
+x0x upgrade --apply --now  # skips staging only; eligibility, holds and transaction checks remain
 # Bare x0x upgrade and --force without --apply do not install.
 # --check takes precedence over --apply; --force cannot bypass daemon apply policy.
 # You can also call the same authenticated endpoint directly:
@@ -179,6 +180,12 @@ x0x upgrade --apply    # installs through the running daemon's authenticated POS
 ```
 
 Use `x0x upgrade --apply`, REST or the GUI to request installation. The daemon checks the signed release and owns the download, verification, replacement and restart. `x0xd --check-updates` only reports availability; it does not install binaries or SKILL.md. The daemon also distributes ML-DSA-65-signed manifests over the `x0x/release` gossip topic, with GitHub as the first-discovery fallback. See [docs/upgrade-system.md](./docs/upgrade-system.md), and never downgrade an owned install to v0.40.x (#451).
+
+On Unix, ordinary apply waits for its durable staging receipt. `--now`
+maps to the same authenticated route with `?now=true`; it cannot bypass a
+held release or a mandatory probe retry wait. It requires `--apply` and
+cannot be combined with `--check`. The CLI keeps the apply request open
+during staging, which can exceed an hour.
 
 ---
 

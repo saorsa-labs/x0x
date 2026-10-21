@@ -3214,7 +3214,15 @@
       "method": "POST",
       "path": "/upgrade/apply",
       "request": {
-        "kind": "none"
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "now",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
