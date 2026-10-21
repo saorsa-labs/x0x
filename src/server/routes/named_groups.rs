@@ -28454,10 +28454,15 @@ pub(in crate::server) fn reject_fork_quarantined_marker(
     state
         .groups_diagnostics
         .record_fork_quarantine_refusal(group_id);
-    (
-        StatusCode::CONFLICT,
-        Json(fork_quarantine_refusal_body(group_id, marker)),
-    )
+    let mut body = fork_quarantine_refusal_body(group_id, marker);
+    // ADR 0109 §8: the additive `recovery` object.
+    if let (Some(recovery), Some(map)) = (
+        group_recovery::cached_recovery_json(state, group_id),
+        body.as_object_mut(),
+    ) {
+        map.insert("recovery".to_string(), recovery);
+    }
+    (StatusCode::CONFLICT, Json(body))
 }
 
 /// ADR-0066 §1 rows 1, 2, 4 and 6 + §4 (slice 9): the re-check the four
