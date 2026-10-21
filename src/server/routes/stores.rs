@@ -1778,6 +1778,17 @@ pub(in crate::server) fn gss_kv_refresh(
                 };
                 (outcome, start_repair)
             };
+            // The group ciphertext boundary (ADR 0110 §4). The GSS seal is
+            // synchronous, so this async hook, which the sync loops run
+            // before every seal, sets the context's hold. It runs after the
+            // named-groups guard above is released.
+            if outcome != GssBindingRefresh::Ineligible {
+                let withheld =
+                    super::named_groups::group_ciphertext_withheld(&state, &group_key, None)
+                        .await
+                        .is_some();
+                ctx.set_seal_withheld(withheld);
+            }
             if start_repair {
                 spawn_gss_key_gap_repair(&state, topic);
             } else if outcome == GssBindingRefresh::Ineligible {
