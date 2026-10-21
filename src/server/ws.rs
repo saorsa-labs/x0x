@@ -2472,12 +2472,21 @@ mod tests {
         state
             .gui_show
             .reload_from_disk()
-            .expect("reload turns local show back on");
-        assert!(state.gui_show.config().local_enabled);
-        assert!(!dir
+            .expect("reload of an unchanged config");
+        assert!(
+            !state.gui_show.config().local_enabled,
+            "an unchanged local_enabled = true does not cancel Stop"
+        );
+        assert!(dir
             .path()
             .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
-            .exists());
+            .is_file());
+        std::fs::remove_file(dir.path().join(crate::gui::show::LOCAL_SHOW_STOP_FILE))
+            .expect("delete marker");
+        assert!(
+            state.gui_show.config().local_enabled,
+            "deleting the marker turns local show back on"
+        );
     }
 
     #[tokio::test]

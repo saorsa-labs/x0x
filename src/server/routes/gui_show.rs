@@ -584,10 +584,14 @@ mod tests {
             .gui_show
             .reload_from_disk()
             .map_err(|error| anyhow::anyhow!(error))?;
-        assert!(!dir
+        assert!(dir
             .path()
             .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
-            .exists());
+            .is_file());
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "disabled", "{body}");
+        std::fs::remove_file(dir.path().join(crate::gui::show::LOCAL_SHOW_STOP_FILE))?;
         let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["outcome"], "opened", "{body}");

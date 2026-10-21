@@ -1317,8 +1317,9 @@ pub async fn serve_with_options(
             runtime.set_config_path(daemon_config_path);
             runtime.set_write_path(gui_show_write_path);
             // `with_defaults` applies a side-file stop before the config path
-            // is known. Apply again so an explicit `local_enabled = true` in
-            // the loaded file wins.
+            // is known. Apply again once the path is attached. The marker
+            // still forces show off when the loaded file already says
+            // `local_enabled = true`.
             runtime.apply_persisted_local_stop();
             runtime
         },

@@ -5,6 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -284,6 +285,11 @@ pub struct GuiShowRuntime {
     blocked_path: PathBuf,
     /// `data_dir/gui_show_local_disabled`. Stop always writes this marker.
     local_stop_path: PathBuf,
+    /// True after this process saved the marker, or found it at startup.
+    ///
+    /// A failed marker write leaves this false, so show stays off in memory
+    /// even though the file is absent. Deleting a saved marker clears it.
+    stop_persisted: AtomicBool,
     /// Shows waiting for the GUI window that was opened for each one.
     pending: Mutex<VecDeque<PendingGuiShow>>,
 }
@@ -316,11 +322,12 @@ impl GuiShowRuntime {
             write_path: Mutex::new(None),
             blocked_path,
             local_stop_path,
+            stop_persisted: AtomicBool::new(false),
             pending: Mutex::new(VecDeque::new()),
         };
-        // Honour a stop recorded before this process. `serve` calls this
-        // again after it attaches the loaded config path, so an explicit
-        // `local_enabled = true` in that file can clear the marker.
+        // Honour a stop recorded before this process. The marker wins over
+        // a config that already says `local_enabled = true`, because Stop
+        // does not rewrite that file.
         runtime.apply_persisted_local_stop();
         runtime
     }
@@ -331,7 +338,15 @@ impl GuiShowRuntime {
     }
 
     /// Snapshot of `[gui_show]`.
+    ///
+    /// A deleted stop marker is applied here, so the next show sees it
+    /// without a new route and without `POST /acl/reload`.
     pub fn config(&self) -> GuiShowConfig {
+        self.lift_stop_if_marker_deleted();
+        self.config_snapshot()
+    }
+
+    fn config_snapshot(&self) -> GuiShowConfig {
         self.config.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
@@ -344,36 +359,25 @@ impl GuiShowRuntime {
 
     /// Re-read `[gui_show]` from the daemon TOML when a path is known.
     ///
-    /// No path means startup loaded no file. A config created later at the
-    /// write path is read, so the human can turn show back on without a
-    /// restart. A missing write path is not an error, and a side-file stop
-    /// stays in memory. A read failure or a TOML error is returned and does
-    /// not change the in-memory config. `local_enabled = true` in the file
-    /// clears a side-file stop. A file that does not set the key leaves that
-    /// stop in place.
+    /// No path means startup loaded no file. A missing write path is not an
+    /// error. A read failure or a TOML error is returned and does not change
+    /// the in-memory config.
+    ///
+    /// The stop marker stays in force while the file exists, including when
+    /// the daemon config already says `local_enabled = true`. Deleting the
+    /// marker returns control to that config. With no config file, deleting
+    /// the marker turns local show back on.
     pub fn reload_from_disk(&self) -> Result<(), String> {
         let had_config_path = self.stored_config_path().is_some();
         let Some(path) = self.reload_config_path() else {
+            self.lift_stop_if_marker_deleted();
             return Ok(());
         };
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("failed to read GUI config {}: {error}", path.display()))?;
-        #[derive(Deserialize)]
-        struct Partial {
-            #[serde(default)]
-            gui_show: GuiShowConfig,
-        }
-        let partial = toml::from_str::<Partial>(&text)
+        let gui_show = parse_gui_show_table(&text)
             .map_err(|error| format!("failed to parse GUI config {}: {error}", path.display()))?;
-        let explicit = explicit_local_enabled(&text);
-        if explicit == Some(true) {
-            self.clear_local_stop()?;
-        }
-        let mut gui_show = partial.gui_show;
-        if explicit != Some(true) && self.local_stop_path.is_file() {
-            gui_show.local_enabled = false;
-        }
-        self.set_config(gui_show);
+        self.set_config(self.config_under_stop_marker(gui_show));
         if !had_config_path {
             self.set_config_path(Some(path));
         }
@@ -382,24 +386,57 @@ impl GuiShowRuntime {
 
     /// Apply a data-directory stop from an earlier process.
     ///
-    /// An explicit `local_enabled = true` in the loaded daemon config clears
-    /// the marker and leaves show on. Otherwise the marker forces show off,
-    /// including when startup loaded no file (`serve(config)`, or `x0xd
-    /// --name` with no config).
+    /// The marker forces show off, including when the loaded config sets
+    /// `local_enabled = true` and when startup loaded no file (`serve(config)`,
+    /// or `x0xd --name` with no config). Stop does not rewrite the config, so
+    /// that existing value is not a new enable decision.
     pub(crate) fn apply_persisted_local_stop(&self) {
         if !self.local_stop_path.is_file() {
             return;
         }
-        if self.loaded_config_sets_local_enabled_true() {
-            let _ = self.clear_local_stop();
-            let mut config = self.config();
+        self.stop_persisted.store(true, Ordering::SeqCst);
+        let mut config = self.config_snapshot();
+        config.local_enabled = false;
+        self.set_config(config);
+    }
+
+    /// The parsed config, forced off while the stop marker is still on disk.
+    fn config_under_stop_marker(&self, mut gui_show: GuiShowConfig) -> GuiShowConfig {
+        if self.local_stop_path.is_file() {
+            gui_show.local_enabled = false;
+            self.stop_persisted.store(true, Ordering::SeqCst);
+        } else {
+            self.stop_persisted.store(false, Ordering::SeqCst);
+        }
+        gui_show
+    }
+
+    /// A human deleted a marker this process had saved.
+    ///
+    /// A failed marker write never sets `stop_persisted`, so show stays off
+    /// in this process. With a daemon config, the file's `[gui_show]` applies
+    /// again. With no file, local show returns to the default (on).
+    fn lift_stop_if_marker_deleted(&self) {
+        if self.local_stop_path.is_file() {
+            return;
+        }
+        if !self.stop_persisted.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let Some(path) = self.reload_config_path() else {
+            let mut config = self.config_snapshot();
             config.local_enabled = true;
             self.set_config(config);
             return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.stop_persisted.store(true, Ordering::SeqCst);
+            return;
+        };
+        match parse_gui_show_table(&text) {
+            Ok(gui_show) => self.set_config(gui_show),
+            Err(_) => self.stop_persisted.store(true, Ordering::SeqCst),
         }
-        let mut config = self.config();
-        config.local_enabled = false;
-        self.set_config(config);
     }
 
     /// Config path `POST /acl/reload` reads when startup loaded no file.
@@ -437,11 +474,13 @@ impl GuiShowRuntime {
     /// modify the daemon config: a named instance would then refuse to start.
     pub fn disable_local_show(&self) -> Result<(), String> {
         self.remember_local_stop();
-        self.write_local_stop_file()
+        self.write_local_stop_file()?;
+        self.stop_persisted.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn remember_local_stop(&self) {
-        let mut config = self.config();
+        let mut config = self.config_snapshot();
         config.local_enabled = false;
         self.set_config(config);
     }
@@ -457,17 +496,6 @@ impl GuiShowRuntime {
             std::fs::create_dir_all(parent).map_err(&report)?;
         }
         std::fs::write(&self.local_stop_path, b"local_enabled = false\n").map_err(report)
-    }
-
-    fn clear_local_stop(&self) -> Result<(), String> {
-        match std::fs::remove_file(&self.local_stop_path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!(
-                "failed to clear persisted local show stop {}: {error}",
-                self.local_stop_path.display()
-            )),
-        }
     }
 
     fn stored_config_path(&self) -> Option<PathBuf> {
@@ -493,16 +521,6 @@ impl GuiShowRuntime {
         } else {
             None
         }
-    }
-
-    fn loaded_config_sets_local_enabled_true(&self) -> bool {
-        let Some(path) = self.stored_config_path().filter(|path| path.is_file()) else {
-            return false;
-        };
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        explicit_local_enabled(&text) == Some(true)
     }
 
     /// Rate-limit gate; `true` means the show may proceed.
@@ -671,17 +689,19 @@ pub fn origin_banner(agent_label: &str, machine_label: &str, rider: bool) -> Str
     format!("{opened}. {LOCAL_SHOW_REENABLE}")
 }
 
-/// `Some` when the daemon TOML sets `[gui_show] local_enabled`.
+/// `[gui_show]` from a daemon TOML document.
 ///
-/// Absent means the key was not set. The serde default is `true`, which
-/// must not wipe a side-file stop.
-fn explicit_local_enabled(text: &str) -> Option<bool> {
-    let table: toml::Table = text.parse().ok()?;
-    table
-        .get("gui_show")
-        .and_then(toml::Value::as_table)
-        .and_then(|gui| gui.get("local_enabled"))
-        .and_then(toml::Value::as_bool)
+/// Absent keys use [`GuiShowConfig`]'s defaults. A parse error is the TOML
+/// error text.
+fn parse_gui_show_table(text: &str) -> Result<GuiShowConfig, String> {
+    #[derive(Deserialize)]
+    struct Partial {
+        #[serde(default)]
+        gui_show: GuiShowConfig,
+    }
+    toml::from_str::<Partial>(text)
+        .map(|partial| partial.gui_show)
+        .map_err(|error| error.to_string())
 }
 
 /// Short hex id for banner fallbacks (10 chars + ellipsis in the GUI; we
@@ -778,12 +798,17 @@ mod tests {
         std::fs::write(&path, original).expect("human sets local_enabled = true");
         rt.reload_from_disk().expect("reload after re-enable");
         assert!(
-            rt.config().local_enabled,
-            "POST /acl/reload applies local_enabled = true"
+            !rt.config().local_enabled,
+            "an unchanged local_enabled = true does not cancel Stop"
         );
         assert!(
-            !dir.path().join(LOCAL_SHOW_STOP_FILE).exists(),
-            "reload drops the stop marker"
+            dir.path().join(LOCAL_SHOW_STOP_FILE).is_file(),
+            "reload leaves the stop marker in place"
+        );
+        std::fs::remove_file(dir.path().join(LOCAL_SHOW_STOP_FILE)).expect("delete marker");
+        assert!(
+            rt.config().local_enabled,
+            "deleting the marker turns local show back on"
         );
         assert!(rt.config().remote_enabled);
     }
@@ -940,7 +965,7 @@ mod tests {
             &default_path,
             "network_id = \"x0x.testnet\"\n\n[gui_show]\nlocal_enabled = true\n",
         )
-        .expect("human turns show back on in a real config");
+        .expect("a real config that already enables show");
         let text = std::fs::read_to_string(&default_path).expect("config");
         let (parsed, _) = crate::server::config::analyze(&text).expect("startup parses it");
         assert!(
@@ -950,10 +975,17 @@ mod tests {
             ),
             "the re-enable config still has network_id, so the named instance starts"
         );
+        let still_stopped = runtime(data.path(), Some(default_path.clone()));
+        assert!(
+            !still_stopped.config().local_enabled,
+            "a config that already says local_enabled = true does not clear the marker"
+        );
+        assert!(data.path().join(LOCAL_SHOW_STOP_FILE).is_file());
+        std::fs::remove_file(data.path().join(LOCAL_SHOW_STOP_FILE)).expect("delete marker");
         let reenabled = runtime(data.path(), Some(default_path));
         assert!(
             reenabled.config().local_enabled,
-            "explicit local_enabled = true clears the side-file stop on the next start"
+            "deleting the marker lets the next start turn show on"
         );
         assert!(!data.path().join(LOCAL_SHOW_STOP_FILE).exists());
     }
@@ -972,18 +1004,28 @@ mod tests {
         );
         assert!(
             !rt.config().local_enabled,
-            "reload must not turn show back on when no config sets it true"
+            "reload must not turn show back on while the marker is present"
+        );
+
+        std::fs::remove_file(data.path().join(LOCAL_SHOW_STOP_FILE)).expect("delete marker");
+        assert!(
+            rt.reload_from_disk().is_ok(),
+            "reload after the marker is deleted is not an error"
+        );
+        assert!(
+            rt.config().local_enabled,
+            "deleting the marker turns show back on when no config file exists"
         );
 
         let restarted = runtime(data.path(), None);
         assert!(
-            !restarted.config().local_enabled,
-            "the next serve of the same data directory stays stopped"
+            restarted.config().local_enabled,
+            "the next serve of the same data directory follows the deleted marker"
         );
     }
 
     #[test]
-    fn reload_clears_a_side_file_stop_when_config_sets_local_enabled_true() {
+    fn reload_keeps_a_side_file_stop_until_the_marker_is_deleted() {
         let data = tempfile::tempdir().expect("tempdir");
         let config_dir = tempfile::tempdir().expect("tempdir");
         let path = config_dir.path().join("config.toml");
@@ -1018,11 +1060,19 @@ mod tests {
         )
         .expect("human re-enable");
         rt.reload_from_disk()
-            .expect("POST /acl/reload applies local_enabled = true");
-        assert!(rt.config().local_enabled);
+            .expect("POST /acl/reload reads local_enabled = true");
         assert!(
-            !data.path().join(LOCAL_SHOW_STOP_FILE).exists(),
-            "reload drops the side-file stop"
+            !rt.config().local_enabled,
+            "reload leaves Stop in force while the marker exists"
+        );
+        assert!(
+            data.path().join(LOCAL_SHOW_STOP_FILE).is_file(),
+            "reload does not delete the stop marker"
+        );
+        std::fs::remove_file(data.path().join(LOCAL_SHOW_STOP_FILE)).expect("delete marker");
+        assert!(
+            rt.config().local_enabled,
+            "deleting the marker applies the config that sets local_enabled = true"
         );
 
         let restarted = runtime(data.path(), Some(path.clone()));
@@ -1033,7 +1083,7 @@ mod tests {
         restarted.apply_persisted_local_stop();
         assert!(
             restarted.config().local_enabled,
-            "a later start keeps the explicit re-enable"
+            "a later start with no marker keeps show on"
         );
     }
 
