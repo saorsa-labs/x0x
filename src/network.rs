@@ -2373,6 +2373,12 @@ pub struct NetworkNode {
     /// churning an LRU eviction, or ignoring an operator teardown. See
     /// [`DisconnectReason`] and [`NetworkNode::is_reconnect_suppressed`].
     reconnect_suppressions: Arc<Mutex<HashMap<[u8; 32], ReconnectSuppression>>>,
+    /// #1112: identities a seed-pin mismatch rejected, recorded at the
+    /// shared address-dial boundary. `peer_admission` answers `Suppressed`
+    /// for them, so a rejected identity never reads gossip-admitted even
+    /// if some non-x0x path left a connection live. A leaf mutex: never
+    /// held across an await or another lock.
+    seed_pin_rejections: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
     /// Per-node, per-peer interlock for the real suppressed-inbound close.
     #[cfg(test)]
     suppressed_inbound_probe: Arc<Mutex<Option<SuppressedInboundProbe>>>,
@@ -2824,6 +2830,9 @@ impl NetworkNode {
             #[cfg(test)]
             one_sided_redial_pause: Arc::new(Mutex::new(Duration::ZERO)),
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
+            seed_pin_rejections: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             #[cfg(test)]
             suppressed_inbound_probe: Arc::new(Mutex::new(None)),
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
@@ -4086,6 +4095,35 @@ impl NetworkNode {
                 self.dial_gated_answered(&node, &peer_conn.peer_id, origin)
                     .await?;
 
+                // #1112 (review round 4): per-address seed pin, enforced at
+                // the shared address-dial boundary BEFORE the cache write,
+                // success record, and PeerConnected event — a pinned seed
+                // address that answers outside its pin set never reaches
+                // any bookkeeping or admission. Every address dial (manual
+                // connects, join dials, HyParView bootstrap dials) routes
+                // through here.
+                if let SeedPinVerdict::Mismatch { answered } =
+                    seed_pin_check(pinned_seed_peer_ids(addr), peer_conn.peer_id.0)
+                {
+                    self.record_seed_pin_rejection(peer_conn.peer_id.0);
+                    tracing::warn!(
+                        target: "x0x::connect",
+                        origin,
+                        %addr,
+                        answered = %hex_prefix(&answered, 8),
+                        "seed pin mismatch: closing and refusing the dial (issue #1112)"
+                    );
+                    let _ = self
+                        .disconnect_with_reason(
+                            &peer_conn.peer_id,
+                            DisconnectReason::PolicyRejection,
+                        )
+                        .await;
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "#1112: seed pin mismatch at {addr}; dial refused ({origin})"
+                    )));
+                }
+
                 let rtt_ms = dur_ms as u32;
                 if let Some(ref cache) = self.bootstrap_cache {
                     cache
@@ -4501,6 +4539,12 @@ impl NetworkNode {
         if self.is_reconnect_suppressed(peer_id.0) {
             return PeerAdmission::Suppressed;
         }
+        // #1112 (review round 4): a seed-pin rejection outranks transport
+        // truth exactly like a suppression tombstone — the identity never
+        // reads gossip-admitted, on any path that left a connection live.
+        if self.is_seed_pin_rejected(peer_id.0) {
+            return PeerAdmission::Suppressed;
+        }
         if !self.is_connected(peer_id).await {
             return PeerAdmission::NotConnected;
         }
@@ -4518,6 +4562,32 @@ impl NetworkNode {
     /// keepalives) must use this instead of raw [`Self::is_connected`].
     pub async fn is_peer_admitted(&self, peer_id: &AntPeerId) -> bool {
         self.peer_admission(peer_id).await == PeerAdmission::Admitted
+    }
+
+    /// Record a seed-pin rejection (issue #1112). Called at the shared
+    /// address-dial boundary; a recorded identity reads `Suppressed` from
+    /// [`Self::peer_admission`] from then on.
+    fn record_seed_pin_rejection(&self, peer_id: [u8; 32]) {
+        if let Ok(mut rejected) = self.seed_pin_rejections.lock() {
+            rejected.insert(peer_id);
+        }
+    }
+
+    /// Whether `peer_id` was rejected by a seed-pin mismatch (#1112).
+    fn is_seed_pin_rejected(&self, peer_id: [u8; 32]) -> bool {
+        self.seed_pin_rejections
+            .lock()
+            .map(|rejected| rejected.contains(&peer_id))
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of the seed-pin-rejected identities (#1112), for callers
+    /// that assemble join candidates or hints away from this node.
+    pub fn seed_pin_rejected_snapshot(&self) -> std::collections::HashSet<[u8; 32]> {
+        self.seed_pin_rejections
+            .lock()
+            .map(|rejected| rejected.clone())
+            .unwrap_or_default()
     }
 
     /// `set_at` of the live suppression tombstone for `peer_id`, if any.

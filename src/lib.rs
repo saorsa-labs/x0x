@@ -786,12 +786,6 @@ pub struct Agent {
         std::sync::Arc<tokio::sync::broadcast::Sender<VerifiedCertificate>>,
     /// ADR-0035 metering: relay/coordinator selection-skew counters.
     pub(crate) selection_skew: std::sync::Arc<SelectionSkew>,
-    /// #1112: identities a seed-pin mismatch rejected. Grown only by the
-    /// join dial verdicts; read by hint selection and join-candidate
-    /// assembly so a rejected identity cannot return through the cache
-    /// (a leaf mutex: never held across an await or another lock).
-    pub(crate) seed_pin_rejected:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
     /// This daemon's live `(user_id, agent_certificate)` pair, served to
     /// blob fetchers by the responder task.
     pub(crate) own_cert_pair: announce_blob::SharedCertPair,
@@ -1700,6 +1694,21 @@ fn classify_with_cache(
     } else {
         SelectionChoice::NonBootstrap
     }
+}
+
+/// The operator bootstrap ADDRESS set (#1112 round 4): every seed
+/// listener row exactly. The operator hint tier matches the FULL observed
+/// socket address against this set, never the IP alone — a NATed peer
+/// with a relay slot on a seed advertises the seed's IP on an allocated
+/// port, and an IP-only match would wrongly enlist it as an operator
+/// hint.
+#[must_use]
+pub(crate) fn bootstrap_seed_addrs() -> std::collections::HashSet<std::net::SocketAddr> {
+    network::DEFAULT_BOOTSTRAP_PEERS
+        .iter()
+        .filter_map(|row| row.parse::<std::net::SocketAddr>().ok())
+        .map(network::normalize_v4_mapped_addr)
+        .collect()
 }
 
 /// The operator bootstrap IP set, deduped by IP across port rows
@@ -5517,7 +5526,6 @@ async fn collect_coordinator_hints(
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
     own_machine_id: identity::MachineId,
-    seed_pin_rejected: &std::collections::HashSet<[u8; 32]>,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
     let origins = network.connected_peer_origins().await;
@@ -5530,13 +5538,16 @@ async fn collect_coordinator_hints(
     // ADR-0035 metering: classify every hint this announce is about to
     // advertise — the supply-side choice skew.
     let bootstrap_ips = bootstrap_ip_set();
+    let seed_addrs = bootstrap_seed_addrs();
+    let seed_pin_rejected = network.seed_pin_rejected_snapshot();
     let cache = machine_cache.read().await;
     select_capability_hints(
         &origins,
         &cache,
         own_machine_id,
         &bootstrap_ips,
-        seed_pin_rejected,
+        &seed_addrs,
+        &seed_pin_rejected,
         selection_skew,
     )
 }
@@ -5570,6 +5581,7 @@ fn select_capability_hints(
     cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
     own_machine_id: identity::MachineId,
     bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
+    seed_addrs: &std::collections::HashSet<std::net::SocketAddr>,
     seed_pin_rejected: &std::collections::HashSet<[u8; 32]>,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
@@ -5586,15 +5598,18 @@ fn select_capability_hints(
             continue;
         }
         // Operator tier: the OBSERVED transport address of a DIRECT path
-        // is a seed IP. The peer cannot forge this by announcing anything.
-        // v4-mapped forms are normalized here as well as in
-        // `connected_peer_origins`, so the pure function's contract does
-        // not depend on the caller (review round 3).
+        // IS a seed listener address — the FULL socket address, never the
+        // IP alone (round 4: a NATed peer with a relay slot on a seed
+        // advertises the seed's IP on an allocated port, and an IP-only
+        // match would wrongly enlist it). The peer cannot forge this by
+        // announcing anything. v4-mapped forms are normalized here as
+        // well as in `connected_peer_origins`, so the pure function's
+        // contract does not depend on the caller (review round 3).
         let on_operator_host = origin
             .direct
             .then(|| origin.remote_addr.map(network::normalize_v4_mapped_addr))
             .flatten()
-            .is_some_and(|observed| bootstrap_ips.contains(&observed.ip()));
+            .is_some_and(|observed| seed_addrs.contains(&observed));
         let Some(entry) = cache.get(&mid) else {
             // No announcement seen: only the operator tier can qualify,
             // under the same deduplication and cap as the tiers below
@@ -5814,7 +5829,6 @@ struct HeartbeatContext {
     heartbeat_tick: std::sync::atomic::AtomicU64,
     /// #1112: identities a seed-pin mismatch rejected (excluded from the
     /// heartbeat's coordinator/relay hints).
-    seed_pin_rejected: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
     /// L3 retirement flip: publish the legacy V2 announce set only when true.
     legacy_announce: bool,
     /// ADR-0035 metering: relay/coordinator selection-skew counters.
@@ -5933,11 +5947,6 @@ impl HeartbeatContext {
                 self.network.as_ref(),
                 &self.machine_cache,
                 self.identity.machine_id(),
-                &self
-                    .seed_pin_rejected
-                    .lock()
-                    .map(|rejected| rejected.clone())
-                    .unwrap_or_default(),
                 &self.selection_skew,
             )
             .await
@@ -12772,11 +12781,6 @@ impl Agent {
                 network.as_ref(),
                 &self.machine_discovery_cache,
                 self.machine_id(),
-                &self
-                    .seed_pin_rejected
-                    .lock()
-                    .map(|rejected| rejected.clone())
-                    .unwrap_or_default(),
                 &self.selection_skew,
             )
             .await
@@ -15079,7 +15083,6 @@ impl Agent {
                 legacy_announce: self.legacy_announce,
                 self_name: std::sync::Arc::clone(&self.self_name),
                 self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
-                seed_pin_rejected: std::sync::Arc::clone(&self.seed_pin_rejected),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -15384,11 +15387,7 @@ impl Agent {
         // but is not in that address's pin set is a poisoned cache row —
         // dial it by id never (drop the row, keep the cache untouched for
         // ant-quic's own accounting).
-        let rejected = self
-            .seed_pin_rejected
-            .lock()
-            .map(|rejected| rejected.clone())
-            .unwrap_or_default();
+        let rejected = network.seed_pin_rejected_snapshot();
         cached_peers.retain(|peer| {
             if rejected.contains(&peer.peer_id.0) {
                 return false;
@@ -15594,9 +15593,6 @@ impl Agent {
         Vec<(std::net::SocketAddr, ant_quic::PeerId)>,
         Vec<std::net::SocketAddr>,
     ) {
-        // #1112 (review round 3): identities a pin mismatch rejects are
-        // remembered so they cannot return through the cache tiers.
-        let seed_pin_rejected = std::sync::Arc::clone(&self.seed_pin_rejected);
         use tokio::time::{timeout, Duration};
 
         // Per-connection timeout prevents hanging when connecting to
@@ -15613,7 +15609,6 @@ impl Agent {
                 let net = network.clone();
                 let addr = *addr;
                 let stop = stop.clone();
-                let seed_pin_rejected = std::sync::Arc::clone(&seed_pin_rejected);
                 tokio::spawn(async move {
                     tracing::debug!("Connecting to peer: {}", addr);
                     // x0x#1321: shutdown can begin after the parent's check.
@@ -15625,48 +15620,12 @@ impl Agent {
                     };
                     match dialled {
                         Ok(Ok(peer_id)) => {
-                            // #1112: seed pinning on the join path. A seed
-                            // address that answers with a PeerId outside its
-                            // pin set is a failed hint, not a trust anchor:
-                            // the hint is dropped and the join continues
-                            // with the other hints. An unpinned address
-                            // keeps trust-on-first-use, as before. No
-                            // connection is torn down on a mismatch
-                            // (review round 2): the dial batch shares one
-                            // snapshot, a concurrently-established
-                            // connection cannot be attributed to this dial,
-                            // and an idle wrong-identity connection is
-                            // bounded by the pool's idle eviction.
-                            //
-                            // Honest limit: ant-quic's `connect_addr`
-                            // performs its own transport-level admission
-                            // (cache write, pool insert, PeerConnected)
-                            // before x0x sees the answered identity; x0x
-                            // validates immediately on return, before any
-                            // x0x-side bookkeeping. Refusing at the
-                            // handshake needs an ant-quic expected-peer
-                            // API (fenced, recorded in the PR).
-                            let pins = network::pinned_seed_peer_ids(addr);
-                            if let network::SeedPinVerdict::Mismatch { .. } =
-                                network::seed_pin_check(pins, peer_id.0)
-                            {
-                                let expected = pins
-                                    .iter()
-                                    .map(|pin| network::hex_prefix(pin, 8))
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                tracing::info!(
-                                    target: "x0x::connect",
-                                    %addr,
-                                    answered = %network::hex_prefix(&peer_id.0, 8),
-                                    expected,
-                                    "seed pin mismatch: dropping bootstrap hint (issue #1112)"
-                                );
-                                if let Ok(mut rejected) = seed_pin_rejected.lock() {
-                                    rejected.insert(peer_id.0);
-                                }
-                                return Err(addr);
-                            }
+                            // #1112 (round 4): the per-address seed pin is
+                            // enforced inside `connect_addr_with_origin`,
+                            // BEFORE the cache write, success record, and
+                            // PeerConnected event — a mismatched answer
+                            // never returns `Ok` from the dial at all, so
+                            // this batch only sees admitted hints.
                             tracing::info!("Connected to peer: {}", addr);
                             Ok((addr, peer_id))
                         }
@@ -19022,7 +18981,6 @@ impl Agent {
             runtime: std::sync::Arc::clone(runtime),
             network: std::sync::Arc::clone(network),
             selection_skew: std::sync::Arc::clone(&self.selection_skew),
-            seed_pin_rejected: std::sync::Arc::clone(&self.seed_pin_rejected),
             interval_secs: self.heartbeat_interval_secs,
             cache: std::sync::Arc::clone(&self.identity_discovery_cache),
             machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
@@ -20244,7 +20202,6 @@ impl Agent {
             identity: std::sync::Arc::clone(&self.identity),
             runtime,
             network,
-            seed_pin_rejected: std::sync::Arc::clone(&self.seed_pin_rejected),
             interval_secs: self.heartbeat_interval_secs,
             cache: std::sync::Arc::clone(&self.identity_discovery_cache),
             machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
@@ -22569,9 +22526,6 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             selection_skew: std::sync::Arc::new(SelectionSkew::default()),
-            seed_pin_rejected: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )),
             kv_snapshot_leases: std::sync::Mutex::new(KvSnapshotRegistry::default()),
             shutdown_serialize: tokio::sync::Mutex::new(()),
             kv_shutdown_drain: std::sync::Mutex::new(None),
@@ -40847,6 +40801,7 @@ mod peer_connected_handler_integration_tests {
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
                 &no_rejections,
                 &skew,
             );
@@ -40882,6 +40837,7 @@ mod peer_connected_handler_integration_tests {
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
                 &no_rejections,
                 &skew,
             );
@@ -40927,6 +40883,7 @@ mod peer_connected_handler_integration_tests {
                 &cache,
                 own,
                 &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
                 &no_rejections,
                 &skew,
             );
@@ -40966,12 +40923,44 @@ mod peer_connected_handler_integration_tests {
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
                 &rejected,
                 &skew,
             );
             assert!(
                 relays.is_empty() && coordinators.is_empty(),
                 "a pin-rejected identity must not become a hint on any tier"
+            );
+        }
+
+        #[test]
+        fn issue1112_allocated_relay_port_on_a_seed_ip_is_no_operator_tier() {
+            // Review round 4: a NATed peer with a relay slot on a seed
+            // advertises the seed's IP on an ALLOCATED port. The operator
+            // tier matches the full seed listener address, so an observed
+            // connection to that allocated port is the NATed peer's own
+            // path — never operator evidence.
+            let mut cache = std::collections::HashMap::new();
+            let nated = identity::MachineId([0x66; 32]);
+            cache.insert(
+                nated,
+                issue1112_machine(nated, &["142.93.199.50:61234".parse().unwrap()], None, None),
+            );
+            let skew = SelectionSkew::default();
+            let no_rejections: std::collections::HashSet<[u8; 32]> =
+                std::collections::HashSet::new();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x66; 32], "142.93.199.50:61234", true)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &no_rejections,
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a seed IP on an allocated relay port is not a seed listener address"
             );
         }
 
@@ -41000,6 +40989,7 @@ mod peer_connected_handler_integration_tests {
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
                 &no_rejections,
                 &skew,
             );
