@@ -45136,6 +45136,7 @@ pub(in crate::server) mod tests {
     mod r19_cert_carry;
     mod r2_journal_ratchet_regression;
     mod requester_offer;
+    mod s4_key_delivery_1508;
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
     mod wp_c;

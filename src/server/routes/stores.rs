@@ -7898,4 +7898,63 @@ mod tests {
             .await
             .expect("an ordinary group seals");
     }
+
+    /// #1508 round 2: ADR 0110 §4 on the GSS KV plane. The GSS seal is
+    /// synchronous, so the daemon's refresh hook, which runs before every
+    /// seal, sets the context's hold from the async boundary check. Red on
+    /// b4adc95: the seal after the revocation succeeded.
+    #[tokio::test]
+    async fn gss_kv_seal_is_withheld_while_every_admin_seat_is_revoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin key");
+        let group_key = "ea".repeat(16);
+        let mut info = GroupInfo::new(
+            "gss".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        let ctx = Arc::new(x0x::groups::GssKvSecureContext::from_group(&info).expect("ctx"));
+        let hook = gss_kv_refresh(
+            &state,
+            Arc::clone(&ctx),
+            group_key.clone(),
+            format!("group/{group_key}/gss"),
+            admin.agent_id(),
+        );
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let store_id = x0x::kv::KvStoreId::new([9; 32]);
+
+        hook().await;
+        ctx.seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect("no false refusal while the admin seat is unrevoked");
+
+        revoke_agent(&state, &admin).await;
+        hook().await;
+        let error = ctx
+            .seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect_err("no GSS ciphertext while no eligible admin remains");
+        assert!(
+            matches!(&error, x0x::kv::KvError::SecureRecord(reason) if reason.starts_with("no_eligible_admin")),
+            "typed refusal, got {error}"
+        );
+        assert!(
+            ctx.is_active_member(&state.agent.agent_id()),
+            "the hold does not invalidate the context: opens keep working"
+        );
+    }
 }
