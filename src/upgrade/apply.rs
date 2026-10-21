@@ -128,9 +128,16 @@ fn arm_http_deferred_restart_owner(
     version: String,
 ) -> Result<Box<dyn FnOnce() + Send>, std::io::Error> {
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    #[cfg(test)]
+    let test_restart = http_deferred_restart_seam::capture(&restart_plan.executable);
     spawn_http_deferred_restart_thread(move || match go_rx.recv() {
         Ok(()) => {
             std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
+            #[cfg(test)]
+            if let Some(restart) = test_restart {
+                restart(&restart_plan, &version);
+                return;
+            }
             let owner = AutoApplyUpgrader::new(&binary_name)
                 .with_stop_on_upgrade(stop_on_upgrade)
                 .with_restart_context(restart_context)
@@ -159,6 +166,47 @@ fn arm_http_deferred_restart_owner(
             );
         }
     }))
+}
+
+/// Replace only the final external restart in the real armed HTTP owner.
+#[cfg(test)]
+pub(crate) mod http_deferred_restart_seam {
+    use super::restart::RestartPlan;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) type Hook = Arc<dyn Fn(&RestartPlan, &str) + Send + Sync>;
+    static INSTALLED: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            INSTALLED
+                .lock()
+                .expect("HTTP restart hook lock")
+                .remove(&self.0);
+        }
+    }
+
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        assert!(INSTALLED
+            .lock()
+            .expect("HTTP restart hook lock")
+            .insert(target.clone(), hook)
+            .is_none());
+        Guard(target)
+    }
+
+    pub(super) fn capture(target: &Path) -> Option<Hook> {
+        INSTALLED
+            .lock()
+            .expect("HTTP restart hook lock")
+            .get(target)
+            .cloned()
+    }
 }
 
 /// Spawn the parked HTTP deferred-restart thread (test seam can force failure).
@@ -281,9 +329,31 @@ pub(crate) struct ReleasePermit {
 struct PermitState {
     cancelled: bool,
     operation: Option<std::sync::Weak<AtomicBool>>,
+    http_wait_slot: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
 }
 
 impl ReleasePermit {
+    pub(crate) fn for_http(slot: Arc<tokio::sync::OwnedMutexGuard<()>>) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(PermitState {
+                http_wait_slot: Some(slot),
+                ..PermitState::default()
+            })),
+            ..Self::default()
+        }
+    }
+
+    fn http_wait_slot(&self) -> Option<Arc<tokio::sync::OwnedMutexGuard<()>>> {
+        self.state.lock().ok()?.http_wait_slot.clone()
+    }
+
+    pub(crate) fn release_http_wait_slot(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .http_wait_slot = None;
+    }
+
     pub(crate) fn check(&self) -> Result<(), UpgradeError> {
         let state = self.state.lock().map_err(|_| cancelled_release())?;
         if state.cancelled {
@@ -387,6 +457,7 @@ where
         .map(|permit| permit.register(&caller_alive))
         .transpose()?;
     let worker_alive = Arc::clone(&caller_alive);
+    let http_wait_slot = permit.and_then(ReleasePermit::http_wait_slot);
     #[cfg(test)]
     let observer = permit.and_then(|permit| permit.observer.clone());
     let join = tokio::task::spawn_blocking(move || {
@@ -397,6 +468,9 @@ where
             }
             OperationObservation(observer)
         };
+        // A cancelled HTTP caller cannot free its bounded request slot while
+        // this operation remains queued on the install lock.
+        let _http_wait_slot = http_wait_slot;
         operation(worker_alive)
     });
     CallerAliveJoin {
@@ -469,6 +543,7 @@ async fn apply_replacements_with_permit(
         .map(|permit| permit.register(&caller_alive))
         .transpose()?;
     let worker_alive = Arc::clone(&caller_alive);
+    let http_wait_slot = permit.and_then(ReleasePermit::http_wait_slot);
     #[cfg(test)]
     let observer = permit.and_then(|permit| permit.observer.clone());
 
@@ -480,6 +555,7 @@ async fn apply_replacements_with_permit(
             }
             OperationObservation(observer)
         };
+        let _http_wait_slot = http_wait_slot;
         // Custody stays with this task through every replace. Dropped
         // explicitly before any on_success continuation that may exit without
         // unwinding (#1447 RC4 P2).
@@ -681,23 +757,39 @@ impl AutoApplyUpgrader {
             &install,
             self.restart_context.data_dir.as_deref(),
             self.restart_context.api_addr,
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
         )
         .await
         .map_err(UpgradeError::from)?;
         // Drain the actual identity readback before observing cancellation.
         self.check_release()?;
-        Ok(Some((install, gate.clone(), identity)))
+        let mut gate = gate.clone();
+        // The HTTP wait override is not authority to change the guide.
+        gate.skip_staging_delay = false;
+        Ok(Some((install, gate, identity)))
     }
 
     #[cfg(unix)]
     pub(crate) fn with_staging_request(mut self, request: super::staging::StagingRequest) -> Self {
         self.staging = Some(super::staging_runtime::Gate {
             request,
+            skip_staging_delay: false,
             #[cfg(test)]
             clock: None,
             #[cfg(test)]
             observed: None,
         });
+        self
+    }
+
+    /// Authenticated D185 override: keep the receipt and mandatory probe wait.
+    #[cfg(unix)]
+    pub(crate) fn with_staging_now(mut self, now: bool) -> Self {
+        if let Some(gate) = &mut self.staging {
+            gate.skip_staging_delay = now;
+        }
         self
     }
 
@@ -737,6 +829,7 @@ impl AutoApplyUpgrader {
                 result = restart::resolve_staging_identity(
                     self.stop_on_upgrade, &install,
                     self.restart_context.data_dir.as_deref(), self.restart_context.api_addr,
+                    self.release_permit.as_ref().and_then(ReleasePermit::http_wait_slot),
                 ) => result.map_err(UpgradeError::from)?,
             };
             self.check_release()?;
@@ -864,6 +957,9 @@ impl AutoApplyUpgrader {
                     &install,
                     self.restart_context.data_dir.as_deref(),
                     self.restart_context.api_addr,
+                    self.release_permit
+                        .as_ref()
+                        .and_then(ReleasePermit::http_wait_slot),
                 )
                 .await
                 .map_err(UpgradeError::from)?;
@@ -943,19 +1039,25 @@ impl AutoApplyUpgrader {
         binary_path: &Path,
     ) -> Result<restart::RestartPlan, UpgradeError> {
         let signals = restart::SupervisionSignals::sample();
-        let launchd_readback = restart::readback_launchd_policy_offloaded(
+        let launchd_readback = restart::readback_launchd_policy_retaining(
             &signals,
             binary_path,
             &restart::current_argv(),
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
         )
         .await;
         // #690: the systemd-side twin — no-op (NotApplicable) unless a
         // systemd signal classified this instance, so macOS and unsupervised
         // applies shell out to nothing.
-        let systemd_readback = restart::readback_systemd_policy_offloaded(
+        let systemd_readback = restart::readback_systemd_policy_retaining(
             &signals,
             binary_path,
             &restart::current_argv(),
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
         )
         .await;
         restart::resolve_restart_plan(
@@ -1876,6 +1978,11 @@ fn extract_from_zip(
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_http_custody.rs"
+    ));
+    http_custody_regression_tests!();
     #[cfg(unix)]
     include!("../../tests/upgrade_background_staging.rs");
     #[cfg(unix)]

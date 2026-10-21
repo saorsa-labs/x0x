@@ -1762,7 +1762,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "upgrade --apply",
         description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)",
         category: "upgrade",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query("now", false)]),
     },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
