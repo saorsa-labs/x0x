@@ -2826,7 +2826,31 @@ pub(super) async fn verify_reseat_mandate_on_receive(
                         .signer
                         .eq_ignore_ascii_case(&mandate.fields.signer)
             });
-        return if consumed { Ok(()) } else { Err("signature") };
+        if !consumed
+            || mandate.verify_signature().is_err()
+            || !commit
+                .committed_by
+                .eq_ignore_ascii_case(&mandate.fields.signer)
+        {
+            return Err("signature");
+        }
+        // The checks this node can make without the chain it lacks: the
+        // signer's seat on its base, the exact role, and the bindings.
+        if !s3::signer_is_active_admin(parent, &mandate.fields.signer) {
+            return Err("signer_not_admin");
+        }
+        let seated_role = next.members_v2.get(subject_hex).map(|seat| seat.role);
+        if seated_role != Some(mandate.fields.role) {
+            return Err("role_raised");
+        }
+        if commit.prev_state_hash.as_deref() != Some(mandate.fields.parent_commit_hash.as_str())
+            || key_package_hash.unwrap_or_default() != mandate.fields.key_package_hash
+            || epoch.unwrap_or_default() != mandate.fields.epoch
+            || commit.roster_root != mandate.fields.terminal_roster_hash
+        {
+            return Err("binding_mismatch");
+        }
+        return Ok(());
     }
     let subject_revoked = match parse_raw(subject_hex) {
         Some(raw) => agent_revoked(state, &AgentId(raw)).await,
