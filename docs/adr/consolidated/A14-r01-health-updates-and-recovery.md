@@ -8,6 +8,8 @@
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
+Changed since revision 1: this revision adds the proposed local upgrade disposition and behind signal, with no wire change.
+
 These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
 
 x0x must remain recoverable when an update fails. Agents can help maintain a node, but update safety must also work when no agent is available.
@@ -156,8 +158,8 @@ enum CliStatus {
 }
 enum CliLocation { SplitPath, PackageManaged }
 enum UpdateState {
-    NotChecked, // no verified manifest yet, or the subscription failed with nothing stored
-    Current,    // only after a verified manifest shows this build is the newest
+    NotChecked, // no verified release evidence at all; a stored manifest is evidence
+    Current,    // a verified manifest shows this build is the newest, including one loaded from the local record
     Waiting { version: Version, due_in_secs: u64 },
     Held { version: Version, cause: HoldCause },        // D188–D190 classes
     Refused { version: Version, reason: RefusalReason }, // receipt, selection, journal
@@ -165,13 +167,13 @@ enum UpdateState {
 }
 ```
 
-1. **Notify-only daemons still listen.** Notify-only daemons subscribe to `x0x/release` and verify manifests. That set is embedders, `update.enabled = false`, `--skip-update-check`, and managed Windows. Each one records the newest verified version and never stages or applies it. This is a behaviour change on an unchanged topic, framing, key and signature context, so it is not a wire change. Embedders get this through the same daemon code path, with no new embedder API. Each subscribed daemon spends ML-DSA-65 verify CPU on the manifest (#656) and parses a release payload it previously ignored, which is a larger attack surface.
-2. **Show it locally.** `GET /diagnostics/upgrade` returns `disposition`, `state` and `cli_status`. Those fields are additive on the route that already returns the version and policy digest. `Current` is allowed only after a verified manifest shows this build is the newest. Startup with no release evidence, and a failed subscription that stored nothing, report `NotChecked`. `/health` reports degraded with reason `update_behind` once `Behind` lasts longer than a set period. `x0x doctor --json` exits non-zero in that case. A local `system.update_behind` event fires once per newly seen version. All of this is additive local API. The implementation that adds `update_behind` changes the comment in `src/server/health_verdict.rs` around L897 and the doctor exit in the same change. That comment says an available update stays `ok`, and doctor exits zero. `update_behind` makes `/health` degraded, so the exit must follow that reason.
+1. **Notify-only daemons still listen.** Notify-only daemons subscribe to `x0x/release` and verify manifests. That set is embedders, `update.enabled = false`, `--skip-update-check`, and managed Windows. Each one records the newest verified version and never stages or applies it. This is a behaviour change on an unchanged topic, framing, key and signature context, so it is not a wire change. Embedders get this through the same daemon code path, with no new embedder API. Subscribing takes part in gossip on that topic, including forwarding. `RelayFanout::verdict` in `src/gossip/relay_fanout.rs` delivers a subscribed topic locally and eager-forwards it while the topic token budget lasts (`ForwardAndDeliver`). An empty budget lazy-forwards. A daemon with no subscription on the topic still lazy-forwards (`LazyForward`). The new cost on a notify-only daemon is the local ML-DSA-65 verify (#656) plus that eager forwarding. Each subscribed daemon also parses a release payload it previously ignored, which is a larger attack surface.
+2. **Show it locally.** `GET /diagnostics/upgrade` returns `disposition`, `state` and `cli_status`. Those fields are additive on the route that already returns the version and policy digest. `Current` is allowed when a verified manifest shows this build is the newest. Stored history counts. After restart, a newest stored verified manifest at or below this build reports `Current`. `NotChecked` is only for no verified evidence at all. There is one transition into `Behind`. Until the wall-clock age of the newest verified version passes the threshold, the daemon stays `Waiting`, `Held`, or `Refused`. It then enters `Behind`. Entering `Behind` is what makes `/health` degraded with reason `update_behind`, emits `system.update_behind` once, and makes `x0x doctor --json` exit non-zero. There is no second wait. All of this is additive local API. The implementation that adds `update_behind` changes the comment in `src/server/health_verdict.rs` around L897 and the doctor exit in the same change. That comment says an available update stays `ok`, and doctor exits zero. `update_behind` makes `/health` degraded, so the exit must follow that reason.
 3. **Show the local machine.** `GET /owner/machines` returns `disposition`, `state` and `cli_status` for the local machine only, on `this_machine` (`src/server/routes/owner.rs` L789). Remote rows stay as they are today (L779).
 4. **CLI status is separate.** The daemon keeps `AutoApply` or `NotifyOnly` on its own terms. A split or package-managed CLI outside the declared install gets `cli_status` `CannotApply`. ADR 0094 leaves that CLI outside the upgrade transaction, and the daemon can still apply. `NotifyReason` lists daemon reasons only: `Embedder`, `DisabledByConfig`, `SkippedThisRun` and `ManagedWindows`.
 5. **Peers on older builds.** Keep feature-level negotiation through ADR 0093 capability bits. Do not infer support from version strings (0093 option 2, rejected). Sends that need a bit the peer lacks fail with `recipient_upgrade_required`, as they do now. Below a hard wire break (saorsa-gossip ADR-014 RejectV1), old peers simply are not supported. A minimum version comes from D35 once census data exists, and D96 ties topic-fetch retirement to it. This proposal sets no number.
 6. **Urgent releases.** No signed urgency field, since that would be a wire change. Owners use D185 `now=true`, and later the M4 owner policy.
-7. **Warning history is durable and local.** For each verified version the daemon persists `first_seen` and whether `system.update_behind` was already emitted. `first_seen` is the wall-clock time of the first verified sighting, and it is the timestamp `Behind` reports. The threshold age uses monotonic elapsed time. The record stores that elapsed remainder and the boot epoch. A restart loads the remainder and starts a new monotonic epoch. It keeps `first_seen` and the emitted flag. A wall-clock jump does not change the elapsed age, does not rewrite `first_seen`, and does not clear the emitted flag. Duplicate delivery of a recorded version keeps the stored `first_seen` and does not emit again. A restart does not block escalation: age already past the threshold stays `Behind`, and age still short can still reach `Behind`. A restart does not repeat an event that the record already marks emitted. This record is local. It is not an owner-sync value and not a release-manifest field. Notify-only daemons may write it. They still never stage or apply the release.
+7. **Warning history is durable and local.** For each verified version the daemon persists `first_seen` and whether `system.update_behind` was already emitted. `first_seen` is the wall-clock time of the first verified sighting, and it is the timestamp `Behind` reports. Age is wall-clock time since that `first_seen`, clamped at zero when the clock goes backwards. Do not count only uptime. A daemon that runs an hour a day must still reach `Behind` in calendar time. A forward clock jump can bring the warning early. That early warning is acceptable. A jump does not rewrite `first_seen` and does not clear the emitted flag. Duplicate delivery of a recorded version keeps the stored `first_seen` and does not emit again. Restart loads the record. The newest stored verified manifest is evidence: at or below this build it reports `Current`, and newer it keeps `Waiting`, `Held`, or `Refused` until the same wall-clock age passes the threshold. Age already past the threshold enters or stays `Behind`. A restart does not repeat an event that the record already marks emitted. This record is local. It is not an owner-sync value and not a release-manifest field. Notify-only daemons may write it. They still never stage or apply the release.
 
 ### Deferred: remote update status
 
@@ -180,18 +182,18 @@ Carrying disposition, state or the running version to other owned machines needs
 ### Consequences
 
 - Drift stops being silent. The wire stays the same. Notify-only daemons verify a release and do not apply it.
-- Those daemons pay ML-DSA-65 verify CPU on each `x0x/release` manifest (#656). They also take a larger attack surface, because they parse and verify release payloads.
+- Those daemons pay ML-DSA-65 verify CPU on each `x0x/release` manifest (#656) and eager-forward the topic while the relay budget lasts. They also take a larger attack surface, because they parse and verify release payloads.
 - Embedders and opted-out users keep control and see when they are behind.
 - There is more API surface to keep stable. `Behind` thresholds become one more number to choose.
 - It does not fix drift by itself. Someone still has to act on the signal, either an owner or, later, an M4 policy agent.
 
 ### Validation
 
-- A notify-only daemon receives a newer signed manifest over gossip. It records the newest verified version in the local warning history, never stages or applies the release, and reports `Behind` once the threshold is reached.
-- Startup with no release evidence reports `NotChecked`, not `Current`. A failed subscription that stored no manifest does the same.
-- A hold, a refused receipt and a disabled config each map to the right state. The `Behind` threshold flips `/health` to degraded with reason `update_behind`, and `x0x doctor` exits non-zero. The same implementation changes `src/server/health_verdict.rs` around L897 and that doctor exit together.
-- Restart loads `first_seen` and the emitted-event flag. A version that already emitted `system.update_behind` does not emit again. `Behind` reached before restart is still `Behind`. Age that has not reached the threshold can still reach it after restart.
-- A duplicate manifest for a recorded version does not reset `first_seen` and does not emit a second event.
+- A notify-only daemon receives a newer signed manifest over gossip. It records the newest verified version in the local warning history and never stages or applies the release. Before the threshold it stays `Waiting`. At the threshold it enters `Behind`.
+- Just before the threshold, state is `Waiting`, `Held`, or `Refused`, `/health` has no `update_behind` reason, and `x0x doctor --json` does not exit non-zero for this cause. At the threshold, state is `Behind`, `/health` is degraded with reason `update_behind`, `system.update_behind` has been emitted once, and `x0x doctor --json` exits non-zero. The same implementation changes `src/server/health_verdict.rs` around L897 and that doctor exit together.
+- Startup with no verified release evidence reports `NotChecked`. A failed subscription that stored no manifest does the same. Restart with a stored verified manifest at or below this build reports `Current`. `NotChecked` is only for no verified evidence at all.
+- A hold, a refused receipt and a disabled config each stay `Held` or `Refused` until the same age threshold, then enter `Behind`.
+- Restart loads `first_seen` and the emitted-event flag. A version that already emitted `system.update_behind` does not emit again. Wall-clock age already past the threshold is `Behind` after restart. Age still short stays `Waiting`, `Held`, or `Refused` and can still enter `Behind`. A duplicate manifest for a recorded version does not reset `first_seen` and does not emit a second event. A backward clock step clamps age at zero. A forward clock step can enter `Behind` early.
 - `GET /owner/machines` shows `disposition`, `state` and `cli_status` on `this_machine`. Remote rows stay unchanged.
 - A split or package-managed CLI reports `CannotApply`. The daemon disposition stays `AutoApply` or `NotifyOnly` on the daemon's own terms, and an `AutoApply` daemon can still apply.
 - Old released binaries still decode the unchanged manifest.
@@ -199,10 +201,9 @@ Carrying disposition, state or the running version to other owned machines needs
 ### Open questions
 
 - Is the `Behind` threshold one release, or N days? Should it vary by disposition?
-- Should a repeated `Refused` state escalate to `Behind`, or stay separate?
 - Can x0xd tell that a binary was built from source rather than released? There is no evidence that it can.
 - Does `update.gossip_updates = false` also turn off verify-only listening on `x0x/release`?
-- D35 says embedders do not auto-update. This proposal has them subscribe and pay the ML-DSA-65 verify cost (#656). Is that cost acceptable for embedders?
+- Notify-only installs and embedders would subscribe to `x0x/release`. That subscription takes part in gossip on the topic, including eager forwarding while the relay budget lasts, and pays ML-DSA-65 verify CPU (#656). D35 says embedders do not auto-update. Is that participation acceptable for notify-only installs and for embedders?
 
 ### Couldn't verify
 
