@@ -2175,8 +2175,6 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         } else {
             ManualRequestKind::Remove
         };
-        let mut scope = eviction_seal_scope(&inner.store, key);
-        scope.prepared_removal = true;
         let Some(row) = inner.store.get_mut(key) else {
             return;
         };
@@ -2186,6 +2184,9 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         row.phase = Phase::Prepared;
         row.parent_head = Some(parent_head.clone());
         let journal = prepared_journal(row, parent_head, next_revision);
+        // The row is `prepared` now, so the scope marks this run as the
+        // worker's own removal (§1a/D135 cancellation).
+        let scope = eviction_seal_scope(&inner.store, key);
         inner.dirty = true;
         Some((journal, kind, scope))
     };
@@ -2302,7 +2303,9 @@ fn eviction_seal_scope(store: &ObligationStore, key: &EvictionKey) -> EvictionSe
             .filter(|row| row.target != key.target)
             .map(|row| hex::encode(row.target))
             .collect(),
-        prepared_removal: false,
+        prepared_removal: store
+            .get(key)
+            .is_some_and(|row| row.phase == Phase::Prepared),
     }
 }
 
