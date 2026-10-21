@@ -728,12 +728,15 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     }
     let mut delivering = inner.ce.delivering();
     delivering.extend(inner.removals.keys().cloned());
-    if reconcile_completion(&mut inner.store, &groups, &leaves, &delivering, now_unix_ms) {
-        inner.dirty = true;
-    }
-    if inner.store.apply_retention(now_unix_ms) {
-        inner.dirty = true;
-    }
+    let memory_only = !inner.sidecar.state.writable();
+    reconcile_and_retain(
+        &mut inner,
+        &groups,
+        &leaves,
+        &delivering,
+        now_unix_ms,
+        memory_only,
+    );
     // Rows loaded from an earlier boot resume their saved budget.
     let rows: Vec<(EvictionKey, u64)> = inner
         .store
@@ -752,7 +755,16 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     inner.queued_manual.retain(|key, _| open.contains(key));
     inner.next_attempt.retain(|key, _| open.contains(key));
     inner.attempt_wait.retain(|key, _| open.contains(key));
-    inner.not_durable.retain(|key, _| open.contains(key));
+    // A `terminated` row keeps its entry until the `.evs` holds the end.
+    let ended: BTreeSet<EvictionKey> = inner
+        .store
+        .rows()
+        .filter(|row| row.phase == Phase::Terminated)
+        .map(ObligationRow::key)
+        .collect();
+    inner
+        .not_durable
+        .retain(|key, _| open.contains(key) || ended.contains(key));
     let queued_bans: BTreeSet<EvictionKey> = inner.queued_bans.keys().cloned().collect();
     inner
         .ban_next_attempt
@@ -764,7 +776,6 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .retain(|key, _| open.contains(key));
     inner.evaluations.clear();
     let gate_open = host_commit_gate_open(state);
-    let memory_only = !inner.sidecar.state.writable();
     let by_stable: HashMap<&str, (&String, &GroupInfo)> = groups
         .iter()
         .map(|(key, info)| (info.stable_group_id(), (key, info)))
@@ -1244,6 +1255,48 @@ fn selected_certificate_expiry(member: &x0x::groups::GroupMember) -> Option<(Str
         return None;
     }
     cert.not_after().map(|not_after| (digest, not_after))
+}
+
+/// Reconcile completion, then apply §5 retention. §1a: a renewal moves
+/// the row to `terminated` with cause `certificate_valid`; §5: "Drop
+/// `terminated` rows once the deletion or cancellation is durable". A row
+/// this pass ended is marked not durable, and retention waits until a
+/// `.evs` write holds every ended row, so the end is durable and visible
+/// before the row goes. A memory-only sidecar never becomes durable, so
+/// it does not hold retention.
+fn reconcile_and_retain(
+    inner: &mut S4Inner,
+    groups: &[(String, GroupInfo)],
+    leaves: &RetainedLeaves,
+    delivering: &BTreeSet<EvictionKey>,
+    now_unix_ms: u64,
+    memory_only: bool,
+) {
+    let open_before: Vec<EvictionKey> = inner
+        .store
+        .rows()
+        .filter(|row| row.phase.is_open())
+        .map(ObligationRow::key)
+        .collect();
+    if reconcile_completion(&mut inner.store, groups, leaves, delivering, now_unix_ms) {
+        inner.dirty = true;
+    }
+    for key in open_before {
+        if inner
+            .store
+            .get(&key)
+            .is_some_and(|row| row.phase == Phase::Terminated)
+        {
+            inner.mark_not_durable(&key);
+        }
+    }
+    let end_not_durable = !memory_only
+        && inner.store.rows().any(|row| {
+            row.phase == Phase::Terminated && inner.not_durable.contains_key(&row.key())
+        });
+    if !end_not_durable && inner.store.apply_retention(now_unix_ms) {
+        inner.dirty = true;
+    }
 }
 
 /// Re-derive completion from the verified roster and crypto state (§1,
@@ -4021,6 +4074,54 @@ mod tests {
             !eviction_seal_scope(&store, &key).prepared_removal,
             "a queued ban of an ended row is not the worker's removal"
         );
+    }
+
+    /// CI on 05d1ecc (`a_rebind_during_the_expiry_prepare_keeps_the_renewed_seat`):
+    /// the pass ended the row and dropped it in the same step, so the end
+    /// (`terminated`, `certificate_valid`) was never durable or visible.
+    /// ADR 0110 §5: drop a `terminated` row once the end is durable.
+    #[test]
+    fn an_ended_row_stays_terminated_until_the_evs_holds_it() {
+        let now = now_unix_ms() / 1000;
+        let (renewed, target) = expiring(now + 86_400);
+        let info = certified_group(&renewed, target);
+        let key = EvictionKey::new(info.stable_group_id(), target);
+        let groups = vec![("k".to_string(), info)];
+        let leaves = RetainedLeaves::default();
+        let fresh = || {
+            let mut inner = S4Inner::default();
+            let expiry = EvictionTrigger::CertificateExpiry {
+                certificate_digest: "ab".repeat(32),
+                not_after: now - 1_000,
+            };
+            inner.store.intake(&key, expiry, None, 0, [0; 16]);
+            inner
+        };
+        let mut inner = fresh();
+        let at = now * 1000;
+        reconcile_and_retain(&mut inner, &groups, &leaves, &BTreeSet::new(), at, false);
+        let row = inner.store.get(&key).expect("the ended row is kept");
+        assert_eq!(row.phase, Phase::Terminated);
+        assert_eq!(row.termination, Some(TerminationCause::CertificateValid));
+        assert!(inner.not_durable.contains_key(&key));
+        // A later pass before the `.evs` write still keeps it.
+        reconcile_and_retain(&mut inner, &groups, &leaves, &BTreeSet::new(), at, false);
+        assert!(inner.store.get(&key).is_some());
+        // The `.evs` write covered it: the next pass drops it.
+        inner.not_durable.clear();
+        reconcile_and_retain(&mut inner, &groups, &leaves, &BTreeSet::new(), at, false);
+        assert!(inner.store.get(&key).is_none());
+        // A memory-only sidecar never becomes durable: no hold.
+        let mut memory_only = fresh();
+        reconcile_and_retain(
+            &mut memory_only,
+            &groups,
+            &leaves,
+            &BTreeSet::new(),
+            at,
+            true,
+        );
+        assert!(memory_only.store.get(&key).is_none());
     }
 
     #[test]
