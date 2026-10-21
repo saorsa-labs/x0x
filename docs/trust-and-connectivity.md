@@ -103,10 +103,12 @@ the pin set for that address:
   production address is pinned today.
 - **Answer inside the pin set**: the hint is accepted.
 - **Answer outside the pin set**: the hint has failed — dropped, never a
-  trust anchor and never a hard join failure. If the dial itself created
-  the connection, it is closed with a `PolicyRejection` tombstone; a
-  connection that already existed before the dial is left standing (the
-  mismatched hint is dropped, not the legitimate peer).
+  trust anchor and never a hard join failure. Nothing is torn down: one
+  dial batch cannot attribute a connection to a single dial, so a
+  mismatch only drops the hint and records the rejected identity, which
+  every later join tier and hint selection then excludes. An idle
+  wrong-identity connection is bounded by the connection pool's idle
+  eviction.
 
 The pin set is per address, never per host: the UDP/443 and UDP/5483
 listeners on one seed host are separate `x0xd` instances with separate

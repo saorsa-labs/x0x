@@ -5587,16 +5587,30 @@ fn select_capability_hints(
         }
         // Operator tier: the OBSERVED transport address of a DIRECT path
         // is a seed IP. The peer cannot forge this by announcing anything.
+        // v4-mapped forms are normalized here as well as in
+        // `connected_peer_origins`, so the pure function's contract does
+        // not depend on the caller (review round 3).
         let on_operator_host = origin
             .direct
-            .then(|| origin.remote_addr.map(|addr| addr.ip()))
+            .then(|| origin.remote_addr.map(network::normalize_v4_mapped_addr))
             .flatten()
-            .is_some_and(|observed_ip| bootstrap_ips.contains(&observed_ip));
+            .is_some_and(|observed| bootstrap_ips.contains(&observed.ip()));
         let Some(entry) = cache.get(&mid) else {
-            // No announcement seen: only the operator tier can qualify.
-            if on_operator_host {
+            // No announcement seen: only the operator tier can qualify,
+            // under the same deduplication and cap as the tiers below
+            // (review round 3).
+            if on_operator_host
+                && !reachable_via.contains(&mid)
+                && reachable_via.len() < MAX_COORDINATOR_HINTS
+            {
                 selection_skew.record(SelectionChoice::Bootstrap);
                 reachable_via.push(mid);
+            }
+            if on_operator_host
+                && !relay_candidates.contains(&mid)
+                && relay_candidates.len() < MAX_COORDINATOR_HINTS
+            {
+                selection_skew.record(SelectionChoice::Bootstrap);
                 relay_candidates.push(mid);
             }
             continue;
@@ -15363,7 +15377,29 @@ impl Agent {
             return;
         };
         const PHASE1_PEER_CANDIDATES: usize = 12;
-        let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        let mut cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        // #1112 (review round 3): cached joins take the pin verdict too.
+        // A cached identity a pin mismatch rejected never returns through
+        // this tier, and a cached peer that lists a pinned seed address
+        // but is not in that address's pin set is a poisoned cache row —
+        // dial it by id never (drop the row, keep the cache untouched for
+        // ant-quic's own accounting).
+        let rejected = self
+            .seed_pin_rejected
+            .lock()
+            .map(|rejected| rejected.clone())
+            .unwrap_or_default();
+        cached_peers.retain(|peer| {
+            if rejected.contains(&peer.peer_id.0) {
+                return false;
+            }
+            !peer.preferred_addresses().into_iter().any(|addr| {
+                matches!(
+                    network::seed_pin_check(network::pinned_seed_peer_ids(addr), peer.peer_id.0),
+                    network::SeedPinVerdict::Mismatch { .. }
+                )
+            })
+        });
         if cached_peers.is_empty() || stop.is_cancelled() {
             return;
         }
@@ -40896,9 +40932,17 @@ mod peer_connected_handler_integration_tests {
             );
             assert!(coordinators.contains(&seed_host));
             assert!(relays.contains(&seed_host));
-            // One bootstrap-classified choice per hint list, none for the
-            // self-entry.
-            assert_eq!(skew.snapshot().chosen_bootstrap, 2);
+            // The mapped seed host (no cache entry) is also an
+            // operator-tier hint, and each hint-list entry records one
+            // bootstrap-classified choice: seed_host twice (its cache
+            // entry classifies) + the mapped peer twice (the no-cache
+            // operator branch). None for the self-entry.
+            let mapped_seed = identity::MachineId([0x55; 32]);
+            assert!(
+                coordinators.contains(&mapped_seed) && relays.contains(&mapped_seed),
+                "a v4-mapped observed seed address must stay an operator-tier hint"
+            );
+            assert_eq!(skew.snapshot().chosen_bootstrap, 4);
             assert_eq!(skew.snapshot().chosen_non_bootstrap, 0);
         }
 
