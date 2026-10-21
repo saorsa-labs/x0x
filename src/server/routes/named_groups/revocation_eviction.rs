@@ -4000,6 +4000,32 @@ mod tests {
         assert_eq!(leftovers, 0);
     }
 
+    /// ADR 0012 (#1533 review): every S3/S4 sidecar can hold private key
+    /// material (the re-seat journal holds a TreeKEM snapshot), so a durable
+    /// write is owner-only under the common umask 022, also when it replaces
+    /// an older world-readable file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_write_is_owner_only_under_umask_022() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: `umask` only swaps the process file-mode mask. nextest
+        // runs each test in its own process.
+        let previous = unsafe { libc::umask(0o022) };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("group.grecov");
+        std::fs::write(&path, b"old").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let written = write_bytes_durably(&path, b"secret", None).await;
+        // SAFETY: as above.
+        unsafe { libc::umask(previous) };
+        written.expect("write");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "sidecar bytes are private");
+    }
+
     #[tokio::test]
     async fn quarantine_moves_damage_aside_and_finalizes_history() {
         let dir = tempfile::tempdir().expect("tempdir");
