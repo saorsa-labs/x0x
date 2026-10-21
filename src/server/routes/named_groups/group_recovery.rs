@@ -3581,6 +3581,35 @@ mod tests {
     }
 
     #[test]
+    fn seating_commit_is_the_first_seat_before_the_removal() {
+        let admin = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let subject = "ab".repeat(32);
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ef".repeat(32),
+        );
+        info.seal_commit(&admin, 1_000).expect("genesis seal");
+        info.add_member(
+            subject.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.seal_commit(&admin, 2_000).expect("seat");
+        let seated = info.state_hash.clone();
+        info.name = "renamed".to_string();
+        info.seal_commit(&admin, 3_000).expect("rename");
+        info.remove_member(&subject, Some(admin_hex));
+        info.seal_commit(&admin, 4_000).expect("removal");
+        let removal = info.state_revision;
+        assert_eq!(seating_commit_hash(&info, &subject, removal), Some(seated));
+        assert_eq!(seating_commit_hash(&info, &"cd".repeat(32), removal), None);
+    }
+
+    #[test]
     fn round_ends_with_the_section_11_backoff() {
         let now = Instant::now();
         let mut subject = SubjectState::new(now, 3);
