@@ -24,6 +24,14 @@ use std::sync::Arc;
 const DURABLE_REQUIRED: &str =
     "name management requires the durable API token (not a session or rider token)";
 
+/// `GET /forwards` `error` for a saved record when connect is disabled.
+///
+/// The daemon has no forwarder, so the record cannot listen. The text
+/// starts with the `connect_disabled` code, the same shape as `name_changed`
+/// and `bind_failed`.
+const CONNECT_DISABLED_REASON: &str =
+    "connect_disabled: connect forwarding is disabled (no connect ACL loaded)";
+
 fn durable_forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -189,12 +197,14 @@ enum CommitError {
 ///
 /// An ephemeral spec deletes any durable record at the bound address, so a
 /// disabled persistent forward replaced by `--ephemeral` cannot return on
-/// restart. A store failure before the rename removes the listener just
-/// bound (and puts a disabled entry back when that is what the bind
-/// replaced). A failure after the rename leaves the listener in place:
-/// the new file is already on disk, so tearing the listener down would
-/// let a restart bring the forward back. An unreadable store does not
-/// block an ephemeral add — there is no usable record to delete.
+/// restart. The socket is bound before the save and does not accept until
+/// the save succeeds. A store failure before the rename drops that socket
+/// (and puts a disabled entry back when that is what the bind replaced).
+/// A connection already accepted on that listener is dropped with it.
+/// A failure after the rename starts accepting and leaves the listener in
+/// place: the new file is already on disk, so tearing the listener down
+/// would let a restart bring the forward back. An unreadable store does
+/// not block an ephemeral add — there is no usable record to delete.
 async fn commit_forward(
     store: &Arc<x0x::forward::store::ForwardStore>,
     forwarder: &Arc<x0x::forward::ForwardService>,
@@ -243,10 +253,7 @@ async fn commit_forward_locked(
                 ),
             ));
         }
-        match forwarder
-            .add_forward_with(spec.clone(), binding.clone())
-            .await
-        {
+        match forwarder.bind_forward(spec.clone(), binding.clone()).await {
             Err(error) if allocating && x0x::forward::is_port_allocation_collision(&error) => {
                 continue;
             }
@@ -291,18 +298,22 @@ async fn commit_forward_locked(
         store.forget(bound).await.map(|_| ())
     };
     if let Err(e) = persisted {
-        // After the rename the new bytes are the store. Keep the listener
-        // so a restart cannot resurrect a forward this handler tore down.
-        if !e.durability_unconfirmed() {
-            forwarder.remove_forward(bound);
-            if let Some(prev) = previous.filter(|status| status.spec.local_addr == bound) {
-                if let Some(reason) = prev.error {
-                    forwarder.add_disabled(prev.spec, prev.binding, reason);
-                }
+        // After the rename the new bytes are the store. Accept, and keep
+        // the listener, so a restart cannot resurrect a forward this
+        // handler tore down.
+        if e.durability_unconfirmed() {
+            forwarder.start_accept(bound).map_err(CommitError::Bind)?;
+            return Err(CommitError::Store(e));
+        }
+        forwarder.remove_forward(bound);
+        if let Some(prev) = previous.filter(|status| status.spec.local_addr == bound) {
+            if let Some(reason) = prev.error {
+                forwarder.add_disabled(prev.spec, prev.binding, reason);
             }
         }
         return Err(CommitError::Store(e));
     }
+    forwarder.start_accept(bound).map_err(CommitError::Bind)?;
     Ok(bound)
 }
 
@@ -323,16 +334,47 @@ fn forward_json(status: &x0x::forward::ForwardStatus) -> serde_json::Value {
     })
 }
 
+fn disabled_saved_json(record: &x0x::forward::store::ForwardRecord) -> serde_json::Value {
+    serde_json::json!({
+        "local_addr": record.local_addr.to_string(),
+        "peer_agent": hex::encode(record.pinned_agent_id.as_bytes()),
+        "target_host": record.target_host,
+        "target_port": record.target_port,
+        "name": record.name,
+        "kind": record.kind.as_str(),
+        "pinned_machine_id": hex::encode(record.pinned_machine_id.as_bytes()),
+        "persistent": true,
+        "enabled": false,
+        "error": CONNECT_DISABLED_REASON,
+    })
+}
+
+async fn disabled_saved_forwards(
+    store: &x0x::forward::store::ForwardStore,
+) -> Vec<serde_json::Value> {
+    match store.records().await {
+        Ok(records) => records.iter().map(disabled_saved_json).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// GET /forwards — list registered forwards, including restored forwards
 /// that are down (`enabled: false` with an `error`).
+///
+/// No forwarder means connect is disabled. Saved records are still listed,
+/// each with [`CONNECT_DISABLED_REASON`]. An unreadable store stays an
+/// empty list; `store_error` carries the load failure.
 pub(in crate::server) async fn forward_list(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let forwards: Vec<serde_json::Value> = state
-        .forward_service
-        .as_ref()
-        .map(|f| f.list_forward_status().iter().map(forward_json).collect())
-        .unwrap_or_default();
+    let forwards: Vec<serde_json::Value> = match state.forward_service.as_ref() {
+        Some(forwarder) => forwarder
+            .list_forward_status()
+            .iter()
+            .map(forward_json)
+            .collect(),
+        None => disabled_saved_forwards(&state.forwards).await,
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1447,5 +1489,143 @@ mod tests {
             restarted.records().await.expect("reloaded").is_empty(),
             "a later start must not see the deleted forward"
         );
+    }
+
+    /// WHY: a client can complete the TCP handshake while the save is still
+    /// in progress. The old accept loop took that connection and kept
+    /// forwarding after the save failed. The save failure must leave no
+    /// listener and must reset that connection.
+    #[tokio::test]
+    async fn failed_save_resets_a_connection_accepted_during_the_save() {
+        use tokio::io::AsyncReadExt;
+
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
+        let addr = free_loopback().await;
+        let reg = hex_spec(addr);
+        let _accepted = forwarder.arm_accepted_connection_pause_for_testing();
+        let pause = x0x::storage::arm_durable_rename_pause_for_testing(&path);
+        let store_add = Arc::clone(&store);
+        let forwarder_add = Arc::clone(&forwarder);
+        let add = tokio::spawn(async move {
+            commit_forward(&store_add, &forwarder_add, reg.spec, reg.binding).await
+        });
+        let start = std::time::Instant::now();
+        while !x0x::storage::durable_rename_pause_entered_for_testing(&path) {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("save did not reach the rename");
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("client connects while the save is paused");
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_millis(50), client.read(&mut buf))
+            .await
+        {
+            Err(_) => {}
+            other => panic!("connection closed before the save failed: {other:?}"),
+        }
+        let start = std::time::Instant::now();
+        while !forwarder.accepted_connection_pause_entered_for_testing() {
+            if start.elapsed() > std::time::Duration::from_millis(500) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let removed_tmp = delete_durable_tmp(dir.path());
+        assert!(
+            removed_tmp > 0,
+            "the paused save must still be holding its temp file"
+        );
+        drop(pause);
+        let err = add.await.expect("add task").expect_err("save must fail");
+        assert!(
+            matches!(err, CommitError::Store(ref e) if !e.durability_unconfirmed()),
+            "a failure before the rename must roll the listener back: {err:?}"
+        );
+        assert!(
+            forwarder.forward_at(addr).is_none(),
+            "the failed save must not leave a forward registered"
+        );
+        assert!(
+            store.records().await.expect("records").is_empty(),
+            "the failed save must not leave a record"
+        );
+        match tokio::time::timeout(std::time::Duration::from_millis(500), client.read(&mut buf))
+            .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("failed save still forwarded {n} bytes"),
+            Err(_) => panic!("connection accepted during the failed save is still open"),
+        }
+        assert_eq!(
+            forwarder.diagnostics().active_streams(),
+            0,
+            "an accepted connection must not keep forwarding after the save fails"
+        );
+        assert_port_released(addr).await;
+        forwarder.shutdown();
+    }
+
+    fn delete_durable_tmp(dir: &std::path::Path) -> usize {
+        let mut removed = 0;
+        for entry in std::fs::read_dir(dir).expect("store dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".forwards.json.") && name.ends_with(".tmp") {
+                std::fs::remove_file(entry.path()).expect("remove temp file");
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// WHY: disabling connect and restarting leaves no forwarder. The saved
+    /// record must still appear in the list, marked down, and delete must
+    /// remove it from that list.
+    #[tokio::test]
+    async fn disabled_connect_lists_saved_forward_then_deletes_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let addr = "127.0.0.1:18023".parse().expect("addr");
+        let reg = hex_spec(addr);
+        {
+            let store = ForwardStore::load(path.clone()).await;
+            assert!(remember_reg(&store, &reg).await.expect("save"));
+        }
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
+        let listed = disabled_saved_forwards(&store).await;
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let forward = &listed[0];
+        assert_eq!(forward["local_addr"], addr.to_string());
+        assert_eq!(forward["enabled"], false);
+        assert_eq!(forward["error"], CONNECT_DISABLED_REASON);
+        assert_eq!(forward["persistent"], true);
+        assert_eq!(forward["target_port"], reg.spec.target_port);
+        assert_eq!(
+            forward["peer_agent"],
+            hex::encode(reg.spec.peer_agent.as_bytes())
+        );
+        assert_eq!(
+            forward["pinned_machine_id"],
+            hex::encode(reg.binding.pinned_machine.expect("pin").as_bytes())
+        );
+
+        let removed = forget_forward(&store, None, addr)
+            .await
+            .expect("delete with no forwarder");
+        assert!(removed);
+        assert!(
+            disabled_saved_forwards(&store).await.is_empty(),
+            "the list must be empty after delete"
+        );
+        let restarted = ForwardStore::load(path).await;
+        assert!(restarted.records().await.expect("reloaded").is_empty());
     }
 }

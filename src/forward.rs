@@ -1650,11 +1650,82 @@ pub struct ForwardStatus {
 
 /// Whether a registered forward is listening (internal).
 enum EntryState {
-    /// Listening; cancelling the token stops the listener.
+    /// Bound and registered. The accept loop has not started, so a failed
+    /// save can drop the socket before any connection is taken.
+    Held(TcpListener),
+    /// Listening. Cancelling the token stops the listener and every
+    /// connection it has already accepted.
     Active(CancellationToken),
     /// Registered but down, with the reason (ADR-0074 §2: a restored
     /// forward that could not be re-resolved or re-bound).
     Disabled(String),
+}
+
+impl EntryState {
+    fn down_reason(&self) -> Option<String> {
+        match self {
+            Self::Held(_) | Self::Active(_) => None,
+            Self::Disabled(reason) => Some(reason.clone()),
+        }
+    }
+}
+
+/// One accepted local connection waits here until the guard drops.
+///
+/// The slot belongs to one [`ForwardService`], so another test's listener
+/// is not paused.
+#[cfg(test)]
+struct AcceptedConnectionPause {
+    hit: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct AcceptedConnectionPauseGuard {
+    slot: Arc<std::sync::Mutex<Option<Arc<AcceptedConnectionPause>>>>,
+}
+
+#[cfg(test)]
+impl Drop for AcceptedConnectionPauseGuard {
+    fn drop(&mut self) {
+        let state = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(state) = state {
+            state.released.store(true, Ordering::Release);
+            state.release.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_accepted_connection(
+    slot: &Arc<std::sync::Mutex<Option<Arc<AcceptedConnectionPause>>>>,
+) {
+    let state = {
+        let guard = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = guard.as_ref() else {
+            return;
+        };
+        if state.hit.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        Arc::clone(state)
+    };
+    loop {
+        if state.released.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            _ = state.release.notified() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    }
 }
 
 /// A registered forward + its state (internal).
@@ -1718,6 +1789,9 @@ pub struct ForwardService {
     /// Test-only bind addresses, consumed from the front.
     #[cfg(test)]
     bind_script: std::sync::Mutex<Vec<SocketAddr>>,
+    /// Test-only pause for the next connection this forwarder accepts.
+    #[cfg(test)]
+    accepted_pause: Arc<std::sync::Mutex<Option<Arc<AcceptedConnectionPause>>>>,
     /// Add, remove, and restore transactions. `None` refuses new ones.
     /// Shutdown drains the admitted tasks before it cancels listeners, so a
     /// transaction cannot bind after shutdown has returned.
@@ -1874,6 +1948,8 @@ impl ForwardService {
             listeners_closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             bind_script: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            accepted_pause: Arc::new(std::sync::Mutex::new(None)),
             transactions: std::sync::Mutex::new(Some(Vec::new())),
             inbound_token: CancellationToken::new(),
             inbound_acceptors: std::sync::Mutex::new(Some((acceptor_v1, acceptor_v2))),
@@ -2101,9 +2177,31 @@ impl ForwardService {
     /// [`Self::add_forward`] with the name, machine pin, and persistence
     /// carried in `binding`.
     ///
+    /// The listener accepts before this returns. A caller that must not
+    /// accept until a later save succeeds uses [`Self::bind_forward`] and
+    /// then [`Self::start_accept`].
+    ///
     /// # Errors
     /// Same as [`Self::add_forward`].
     pub async fn add_forward_with(
+        &self,
+        spec: ForwardSpec,
+        binding: ForwardBinding,
+    ) -> NetworkResult<SocketAddr> {
+        let bound = self.bind_forward(spec, binding).await?;
+        self.start_accept(bound)?;
+        Ok(bound)
+    }
+
+    /// Bind `spec` and register it without accepting.
+    ///
+    /// The socket is held until [`Self::start_accept`] or
+    /// [`Self::remove_forward`]. A failed save can drop it before any
+    /// local connection is taken.
+    ///
+    /// # Errors
+    /// Same as [`Self::add_forward`].
+    pub(crate) async fn bind_forward(
         &self,
         spec: ForwardSpec,
         binding: ForwardBinding,
@@ -2139,108 +2237,197 @@ impl ForwardService {
                 ));
             }
         }
-        let cancel = CancellationToken::new();
         // Register the kernel-assigned address.  Keeping the requested
         // `:0` here makes list/remove unable to identify the listener that
         // was actually opened (and makes two ephemeral forwards collide).
-        let mut registered_spec = spec.clone();
+        let mut registered_spec = spec;
         registered_spec.local_addr = bound;
-        let accept = {
-            let mut forwards = self
-                .forwards
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Shutdown sets `listeners_closed` under this same lock and then
-            // takes `listener_tasks`. Checking here, and publishing the
-            // accept loop before the lock is released, means a bind that
-            // resumes after shutdown cannot keep the port.
-            if self.listeners_closed.load(Ordering::Acquire) {
-                drop(listener);
-                return Err(NetworkError::ConnectionFailed(
-                    "forwarder is shut down".to_string(),
-                ));
+        let mut forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Shutdown sets `listeners_closed` under this same lock and then
+        // takes `listener_tasks`. Checking here means a bind that resumes
+        // after shutdown cannot keep the port.
+        if self.listeners_closed.load(Ordering::Acquire) {
+            drop(listener);
+            return Err(NetworkError::ConnectionFailed(
+                "forwarder is shut down".to_string(),
+            ));
+        }
+        // A prior disabled entry for this address (restore that failed,
+        // then a successful re-add) is replaced.
+        forwards.retain(|e| e.spec.local_addr != bound);
+        forwards.push(ForwardEntry {
+            spec: registered_spec,
+            binding,
+            state: EntryState::Held(listener),
+        });
+        Ok(bound)
+    }
+
+    /// Start the accept loop for a forward [`Self::bind_forward`] is holding.
+    ///
+    /// Each accepted connection selects on the listener token. Cancelling
+    /// that token drops the connection, including one already taken off
+    /// the socket.
+    ///
+    /// # Errors
+    /// [`NetworkError::ConnectionFailed`] when `bound` is not a held
+    /// forward, or the forwarder has shut down. A shutdown drops the
+    /// socket before this returns.
+    pub(crate) fn start_accept(&self, bound: SocketAddr) -> NetworkResult<()> {
+        let mut forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = forwards.iter_mut().find(|e| e.spec.local_addr == bound) else {
+            return Err(NetworkError::ConnectionFailed(format!(
+                "no held forward at {bound}"
+            )));
+        };
+        if self.listeners_closed.load(Ordering::Acquire) {
+            let state = std::mem::replace(&mut entry.state, EntryState::Disabled(String::new()));
+            match state {
+                EntryState::Held(listener) => {
+                    drop(listener);
+                    entry.state = EntryState::Disabled("forwarder is shut down".to_string());
+                }
+                other => entry.state = other,
             }
-            // A prior disabled entry for this address (restore that failed,
-            // then a successful re-add) is replaced.
-            forwards.retain(|e| e.spec.local_addr != bound);
-            let pinned_machine = binding.pinned_machine;
-            forwards.push(ForwardEntry {
-                spec: registered_spec,
-                binding,
-                state: EntryState::Active(cancel.clone()),
-            });
-            let agent = Arc::clone(&self.agent);
-            let fwd_diag = Arc::clone(&self.fwd_diag);
-            let outbound_permits = Arc::clone(&self.outbound_permits);
-            let per_peer = Arc::clone(&self.per_peer);
-            let target = OutboundTarget {
-                peer_agent: spec.peer_agent,
-                pinned_machine,
-                target_host: spec.target_host.clone(),
-                target_port: spec.target_port,
+            return Err(NetworkError::ConnectionFailed(
+                "forwarder is shut down".to_string(),
+            ));
+        }
+        let listener =
+            match std::mem::replace(&mut entry.state, EntryState::Disabled(String::new())) {
+                EntryState::Held(listener) => listener,
+                other => {
+                    entry.state = other;
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "forward at {bound} is not waiting to accept"
+                    )));
+                }
             };
-            let require_attestation = self.require_attestation;
-            let live = Arc::clone(&self.live);
-            let handle = tokio::spawn(async move {
-                tracing::info!(
-                    target: "x0x::forward",
-                    local = %bound,
-                    peer = %hex::encode(target.peer_agent.as_bytes()),
-                    "outbound forward listener started"
-                );
-                loop {
-                    let (tcp, _) = tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        a = listener.accept() => match a {
-                            Ok(a) => a,
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "x0x::forward",
-                                    local = %bound,
-                                    error = %e,
-                                    "accept failed; listener stopping"
-                                );
-                                break;
-                            }
-                        },
-                    };
-                    // FIX 3: cap outbound driven connections. Over-cap TCP
-                    // accepts are dropped (the client sees a refused connection)
-                    // + counted rather than spawning unbounded.
-                    let admission = match admit_to(&outbound_permits, &per_peer, target.peer_agent)
-                    {
-                        Some(a) => a,
-                        None => {
-                            fwd_diag.record_over_cap();
-                            tracing::info!(
+        let cancel = CancellationToken::new();
+        let target = OutboundTarget {
+            peer_agent: entry.spec.peer_agent,
+            pinned_machine: entry.binding.pinned_machine,
+            target_host: entry.spec.target_host.clone(),
+            target_port: entry.spec.target_port,
+        };
+        entry.state = EntryState::Active(cancel.clone());
+        let agent = Arc::clone(&self.agent);
+        let fwd_diag = Arc::clone(&self.fwd_diag);
+        let outbound_permits = Arc::clone(&self.outbound_permits);
+        let per_peer = Arc::clone(&self.per_peer);
+        let require_attestation = self.require_attestation;
+        let live = Arc::clone(&self.live);
+        #[cfg(test)]
+        let accepted_pause = Arc::clone(&self.accepted_pause);
+        // Publish the accept loop before the lock is released, so shutdown
+        // cannot miss it.
+        let handle = tokio::spawn(async move {
+            tracing::info!(
+                target: "x0x::forward",
+                local = %bound,
+                peer = %hex::encode(target.peer_agent.as_bytes()),
+                "outbound forward listener started"
+            );
+            loop {
+                let (tcp, _) = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    a = listener.accept() => match a {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::warn!(
                                 target: "x0x::forward",
                                 local = %bound,
-                                "outbound forward refused: concurrency cap reached — closing local TCP"
+                                error = %e,
+                                "accept failed; listener stopping"
                             );
-                            continue;
+                            break;
                         }
-                    };
-                    let agent = Arc::clone(&agent);
-                    let fwd_diag = Arc::clone(&fwd_diag);
-                    let live = Arc::clone(&live);
-                    let target = target.clone();
-                    tokio::spawn(async move {
-                        let _admission = admission;
-                        fwd_diag.enter_stream();
-                        let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
-                        drive_outbound(agent, &target, tcp, require_attestation, &live, &fwd_diag)
+                    },
+                };
+                // FIX 3: cap outbound driven connections. Over-cap TCP
+                // accepts are dropped (the client sees a refused connection)
+                // + counted rather than spawning unbounded.
+                let admission = match admit_to(&outbound_permits, &per_peer, target.peer_agent) {
+                    Some(a) => a,
+                    None => {
+                        fwd_diag.record_over_cap();
+                        tracing::info!(
+                            target: "x0x::forward",
+                            local = %bound,
+                            "outbound forward refused: concurrency cap reached — closing local TCP"
+                        );
+                        continue;
+                    }
+                };
+                let agent = Arc::clone(&agent);
+                let fwd_diag = Arc::clone(&fwd_diag);
+                let live = Arc::clone(&live);
+                let target = target.clone();
+                let drive_cancel = cancel.clone();
+                #[cfg(test)]
+                let accepted_pause = Arc::clone(&accepted_pause);
+                tokio::spawn(async move {
+                    let _admission = admission;
+                    tokio::select! {
+                        _ = drive_cancel.cancelled() => {}
+                        _ = async move {
+                            fwd_diag.enter_stream();
+                            let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
+                            #[cfg(test)]
+                            pause_accepted_connection(&accepted_pause).await;
+                            drive_outbound(
+                                agent,
+                                &target,
+                                tcp,
+                                require_attestation,
+                                &live,
+                                &fwd_diag,
+                            )
                             .await;
-                    });
-                }
-            });
-            self.reap_finished_listener_tasks();
-            self.listener_tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(handle);
-            bound
-        };
-        Ok(accept)
+                        } => {}
+                    }
+                });
+            }
+        });
+        self.reap_finished_listener_tasks();
+        self.listener_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(handle);
+        Ok(())
+    }
+
+    /// Hold the next connection this forwarder accepts until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn arm_accepted_connection_pause_for_testing(&self) -> AcceptedConnectionPauseGuard {
+        let state = Arc::new(AcceptedConnectionPause {
+            hit: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        *self
+            .accepted_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
+        AcceptedConnectionPauseGuard {
+            slot: Arc::clone(&self.accepted_pause),
+        }
+    }
+
+    /// `true` once an accepted connection has entered the test pause.
+    #[cfg(test)]
+    pub(crate) fn accepted_connection_pause_entered_for_testing(&self) -> bool {
+        self.accepted_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|state| state.hit.load(Ordering::Acquire))
     }
 
     /// Register `spec` and `binding` as a forward that is down for `reason`
@@ -2252,7 +2439,8 @@ impl ForwardService {
     pub fn add_disabled(&self, spec: ForwardSpec, binding: ForwardBinding, reason: String) {
         if let Ok(mut forwards) = self.forwards.lock() {
             if forwards.iter().any(|e| {
-                e.spec.local_addr == spec.local_addr && matches!(e.state, EntryState::Active(_))
+                e.spec.local_addr == spec.local_addr
+                    && matches!(e.state, EntryState::Active(_) | EntryState::Held(_))
             }) {
                 return;
             }
@@ -2289,10 +2477,7 @@ impl ForwardService {
                     .map(|e| ForwardStatus {
                         spec: e.spec.clone(),
                         binding: e.binding.clone(),
-                        error: match &e.state {
-                            EntryState::Active(_) => None,
-                            EntryState::Disabled(reason) => Some(reason.clone()),
-                        },
+                        error: e.state.down_reason(),
                     })
                     .collect()
             })
@@ -2315,16 +2500,16 @@ impl ForwardService {
                 .map(|e| ForwardStatus {
                     spec: e.spec.clone(),
                     binding: e.binding.clone(),
-                    error: match &e.state {
-                        EntryState::Active(_) => None,
-                        EntryState::Disabled(reason) => Some(reason.clone()),
-                    },
+                    error: e.state.down_reason(),
                 })
         })
     }
 
-    /// Remove a forward by its bound local address. Cancels the listener.
-    /// Returns `true` if a forward was removed.
+    /// Remove a forward by its bound local address.
+    ///
+    /// Cancels the listener and drops every connection it has already
+    /// accepted. A forward that is bound but not yet accepting drops its
+    /// socket. Returns `true` if a forward was removed.
     pub fn remove_forward(&self, local_addr: SocketAddr) -> bool {
         let mut removed = false;
         if let Ok(mut forwards) = self.forwards.lock() {
@@ -2332,8 +2517,13 @@ impl ForwardService {
                 .iter()
                 .position(|e| e.spec.local_addr == local_addr)
             {
-                if let EntryState::Active(cancel) = &forwards[pos].state {
-                    cancel.cancel();
+                match std::mem::replace(
+                    &mut forwards[pos].state,
+                    EntryState::Disabled(String::new()),
+                ) {
+                    EntryState::Active(cancel) => cancel.cancel(),
+                    EntryState::Held(listener) => drop(listener),
+                    EntryState::Disabled(_) => {}
                 }
                 forwards.remove(pos);
                 removed = true;
@@ -2478,14 +2668,25 @@ impl ForwardService {
     /// synchronous and must not detach them. [`Self::await_listener_tasks`]
     /// takes them under the same lock after this returns.
     fn cancel_listener_tokens(&self) {
-        let forwards = self
+        let mut forwards = self
             .forwards
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.listeners_closed.store(true, Ordering::Release);
-        for entry in forwards.iter() {
-            if let EntryState::Active(cancel) = &entry.state {
-                cancel.cancel();
+        for entry in forwards.iter_mut() {
+            let state = std::mem::replace(&mut entry.state, EntryState::Disabled(String::new()));
+            match state {
+                EntryState::Active(cancel) => {
+                    entry.state = EntryState::Active(cancel.clone());
+                    cancel.cancel();
+                }
+                EntryState::Held(listener) => {
+                    drop(listener);
+                    let cancel = CancellationToken::new();
+                    cancel.cancel();
+                    entry.state = EntryState::Active(cancel);
+                }
+                disabled => entry.state = disabled,
             }
         }
     }
