@@ -130,15 +130,23 @@ refuses a mismatched answer instead of admitting it:
 
 The guards (`peer_admission`, the receive pump's frame drop, both
 guarded-send policy checks) refuse only the mismatching session: a live
-rejection entry must name the CURRENT connection's generation, so a valid
-connection of the same identity elsewhere — a different generation —
-stays admitted whatever the dial completion order. The guarded-send
-policy is recomputed inside the post-`open_uni` callback, so a rejection
-that lands while a stream waits for credit refuses the bytes there. The
-capability-hint selector additionally validates the observed
-(seed address, identity) pair itself, because inbound connections and
-id-based dials never pass the address-dial seam; that exclusion is
-pair-scoped, not identity-wide.
+rejection entry must name the CURRENT connection's generation, or its
+address, so a valid connection of the same identity elsewhere — a
+different generation and address — stays admitted whatever the dial
+completion order. An entry with no generation evidence (the mismatching
+connection closed before capture) stays address-scoped: it refuses a
+session on its own address only, never the identity's sessions elsewhere.
+Independent of every recorded entry, the guards also apply the timeless
+pair verdict to the live connection set: a current connection on a
+pinned address whose pin set excludes the identity is refused with no
+entry at all and after an entry expires — this is what catches an
+ant-quic-internal coordinator redial of a rejected seed, whose connection
+never passed x0x's dial seam. The guarded-send policy is recomputed
+inside the post-`open_uni` callback, so a rejection that lands while a
+stream waits for credit refuses the bytes there. The capability-hint
+selector additionally validates the observed (seed address, identity)
+pair itself, because inbound connections and id-based dials never pass
+the address-dial seam; that exclusion is pair-scoped, not identity-wide.
 
 The pin set is per address, never per host: the UDP/443 and UDP/5483
 listeners on one seed host are separate `x0xd` instances with separate
