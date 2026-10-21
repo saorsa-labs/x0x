@@ -1580,6 +1580,132 @@ pub struct GroupRecoveryV1 {
     /// ([`conflict_gate_sequence`]), no ATA arms, and the node shows
     /// `reseat_required {attestation_conflict}`. A re-seat swap clears it.
     pub attestation_conflict: Option<AdminTerminalAttestation>,
+    /// §4 "Transactions": the exact `before` and `after` of the transition
+    /// that wrote `authoritative_record`. Load reconciliation uses it to
+    /// choose which record replaces the legacy placeholder.
+    pub authoritative_binding: Option<AuthoritativeBindingV1>,
+}
+
+/// One end of an S3 two-file transition (§4 "Transactions"): the state
+/// revision and hash, and the containment identity (the ADR 0067 epoch
+/// token is `(state_revision, marker identity)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritativeHead {
+    /// The record's state revision.
+    pub revision: u64,
+    /// The record's state hash.
+    pub state_hash: String,
+    /// The record's marker identity, when it holds one.
+    pub marker: Option<RecoveryRef>,
+}
+
+impl AuthoritativeHead {
+    /// The head and containment identity of `info`.
+    #[must_use]
+    pub fn of(info: &GroupInfo) -> Self {
+        Self {
+            revision: info.state_revision,
+            state_hash: info.state_hash.clone(),
+            marker: info.fork_quarantine.as_ref().map(RecoveryRef::from_marker),
+        }
+    }
+
+    fn same_head(&self, info: &GroupInfo) -> bool {
+        self.revision == info.state_revision && self.state_hash == info.state_hash
+    }
+}
+
+/// The binding of the sidecar's `authoritative_record` (§4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritativeBindingV1 {
+    /// The live map key of the record.
+    pub live_key: String,
+    /// The head the legacy view held before this write.
+    pub before: AuthoritativeHead,
+    /// The authoritative record that `before` names, when the legacy view
+    /// already held a placeholder for it (JSON). `None` when the legacy
+    /// view held the real record (the arming transition).
+    pub before_record: Option<Vec<u8>>,
+    /// The head of `authoritative_record`.
+    pub after: AuthoritativeHead,
+}
+
+/// What load reconciliation does with the legacy entry of a group whose
+/// sidecar holds an authoritative record (§4 "Crash reconciliation at
+/// load").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthoritativeChoice {
+    /// The legacy entry is the placeholder of `after`: the transition is
+    /// finalised and the authoritative record replaces it.
+    After,
+    /// The legacy entry is the placeholder of `before`: the transition's
+    /// legacy write never landed, so the earlier authoritative record
+    /// replaces it and the later one is dropped.
+    Before,
+    /// The legacy entry is a real record (the arming write never landed,
+    /// or a retirement already landed). It is kept.
+    KeepLoaded,
+    /// The legacy entry is a placeholder that matches neither end. It stays
+    /// in place, inert, and containment is kept (`local_state_lost`).
+    Lost,
+}
+
+/// Choose the record for a loaded legacy entry (§4). Matching is by head
+/// only: the caller unions the loaded entry's containment into whichever
+/// record it keeps, so a marker installed in place on disk is never lost.
+#[must_use]
+pub fn choose_authoritative(
+    binding: &AuthoritativeBindingV1,
+    loaded: &GroupInfo,
+) -> AuthoritativeChoice {
+    if !is_s3_placeholder(loaded) {
+        return AuthoritativeChoice::KeepLoaded;
+    }
+    if binding.after.same_head(loaded) {
+        AuthoritativeChoice::After
+    } else if binding.before.same_head(loaded) && binding.before_record.is_some() {
+        AuthoritativeChoice::Before
+    } else {
+        AuthoritativeChoice::Lost
+    }
+}
+
+/// The S3 placeholder roster (§4 "Placeholder"): every entry of `info`'s
+/// roster, each Removed, so no seat is Active and no admin exists. It is
+/// never empty: released binaries run `migrate_from_v1` on every loaded
+/// entry, and on an empty roster that seats the creator as Admin. A record
+/// with no roster gets its creator as one Removed entry.
+#[must_use]
+pub fn placeholder_roster(
+    info: &GroupInfo,
+) -> std::collections::BTreeMap<String, crate::groups::member::GroupMember> {
+    let mut roster = info.members_v2.clone();
+    if roster.is_empty() {
+        let creator = hex::encode(info.creator.as_bytes());
+        roster.insert(
+            creator.clone(),
+            crate::groups::member::GroupMember::new_admin(creator, None, info.created_at),
+        );
+    }
+    for member in roster.values_mut() {
+        member.state = GroupMemberState::Removed;
+    }
+    roster
+}
+
+/// `info` is an S3 placeholder: a non-empty roster with every entry
+/// Removed, and none of the state a placeholder clears (retained commits,
+/// join requests, a shared secret).
+#[must_use]
+pub fn is_s3_placeholder(info: &GroupInfo) -> bool {
+    !info.members_v2.is_empty()
+        && info
+            .members_v2
+            .values()
+            .all(|member| member.state == GroupMemberState::Removed)
+        && info.commit_log.is_empty()
+        && info.join_requests.is_empty()
+        && info.shared_secret.is_none()
 }
 
 impl GroupRecoveryV1 {
@@ -1595,6 +1721,7 @@ impl GroupRecoveryV1 {
             && self.issued_reseats.is_empty()
             && self.retired.is_empty()
             && self.attestation_conflict.is_none()
+            && self.authoritative_binding.is_none()
     }
 
     /// Keep a retired record, dropping the oldest past the cap.
@@ -2051,6 +2178,112 @@ mod tests {
         assert_eq!(
             conflict_gate_sequence(&active, &agreeing, "h4"),
             Some(Vec::new())
+        );
+    }
+
+    /// §4 "Placeholder": a non-empty, all-Removed roster, which released
+    /// binaries' `migrate_from_v1` leaves alone (an empty roster would
+    /// seat the creator as Admin).
+    #[test]
+    fn placeholder_roster_is_non_empty_and_seats_no_one() {
+        let admin = keypair();
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ef".repeat(32),
+        );
+        info.add_member(
+            "ab".repeat(32),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        let roster = placeholder_roster(&info);
+        assert_eq!(roster.len(), info.members_v2.len());
+        assert!(roster
+            .values()
+            .all(|member| member.state == GroupMemberState::Removed));
+        let mut placeholder = info.clone();
+        placeholder.members_v2 = roster;
+        placeholder.commit_log.clear();
+        placeholder.shared_secret = None;
+        placeholder.migrate_from_v1();
+        assert!(placeholder
+            .members_v2
+            .values()
+            .all(|member| member.state != GroupMemberState::Active));
+        assert!(is_s3_placeholder(&placeholder));
+        assert!(!is_s3_placeholder(&info));
+        // A record with no roster still gets one Removed entry.
+        let mut empty = info.clone();
+        empty.members_v2.clear();
+        let roster = placeholder_roster(&empty);
+        assert_eq!(roster.len(), 1);
+        empty.members_v2 = roster;
+        empty.migrate_from_v1();
+        assert!(empty
+            .members_v2
+            .values()
+            .all(|member| member.state == GroupMemberState::Removed));
+    }
+
+    /// §4 "Crash reconciliation at load": `after` finalises, `before` (the
+    /// legacy write never landed) restores the earlier record, a real
+    /// legacy record is kept, and a placeholder matching neither is lost.
+    #[test]
+    fn load_reconciliation_chooses_by_the_binding() {
+        let admin = keypair();
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ef".repeat(32),
+        );
+        info.seal_commit(&admin, 1_000).expect("seal");
+        let before = AuthoritativeHead::of(&info);
+        let mut later = info.clone();
+        later.name = "later".to_string();
+        later.seal_commit(&admin, 2_000).expect("seal");
+        let after = AuthoritativeHead::of(&later);
+        let placeholder_of = |record: &GroupInfo| {
+            let mut placeholder = record.clone();
+            placeholder.members_v2 = placeholder_roster(record);
+            placeholder.commit_log.clear();
+            placeholder.shared_secret = None;
+            placeholder
+        };
+        let mut binding = AuthoritativeBindingV1 {
+            live_key: info.mls_group_id.clone(),
+            before: before.clone(),
+            before_record: Some(serde_json::to_vec(&info).expect("json")),
+            after,
+        };
+        assert_eq!(
+            choose_authoritative(&binding, &placeholder_of(&later)),
+            AuthoritativeChoice::After
+        );
+        assert_eq!(
+            choose_authoritative(&binding, &placeholder_of(&info)),
+            AuthoritativeChoice::Before
+        );
+        assert_eq!(
+            choose_authoritative(&binding, &info),
+            AuthoritativeChoice::KeepLoaded
+        );
+        let mut third = later.clone();
+        third.seal_commit(&admin, 3_000).expect("seal");
+        assert_eq!(
+            choose_authoritative(&binding, &placeholder_of(&third)),
+            AuthoritativeChoice::Lost
+        );
+        // The arming write (no earlier authoritative record) that never
+        // landed leaves a real record, which is kept; a placeholder at the
+        // before head with nothing to restore is lost, never guessed.
+        binding.before_record = None;
+        assert_eq!(
+            choose_authoritative(&binding, &placeholder_of(&info)),
+            AuthoritativeChoice::Lost
         );
     }
 

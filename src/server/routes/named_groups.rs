@@ -6342,7 +6342,8 @@ where
     }
     enforce_containment_invariant(&mut candidate, &before);
     let (legacy_json, home_suite_json) =
-        encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)?;
+        encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)
+            .await?;
     let prejournaled = if let Some(group_id) = rebind_group_id {
         match prepare_rebind_journal_for_groups(state, group_id, &candidate).await {
             RebindOutcome::Failed(error) => {
@@ -7272,6 +7273,7 @@ async fn prepare_rebind_journal_for_groups(
         // persisted, so it survives the filter.
         let (legacy_json, home_suite_json) =
             encode_named_groups_store_excluding_pending_stubs(state, groups, Some(group_id))
+                .await
                 .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?;
         // The LEGACY journal carries the legacy half (its postcard shape
         // is the downgrade-safe replay carrier — old binaries decode and
@@ -23063,7 +23065,8 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         if !has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id) {
             return Ok(false);
         }
-        encode_named_groups_store(&groups)
+        encode_named_groups_store_for_state(state, &groups)
+            .await
             .map_err(|e| anyhow::anyhow!("withdrawn named groups repair encode: {e}"))?
     };
 
@@ -33337,7 +33340,8 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         // containment cannot have moved under it, so the results agree.
         enforce_containment_invariant(&mut next_groups, &groups);
         // #451 (merged main): the two-file split encoder.
-        encode_named_groups_store(&next_groups)
+        encode_named_groups_store_for_state(state, &next_groups)
+            .await
             .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
     };
 
@@ -36488,6 +36492,11 @@ pub(in crate::server) async fn load_named_groups_merged(
                 );
             }
         }
+        // ADR 0109 §4: an S3 placeholder is replaced by its authoritative
+        // record from `<data_dir>/group-recovery/`.
+        if let Some(data_dir) = named_groups_path.parent() {
+            group_recovery::splice_authoritative_records(data_dir, &mut merged).await;
+        }
         Ok(merged)
     })
     .await
@@ -38898,22 +38907,40 @@ pub(in crate::server) async fn save_named_groups_checked(
 /// only, and no whole-map save may durably capture it before the member's
 /// own `MemberAdded` applies. THIS group's entry (when it is the confirmed
 /// state being persisted) survives the filter via `always_include`.
-fn encode_named_groups_store_excluding_pending_stubs(
+async fn encode_named_groups_store_excluding_pending_stubs(
     state: &AppState,
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     always_include: Option<&str>,
 ) -> std::io::Result<(String, String)> {
-    let pending = state
-        .pending_join_stubs
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if pending.is_empty() {
-        return encode_named_groups_store(groups);
+    let durable_view = {
+        let pending = state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!pending.is_empty()).then(|| {
+            let mut durable_view = groups.clone();
+            durable_view.retain(|key, _| {
+                Some(key.as_str()) == always_include || !pending.contains(key.as_str())
+            });
+            durable_view
+        })
+    };
+    encode_named_groups_store_for_state(state, durable_view.as_ref().unwrap_or(groups)).await
+}
+
+/// The production store encoder: ADR 0109 §4's S3 placeholder transaction
+/// (the authoritative record durable in the S3 sidecar first, then the
+/// placeholder in both legacy views), then the #451 split encode.
+async fn encode_named_groups_store_for_state(
+    state: &AppState,
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> std::io::Result<(String, String)> {
+    // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
+    // S3 sidecar writer future lives on the heap, not in every save path.
+    match Box::pin(group_recovery::legacy_store_view(state, groups)).await? {
+        Some(view) => encode_named_groups_store(&view),
+        None => encode_named_groups_store(groups),
     }
-    let mut durable_view = groups.clone();
-    durable_view
-        .retain(|key, _| Some(key.as_str()) == always_include || !pending.contains(key.as_str()));
-    encode_named_groups_store(&durable_view)
 }
 
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
@@ -38921,7 +38948,7 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
 ) -> std::io::Result<AtomicWriteOutcome> {
     let (legacy_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
-        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None).await?
     };
     save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
 }
