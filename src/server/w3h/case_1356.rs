@@ -1,15 +1,17 @@
 //! W3-H cases for #1356 (ADR 0109, S3 of ADR 0088): ownerless attestation,
 //! stale-base self-recovery and manual re-seat. Harness first (D16, D54,
-//! D181): each red arm is committed and shown RED on the S3 base before
-//! the S3 code merges. A red arm that fails with the observation its
-//! `CAUSE_*` names is RED; any other failure is INFRA. Controls are GREEN
-//! before and after S3.
+//! D181): each red arm was committed and shown RED on the S3 base before
+//! the S3 code merged. This branch has the S3 code, so each red arm now
+//! expects GREEN (the ADR 0109 behaviour) and keeps its `_red_` name, as
+//! #1256 and #1357 did. A red arm that fails with the observation its
+//! `CAUSE_*` names (the base's behaviour) is RED; any other failure is
+//! INFRA. Controls are GREEN before and after S3.
 //!
 //! The ADR 0109 H-S3-a row (#818, skewed clocks) is `case_818`'s red
 //! baseline, `w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined`.
-//! Its GREEN end state is H-S3-a's candidate assertion, so the S3 code is
-//! expected to flip it (issue #1356, "the W3-H case for #818 is green").
-//! This file does not repeat it.
+//! Its GREEN end state is H-S3-a's candidate assertion, and it now expects
+//! GREEN too (issue #1356, "the W3-H case for #818 is green"). This file
+//! does not repeat it.
 //!
 //! Join arms. Nodes A (creator and only admin), M1 and M2 (members), J
 //! (joiner), in an ordinary `private_secure` (TreeKEM) group with no owner
@@ -17,7 +19,7 @@
 //! past the last metadata resend, and then J joins with I and A seals J
 //! (r+2).
 //!
-//! - `s3_aligned_stale_joiner` (H-S3-a2, RED on the base). Setup S0′: no
+//! - `s3_aligned_stale_joiner` (H-S3-a2, RED on the base, GREEN with S3). Setup S0′: no
 //!   state-only commits before the mint, so the clocks are aligned and the
 //!   seal's roster clock is above J's seed. Desired (ADR 0109 §2): within
 //!   [`CATCHUP`] J is active at A's state revision and TreeKEM epoch and is
@@ -59,7 +61,8 @@
 //! chain: X is forked (ADR 0109 §3), while A and M1 share one chain and
 //! are unmarked. The case then advances [`ATTEST_ROUND`].
 //!
-//! - `s3_forked_node_shows_reseat_required` (§3 and §8, RED on the base).
+//! - `s3_forked_node_shows_reseat_required` (§3 and §8, RED on the base,
+//!   GREEN with S3).
 //!   Desired: X shows the typed wait `recovery.state = reseat_required`
 //!   with `cause = not_on_chain` (A answered its request), and stays
 //!   marked on its fork. The base ([`CAUSE_TYPED`]): X stays marked, and
@@ -69,7 +72,8 @@
 //!   its marker and its fork head, and A and M1 do not change. No
 //!   attestation resolves a fork.
 //! - `s3_manual_reseat_recovers_forked_node` (§3, an ownerless H-S3-c with
-//!   a `Removal` basis as in H-S3-d8; RED on the base). After the window
+//!   a `Removal` basis as in H-S3-d8; RED on the base, GREEN with S3).
+//!   After the window
 //!   A removes X (r+2) and calls `POST /groups/:id/members/:agent_id/reseat`
 //!   with a reason and basis `Removal(r+2)` ([`reseat_body`]). With no call
 //!   on X's API, X consumes the authorisation and is desired active at
@@ -78,10 +82,11 @@
 //!   exist (404) and X stays forked.
 //!
 //! The `recovery` object is read as `{"state": .., "cause": ..}` and the
-//! re-seat request body as [`reseat_body`]: the harness's reading of ADR
-//! 0109 §3 and §8, which name the fields but not their JSON. The S3 code
-//! sets the API (`docs/api-reference.md`); if it differs, the S3 PR
-//! aligns these two readers in this file.
+//! re-seat request body is [`reseat_body`]. ADR 0109 §3 and §8 name the
+//! fields; the S3 API (`docs/api-reference.md`, "Ownerless attestation and
+//! re-seat") gives the same JSON: `recovery` is `{"state", "cause", "ref",
+//! "last_refusal", "asked"}` for `reseat_required`, and the re-seat body is
+//! `{"reason", "basis": {"kind": "removal", "revision", "state_hash"}}`.
 //!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
@@ -128,17 +133,18 @@ const QUEUED_LOG: &str = "queued TreeKEM membership event pending catch-up/repla
 /// changes make the skew. Two would be enough; four keep a margin.
 const POLICY_CHANGES: [&str; 4] = ["admin_only", "members_only", "admin_only", "members_only"];
 const FORK_LABELS: &[&str] = &["A", "X", "M1"];
-/// PLACEHOLDER (ADR 0109 leaves it to measurement): the time a marked,
-/// forked node takes to reach its typed state. It covers the first
-/// `group_attest_request` and two retries at the §11 backoff (60 s, then
-/// 120 s), each with its answer.
+/// The time a marked, forked node takes to reach its typed state. ADR 0109
+/// gives no bound for it; it covers the first `group_attest_request` and
+/// two retries at the §11 backoff (60 s, then 120 s; `request_backoff(0)`
+/// and `request_backoff(1)` in `groups::recovery`), each with its answer,
+/// plus 60 s of margin.
 const ATTEST_ROUND: Duration = Duration::from_secs(240);
 const FINAL_TYPED: &str = "x_shows_reseat_required_not_on_chain_and_stays_contained";
 const CAUSE_TYPED: &str = "X stays marked on its fork, and GET /groups/:id on X has no \
                            recovery object in the whole window";
 const FINAL_NOT_AUTO: &str = "x_stays_marked_on_its_fork_and_a_m1_unchanged";
-/// PLACEHOLDER (ADR 0109 leaves it to measurement): from the admin's
-/// re-seat call to the subject's swap (§3: delivery, the staged join
+/// PLACEHOLDER (ADR 0109 gives no value; it leaves it to measurement):
+/// from the admin's re-seat call to the subject's swap (§3: delivery, the staged join
 /// with ADR 0107's guards, the TreeKEM Welcome and the durable swap).
 const RESEAT_BOUND: Duration = Duration::from_secs(300);
 const RESEAT_REASON: &str = "w3h #1356: X forked off the main chain while partitioned";
@@ -1109,7 +1115,7 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     Ok(())
 }
 
-/// H-S3-a2 (#818, aligned clocks): RED until ADR 0109 S3 lands.
+/// H-S3-a2 (#818, aligned clocks): RED on the base; GREEN with ADR 0109 S3.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1120,7 +1126,7 @@ async fn w3h_1356_red_s3_aligned_stale_joiner_catches_up() -> Result<()> {
         "w3h_1356_red_s3_aligned_stale_joiner_catches_up",
         0x1356_0001,
         Arm::AlignedJoin,
-        Verdict::Red,
+        Verdict::Green,
     )
     .await
 }
@@ -1141,7 +1147,8 @@ async fn w3h_1356_control_s3_attestation_touches_only_the_subject() -> Result<()
     .await
 }
 
-/// ADR 0109 §3 and §8: a forked node shows `reseat_required {not_on_chain}`.
+/// ADR 0109 §3 and §8: a forked node shows `reseat_required {not_on_chain}`
+/// (RED on the base; GREEN with S3).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1152,7 +1159,7 @@ async fn w3h_1356_red_s3_forked_node_shows_reseat_required() -> Result<()> {
         "w3h_1356_red_s3_forked_node_shows_reseat_required",
         0x1356_0003,
         Arm::ForkTyped,
-        Verdict::Red,
+        Verdict::Green,
     )
     .await
 }
@@ -1173,7 +1180,8 @@ async fn w3h_1356_control_s3_forked_node_not_auto_recovered() -> Result<()> {
     .await
 }
 
-/// ADR 0109 §3: an admin's manual re-seat recovers a forked node.
+/// ADR 0109 §3: an admin's manual re-seat recovers a forked node (RED on
+/// the base; GREEN with S3).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1184,7 +1192,7 @@ async fn w3h_1356_red_s3_manual_reseat_recovers_forked_node() -> Result<()> {
         "w3h_1356_red_s3_manual_reseat_recovers_forked_node",
         0x1356_0005,
         Arm::ForkReseat,
-        Verdict::Red,
+        Verdict::Green,
     )
     .await
 }
