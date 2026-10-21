@@ -665,4 +665,116 @@ mod tests {
         );
         Ok(())
     }
+
+    /// One under-lock cancellation case: the seat of `target_hex` commits
+    /// `old` and the S4 row is prepared for its expiry. Then the committed
+    /// certificate changes to `new` (also expired, so the gate's
+    /// reconciliation keeps the row open and the request reaches the
+    /// membership lock). The worker's `kind` request must stop with
+    /// `409 s4_exclusion_cancelled` and keep the seat.
+    async fn assert_cancelled_under_lock(
+        state: &Arc<AppState>,
+        group_id: &str,
+        target_hex: &str,
+        target_kp: &x0x::identity::AgentKeypair,
+        kind: super::super::ManualRequestKind,
+    ) -> anyhow::Result<()> {
+        use x0x::identity::AgentCertificate;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let now_unix = super::super::now_unix_ms() / 1000;
+        let old = AgentCertificate::issue_with_expiry(&owner, target_kp, Some(now_unix - 2_000))?;
+        let new = AgentCertificate::issue_with_expiry(&owner, target_kp, Some(now_unix - 1_000))?;
+        let old_digest = x0x::groups::owner_cert::certificate_digest_hex(&old);
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(group_id).expect("group");
+            info.set_member_certificate(target_hex, old)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            info.recompute_state_hash();
+        }
+        let key = s4_prepare(state, group_id, target_hex, |key| {
+            let mut store = ObligationStore::new();
+            store.intake(
+                key,
+                EvictionTrigger::CertificateExpiry {
+                    certificate_digest: old_digest.clone(),
+                    not_after: now_unix - 2_000,
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            store
+        })
+        .await?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(group_id).expect("group");
+            let member = info.members_v2.get_mut(target_hex).expect("seat");
+            member.certificate_digest = Some(x0x::groups::owner_cert::certificate_digest_hex(&new));
+            member.certificate = Some(new);
+            info.recompute_state_hash();
+        }
+        let mut scope = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            super::super::eviction_seal_scope(&inner.store, &key)
+        };
+        scope.prepared_removal = true;
+        let (status, body) =
+            super::super::run_member_route(state, group_id, target_hex, kind, scope).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "{kind:?}: {body:?}"
+        );
+        assert_eq!(body["error"], "s4_exclusion_cancelled", "{kind:?}");
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_id).expect("group");
+        assert!(
+            info.has_active_member(target_hex),
+            "{kind:?}: the seat is kept"
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1 #2, every plane: the S4 eligibility re-check runs
+    /// under the membership lock in the remove and ban routes, for GSS and
+    /// TreeKEM groups, and the cancellation is a typed `409`.
+    #[tokio::test]
+    async fn a_cancelled_expiry_removal_stops_under_the_lock_on_every_plane() -> anyhow::Result<()>
+    {
+        use super::super::ManualRequestKind::{Ban, Remove};
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (treekem_target, treekem_kp) = seated_target_group(&state, &"a2".repeat(16)).await?;
+        assert_cancelled_under_lock(
+            &state,
+            &"a2".repeat(16),
+            &treekem_target,
+            &treekem_kp,
+            Remove,
+        )
+        .await?;
+        for (group_id, kind) in [("a3".repeat(16), Remove), ("a4".repeat(16), Ban)] {
+            let admin = state.agent.agent_id();
+            let target_kp = x0x::identity::AgentKeypair::generate()?;
+            let target_hex = hex::encode(target_kp.agent_id().as_bytes());
+            let mut info = GroupInfo::new("s4-gss".into(), String::new(), admin, group_id.clone());
+            info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+            let admin_hex = hex::encode(admin.as_bytes());
+            info.add_member(
+                target_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(admin_hex),
+                None,
+            );
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info);
+            assert_cancelled_under_lock(&state, &group_id, &target_hex, &target_kp, kind).await?;
+        }
+        Ok(())
+    }
 }
