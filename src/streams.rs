@@ -918,7 +918,9 @@ mod tests {
         if let crate::connect::ConnectPolicy::Enabled(acl) = &mut with_owner_entry {
             acl.owner_allow.push(crate::connect::ConnectOwnerEntry {
                 description: None,
-                targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
+                targets: vec![crate::connect::OwnerTarget::Exact(
+                    "127.0.0.1:22".parse().expect("loopback literal"),
+                )],
             });
         }
         // Owner entry + owner-trusted agent ⇒ pass.

@@ -23,6 +23,7 @@ mod key_move;
 mod machines;
 mod messaging;
 pub(crate) mod named_groups;
+pub(in crate::server) mod names;
 mod network;
 mod owner;
 mod presence;
@@ -123,6 +124,10 @@ pub(super) use named_groups::{
     DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
     GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
 };
+pub(super) use names::{
+    names_list, names_machine_label, names_owner_bind, names_owner_unbind, names_resolve,
+    names_unpin,
+};
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
     gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
@@ -151,6 +156,8 @@ pub(super) use tasks::{
     legacy_space_board_retired, list_task_lists, list_tasks, update_task,
 };
 pub(super) use trust::evaluate_trust;
+#[cfg(unix)]
+pub(super) use upgrade::StartupStagingContext;
 pub(super) use upgrade::{
     apply_upgrade, broadcast_current_manifest, check_upgrade, daemon_shutdown_hook,
     listener_restart_context, run_fallback_github_poll, run_gossip_update_listener,

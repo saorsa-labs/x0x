@@ -1940,6 +1940,64 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "grants",
         request: RequestSpec::None,
     },
+    // ── Names (ADR-0074 §1; durable owner token only) ───────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/names",
+        cli_name: "names list",
+        description: "List owner petnames and pinned names",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/resolve",
+        cli_name: "names resolve",
+        description: "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
+        category: "names",
+        // Positional NAME — dump-request must not synthesize `--name`
+        // (collides with the global instance `--name` flag).
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/owners",
+        cli_name: "names owner add",
+        description: "Bind a local owner petname to a user id (frozen at first bind)",
+        category: "names",
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("label", true, "LABEL"),
+            RequestField::body_as("user_id", true, "USER_ID"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/owners/:label",
+        cli_name: "names owner rm",
+        description: "Remove a local owner petname and every pin under it",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/machines",
+        cli_name: "names machine label",
+        description: "Label a shared machine (machine:<label>.<owner> -> machine id)",
+        category: "names",
+        // Same positional NAME rule as `/names/resolve` (global `--name` clash).
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("name", true, "NAME"),
+            RequestField::body_as("machine_id", true, "MACHINE_ID"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/pins/:name",
+        cli_name: "names unpin",
+        description: "Drop a TOFU pin so the name re-pins at next use",
+        category: "names",
+        request: RequestSpec::None,
+    },
 ];
 
 /// Find an endpoint by its CLI name.

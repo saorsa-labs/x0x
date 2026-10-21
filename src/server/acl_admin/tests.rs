@@ -594,7 +594,10 @@ async fn api_accepts_well_formed_grant_entry_like_toml() {
         panic!("connect stays enabled");
     };
     assert_eq!(acl.grant_allow.len(), 1);
-    assert_eq!(acl.grant_allow[0].targets, vec![target("127.0.0.1:22")]);
+    assert_eq!(
+        acl.grant_allow[0].targets,
+        vec![crate::connect::OwnerTarget::Exact(target("127.0.0.1:22"))]
+    );
     assert!(
         acl.owner_allow.is_empty(),
         "grant entry is not an owner entry"
