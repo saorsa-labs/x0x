@@ -2095,42 +2095,48 @@ pub(in crate::server) async fn reseat_group_member(
     if !basis_known {
         return reseat_refusal(StatusCode::CONFLICT, "basis_unknown", basis.to_json());
     }
+    let mut promoted = false;
     if let Some(owner) = info.policy.admission.owner_certified_user_id() {
         let owner_path =
             state.agent.identity().user_keypair().is_some_and(|kp| {
                 x0x::identity::UserId::from_public_key(kp.public_key()) == *owner
             });
         if !owner_path {
-            // §3a: the promoted-admin path needs `group_reseat_mandate_v1`
-            // receivers; this release does not advertise it yet, so every
-            // current receiver counts as legacy (the capability floor).
-            let members: Vec<String> = info
-                .members_v2
-                .iter()
-                .filter(|(member, seat)| seat.is_active() && !member.eq_ignore_ascii_case(&local))
-                .map(|(member, _)| member.clone())
-                .collect();
-            return reseat_refusal(
-                StatusCode::CONFLICT,
-                "reseat_receiver_upgrade_required",
-                serde_json::json!({ "members": members }),
-            );
+            promoted = true;
+            if let Err(response) = promoted_admin_checks(&state, &info, &subject_hex, &basis).await
+            {
+                return response;
+            }
         }
     }
     let expiry_secs = s3::RESEAT_AUTHORISATION_LIFETIME.as_secs();
-    let (invite, link) = match super::mint_invite_transaction(
-        &state,
-        &group_key,
-        expiry_secs,
-        Some(subject),
-        x0x::groups::InviteOrigin::Explicit,
-        actor.is_durable_owner(),
-    )
-    .await
-    {
-        Ok(minted) => minted,
-        Err(refusal) => return super::mint_refusal_response(&id, refusal).into_response(),
+    let minted = if promoted {
+        match mint_reseat_invite(&state, &group_key, subject, expiry_secs).await {
+            Ok(minted) => minted,
+            Err(reason) => {
+                return reseat_refusal(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    reason,
+                    serde_json::Value::Null,
+                );
+            }
+        }
+    } else {
+        match super::mint_invite_transaction(
+            &state,
+            &group_key,
+            expiry_secs,
+            Some(subject),
+            x0x::groups::InviteOrigin::Explicit,
+            actor.is_durable_owner(),
+        )
+        .await
+        {
+            Ok(minted) => minted,
+            Err(refusal) => return super::mint_refusal_response(&id, refusal).into_response(),
+        }
     };
+    let (invite, link) = minted;
     let keypair = state.agent.identity().agent_keypair();
     let expires_at_ms = invite.expires_at.saturating_mul(1000);
     let fields = ReseatAuthorisationFields {
@@ -2312,6 +2318,360 @@ pub(in crate::server) async fn get_group_recovery(
         .into_response()
 }
 
+// ─── §3a The promoted-admin re-seat mandate (wiring) ───────────────────────
+
+/// The §3a capability floor: every current roster member that may receive
+/// the chain (Active seats other than this node, online or not) whose
+/// current verified advert does not set `group_reseat_mandate_v1`. A member
+/// without a current advert counts as legacy.
+fn reseat_floor_missing(state: &AppState, info: &GroupInfo) -> Vec<String> {
+    let local = local_hex(state);
+    let capabilities = state.agent.capability_store();
+    let mut missing: Vec<String> = info
+        .members_v2
+        .iter()
+        .filter(|(member, seat)| seat.is_active() && !member.eq_ignore_ascii_case(&local))
+        .filter(|(member, _)| {
+            parse_raw(member).is_none_or(|raw| {
+                capabilities.verified_registry_supports(
+                    &AgentId(raw),
+                    x0x::dm::CapabilityRegistry::GROUP_RESEAT_MANDATE_V1,
+                ) != Some(true)
+            })
+        })
+        .map(|(member, _)| member.clone())
+        .collect();
+    missing.sort();
+    missing
+}
+
+/// The subject's owner certificate as this admin holds it: the bytes kept
+/// on its (Removed) seat, else the discovery evidence.
+async fn subject_certificate(
+    state: &AppState,
+    info: &GroupInfo,
+    subject_hex: &str,
+) -> Option<x0x::identity::AgentCertificate> {
+    if let Some(cert) = info
+        .members_v2
+        .get(subject_hex)
+        .and_then(|seat| seat.certificate.clone())
+    {
+        return Some(cert);
+    }
+    super::owner_cert_evidence_for(state, &[subject_hex])
+        .await
+        .cert_for(subject_hex)
+        .cloned()
+}
+
+/// The first retained commit that seated `subject_hex` before `before`.
+fn seating_commit_hash(info: &GroupInfo, subject_hex: &str, before: u64) -> Option<String> {
+    let mut log: Vec<&RetainedCommit> = info
+        .commit_log
+        .iter()
+        .filter(|entry| entry.commit.revision < before)
+        .collect();
+    log.sort_by_key(|entry| entry.commit.revision);
+    let mut seated_prior = false;
+    let mut found = None;
+    for entry in log {
+        let seated = entry
+            .roster
+            .get(subject_hex)
+            .is_some_and(|member| member.state == x0x::groups::GroupMemberState::Active);
+        if seated && !seated_prior {
+            found = Some(entry.commit.state_hash.clone());
+        }
+        seated_prior = seated;
+    }
+    found
+}
+
+/// The issued re-seat whose invite secret this `MemberJoined` redeems, for
+/// this subject (§3a: the issuing admin applies checks 1 and 2 again when
+/// the join request arrives).
+pub(super) async fn issued_reseat_for_secret(
+    state: &AppState,
+    stable_group_id: &str,
+    subject_hex: &str,
+    invite_secret: &str,
+) -> Option<IssuedReseatV1> {
+    let hash = s3::invite_secret_hash(invite_secret);
+    current_issued_reseat(state, stable_group_id, subject_hex)
+        .await
+        .filter(|issued| issued.authorisation.fields.invite_secret_hash == hash)
+}
+
+/// The outcome of the §3a seal step for one `MemberJoined`.
+pub(super) enum ReseatSeal {
+    /// Not a promoted-admin re-seat: seal as today.
+    NotReseat,
+    /// A promoted-admin re-seat: embed this mandate in place of the owner
+    /// mandate.
+    Mandate(Box<x0x::groups::recovery::ReseatMandateV1>),
+    /// A promoted-admin re-seat whose floor or bindings fail at seal: seal
+    /// nothing.
+    Refused(&'static str),
+}
+
+/// §3a at seal: when this `MemberJoined` redeems a promoted-admin re-seat
+/// invite (an owner-axis group, no owner key here, a paired issued
+/// authorisation with a `Removal` basis), re-check the floor and sign the
+/// mandate over the parent and the seat-write in `next`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn reseat_mandate_for_seat(
+    state: &AppState,
+    parent: &GroupInfo,
+    next: &GroupInfo,
+    subject_hex: &str,
+    invite_secret: &str,
+    epoch: u64,
+    certificate: Option<&x0x::identity::AgentCertificate>,
+    role: x0x::groups::GroupRole,
+) -> ReseatSeal {
+    let Some(owner) = parent.policy.admission.owner_certified_user_id() else {
+        return ReseatSeal::NotReseat;
+    };
+    let owner_key_here = state
+        .agent
+        .identity()
+        .user_keypair()
+        .is_some_and(|kp| x0x::identity::UserId::from_public_key(kp.public_key()) == *owner);
+    if owner_key_here {
+        return ReseatSeal::NotReseat;
+    }
+    let Some(issued) =
+        issued_reseat_for_secret(state, parent.stable_group_id(), subject_hex, invite_secret).await
+    else {
+        return ReseatSeal::NotReseat;
+    };
+    let ReseatBasis::Removal {
+        revision: removal_revision,
+        state_hash: removal_hash,
+    } = &issued.authorisation.fields.basis
+    else {
+        return ReseatSeal::Refused("basis_unknown");
+    };
+    if !reseat_floor_missing(state, parent).is_empty() {
+        return ReseatSeal::Refused("reseat_receiver_upgrade_required");
+    }
+    let Some(certificate) = certificate else {
+        return ReseatSeal::Refused("subject_certificate_unavailable");
+    };
+    let Some(seating) = seating_commit_hash(parent, subject_hex, *removal_revision) else {
+        return ReseatSeal::Refused("basis_unknown");
+    };
+    let key_package_hash = next
+        .members_v2
+        .get(subject_hex)
+        .and_then(|seat| seat.treekem_key_package_hash.clone())
+        .unwrap_or_default();
+    let keypair = state.agent.identity().agent_keypair();
+    let fields = x0x::groups::recovery::ReseatMandateFields {
+        owner_user_id: hex::encode(owner.as_bytes()),
+        group_id: parent.stable_group_id().to_string(),
+        genesis_hash: s3::genesis_hash(parent),
+        signer: local_hex(state),
+        subject: subject_hex.to_string(),
+        seating_commit_hash: seating,
+        removal_commit_hash: removal_hash.clone(),
+        parent_commit_hash: parent.state_hash.clone(),
+        terminal_roster_hash: x0x::groups::state_commit::compute_roster_root(&next.members_v2),
+        invite_secret_hash: s3::invite_secret_hash(invite_secret),
+        authorisation_digest: hex::encode(issued.authorisation.digest()),
+        key_package_hash,
+        epoch,
+        certificate_digest: x0x::groups::owner_cert::certificate_digest_hex(certificate),
+        policy_hash: x0x::groups::compute_policy_hash(&parent.policy),
+        role,
+        signer_public_key: hex::encode(keypair.public_key().as_bytes()),
+    };
+    match x0x::groups::recovery::ReseatMandateV1::sign(fields, keypair) {
+        Ok(mandate) => ReseatSeal::Mandate(Box::new(mandate)),
+        Err(_) => ReseatSeal::Refused("signature"),
+    }
+}
+
+/// §3a receiver: accept a re-seat `MemberAdded` that carries a
+/// `ReseatMandateV1` in place of an owner mandate, or name the failed
+/// check (`reseat_mandate_invalid {cause}`). The subject itself accepts its
+/// own re-seat add when the mandate binds the authorisation it consumed;
+/// it holds no chain to walk (its staging record starts at the invite
+/// base), and its own join validation covers the rest.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn verify_reseat_mandate_on_receive(
+    state: &AppState,
+    parent: &GroupInfo,
+    next: &GroupInfo,
+    commit: &GroupStateCommit,
+    mandate: &x0x::groups::recovery::ReseatMandateV1,
+    subject_hex: &str,
+    key_package_hash: Option<&str>,
+    epoch: Option<u64>,
+    certificate: Option<&x0x::identity::AgentCertificate>,
+) -> Result<(), &'static str> {
+    let Some(owner) = parent.policy.admission.owner_certified_user_id() else {
+        return Err("policy_mismatch");
+    };
+    if subject_hex.eq_ignore_ascii_case(&local_hex(state)) {
+        let consumed = sidecar_snapshot(state, parent.stable_group_id())
+            .await
+            .and_then(|body| body.reseat_journal)
+            .is_some_and(|journal| {
+                hex::encode(journal.authorisation.digest()) == mandate.fields.authorisation_digest
+                    && journal
+                        .authorisation
+                        .fields
+                        .signer
+                        .eq_ignore_ascii_case(&mandate.fields.signer)
+            });
+        return if consumed { Ok(()) } else { Err("signature") };
+    }
+    let subject_revoked = match parse_raw(subject_hex) {
+        Some(raw) => agent_revoked(state, &AgentId(raw)).await,
+        None => true,
+    };
+    let digest = certificate.map(x0x::groups::owner_cert::certificate_digest_hex);
+    let certificate_valid = certificate.is_some_and(|cert| {
+        x0x::groups::owner_cert::verify_cert_against_owner(
+            owner,
+            subject_hex,
+            cert,
+            subject_revoked,
+            x0x::groups::owner_cert::restore_clock_now(),
+        )
+        .is_ok()
+    });
+    let seated_role = next
+        .members_v2
+        .get(subject_hex)
+        .map_or(x0x::groups::GroupRole::Guest, |seat| seat.role);
+    let check = x0x::groups::recovery::ReseatMandateCheck {
+        parent,
+        commit,
+        subject: subject_hex,
+        key_package_hash: Some(key_package_hash.unwrap_or_default()),
+        epoch: Some(epoch.unwrap_or_default()),
+        seated_role,
+        certificate_digest: digest.as_deref(),
+        certificate_valid,
+        subject_revoked,
+    };
+    x0x::groups::recovery::verify_reseat_mandate(mandate, &check).map_err(|cause| cause.as_str())
+}
+
+/// §3a route checks after §3's, in order, for a promoted admin. `Ok(())`
+/// means the route may mint the re-seat invite.
+async fn promoted_admin_checks(
+    state: &AppState,
+    info: &GroupInfo,
+    subject_hex: &str,
+    basis: &ReseatBasis,
+) -> Result<(), axum::response::Response> {
+    let local = local_hex(state);
+    let own_removal = match basis {
+        ReseatBasis::Removal { state_hash, .. } => info.commit_log.iter().any(|entry| {
+            entry.commit.state_hash == *state_hash
+                && entry.commit.committed_by.eq_ignore_ascii_case(&local)
+        }),
+        ReseatBasis::Ref(_) => false,
+    };
+    if !own_removal {
+        return Err(reseat_refusal(
+            StatusCode::CONFLICT,
+            "reseat_removal_not_own",
+            serde_json::Value::Null,
+        ));
+    }
+    let missing = reseat_floor_missing(state, info);
+    if !missing.is_empty() {
+        return Err(reseat_refusal(
+            StatusCode::CONFLICT,
+            "reseat_receiver_upgrade_required",
+            serde_json::json!({ "members": missing }),
+        ));
+    }
+    let Some(certificate) = subject_certificate(state, info, subject_hex).await else {
+        return Err(reseat_refusal(
+            StatusCode::CONFLICT,
+            "subject_certificate_unavailable",
+            serde_json::Value::Null,
+        ));
+    };
+    let valid = info
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .is_some_and(|owner| {
+            x0x::groups::owner_cert::verify_cert_against_owner(
+                owner,
+                subject_hex,
+                &certificate,
+                false,
+                x0x::groups::owner_cert::restore_clock_now(),
+            )
+            .is_ok()
+        });
+    if !valid {
+        return Err(reseat_refusal(
+            StatusCode::CONFLICT,
+            "subject_certificate_invalid",
+            serde_json::Value::Null,
+        ));
+    }
+    Ok(())
+}
+
+/// Mint a re-seat invite for the promoted-admin path (§3a): an InviteV4
+/// signed by this admin's agent key alone, with no owner countersignature,
+/// addressed to the subject and recorded as an ordinary issued invite. Its
+/// re-seat scope is the paired authorisation: only the named subject, at
+/// this admin, with the matching unconsumed authorisation, can redeem it.
+async fn mint_reseat_invite(
+    state: &AppState,
+    group_key: &str,
+    subject: AgentId,
+    expiry_secs: u64,
+) -> Result<(x0x::groups::invite::SignedInvite, String), &'static str> {
+    let info = state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .cloned()
+        .ok_or("group_not_found")?;
+    let mut invite = x0x::groups::invite::SignedInvite::new(
+        info.mls_group_id.clone(),
+        info.name.clone(),
+        &state.agent.agent_id(),
+        expiry_secs,
+    );
+    crate::server::routes::identity::populate_invite_base_state_v4(
+        &mut invite,
+        &info,
+        Some(subject),
+    );
+    invite
+        .sign_v4(state.agent.identity().agent_keypair(), None)
+        .map_err(|_| "invite_sign_failed")?;
+    let link = invite.encode_link().map_err(|_| "invite_too_large")?;
+    let mut next = info.clone();
+    next.record_issued_invite_v2(
+        invite.invite_secret.clone(),
+        invite.created_at,
+        invite.expires_at,
+        x0x::groups::GroupRole::Member,
+        Some(hex::encode(subject.as_bytes())),
+        x0x::groups::InviteOrigin::Explicit,
+        None,
+    );
+    match super::persist_named_group_info(state, group_key, next).await {
+        Ok(super::AtomicWriteOutcome::Durable) => Ok((invite, link)),
+        _ => Err("not_durable"),
+    }
+}
+
 // ─── §3 The subject's staged join and swap ─────────────────────────────────
 
 async fn refuse_authorisation(state: &AppState, stable: &str, revision: u64, cause: &str) {
@@ -2490,16 +2850,26 @@ async fn consume_reseat(
         authorised_by = %LogHexId::agent(&authorisation.fields.signer),
         "ADR 0109 S3: consuming a re-seat authorisation; staged join starts"
     );
+    // §3a checks 3 and 4: the owner pin comes from this node's own live
+    // record (the trust root: it was admitted under that owner before), so
+    // an owner-axis staged join runs in ADR 0059 §2's Home mode pinned to
+    // it; the join's mode matrix then refuses `owner_mismatch` and
+    // `invite_downgraded`.
+    let owner_pin = info
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .map(|owner| hex::encode(owner.as_bytes()));
     let request = super::JoinGroupRequest {
         invite: invite_link,
         display_name: info
             .members_v2
             .get(&local)
             .and_then(|member| member.display_name.clone()),
-        mode: None,
-        expected_owner_user_id: None,
+        mode: owner_pin.as_ref().map(|_| "home".to_string()),
+        expected_owner_user_id: owner_pin,
     };
-    let response = super::join_group_via_invite(State(Arc::clone(state)), Json(request))
+    let response = super::join_group_via_invite_inner(Arc::clone(state), request, true)
         .await
         .into_response();
     if !response.status().is_success() {
