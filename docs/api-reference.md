@@ -1784,10 +1784,21 @@ route checks in this order and refuses with the first failure:
 | 409 | `subject_active` | The subject is Active. Remove it first with `DELETE /groups/:id/members/:agent_id`. |
 | 409 | `subject_banned_or_revoked` | The subject is banned or its agent is revoked. |
 | 409 | `basis_unknown` | The basis is not a removal of the subject on this chain, and not a known `ref`. |
-| 409 | `reseat_receiver_upgrade_required` | Owner-axis group, and this admin does not hold the owner's USER key. `detail.members` names the members without a current verified `group_reseat_mandate_v1` advert (§3a). |
+| 409 | `reseat_removal_not_own` | Owner-axis group, this admin does not hold the owner's USER key, and the `Removal` basis is not this admin's own removal (§3a, D170). |
+| 409 | `reseat_receiver_upgrade_required` | Same promoted-admin path: `detail.members` names each Active member without a current verified `group_reseat_mandate_v1` advert (the capability floor). |
+| 409 | `subject_certificate_unavailable`, `subject_certificate_invalid` | Same path: this admin does not hold the subject's owner certificate, or it does not verify against the owner. |
 
 On success (200) the route mints an invite addressed to the subject and
-signs a `ReseatAuthorisation` (domain `x0x.reseat-authorisation.v1`). The
+signs a `ReseatAuthorisation` (domain `x0x.reseat-authorisation.v1`). An
+admin that holds the owner's USER key mints an ordinary owner-countersigned
+InviteV4. A promoted admin mints a re-seat invite signed by its agent key
+alone; at seal it embeds a `ReseatMandateV1` (domain
+`x0x/owner-axis/reseat-mandate-admin/v1`) in the `MemberAdded` field
+`reseat_mandate`, in place of the owner mandate. A receiver refuses a bad
+one with `reseat_mandate_invalid` and one cause of `signature`,
+`signer_not_admin`, `policy_mismatch`, `not_previously_seated`,
+`removal_mismatch`, `certificate_invalid`, `role_raised` or
+`binding_mismatch`, and keeps its state unchanged. The
 answer is `{"ok": true, "group_id", "subject", "basis", "authorisation": {"signer", "expires_at_ms", "digest"}}`.
 The admin keeps the authorisation in its sidecar and sends it to the
 subject. The subject needs no operator step (D79). It journals, joins
@@ -1797,7 +1808,11 @@ keys. On failure it restores its contained record and shows
 
 **`GET /groups/:id/recovery`.** Answers `{"group_id", "recovery", "requesters", "issued_reseats", "retired_records", "sidecar": {"file", "rebuilt_from"}}`.
 `requesters` and `issued_reseats` are filled only while this daemon holds
-an Active admin seat. Each requester row has `requester`, `head_revision`,
+an Active admin seat. `issued_reseats_lost` is `true` on an admin whose
+sidecar was rebuilt (§4): its unconsumed authorisations are gone, so it
+calls the route again. `sidecar.copies` lists each quarantined copy with
+`file`, `txid`, `state` (`pending` or `history`) and `size`; S3 never
+deletes them. Each requester row has `requester`, `head_revision`,
 `head_state_hash`, `refs`, `answer` and `at_ms`. The list keeps 32 rows per
 group for 24 hours.
 
@@ -1811,8 +1826,12 @@ reports the `recovery` state (`catching_up`, `awaiting_attestation`, …) in
 `last_join_outcome.outcome` with reason `adr0109_recovery_held`, never a
 bare `timed_out`.
 
+**Home.** Home activation is off (§4, D81). For a Home-policy group S3
+issues, requests and arms no ATA, and the node shows `recovery_deferred`
+with `cause: home_gate_closed`. The manual re-seat still works.
+
 **Wire and capabilities.** The daemon advertises
-`group_terminal_attest_v1` (bit 8). `group_attest_request` and
+`group_terminal_attest_v1` (bit 8) and `group_reseat_mandate_v1` (bit 9). `group_attest_request` and
 `group_attest_response` ride the direct-message carrier on the typed prefix
 `X0XGRC1` with an exact-consumed postcard body. A response answers
 `attested`, `on_chain`, `not_on_chain`, `reseat` or `refused` with one of

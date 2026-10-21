@@ -735,6 +735,17 @@ async fn answer_request(state: &Arc<AppState>, sender: AgentId, request: GroupAt
     else {
         return;
     };
+    // §4 (D81): Home activation (issuing an ATA for a Home-policy group)
+    // ships off, and a Home subject never asks; S3 answers nothing there.
+    let home = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_key)
+        .is_some_and(is_home_policy_group);
+    if home {
+        return;
+    }
     // Step 2: limits, before anything else.
     let now = Instant::now();
     let admitted = state
@@ -1583,23 +1594,56 @@ async fn prune_admin_state(state: &AppState) {
         list.retain(|entry| now.saturating_duration_since(entry.at) < s3::RECOVERY_LIST_TTL);
     }
     inner.recovery_lists.retain(|_, list| !list.is_empty());
-    let expired: Vec<String> = inner
+    let issued: Vec<(String, Vec<String>)> = inner
         .sidecars
         .iter()
-        .filter(|(_, body)| {
-            body.issued_reseats
-                .iter()
-                .any(|issued| issued.authorisation.fields.expires_at_ms <= now_wall)
+        .filter(|(_, body)| !body.issued_reseats.is_empty())
+        .map(|(group, body)| {
+            (
+                group.clone(),
+                body.issued_reseats
+                    .iter()
+                    .map(|issued| issued.authorisation.fields.subject.clone())
+                    .collect(),
+            )
         })
-        .map(|(group, _)| group.clone())
         .collect();
     drop(inner);
-    for group in expired {
-        let _ = update_sidecar(state, &group, |body| {
-            body.issued_reseats
-                .retain(|issued| issued.authorisation.fields.expires_at_ms > now_wall);
-        })
-        .await;
+    // §3: an authorisation is kept until consumed (its subject is Active
+    // again on this roster) or expired.
+    for (group, subjects) in issued {
+        let seated: Vec<String> = {
+            let groups = state.named_groups.read().await;
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group)
+                .map(|info| {
+                    subjects
+                        .iter()
+                        .filter(|subject| info.has_active_member(subject))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let due = {
+            let inner = state.group_recovery.inner.lock().await;
+            inner.sidecars.get(&group).is_some_and(|body| {
+                body.issued_reseats.iter().any(|issued| {
+                    issued.authorisation.fields.expires_at_ms <= now_wall
+                        || seated.contains(&issued.authorisation.fields.subject)
+                })
+            })
+        };
+        if due {
+            let _ = update_sidecar(state, &group, |body| {
+                body.issued_reseats.retain(|issued| {
+                    issued.authorisation.fields.expires_at_ms > now_wall
+                        && !seated.contains(&issued.authorisation.fields.subject)
+                });
+            })
+            .await;
+        }
     }
 }
 
@@ -2539,6 +2583,8 @@ pub(in crate::server) async fn get_group_recovery(
         .unwrap_or_default();
     drop(inner);
     let copies = quarantined_copies(&state, &stable).await;
+    // §4: a rebuilt sidecar on an admin lost its unconsumed authorisations.
+    let issued_reseats_lost = admin && !rebuilt_from.is_empty();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -2546,6 +2592,7 @@ pub(in crate::server) async fn get_group_recovery(
             "recovery": recovery,
             "requesters": requesters,
             "issued_reseats": issued,
+            "issued_reseats_lost": issued_reseats_lost,
             "retired_records": retired,
             "sidecar": {
                 "file": s3::sidecar_file_name(&stable),
