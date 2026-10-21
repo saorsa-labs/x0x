@@ -1955,7 +1955,10 @@ mod daemon_tests {
                 info.ban_member(member, None);
             }),
             ("frame left the chain", |info, _| {
+                // The state hash commits to `security_binding`, not to
+                // `secret_epoch`, so move both.
                 info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
                 info.recompute_state_hash();
             }),
             ("quarantined", |info, _| {
