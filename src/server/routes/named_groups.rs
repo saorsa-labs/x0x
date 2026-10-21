@@ -9,6 +9,7 @@
 mod control_blob;
 mod direct_metadata_lanes;
 mod fair_admission;
+mod group_recovery;
 mod revocation_eviction;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
@@ -16,6 +17,9 @@ pub(in crate::server) use control_blob::{
 };
 pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
 pub(in crate::server) use fair_admission::FairAdmission;
+pub(in crate::server) use group_recovery::{
+    get_group_recovery, reseat_group_member, run_group_recovery_worker, S3Runtime,
+};
 pub(in crate::server) use revocation_eviction::{run_revocation_eviction_worker, S4Runtime};
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
@@ -1387,6 +1391,14 @@ pub(in crate::server) enum JoinResultMessage {
         /// the key.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         intervening_events: Vec<NamedGroupMetadataEvent>,
+        /// ADR 0109 §2 (join carry): the authority's admin terminal
+        /// attestation for the first segment of `chain` plus the terminal,
+        /// naming this joiner. Sent only to a joiner whose current
+        /// verified advert sets `group_terminal_attest_v1`, and only when
+        /// no owner v2 attestation is served; omitted otherwise, so the
+        /// bytes a legacy joiner receives are unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin_attestation: Option<Box<x0x::groups::recovery::AdminTerminalAttestation>>,
     },
     /// #477 W1: the authority's typed, attempt-bound refusal. Served ONLY
     /// to fetches that carried `accepts_refusal: true` AND a matching
@@ -11442,6 +11454,18 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             return;
         }
     }
+    // ADR 0109 §2: an admin-armed ATA (held in the S3 sidecar) gates the
+    // pages the same way, inside its attested segment.
+    if let Some(sequence) = group_recovery::armed_admin_sequence(state, &response_info).await {
+        if !catchup_page_within_attested_sequence(&events, &response_info.state_hash, &sequence) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&response.group_id),
+                sender = %LogHexId::agent(&sender_hex),
+                "ADR 0109 S3: TreeKEM catch-up page leaves the admin-attested sequence; adopting nothing"
+            );
+            return;
+        }
+    }
     // #1113: a catch-up page is one batch. A truncated page from this peer
     // means that peer still owes a later page. Another peer's last page,
     // and a member-keyed KeyPackage reply, do not close this peer's stream.
@@ -16715,6 +16739,9 @@ pub(in crate::server) async fn get_named_group(
     let members = named_group_member_values(&info);
     // ADR 0110 (D64): the S4 obligations and their typed waits.
     let s4_status = revocation_eviction::group_status_json(&state, &info).await;
+    // ADR 0109 §8: the additive `recovery` object (absent when S3 holds no
+    // state for the group).
+    let s3_recovery = group_recovery::recovery_json(&state, &info).await;
 
     (
         StatusCode::OK,
@@ -16726,6 +16753,7 @@ pub(in crate::server) async fn get_named_group(
             "revocation_eviction_store": s4_status.store,
             "admin_availability": s4_status.admin_availability,
             "certificate_evidence_waits": s4_status.certificate_evidence_waits,
+            "recovery": s3_recovery,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
@@ -42519,7 +42547,7 @@ async fn handle_join_result_message_bound(
             group_id,
             member_agent_id,
             from_revision,
-            base_state_hash: _base_state_hash,
+            base_state_hash,
             accepts_refusal,
             accepts_control_blob_ref,
             attempt_id,
@@ -42733,12 +42761,38 @@ async fn handle_join_result_message_bound(
                     }
                     _ => Vec::new(),
                 };
+            // ADR 0109 §2: the join-carry ATA for a capable stale joiner
+            // when no owner v2 attestation is served.
+            let admin_attestation = {
+                let owner_terminal_served = head_attestation
+                    .as_ref()
+                    .is_some_and(|attestation| attestation.terminal_signature_b64.is_some());
+                let terminal_epoch = match &event {
+                    NamedGroupMetadataEvent::MemberAdded { treekem_epoch, .. } => *treekem_epoch,
+                    _ => None,
+                };
+                group_recovery::join_carry_attestation(
+                    state,
+                    &group_id,
+                    &member_agent_id,
+                    from_revision,
+                    base_state_hash.as_deref(),
+                    &chain,
+                    named_group_metadata_event_commit(&event),
+                    terminal_epoch,
+                    attempt_id.as_deref(),
+                    owner_terminal_served,
+                )
+                .await
+                .map(Box::new)
+            };
             let response = JoinResultMessage::Result {
                 event: Box::new(event),
                 chain,
                 head_attestation: head_attestation.map(Box::new),
                 roster_certificates_b64: Vec::new(),
                 intervening_events,
+                admin_attestation,
             };
             let payload = match join_result_payload_with_roster_certificates(
                 state,
@@ -43001,6 +43055,7 @@ async fn handle_join_result_message_bound(
             head_attestation,
             roster_certificates_b64,
             intervening_events,
+            admin_attestation,
         } => {
             let event = *event;
             tracing::debug!(
@@ -43112,6 +43167,21 @@ async fn handle_join_result_message_bound(
                 intervening_events,
             ))
             .await;
+            // ADR 0109 §2: with a verified join-carry ATA, apply the
+            // attested served links state-only (rule (b)) so `event`
+            // chains from the new head.
+            let attested = match (
+                admin_attestation.as_deref(),
+                named_group_metadata_event_commit(&event),
+            ) {
+                (Some(ata), Some(terminal)) if verified && !chain.is_empty() => {
+                    Box::pin(group_recovery::apply_join_carry(
+                        state, &group_id, &chain, terminal, ata,
+                    ))
+                    .await
+                }
+                _ => false,
+            };
             // #458 r3/r5: expose the carried chain AND head attestation
             // to the joiner's adoption path for exactly this apply.
             {
@@ -43162,6 +43232,9 @@ async fn handle_join_result_message_bound(
                 &roster_certificates_b64,
             )
             .await;
+            if attested {
+                group_recovery::retire_converged(state, &group_id).await;
+            }
             if applied {
                 // #477 (r6 item 2 → r7): the seat finalize ran INSIDE the
                 // MemberAdded apply while its membership guard was held
@@ -43578,6 +43651,33 @@ async fn poll_join_result_until_membership_confirmed(
         return;
     }
     if timed_out {
+        // ADR 0109 §2 (D64): an attempt S3 holds (an armed admin record,
+        // or a marker whose served chain S3 kept) keeps its stub and row,
+        // and reports the join state that mirrors its `recovery` object,
+        // never a bare TimedOut.
+        let held = {
+            let info = state.named_groups.read().await.get(&group_id).cloned();
+            match info {
+                Some(info) => group_recovery::held_join_state(state.as_ref(), &info).await,
+                None => None,
+            }
+        };
+        if let Some(join_state) = held {
+            tracing::info!(group_id = %LogHexId::group(&group_id), join_state, "ADR 0109 S3: join poll ended on an attempt S3 holds; the stub stays");
+            state
+                .last_join_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    group_id.clone(),
+                    LastJoinOutcome {
+                        outcome: join_state,
+                        reason: Some("adr0109_recovery_held"),
+                        finished_at_ms: now_millis_u64(),
+                    },
+                );
+            return;
+        }
         tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; finalizing the attempt as timed_out");
         // #477 C8: the poll task IS the deadline owner — the live expiry
         // path finalizes the joiner-side attempt state (stub cleanup) with
@@ -45711,6 +45811,7 @@ pub(in crate::server) mod tests {
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
+            group_recovery: S3Runtime::default(),
             ws_sessions: RwLock::new(HashMap::new()),
             ws_topics: RwLock::new(HashMap::new()),
             ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -47080,6 +47181,7 @@ pub(in crate::server) mod tests {
                     head_attestation: attestation.map(Box::new),
                     roster_certificates_b64: Vec::new(),
                     intervening_events: Vec::new(),
+                    admin_attestation: None,
                 },
             )
             .await;
@@ -57151,6 +57253,7 @@ pub(in crate::server) mod tests {
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");

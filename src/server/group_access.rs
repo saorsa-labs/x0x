@@ -346,6 +346,20 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/:id/ban/:agent_id",
         level: AccessLevel::Admin,
     },
+    // ADR 0109 §3: the admin's manual re-seat (the admin trio runs in the
+    // handler under the membership lock).
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/members/:agent_id/reseat",
+        level: AccessLevel::Admin,
+    },
+    // ADR 0109 §8: never refuses; the admin-only lists are filtered by the
+    // daemon's own seat.
+    RouteAccess {
+        method: Method::GET,
+        path: "/groups/:id/recovery",
+        level: AccessLevel::PublicRead,
+    },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/ban/:agent_id",
@@ -1930,6 +1944,12 @@ mod tests {
                 "/groups/:id/ban/:agent_id",
                 AccessLevel::Admin,
             ),
+            (
+                Method::POST,
+                "/groups/:id/members/:agent_id/reseat",
+                AccessLevel::Admin,
+            ),
+            (Method::GET, "/groups/:id/recovery", AccessLevel::PublicRead),
             (
                 Method::DELETE,
                 "/groups/:id/ban/:agent_id",

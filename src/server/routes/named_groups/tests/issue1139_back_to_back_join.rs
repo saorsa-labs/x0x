@@ -335,6 +335,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
                 head_attestation,
                 roster_certificates_b64,
                 intervening_events,
+                admin_attestation: _,
             } => (
                 event,
                 chain,
@@ -361,6 +362,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         head_attestation: served_head,
         roster_certificates_b64: served_certs,
         intervening_events: Vec::new(),
+        admin_attestation: None,
     };
     Ok(BackToBack {
         j1_attempt,
@@ -545,6 +547,7 @@ async fn issue1139_legacy_join_result_alone_leaves_second_joiner_pending() -> Re
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         },
         Some(s.j1_attempt.as_str()),
     )
@@ -1278,6 +1281,7 @@ async fn issue1139_joiner_ignores_stale_foreign_or_oversized_carries() -> Result
             head_attestation,
             roster_certificates_b64,
             intervening_events: events,
+            admin_attestation: None,
         },
         other => other,
     };
@@ -1353,6 +1357,7 @@ fn result_with_events(s: &BackToBack, events: Vec<NamedGroupMetadataEvent>) -> J
             head_attestation,
             roster_certificates_b64,
             intervening_events: events,
+            admin_attestation: None,
         },
         other => other,
     }
@@ -1784,6 +1789,7 @@ async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -
                     head_attestation: head_attestation.map(Box::new),
                     roster_certificates_b64: Vec::new(),
                     intervening_events,
+                    admin_attestation: None,
                 },
                 Some(attempt_id.as_str()),
             )

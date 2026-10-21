@@ -649,6 +649,7 @@ async fn inert_card_import_stub_replaced_by_verified_invite_seats_with_key() -> 
             head_attestation: staged.1.map(Box::new),
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         },
     )
     .await;
@@ -887,6 +888,7 @@ async fn inert_stub_forged_owner_replaced_by_verified_invite() -> Result<()> {
             head_attestation: staged.1.map(Box::new),
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         },
     )
     .await;

@@ -139,6 +139,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         head_attestation: Some(Box::new(head)),
         roster_certificates_b64: Vec::new(),
         intervening_events: Vec::new(),
+        admin_attestation: None,
     };
     let result_len = serde_json::to_vec(&result)?.len();
     let result_bytes = serde_json::to_vec(&result)?;
@@ -340,6 +341,7 @@ impl BoundJoinerScenario {
             head_attestation: Some(Box::new(self.head_attestation.clone())),
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         }
     }
 }
@@ -487,6 +489,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
         head_attestation: Some(Box::new(head.clone())),
         roster_certificates_b64: Vec::new(),
         intervening_events: Vec::new(),
+        admin_attestation: None,
     })?;
     assert!(
         result_wire.len() > crate::dm::MAX_PAYLOAD_BYTES,
@@ -536,6 +539,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
             head_attestation: Some(Box::new(head.clone())),
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         })?
         .len()
             > crate::dm::MAX_PAYLOAD_BYTES

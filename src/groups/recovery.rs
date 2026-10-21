@@ -1121,6 +1121,8 @@ pub struct ReseatJournalV1 {
     pub record_digest: [u8; 32],
     /// The journal phase.
     pub phase: ReseatPhase,
+    /// The live map key of the record the re-seat replaces.
+    pub live_key: String,
     /// The live record (JSON) the re-seat replaces; restored on failure.
     pub live_record: Vec<u8>,
     /// The live record's TreeKEM snapshot, when it had one.

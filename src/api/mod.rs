@@ -1420,6 +1420,22 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/groups/:id/members/:agent_id/reseat",
+        cli_name: "group reseat",
+        description: "Re-seat a forked or removed node by hand under a signed authorisation (admin+, ADR 0109 §3)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("reason", true, "--reason"), RequestField::body_as("basis", true, "--basis")]),
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/recovery",
+        cli_name: "group recovery",
+        description: "Show this node's ADR 0109 recovery state, and on an admin the pending requesters and issued re-seats",
+        category: "named-groups",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/groups/:id/ban/:agent_id",
         cli_name: "group ban",
         description: "Ban a member (admin+)",

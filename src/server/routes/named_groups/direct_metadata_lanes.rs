@@ -152,6 +152,15 @@ pub(in crate::server) async fn run_direct_metadata_listener(
             );
             continue;
         }
+        // ADR 0109 §5: S3 attestation requests and responses ride the same
+        // direct carrier; they are handled off this loop.
+        if msg
+            .payload
+            .starts_with(x0x::groups::recovery::GROUP_RECOVERY_PREFIX)
+        {
+            super::group_recovery::spawn_receipt(&state, msg.sender, msg.verified, msg.payload);
+            continue;
+        }
         let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
             continue; // not a named-group metadata event
         };

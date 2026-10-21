@@ -97,7 +97,7 @@ impl CapabilityRegistry {
     pub const OWNER_RECOVERY_V1: u64 = 1 << 7;
     /// ADR 0109 §5: issues and verifies admin terminal attestations,
     /// answers `group_attest_request` (`X0XGRC1`) and consumes re-seat
-    /// authorisations. Bit 8.
+    /// authorisations. Bit 8. Advertised: the S3 receivers are in place.
     pub const GROUP_TERMINAL_ATTEST_V1: u64 = 1 << 8;
     /// ADR 0109 §3a: verifies and applies promoted-admin
     /// `ReseatMandateV1` commits. Bit 9. Not in [`Self::current`] yet.
@@ -112,7 +112,8 @@ impl CapabilityRegistry {
                 | Self::PEER_EVIDENCE_V1
                 | Self::FILE_CONTROL_ACK_V1
                 | Self::EVICTION_HANDOFF_V1
-                | Self::CRYPTO_EXCLUSION_V1,
+                | Self::CRYPTO_EXCLUSION_V1
+                | Self::GROUP_TERMINAL_ATTEST_V1,
         }
     }
 
