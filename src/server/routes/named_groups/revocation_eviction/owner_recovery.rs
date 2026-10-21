@@ -22,7 +22,7 @@
 //! - **Receive.** The §4b(1) L4 rule, then the ordinary chained apply with
 //!   the roster change as its only mutation, then the crypto removal proof.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ use super::crypto_exclusion::{
     apply_round, finish_attempt, guarded_admission_for, next_attempt, write_allowed, HeadRule,
     RecipientDelivery, RoundUpdate,
 };
+use super::rebind::replay_log;
 
 /// The owner node's typed state until the promoted member commits.
 pub(in crate::server) const WAITING_FOR_RECOVERY_MEMBER: &str = "waiting_for_recovery_member";
@@ -98,16 +99,6 @@ struct StashedFrame {
     at: Instant,
 }
 
-/// A recovery commit frame held for catch-up serving.
-#[derive(Debug, Clone)]
-struct OrcLogEntry {
-    next_revision: u64,
-    /// The frame's result head: it is served only while this head is on
-    /// the verified chain.
-    result_head: String,
-    bytes: Arc<Vec<u8>>,
-}
-
 /// The owner-recovery state held in the S4 runtime, keyed by stable
 /// group ID.
 #[derive(Debug, Default)]
@@ -116,9 +107,9 @@ pub(super) struct OrcState {
     pending: HashMap<String, PendingMandate>,
     deliveries: HashMap<String, CommitDelivery>,
     stash: Vec<StashedFrame>,
-    /// Authored and installed recovery commits, for catch-up serving
-    /// (memory only; see [`serve_catchup`]).
-    log: HashMap<String, VecDeque<OrcLogEntry>>,
+    /// Authored and installed recovery commits, for catch-up serving; the
+    /// author's are durable ([`replay_log`]).
+    log: replay_log::HeldLog<ORC_LOG_PER_GROUP>,
 }
 
 impl OrcState {
@@ -221,60 +212,35 @@ impl OrcState {
             _ => false,
         }
     }
+}
 
-    /// Keep a recovery commit frame for catch-up serving (bounded, by
-    /// revision, deduplicated).
-    fn remember(
-        &mut self,
-        stable_group_id: &str,
-        next_revision: u64,
-        result_head: &str,
-        bytes: Arc<Vec<u8>>,
-    ) {
-        let log = self.log.entry(stable_group_id.to_string()).or_default();
-        if log.iter().any(|entry| entry.next_revision == next_revision) {
-            return;
-        }
-        let at = log
-            .iter()
-            .position(|entry| entry.next_revision > next_revision)
-            .unwrap_or(log.len());
-        log.insert(
-            at,
-            OrcLogEntry {
-                next_revision,
-                result_head: result_head.to_string(),
-                bytes,
-            },
-        );
-        while log.len() > ORC_LOG_PER_GROUP {
-            log.pop_front();
-        }
-    }
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP> {
+    &mut inner.orc.log
+}
 
-    /// The frames held for any of `group_ids` above `from_revision`, oldest
-    /// first, with their group ID and result head.
-    fn catchup_frames(
-        &self,
-        group_ids: &[String],
-        from_revision: u64,
-    ) -> Vec<(String, String, Arc<Vec<u8>>)> {
-        group_ids
-            .iter()
-            .find_map(|id| self.log.get(id).map(|log| (id, log)))
-            .map(|(id, log)| {
-                log.iter()
-                    .filter(|entry| entry.next_revision > from_revision)
-                    .map(|entry| {
-                        (
-                            id.clone(),
-                            entry.result_head.clone(),
-                            Arc::clone(&entry.bytes),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+/// Load the durable recovery frames once, and deliver an authored commit
+/// that is still its group's head again (#1508 review).
+async fn ensure_restored(state: &AppState) {
+    let resumes = replay_log::ensure_restored(state, replay_log::RECOVERY_EXTENSION, held).await;
+    let local = *state.agent.agent_id().as_bytes();
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    for resume in resumes {
+        let recipients = survivors(&resume.info, &local, &BTreeSet::new());
+        let stable = resume.stable_group_id;
+        inner
+            .orc
+            .deliveries
+            .entry(stable)
+            .or_insert_with(|| CommitDelivery {
+                bytes: resume.bytes,
+                result_head: resume.result_head,
+                next_revision: resume.next_revision,
+                recipients: recipients
+                    .into_iter()
+                    .map(|id| (id, RecipientDelivery::Due))
+                    .collect(),
+                next_at: Instant::now(),
+            });
     }
 }
 
@@ -485,6 +451,7 @@ pub(in crate::server) async fn sign_recovery_mandate(
 /// One owner-recovery round: mandate sends, commit attempts, commit
 /// deliveries and stashed frames.
 pub(super) async fn drive(state: &Arc<AppState>) {
+    ensure_restored(state).await;
     drive_mandates(state).await;
     let due: Vec<String> = {
         let now = Instant::now();
@@ -1148,6 +1115,18 @@ async fn finish_commit(
         set_wait(state, &stable, None).await;
         return false;
     }
+    // #1508 review: the exact frame is durable before the local commit, so
+    // a crash before the delivery cannot lose the chain link.
+    let bytes = Arc::new(bytes);
+    let ext = replay_log::RECOVERY_EXTENSION;
+    ensure_restored(state).await;
+    let at = (next_revision, commit.state_hash.as_str());
+    if !replay_log::write_planned(state, ext, held, &stable, at, &bytes).await {
+        rollback(&mut tree, &next, "owner_recovery_frame_not_durable");
+        tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: the frame is not durable");
+        set_wait(state, &stable, None).await;
+        return false;
+    }
     for seat in &removed {
         ng::quiesce_member_join_egress(state, group_key, seat).await;
     }
@@ -1171,6 +1150,7 @@ async fn finish_commit(
         ),
     };
     if !persisted {
+        replay_log::rewrite_from_memory(state, ext, held, &stable).await;
         rollback(&mut tree, &next, "owner_recovery_persist_failed");
         tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: persist failed");
         set_wait(state, &stable, None).await;
@@ -1183,14 +1163,14 @@ async fn finish_commit(
     let removed_ids: BTreeSet<[u8; 32]> = removed.iter().filter_map(|id| agent_bytes(id)).collect();
     let recipients = survivors(&next, &local, &removed_ids);
     {
-        let bytes = Arc::new(bytes);
         let mut inner = state.revocation_evictions.inner.lock().await;
         inner.orc.pending.remove(&stable);
-        inner.orc.remember(
+        inner.orc.log.remember(
             &stable,
             next_revision,
             &commit.state_hash,
             Arc::clone(&bytes),
+            true,
         );
         inner.orc.deliveries.insert(
             stable.clone(),
@@ -1360,21 +1340,21 @@ fn spawn_commit_send(
 /// catch-up page (§4b(1) "Mixed versions"). Each write uses the guarded
 /// admission with [`HeadRule::OnChain`] and the `owner_recovery_v1` gate.
 ///
-/// The log is memory only: after a restart this node serves only the
-/// frames it authors or installs again (restart durability is a later
-/// step).
+/// The author's frames survive a restart ([`replay_log`]).
 pub(in crate::server) async fn serve_catchup(
     state: &Arc<AppState>,
     requester: &AgentId,
     group_ids: &[String],
     from_revision: u64,
 ) {
+    ensure_restored(state).await;
     let frames = state
         .revocation_evictions
         .inner
         .lock()
         .await
         .orc
+        .log
         .catchup_frames(group_ids, from_revision);
     for (group_id, result_head, bytes) in frames {
         let status = send_guarded(
@@ -1690,11 +1670,12 @@ async fn receive_commit(
         inner.orc.mandates.remove(&body.stable_group_id);
         // Any installed replica serves the frame to a survivor that
         // missed it (catch-up, §4).
-        inner.orc.remember(
+        inner.orc.log.remember(
             &body.stable_group_id,
             body.next_revision,
             &body.commit.state_hash,
             Arc::new(payload.to_vec()),
+            false,
         );
     }
     tracing::info!(
@@ -1799,6 +1780,30 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "recovery_head_mismatch");
         assert_eq!(body["group_id"], "g");
+    }
+
+    /// #1508 review (Codex P1 #3): the promoted member writes the recovery
+    /// frame before its local commit and dies before any delivery. The
+    /// restart serves the exact bytes at catch-up and resumes the delivery.
+    #[tokio::test]
+    async fn a_crash_after_the_recovery_commit_keeps_the_exact_frame() {
+        let (local, survivor) = (AgentId([1; 32]), [2u8; 32]);
+        let (stable, groups) = replay_log::tests::committed_group(local, survivor);
+        let frame = Arc::new(b"X0XORC1\0exact frame bytes".to_vec());
+        let resumes = replay_log::tests::crash_and_restart::<ORC_LOG_PER_GROUP>(
+            replay_log::RECOVERY_EXTENSION,
+            &stable,
+            &groups,
+            &frame,
+        )
+        .await;
+        assert_eq!(resumes.len(), 1, "the restart resumes the delivery");
+        assert_eq!(resumes[0].bytes.as_slice(), frame.as_slice());
+        let none = BTreeSet::new();
+        assert_eq!(
+            survivors(&resumes[0].info, local.as_bytes(), &none),
+            [survivor]
+        );
     }
 
     #[test]
@@ -1982,24 +1987,26 @@ mod tests {
         let mut orc = OrcState::default();
         let total = ORC_LOG_PER_GROUP as u64 + 2;
         for revision in (1..=total).rev() {
-            orc.remember(
+            orc.log.remember(
                 "g",
                 revision,
                 &format!("h{revision}"),
                 Arc::new(vec![revision as u8]),
+                false,
             );
         }
-        orc.remember("g", total, "dup", Arc::new(vec![0]));
-        let all = orc.catchup_frames(&["x".into(), "g".into()], 0);
+        orc.log
+            .remember("g", total, "dup", Arc::new(vec![0]), false);
+        let all = orc.log.catchup_frames(&["x".into(), "g".into()], 0);
         assert_eq!(all.len(), ORC_LOG_PER_GROUP);
         let heads: Vec<&str> = all.iter().map(|(_, head, _)| head.as_str()).collect();
         let expected: Vec<String> = (3..=total).map(|revision| format!("h{revision}")).collect();
         assert_eq!(heads, expected);
         assert!(all.iter().all(|(id, _, _)| id == "g"));
-        let tail = orc.catchup_frames(&["g".into()], total - 1);
+        let tail = orc.log.catchup_frames(&["g".into()], total - 1);
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].1, format!("h{total}"));
-        assert!(orc.catchup_frames(&["other".into()], 0).is_empty());
+        assert!(orc.log.catchup_frames(&["other".into()], 0).is_empty());
     }
 
     /// #1357 / ADR 0110 §2: a held mandate keeps its group in the head
@@ -2354,6 +2361,7 @@ mod tests {
             .lock()
             .await
             .orc
+            .log
             .catchup_frames(std::slice::from_ref(&stable), info.state_revision);
         assert_eq!(served.len(), 1);
         assert_eq!(served[0].1, committed.state_hash);
@@ -2381,6 +2389,44 @@ mod tests {
             installed.members_v2[&local_hex].role,
             x0x::groups::GroupRole::Admin
         );
+        state.agent.shutdown().await;
+    }
+
+    /// #1508 review (Codex P1 #3), daemon level: the real commit path
+    /// writes the frame before it persists the group. The in-memory
+    /// recovery state is dropped (a crash before the delivery), and the
+    /// catch-up after the restart serves the exact committed frame.
+    /// Daemon-level; CI only.
+    #[tokio::test]
+    async fn a_restart_after_the_recovery_commit_serves_the_exact_frame() {
+        let (_dir, state, info, _admin_hex) = recovery_fixture().await;
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        sync_head(&state, &info).await;
+        try_commit(&state, &stable).await;
+        let committed = state.named_groups.read().await[&stable].clone();
+        assert_eq!(committed.state_revision, info.state_revision + 1);
+        let bytes = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            let bytes = inner.orc.deliveries[&stable].bytes.to_vec();
+            inner.orc = OrcState::default();
+            bytes
+        };
+        ensure_restored(&state).await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let from = info.state_revision;
+        let served = inner
+            .orc
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), from);
+        assert_eq!(served.len(), 1, "the frame is missing after the restart");
+        assert_eq!(served[0].1, committed.state_hash);
+        assert_eq!(served[0].2.as_slice(), bytes.as_slice());
+        assert!(inner.orc.deliveries.contains_key(&stable));
+        drop(inner);
         state.agent.shutdown().await;
     }
 

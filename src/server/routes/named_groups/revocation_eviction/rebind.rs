@@ -33,7 +33,7 @@
 //!   chain ends that seat's expiry rows with cause `certificate_valid`
 //!   (the S4 pass re-derives it from the roster).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +57,8 @@ use super::crypto_exclusion::{
     apply_round, finish_attempt, guarded_admission_for, head_rule_admits, next_attempt,
     write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
+
+pub(super) mod replay_log;
 
 /// A delivery round runs no more often than this per frame.
 const CRB_RESEND_INTERVAL: Duration = Duration::from_secs(5);
@@ -84,15 +86,6 @@ struct Delivery {
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
     started: Instant,
-}
-
-#[derive(Debug, Clone)]
-struct LogEntry {
-    next_revision: u64,
-    /// The frame's result head: catch-up serves it only while it is on
-    /// this node's verified chain ([`HeadRule::OnChain`]).
-    result_head: String,
-    bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +117,9 @@ struct HeldSelfRebind {
 pub(super) struct RebindState {
     /// Keyed by (stable group ID, result head).
     deliveries: HashMap<(String, String), Delivery>,
-    log: HashMap<String, VecDeque<LogEntry>>,
+    /// Frames held for catch-up; the author's are durable
+    /// ([`replay_log`]).
+    log: replay_log::HeldLog<CRB_LOG_PER_GROUP>,
     stash: Vec<StashedFrame>,
     /// Verified renewals an admin holds for a seat, from a hand-off.
     renewals: HashMap<EvictionKey, AgentCertificate>,
@@ -134,56 +129,32 @@ pub(super) struct RebindState {
     held: HashMap<EvictionKey, HeldSelfRebind>,
 }
 
-impl RebindState {
-    fn remember(
-        &mut self,
-        stable_group_id: &str,
-        next_revision: u64,
-        result_head: &str,
-        bytes: Arc<Vec<u8>>,
-    ) {
-        let log = self.log.entry(stable_group_id.to_string()).or_default();
-        if log.iter().any(|entry| entry.next_revision == next_revision) {
-            return;
-        }
-        log.push_back(LogEntry {
-            next_revision,
-            result_head: result_head.to_string(),
-            bytes,
-        });
-        while log.len() > CRB_LOG_PER_GROUP {
-            log.pop_front();
-        }
-    }
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP> {
+    &mut inner.rebind.log
+}
 
-    /// The held frames of the group (any of `group_ids`) above
-    /// `from_revision`, oldest first, with their group ID and result head.
-    fn catchup_frames(
-        &self,
-        group_ids: &[String],
-        from_revision: u64,
-    ) -> Vec<(String, String, Arc<Vec<u8>>)> {
-        let Some((group_id, log)) = group_ids
-            .iter()
-            .find_map(|id| self.log.get(id).map(|log| (id, log)))
-        else {
-            return Vec::new();
-        };
-        let mut entries: Vec<&LogEntry> = log
-            .iter()
-            .filter(|entry| entry.next_revision > from_revision)
-            .collect();
-        entries.sort_by_key(|entry| entry.next_revision);
-        entries
-            .into_iter()
-            .map(|entry| {
-                (
-                    group_id.clone(),
-                    entry.result_head.clone(),
-                    Arc::clone(&entry.bytes),
-                )
-            })
-            .collect()
+/// Load the durable rebind frames once, and deliver an authored frame
+/// that is still its group's head again (#1508 review).
+async fn ensure_restored(state: &AppState) {
+    let resumes = replay_log::ensure_restored(state, replay_log::REBIND_EXTENSION, held).await;
+    let local = *state.agent.agent_id().as_bytes();
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    for resume in resumes {
+        let key = (resume.stable_group_id, resume.result_head.clone());
+        inner
+            .rebind
+            .deliveries
+            .entry(key)
+            .or_insert_with(|| Delivery {
+                bytes: resume.bytes,
+                result_head: resume.result_head,
+                recipients: other_active_members(&resume.info, &local)
+                    .into_iter()
+                    .map(|id| (id, RecipientDelivery::Due))
+                    .collect(),
+                next_at: Instant::now(),
+                started: Instant::now(),
+            });
     }
 }
 
@@ -361,28 +332,41 @@ async fn commit_locked(
     if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
         return Err(CommitError::Oversized);
     }
-    match ng::persist_named_group_info(state, group_key, next.clone()).await {
-        Ok(ng::AtomicWriteOutcome::Durable) => {}
+    // #1508 review: the exact frame is durable before the local commit, so
+    // a crash before the delivery cannot lose the chain link.
+    let bytes = Arc::new(bytes);
+    let stable = next.stable_group_id();
+    ensure_restored(state).await;
+    let at = (next.state_revision, next.state_hash.as_str());
+    let ext = replay_log::REBIND_EXTENSION;
+    if !replay_log::write_planned(state, ext, held, stable, at, &bytes).await {
+        return Err(CommitError::Persist("frame not durable".to_string()));
+    }
+    let persisted = match ng::persist_named_group_info(state, group_key, next.clone()).await {
+        Ok(ng::AtomicWriteOutcome::Durable) => Ok(()),
         Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
             // The replacement is visible on disk and in memory; deliver it
             // so the chain stays coherent, and say so.
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
+            Ok(())
         }
-        Ok(ng::AtomicWriteOutcome::NotReplaced) => {
-            return Err(CommitError::Persist("not replaced".to_string()));
-        }
-        Err(error) => return Err(CommitError::Persist(error.to_string())),
+        Ok(ng::AtomicWriteOutcome::NotReplaced) => Err("not replaced".to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    if let Err(error) = persisted {
+        replay_log::rewrite_from_memory(state, ext, held, stable).await;
+        return Err(CommitError::Persist(error));
     }
     ng::refresh_group_card_cache_from_info(state, group_key, &next).await;
     let local = *state.agent.agent_id().as_bytes();
-    let bytes = Arc::new(bytes);
     {
         let mut inner = state.revocation_evictions.inner.lock().await;
-        inner.rebind.remember(
+        inner.rebind.log.remember(
             next.stable_group_id(),
             next.state_revision,
             &next.state_hash,
             Arc::clone(&bytes),
+            true,
         );
         inner.rebind.deliveries.insert(
             (next.stable_group_id().to_string(), next.state_hash.clone()),
@@ -955,6 +939,7 @@ pub(super) async fn try_admin_rebind(
 /// One worker step: deliveries, stashed receipts, held self-rebinds and
 /// the seat agent's admin waits.
 pub(super) async fn drive(state: &Arc<AppState>) {
+    ensure_restored(state).await;
     drive_deliveries(state).await;
     retry_stash(state).await;
     drive_held(state).await;
@@ -1339,12 +1324,14 @@ pub(in crate::server) async fn serve_catchup(
     group_ids: &[String],
     from_revision: u64,
 ) {
+    ensure_restored(state).await;
     let frames = state
         .revocation_evictions
         .inner
         .lock()
         .await
         .rebind
+        .log
         .catchup_frames(group_ids, from_revision);
     for (group_id, result_head, bytes) in frames {
         let admission = guarded_admission_for(
@@ -1589,11 +1576,12 @@ pub(in crate::server) async fn receive(
     ng::refresh_group_card_cache_from_info(state, &group_key, &next).await;
     {
         let mut inner = state.revocation_evictions.inner.lock().await;
-        inner.rebind.remember(
+        inner.rebind.log.remember(
             &body.stable_group_id,
             body.next_revision,
             &body.commit.state_hash,
             Arc::new(payload.to_vec()),
+            false,
         );
         let key = EvictionKey::new(body.stable_group_id.clone(), body.seat);
         inner.rebind.renewals.remove(&key);
@@ -1670,13 +1658,14 @@ mod tests {
     fn catchup_log_is_bounded_and_deduplicated() {
         let mut rebind = RebindState::default();
         for revision in 0..(CRB_LOG_PER_GROUP as u64 + 4) {
-            rebind.remember("g", revision, "h", Arc::new(vec![1]));
-            rebind.remember("g", revision, "h", Arc::new(vec![2]));
+            rebind
+                .log
+                .remember("g", revision, "h", Arc::new(vec![1]), false);
+            rebind
+                .log
+                .remember("g", revision, "h", Arc::new(vec![2]), false);
         }
-        assert_eq!(
-            rebind.log.get("g").map(VecDeque::len),
-            Some(CRB_LOG_PER_GROUP)
-        );
+        assert_eq!(rebind.log.len("g"), Some(CRB_LOG_PER_GROUP));
     }
 
     /// Catch-up serves frames oldest first with their result heads, even
@@ -1684,10 +1673,12 @@ mod tests {
     #[test]
     fn catchup_frames_are_served_oldest_first_with_their_heads() {
         let mut rebind = RebindState::default();
-        rebind.remember("g", 7, "r7", Arc::new(vec![7]));
-        rebind.remember("g", 5, "r5", Arc::new(vec![5]));
-        rebind.remember("g", 6, "r6", Arc::new(vec![6]));
-        let frames = rebind.catchup_frames(&["other".to_string(), "g".to_string()], 5);
+        rebind.log.remember("g", 7, "r7", Arc::new(vec![7]), false);
+        rebind.log.remember("g", 5, "r5", Arc::new(vec![5]), false);
+        rebind.log.remember("g", 6, "r6", Arc::new(vec![6]), false);
+        let frames = rebind
+            .log
+            .catchup_frames(&["other".to_string(), "g".to_string()], 5);
         let heads: Vec<(String, String)> = frames
             .iter()
             .map(|(group, head, _)| (group.clone(), head.clone()))
@@ -1698,6 +1689,29 @@ mod tests {
                 ("g".to_string(), "r6".to_string()),
                 ("g".to_string(), "r7".to_string())
             ]
+        );
+    }
+
+    /// #1508 review (Codex P1 #3): the author writes the rebind frame
+    /// before its local commit and dies before any delivery. The restart
+    /// serves the exact bytes at catch-up and resumes the delivery.
+    #[tokio::test]
+    async fn a_crash_after_the_rebind_commit_keeps_the_exact_frame() {
+        let (local, survivor) = (AgentId([1; 32]), [2u8; 32]);
+        let (stable, groups) = replay_log::tests::committed_group(local, survivor);
+        let frame = Arc::new(b"X0XCRB1\0exact frame bytes".to_vec());
+        let resumes = replay_log::tests::crash_and_restart::<CRB_LOG_PER_GROUP>(
+            replay_log::REBIND_EXTENSION,
+            &stable,
+            &groups,
+            &frame,
+        )
+        .await;
+        assert_eq!(resumes.len(), 1, "the restart resumes the delivery");
+        assert_eq!(resumes[0].bytes.as_slice(), frame.as_slice());
+        assert_eq!(
+            other_active_members(&resumes[0].info, local.as_bytes()),
+            [survivor]
         );
     }
 
