@@ -246,20 +246,25 @@ async fn commit_forward_locked(
                 return Err(CommitError::Bind(error));
             }
             Ok(bound) if allocating => {
-                let saved = match store.records().await {
-                    Ok(records) => records,
-                    Err(error) => {
+                // An unreadable store has no saved ports. An ephemeral add
+                // already skips the record update in that case, so the
+                // allocation must not fail closed on `records()` either.
+                if spec.persistent || store.load_error().is_none() {
+                    let saved = match store.records().await {
+                        Ok(records) => records,
+                        Err(error) => {
+                            forwarder.remove_forward(bound);
+                            forwarder.release_allocation_holds();
+                            return Err(CommitError::Store(error));
+                        }
+                    };
+                    if saved.iter().any(|record| record.local_addr == bound) {
                         forwarder.remove_forward(bound);
-                        forwarder.release_allocation_holds();
-                        return Err(CommitError::Store(error));
+                        if let Ok(hold) = tokio::net::TcpListener::bind(bound).await {
+                            forwarder.hold_allocation(hold);
+                        }
+                        continue;
                     }
-                };
-                if saved.iter().any(|record| record.local_addr == bound) {
-                    forwarder.remove_forward(bound);
-                    if let Ok(hold) = tokio::net::TcpListener::bind(bound).await {
-                        forwarder.hold_allocation(hold);
-                    }
-                    continue;
                 }
                 break bound;
             }
@@ -1276,6 +1281,33 @@ mod tests {
             x0x::forward::store::ForwardStoreError::Unusable(_)
         ));
         assert!(forwarder.forward_at(addr_persistent).is_some());
+        assert_eq!(std::fs::read(&path).expect("read"), original);
+        forwarder.shutdown();
+    }
+
+    /// WHY: port 0 reads the saved record list to avoid taking a saved
+    /// forward's port. That read must not turn an unreadable `forwards.json`
+    /// into a 503 for `--ephemeral`, and it must not remove the listener
+    /// just bound. The corrupt file stays byte-for-byte.
+    #[tokio::test]
+    async fn corrupt_store_still_allocates_an_ephemeral_port() {
+        let (agent, _agent_dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = ForwardStore::path_in(dir.path());
+        let original = b"{not json".to_vec();
+        std::fs::write(&path, &original).expect("write corrupt store");
+        let store = Arc::new(ForwardStore::load(path.clone()).await);
+        assert!(store.load_error().is_some());
+
+        let mut ephemeral = hex_spec("127.0.0.1:0".parse().expect("unbound loopback"));
+        ephemeral.persistent = false;
+        ephemeral.pinned_machine = None;
+        let bound = commit_forward(&store, &forwarder, ephemeral)
+            .await
+            .expect("ephemeral :0 add against a corrupt store");
+        assert_ne!(bound.port(), 0);
+        assert!(forwarder.forward_at(bound).is_some());
         assert_eq!(std::fs::read(&path).expect("read"), original);
         forwarder.shutdown();
     }

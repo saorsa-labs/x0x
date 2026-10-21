@@ -28,6 +28,10 @@
 //!
 //! ## Loopback-only (Phase 1)
 //!
+//! Targets are numeric loopback IPs only (`127.0.0.0/8`, `::1`). A hostname
+//! or non-loopback IP in a header is refused before the gate (defense in
+//! depth — the ACL loader already rejects non-loopback at load time, and the
+//! gate re-checks `is_loopback`).
 //!
 //! ## Persistence and machine binding (ADR-0074 §2 / §1)
 //!
@@ -35,10 +39,6 @@
 //! opts out. A forward with a pinned [`crate::identity::MachineId`] checks
 //! `PeerStream::peer()` before any forward-header byte; a mismatch resets
 //! the stream and counts `machine_mismatch`, and never falls back to V1.
-//! Targets are numeric loopback IPs only (`127.0.0.0/8`, `::1`). A hostname
-//! or non-loopback IP in a header is refused before the gate (defense in
-//! depth — the ACL loader already rejects non-loopback at load time, and the
-//! gate re-checks `is_loopback`).
 //!
 //! The header codec and the inbound gate decision are pure functions of
 //! bytes / resolved inputs so the whole deny/allow matrix is fast unit-
@@ -2178,6 +2178,7 @@ impl ForwardService {
                     });
                 }
             });
+            self.reap_finished_listener_tasks();
             self.listener_tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2252,7 +2253,20 @@ impl ForwardService {
                 removed = true;
             }
         }
+        self.reap_finished_listener_tasks();
         removed
+    }
+
+    /// Drop accept-loop handles that have already exited.
+    ///
+    /// [`Self::remove_forward`] cancels the listener and returns before that
+    /// task finishes. The next add or remove drops the finished handle, so
+    /// completed listeners do not stay in memory until shutdown.
+    fn reap_finished_listener_tasks(&self) {
+        self.listener_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|task| !task.is_finished());
     }
 
     /// Tear down every listener + the inbound consumer.
@@ -4588,6 +4602,60 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("listener {addr} did not close within bounded wait");
+    }
+
+    /// WHY: each add publishes an accept-loop handle, and remove only
+    /// cancels it. Without a reap, finished handles stay until shutdown
+    /// and grow with every add/remove cycle.
+    #[tokio::test]
+    async fn removed_listener_handles_do_not_accumulate() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(Arc::clone(&agent), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+        let spec = ForwardSpec {
+            local_addr: "127.0.0.1:0".parse().expect("loopback address"),
+            peer_agent: AgentId([7; 32]),
+            target_host: "127.0.0.1".to_string(),
+            target_port: 9,
+            name: None,
+            kind: crate::names::NameKind::Agent,
+            pinned_machine: None,
+            persistent: false,
+        };
+
+        for _ in 0..24 {
+            let bound = service.add_forward(spec.clone()).await.expect("bind");
+            assert!(service.remove_forward(bound));
+            wait_until_bindable(bound).await;
+        }
+        let mut left = usize::MAX;
+        for _ in 0..100 {
+            service.reap_finished_listener_tasks();
+            left = service
+                .listener_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            if left == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(left, 0, "finished accept-loop handles must be dropped");
+        service.shutdown();
+        agent.shutdown().await;
     }
 
     #[tokio::test]
