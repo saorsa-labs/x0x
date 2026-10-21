@@ -11552,6 +11552,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     } else {
         // Record this peer even when another peer's page stream is open.
         // The aggregate fence still decides whether this pass may seal.
+        revocation_eviction::note_catchup_head(
+            state,
+            &fence_ids,
+            &sender_hex,
+            reported_head.as_deref(),
+        )
+        .await;
         self_leave_startup_note_verified_head(
             state,
             &fence_ids,
@@ -27884,10 +27891,20 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         let group_id = info.stable_group_id().to_string();
         let failed = verdict.failed();
         if !failed.is_empty() {
+            let members: Vec<String> = failed.iter().map(|(hex, _)| hex.clone()).collect();
+            // ADR 0110 §3: an S4 removal of one revoked or expired seat may
+            // seal while the group's other open S4 targets still fail; each
+            // gets its own transition (ADR-0038 B3, no prune).
+            if verdict.in_grace().is_empty()
+                && verdict.digest_pending().is_empty()
+                && revocation_eviction::s4_eviction_seal_tolerates(info, &members)
+            {
+                return info.seal_commit_evicting(signing_kp, now_ms);
+            }
             return Err(
                 x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
                     group_id,
-                    members: failed.iter().map(|(hex, _)| hex.clone()).collect(),
+                    members,
                 },
             );
         }

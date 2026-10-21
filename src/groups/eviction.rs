@@ -1302,10 +1302,16 @@ pub const EVS_PREFIX: &[u8] = b"X0XEVICT";
 pub const EVJOURNAL_PREFIX: &[u8] = b"X0XEVJ";
 /// The `.evs` v1 header (10 bytes).
 pub const EVS_HEADER_V1: &[u8; 10] = b"X0XEVICT1\0";
+/// The `.evs` v2 header (10 bytes): the v1 body followed by
+/// [`EvsQueuedBansV2`]. It is written only while a queued manual ban
+/// exists, so a store without one stays v1 and readable by a v1 binary.
+pub const EVS_HEADER_V2: &[u8; 10] = b"X0XEVICT2\0";
 /// The `.evjournal` v1 header (8 bytes).
 pub const EVJOURNAL_HEADER_V1: &[u8; 8] = b"X0XEVJ1\0";
-/// The highest layout version this binary reads, for both files.
+/// The highest `.evjournal` layout version this binary reads.
 pub const SIDECAR_MAX_SUPPORTED_VERSION: u8 = 1;
+/// The highest `.evs` layout version this binary reads.
+pub const EVS_MAX_SUPPORTED_VERSION: u8 = 2;
 
 /// Why an S4 file could not be used (ADR 0108 §5a classification).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1335,6 +1341,28 @@ pub struct EvsBodyV1 {
     pub rebuilt_from: Vec<[u8; 16]>,
     /// The obligation rows.
     pub rows: Vec<ObligationRow>,
+}
+
+/// One manual ban that a non-designated admin accepted with `202 queued`
+/// (ADR 0110 §2 amendment to ADR 0016 §6). It is applied as a ban after
+/// the designated removal, or at this node's fallback time, and it must
+/// survive a restart (ADR 0110 follow-up "a queued manual ban is still
+/// applied after the designated removal").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedBanV1 {
+    /// Stable group ID.
+    pub stable_group_id: String,
+    /// The agent to ban.
+    pub target: [u8; 32],
+    /// When the request was accepted (Unix ms).
+    pub queued_at_unix_ms: u64,
+}
+
+/// The `.evs` v2 extension that follows the v1 body.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EvsQueuedBansV2 {
+    /// Accepted manual bans that are not applied yet.
+    pub queued_bans: Vec<QueuedBanV1>,
 }
 
 /// The frozen v1 `.evjournal` body: one prepared S4 transition (§5).
@@ -1368,7 +1396,11 @@ pub struct EvJournalV1 {
 
 /// Split and check a `<prefix><digit>\0` header. Returns the version and
 /// the body.
-fn split_header<'a>(bytes: &'a [u8], prefix: &[u8]) -> Result<(u8, &'a [u8]), SidecarDecodeError> {
+fn split_header<'a>(
+    bytes: &'a [u8],
+    prefix: &[u8],
+    max_version: u8,
+) -> Result<(u8, &'a [u8]), SidecarDecodeError> {
     let header_len = prefix.len() + 2;
     let Some(found_prefix) = bytes.get(..prefix.len()) else {
         if prefix.starts_with(bytes) && !bytes.is_empty() {
@@ -1393,7 +1425,7 @@ fn split_header<'a>(bytes: &'a [u8], prefix: &[u8]) -> Result<(u8, &'a [u8]), Si
         return Err(SidecarDecodeError::Damaged("missing_nul"));
     }
     let version = version_byte - b'0';
-    if version > SIDECAR_MAX_SUPPORTED_VERSION {
+    if version > max_version {
         return Err(SidecarDecodeError::NewerFormat(version));
     }
     Ok((version, body))
@@ -1460,19 +1492,58 @@ fn decode_exact<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Sideca
 ///
 /// Returns the postcard error when encoding fails.
 pub fn encode_evs(body: &EvsBodyV1) -> Result<Vec<u8>, postcard::Error> {
-    let mut out = EVS_HEADER_V1.to_vec();
+    encode_evs_with_queued_bans(body, &[])
+}
+
+/// Encode the `.evs` sidecar with its queued manual bans. With no queued
+/// ban the file is v1; otherwise it is v2 (the v1 body, then
+/// [`EvsQueuedBansV2`]).
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub fn encode_evs_with_queued_bans(
+    body: &EvsBodyV1,
+    queued_bans: &[QueuedBanV1],
+) -> Result<Vec<u8>, postcard::Error> {
+    if queued_bans.is_empty() {
+        let mut out = EVS_HEADER_V1.to_vec();
+        out.extend(postcard::to_stdvec(body)?);
+        return Ok(out);
+    }
+    let mut out = EVS_HEADER_V2.to_vec();
     out.extend(postcard::to_stdvec(body)?);
+    out.extend(postcard::to_stdvec(&EvsQueuedBansV2 {
+        queued_bans: queued_bans.to_vec(),
+    })?);
     Ok(out)
 }
 
-/// Decode the `.evs` sidecar.
+/// Decode the `.evs` sidecar (the rows only).
 ///
 /// # Errors
 ///
 /// Returns the §5a classification of a file that cannot be used.
 pub fn decode_evs(bytes: &[u8]) -> Result<EvsBodyV1, SidecarDecodeError> {
-    let (_, body) = split_header(bytes, EVS_PREFIX)?;
-    decode_exact(body)
+    decode_evs_with_queued_bans(bytes).map(|(body, _)| body)
+}
+
+/// Decode the `.evs` sidecar with its queued manual bans (empty for v1).
+///
+/// # Errors
+///
+/// Returns the §5a classification of a file that cannot be used.
+pub fn decode_evs_with_queued_bans(
+    bytes: &[u8],
+) -> Result<(EvsBodyV1, Vec<QueuedBanV1>), SidecarDecodeError> {
+    let (version, body) = split_header(bytes, EVS_PREFIX, EVS_MAX_SUPPORTED_VERSION)?;
+    if version == 1 {
+        return decode_exact(body).map(|rows| (rows, Vec::new()));
+    }
+    let (rows, rest) = postcard::take_from_bytes::<EvsBodyV1>(body)
+        .map_err(|_| SidecarDecodeError::Damaged("body_decode"))?;
+    let extension: EvsQueuedBansV2 = decode_exact(rest)?;
+    Ok((rows, extension.queued_bans))
 }
 
 /// Encode one `.evjournal`.
@@ -1492,7 +1563,7 @@ pub fn encode_evjournal(journal: &EvJournalV1) -> Result<Vec<u8>, postcard::Erro
 ///
 /// Returns the §5a classification of a file that cannot be used.
 pub fn decode_evjournal(bytes: &[u8]) -> Result<EvJournalV1, SidecarDecodeError> {
-    let (_, body) = split_header(bytes, EVJOURNAL_PREFIX)?;
+    let (_, body) = split_header(bytes, EVJOURNAL_PREFIX, SIDECAR_MAX_SUPPORTED_VERSION)?;
     decode_exact(body)
 }
 
@@ -1950,8 +2021,40 @@ mod tests {
             Err(SidecarDecodeError::Damaged("missing_nul"))
         );
         let mut newer = bytes;
-        newer[8] = b'2';
-        assert_eq!(decode_evs(&newer), Err(SidecarDecodeError::NewerFormat(2)));
+        newer[8] = b'3';
+        assert_eq!(decode_evs(&newer), Err(SidecarDecodeError::NewerFormat(3)));
+    }
+
+    #[test]
+    fn evs_v2_carries_queued_bans_and_v1_stays_v1() {
+        let body = EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: vec![sample_row()],
+        };
+        let none = encode_evs_with_queued_bans(&body, &[]).expect("encode");
+        assert_eq!(&none[..10], EVS_HEADER_V1);
+        assert_eq!(
+            decode_evs_with_queued_bans(&none).expect("decode"),
+            (body.clone(), Vec::new())
+        );
+        let bans = vec![QueuedBanV1 {
+            stable_group_id: "g".into(),
+            target: [5; 32],
+            queued_at_unix_ms: 42,
+        }];
+        let some = encode_evs_with_queued_bans(&body, &bans).expect("encode");
+        assert_eq!(&some[..10], EVS_HEADER_V2);
+        assert_eq!(
+            decode_evs_with_queued_bans(&some).expect("decode"),
+            (body.clone(), bans)
+        );
+        assert_eq!(decode_evs(&some).expect("decode rows"), body);
+        let mut trailing = some;
+        trailing.push(0);
+        assert_eq!(
+            decode_evs_with_queued_bans(&trailing),
+            Err(SidecarDecodeError::Damaged("trailing_bytes"))
+        );
     }
 
     #[test]
