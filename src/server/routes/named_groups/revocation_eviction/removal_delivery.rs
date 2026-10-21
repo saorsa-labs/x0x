@@ -633,6 +633,26 @@ mod tests {
         assert!(decode_saved_removal(b"X0XCE1\0frame").is_none());
     }
 
+    /// #1508 review P1 #4: an S4 ban saves its `MemberBanned` as the
+    /// removal event of its row, so restart can classify and deliver it.
+    #[test]
+    fn a_saved_ban_decodes_like_a_removal() {
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: "g".to_string(),
+            revision: 4,
+            actor: "aa".repeat(32),
+            agent_id: "bb".repeat(32),
+            secret_epoch: None,
+            treekem_commit_b64: Some("Y29tbWl0".to_string()),
+            treekem_epoch: Some(3),
+            commit: Some(commit("p", "r")),
+        };
+        let bytes = serde_json::to_vec(&event).unwrap_or_default();
+        let saved = decode_saved_removal(&bytes).expect("a saved ban decodes");
+        assert_eq!(saved.result_head, "r");
+        assert_eq!(saved.result_epoch, Some(3));
+    }
+
     /// The `s4_restart_intake_prepare` crash: the legacy commit landed and
     /// was persisted, its publication was lost, and the restarted node's
     /// head is the removal's result. The saved event is delivered again,
