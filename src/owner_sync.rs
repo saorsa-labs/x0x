@@ -3125,7 +3125,8 @@ async fn append_synced_journal_line(
 /// Not when the line is already local, unless the local line lacks the
 /// expiry the synced value carries (a line written before #1542); the new
 /// line then supplies it (see `latest_journal_values`). Never when this
-/// owner already has a newer issuance for the agent: readers of the
+/// owner already has another certificate for the agent issued in the same
+/// second or later (`issued_at` has second precision): readers of the
 /// journal (the owner roster) take the last line per agent, so a later
 /// line for an older certificate would roll them back to it.
 fn synced_line_needed(
@@ -3139,7 +3140,9 @@ fn synced_line_needed(
     !existing.iter().any(|r| {
         r.agent_id == agent_hex
             && ((r.cert_digest == cert_digest && (r.not_after.is_some() || not_after.is_none()))
-                || (r.user_id == owner_hex && r.issued_at > issued_at))
+                || (r.user_id == owner_hex
+                    && r.cert_digest != cert_digest
+                    && r.issued_at >= issued_at))
     })
 }
 

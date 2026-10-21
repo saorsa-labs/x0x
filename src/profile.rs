@@ -296,6 +296,12 @@ pub fn cert_storage_digest(cert: &crate::identity::AgentCertificate) -> String {
     hex::encode(blake3::hash(&bytes).as_bytes())
 }
 
+/// Serialises every read-modify-write of the issuance journal in this
+/// process ([`IssuedCertRecord::append`], [`IssuedCertRecord::append_when`]).
+/// An append is a whole-file rewrite, so two writers that interleave lose a
+/// line or put an older line last.
+static JOURNAL_WRITER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 impl IssuedCertRecord {
     /// Build the record for a certificate about to be journaled, scoped to
     /// the issuing owner.
@@ -354,6 +360,12 @@ impl IssuedCertRecord {
     /// the issuance call sites (warn + continue): a missing journal line
     /// degrades the roster to discovery-derived, it never blocks startup.
     pub async fn append(path: &Path, record: &Self) -> std::io::Result<()> {
+        let _writer = JOURNAL_WRITER.lock().await;
+        Self::append_locked(path, record).await
+    }
+
+    /// [`Self::append`] for a caller that holds [`JOURNAL_WRITER`].
+    async fn append_locked(path: &Path, record: &Self) -> std::io::Result<()> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         if let Some(dir) = path.parent() {
@@ -390,7 +402,8 @@ impl IssuedCertRecord {
     /// or nothing when it returns `None`. Returns whether a line was
     /// appended. A writer that decides from what is already in the journal
     /// (owner sync's repair of a synced line) uses this, so the read, the
-    /// decision and the append are one step.
+    /// decision and the append are one step: every journal writer in this
+    /// process holds [`JOURNAL_WRITER`] for its read-modify-write.
     ///
     /// # Errors
     /// Returns the underlying IO error of the append.
@@ -398,11 +411,12 @@ impl IssuedCertRecord {
         path: &Path,
         decide: impl FnOnce(&[Self]) -> Option<Self>,
     ) -> std::io::Result<bool> {
+        let _writer = JOURNAL_WRITER.lock().await;
         let existing = Self::load(path).await;
         let Some(record) = decide(&existing) else {
             return Ok(false);
         };
-        Self::append(path, &record).await?;
+        Self::append_locked(path, &record).await?;
         Ok(true)
     }
 
