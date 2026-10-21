@@ -186,6 +186,17 @@ macro_rules! fleet_startup_regression_tests {
         #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
         #[tokio::test(start_paused = true)]
         async fn fleet_production_startup_zero_config_still_uses_the_minimum_window() {
+            fleet_first_receipt_case(false).await;
+        }
+
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        #[tokio::test(start_paused = true)]
+        async fn fleet_production_pending_start_rate_keeps_the_first_receipt_minimum() {
+            fleet_first_receipt_case(true).await;
+        }
+
+        #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
+        async fn fleet_first_receipt_case(start_rate_pending: bool) {
             use sha2::Digest;
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let evidence = std::env::var_os("X0X_UPGRADE_FLEET_EVIDENCE_DIR")
@@ -195,7 +206,7 @@ macro_rules! fleet_startup_regression_tests {
             std::fs::create_dir_all(&evidence).unwrap();
             let dir = tempfile::Builder::new().prefix("fleet-startup-").tempdir_in(evidence).unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let (mut runtime, _shutdown) = e2e_startup_runtime(&root);
+            let (mut runtime, shutdown) = e2e_startup_runtime(&root);
             let _current_path = crate::upgrade::apply::current_binary_path_seam::install(
                 root.join("x0xd"),
             );
@@ -220,9 +231,13 @@ macro_rules! fleet_startup_regression_tests {
             ))).unwrap();
             let unit = std::path::Path::new(authority["instances"][0]["unit"]["destination"]
                 .as_str().unwrap()).file_name().unwrap().to_str().unwrap();
-            let mut scenario = staging_readback(one_call_scenario("0", "5"), &runtime);
+            let interval = if start_rate_pending { "10s" } else { "0" };
+            let mut scenario = staging_readback(one_call_scenario(interval, "5"), &runtime);
             scenario.cgroup = format!("0::/system.slice/{unit}");
-            let _readback = restart::systemd_readback_seam::install(scenario);
+            let mut aged_out = staging_readback(one_call_scenario("10s", "5"), &runtime);
+            aged_out.cgroup = scenario.cgroup.clone();
+            aged_out.calls[0].monotonic_now_us = 15_000_000;
+            let mut readback = Some(restart::systemd_readback_seam::install(scenario));
             let mut manifest = manifest_for_this_platform("9.9.9");
             manifest.timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -246,10 +261,23 @@ macro_rules! fleet_startup_regression_tests {
             });
             let mut config = DaemonConfig { data_dir: root, ..Default::default() };
             config.update.rollout_window_minutes = 0;
-            let startup = run_startup_update_check(&config, None, Some(runtime));
-            tokio::pin!(startup);
-            let mut next = staging_next_observation(startup.as_mut(), &mut observations, deadline)
-                .await.unwrap_or_else(|result| panic!("fleet applied before its window: {result:?}"));
+            let mut startup = Box::pin(run_startup_update_check(&config, None, Some(runtime)));
+            let mut next = match staging_next_observation(startup.as_mut(), &mut observations, deadline).await {
+                Ok(decision) => decision,
+                Err(result) => {
+                    drop(startup);
+                    // A refused identity schedules a real retry. Let its check
+                    // finish before scoped raw readback/path guards are dropped.
+                    loop {
+                        if let Some(owner) = crate::upgrade::probe_retry::claim_retry(
+                            install.clone(), "9.9.9".into(),
+                        ) { drop(owner); break; }
+                        assert!(std::time::Instant::now() < deadline, "retry check did not drain");
+                        tokio::task::yield_now().await;
+                    }
+                    panic!("fleet must acknowledge its first window before admission: {result:?}");
+                }
+            };
             // Independently known [42;32]/9.9.9 fraction gives3260 seconds
             // for a60-minute window. The floor is not a minimum chosen delay.
             assert_eq!(next, crate::upgrade::staging::Decision::Waiting(Duration::from_secs(3260)));
@@ -258,6 +286,23 @@ macro_rules! fleet_startup_regression_tests {
             assert_eq!(receipt.first_receipt_ms, 1000);
             assert_eq!(attempts.load(Ordering::SeqCst), 0);
             assert!(apply_lock.try_lock().is_ok());
+            if start_rate_pending {
+                // The real readback still refuses restart, independently of
+                // the staging-only identity used for the acknowledged receipt.
+                let pending = restart::readback_systemd_policy(
+                    &restart::SupervisionSignals::sample(), &install, &restart::current_argv(),
+                );
+                assert!(matches!(pending, restart::SystemdPolicyReadback::StartRateWindowPending {
+                    retry_after, ..
+                } if retry_after == Duration::from_secs(8)), "{pending:?}");
+                assert_eq!(started.elapsed(), Duration::ZERO);
+                assert_eq!(std::fs::read(&install).unwrap(), original);
+                // One raw scenario repeats its pending result. Replace it only
+                // after the first durable receipt; never drop an old guard
+                // after installing the replacement, which would clear it.
+                drop(readback.take());
+                readback = Some(restart::systemd_readback_seam::install(aged_out));
+            }
             let result = loop {
                 if let crate::upgrade::staging::Decision::Waiting(wait) = next {
                     let step = wait.min(Duration::from_secs(30));
@@ -269,11 +314,17 @@ macro_rules! fleet_startup_regression_tests {
                     Err(result) => break result,
                 }
             };
+            drop(startup);
+            drop(shutdown);
             assert!(matches!(&result, Ok(Some(version)) if version == "9.9.9"), "{result:?}");
             assert_eq!(attempts.load(Ordering::SeqCst), 1);
             assert!(started.elapsed() >= Duration::from_secs(3260));
             assert!(started.elapsed() <= Duration::from_secs(3600));
+            let retained = crate::upgrade::staging::read_receipt(&request).unwrap().unwrap();
+            assert_eq!(retained.first_receipt_ms, receipt.first_receipt_ms);
+            assert_eq!(retained.window_minutes, 60);
             assert_eq!(std::fs::read(install).unwrap(), original);
+            drop(readback);
         }
 
         #[cfg(all(unix, not(feature = "upgrade-test-signing")))]
