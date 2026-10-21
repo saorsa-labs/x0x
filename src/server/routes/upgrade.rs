@@ -1022,6 +1022,69 @@ async fn download_skill(url: &str) -> Result<Vec<u8>, reqwest::Error> {
         .map(|bytes| bytes.to_vec())
 }
 
+#[cfg(test)]
+mod skill_install_seam {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{Arc, LazyLock, Mutex},
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Event {
+        Entered,
+        BeforeWrite,
+        Exited,
+    }
+
+    type Observer = Arc<dyn Fn(Event) + Send + Sync>;
+    static OBSERVERS: LazyLock<Mutex<HashMap<PathBuf, Observer>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVERS.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    pub(super) fn install(path: PathBuf, observer: Observer) -> Guard {
+        assert!(OBSERVERS
+            .lock()
+            .unwrap()
+            .insert(path.clone(), observer)
+            .is_none());
+        Guard(path)
+    }
+
+    pub(super) struct Active(Option<Observer>);
+
+    impl Active {
+        pub(super) fn before_write(&self) {
+            if let Some(observer) = &self.0 {
+                observer(Event::BeforeWrite);
+            }
+        }
+    }
+
+    pub(super) fn entered(path: &Path) -> Active {
+        let observer = OBSERVERS.lock().unwrap().get(path).cloned();
+        if let Some(observer) = &observer {
+            observer(Event::Entered);
+        }
+        Active(observer)
+    }
+
+    impl Drop for Active {
+        fn drop(&mut self) {
+            if let Some(observer) = &self.0 {
+                observer(Event::Exited);
+            }
+        }
+    }
+}
+
 async fn update_skill_inner(
     manifest: &ReleaseManifest,
     data_dir: &std::path::Path,
@@ -1066,6 +1129,8 @@ async fn update_skill_inner(
                 SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             let install = x0x::upgrade::apply::run_owned_blocking(move |caller_alive| {
+                #[cfg(test)]
+                let observation = skill_install_seam::entered(&skill_path);
                 // Watch value custody orders a shutdown signal against
                 // this short atomic install. A cancelled queued worker
                 // cannot begin it after its observer has gone away.
@@ -1080,6 +1145,8 @@ async fn update_skill_inner(
                         "guide update cancelled before install".into(),
                     ));
                 }
+                #[cfg(test)]
+                observation.before_write();
                 let result = std::fs::write(&tmp_path, &new_contents)
                     .and_then(|()| std::fs::rename(&tmp_path, &skill_path));
                 if result.is_err() {
@@ -1390,6 +1457,11 @@ mod tests {
     ));
     #[cfg(unix)]
     staging_regression_tests!();
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging_guide.rs"
+    ));
+    staging_guide_regression_tests!();
     #[cfg(unix)]
     staging_runtime_regression_tests!();
     #[cfg(unix)]
