@@ -31,50 +31,48 @@ async fn inspect_probe_admission(
     install: PathBuf,
     version: String,
     staging: Option<(super::staging_runtime::Gate, restart::RestartPlan)>,
+    permit: Option<&ReleasePermit>,
 ) -> Result<super::probe::Admission, UpgradeError> {
-    if let Some((gate, plan)) = staging {
-        return run_owned_blocking(move |caller_alive| {
-            let _lock = super::acquire_host_upgrade_lock(&install)?;
-            let check_custody = || {
-                if caller_alive.load(Ordering::Acquire) {
-                    Ok(())
-                } else {
-                    Err(UpgradeError::Other(
-                        "staging probe admission cancelled before record I/O".into(),
-                    ))
-                }
-            };
-            check_custody()?;
-            ensure_canonical_install(&install)?;
-            // Selection or refusal evidence can change after the first gate
-            // releases its lock. Recheck before probe inspection can write.
-            gate.check_apply_policy(&install, &plan)?;
-            check_custody()?;
-            super::probe::inspect_admission(&install, &version)
-                .map_err(|error| UpgradeError::Other(error.to_string()))
-        })
-        .await;
-    }
-    tokio::task::spawn_blocking(move || {
+    run_owned_blocking_with_permit(permit, move |alive| {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
+        if !alive.load(Ordering::Acquire) {
+            return Err(cancelled_release());
+        }
+        if let Some((gate, plan)) = staging {
+            ensure_canonical_install(&install)?;
+            gate.check_apply_policy(&install, &plan)?;
+        }
+        if !alive.load(Ordering::Acquire) {
+            return Err(cancelled_release());
+        }
         super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))
     })
     .await
-    .map_err(|error| UpgradeError::Other(format!("probe admission worker failed: {error}")))?
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 async fn probe_retry_delay_for_install(
     install: PathBuf,
     version: String,
 ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
-    tokio::task::spawn_blocking(move || {
+    probe_retry_delay_owned(install, version, None).await
+}
+
+#[cfg(unix)]
+async fn probe_retry_delay_owned(
+    install: PathBuf,
+    version: String,
+    permit: Option<&ReleasePermit>,
+) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+    run_owned_blocking_with_permit(permit, move |alive| {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
+        if !alive.load(Ordering::Acquire) {
+            return Err(cancelled_release());
+        }
         probe_retry_state_under_lock(&install, &version)
     })
     .await
-    .map_err(|error| UpgradeError::Other(format!("probe retry-state worker failed: {error}")))?
 }
 
 /// The caller holds the install lock and has completed any staging refusal
@@ -250,6 +248,7 @@ impl Drop for TempDirGuard {
 struct CallerAliveJoin<T> {
     caller_alive: Arc<AtomicBool>,
     join: JoinHandle<Result<T, UpgradeError>>,
+    _permit: Option<PermitOperation>,
 }
 
 impl<T> Future for CallerAliveJoin<T> {
@@ -267,19 +266,146 @@ impl<T> Drop for CallerAliveJoin<T> {
     }
 }
 
+/// A background release may withdraw admission without dropping its queued
+/// worker. Each operation keeps its own caller flag; completing one operation
+/// must not cancel the next observation of the same release.
+#[derive(Clone, Default)]
+pub(crate) struct ReleasePermit {
+    state: Arc<std::sync::Mutex<PermitState>>,
+    wake: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct PermitState {
+    cancelled: bool,
+    operation: Option<std::sync::Weak<AtomicBool>>,
+}
+
+impl ReleasePermit {
+    pub(crate) fn check(&self) -> Result<(), UpgradeError> {
+        let state = self.state.lock().map_err(|_| cancelled_release())?;
+        if state.cancelled {
+            Err(cancelled_release())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cancelled = true;
+        if let Some(flag) = state.operation.as_ref().and_then(std::sync::Weak::upgrade) {
+            flag.store(false, Ordering::Release);
+        }
+        drop(state);
+        self.wake.notify_waiters();
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.check().is_err() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn register(&self, flag: &Arc<AtomicBool>) -> Result<PermitOperation, UpgradeError> {
+        let mut state = self.state.lock().map_err(|_| cancelled_release())?;
+        if state.cancelled
+            || state
+                .operation
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
+        {
+            return Err(cancelled_release());
+        }
+        state.operation = Some(Arc::downgrade(flag));
+        Ok(PermitOperation {
+            permit: self.clone(),
+            flag: Arc::clone(flag),
+        })
+    }
+}
+
+fn cancelled_release() -> UpgradeError {
+    UpgradeError::Other("background release admission cancelled".into())
+}
+
+struct PermitOperation {
+    permit: ReleasePermit,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for PermitOperation {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+        if let Ok(mut state) = self.permit.state.lock() {
+            if state
+                .operation
+                .as_ref()
+                .is_some_and(|flag| flag.ptr_eq(&Arc::downgrade(&self.flag)))
+            {
+                state.operation = None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct OperationObservation(Option<Arc<dyn Fn(bool) + Send + Sync>>);
+#[cfg(test)]
+impl Drop for OperationObservation {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.0 {
+            observer(false);
+        }
+    }
+}
+
 /// Retain a blocking operation's cancellation flag until its observer returns.
 /// The operation must check the flag at its own mutation admission boundary.
-pub(crate) async fn run_owned_blocking<T, F>(operation: F) -> Result<T, UpgradeError>
+pub(crate) async fn run_owned_blocking_with_permit<T, F>(
+    permit: Option<&ReleasePermit>,
+    operation: F,
+) -> Result<T, UpgradeError>
 where
     T: Send + 'static,
     F: FnOnce(Arc<AtomicBool>) -> Result<T, UpgradeError> + Send + 'static,
 {
     let caller_alive = Arc::new(AtomicBool::new(true));
+    let registration = permit
+        .map(|permit| permit.register(&caller_alive))
+        .transpose()?;
     let worker_alive = Arc::clone(&caller_alive);
-    let join = tokio::task::spawn_blocking(move || operation(worker_alive));
-    CallerAliveJoin { caller_alive, join }
-        .await
-        .map_err(|error| UpgradeError::Other(format!("upgrade worker failed: {error}")))?
+    #[cfg(test)]
+    let observer = permit.and_then(|permit| permit.observer.clone());
+    let join = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _observation = {
+            if let Some(observer) = &observer {
+                observer(true);
+            }
+            OperationObservation(observer)
+        };
+        operation(worker_alive)
+    });
+    CallerAliveJoin {
+        caller_alive,
+        join,
+        _permit: registration,
+    }
+    .await
+    .map_err(|error| UpgradeError::Other(format!("upgrade worker failed: {error}")))?
 }
 
 /// Companion + primary replace on the blocking pool.
@@ -303,7 +429,32 @@ where
 /// async observer after admission cannot detach installed bytes from that
 /// continuation (#1447 RC3). Extra pre-rename boolean checks only move the
 /// window; ownership transfer at admission closes it.
+#[cfg(test)]
 async fn apply_replacements_offloaded(
+    upgrader: Upgrader,
+    extracted_path: PathBuf,
+    target_version: semver::Version,
+    companion: Option<(Upgrader, PathBuf)>,
+    temp_guard: TempDirGuard,
+    on_success: Option<Box<dyn FnOnce() + Send>>,
+    probe_admission: Option<ProbeAdmission>,
+) -> Result<UpgradeResult, UpgradeError> {
+    apply_replacements_with_permit(
+        upgrader,
+        extracted_path,
+        target_version,
+        companion,
+        temp_guard,
+        on_success,
+        probe_admission,
+        None,
+    )
+    .await
+}
+
+// Keep the existing replacement inputs together with its admission custody.
+#[allow(clippy::too_many_arguments)]
+async fn apply_replacements_with_permit(
     upgrader: Upgrader,
     extracted_path: PathBuf,
     target_version: semver::Version,
@@ -311,11 +462,24 @@ async fn apply_replacements_offloaded(
     temp_guard: TempDirGuard,
     mut on_success: Option<Box<dyn FnOnce() + Send>>,
     probe_admission: Option<ProbeAdmission>,
+    permit: Option<&ReleasePermit>,
 ) -> Result<UpgradeResult, UpgradeError> {
     let caller_alive = Arc::new(AtomicBool::new(true));
+    let registration = permit
+        .map(|permit| permit.register(&caller_alive))
+        .transpose()?;
     let worker_alive = Arc::clone(&caller_alive);
+    #[cfg(test)]
+    let observer = permit.and_then(|permit| permit.observer.clone());
 
     let join = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _observation = {
+            if let Some(observer) = &observer {
+                observer(true);
+            }
+            OperationObservation(observer)
+        };
         // Custody stays with this task through every replace. Dropped
         // explicitly before any on_success continuation that may exit without
         // unwinding (#1447 RC4 P2).
@@ -394,11 +558,13 @@ async fn apply_replacements_offloaded(
         Ok(result)
     });
 
-    CallerAliveJoin { caller_alive, join }
-        .await
-        .map_err(|join_err| {
-            UpgradeError::Other(format!("upgrade replace task failed: {join_err}"))
-        })?
+    CallerAliveJoin {
+        caller_alive,
+        join,
+        _permit: registration,
+    }
+    .await
+    .map_err(|join_err| UpgradeError::Other(format!("upgrade replace task failed: {join_err}")))?
 }
 
 /// Context the restart planner needs from the running daemon: where the
@@ -433,6 +599,7 @@ pub struct AutoApplyUpgrader {
     restart_context: RestartContext,
     #[cfg(unix)]
     staging: Option<super::staging_runtime::Gate>,
+    release_permit: Option<ReleasePermit>,
 }
 
 impl AutoApplyUpgrader {
@@ -445,6 +612,25 @@ impl AutoApplyUpgrader {
             restart_context: RestartContext::default(),
             #[cfg(unix)]
             staging: None,
+            release_permit: None,
+        }
+    }
+
+    pub(crate) fn with_release_permit(mut self, permit: ReleasePermit) -> Self {
+        self.release_permit = Some(permit);
+        self
+    }
+
+    fn check_release(&self) -> Result<(), UpgradeError> {
+        self.release_permit
+            .as_ref()
+            .map_or(Ok(()), ReleasePermit::check)
+    }
+
+    pub(crate) async fn release_cancelled(&self) {
+        match &self.release_permit {
+            Some(permit) => permit.cancelled().await,
+            None => std::future::pending().await,
         }
     }
 
@@ -488,6 +674,7 @@ impl AutoApplyUpgrader {
         let Some(gate) = &self.staging else {
             return Ok(None);
         };
+        self.check_release()?;
         let install = self.install_path()?;
         let identity = restart::resolve_staging_identity(
             self.stop_on_upgrade,
@@ -497,6 +684,8 @@ impl AutoApplyUpgrader {
         )
         .await
         .map_err(UpgradeError::from)?;
+        // Drain the actual identity readback before observing cancellation.
+        self.check_release()?;
         Ok(Some((install, gate.clone(), identity)))
     }
 
@@ -535,6 +724,7 @@ impl AutoApplyUpgrader {
         };
         let install = self.install_path()?;
         loop {
+            self.check_release()?;
             if *shutdown.borrow() || shutdown.has_changed().is_err() {
                 return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
             }
@@ -549,27 +739,29 @@ impl AutoApplyUpgrader {
                     self.restart_context.data_dir.as_deref(), self.restart_context.api_addr,
                 ) => result.map_err(UpgradeError::from)?,
             };
+            self.check_release()?;
             let gate = gate.clone();
             let install = install.clone();
             let worker_shutdown = shutdown.clone();
-            let worker = run_owned_blocking(move |worker_alive| {
-                let _lock = super::acquire_host_upgrade_lock(&install)?;
-                // A queued blocking task outlives a dropped JoinHandle. Recheck
-                // custody after obtaining the lock and before any record I/O.
-                let shutdown_value = worker_shutdown.borrow();
-                if !worker_alive.load(Ordering::Acquire)
-                    || *shutdown_value
-                    || worker_shutdown.has_changed().is_err()
-                {
-                    return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
-                }
-                // Measure receipt time after lock acquisition: time spent
-                // queued for that lock must not count as durable rollout wait.
-                let clock = gate
-                    .clock()
-                    .map_err(|error| UpgradeError::Other(error.to_string()))?;
-                gate.observe_locked_at(&install, &clock, &identity)
-            });
+            let worker =
+                run_owned_blocking_with_permit(self.release_permit.as_ref(), move |worker_alive| {
+                    let _lock = super::acquire_host_upgrade_lock(&install)?;
+                    // A queued blocking task outlives a dropped JoinHandle. Recheck
+                    // custody after obtaining the lock and before any record I/O.
+                    let shutdown_value = worker_shutdown.borrow();
+                    if !worker_alive.load(Ordering::Acquire)
+                        || *shutdown_value
+                        || worker_shutdown.has_changed().is_err()
+                    {
+                        return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+                    }
+                    // Measure receipt time after lock acquisition: time spent
+                    // queued for that lock must not count as durable rollout wait.
+                    let clock = gate
+                        .clock()
+                        .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                    gate.observe_locked_at(&install, &clock, &identity)
+                });
             let decision = tokio::select! {
                 biased;
                 _ = shutdown.changed() => return Err(UpgradeError::Other("staging cancelled by shutdown".into())),
@@ -586,11 +778,13 @@ impl AutoApplyUpgrader {
             {
                 observed(decision.clone());
             }
+            self.check_release()?;
             let super::staging::Decision::Waiting(wait) = decision else {
                 return Ok(());
             };
             tokio::select! {
                 _ = tokio::time::sleep(wait.min(std::time::Duration::from_secs(30))) => {}
+                _ = self.release_cancelled() => return Err(cancelled_release()),
                 _ = shutdown.changed() => {
                     return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
                 }
@@ -646,6 +840,7 @@ impl AutoApplyUpgrader {
             restart_context: self.restart_context.clone(),
             #[cfg(unix)]
             staging: self.staging.clone(),
+            release_permit: self.release_permit.clone(),
         }
     }
 
@@ -659,6 +854,7 @@ impl AutoApplyUpgrader {
         {
             let install = self.install_path()?;
             let version = version.to_owned();
+            self.check_release()?;
             if let Some(gate) = &self.staging {
                 if gate.request.version != version {
                     return Err(UpgradeError::Other("staging retry release changed".into()));
@@ -671,8 +867,9 @@ impl AutoApplyUpgrader {
                 )
                 .await
                 .map_err(UpgradeError::from)?;
+                self.check_release()?;
                 let gate = gate.clone();
-                run_owned_blocking(move |caller_alive| {
+                run_owned_blocking_with_permit(self.release_permit.as_ref(), move |caller_alive| {
                     let _lock = super::acquire_host_upgrade_lock(&install)?;
                     let check_custody = || {
                         if caller_alive.load(Ordering::Acquire) {
@@ -691,7 +888,7 @@ impl AutoApplyUpgrader {
                 })
                 .await
             } else {
-                probe_retry_delay_for_install(install, version).await
+                probe_retry_delay_owned(install, version, self.release_permit.as_ref()).await
             }
         }
         #[cfg(not(unix))]
@@ -786,6 +983,7 @@ impl AutoApplyUpgrader {
         &self,
         manifest: &ReleaseManifest,
     ) -> Result<UpgradeResult, UpgradeError> {
+        self.check_release()?;
         let current_version_str = crate::VERSION;
         let target_version = semver::Version::parse(&manifest.version)
             .map_err(|e| UpgradeError::Other(format!("invalid version: {e}")))?;
@@ -817,6 +1015,7 @@ impl AutoApplyUpgrader {
         // installed binaries untouched. The plan is then carried through
         // replacement and restart — never re-derived post-swap.
         let restart_plan = self.resolve_restart_plan(&target_path).await?;
+        self.check_release()?;
         #[cfg(unix)]
         let probe_launch = super::probe::ProbeLaunch::capture(&restart_plan.cwd);
         // Refuse a failed Unix record barrier before download or replacement.
@@ -842,7 +1041,7 @@ impl AutoApplyUpgrader {
             let gate = gate.clone();
             let install = target_path.clone();
             let staging_plan = restart_plan.clone();
-            run_owned_blocking(move |caller_alive| {
+            run_owned_blocking_with_permit(self.release_permit.as_ref(), move |caller_alive| {
                 let _lock = super::acquire_host_upgrade_lock(&install)?;
                 if !caller_alive.load(Ordering::Acquire) {
                     return Err(UpgradeError::Other(
@@ -862,6 +1061,7 @@ impl AutoApplyUpgrader {
             self.staging
                 .clone()
                 .map(|gate| (gate, restart_plan.clone())),
+            self.release_permit.as_ref(),
         )
         .await?
         {
@@ -869,6 +1069,7 @@ impl AutoApplyUpgrader {
                 super::probe::ProbeRefusal::Waiting { retry_after }.to_string(),
             ));
         }
+        self.check_release()?;
         info!(
             mode = ?restart_plan.mode,
             supervision = restart_plan.supervision_signal.as_deref().unwrap_or("none"),
@@ -1095,7 +1296,8 @@ impl AutoApplyUpgrader {
             None
         };
 
-        let result = apply_replacements_offloaded(
+        self.check_release()?;
+        let result = apply_replacements_with_permit(
             upgrader,
             extracted_path,
             target_version.clone(),
@@ -1103,6 +1305,7 @@ impl AutoApplyUpgrader {
             _temp_guard,
             on_success,
             probe_admission,
+            self.release_permit.as_ref(),
         )
         .await?;
 
@@ -1673,6 +1876,10 @@ fn extract_from_zip(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    include!("../../tests/upgrade_background_staging.rs");
+    #[cfg(unix)]
+    background_permit_regression_tests!();
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
