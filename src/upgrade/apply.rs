@@ -451,17 +451,33 @@ impl AutoApplyUpgrader {
         Ok(observed)
     }
 
-    /// Capture guide admission after download, from the independent executable
-    /// observation. The writer must hold this install lock through the fresh
-    /// gate check and rename; this snapshot alone does not authorize a write.
+    /// Capture actual guide policy evidence after download. The writer must
+    /// hold the returned install lock through a fresh observe_locked_at check
+    /// requiring Due and the rename; this snapshot alone authorizes no write.
     #[cfg(unix)]
-    pub(crate) fn guide_staging(
+    pub(crate) async fn guide_staging(
         &self,
-    ) -> Result<Option<(PathBuf, super::staging_runtime::Gate)>, UpgradeError> {
+    ) -> Result<
+        Option<(
+            PathBuf,
+            super::staging_runtime::Gate,
+            restart::StagingIdentity,
+        )>,
+        UpgradeError,
+    > {
         let Some(gate) = &self.staging else {
             return Ok(None);
         };
-        Ok(Some((self.install_path()?, gate.clone())))
+        let install = self.install_path()?;
+        let identity = restart::resolve_staging_identity(
+            self.stop_on_upgrade,
+            &install,
+            self.restart_context.data_dir.as_deref(),
+            self.restart_context.api_addr,
+        )
+        .await
+        .map_err(UpgradeError::from)?;
+        Ok(Some((install, gate.clone(), identity)))
     }
 
     #[cfg(unix)]
