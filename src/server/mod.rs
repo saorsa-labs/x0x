@@ -1866,38 +1866,19 @@ pub async fn serve_with_options(
         && config.update.enabled
         && (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)
     {
-        let runtime = async {
+        let runtime = routes::BackgroundRuntime::from_boot(
+            &config,
+            state.api_address,
+            (
+                daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx),
+                state.shutdown_notify.subscribe(),
+            ),
+            Arc::clone(&state.upgrade_apply_lock),
             #[cfg(unix)]
-            let staging = {
-                let identity_root = match identity_dir.clone() {
-                    Some(path) => path,
-                    None => crate::storage::x0x_dir().await?,
-                };
-                routes::StartupStagingContext {
-                    install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
-                    identity_root: identity_root.canonicalize()?,
-                    machine_id: *state.agent.machine_id().as_bytes(),
-                    #[cfg(test)]
-                    clock: None,
-                    #[cfg(test)]
-                    observed: None,
-                }
-            };
-            Ok::<_, anyhow::Error>(routes::BackgroundRuntime {
-                config: config.update.clone(),
-                data_dir: config.data_dir.clone(),
-                api_addr: state.api_address,
-                shutdown: (
-                    daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx),
-                    state.shutdown_notify.subscribe(),
-                ),
-                apply_lock: Arc::clone(&state.upgrade_apply_lock),
-                #[cfg(unix)]
-                staging,
-                #[cfg(test)]
-                operation_observer: None,
-            })
-        }
+            identity_dir.clone(),
+            #[cfg(unix)]
+            *state.agent.machine_id().as_bytes(),
+        )
         .await;
         match runtime {
             Ok(runtime) => {
@@ -1917,26 +1898,26 @@ pub async fn serve_with_options(
     // Gossip-based release subscription (primary update mechanism). This
     // listener can download + install + restart, so it is gated on
     // `self_update_enabled` — embedders never replace the host binary.
-    if let Some(submit) = background_submit
-        .as_ref()
-        .filter(|_| config.update.gossip_updates)
-    {
-        let submit = submit.clone();
-        let agent_for_gossip = Arc::clone(&state.agent);
-        let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
-        // Restart context stays with the shared owner; this source only
-        // discovers verified releases and observes daemon shutdown.
-        let gossip_shutdown_watch = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
-            run_gossip_update_listener(
-                agent_for_gossip,
-                submit,
-                self_published_for_gossip,
-                gossip_shutdown_watch,
-            )
-            .await;
-        }));
-    }
+    bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
+        self_update_enabled && config.update.enabled && config.update.gossip_updates,
+        background_submit.clone(),
+        |submit| {
+            let agent_for_gossip = Arc::clone(&state.agent);
+            let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
+            // Restart context stays with the shared owner; this source only
+            // discovers verified releases and observes daemon shutdown.
+            let gossip_shutdown_watch = state.shutdown_notify.subscribe();
+            async move {
+                run_gossip_update_listener(
+                    agent_for_gossip,
+                    submit,
+                    self_published_for_gossip,
+                    gossip_shutdown_watch,
+                )
+                .await;
+            }
+        },
+    ));
 
     // Broadcast current manifest to gossip after joining the network.
     // Ensures nodes that missed the initial gossip window can still receive it.
@@ -1964,26 +1945,28 @@ pub async fn serve_with_options(
 
     // GitHub fallback poll (safety net, default every 48h). Install/restart
     // capable, so gated on `self_update_enabled` (embedders opt out).
-    if let Some(submit) = background_submit
-        .as_ref()
-        .filter(|_| config.update.fallback_check_interval_minutes > 0)
-    {
-        let submit = submit.clone();
-        let update_config = config.update.clone();
-        let agent_for_poll = Arc::clone(&state.agent);
-        let self_published_for_poll = Arc::clone(&self_published_release_manifests);
-        let poll_shutdown_watch = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
-            run_fallback_github_poll(
-                agent_for_poll,
-                update_config,
-                submit,
-                self_published_for_poll,
-                poll_shutdown_watch,
-            )
-            .await;
-        }));
-    }
+    bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
+        self_update_enabled
+            && config.update.enabled
+            && config.update.fallback_check_interval_minutes > 0,
+        background_submit,
+        |submit| {
+            let update_config = config.update.clone();
+            let agent_for_poll = Arc::clone(&state.agent);
+            let self_published_for_poll = Arc::clone(&self_published_release_manifests);
+            let poll_shutdown_watch = state.shutdown_notify.subscribe();
+            async move {
+                run_fallback_github_poll(
+                    agent_for_poll,
+                    update_config,
+                    submit,
+                    self_published_for_poll,
+                    poll_shutdown_watch,
+                )
+                .await;
+            }
+        },
+    ));
 
     // Background rendezvous re-advertisement (re-advertise every validity_ms / 2)
     if config.rendezvous_enabled && config.rendezvous_validity_ms > 0 {

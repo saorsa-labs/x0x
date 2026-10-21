@@ -635,6 +635,61 @@ pub(in crate::server) struct BackgroundRuntime {
     pub operation_observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
 }
 
+impl BackgroundRuntime {
+    /// Resolve the actual boot context before constructing an apply owner.
+    pub(in crate::server) async fn from_boot(
+        config: &DaemonConfig,
+        api_addr: SocketAddr,
+        shutdown: UpdateShutdown,
+        apply_lock: Arc<Mutex<()>>,
+        #[cfg(unix)] identity_dir: Option<PathBuf>,
+        #[cfg(unix)] machine_id: [u8; 32],
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        let staging = {
+            let identity_root = match identity_dir {
+                Some(path) => path,
+                None => crate::storage::x0x_dir().await?,
+            };
+            StartupStagingContext {
+                install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                identity_root: identity_root.canonicalize()?,
+                machine_id,
+                #[cfg(test)]
+                clock: None,
+                #[cfg(test)]
+                observed: None,
+            }
+        };
+        Ok(Self {
+            config: config.update.clone(),
+            data_dir: config.data_dir.clone(),
+            api_addr,
+            shutdown,
+            apply_lock,
+            #[cfg(unix)]
+            staging,
+            #[cfg(test)]
+            operation_observer: None,
+        })
+    }
+
+    /// Spawn the server's real discovery source under its configured gate.
+    pub(in crate::server) fn spawn_source<F>(
+        enabled: bool,
+        submit: Option<BackgroundSubmit>,
+        source: impl FnOnce(BackgroundSubmit) -> F,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if !enabled {
+            return None;
+        }
+        submit.map(|submit| tokio::spawn(source(submit)))
+    }
+}
+
 /// Intake results only; Accepted does not acknowledge a durable receipt or
 /// supersession. The owned worker must still complete those record barriers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
