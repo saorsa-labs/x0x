@@ -1672,6 +1672,19 @@ enum GroupSub {
         /// Role to assign: admin | member.
         role: String,
     },
+    /// Self-rebind this agent's renewed certificate into its seat before
+    /// the cutoff `not_after − τ` (ADR 0110 §4a).
+    RebindCertificate {
+        /// Group ID.
+        group_id: String,
+        /// This agent's hex ID (the seat to rebind).
+        agent_id: String,
+        /// Renewed certificate, base64 storage encoding (the
+        /// `certificate.storage_b64` of `x0x owner agents issue`). Defaults
+        /// to the daemon's loaded agent certificate.
+        #[arg(long)]
+        certificate: Option<String>,
+    },
     /// Ban a member (admin+).
     Ban {
         /// Group ID.
@@ -2964,6 +2977,19 @@ async fn run(
                 agent_id,
                 role,
             }) => commands::group::set_role(&client, &group_id, &agent_id, &role).await,
+            Some(GroupSub::RebindCertificate {
+                group_id,
+                agent_id,
+                certificate,
+            }) => {
+                commands::group::rebind_certificate(
+                    &client,
+                    &group_id,
+                    &agent_id,
+                    certificate.as_deref(),
+                )
+                .await
+            }
             Some(GroupSub::Ban { group_id, agent_id }) => {
                 commands::group::ban(&client, &group_id, &agent_id).await
             }

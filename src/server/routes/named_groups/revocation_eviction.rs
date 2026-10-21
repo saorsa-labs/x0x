@@ -47,6 +47,7 @@ use x0x::groups::eviction::{
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
+pub(super) mod rebind;
 mod removal_delivery;
 
 pub(super) use removal_delivery::record_committed_removal;
@@ -164,6 +165,8 @@ struct S4Inner {
     /// §3: committed seated-target removals whose saved event is still
     /// being delivered to the survivors.
     removals: HashMap<EvictionKey, removal_delivery::RemovalDelivery>,
+    /// §4a, §4b(2): certificate rebind deliveries, renewals and waits.
+    rebind: rebind::RebindState,
 }
 
 impl Default for S4Runtime {
@@ -235,6 +238,7 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
         crypto_exclusion::drive_deliveries(&state).await;
         removal_delivery::drive(&state).await;
         crypto_exclusion::retry_stash(&state).await;
+        rebind::drive(&state).await;
         tokio::select! {
             () = notify.notified() => {}
             () = tokio::time::sleep(S4_WORKER_TICK) => {}
@@ -398,6 +402,13 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 evaluation.action = RowAction::None;
                 inner.ce.holders.insert(key.clone(), holders);
             }
+        }
+        // §1a, §4b(2): every admin other than the target is expired; the
+        // row waits for an owner renewal and the admin's self-rebind.
+        if let Some(wait) = rebind::row_override(&inner.rebind, info, &row, target_seated, now_unix)
+        {
+            evaluation.waiting = Some(wait);
+            evaluation.action = RowAction::None;
         }
         // §2: each observing admin forwards the trigger evidence to every
         // eligible admin once; the dispatch time is recorded before route
@@ -1259,6 +1270,20 @@ async fn receive_handoff(state: &Arc<AppState>, sender: x0x::identity::AgentId, 
             }
         }
     }
+    // §4a (D155): a renewal from the seat's own agent after its cutoff.
+    if let Some(bytes) = &handoff.renewed_certificate {
+        if rebind::note_handoff_renewal(
+            state,
+            &handoff.stable_group_id,
+            handoff.target,
+            sender,
+            bytes,
+        )
+        .await
+        {
+            verified_any = true;
+        }
+    }
     // Self-leave and expiry evidence is re-derived from this node's own
     // chain and clock (§1a: a hand-off never shortens another node's
     // expiry budget); the pass below picks it up.
@@ -1312,7 +1337,11 @@ async fn drive_exclusions(state: &Arc<AppState>) {
     for (key, group_key, action) in candidates {
         match action {
             RowAction::CommitRemoval { rank } => {
-                commit_removal(state, &key, &group_key, rank).await;
+                // §4a: with a verified renewal and every member capable,
+                // the expiry worker rebinds instead of removing.
+                if !rebind::try_admin_rebind(state, &key, &group_key).await {
+                    commit_removal(state, &key, &group_key, rank).await;
+                }
             }
             RowAction::SelfLeaveRekey { rank } => {
                 // The responsive self-leave rekey (#1113, PR #1337) already
@@ -2147,6 +2176,9 @@ pub(in crate::server) struct GroupS4Status {
     /// for each Active digest-only seat of an `OwnerCertified` group whose
     /// committed certificate bytes this node lacks.
     pub(in crate::server) certificate_evidence_waits: serde_json::Value,
+    /// `certificate_rebind`: §4a `waiting_for_admin_rebind`, §4b(2) held
+    /// self-rebinds and the renewals this admin holds.
+    pub(in crate::server) certificate_rebind: serde_json::Value,
 }
 
 /// §1a: Active seats whose committed digest has no matching bytes here.
@@ -2184,11 +2216,14 @@ pub(in crate::server) async fn group_status_json(
             no_eligible_admin_json(&derived)
         });
     let (rows, store) = group_rows_json(state, info).await;
+    let certificate_rebind =
+        rebind::status_json(&state.revocation_evictions.inner.lock().await.rebind, info);
     GroupS4Status {
         rows,
         store,
         admin_availability,
         certificate_evidence_waits: certificate_evidence_waits(info),
+        certificate_rebind,
     }
 }
 

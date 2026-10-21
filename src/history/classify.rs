@@ -96,6 +96,7 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
         // user message that starts with the prefix stays history.
         || crate::groups::eviction::decode_handoff(payload).is_ok()
         || crate::groups::crypto_exclusion::decode_frame(payload).is_ok()
+        || crate::groups::cert_rebind::decode_frame(payload).is_ok()
     {
         return DmPayloadClass::Ephemeral;
     }
@@ -232,6 +233,10 @@ mod tests {
         );
         assert_eq!(
             classify_dm_payload(b"X0XCE1 hello"),
+            DmPayloadClass::Durable("text/plain")
+        );
+        assert_eq!(
+            classify_dm_payload(b"X0XCRB1 hello"),
             DmPayloadClass::Durable("text/plain")
         );
     }

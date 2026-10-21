@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 211,
+  "endpoint_count": 212,
   "endpoints": [
     {
       "category": "status",
@@ -2528,6 +2528,24 @@
             "in": "body",
             "name": "role",
             "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group rebind-certificate",
+      "description": "Self-rebind this agent's renewed certificate into its seat before the cutoff (ADR 0110 §4a)",
+      "method": "POST",
+      "path": "/groups/:id/members/:agent_id/certificate/rebind",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "certificate",
+            "required": false
           }
         ],
         "kind": "fields"

@@ -10,6 +10,7 @@ mod control_blob;
 mod direct_metadata_lanes;
 mod fair_admission;
 mod revocation_eviction;
+pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
@@ -11209,6 +11210,13 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 from_revision,
             )
             .await;
+            revocation_eviction::rebind::serve_catchup(
+                &serve_state,
+                &requester,
+                &group_ids,
+                from_revision,
+            )
+            .await;
         });
     }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
@@ -16726,6 +16734,7 @@ pub(in crate::server) async fn get_named_group(
             "revocation_eviction_store": s4_status.store,
             "admin_availability": s4_status.admin_availability,
             "certificate_evidence_waits": s4_status.certificate_evidence_waits,
+            "certificate_rebind": s4_status.certificate_rebind,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
@@ -44883,6 +44892,7 @@ pub(in crate::server) mod tests {
     mod adr0068_quarantine_pin;
     mod adr0068_task_buffer;
     mod adr0107_stuck_join_rearm;
+    mod adr0110_certificate_rebind;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod home_control_payload_size;
