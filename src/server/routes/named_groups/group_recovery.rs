@@ -299,6 +299,7 @@ async fn contained(state: &AppState, info: &GroupInfo) -> bool {
                     && info.state_revision < record.terminal_revision
             })
         || armed_admin_ata(state, info).await.is_some()
+        || exhausted_segment(state, info).await.is_some()
 }
 
 async fn agent_revoked(state: &AppState, agent: &AgentId) -> bool {
@@ -1193,6 +1194,7 @@ pub(super) async fn apply_join_carry(
     group_id: &str,
     chain: &[RetainedCommit],
     terminal: &GroupStateCommit,
+    terminal_event: &super::NamedGroupMetadataEvent,
     ata: &AdminTerminalAttestation,
 ) -> bool {
     let Some(group_key) = super::resolve_named_group_storage_key(state, group_id).await else {
@@ -1326,13 +1328,15 @@ pub(super) async fn apply_join_carry(
             }
         }
     }
-    // Keep the served chain and the ATA beside the record (§4).
+    // Keep the served chain, the ATA and the terminal event beside the
+    // record (§4). The event is what a later segment replays when this
+    // segment ends before the terminal (§2 "Segments").
     let served_json: Vec<Vec<u8>> = chain
         .iter()
         .filter_map(|link| serde_json::to_vec(link).ok())
         .collect();
     let ata_kept = ata.clone();
-    let terminal_json = serde_json::to_vec(terminal).ok();
+    let terminal_json = serde_json::to_vec(terminal_event).ok();
     if !update_sidecar(state, &stable, move |body| {
         body.served_chain = served_json;
         body.active_ata = Some(ata_kept);
@@ -1437,11 +1441,19 @@ async fn apply_kept_chain(
     let Ok(event) = serde_json::from_slice::<super::NamedGroupMetadataEvent>(&event_json) else {
         return false;
     };
-    let chain: Vec<RetainedCommit> = body
+    let kept: Vec<RetainedCommit> = body
         .served_chain
         .iter()
         .filter_map(|bytes| serde_json::from_slice(bytes).ok())
         .collect();
+    if kept.is_empty() {
+        return false;
+    }
+    // §2 "Segments": after an earlier segment the head is inside the kept
+    // chain; only the links after it are still to apply.
+    let Some(chain) = s3::kept_chain_remainder(kept, info.state_revision, &info.state_hash) else {
+        return false;
+    };
     let (Some(terminal), Some(actor)) = (
         super::named_group_metadata_event_commit(&event).cloned(),
         match &event {
@@ -1451,8 +1463,10 @@ async fn apply_kept_chain(
     ) else {
         return false;
     };
-    if chain.is_empty()
-        || !Box::pin(apply_join_carry(state, group_key, &chain, &terminal, ata)).await
+    if !Box::pin(apply_join_carry(
+        state, group_key, &chain, &terminal, &event, ata,
+    ))
+    .await
     {
         return false;
     }
@@ -1467,6 +1481,27 @@ async fn apply_kept_chain(
     .accepted;
     retire_converged(state, group_key).await;
     accepted
+}
+
+/// §2 "Segments": the admin-armed ATA's segment is exhausted (the head is
+/// its last hash) while the kept terminal is still ahead. The gate stays
+/// armed with an empty remaining sequence, which admits nothing, and the
+/// node asks for the next segment from its head. Returns the kept
+/// terminal's `(revision, state_hash)`.
+async fn exhausted_segment(state: &AppState, info: &GroupInfo) -> Option<(u64, String)> {
+    let body = sidecar_snapshot(state, info.stable_group_id()).await?;
+    let ata = body.active_ata?;
+    let at_end = info.state_revision == ata.fields.segment_terminal_revision
+        && ata.fields.sequence.last() == Some(&info.state_hash);
+    if !at_end {
+        return None;
+    }
+    let event =
+        serde_json::from_slice::<super::NamedGroupMetadataEvent>(body.queued_terminal.as_deref()?)
+            .ok()?;
+    let terminal = super::named_group_metadata_event_commit(&event)?;
+    (terminal.revision > info.state_revision)
+        .then(|| (terminal.revision, terminal.state_hash.clone()))
 }
 
 /// The armed admin ATA of `info` (§2 "Arming"): the sidecar's active ATA
@@ -1485,13 +1520,21 @@ pub(super) async fn armed_admin_ata(
 }
 
 /// The #846 gate under an admin-armed ATA (§2): `Some(sequence)` while
-/// armed. The caller requires each catch-up page to stay inside it.
+/// armed. The caller requires each catch-up page to stay inside it. An
+/// exhausted segment keeps the gate armed: the head is the sequence's last
+/// hash, so no page link fits and the gate admits nothing until the next
+/// segment arms (§2 "Segments").
 pub(super) async fn armed_admin_sequence(
     state: &AppState,
     info: &GroupInfo,
 ) -> Option<Vec<String>> {
-    armed_admin_ata(state, info)
-        .await
+    if let Some(ata) = armed_admin_ata(state, info).await {
+        return Some(ata.fields.sequence);
+    }
+    exhausted_segment(state, info).await?;
+    sidecar_snapshot(state, info.stable_group_id())
+        .await?
+        .active_ata
         .map(|ata| ata.fields.sequence)
 }
 
@@ -1505,6 +1548,15 @@ async fn live_refs(state: &AppState, info: &GroupInfo) -> Vec<RecoveryRef> {
             head_state_hash: info.state_hash.clone(),
             terminal_revision: ata.fields.segment_terminal_revision,
             terminal_state_hash: ata.fields.sequence.last().cloned().unwrap_or_default(),
+        });
+    } else if let Some((terminal_revision, terminal_state_hash)) =
+        exhausted_segment(state, info).await
+    {
+        refs.push(RecoveryRef::Gap {
+            reason: s3::ADMIN_ATTESTED_GAP_REASON.to_string(),
+            head_state_hash: info.state_hash.clone(),
+            terminal_revision,
+            terminal_state_hash,
         });
     }
     refs
@@ -1534,6 +1586,22 @@ pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
                 && entry.commit.state_hash == terminal_hash
         });
     if !converged {
+        return;
+    }
+    if exhausted_segment(state, &info).await.is_some() {
+        // A segment end before the terminal: keep the served chain and the
+        // terminal for the next segment, and ask for it (§2 "Segments").
+        let now = Instant::now();
+        let mut inner = state.group_recovery.inner.lock().await;
+        let subject = inner
+            .subjects
+            .entry(stable.clone())
+            .or_insert_with(|| SubjectState::new(now, info.state_revision));
+        if !subject.view.sticky() {
+            subject.view = SubjectView::Awaiting {
+                reason: "segment_exhausted".to_string(),
+            };
+        }
         return;
     }
     if !update_sidecar(state, &stable, |body| {
@@ -1829,6 +1897,7 @@ async fn next_target(
 ) -> Option<AgentId> {
     let stable = info.stable_group_id().to_string();
     let marker = info.fork_quarantine.is_some();
+    let exhausted = exhausted_segment(state, info).await.is_some();
     let targets = ordered_targets(state, info, local);
     let mut inner = state.group_recovery.inner.lock().await;
     let subject = inner
@@ -1850,7 +1919,14 @@ async fn next_target(
     } else {
         s3::GATE_STALL
     };
-    if gap_only {
+    if exhausted {
+        // §2 "Segments": the next segment is due now, not after a stall.
+        if !subject.view.sticky() {
+            subject.view = SubjectView::Awaiting {
+                reason: "segment_exhausted".to_string(),
+            };
+        }
+    } else if gap_only {
         if now.saturating_duration_since(subject.progress_at) < stall {
             return None;
         }
@@ -3591,7 +3667,8 @@ pub(in crate::server) async fn held_join_state(
     state: &AppState,
     info: &GroupInfo,
 ) -> Option<&'static str> {
-    let armed = armed_admin_ata(state, info).await.is_some();
+    let armed = armed_admin_ata(state, info).await.is_some()
+        || exhausted_segment(state, info).await.is_some();
     let inner = state.group_recovery.inner.lock().await;
     let kept_chain = inner
         .sidecars

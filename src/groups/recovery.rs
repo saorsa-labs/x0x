@@ -1645,6 +1645,31 @@ pub fn apply_link_state_only(
     Ok(next)
 }
 
+/// §2 "Segments": the links of a kept served chain still to apply when
+/// this node's head is `(head_revision, head_state_hash)`. After an earlier
+/// segment the head is inside the chain, so the links up to it are already
+/// applied. `None` when the head is inside the chain's range but is not
+/// its link at that revision (the chain does not continue from the head).
+#[must_use]
+pub fn kept_chain_remainder(
+    chain: Vec<crate::groups::state_commit::RetainedCommit>,
+    head_revision: u64,
+    head_state_hash: &str,
+) -> Option<Vec<crate::groups::state_commit::RetainedCommit>> {
+    let applied = chain
+        .iter()
+        .take_while(|link| link.commit.revision <= head_revision)
+        .count();
+    if let Some(last_applied) = applied.checked_sub(1).and_then(|index| chain.get(index)) {
+        if last_applied.commit.revision != head_revision
+            || last_applied.commit.state_hash != head_state_hash
+        {
+            return None;
+        }
+    }
+    Some(chain.into_iter().skip(applied).collect())
+}
+
 /// §2 provisional signer: the promotion path inside the served chain.
 /// Returns the number of leading links (a prefix of the ATA's own
 /// sequence) that end at the first link whose roster makes the signer an
@@ -1918,6 +1943,40 @@ mod tests {
             chain_position(&info, info.state_revision + 1, "ahead"),
             ChainPosition::AttesterBehind
         );
+    }
+
+    #[test]
+    fn kept_chain_remainder_resumes_from_the_head() {
+        let admin = keypair();
+        let mut info = signed_group(&admin);
+        let base = info.clone();
+        info.remove_member(&"m2".repeat(32), None);
+        info.seal_commit(&admin, 2_000).expect("seal removal");
+        info.name = "renamed".to_string();
+        info.seal_commit(&admin, 3_000).expect("seal rename");
+        let links: Vec<_> = info
+            .commit_log
+            .iter()
+            .filter(|entry| entry.commit.revision > base.state_revision)
+            .cloned()
+            .collect();
+        assert_eq!(links.len(), 2);
+        // At the base: the whole chain is still to apply.
+        let all = kept_chain_remainder(links.clone(), base.state_revision, &base.state_hash)
+            .expect("from the base");
+        assert_eq!(all.len(), 2);
+        // After the first segment: only the second link.
+        let first = links[0].commit.clone();
+        let rest = kept_chain_remainder(links.clone(), first.revision, &first.state_hash)
+            .expect("from the first link");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].commit.state_hash, links[1].commit.state_hash);
+        // At the chain's end: nothing left, the terminal follows.
+        let end = kept_chain_remainder(links.clone(), info.state_revision, &info.state_hash)
+            .expect("from the end");
+        assert!(end.is_empty());
+        // A head at a chain revision with another hash: not this chain.
+        assert!(kept_chain_remainder(links, first.revision, "sibling").is_none());
     }
 
     #[test]

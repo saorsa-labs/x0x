@@ -43323,7 +43323,7 @@ async fn handle_join_result_message_bound(
             ) {
                 (Some(ata), Some(terminal)) if verified && !chain.is_empty() => {
                     Box::pin(group_recovery::apply_join_carry(
-                        state, &group_id, &chain, terminal, ata,
+                        state, &group_id, &chain, terminal, &event, ata,
                     ))
                     .await
                 }
