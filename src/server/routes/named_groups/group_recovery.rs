@@ -557,6 +557,55 @@ async fn load_sidecars(state: &AppState) {
     }
 }
 
+/// §4 "Crash reconciliation at load": a crash between the sidecar write
+/// and the legacy write leaves an active ATA whose links never became
+/// durable (the loaded head is still its `from`), or one that no longer
+/// matches the loaded record. Drop each such ATA, durably. Containment is
+/// kept: the marker and the legacy record are untouched, and the node asks
+/// again from its loaded head.
+async fn reconcile_loaded_atas(state: &AppState) {
+    let candidates: Vec<(String, AdminTerminalAttestation)> = {
+        let inner = state.group_recovery.inner.lock().await;
+        inner
+            .sidecars
+            .iter()
+            .filter_map(|(stable, body)| body.active_ata.clone().map(|ata| (stable.clone(), ata)))
+            .collect()
+    };
+    for (stable, ata) in candidates {
+        let live = {
+            let groups = state.named_groups.read().await;
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == stable)
+                .cloned()
+        };
+        let head = live
+            .as_ref()
+            .map(|info| (info.state_revision, info.state_hash.clone()));
+        // §2 "Segments": after a restart the stored ATA's signature and its
+        // signer's eligibility are verified again against the loaded
+        // roster before it resumes at the cursor.
+        let keep = live.as_ref().is_some_and(|info| {
+            s3::keep_active_ata_at_load(&ata, info.state_revision, &info.state_hash)
+                && ata.verify_signature().is_ok()
+                && ata.signer_verified_on(info)
+        });
+        if keep {
+            continue;
+        }
+        let from = ata.fields.from_revision;
+        if update_sidecar(state, &stable, |body| body.active_ata = None).await {
+            tracing::warn!(
+                group_id = %LogHexId::group(&stable),
+                from,
+                head = ?head.as_ref().map(|(revision, _)| *revision),
+                "ADR 0109 S3: load reconciliation dropped an active ATA that does not match the loaded head or no longer verifies; containment kept"
+            );
+        }
+    }
+}
+
 async fn write_sidecar_rebuild(path: &FsPath, body: &GroupRecoveryV1) -> bool {
     match s3::encode_sidecar(body) {
         Ok(bytes) => super::revocation_eviction::write_bytes_durably(path, &bytes, None)
@@ -1647,6 +1696,7 @@ async fn set_view(state: &AppState, stable_group_id: &str, revision: u64, view: 
 /// until shutdown.
 pub(in crate::server) async fn run_group_recovery_worker(state: Arc<AppState>) {
     load_sidecars(&state).await;
+    reconcile_loaded_atas(&state).await;
     resume_journals(&state).await;
     let mut interval = tokio::time::interval(TICK);
     loop {

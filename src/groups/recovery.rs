@@ -1645,6 +1645,32 @@ pub fn apply_link_state_only(
     Ok(next)
 }
 
+/// §4 "Crash reconciliation at load" for the active ATA. The transition
+/// that armed it binds `before` (the head at its `from`) and `after` (a
+/// head on its sequence, once a link applied). An ATA whose `after`
+/// matches the loaded head is finalised (kept). One that matches `before`,
+/// or neither, is dropped: a fresh request re-derives it, and the gate
+/// that dropping it removes only ever admitted links, so containment is
+/// kept.
+#[must_use]
+pub fn keep_active_ata_at_load(
+    ata: &AdminTerminalAttestation,
+    head_revision: u64,
+    head_state_hash: &str,
+) -> bool {
+    ata.fields
+        .sequence
+        .iter()
+        .position(|hash| hash == head_state_hash)
+        .is_some_and(|index| {
+            u64::try_from(index)
+                .ok()
+                .and_then(|index| ata.fields.from_revision.checked_add(index))
+                .and_then(|revision| revision.checked_add(1))
+                == Some(head_revision)
+        })
+}
+
 /// Where a non-joiner stands on a provisional signer's promotion path
 /// (§2 "Verification and signer eligibility").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2067,6 +2093,21 @@ mod tests {
             provisional_path(&ata, &demoted),
             ProvisionalPath::Unverified
         );
+    }
+
+    #[test]
+    fn active_ata_at_load_keeps_only_an_applied_after() {
+        let admin = keypair();
+        let ata = AdminTerminalAttestation::sign(fields(&admin), &admin).expect("sign");
+        // `before`: the head is still the ATA's `from`.
+        assert!(!keep_active_ata_at_load(&ata, 4, "h4"));
+        // `after`: a head on the sequence at its revision.
+        assert!(keep_active_ata_at_load(&ata, 5, "h5"));
+        assert!(keep_active_ata_at_load(&ata, 6, "h6"));
+        // Neither: an off-sequence head, or a sequence hash at the wrong
+        // revision.
+        assert!(!keep_active_ata_at_load(&ata, 5, "sibling"));
+        assert!(!keep_active_ata_at_load(&ata, 7, "h6"));
     }
 
     #[test]
