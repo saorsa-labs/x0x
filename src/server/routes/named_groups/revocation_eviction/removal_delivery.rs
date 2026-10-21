@@ -427,22 +427,61 @@ pub(super) async fn drive(state: &Arc<AppState>) {
     }
 }
 
-/// The bound on one saved-removal exchange (resolution, the pre-phase and
-/// the write).
-const REMOVAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Write the saved removal event to `recipient` in ONE guarded exchange
-/// (§3 L231, ADR 0107 serving guard and D60, re-checked at the write
-/// seam): [`crypto_exclusion::guarded_removal_admission`] with
-/// [`HeadRule::Current`] on the pinned direct carrier.
+/// The guarded-egress admission of one saved-removal write to `recipient`
+/// (§3 L231): [`crypto_exclusion::guarded_removal_admission`] with
+/// [`HeadRule::Current`]. The pre-phase runs under the group's membership
+/// lock (ADR 0107 serving check, D60, head rule, no capability gate), and
+/// the synchronous seam check runs at once after it, immediately before the
+/// caller hands the bytes to the ACK'd send.
 ///
-/// The bytes are the legacy `MemberRemoved` JSON, unchanged, framed as a
-/// normal direct message, so a legacy survivor decodes it. The admission
-/// has no capability gate for the same reason. An event above
-/// `MAX_PAYLOAD_BYTES` is staged as a control blob and its reference, the
-/// same message the legacy path sends, goes through the same guarded
-/// write. Without the reference the recipient cannot name the blob, so a
-/// refused write gives it nothing.
+/// Residual (FOR ENGINEER): ant-quic exposes no receive-ACK send with a
+/// stream-seam admission, so the seam check runs before the ACK'd send's
+/// own resolution and stream open, not inside it, and that send's internal
+/// duplicate-safe retry writes again without a fresh check.
+async fn removal_write_admitted(
+    state: &Arc<AppState>,
+    stable_group_id: &str,
+    recipient: &x0x::identity::AgentId,
+    result_head: &str,
+) -> Result<(), String> {
+    let admission = crypto_exclusion::guarded_removal_admission(
+        state,
+        stable_group_id,
+        recipient,
+        HeadRule::Current(result_head.to_string()),
+    );
+    let Some(seam) = admission().await else {
+        return Err(x0x::dm::PINNED_ADMISSION_REFUSED.to_string());
+    };
+    if !seam() {
+        return Err(x0x::dm::PINNED_ADMISSION_REFUSED.to_string());
+    }
+    Ok(())
+}
+
+/// ADR 0110 §3 (#1357): whether one chunk of a staged S4 removal blob may
+/// be served to `recipient` now: the same guarded admission as the event
+/// write. The control-blob fetch handler calls it before each chunk send.
+pub(in crate::server) async fn removal_blob_serve_admitted(
+    state: &Arc<AppState>,
+    guard: &super::super::control_blob::ServeGuard,
+    recipient: &x0x::identity::AgentId,
+) -> Result<(), String> {
+    removal_write_admitted(state, &guard.stable_group_id, recipient, &guard.result_head).await
+}
+
+/// Send the saved removal event to `recipient`, guarded (§3 L231) and
+/// acknowledged.
+///
+/// [`removal_write_admitted`] runs first; a refusal is a withhold and
+/// sends nothing. The send is then the legacy removal send, unchanged:
+/// the same bytes and the same ACK'd direct delivery
+/// (`named_group_direct_delivery_config`, with the #1217 cold wait for an
+/// owner's removal notice), so `Ok` still means the survivor's daemon
+/// acknowledged receipt, and a legacy survivor decodes the event. An event
+/// above `MAX_PAYLOAD_BYTES` goes by control-blob reference as before; the
+/// blob is staged with a [`ServeGuard`](super::super::control_blob::ServeGuard),
+/// so each chunk serve passes the same admission.
 async fn send_removal(
     state: &Arc<AppState>,
     stable_group_id: &str,
@@ -452,8 +491,13 @@ async fn send_removal(
 ) -> Result<(), String> {
     use super::super::control_blob;
     let payload = serde_json::to_vec(event).map_err(|e| e.to_string())?;
-    let payload = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-        let reference = control_blob::stage_reference(
+    removal_write_admitted(state, stable_group_id, recipient, result_head).await?;
+    // The #1217 opt-in, exactly as the legacy send decides it.
+    let cold_removal = matches!(event,
+        NamedGroupMetadataEvent::MemberRemoved { actor, agent_id, .. }
+            if actor == &hex::encode(state.agent.agent_id().as_bytes()) && actor != agent_id);
+    if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return control_blob::send_reference_guarded(
             &state.control_blobs,
             &state.agent,
             recipient,
@@ -461,32 +505,32 @@ async fn send_removal(
             super::super::named_group_metadata_event_group_id(event),
             None,
             payload,
-            None,
+            cold_removal,
+            Some(control_blob::ServeGuard {
+                stable_group_id: stable_group_id.to_string(),
+                result_head: result_head.to_string(),
+            }),
         )
-        .map_err(str::to_string)?;
-        control_blob::encode_message(&control_blob::ControlBlobMessage::Reference { reference })?
-    } else {
-        payload
-    };
-    let admission = crypto_exclusion::guarded_removal_admission(
-        state,
-        stable_group_id,
-        recipient,
-        HeadRule::Current(result_head.to_string()),
-    );
-    let resolve_within = std::cmp::min(
-        x0x::dm::PINNED_RESOLUTION_WAIT,
-        REMOVAL_EXCHANGE_TIMEOUT / 2,
-    );
-    let exchange =
+        .await;
+    }
+    let config = super::super::named_group_direct_delivery_config();
+    let sent = if cold_removal {
         state
             .agent
-            .send_direct_pinned_admitted(recipient, &payload, &admission, resolve_within);
-    match tokio::time::timeout(REMOVAL_EXCHANGE_TIMEOUT, exchange).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err("saved removal exchange deadline elapsed".to_string()),
-    }
+            .send_direct_with_config_cold_wait(
+                recipient,
+                payload,
+                config,
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+            )
+            .await
+    } else {
+        state
+            .agent
+            .send_direct_with_config(recipient, payload, config)
+            .await
+    };
+    sent.map(|_| ()).map_err(|e| e.to_string())
 }
 
 fn spawn_send(
@@ -889,8 +933,15 @@ mod daemon_tests {
                 info.ban_member(member, None);
             }),
             ("head moved", |info, _| {
+                // A TreeKEM epoch move as production commits it: the epoch
+                // and its security binding move together, and the binding
+                // is what the state hash commits to (#1357 CI: the epoch
+                // alone left the head unchanged).
+                let before = info.state_hash.clone();
                 info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
                 info.recompute_state_hash();
+                assert_ne!(info.state_hash, before, "the head must move");
             }),
             ("quarantined", |info, _| {
                 info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
@@ -949,6 +1000,55 @@ mod daemon_tests {
         assert!(
             admit(&state, &stable, &survivor, &rule).await.is_none(),
             "machine revoked: a fresh pre-phase must refuse"
+        );
+        Ok(())
+    }
+
+    /// #1357 review: the ACK'd saved-removal send and the serve of a chunk
+    /// of its blob both pass the guarded admission first. For a banned
+    /// survivor both are refused before anything is sent.
+    #[tokio::test]
+    async fn saved_removal_send_and_blob_serve_refuse_an_ineligible_recipient() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let survivor = AgentId([0x71; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let target = [0x72; 32];
+        let group_id = "d6".repeat(16);
+        let info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let guard = super::super::super::control_blob::ServeGuard {
+            stable_group_id: stable.clone(),
+            result_head: info.state_hash.clone(),
+        };
+        assert_eq!(
+            removal_blob_serve_admitted(&state, &guard, &survivor).await,
+            Ok(()),
+            "an eligible survivor's chunk is served"
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .context("group")?
+            .ban_member(&survivor_hex, None);
+        assert_eq!(
+            removal_blob_serve_admitted(&state, &guard, &survivor).await,
+            Err(x0x::dm::PINNED_ADMISSION_REFUSED.to_string()),
+            "a banned survivor's chunk is withheld"
+        );
+        let sent = send_removal(
+            &state,
+            &stable,
+            &survivor,
+            &info.state_hash,
+            &removal_event(&group_id, &target),
+        )
+        .await;
+        assert_eq!(
+            sent,
+            Err(x0x::dm::PINNED_ADMISSION_REFUSED.to_string()),
+            "the send is refused at admission, before any write"
         );
         Ok(())
     }

@@ -52,7 +52,7 @@ pub(super) mod rebind;
 mod removal_delivery;
 pub(super) mod removal_journal;
 
-pub(super) use removal_delivery::record_committed_removal;
+pub(super) use removal_delivery::{record_committed_removal, removal_blob_serve_admitted};
 
 /// The worker's idle re-check interval. Budgets and expiry checks run at
 /// least this often; intake wakes the worker at once.

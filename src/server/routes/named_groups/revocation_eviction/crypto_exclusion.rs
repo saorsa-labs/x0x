@@ -1780,6 +1780,32 @@ mod tests {
         assert!(!head_rule_admits(&info, &live));
     }
 
+    /// #1357 CI (493c2a6): the live head rule follows the state hash, and
+    /// the state hash commits to the TreeKEM epoch through the security
+    /// binding, not through `secret_epoch`. An epoch bump alone is not a
+    /// head move (the daemon test's old mutation); a production epoch move
+    /// (epoch and binding together) is, and the rule then refuses.
+    #[test]
+    fn an_epoch_move_moves_the_head_through_its_binding() {
+        let admin = AgentId([1; 32]);
+        let mut info = GroupInfo::new("e".into(), String::new(), admin, "ab".repeat(16));
+        info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
+        info.recompute_state_hash();
+        let live = HeadRule::Current(info.state_hash.clone());
+        assert!(head_rule_admits(&info, &live));
+        let mut epoch_only = info.clone();
+        epoch_only.secret_epoch = epoch_only.secret_epoch.saturating_add(1);
+        epoch_only.recompute_state_hash();
+        assert_eq!(epoch_only.state_hash, info.state_hash);
+        assert!(head_rule_admits(&epoch_only, &live));
+        let mut moved = info.clone();
+        moved.secret_epoch = moved.secret_epoch.saturating_add(1);
+        moved.security_binding = Some(format!("treekem:epoch={}", moved.secret_epoch));
+        moved.recompute_state_hash();
+        assert_ne!(moved.state_hash, info.state_hash);
+        assert!(!head_rule_admits(&moved, &live));
+    }
+
     // ─── #1357 review P1: replay evidence across restart ─────────────────
 
     fn signed_frame(
@@ -2006,8 +2032,15 @@ mod daemon_tests {
                 info.ban_member(member, None);
             }),
             ("head moved", |info, _| {
+                // A TreeKEM epoch move as production commits it: the epoch
+                // and its security binding move together, and the binding
+                // is what the state hash commits to (#1357 CI: the epoch
+                // alone left the head unchanged).
+                let before = info.state_hash.clone();
                 info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
                 info.recompute_state_hash();
+                assert_ne!(info.state_hash, before, "the head must move");
             }),
             ("quarantined", |info, _| {
                 info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
