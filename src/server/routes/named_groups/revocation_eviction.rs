@@ -3917,6 +3917,35 @@ mod tests {
         (cert, *agent.agent_id().as_bytes())
     }
 
+    /// #1508 review P1 #2 (CI DIAG #1547, #1548): every S4 route run for a
+    /// `prepared` row is the worker's own removal, so the gate and the
+    /// under-lock check cancel it once a rebind ends the row. The mark
+    /// comes from the row, not from a flag that each caller must set.
+    #[test]
+    fn the_seal_scope_of_a_prepared_row_marks_the_workers_removal() {
+        let key = EvictionKey::new("g", [2; 32]);
+        let mut store = ObligationStore::new();
+        let expiry = EvictionTrigger::CertificateExpiry {
+            certificate_digest: "d".into(),
+            not_after: 1,
+        };
+        store.intake(&key, expiry, None, 0, [0; 16]);
+        assert!(
+            !eviction_seal_scope(&store, &key).prepared_removal,
+            "pending"
+        );
+        store.get_mut(&key).expect("row").phase = Phase::Prepared;
+        assert!(
+            eviction_seal_scope(&store, &key).prepared_removal,
+            "prepared"
+        );
+        store.terminate(&key, TerminationCause::CertificateValid);
+        assert!(
+            !eviction_seal_scope(&store, &key).prepared_removal,
+            "a queued ban of an ended row is not the worker's removal"
+        );
+    }
+
     #[test]
     fn a_rebind_cancels_only_expiry_work_under_the_lock() {
         let now = 1_000_000;
