@@ -20,6 +20,7 @@ pub mod history;
 pub mod identity;
 pub mod machines;
 pub mod messaging;
+pub mod names;
 pub mod network;
 pub mod onboard;
 pub mod presence;

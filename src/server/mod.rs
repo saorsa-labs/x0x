@@ -1312,6 +1312,9 @@ pub async fn serve_with_options(
         forward_service,
         socks_service,
         owner_sync,
+        names: Arc::new(
+            x0x::names::NameStore::load(x0x::names::NameStore::path_in(&config.data_dir)).await,
+        ),
         startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
         startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
         startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
@@ -2904,6 +2907,13 @@ pub async fn serve_with_options(
         )
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
+        // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
+        .route("/names", get(routes::names_list))
+        .route("/names/resolve", post(routes::names_resolve))
+        .route("/names/owners", post(routes::names_owner_bind))
+        .route("/names/owners/:label", delete(routes::names_owner_unbind))
+        .route("/names/machines", post(routes::names_machine_label))
+        .route("/names/pins/:name", delete(routes::names_unpin))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
