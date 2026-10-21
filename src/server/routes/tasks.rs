@@ -2527,4 +2527,166 @@ mod tests {
             );
         }
     }
+
+    /// #1508 Codex P1 #1 (and #1533): ADR 0110 §4 (D75) and §4b(3)
+    /// (D126) at the task-list seal. While verified revocations cover every
+    /// Admin-or-higher Active seat, a member must not seal a task delta
+    /// under the epoch the revoked admin can still decrypt. Red on f634bed:
+    /// both planes sealed after the revocation.
+    mod no_eligible_admin_1508 {
+        use super::publication_epoch_975::test_state;
+        use super::*;
+        use x0x::crdt::sealed::SealedTaskRecordBody;
+        use x0x::identity::AgentKeypair;
+
+        async fn revoke_agent(state: &AppState, subject: &AgentKeypair) {
+            let record = x0x::revocation::RevocationRecord::sign(
+                x0x::revocation::RevokedSubject::Agent(subject.agent_id()),
+                subject.public_key(),
+                subject.secret_key(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_secs(),
+                Some("test".to_string()),
+            )
+            .expect("sign revocation");
+            let revocation_set = state.agent.revocation_set();
+            assert!(revocation_set
+                .write()
+                .await
+                .verify_and_insert(record, None)
+                .expect("self-revocation verifies"));
+        }
+
+        /// A group whose sole admin is `admin` (the creator, a foreign
+        /// key) and where this node holds an ordinary Member seat.
+        fn group_with_foreign_admin(
+            state: &AppState,
+            group_key: &str,
+            admin: &AgentKeypair,
+        ) -> x0x::groups::GroupInfo {
+            let mut info = x0x::groups::GroupInfo::new(
+                "board".to_string(),
+                String::new(),
+                admin.agent_id(),
+                group_key.to_string(),
+            );
+            info.migrate_from_v1();
+            info.add_member(
+                hex::encode(state.agent.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(admin.agent_id().as_bytes())),
+                None,
+            );
+            info
+        }
+
+        async fn seal_once(
+            state: &Arc<AppState>,
+            topic: &str,
+        ) -> x0x::crdt::Result<Option<SealedTaskRecordBody>> {
+            let protector = group_task_list_binding(state, topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                protector.seal(x0x::kv::KvMutationKind::Delta, b"delta"),
+            )
+            .await
+            .expect("the boundary check must not stall the seal")
+        }
+
+        fn assert_withheld(result: x0x::crdt::Result<Option<SealedTaskRecordBody>>) {
+            match result {
+                Err(x0x::crdt::CrdtError::Gossip(reason)) => assert!(
+                    reason.contains("no_eligible_admin"),
+                    "typed refusal, got {reason}"
+                ),
+                Err(other) => panic!("wrong refusal: {other}"),
+                Ok(_) => panic!("a task delta was sealed while no eligible admin remains"),
+            }
+        }
+
+        #[tokio::test]
+        async fn gss_task_seal_is_withheld_while_every_admin_seat_is_revoked() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b1".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+
+            // No false refusal while the admin seat is unrevoked.
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+            revoke_agent(&state, &admin).await;
+            assert_withheld(seal_once(&state, &topic).await);
+        }
+
+        #[tokio::test]
+        async fn treekem_task_seal_is_withheld_while_every_admin_seat_is_revoked() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let writer = state.agent.agent_id();
+            let group_key = "b2".repeat(16);
+            let group_id = hex::decode(&group_key).expect("group id");
+            let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+                state.agent.as_ref(),
+                &group_id,
+            );
+            let mut admin_group =
+                x0x::mls::TreeKemMlsGroup::create(group_id.clone(), admin.agent_id(), &[0xb2; 32])
+                    .expect("admin group");
+            let writer_prepared =
+                x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+            let writer_add = admin_group
+                .add_member(writer, writer_prepared.key_package_bytes())
+                .expect("add writer");
+            let writer_group =
+                x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                    .expect("writer join");
+            let epoch = writer_group.epoch();
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+            info.shared_secret = None;
+            info.secret_epoch = epoch;
+            info.security_binding = Some(format!("treekem:epoch={epoch}"));
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let live = Arc::new(tokio::sync::Mutex::new(writer_group));
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_key.clone(), Arc::clone(&live));
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+
+            // No false refusal while the admin seat is unrevoked.
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::TreeKem(_)))
+            ));
+            revoke_agent(&state, &admin).await;
+            let before = live.lock().await.to_snapshot_bytes().expect("snapshot");
+            assert_withheld(seal_once(&state, &topic).await);
+            assert_eq!(
+                before,
+                live.lock().await.to_snapshot_bytes().expect("snapshot"),
+                "a refused seal must not advance the send ratchet"
+            );
+        }
+    }
 }
