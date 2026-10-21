@@ -5557,8 +5557,9 @@ async fn collect_coordinator_hints(
 /// Two eligibility tiers:
 ///
 /// - **Operator tier (new, #1112):** the peer is connected over a DIRECT
-///   path whose OBSERVED remote IP (v4-mapped forms normalized) is a
-///   compiled-in seed IP. The operator fleet runs coordinator and relay
+///   path whose OBSERVED remote address (v4-mapped forms normalized) IS
+///   a compiled-in seed listener address — the full socket address —
+///   and the identity is inside that address's pin set when pinned. The operator fleet runs coordinator and relay
 ///   roles by deployment, and a completed QUIC handshake with that source
 ///   is deployment-derived evidence no announcement can forge. No
 ///   capability flag is consulted for these peers, and a pin-mismatched
@@ -5605,11 +5606,22 @@ fn select_capability_hints(
         // announcing anything. v4-mapped forms are normalized here as
         // well as in `connected_peer_origins`, so the pure function's
         // contract does not depend on the caller (review round 3).
-        let on_operator_host = origin
+        let observed_seed_addr = origin
             .direct
             .then(|| origin.remote_addr.map(network::normalize_v4_mapped_addr))
             .flatten()
-            .is_some_and(|observed| seed_addrs.contains(&observed));
+            .filter(|observed| seed_addrs.contains(observed));
+        // Round 5: the operator tier validates the PAIR — the observed
+        // address is a seed listener AND the identity is inside that
+        // address's pin set. Inbound connections and
+        // `connect_peer_with_addrs` bypass the dial seam, so the selector
+        // cannot assume the seam already rejected a mismatched identity.
+        let on_operator_host = observed_seed_addr.is_some_and(|observed| {
+            !matches!(
+                network::seed_pin_gate(observed, origin.peer_id.0),
+                network::SeedPinVerdict::Mismatch { .. }
+            )
+        });
         let Some(entry) = cache.get(&mid) else {
             // No announcement seen: only the operator tier can qualify,
             // under the same deduplication and cap as the tiers below
@@ -5827,8 +5839,6 @@ struct HeartbeatContext {
     last_revocation_generation: std::sync::atomic::AtomicU64,
     /// Heartbeat tick counter for the periodic revocation fallback.
     heartbeat_tick: std::sync::atomic::AtomicU64,
-    /// #1112: identities a seed-pin mismatch rejected (excluded from the
-    /// heartbeat's coordinator/relay hints).
     /// L3 retirement flip: publish the legacy V2 announce set only when true.
     legacy_announce: bool,
     /// ADR-0035 metering: relay/coordinator selection-skew counters.

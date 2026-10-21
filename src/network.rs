@@ -612,6 +612,25 @@ pub fn pinned_seed_peer_ids(addr: SocketAddr) -> &'static [&'static [u8; 32]] {
     pinned_peer_ids_in(SEED_PEER_ID_PINS, addr)
 }
 
+/// The per-address seed-pin gate the dial seam and the hint selector
+/// share (#1112 round 5): the verdict for "identity `answered` dialled or
+/// observed at `addr`". Composes the pin lookup with [`seed_pin_check`];
+/// unpinned addresses and non-seed addresses stay TOFU.
+pub(crate) fn seed_pin_gate(addr: SocketAddr, answered: [u8; 32]) -> SeedPinVerdict {
+    seed_pin_check(pinned_seed_peer_ids(addr), answered)
+}
+
+/// The same gate over an injected table, for tests that must not read
+/// the compiled-in table.
+#[cfg(test)]
+pub(crate) fn seed_pin_gate_in(
+    pins: &[SeedPeerPin],
+    addr: SocketAddr,
+    answered: [u8; 32],
+) -> SeedPinVerdict {
+    seed_pin_check(pinned_peer_ids_in(pins, addr), answered)
+}
+
 /// `dial_bootstrap`'s pinned-set rule: an empty set pins nothing (TOFU,
 /// the x0xd default); a non-empty set admits only member identities.
 /// Issue #1112 reuses these semantics for the per-address join pins.
@@ -4103,7 +4122,7 @@ impl NetworkNode {
                 // connects, join dials, HyParView bootstrap dials) routes
                 // through here.
                 if let SeedPinVerdict::Mismatch { answered } =
-                    seed_pin_check(pinned_seed_peer_ids(addr), peer_conn.peer_id.0)
+                    seed_pin_gate(addr, peer_conn.peer_id.0)
                 {
                     self.record_seed_pin_rejection(peer_conn.peer_id.0);
                     tracing::warn!(
@@ -4111,14 +4130,16 @@ impl NetworkNode {
                         origin,
                         %addr,
                         answered = %hex_prefix(&answered, 8),
-                        "seed pin mismatch: closing and refusing the dial (issue #1112)"
+                        "seed pin mismatch: refusing the dial (issue #1112)"
                     );
-                    let _ = self
-                        .disconnect_with_reason(
-                            &peer_conn.peer_id,
-                            DisconnectReason::PolicyRejection,
-                        )
-                        .await;
+                    // No connection teardown here (review round 5): the
+                    // close APIs are identity-scoped, and the same
+                    // identity may hold a valid connection through
+                    // another address. The refusal scopes to THIS hint —
+                    // the dial fails, the identity is recorded, and
+                    // `peer_admission` answers `Suppressed` for it, so
+                    // gossip and keepalives exclude it while any leftover
+                    // transport connection dies by idle eviction.
                     return Err(NetworkError::ConnectionFailed(format!(
                         "#1112: seed pin mismatch at {addr}; dial refused ({origin})"
                     )));
@@ -10264,6 +10285,52 @@ mod tests {
             pinned_peer_ids_in(&mapped_table, "198.51.100.7:5483".parse().unwrap()),
             &PIN[..]
         );
+    }
+
+    #[test]
+    fn issue1112_gate_scopes_the_verdict_to_the_address_and_identity() {
+        // Review round 5: the shared gate composes the pin lookup with
+        // the verdict, so the selector (which sees inbound connections
+        // the dial seam never gated) can validate the observed
+        // (address, identity) pair itself.
+        const PIN: [&[u8; 32]; 1] = [&[0x71; 32]];
+        const OTHER: [u8; 32] = [0x72; 32];
+        let table = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &PIN,
+        }];
+        let pinned_addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
+        let other_addr: SocketAddr = "198.51.100.99:5483".parse().unwrap();
+        // Pinned address, member identity: admitted.
+        assert!(matches!(
+            seed_pin_gate_in(&table, pinned_addr, *PIN[0]),
+            SeedPinVerdict::Match(_)
+        ));
+        // Pinned address, non-member identity: mismatch — the pair check
+        // the selector runs on inbound connections.
+        assert!(matches!(
+            seed_pin_gate_in(&table, pinned_addr, OTHER),
+            SeedPinVerdict::Mismatch { .. }
+        ));
+        // Unpinned address: TOFU regardless of identity.
+        assert_eq!(
+            seed_pin_gate_in(&table, other_addr, OTHER),
+            SeedPinVerdict::Unpinned
+        );
+        // v4-mapped form of the pinned address resolves to the same row.
+        assert!(matches!(
+            seed_pin_gate_in(
+                &table,
+                "[::ffff:198.51.100.7]:5483".parse().unwrap(),
+                *PIN[0]
+            ),
+            SeedPinVerdict::Match(_)
+        ));
+        // The compiled-in table is empty: every production dial is TOFU
+        // today (the seam and the selector turn on together with the
+        // first pin).
+        let any_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
+        assert_eq!(seed_pin_gate(any_seed, OTHER), SeedPinVerdict::Unpinned);
     }
 
     #[test]

@@ -95,43 +95,42 @@ Successful connections enrich the bootstrap cache via `add_from_connection()`.
 
 `SEED_PEER_ID_PINS` (`src/network.rs`) carries one `SeedPeerPin` row per
 pinned seed address, separate from the `DEFAULT_BOOTSTRAP_PEERS` address
-list (whose public type is unchanged). The join dial
-(`Agent::connect_peers_parallel_tracked`) checks each answered dial against
-the pin set for that address:
+list (whose public type is unchanged). The per-address pin is enforced at
+the SHARED address-dial boundary — `NetworkNode::connect_addr_with_origin`,
+next to the #292 answered-id gate and BEFORE the bootstrap-cache write,
+the success record, and the `PeerConnected` event — so every address dial
+(manual connects, join dials in every phase, HyParView bootstrap dials)
+refuses a mismatched answer instead of admitting it:
 
 - **No pin row**: trust-on-first-use, exactly as before #1112. No
   production address is pinned today.
-- **Answer inside the pin set**: the hint is accepted.
-- **Answer outside the pin set**: the hint has failed — dropped, never a
-  trust anchor and never a hard join failure. Nothing is torn down: one
-  dial batch cannot attribute a connection to a single dial, so a
-  mismatch only drops the hint and records the rejected identity, which
-  every later join tier and hint selection then excludes. An idle
-  wrong-identity connection is bounded by the connection pool's idle
-  eviction.
+- **Answer inside the pin set**: the dial proceeds.
+- **Answer outside the pin set**: the dial returns an error — the hint is
+  dropped, never a trust anchor and never a hard join failure. The
+  rejected identity is recorded on the node, and `peer_admission` answers
+  `Suppressed` for it from then on, so gossip eligibility and keepalives
+  exclude it too. No connection is torn down: the close APIs are
+  identity-scoped, and the same identity may hold a valid connection
+  through another address (a concurrent dial that matched its pin); a
+  leftover transport connection dies by the pool's idle eviction. The
+  capability-hint selector additionally validates the observed
+  (seed address, identity) pair itself, because inbound connections and
+  id-based dials never pass the address-dial seam.
 
 The pin set is per address, never per host: the UDP/443 and UDP/5483
 listeners on one seed host are separate `x0xd` instances with separate
 machine keys (`.deployment/deploy-443.sh`), so each address needs its own
-pin.
-
-**Enforcement scope (honest limits).** The pin gates the x0x join dial
-path: the answered PeerId is validated immediately on the dial's return,
-before any x0x-side bookkeeping, and a mismatched hint never joins. Two
-paths are NOT pin-gated: the `bootstrap_nodes` handed to ant-quic's own
-connection orchestration, and dials served from ant-quic's bootstrap cache.
-ant-quic performs its transport-level admission (pool insert, PeerConnected)
-inside `connect_addr`, before x0x sees the answered identity; a dial that
-refuses a mismatched identity at the handshake needs an ant-quic
-expected-peer API, which x0x cannot add from here.
+pin. Pin lookups normalize v4-mapped forms on both sides.
 
 Why no production address is pinned yet: the repo holds PeerId captures
 for the six `:5483` seed listeners only (git history,
 `proofs/v0.19.0-validation-*` sustained-watch diagnostics of 2026-04-23,
 cross-confirmed by the May 2026 soak captures), and they are six months
-old. A pin that no longer matches a live seed key would silently drop that
-seed for every client. Pinning is a deliberate operator change, made when
-the live fleet keys are verified.
+old. A pin that no longer matches a live seed key would refuse that seed
+for every client. Pinning is a deliberate operator change, made when the
+live fleet keys are verified. The rejection set grows only with dial
+rate against pinned addresses; a cap or TTL is future work if it ever
+matters.
 
 ### Capability hints: an observed operator tier, plus the ADR-0071 tiers (#1112)
 
@@ -144,11 +143,15 @@ community eligibility unchanged — the announcement's `is_relay`/
 one verified tier:
 
 - **Operator tier (new, #1112):** a peer connected over a DIRECT path
-  whose OBSERVED remote address (v4-mapped forms normalized) is a
-  compiled-in seed IP is a coordinator and relay hint with no capability
-  flag consulted at all. A completed QUIC handshake with that source is
-  deployment-derived evidence no announcement can forge: listing a seed
-  IP in an announcement buys nothing.
+  whose OBSERVED remote address (v4-mapped forms normalized) IS a
+  compiled-in seed listener address — the full socket address, never the
+  IP alone, so a NATed peer with a relay slot on a seed (which advertises
+  the seed IP on an allocated port) does not qualify — and, when that
+  address is pinned, whose identity is inside its pin set, is a
+  coordinator and relay hint with no capability flag consulted at all. A
+  completed QUIC handshake with that source is deployment-derived
+  evidence no announcement can forge: listing a seed address in an
+  announcement buys nothing.
 
 Identities rejected by a seed-pin mismatch are excluded from every tier.
 A relayed connection's observed address names the relay, not the peer, so
