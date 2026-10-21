@@ -1218,6 +1218,7 @@ pub async fn serve_with_options(
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::default(),
+        group_recovery: routes::named_groups::S3Runtime::default(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -2233,6 +2234,11 @@ pub async fn serve_with_options(
         routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
     ));
 
+    // ADR 0109 S3: ownerless attestation and manual re-seat.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_group_recovery_worker(Arc::clone(&state)),
+    ));
+
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
     // handles the same signed message when the sender additionally direct-
@@ -2642,6 +2648,14 @@ pub async fn serve_with_options(
         .route(
             "/groups/:id/members/:agent_id/role",
             patch(update_member_role),
+        )
+        .route(
+            "/groups/:id/members/:agent_id/reseat",
+            post(routes::named_groups::reseat_group_member),
+        )
+        .route(
+            "/groups/:id/recovery",
+            get(routes::named_groups::get_group_recovery),
         )
         .route("/groups/:id/ban/:agent_id", post(ban_group_member))
         .route("/groups/:id/ban/:agent_id", delete(unban_group_member))

@@ -112,6 +112,7 @@ async fn deliver_result(
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         },
     )
     .await;
