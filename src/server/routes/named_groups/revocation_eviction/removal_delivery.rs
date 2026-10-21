@@ -897,14 +897,21 @@ mod daemon_tests {
         let info = insert_group(&state, &group_id, &survivor).await;
         let stable = info.stable_group_id().to_string();
         let rule = HeadRule::Current(info.state_hash.clone());
-        // A legacy advert: a verified machine binding and no application
-        // bits.
+        // A legacy advert: a verified machine binding and a known registry
+        // with none of the S4 bits. `v1_gossip_ready` advertises this
+        // build's `CapabilityRegistry::current()`, which sets them, so the
+        // registry is replaced (#1357 CI 972ede0).
         let machine = x0x::identity::MachineKeypair::generate()?;
+        let mut legacy = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        legacy.application_registry = x0x::dm::CapabilityRegistry {
+            version: x0x::dm::CapabilityRegistry::current().version,
+            bits: 0,
+        };
         assert!(
             state.agent.capability_store().insert(
                 survivor,
                 machine.machine_id(),
-                x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]),
+                legacy,
                 x0x::dm_capability::now_unix_ms(),
             ),
             "verified legacy advert"
