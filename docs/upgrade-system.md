@@ -39,6 +39,12 @@ that already says the delay is complete. Unknown or damaged records remain
 in place and refuse this apply; they do not block normal daemon startup.
 Shutdown or loss of the task cancels work before mutation admission.
 
+After a guide download, startup resolves the install again and rechecks the
+current staging and probe state under that install's lock. It holds the lock
+through the guide write and rename. A hold recorded before this admission
+keeps the prior guide. This does not defer an admitted guide update to host
+commit; transaction-bound guide promotion remains separate work.
+
 This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
 the fleet minimum, complete host inventory and transaction-bound guide
 installation remain separate M2 work. It does not claim that every apply

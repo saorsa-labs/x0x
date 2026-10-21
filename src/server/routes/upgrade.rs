@@ -527,8 +527,14 @@ pub(in crate::server) async fn run_startup_update_check(
             x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
         }
         // Staging must precede all release content writes, including the guide.
-        update_skill_while_running(&verified.manifest, &config.data_dir, shutdown_watch.clone())
-            .await;
+        update_skill_while_running(
+            &verified.manifest,
+            &config.data_dir,
+            shutdown_watch.clone(),
+            #[cfg(unix)]
+            Some(&upgrader),
+        )
+        .await;
         match shutdown_watch.as_mut() {
             // Daemon startup check: #1196 — a refusal that is ONLY the not-yet-
             // aged-out systemd start-rate window is waited out (bounded by the
@@ -958,16 +964,30 @@ pub(in crate::server) async fn run_fallback_github_poll(
 
 /// Update SKILL.md if the manifest has a different hash.
 async fn update_skill_if_changed(manifest: &ReleaseManifest, data_dir: &std::path::Path) {
-    update_skill_while_running(manifest, data_dir, None).await;
+    update_skill_while_running(
+        manifest,
+        data_dir,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+    .await;
 }
 
 async fn update_skill_while_running(
     manifest: &ReleaseManifest,
     data_dir: &std::path::Path,
     mut shutdown: Option<watch::Receiver<bool>>,
+    #[cfg(unix)] upgrader: Option<&crate::upgrade::apply::AutoApplyUpgrader>,
 ) {
     let writer_shutdown = shutdown.clone();
-    let update = update_skill_inner(manifest, data_dir, writer_shutdown);
+    let update = update_skill_inner(
+        manifest,
+        data_dir,
+        writer_shutdown,
+        #[cfg(unix)]
+        upgrader,
+    );
     match shutdown.as_mut() {
         Some(shutdown) => {
             if *shutdown.borrow() || shutdown.has_changed().is_err() {
@@ -1089,6 +1109,7 @@ async fn update_skill_inner(
     manifest: &ReleaseManifest,
     data_dir: &std::path::Path,
     shutdown: Option<watch::Receiver<bool>>,
+    #[cfg(unix)] upgrader: Option<&crate::upgrade::apply::AutoApplyUpgrader>,
 ) {
     let skill_path = data_dir.join("SKILL.md");
 
@@ -1117,6 +1138,32 @@ async fn update_skill_inner(
                 tracing::warn!("SKILL.md hash mismatch after download");
                 return;
             }
+            // Resolve the independent executable observation after the await.
+            // The earlier Due decision cannot authorize this later write.
+            #[cfg(unix)]
+            let staged_guide = match upgrader {
+                Some(upgrader) => match upgrader.guide_staging() {
+                    Ok(staging) => staging,
+                    Err(error) => {
+                        tracing::warn!(%error, "Guide staging identity changed");
+                        return;
+                    }
+                },
+                None => None,
+            };
+            #[cfg(unix)]
+            let data_dir = if let Some((_, gate)) = &staged_guide {
+                match data_dir.canonicalize() {
+                    Ok(root) if root == gate.request.data_root => gate.request.data_root.as_path(),
+                    _ => {
+                        tracing::warn!("Guide staging data root changed");
+                        return;
+                    }
+                }
+            } else {
+                data_dir
+            };
+            let skill_path = data_dir.join("SKILL.md");
             // The startup check and the startup manifest broadcast can
             // both reach this write concurrently (#1086): stage the
             // verified bytes in a unique temp file and rename it into
@@ -1131,6 +1178,20 @@ async fn update_skill_inner(
             let install = x0x::upgrade::apply::run_owned_blocking(move |caller_alive| {
                 #[cfg(test)]
                 let observation = skill_install_seam::entered(&skill_path);
+                if !caller_alive.load(Ordering::Acquire)
+                    || shutdown
+                        .as_ref()
+                        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+                {
+                    return Err(x0x::upgrade::UpgradeError::Other(
+                        "guide update cancelled before install lock".into(),
+                    ));
+                }
+                #[cfg(unix)]
+                let _install_lock = staged_guide
+                    .as_ref()
+                    .map(|(install, _)| crate::upgrade::acquire_host_upgrade_lock(install))
+                    .transpose()?;
                 // Watch value custody orders a shutdown signal against
                 // this short atomic install. A cancelled queued worker
                 // cannot begin it after its observer has gone away.
@@ -1143,6 +1204,15 @@ async fn update_skill_inner(
                 {
                     return Err(x0x::upgrade::UpgradeError::Other(
                         "guide update cancelled before install".into(),
+                    ));
+                }
+                #[cfg(unix)]
+                if let Some((install, gate)) = &staged_guide {
+                    gate.require_due(install)?;
+                }
+                if !caller_alive.load(Ordering::Acquire) {
+                    return Err(x0x::upgrade::UpgradeError::Other(
+                        "guide update cancelled after staging check".into(),
                     ));
                 }
                 #[cfg(test)]
