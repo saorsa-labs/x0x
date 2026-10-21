@@ -1748,6 +1748,12 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// present on receivers in this slice; enforcement is slice 3.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_mandate: Option<x0x::groups::OwnerMandate>,
+        /// ADR 0109 §3a: a promoted admin's `ReseatMandateV1`, carried in
+        /// place of `owner_mandate` on one re-seat add in an owner-axis
+        /// group. Absent on every other add; old binaries ignore the key
+        /// and judge the add by ADR 0064 §1b.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reseat_mandate: Option<x0x::groups::recovery::ReseatMandateV1>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
         /// #1023 (R19 Home blocker): base64 bincode `AgentCertificate`s for
@@ -12918,6 +12924,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // #1023: hydrated by the apply wrappers after every guard has
             // dropped (`hydrate_from_member_added_sidecar`), never here.
             roster_certificates_b64: _,
+            reseat_mandate,
         } => {
             // ADR-0038 review B1 (+round-2): receivers enforce OwnerCertified
             // admission on inbound authority commits too. The event must
@@ -13247,8 +13254,46 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // by construction (this whole block is behind the
             // owner-axis predicate), so those groups stay
             // byte-for-byte unchanged.
+            // ADR 0109 §3a: a re-seat add carries a promoted admin's
+            // `ReseatMandateV1` in place of the owner mandate. It is
+            // accepted only under the §3a rule; a failure refuses with the
+            // committed state unchanged, as `owner_mandate_missing` does.
+            let reseat_accepted = match (
+                info.policy.admission.owner_certified_user_id(),
+                owner_mandate.as_ref(),
+                reseat_mandate.as_ref(),
+            ) {
+                (Some(_), None, Some(mandate)) => {
+                    match group_recovery::verify_reseat_mandate_on_receive(
+                        state,
+                        &info,
+                        &next,
+                        &commit,
+                        mandate,
+                        &agent_id,
+                        treekem_key_package_hash.as_deref(),
+                        treekem_epoch,
+                        owner_certified_certificate.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(cause) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                cause,
+                                "MemberAdded: reseat_mandate_invalid; rejecting with state byte-identical (ADR 0109 §3a)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
+                }
+                _ => false,
+            };
             if let Some(owner) = info.policy.admission.owner_certified_user_id().copied() {
                 match owner_mandate.as_ref() {
+                    None if reseat_accepted => {}
                     Some(mandate) => {
                         // Trusted owner material: the event's committed
                         // certificate (verified against the owner above)
@@ -15567,6 +15612,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // ADR-0064 slice 2: minted in BOTH branches below at the
             // pre-mutation point (before `seal_commit_owner_certified`).
             let owner_mandate;
+            // ADR 0109 §3a: a promoted admin's re-seat mandate, in place of
+            // the owner mandate on one re-seat add.
+            let mut reseat_mandate: Option<x0x::groups::recovery::ReseatMandateV1> = None;
             next.roster_revision = next.roster_revision.saturating_add(1);
             next.add_member_with_kem(
                 member_agent_id.clone(),
@@ -15682,6 +15730,34 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     now_ms,
                 )
                 .await;
+                if owner_mandate.is_none() {
+                    match group_recovery::reseat_mandate_for_seat(
+                        state,
+                        &info,
+                        &next,
+                        &member_agent_id,
+                        &invite_secret,
+                        expected_epoch,
+                        owner_certified_admission.as_ref(),
+                        role,
+                    )
+                    .await
+                    {
+                        group_recovery::ReseatSeal::NotReseat => {}
+                        group_recovery::ReseatSeal::Mandate(mandate) => {
+                            reseat_mandate = Some(*mandate);
+                        }
+                        group_recovery::ReseatSeal::Refused(reason) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                reason,
+                                "ADR 0109 §3a: re-seat seal refused; nothing sealed"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
+                }
                 let commit =
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(commit) => commit,
@@ -15770,6 +15846,34 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     now_ms,
                 )
                 .await;
+                if owner_mandate.is_none() {
+                    match group_recovery::reseat_mandate_for_seat(
+                        state,
+                        &info,
+                        &next,
+                        &member_agent_id,
+                        &invite_secret,
+                        0,
+                        owner_certified_admission.as_ref(),
+                        role,
+                    )
+                    .await
+                    {
+                        group_recovery::ReseatSeal::NotReseat => {}
+                        group_recovery::ReseatSeal::Mandate(mandate) => {
+                            reseat_mandate = Some(*mandate);
+                        }
+                        group_recovery::ReseatSeal::Refused(reason) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                reason,
+                                "ADR 0109 §3a: re-seat seal refused; nothing sealed"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
+                }
                 match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                     Ok(commit) => commit,
                     Err(e) => {
@@ -15903,6 +16007,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 }),
                 owner_mandate,
                 commit: Some(commit),
+                reseat_mandate,
             };
             // #1023: every other owner-certified seat's certificate rides
             // the seat event, so the joiner holds them even when it is
@@ -20460,6 +20565,20 @@ pub(in crate::server) async fn join_group_via_invite(
     State(state): State<Arc<AppState>>,
     Json(req): Json<JoinGroupRequest>,
 ) -> impl IntoResponse {
+    join_group_via_invite_inner(state, req, false).await
+}
+
+/// `POST /groups/join`, and (with `reseat_staging`) ADR 0109 §3's staged
+/// join. A staged join may redeem §3a's promoted-admin re-seat invite,
+/// which has no owner countersignature: its caller has already run §3a's
+/// invite check (the paired authorisation, and the owner pin taken from
+/// the subject's own live record, passed as the Home-mode pin below).
+/// Every other ADR 0059 check runs unchanged.
+pub(super) async fn join_group_via_invite_inner(
+    state: Arc<AppState>,
+    req: JoinGroupRequest,
+    reseat_staging: bool,
+) -> impl IntoResponse {
     // r3 (Codex 10): the joiner-supplied display name is request-sized
     // input that rides the MemberJoined event onto every receiver's
     // roster — cap it at mint parity before anything else runs.
@@ -20648,7 +20767,11 @@ pub(in crate::server) async fn join_group_via_invite(
     // sigs, owner half (A2 step 8): the owner countersignature verifies
     // only after the base it commits to has re-derived.
     if let Err(refusal) = invite.verify_v4_owner_countersignature() {
-        return refuse_invite(&state, &invite, refusal.reason());
+        let reseat_invite = reseat_staging
+            && refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
+        if !reseat_invite {
+            return refuse_invite(&state, &invite, refusal.reason());
+        }
     }
 
     // ── owner (A2 step 9): #469 A3 Home-join mode matrix (fail closed
@@ -21933,6 +22056,7 @@ pub(in crate::server) async fn add_named_group_member(
             // (None on keyless-owner installs and non-owner-axis groups).
             owner_mandate,
             commit: Some(commit),
+            reseat_mandate: None,
         };
         // #1023: the sealed roster's other certificates ride the seat event.
         seat_cert_fetch::attach_roster_certificates_to_member_added(
@@ -22228,6 +22352,7 @@ async fn add_treekem_named_group_member(
         // on keyless-owner installs and non-owner-axis groups).
         owner_mandate,
         commit: Some(commit),
+        reseat_mandate: None,
     };
     // #1023: the sealed roster's other certificates ride the seat event.
     seat_cert_fetch::attach_roster_certificates_to_member_added(&state, &next, &mut event);
@@ -51276,6 +51401,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add),
+            reseat_mandate: None,
         };
 
         let mut adminified = seated.clone();
@@ -51444,6 +51570,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add),
+            reseat_mandate: None,
         };
         let applied_add = apply_named_group_metadata_event(
             &state,
@@ -51511,6 +51638,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add2),
+            reseat_mandate: None,
         };
         let applied_add2 = apply_named_group_metadata_event(
             &state,
@@ -51845,6 +51973,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add),
+            reseat_mandate: None,
         };
         let applied_inner = apply_named_group_metadata_event_inner(
             &state,
@@ -56673,6 +56802,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 2, &admin_hex)),
+            reseat_mandate: None,
         };
         assert!(authorized_treekem_membership_event_for_queue(
             &info,
@@ -56802,6 +56932,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
+            reseat_mandate: None,
         };
 
         assert_eq!(
@@ -57199,6 +57330,7 @@ pub(in crate::server) mod tests {
             }),
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            reseat_mandate: None,
         };
 
         assert_eq!(
@@ -57248,6 +57380,7 @@ pub(in crate::server) mod tests {
                 certificate_b64: None,
                 owner_mandate: None,
                 commit: None,
+                reseat_mandate: None,
             }),
             chain: Vec::new(),
             head_attestation: None,
@@ -58132,6 +58265,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: None,
+            reseat_mandate: None,
         };
         let json = serde_json::to_value(event);
         assert!(json.is_ok(), "welcome ref event serializes");
@@ -58325,6 +58459,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: None,
+            reseat_mandate: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_added));
 
@@ -58387,6 +58522,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(fake_commit(2, "state-1")),
+            reseat_mandate: None,
         };
         let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
             group_id: "aa".to_string(),
@@ -58457,6 +58593,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit),
+            reseat_mandate: None,
         };
 
         assert_eq!(

@@ -120,6 +120,7 @@ async fn seal_home_add(
         certificate_b64: Some(BASE64.encode(bincode::serialize(&cert)?)),
         owner_mandate: Some(mandate),
         commit: Some(commit.clone()),
+        reseat_mandate: None,
     };
     Ok(SealedAdd {
         event,

@@ -1167,6 +1167,7 @@ fn staged_member_added(
         certificate_b64: Some(cert_b64(member_cert)),
         owner_mandate: None,
         commit: None,
+        reseat_mandate: None,
     }
 }
 

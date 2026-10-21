@@ -100,7 +100,8 @@ impl CapabilityRegistry {
     /// authorisations. Bit 8. Advertised: the S3 receivers are in place.
     pub const GROUP_TERMINAL_ATTEST_V1: u64 = 1 << 8;
     /// ADR 0109 §3a: verifies and applies promoted-admin
-    /// `ReseatMandateV1` commits. Bit 9. Not in [`Self::current`] yet.
+    /// `ReseatMandateV1` commits. Bit 9. Advertised: the receiver rule is
+    /// in place.
     pub const GROUP_RESEAT_MANDATE_V1: u64 = 1 << 9;
 
     /// The routes supported by this release's ready receiver.
@@ -113,7 +114,8 @@ impl CapabilityRegistry {
                 | Self::FILE_CONTROL_ACK_V1
                 | Self::EVICTION_HANDOFF_V1
                 | Self::CRYPTO_EXCLUSION_V1
-                | Self::GROUP_TERMINAL_ATTEST_V1,
+                | Self::GROUP_TERMINAL_ATTEST_V1
+                | Self::GROUP_RESEAT_MANDATE_V1,
         }
     }
 
