@@ -38,6 +38,8 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 use x0x::logging::LogHexId;
 
+mod sidecar_resume;
+
 /// The worker tick.
 const TICK: Duration = Duration::from_secs(2);
 /// How long the subject waits for one target's answer before it asks the
@@ -472,16 +474,24 @@ async fn sidecar_snapshot(state: &AppState, stable_group_id: &str) -> Option<Gro
         .cloned()
 }
 
-/// Load every `.grecov` file at worker start (§4). A damaged file is moved
-/// aside by the ADR 0108 §5a quarantine and replaced by an empty rebuild;
-/// a newer-format file stays in place and its group is memory-only.
-async fn load_sidecars(state: &AppState) {
-    let dir = sidecar_dir(state);
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
+/// Read every `.grecov` file in `dir` (§4). Open ADR 0108 §5a quarantine
+/// transactions are resumed first ([`sidecar_resume`]). A damaged file is
+/// moved aside by the quarantine and replaced by an empty rebuild; a
+/// newer-format file stays in place and its group is memory-only. Returns
+/// the loaded bodies and the faults, keyed by file stem.
+async fn scan_sidecar_dir(
+    dir: &FsPath,
+) -> (
+    HashMap<String, GroupRecoveryV1>,
+    HashMap<String, SidecarFault>,
+) {
     let mut loaded = HashMap::new();
     let mut faults = HashMap::new();
+    // RED STUB (commit A): 11ff5a0 runs no resume.
+    let _ = sidecar_resume::resume_pending;
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return (loaded, faults);
+    };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
         let Some(name) = path
@@ -555,6 +565,17 @@ async fn load_sidecars(state: &AppState) {
             }
         }
     }
+    (loaded, faults)
+}
+
+/// Load every `.grecov` file at worker start (§4), under the sidecar
+/// writer lock (ADR 0108 §5a writer exclusion). See [`scan_sidecar_dir`].
+async fn load_sidecars(state: &AppState) {
+    let dir = sidecar_dir(state);
+    let (mut loaded, mut faults) = {
+        let _writer = state.group_recovery.writer.lock().await;
+        scan_sidecar_dir(&dir).await
+    };
     // Files are named by the sanitised stable ID; map them back through
     // the live groups so the in-memory key is the stable ID itself. The
     // roster is read before the S3 lock (the roster encoder takes the S3
@@ -739,9 +760,11 @@ pub(super) async fn legacy_store_view(
     groups: &HashMap<String, GroupInfo>,
 ) -> std::io::Result<Option<HashMap<String, GroupInfo>>> {
     let placeheld = placeheld_snapshot(state);
-    if placeheld.is_empty() {
+    let journals = open_reseat_journals(state).await;
+    if placeheld.is_empty() && journals.is_empty() {
         return Ok(None);
     }
+    let placeheld_ids: HashSet<String> = placeheld.keys().cloned().collect();
     let mut view: Option<HashMap<String, GroupInfo>> = None;
     for (stable, entry) in placeheld {
         let Some(canonical) = placeheld_key(groups, &stable, &entry).cloned() else {
@@ -757,7 +780,65 @@ pub(super) async fn legacy_store_view(
             }
         }
     }
+    if let Some(overlaid) =
+        reseat_overlay(view.as_ref().unwrap_or(groups), &journals, &placeheld_ids)
+    {
+        view = Some(overlaid);
+    }
     Ok(view)
+}
+
+/// The re-seat journals that are open and not yet swapping.
+async fn open_reseat_journals(state: &AppState) -> Vec<ReseatJournalV1> {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .sidecars
+        .values()
+        .filter_map(|body| body.reseat_journal.clone())
+        .filter(|journal| journal.phase != ReseatPhase::Swapping)
+        .collect()
+}
+
+/// §3 step 2 (#1533 review): the staged join runs apart from the
+/// original's containment. While a journal is open and not yet
+/// `Swapping`, every legacy file keeps the journalled original record (its
+/// S3 placeholder when the group is placeheld) under the journal's key,
+/// with its marker and gates, whatever the live map holds: nothing, a
+/// staging stub, or a staged record that is not yet swapped. So a crash at
+/// any point, or a downgrade, loads the original containment. Only the
+/// swap (`Swapping`, then a durable legacy write) puts the staged record
+/// on disk. `None` when no journal applies.
+fn reseat_overlay(
+    groups: &HashMap<String, GroupInfo>,
+    journals: &[ReseatJournalV1],
+    placeheld: &HashSet<String>,
+) -> Option<HashMap<String, GroupInfo>> {
+    // RED STUB (commit A): 11ff5a0 writes the live map as it is.
+    let _ = (groups, journals, placeheld);
+    None
+}
+
+/// `info` is the journalled original record (same revision and head), not
+/// a staged result. Compared by head, not by bytes: the original can come
+/// back from disk after a restart (§3 step 2).
+fn is_journalled_original(info: &GroupInfo, journal: &ReseatJournalV1) -> bool {
+    serde_json::from_slice::<GroupInfo>(&journal.live_record).is_ok_and(|original| {
+        original.state_revision == info.state_revision && original.state_hash == info.state_hash
+    })
+}
+
+/// The staged join of an open `Staging`/`Swapping` journal cannot finish:
+/// no staged join runs in this process (`preparing` is false), and either
+/// the journal is still `Staging` (after a restart the legacy files hold
+/// the original, so the staged state is gone) or the live record is
+/// absent or is the original.
+fn staged_join_lost(journal: &ReseatJournalV1, live: Option<&GroupInfo>, preparing: bool) -> bool {
+    // RED STUB (commit A): the 11ff5a0 rule.
+    let _ = journal;
+    !preparing && live.is_none()
 }
 
 /// Write `groups[key]` as the sidecar's authoritative record of `stable`
@@ -1167,11 +1248,52 @@ enum Guard {
     /// ADR 0107's serving guard plus D60: an Active, unbanned, unrevoked
     /// member of a group that is not withdrawn or quarantined.
     Member,
-    /// The re-seat guard: not Active, not banned or revoked, holding a
-    /// current unconsumed authorisation, plus D60.
-    Reseat,
+    /// The re-seat guard: not Active, not banned or revoked, holding the
+    /// current unconsumed authorisation with this digest, from an issuer
+    /// whose own record is uncontained, plus D60.
+    Reseat([u8; 32]),
     /// A refusal carries no group state: D60 only.
     Refusal,
+}
+
+/// §5: only a current, verified, positive `group_terminal_attest_v1`
+/// advert admits an S3 write. Unknown, expired or card-only support sends
+/// nothing.
+fn capability_admits(supported: Option<bool>) -> bool {
+    // RED STUB (commit A): 11ff5a0 gates nothing.
+    let _ = supported;
+    true
+}
+
+/// The sync part of [`contained`]: a marker or an owner-armed gap record
+/// on the record itself (the seam cannot await).
+fn record_contained(info: &GroupInfo) -> bool {
+    info.fork_quarantine.is_some()
+        || info
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+            .is_some_and(|record| {
+                record.reason == s3::OWNER_ATTESTED_GAP_REASON
+                    && info.state_revision < record.terminal_revision
+            })
+}
+
+/// §6 at a re-seat write: the group is not withdrawn; the recipient is not
+/// Active or banned; this node's own record (the issuer's) is not
+/// contained; and the authorisation with `digest` is still issued to the
+/// recipient (not consumed or replaced) and unexpired at `now_ms`.
+fn reseat_write_admits(
+    info: &GroupInfo,
+    issuer_contained: bool,
+    issued: &[IssuedReseatV1],
+    recipient_hex: &str,
+    digest: &[u8; 32],
+    now_ms: u64,
+) -> bool {
+    // RED STUB (commit A): the 11ff5a0 write check.
+    let _ = (issuer_contained, issued, digest, now_ms);
+    !info.withdrawn && !info.has_active_member(recipient_hex) && !info.is_banned(recipient_hex)
 }
 
 fn admission(
@@ -1190,7 +1312,11 @@ fn admission(
             let lock = super::group_membership_lock_for_known_group(&state, &group_key).await?;
             let evidence = {
                 let _membership_guard = lock.lock().await;
-                if !write_allowed(&state, &recipient).await {
+                let supported = state.agent.capability_store().verified_registry_supports(
+                    &recipient,
+                    x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1,
+                );
+                if !capability_admits(supported) || !write_allowed(&state, &recipient).await {
                     return None;
                 }
                 match guard {
@@ -1199,18 +1325,18 @@ fn admission(
                             .await
                             .ok()?
                     }
-                    Guard::Reseat => {
+                    Guard::Reseat(digest) => {
                         let info = state.named_groups.read().await.get(&group_key).cloned()?;
-                        if info.withdrawn
-                            || info.has_active_member(&recipient_hex)
-                            || info.is_banned(&recipient_hex)
-                            || !issued_reseat_current(
-                                &state,
-                                info.stable_group_id(),
-                                &recipient_hex,
-                            )
-                            .await
-                        {
+                        let issuer_contained = contained(&state, &info).await;
+                        let issued = issued_reseats(&state, info.stable_group_id()).await;
+                        if !reseat_write_admits(
+                            &info,
+                            issuer_contained,
+                            &issued,
+                            &recipient_hex,
+                            &digest,
+                            now_ms(),
+                        ) {
                             return None;
                         }
                         None
@@ -1220,19 +1346,54 @@ fn admission(
             };
             let seam: x0x::dm::SeamAdmission = match guard {
                 Guard::Member => Box::new(move || {
-                    super::join_artifact_seam_refusal(&state, &group_key, &recipient_hex, evidence)
-                        .is_none()
+                    capability_admits(state.agent.capability_store().verified_registry_supports(
+                        &recipient,
+                        x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1,
+                    )) && super::join_artifact_seam_refusal(
+                        &state,
+                        &group_key,
+                        &recipient_hex,
+                        evidence,
+                    )
+                    .is_none()
                 }),
-                Guard::Reseat => Box::new(move || {
-                    state.named_groups.try_read().is_ok_and(|groups| {
-                        groups.get(&group_key).is_some_and(|info| {
-                            !info.withdrawn
-                                && !info.has_active_member(&recipient_hex)
-                                && !info.is_banned(&recipient_hex)
-                        })
-                    })
+                // Immediately before the write: the same checks again, from
+                // the live roster and sidecar (busy locks fail closed).
+                Guard::Reseat(digest) => Box::new(move || {
+                    let supported = state.agent.capability_store().verified_registry_supports(
+                        &recipient,
+                        x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1,
+                    );
+                    let Ok(groups) = state.named_groups.try_read() else {
+                        return false;
+                    };
+                    let Some(info) = groups.get(&group_key) else {
+                        return false;
+                    };
+                    let Ok(inner) = state.group_recovery.inner.try_lock() else {
+                        return false;
+                    };
+                    let issued = inner
+                        .sidecars
+                        .get(info.stable_group_id())
+                        .map(|body| body.issued_reseats.as_slice())
+                        .unwrap_or_default();
+                    capability_admits(supported)
+                        && reseat_write_admits(
+                            info,
+                            record_contained(info),
+                            issued,
+                            &recipient_hex,
+                            &digest,
+                            now_ms(),
+                        )
                 }),
-                Guard::Refusal => Box::new(|| true),
+                Guard::Refusal => Box::new(move || {
+                    capability_admits(state.agent.capability_store().verified_registry_supports(
+                        &recipient,
+                        x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1,
+                    ))
+                }),
             };
             Some(seam)
         })
@@ -1270,8 +1431,7 @@ async fn guarded_send(
     }
 }
 
-async fn issued_reseat_current(state: &AppState, stable_group_id: &str, subject_hex: &str) -> bool {
-    let now = now_ms();
+async fn issued_reseats(state: &AppState, stable_group_id: &str) -> Vec<IssuedReseatV1> {
     state
         .group_recovery
         .inner
@@ -1279,16 +1439,8 @@ async fn issued_reseat_current(state: &AppState, stable_group_id: &str, subject_
         .await
         .sidecars
         .get(stable_group_id)
-        .is_some_and(|body| {
-            body.issued_reseats.iter().any(|issued| {
-                issued
-                    .authorisation
-                    .fields
-                    .subject
-                    .eq_ignore_ascii_case(subject_hex)
-                    && issued.authorisation.fields.expires_at_ms > now
-            })
-        })
+        .map(|body| body.issued_reseats.clone())
+        .unwrap_or_default()
 }
 
 // ─── Receive ───────────────────────────────────────────────────────────────
@@ -1406,7 +1558,10 @@ async fn send_response(
         );
         return 0;
     }
-    let sent = guarded_send(state, group_key, recipient, guard, &payload).await;
+    // §5: an unknown advert asks for a refresh and sends nothing now; the
+    // admission re-checks the advert under the membership lock.
+    let sent = capability_admits(peer_capable(state, &recipient))
+        && guarded_send(state, group_key, recipient, guard, &payload).await;
     if log {
         tracing::info!(
             group_id = %LogHexId::group(group_key),
@@ -1450,13 +1605,16 @@ async fn build_answer(
             )
         } else if !info.has_active_member(&requester_hex) {
             match current_issued_reseat(state, &stable, &requester_hex).await {
-                Some(issued) => (
-                    AttestAnswer::Reseat {
-                        authorisation: Box::new(issued.authorisation),
-                        invite: issued.invite,
-                    },
-                    Guard::Reseat,
-                ),
+                Some(issued) => {
+                    let digest = issued.authorisation.digest();
+                    (
+                        AttestAnswer::Reseat {
+                            authorisation: Box::new(issued.authorisation),
+                            invite: issued.invite,
+                        },
+                        Guard::Reseat(digest),
+                    )
+                }
                 None => (
                     AttestAnswer::Refused(AttestRefusalReason::NotAMember),
                     Guard::Refusal,
@@ -3492,6 +3650,7 @@ pub(in crate::server) async fn reseat_group_member(
     // `reseat` response under the re-seat guard (§6).
     let push_state = Arc::clone(&state);
     let push_key = group_key.clone();
+    let push_guard = Guard::Reseat(authorisation.digest());
     let push_response = GroupAttestResponseV1 {
         group: stable.clone(),
         subject: *subject.as_bytes(),
@@ -3506,7 +3665,7 @@ pub(in crate::server) async fn reseat_group_member(
             &push_state,
             &push_key,
             subject,
-            Guard::Reseat,
+            push_guard,
             &push_response,
             true,
         )
@@ -4245,7 +4404,9 @@ async fn prepare_reseat(
 
 /// Move the contained live record aside: the same teardown a self-removal
 /// runs, so the staged join starts from no local record. The record and its
-/// tree are already durable in the journal.
+/// tree are already durable in the journal, and the open journal keeps the
+/// original in every legacy file ([`reseat_overlay`]), so the roster write
+/// below changes only the live map.
 ///
 /// The roster write runs FIRST. Nothing else is touched until it is
 /// durable, so a failed write leaves the live record, its tree and its
@@ -4445,21 +4606,45 @@ async fn swap_if_seated(
 ) -> bool {
     let local = local_hex(state);
     let seated = match live {
-        Some((key, info)) => {
+        Some((key, info)) if !is_journalled_original(info, journal) => {
             let has_tree = state.treekem_groups.read().await.contains_key(key);
             journal.staged_result_ready(info, &local, has_tree)
         }
-        None => false,
+        _ => false,
     };
     if !seated {
         return false;
+    }
+    let expected = journal.record_digest;
+    // §3 step 3 (#1533 review): `Swapping` lifts the legacy overlay, then
+    // the staged record and its tree must be durable in the legacy files
+    // before the journal closes. A crash before that write loads the
+    // original, which rolls back.
+    if journal.phase != ReseatPhase::Swapping {
+        let mut marked = false;
+        let marked_ref = &mut marked;
+        let durable = update_sidecar(state, stable, move |body| {
+            if let Some(open) = body.reseat_journal.as_mut() {
+                if open.record_digest == expected {
+                    open.phase = ReseatPhase::Swapping;
+                    *marked_ref = true;
+                }
+            }
+        })
+        .await;
+        if !(durable && marked) {
+            return true;
+        }
+    }
+    if resave_legacy(state).await != LegacyWrite::Durable {
+        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the swapped-in record is not durable yet; the swap is retried");
+        return true;
     }
     let retired = RetiredRecordV1 {
         cause: "reseat".to_string(),
         retired_at_ms: now_ms(),
         record: journal.live_record.clone(),
     };
-    let expected = journal.record_digest;
     let mut swapped = false;
     let swapped_ref = &mut swapped;
     if update_sidecar(state, stable, move |body| {
@@ -4559,9 +4744,13 @@ async fn reseat_progress(state: &Arc<AppState>) {
             .saturating_add(u64::try_from(STAGING_GRACE.as_millis()).unwrap_or(u64::MAX));
         if failed_outcome || now_ms() > deadline {
             rollback_reseat(state, &stable, "staged_join_ended").await;
-        } else if live.is_none() && !preparing.contains(&stable) {
-            // The stub is gone with no outcome and no staged join runs in
-            // this process (a restart lost the in-memory stub): roll back.
+        } else if staged_join_lost(
+            &journal,
+            live.as_ref().map(|(_, info)| info),
+            preparing.contains(&stable),
+        ) {
+            // No staged join runs in this process (a restart lost it) and
+            // no staged record is durable: roll back.
             rollback_reseat(state, &stable, "staged_join_lost").await;
         }
     }
@@ -4741,6 +4930,191 @@ pub(in crate::server) async fn held_join_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A contained original record (marker set) and its re-seat journal
+    /// in `phase`, built without a daemon. The subject is a second agent.
+    fn pure_reseat(
+        phase: ReseatPhase,
+    ) -> anyhow::Result<(GroupInfo, ReseatJournalV1, x0x::identity::AgentKeypair)> {
+        let keypair = x0x::identity::AgentKeypair::generate()?;
+        let signer = hex::encode(keypair.agent_id().as_bytes());
+        let subject = hex::encode(
+            x0x::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let mut info = GroupInfo::new(
+            "adr0109-pure".to_string(),
+            String::new(),
+            keypair.agent_id(),
+            "2109".repeat(16),
+        );
+        info.seal_commit(&keypair, 1_000)?;
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: info.state_revision,
+            state_hash: "sibling".to_string(),
+            committed_by: signer.clone(),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        let authorisation = ReseatAuthorisation::sign(
+            ReseatAuthorisationFields {
+                group: info.stable_group_id().to_string(),
+                subject,
+                basis: ReseatBasis::Removal {
+                    revision: info.state_revision,
+                    state_hash: info.state_hash.clone(),
+                },
+                invite_secret_hash: s3::invite_secret_hash("secret"),
+                invite_base_revision: info.state_revision,
+                invite_base_state_hash: info.state_hash.clone(),
+                signer,
+                signer_public_key: hex::encode(keypair.public_key().as_bytes()),
+                reason_hash: s3::reason_hash("r"),
+                expires_at_ms: 10_000,
+            },
+            &keypair,
+        )?;
+        let live_record = serde_json::to_vec(&info)?;
+        let journal = ReseatJournalV1 {
+            authorisation,
+            invite: String::new(),
+            record_digest: *blake3::hash(&live_record).as_bytes(),
+            phase,
+            live_key: info.mls_group_id.clone(),
+            live_record,
+            live_tree: None,
+            started_at_ms: 0,
+        };
+        Ok((info, journal, keypair))
+    }
+
+    /// #1533 review (Codex P1, re-seat containment): at every crash point
+    /// before the swap, the legacy files hold the original record with its
+    /// marker, whatever the live map holds. Before the fix the move aside
+    /// removed it from disk, so a crash or a downgrade loaded no
+    /// containment (or the staged record).
+    #[test]
+    fn the_legacy_view_keeps_the_original_containment_until_the_swap() -> anyhow::Result<()> {
+        let (original, journal, keypair) = pure_reseat(ReseatPhase::Staging)?;
+        let key = journal.live_key.clone();
+        let mut staged = original.clone();
+        staged.fork_quarantine = None;
+        staged.name = "staged".to_string();
+        staged.seal_commit(&keypair, 2_000)?;
+        let none = HashSet::new();
+        for (phase, live) in [
+            (ReseatPhase::Prepared, Some(original.clone())),
+            (ReseatPhase::Staging, None),
+            (ReseatPhase::Staging, Some(staged.clone())),
+        ] {
+            let mut open = journal.clone();
+            open.phase = phase;
+            let groups: HashMap<String, GroupInfo> =
+                live.into_iter().map(|info| (key.clone(), info)).collect();
+            let view = reseat_overlay(&groups, std::slice::from_ref(&open), &none)
+                .expect("an open journal overlays the legacy view");
+            let on_disk = view.get(&key).expect("the group stays on disk");
+            assert!(on_disk.fork_quarantine.is_some(), "{phase:?}: the marker");
+            assert_eq!(on_disk.state_hash, original.state_hash, "{phase:?}");
+            assert_eq!(view.len(), 1, "{phase:?}");
+        }
+        // Placeheld: the original's S3 placeholder, with no Active seat.
+        let placeheld = HashSet::from([original.stable_group_id().to_string()]);
+        let view = reseat_overlay(&HashMap::new(), std::slice::from_ref(&journal), &placeheld)
+            .expect("overlay");
+        assert!(view[&key].fork_quarantine.is_some());
+        assert_eq!(view[&key].active_members().count(), 0);
+        // `Swapping` lifts the overlay: the staged record is written.
+        let mut swapping = journal;
+        swapping.phase = ReseatPhase::Swapping;
+        let groups = HashMap::from([(key, staged)]);
+        assert!(reseat_overlay(&groups, &[swapping], &none).is_none());
+        Ok(())
+    }
+
+    /// #1533 review: after a restart the original is live again (from the
+    /// legacy files). A `Staging` journal, or a `Swapping` one whose staged
+    /// record never became durable, is lost and rolls back; it never waits
+    /// for the authorisation deadline with the staged state gone.
+    #[test]
+    fn a_reseat_cut_before_the_durable_swap_rolls_back_after_restart() -> anyhow::Result<()> {
+        let (original, staging, keypair) = pure_reseat(ReseatPhase::Staging)?;
+        let mut reloaded = original.clone();
+        reloaded.name = "re-encoded on load".to_string();
+        let mut staged = original.clone();
+        staged.fork_quarantine = None;
+        staged.seal_commit(&keypair, 2_000)?;
+        assert!(is_journalled_original(&reloaded, &staging));
+        assert!(!is_journalled_original(&staged, &staging));
+        assert!(staged_join_lost(&staging, Some(&reloaded), false));
+        assert!(staged_join_lost(&staging, None, false));
+        assert!(
+            !staged_join_lost(&staging, Some(&reloaded), true),
+            "in-process join"
+        );
+        let mut swapping = staging;
+        swapping.phase = ReseatPhase::Swapping;
+        assert!(staged_join_lost(&swapping, Some(&reloaded), false));
+        assert!(
+            !staged_join_lost(&swapping, Some(&staged), false),
+            "swap resumes"
+        );
+        Ok(())
+    }
+
+    /// #1533 review (Codex P1, re-seat delivery): the write of a re-seat
+    /// exchange is refused once the issuer's own record is contained, the
+    /// authorisation expired, or it is no longer the issued one.
+    #[test]
+    fn a_reseat_write_needs_an_uncontained_issuer_and_the_current_authorisation(
+    ) -> anyhow::Result<()> {
+        let (mut info, journal, _) = pure_reseat(ReseatPhase::Staging)?;
+        info.fork_quarantine = None;
+        let authorisation = journal.authorisation;
+        let subject = authorisation.fields.subject.clone();
+        let digest = authorisation.digest();
+        let issued = vec![IssuedReseatV1 {
+            authorisation,
+            invite: String::new(),
+            issued_at_ms: 0,
+        }];
+        assert!(reseat_write_admits(
+            &info, false, &issued, &subject, &digest, 5_000
+        ));
+        assert!(
+            !reseat_write_admits(&info, true, &issued, &subject, &digest, 5_000),
+            "issuer contained"
+        );
+        assert!(
+            !reseat_write_admits(&info, false, &issued, &subject, &digest, 10_000),
+            "expired"
+        );
+        assert!(
+            !reseat_write_admits(&info, false, &issued, &subject, &[0; 32], 5_000),
+            "replaced"
+        );
+        assert!(
+            !reseat_write_admits(&info, false, &[], &subject, &digest, 5_000),
+            "consumed"
+        );
+        Ok(())
+    }
+
+    /// #1533 review (Codex P2): only a current verified positive advert
+    /// admits an S3 write; unknown (legacy) or expired support sends
+    /// nothing.
+    #[test]
+    fn s3_writes_need_current_verified_support() {
+        assert!(capability_admits(Some(true)));
+        assert!(!capability_admits(Some(false)));
+        assert!(!capability_admits(None));
+    }
 
     #[test]
     fn responder_budget_limits_each_requester_and_builds() {
@@ -5260,7 +5634,8 @@ mod tests {
         let stable = info.stable_group_id().to_string();
         assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
         assert!(move_live_record_aside(&state, &key, &info).await);
-        assert!(!on_disk_keys(&state).await?.contains(&key));
+        // #1533 review: the open journal keeps the original on disk.
+        assert!(on_disk_keys(&state).await?.contains(&key));
         resume_journals(&state).await;
         assert!(open_journal(&state, &stable).await.is_none());
         assert!(on_disk_keys(&state).await?.contains(&key));
@@ -5276,15 +5651,27 @@ mod tests {
         assert_eq!(retired(Arc::clone(&state), stable.clone()).await, 0);
         state.group_recovery.inner.lock().await.subjects.clear();
 
-        // 3. `Staging` with the original record under the key (it can only
-        //    get there by a fault): not a swap, the journal stays.
-        let (_key, info, mut journal) = reseat_fixture(&state).await?;
+        // 3. `Staging` with the original record under the key: a restart
+        //    (the legacy files hold the original). Not a swap: the staged
+        //    join is gone, so it rolls back and retires nothing (#1533).
+        let (key, info, mut journal) = reseat_fixture(&state).await?;
         let stable = info.stable_group_id().to_string();
         journal.phase = ReseatPhase::Staging;
+        let reopen = journal.clone();
         assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
         resume_journals(&state).await;
-        assert!(open_journal(&state, &stable).await.is_some());
+        assert!(open_journal(&state, &stable).await.is_none());
         assert_eq!(retired(Arc::clone(&state), stable.clone()).await, 0);
+        assert_eq!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .map(|record| record.state_hash.clone()),
+            Some(info.state_hash.clone())
+        );
+        assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(reopen)).await);
 
         // 4. `Staging` with a staged result sealed past the invite base and
         //    this node Active: the swap retires the original once.
@@ -5292,10 +5679,20 @@ mod tests {
         staged.name = "staged".to_string();
         staged.seal_commit(keypair, 2_000)?;
         let staged_key = staged.mls_group_id.clone();
-        state.named_groups.write().await.insert(staged_key, staged);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(staged_key.clone(), staged.clone());
         resume_journals(&state).await;
         assert!(open_journal(&state, &stable).await.is_none());
         assert_eq!(retired(Arc::clone(&state), stable.clone()).await, 1);
+        // The swap wrote the staged record to the legacy files.
+        let on_disk = legacy_entry(&state.named_groups_path, &staged_key).await?;
+        assert_eq!(
+            on_disk.map(|record| record.state_hash),
+            Some(staged.state_hash)
+        );
 
         // 5. `Staging`, the in-memory stub lost in a restart: roll back.
         let (key, info, mut journal) = reseat_fixture(&state).await?;
@@ -5313,6 +5710,41 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    /// #1533 review (Codex P2 and P1): every S3 write needs the
+    /// recipient's current verified `group_terminal_attest_v1`. A legacy
+    /// recipient (no advert) gets nothing, not even a refusal, under every
+    /// guard. A marker on the issuer's record counts as contained for both
+    /// the admission and the write-seam check. Daemon-level; CI only.
+    #[tokio::test]
+    async fn s3_admission_refuses_legacy_recipients_and_contained_issuers() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _) = reseat_fixture(&state).await?;
+        let legacy = x0x::identity::AgentKeypair::generate()?.agent_id();
+        for guard in [Guard::Refusal, Guard::Member, Guard::Reseat([0; 32])] {
+            let admit = admission(&state, &key, legacy, guard);
+            assert!(
+                admit().await.is_none(),
+                "{guard:?}: a legacy recipient gets nothing"
+            );
+        }
+        let mut contained_info = info.clone();
+        contained_info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: info.state_revision,
+            state_hash: "sibling".to_string(),
+            committed_by: local_hex(&state),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        assert!(contained(&state, &contained_info).await);
+        assert!(record_contained(&contained_info));
         Ok(())
     }
 
