@@ -13,34 +13,64 @@ use crate::names::{
 const NOW: u64 = 1_900_000_000;
 const OWNER: UserId = UserId([0x0a; 32]);
 
-fn machine_spec(persistent: bool) -> ForwardSpec {
-    ForwardSpec {
-        local_addr: "127.0.0.1:18022".parse().unwrap(),
-        peer_agent: AgentId([0x44; 32]),
-        target_host: "::1".to_string(),
-        target_port: 22,
-        name: Some("machine:box.me".to_string()),
-        kind: NameKind::Machine,
-        pinned_machine: Some(MachineId([0x11; 32])),
-        persistent,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Parts {
+    spec: ForwardSpec,
+    binding: ForwardBinding,
+}
+
+impl Parts {
+    fn pair(&self) -> (ForwardSpec, ForwardBinding) {
+        (self.spec.clone(), self.binding.clone())
+    }
+
+    async fn remember(&self, store: &ForwardStore) -> Result<bool, ForwardStoreError> {
+        store.remember(&self.spec, &self.binding).await
+    }
+
+    fn check(&self, store: &ForwardStore) -> Result<(), ForwardStoreError> {
+        store.check(&self.spec, &self.binding)
     }
 }
 
-fn agent_spec(port: u16) -> ForwardSpec {
-    ForwardSpec {
-        local_addr: format!("127.0.0.1:{port}").parse().unwrap(),
-        peer_agent: AgentId([0x55; 32]),
-        target_host: "127.0.0.1".to_string(),
-        target_port: 8080,
-        name: Some("agent:studio.bob".to_string()),
-        kind: NameKind::Agent,
-        pinned_machine: Some(MachineId([0x66; 32])),
-        persistent: true,
+fn machine_spec(persistent: bool) -> Parts {
+    Parts {
+        spec: ForwardSpec {
+            local_addr: "127.0.0.1:18022".parse().unwrap(),
+            peer_agent: AgentId([0x44; 32]),
+            target_host: "::1".to_string(),
+            target_port: 22,
+        },
+        binding: ForwardBinding {
+            name: Some("machine:box.me".to_string()),
+            kind: NameKind::Machine,
+            pinned_machine: Some(MachineId([0x11; 32])),
+            persistent,
+        },
     }
 }
 
-fn record(spec: &ForwardSpec) -> ForwardRecord {
-    ForwardRecord::from_spec(spec).unwrap().unwrap()
+fn agent_spec(port: u16) -> Parts {
+    Parts {
+        spec: ForwardSpec {
+            local_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            peer_agent: AgentId([0x55; 32]),
+            target_host: "127.0.0.1".to_string(),
+            target_port: 8080,
+        },
+        binding: ForwardBinding {
+            name: Some("agent:studio.bob".to_string()),
+            kind: NameKind::Agent,
+            pinned_machine: Some(MachineId([0x66; 32])),
+            persistent: true,
+        },
+    }
+}
+
+fn record(parts: &Parts) -> ForwardRecord {
+    ForwardRecord::from_spec(&parts.spec, &parts.binding)
+        .unwrap()
+        .unwrap()
 }
 
 fn resolved_machine(agent: [u8; 32], machine: [u8; 32]) -> Resolved {
@@ -64,8 +94,8 @@ async fn persisted_forward_survives_restart_with_its_target_and_pins() {
     let path = ForwardStore::path_in(dir.path());
     {
         let store = ForwardStore::load(path.clone()).await;
-        assert!(store.remember(&machine_spec(true)).await.unwrap());
-        assert!(store.remember(&agent_spec(18023)).await.unwrap());
+        assert!(machine_spec(true).remember(&store).await.unwrap());
+        assert!(agent_spec(18023).remember(&store).await.unwrap());
     }
     // "Restart": a fresh store from the same file.
     let store = ForwardStore::load(path.clone()).await;
@@ -77,14 +107,16 @@ async fn persisted_forward_survives_restart_with_its_target_and_pins() {
     );
     // It comes back up on exactly its pinned ids when the name still
     // resolves to them.
-    let spec = restore_decision(
+    let (spec, binding) = restore_decision(
         &records[0],
         Some(Ok(resolved_machine([0x44; 32], [0x11; 32]))),
     )
     .unwrap();
-    assert_eq!(spec, machine_spec(true));
+    let want = machine_spec(true);
+    assert_eq!(spec, want.spec);
+    assert_eq!(binding, want.binding);
     assert_eq!(spec.target_host, "::1");
-    assert_eq!(spec.pinned_machine, Some(MachineId([0x11; 32])));
+    assert_eq!(binding.pinned_machine, Some(MachineId([0x11; 32])));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -112,14 +144,14 @@ async fn ephemeral_forward_is_not_persisted() {
     let path = ForwardStore::path_in(dir.path());
     {
         let store = ForwardStore::load(path.clone()).await;
-        assert!(!store.remember(&machine_spec(false)).await.unwrap());
+        assert!(!machine_spec(false).remember(&store).await.unwrap());
         assert!(!path.exists(), "an ephemeral forward writes nothing");
-        assert!(store.remember(&agent_spec(18023)).await.unwrap());
+        assert!(agent_spec(18023).remember(&store).await.unwrap());
     }
     let store = ForwardStore::load(path).await;
     let records = store.records().await.unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].local_addr, agent_spec(18023).local_addr);
+    assert_eq!(records[0].local_addr, agent_spec(18023).spec.local_addr);
 }
 
 /// WHY (ADR-0074 §1): every persisted forward must reach a pinned
@@ -133,30 +165,30 @@ async fn unpinned_or_unloadable_forward_is_refused_not_written() {
     let path = ForwardStore::path_in(dir.path());
     let store = ForwardStore::load(path.clone()).await;
     let mut unpinned = agent_spec(18023);
-    unpinned.pinned_machine = None;
+    unpinned.binding.pinned_machine = None;
     assert!(matches!(
-        store.check(&unpinned),
+        unpinned.check(&store),
         Err(ForwardStoreError::Unpinned(_))
     ));
     assert!(matches!(
-        store.remember(&unpinned).await,
+        unpinned.remember(&store).await,
         Err(ForwardStoreError::Unpinned(_))
     ));
     let mut hostname = agent_spec(18024);
-    hostname.target_host = "localhost".to_string();
+    hostname.spec.target_host = "localhost".to_string();
     assert!(matches!(
-        store.check(&hostname),
+        hostname.check(&store),
         Err(ForwardStoreError::Invalid(_))
     ));
     assert!(matches!(
-        store.remember(&hostname).await,
+        hostname.remember(&store).await,
         Err(ForwardStoreError::Invalid(_))
     ));
     assert!(!path.exists(), "nothing was written");
     // A requested `:0` is checkable before the kernel assigns the port.
     let mut any_port = agent_spec(18025);
-    any_port.local_addr.set_port(0);
-    assert_eq!(store.check(&any_port), Ok(()));
+    any_port.spec.local_addr.set_port(0);
+    assert_eq!(any_port.check(&store), Ok(()));
 }
 
 /// WHY: a corrupt, unknown-schema or tampered file must fail closed:
@@ -231,7 +263,7 @@ async fn corrupt_store_fails_closed_and_is_never_overwritten() {
         );
         assert!(
             matches!(
-                store.remember(&agent_spec(18023)).await,
+                agent_spec(18023).remember(&store).await,
                 Err(ForwardStoreError::Unusable(_))
             ),
             "{case}: persistent adds are refused"
@@ -249,7 +281,7 @@ async fn corrupt_store_fails_closed_and_is_never_overwritten() {
             "{case}: the file is never overwritten"
         );
         // An ephemeral forward needs no store and still works.
-        assert!(!store.remember(&machine_spec(false)).await.unwrap());
+        assert!(!machine_spec(false).remember(&store).await.unwrap());
     }
 }
 
@@ -289,7 +321,7 @@ async fn restore_with_a_pin_mismatch_leaves_the_forward_disabled() {
 
     // Same key after restart: comes back up.
     let again = resolve_with(&names, &name, OWNER, &agent_candidate(0x55), NOW).await;
-    let spec = restore_decision(&rec, Some(again)).unwrap();
+    let (spec, _) = restore_decision(&rec, Some(again)).unwrap();
     assert_eq!(spec.peer_agent, AgentId([0x55; 32]));
 
     // An impostor now answers to the name: the pin refuses it and the
@@ -342,7 +374,7 @@ async fn restore_with_a_pin_mismatch_leaves_the_forward_disabled() {
     .await;
     assert_eq!(
         restore_decision(&mrec, Some(ok)).unwrap(),
-        machine_spec(true)
+        machine_spec(true).pair()
     );
 }
 
@@ -369,7 +401,7 @@ async fn after_rename_failure_keeps_add_and_delete_and_reload_agrees() {
     // Before the rename, disk and memory stay on the old set.
     {
         let seam = crate::storage::arm_fail_durable_before_rename_for_testing(&path);
-        let err = store.remember(&first).await.unwrap_err();
+        let err = first.remember(&store).await.unwrap_err();
         assert!(
             matches!(err, ForwardStoreError::Write(_)),
             "before-rename must not install: {err}"
@@ -381,27 +413,27 @@ async fn after_rename_failure_keeps_add_and_delete_and_reload_agrees() {
     assert!(!path.exists(), "a before-rename failure must not publish");
 
     let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
-    let added = store.remember(&first).await;
+    let added = first.remember(&store).await;
     assert_unconfirmed(&added);
     assert_eq!(store.records().await.unwrap(), vec![record(&first)]);
 
     // Identical retry while fsync still fails must not ACK.
-    let retry_add = store.remember(&first).await;
+    let retry_add = first.remember(&store).await;
     assert_unconfirmed(&retry_add);
     assert_eq!(store.records().await.unwrap(), vec![record(&first)]);
 
     // A second add under the same fault keeps both records (memory == disk).
-    let added_second = store.remember(&second).await;
+    let added_second = second.remember(&store).await;
     assert_unconfirmed(&added_second);
     assert_eq!(
         store.records().await.unwrap(),
         vec![record(&first), record(&second)]
     );
 
-    let deleted = store.forget(first.local_addr).await;
+    let deleted = store.forget(first.spec.local_addr).await;
     assert_unconfirmed(&deleted);
     assert_eq!(store.records().await.unwrap(), vec![record(&second)]);
-    let retry_delete = store.forget(first.local_addr).await;
+    let retry_delete = store.forget(first.spec.local_addr).await;
     assert_unconfirmed(&retry_delete);
     assert_eq!(
         store.records().await.unwrap(),
@@ -418,11 +450,11 @@ async fn after_rename_failure_keeps_add_and_delete_and_reload_agrees() {
     );
 
     assert!(
-        !store.remember(&second).await.unwrap(),
+        !second.remember(&store).await.unwrap(),
         "durability retry of an identical record ACKs only after the fault drops"
     );
     assert!(
-        !store.forget(first.local_addr).await.unwrap(),
+        !store.forget(first.spec.local_addr).await.unwrap(),
         "the deleted id stays gone once durability is confirmed"
     );
     let reloaded = ForwardStore::load(path).await;
@@ -446,7 +478,7 @@ async fn reload_keeps_pending_durability_until_directory_sync() {
     let store = ForwardStore::load(path.clone()).await;
     let spec = agent_spec(18022);
     let seam = crate::storage::arm_fail_parent_dir_fsync_for_testing(&path);
-    let added = store.remember(&spec).await;
+    let added = spec.remember(&store).await;
     assert_unconfirmed(&added);
     assert!(
         store.pending_durability.load(Ordering::Acquire),
@@ -464,13 +496,13 @@ async fn reload_keeps_pending_durability_until_directory_sync() {
         "reload must not forget an unconfirmed directory sync"
     );
     assert_eq!(reloaded.records().await.unwrap(), vec![record(&spec)]);
-    let retry = reloaded.remember(&spec).await;
+    let retry = spec.remember(&reloaded).await;
     assert_unconfirmed(&retry);
     assert!(reloaded.pending_durability.load(Ordering::Acquire));
 
     drop(seam);
     assert!(
-        !reloaded.remember(&spec).await.unwrap(),
+        !spec.remember(&reloaded).await.unwrap(),
         "an identical remember ACKs only after the directory sync succeeds"
     );
     assert!(

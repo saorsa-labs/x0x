@@ -78,7 +78,7 @@ pub(in crate::server) async fn forward_add(
     Extension(actor): Extension<ActorContext>,
     Json(req): Json<ForwardAddRequest>,
 ) -> impl IntoResponse {
-    use x0x::forward::ForwardSpec;
+    use x0x::forward::{ForwardBinding, ForwardSpec};
     use x0x::names::{NameKind, PeerRef};
     if !actor.is_durable_owner() {
         return durable_forbidden();
@@ -140,12 +140,14 @@ pub(in crate::server) async fn forward_add(
         peer_agent,
         target_host: req.target_host,
         target_port: req.target_port,
+    };
+    let binding = ForwardBinding {
         name: name.clone(),
         kind,
         pinned_machine,
         persistent: !req.ephemeral,
     };
-    let bound = match commit_forward(&state.forwards, forwarder, spec).await {
+    let bound = match commit_forward(&state.forwards, forwarder, spec, binding).await {
         Ok(bound) => bound,
         Err(CommitError::Store(e)) => return store_error_response(&e),
         Err(CommitError::Bind(e)) => {
@@ -197,15 +199,18 @@ async fn commit_forward(
     store: &Arc<x0x::forward::store::ForwardStore>,
     forwarder: &Arc<x0x::forward::ForwardService>,
     spec: x0x::forward::ForwardSpec,
+    binding: x0x::forward::ForwardBinding,
 ) -> Result<SocketAddr, CommitError> {
-    if let Err(e) = store.check(&spec) {
+    if let Err(e) = store.check(&spec, &binding) {
         return Err(CommitError::Store(e));
     }
     let store = Arc::clone(store);
     let forwarder = Arc::clone(forwarder);
     let task_forwarder = Arc::clone(&forwarder);
     match forwarder
-        .run_transaction(async move { commit_forward_locked(&store, &task_forwarder, spec).await })
+        .run_transaction(async move {
+            commit_forward_locked(&store, &task_forwarder, spec, binding).await
+        })
         .await
     {
         Ok(result) => result,
@@ -219,10 +224,11 @@ async fn commit_forward_locked(
     store: &x0x::forward::store::ForwardStore,
     forwarder: &x0x::forward::ForwardService,
     spec: x0x::forward::ForwardSpec,
+    binding: x0x::forward::ForwardBinding,
 ) -> Result<SocketAddr, CommitError> {
     let _ops = store.lock_ops().await;
     let previous = forwarder
-        .list_forwards()
+        .list_forward_status()
         .into_iter()
         .find(|status| status.spec.local_addr == spec.local_addr);
     let allocating = spec.local_addr.port() == 0;
@@ -237,7 +243,10 @@ async fn commit_forward_locked(
                 ),
             ));
         }
-        match forwarder.add_forward(spec.clone()).await {
+        match forwarder
+            .add_forward_with(spec.clone(), binding.clone())
+            .await
+        {
             Err(error) if allocating && x0x::forward::is_port_allocation_collision(&error) => {
                 continue;
             }
@@ -249,7 +258,7 @@ async fn commit_forward_locked(
                 // An unreadable store has no saved ports. An ephemeral add
                 // already skips the record update in that case, so the
                 // allocation must not fail closed on `records()` either.
-                if spec.persistent || store.load_error().is_none() {
+                if binding.persistent || store.load_error().is_none() {
                     let saved = match store.records().await {
                         Ok(records) => records,
                         Err(error) => {
@@ -274,8 +283,8 @@ async fn commit_forward_locked(
     forwarder.release_allocation_holds();
     let mut registered = spec;
     registered.local_addr = bound;
-    let persisted = if registered.persistent {
-        store.remember(&registered).await.map(|_| ())
+    let persisted = if binding.persistent {
+        store.remember(&registered, &binding).await.map(|_| ())
     } else if store.load_error().is_some() {
         Ok(())
     } else {
@@ -288,7 +297,7 @@ async fn commit_forward_locked(
             forwarder.remove_forward(bound);
             if let Some(prev) = previous.filter(|status| status.spec.local_addr == bound) {
                 if let Some(reason) = prev.error {
-                    forwarder.add_disabled(prev.spec, reason);
+                    forwarder.add_disabled(prev.spec, prev.binding, reason);
                 }
             }
         }
@@ -299,15 +308,16 @@ async fn commit_forward_locked(
 
 fn forward_json(status: &x0x::forward::ForwardStatus) -> serde_json::Value {
     let s = &status.spec;
+    let binding = &status.binding;
     serde_json::json!({
         "local_addr": s.local_addr.to_string(),
         "peer_agent": s.peer_agent_hex(),
         "target_host": s.target_host,
         "target_port": s.target_port,
-        "name": s.name,
-        "kind": s.kind.as_str(),
-        "pinned_machine_id": s.pinned_machine.map(|m| hex::encode(m.as_bytes())),
-        "persistent": s.persistent,
+        "name": binding.name,
+        "kind": binding.kind.as_str(),
+        "pinned_machine_id": binding.pinned_machine.map(|m| hex::encode(m.as_bytes())),
+        "persistent": binding.persistent,
         "enabled": status.error.is_none(),
         "error": status.error,
     })
@@ -321,7 +331,7 @@ pub(in crate::server) async fn forward_list(
     let forwards: Vec<serde_json::Value> = state
         .forward_service
         .as_ref()
-        .map(|f| f.list_forwards().iter().map(forward_json).collect())
+        .map(|f| f.list_forward_status().iter().map(forward_json).collect())
         .unwrap_or_default();
     (
         StatusCode::OK,
@@ -449,9 +459,9 @@ async fn remove_persisted_locked(
 ) -> Result<bool, x0x::forward::store::ForwardStoreError> {
     let _ops = store.lock_ops().await;
     let live_persistent = forwarder
-        .list_forwards()
+        .list_forward_status()
         .into_iter()
-        .any(|status| status.spec.local_addr == addr && status.spec.persistent);
+        .any(|status| status.spec.local_addr == addr && status.binding.persistent);
     if store.load_error().is_some() && !live_persistent {
         return Ok(forwarder.remove_forward(addr));
     }
@@ -488,8 +498,8 @@ async fn install_restored(
     record: &x0x::forward::store::ForwardRecord,
     resolution: Option<Result<x0x::names::Resolved, x0x::names::NameError>>,
 ) -> bool {
-    let spec = match x0x::forward::store::restore_decision(record, resolution) {
-        Ok(spec) => spec,
+    let (spec, binding) = match x0x::forward::store::restore_decision(record, resolution) {
+        Ok(parts) => parts,
         Err(reason) => {
             tracing::warn!(
                 target: "x0x::forward",
@@ -497,11 +507,14 @@ async fn install_restored(
                 %reason,
                 "persisted forward stays down"
             );
-            forwarder.add_disabled(record.to_spec(), reason);
+            forwarder.add_disabled(record.to_spec(), record.binding(), reason);
             return false;
         }
     };
-    match forwarder.add_forward(spec.clone()).await {
+    match forwarder
+        .add_forward_with(spec.clone(), binding.clone())
+        .await
+    {
         Ok(_) => true,
         Err(e) => {
             let reason = format!("bind_failed: {e}");
@@ -511,7 +524,7 @@ async fn install_restored(
                 %reason,
                 "persisted forward stays down"
             );
-            forwarder.add_disabled(spec, reason);
+            forwarder.add_disabled(spec, binding, reason);
             false
         }
     }
@@ -537,7 +550,7 @@ where
         }
     };
     let listening: std::collections::BTreeSet<SocketAddr> = forwarder
-        .list_forwards()
+        .list_forward_status()
         .iter()
         .filter(|f| f.error.is_none())
         .map(|f| f.spec.local_addr)
@@ -651,7 +664,7 @@ mod tests {
     use super::*;
     use x0x::connect::{ConnectDiagnostics, ConnectPolicy};
     use x0x::forward::store::ForwardStore;
-    use x0x::forward::{ForwardService, ForwardSpec};
+    use x0x::forward::{ForwardBinding, ForwardService, ForwardSpec};
     use x0x::identity::{AgentId, MachineId};
     use x0x::names::NameKind;
 
@@ -741,17 +754,34 @@ mod tests {
         }
     }
 
-    fn hex_spec(addr: SocketAddr) -> ForwardSpec {
-        ForwardSpec {
-            local_addr: addr,
-            peer_agent: AgentId([0x55; 32]),
-            target_host: "127.0.0.1".to_string(),
-            target_port: 9,
-            name: None,
-            kind: NameKind::Agent,
-            pinned_machine: Some(MachineId([0x11; 32])),
-            persistent: true,
+    #[derive(Clone)]
+    struct Reg {
+        spec: ForwardSpec,
+        binding: ForwardBinding,
+    }
+
+    fn hex_spec(addr: SocketAddr) -> Reg {
+        Reg {
+            spec: ForwardSpec {
+                local_addr: addr,
+                peer_agent: AgentId([0x55; 32]),
+                target_host: "127.0.0.1".to_string(),
+                target_port: 9,
+            },
+            binding: ForwardBinding {
+                name: None,
+                kind: NameKind::Agent,
+                pinned_machine: Some(MachineId([0x11; 32])),
+                persistent: true,
+            },
         }
+    }
+
+    async fn remember_reg(
+        store: &ForwardStore,
+        reg: &Reg,
+    ) -> Result<bool, x0x::forward::store::ForwardStoreError> {
+        store.remember(&reg.spec, &reg.binding).await
     }
 
     /// WHY: a persisted agent forward must pin the machine the outbound
@@ -807,7 +837,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(ForwardStore::load(ForwardStore::path_in(dir.path())).await);
         let addr = free_loopback().await;
-        assert!(store.remember(&hex_spec(addr)).await.expect("remember"));
+        assert!(remember_reg(&store, &hex_spec(addr))
+            .await
+            .expect("remember"));
 
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -873,15 +905,19 @@ mod tests {
         let store = Arc::new(ForwardStore::load(path.clone()).await);
         let addr = free_loopback().await;
         let mut persistent = hex_spec(addr);
-        persistent.target_port = 59991;
-        assert!(store.remember(&persistent).await.expect("remember"));
-        forwarder.add_disabled(persistent.clone(), "name_changed: test".to_string());
+        persistent.spec.target_port = 59991;
+        assert!(remember_reg(&store, &persistent).await.expect("remember"));
+        forwarder.add_disabled(
+            persistent.spec.clone(),
+            persistent.binding.clone(),
+            "name_changed: test".to_string(),
+        );
 
         let mut ephemeral = persistent.clone();
-        ephemeral.persistent = false;
-        ephemeral.pinned_machine = None;
-        ephemeral.target_port = 7;
-        let bound = commit_forward(&store, &forwarder, ephemeral)
+        ephemeral.binding.persistent = false;
+        ephemeral.binding.pinned_machine = None;
+        ephemeral.spec.target_port = 7;
+        let bound = commit_forward(&store, &forwarder, ephemeral.spec, ephemeral.binding)
             .await
             .expect("ephemeral add");
         assert_eq!(bound, addr);
@@ -889,9 +925,11 @@ mod tests {
             store.records().await.expect("records").is_empty(),
             "the disabled persistent record must leave disk"
         );
-        let live = forwarder.forward_at(addr).expect("ephemeral is registered");
-        assert!(!live.persistent);
-        assert_eq!(live.target_port, 7);
+        let live = forwarder
+            .forward_status_at(addr)
+            .expect("ephemeral is registered");
+        assert!(!live.binding.persistent);
+        assert_eq!(live.spec.target_port, 7);
         forwarder.shutdown();
 
         let (agent, _agent_dir) = offline_agent().await;
@@ -927,21 +965,30 @@ mod tests {
         let store = Arc::new(ForwardStore::load(path.clone()).await);
         let addr = free_loopback().await;
         let mut persistent = hex_spec(addr);
-        persistent.target_port = 59991;
-        assert!(store.remember(&persistent).await.expect("remember"));
-        forwarder.add_disabled(persistent.clone(), "name_changed: test".to_string());
+        persistent.spec.target_port = 59991;
+        assert!(remember_reg(&store, &persistent).await.expect("remember"));
+        forwarder.add_disabled(
+            persistent.spec.clone(),
+            persistent.binding.clone(),
+            "name_changed: test".to_string(),
+        );
 
         let mut ephemeral = persistent.clone();
-        ephemeral.persistent = false;
-        ephemeral.pinned_machine = None;
-        ephemeral.target_port = 7;
+        ephemeral.binding.persistent = false;
+        ephemeral.binding.pinned_machine = None;
+        ephemeral.spec.target_port = 7;
         let pause = x0x::storage::arm_durable_rename_pause_for_testing(&path);
         let store_add = Arc::clone(&store);
         let forwarder_add = Arc::clone(&forwarder);
-        let add =
-            tokio::spawn(
-                async move { commit_forward(&store_add, &forwarder_add, ephemeral).await },
-            );
+        let add = tokio::spawn(async move {
+            commit_forward(
+                &store_add,
+                &forwarder_add,
+                ephemeral.spec,
+                ephemeral.binding,
+            )
+            .await
+        });
         let start = std::time::Instant::now();
         while !x0x::storage::durable_rename_pause_entered_for_testing(&path) {
             if start.elapsed() > std::time::Duration::from_secs(5) {
@@ -949,9 +996,11 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        let live = forwarder.forward_at(addr).expect("listener is already up");
-        assert!(!live.persistent);
-        assert_eq!(live.target_port, 7);
+        let live = forwarder
+            .forward_status_at(addr)
+            .expect("listener is already up");
+        assert!(!live.binding.persistent);
+        assert_eq!(live.spec.target_port, 7);
         let saved = std::fs::read_to_string(&path).expect("forwards.json");
         assert!(
             saved.contains("59991"),
@@ -970,11 +1019,11 @@ mod tests {
         let start = std::time::Instant::now();
         loop {
             let saved_records = store.records().await.expect("records");
-            let live = forwarder.forward_at(addr);
+            let live = forwarder.forward_status_at(addr);
             if saved_records.is_empty()
                 && matches!(
                     &live,
-                    Some(spec) if !spec.persistent && spec.target_port == 7
+                    Some(status) if !status.binding.persistent && status.spec.target_port == 7
                 )
             {
                 break;
@@ -1010,10 +1059,10 @@ mod tests {
         let path = ForwardStore::path_in(dir.path());
         let store = Arc::new(ForwardStore::load(path.clone()).await);
         let addr = free_loopback().await;
-        let spec = hex_spec(addr);
+        let reg = hex_spec(addr);
 
         let seam = x0x::storage::arm_fail_parent_dir_fsync_for_testing(&path);
-        let err = commit_forward(&store, &forwarder, spec.clone())
+        let err = commit_forward(&store, &forwarder, reg.spec.clone(), reg.binding.clone())
             .await
             .expect_err("add must not ACK");
         assert!(
@@ -1034,7 +1083,7 @@ mod tests {
         // The port is already bound, so the durability retry is the store
         // write, not a second bind.
         let retry = store
-            .remember(&spec)
+            .remember(&reg.spec, &reg.binding)
             .await
             .expect_err("retry under the fault must not ACK");
         assert!(retry.durability_unconfirmed());
@@ -1084,8 +1133,7 @@ mod tests {
         let store = Arc::new(ForwardStore::load(path.clone()).await);
 
         let restore_addr = free_loopback().await;
-        assert!(store
-            .remember(&hex_spec(restore_addr))
+        assert!(remember_reg(&store, &hex_spec(restore_addr))
             .await
             .expect("remember"));
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -1120,9 +1168,10 @@ mod tests {
         let pause = x0x::storage::arm_durable_rename_pause_for_testing(&path);
         let store_add = Arc::clone(&store);
         let forwarder_add = Arc::clone(&forwarder);
-        let spec = hex_spec(add_addr);
-        let add =
-            tokio::spawn(async move { commit_forward(&store_add, &forwarder_add, spec).await });
+        let reg = hex_spec(add_addr);
+        let add = tokio::spawn(async move {
+            commit_forward(&store_add, &forwarder_add, reg.spec, reg.binding).await
+        });
         let start = std::time::Instant::now();
         while !x0x::storage::durable_rename_pause_entered_for_testing(&path) {
             if start.elapsed() > std::time::Duration::from_secs(5) {
@@ -1160,8 +1209,9 @@ mod tests {
         let pause = x0x::storage::arm_durable_rename_pause_for_testing(&path);
         let store_add = Arc::clone(&store);
         let forwarder_add = Arc::clone(&forwarder);
+        let reg = hex_spec(addr);
         let add = tokio::spawn(async move {
-            commit_forward(&store_add, &forwarder_add, hex_spec(addr)).await
+            commit_forward(&store_add, &forwarder_add, reg.spec, reg.binding).await
         });
         let start = std::time::Instant::now();
         while !x0x::storage::durable_rename_pause_entered_for_testing(&path) {
@@ -1195,13 +1245,12 @@ mod tests {
         let store = Arc::new(ForwardStore::load(path).await);
         let saved_addr = free_loopback().await;
         let saved = hex_spec(saved_addr);
-        assert!(store.remember(&saved).await.expect("remember saved"));
-        forwarder.add_disabled(saved, "name_changed".to_string());
+        assert!(remember_reg(&store, &saved).await.expect("remember saved"));
+        forwarder.add_disabled(saved.spec, saved.binding, "name_changed".to_string());
         let fresh = free_loopback().await;
         forwarder.script_binds_for_test(vec![saved_addr, fresh]);
-        let mut spec = hex_spec(SocketAddr::from(([127, 0, 0, 1], 0)));
-        spec.persistent = true;
-        let bound = commit_forward(&store, &forwarder, spec)
+        let spec = hex_spec(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let bound = commit_forward(&store, &forwarder, spec.spec, spec.binding)
             .await
             .expect("allocation skips the saved port");
         assert_eq!(bound, fresh);
@@ -1211,7 +1260,7 @@ mod tests {
             "the saved forward is still on disk: {records:?}"
         );
         assert!(records.iter().any(|record| record.local_addr == fresh));
-        let listed = forwarder.list_forwards();
+        let listed = forwarder.list_forward_status();
         assert!(
             listed
                 .iter()
@@ -1240,9 +1289,9 @@ mod tests {
 
         let addr = free_loopback().await;
         let mut ephemeral = hex_spec(addr);
-        ephemeral.persistent = false;
-        ephemeral.pinned_machine = None;
-        let bound = commit_forward(&store, &forwarder, ephemeral)
+        ephemeral.binding.persistent = false;
+        ephemeral.binding.pinned_machine = None;
+        let bound = commit_forward(&store, &forwarder, ephemeral.spec, ephemeral.binding)
             .await
             .expect("ephemeral add against a corrupt store");
         assert_eq!(bound, addr);
@@ -1257,7 +1306,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read"), original);
 
         let persistent = hex_spec(addr);
-        let err = commit_forward(&store, &forwarder, persistent)
+        let err = commit_forward(&store, &forwarder, persistent.spec, persistent.binding)
             .await
             .expect_err("persistent add stays fail-closed");
         assert!(matches!(
@@ -1270,7 +1319,7 @@ mod tests {
         let addr_persistent = free_loopback().await;
         let live = hex_spec(addr_persistent);
         forwarder
-            .add_forward(live)
+            .add_forward_with(live.spec, live.binding)
             .await
             .expect("register a persistent listener without the store");
         let err = remove_persisted(&store, &forwarder, addr_persistent)
@@ -1301,9 +1350,9 @@ mod tests {
         assert!(store.load_error().is_some());
 
         let mut ephemeral = hex_spec("127.0.0.1:0".parse().expect("unbound loopback"));
-        ephemeral.persistent = false;
-        ephemeral.pinned_machine = None;
-        let bound = commit_forward(&store, &forwarder, ephemeral)
+        ephemeral.binding.persistent = false;
+        ephemeral.binding.pinned_machine = None;
+        let bound = commit_forward(&store, &forwarder, ephemeral.spec, ephemeral.binding)
             .await
             .expect("ephemeral :0 add against a corrupt store");
         assert_ne!(bound.port(), 0);
@@ -1322,11 +1371,11 @@ mod tests {
         let path = ForwardStore::path_in(dir.path());
         let addr = free_loopback().await;
         let mut spec = hex_spec(addr);
-        spec.name = Some("machine:box.me".to_string());
-        spec.kind = NameKind::Machine;
+        spec.binding.name = Some("machine:box.me".to_string());
+        spec.binding.kind = NameKind::Machine;
         {
             let store = ForwardStore::load(path.clone()).await;
-            assert!(store.remember(&spec).await.expect("save"));
+            assert!(remember_reg(&store, &spec).await.expect("save"));
         }
         let store = ForwardStore::load(path).await;
         let records = store.records().await.expect("records");
@@ -1343,11 +1392,11 @@ mod tests {
             install_restored(&forwarder, record, Some(Ok(resolved))).await,
             "restore must bind the saved forward"
         );
-        let listed = forwarder.list_forwards();
+        let listed = forwarder.list_forward_status();
         assert!(
             listed.iter().any(|status| {
                 status.spec.local_addr == addr
-                    && status.spec.pinned_machine == Some(MachineId([0x11; 32]))
+                    && status.binding.pinned_machine == Some(MachineId([0x11; 32]))
                     && status.error.is_none()
             }),
             "the restored forward is listening with its pin: {listed:?}"

@@ -1766,6 +1766,26 @@ impl crate::Agent {
         self.resolve_name_opts(names, devices, name, false).await
     }
 
+    /// Resolve for `POST /forwards`: refuse a machine target before pinning
+    /// so a refused forward does not write `names.json`.
+    ///
+    /// Machine names are valid forward targets. Call [`Self::resolve_name`].
+    ///
+    /// # Errors
+    /// Any [`NameError`], including [`NameError::MachineTargetUnsupported`].
+    #[deprecated(
+        since = "0.48.1",
+        note = "use `resolve_name`; machine targets are valid forwards"
+    )]
+    pub async fn resolve_name_for_forward(
+        &self,
+        names: &NameStore,
+        devices: Option<&crate::owner_sync::OwnerSyncStore>,
+        name: &NameRef,
+    ) -> Result<Resolved, NameError> {
+        self.resolve_name_opts(names, devices, name, true).await
+    }
+
     async fn resolve_name_opts(
         &self,
         names: &NameStore,

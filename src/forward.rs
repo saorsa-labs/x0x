@@ -1571,6 +1571,10 @@ impl ForwardConfig {
 // ===========================================================================
 
 /// A registered local forward (`forward add`).
+///
+/// The fields are the pre-ADR-0074 set, so an existing struct literal keeps
+/// compiling. Name, machine pin, and persistence travel in
+/// [`ForwardBinding`], beside this spec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ForwardSpec {
     /// Local loopback address the daemon binds (`127.0.0.1:PORT`).
@@ -1581,6 +1585,15 @@ pub struct ForwardSpec {
     pub target_host: String,
     /// Loopback target port.
     pub target_port: u16,
+}
+
+/// Name, machine pin, and persistence for one forward.
+///
+/// [`ForwardService::add_forward`] uses [`ForwardBinding::ephemeral`].
+/// Callers that persist a forward or pin its machine pass this value to
+/// [`ForwardService::add_forward_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardBinding {
     /// Canonical kind-prefixed name, or `None` for a hex peer.
     pub name: Option<String>,
     /// Agent or machine target (meaningful with `name`).
@@ -1593,6 +1606,25 @@ pub struct ForwardSpec {
     /// Persisted in `forwards.json` (ADR-0074 §2); `false` for
     /// `--ephemeral` forwards.
     pub persistent: bool,
+}
+
+impl ForwardBinding {
+    /// No name, no machine pin, and not written to `forwards.json`.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        Self {
+            name: None,
+            kind: crate::names::NameKind::Agent,
+            pinned_machine: None,
+            persistent: false,
+        }
+    }
+}
+
+impl Default for ForwardBinding {
+    fn default() -> Self {
+        Self::ephemeral()
+    }
 }
 
 impl ForwardSpec {
@@ -1610,6 +1642,8 @@ impl ForwardSpec {
 pub struct ForwardStatus {
     /// The forward.
     pub spec: ForwardSpec,
+    /// Name, machine pin, and persistence. Not part of [`ForwardSpec`].
+    pub binding: ForwardBinding,
     /// `None` while listening; otherwise why the forward is down.
     pub error: Option<String>,
 }
@@ -1626,6 +1660,7 @@ enum EntryState {
 /// A registered forward + its state (internal).
 struct ForwardEntry {
     spec: ForwardSpec,
+    binding: ForwardBinding,
     state: EntryState,
 }
 
@@ -2054,7 +2089,25 @@ impl ForwardService {
     /// `NetworkError` if the local listener cannot be bound, or if the
     /// forwarder has shut down. A shutdown that wins the race drops the
     /// socket before this returns; it does not publish a listener.
+    ///
+    /// The forward is ephemeral: no name, no machine pin, and it is not
+    /// written to `forwards.json`. Use [`Self::add_forward_with`] to pin
+    /// or persist.
     pub async fn add_forward(&self, spec: ForwardSpec) -> NetworkResult<SocketAddr> {
+        self.add_forward_with(spec, ForwardBinding::ephemeral())
+            .await
+    }
+
+    /// [`Self::add_forward`] with the name, machine pin, and persistence
+    /// carried in `binding`.
+    ///
+    /// # Errors
+    /// Same as [`Self::add_forward`].
+    pub async fn add_forward_with(
+        &self,
+        spec: ForwardSpec,
+        binding: ForwardBinding,
+    ) -> NetworkResult<SocketAddr> {
         if self.listeners_closed.load(Ordering::Acquire) {
             return Err(NetworkError::ConnectionFailed(
                 "forwarder is shut down".to_string(),
@@ -2110,8 +2163,10 @@ impl ForwardService {
             // A prior disabled entry for this address (restore that failed,
             // then a successful re-add) is replaced.
             forwards.retain(|e| e.spec.local_addr != bound);
+            let pinned_machine = binding.pinned_machine;
             forwards.push(ForwardEntry {
                 spec: registered_spec,
+                binding,
                 state: EntryState::Active(cancel.clone()),
             });
             let agent = Arc::clone(&self.agent);
@@ -2120,7 +2175,7 @@ impl ForwardService {
             let per_peer = Arc::clone(&self.per_peer);
             let target = OutboundTarget {
                 peer_agent: spec.peer_agent,
-                pinned_machine: spec.pinned_machine,
+                pinned_machine,
                 target_host: spec.target_host.clone(),
                 target_port: spec.target_port,
             };
@@ -2188,12 +2243,13 @@ impl ForwardService {
         Ok(accept)
     }
 
-    /// Register `spec` as a forward that is down for `reason` (ADR-0074 §2:
-    /// a restored forward whose name did not re-resolve to its pinned ids,
-    /// or whose port could not be bound). It is listed with its reason and
-    /// never listens; a later successful [`Self::add_forward`] for the same
-    /// address replaces it. An active forward on that address is left alone.
-    pub fn add_disabled(&self, spec: ForwardSpec, reason: String) {
+    /// Register `spec` and `binding` as a forward that is down for `reason`
+    /// (ADR-0074 §2: a restored forward whose name did not re-resolve to its
+    /// pinned ids, or whose port could not be bound). It is listed with its
+    /// reason and never listens; a later successful [`Self::add_forward`]
+    /// for the same address replaces it. An active forward on that address
+    /// is left alone.
+    pub fn add_disabled(&self, spec: ForwardSpec, binding: ForwardBinding, reason: String) {
         if let Ok(mut forwards) = self.forwards.lock() {
             if forwards.iter().any(|e| {
                 e.spec.local_addr == spec.local_addr && matches!(e.state, EntryState::Active(_))
@@ -2203,20 +2259,36 @@ impl ForwardService {
             forwards.retain(|e| e.spec.local_addr != spec.local_addr);
             forwards.push(ForwardEntry {
                 spec,
+                binding,
                 state: EntryState::Disabled(reason),
             });
         }
     }
 
-    /// Snapshot of registered forwards (for `GET /forwards` / `x0x forward list`).
+    /// Snapshot of registered forward specs.
+    ///
+    /// This is the pre-ADR-0074 return type. Name, machine pin, persistence,
+    /// and a down reason are on [`Self::list_forward_status`].
     #[must_use]
-    pub fn list_forwards(&self) -> Vec<ForwardStatus> {
+    pub fn list_forwards(&self) -> Vec<ForwardSpec> {
+        self.list_forward_status()
+            .into_iter()
+            .map(|status| status.spec)
+            .collect()
+    }
+
+    /// Snapshot of registered forwards, including ones that are down.
+    ///
+    /// `GET /forwards` uses this. `error` is `None` while the listener is up.
+    #[must_use]
+    pub fn list_forward_status(&self) -> Vec<ForwardStatus> {
         self.forwards
             .lock()
             .map(|f| {
                 f.iter()
                     .map(|e| ForwardStatus {
                         spec: e.spec.clone(),
+                        binding: e.binding.clone(),
                         error: match &e.state {
                             EntryState::Active(_) => None,
                             EntryState::Disabled(reason) => Some(reason.clone()),
@@ -2230,10 +2302,24 @@ impl ForwardService {
     /// The registered forward bound to `local_addr`, if any.
     #[must_use]
     pub fn forward_at(&self, local_addr: SocketAddr) -> Option<ForwardSpec> {
+        self.forward_status_at(local_addr).map(|status| status.spec)
+    }
+
+    /// The registered forward bound to `local_addr`, including its binding
+    /// and down reason.
+    #[must_use]
+    pub fn forward_status_at(&self, local_addr: SocketAddr) -> Option<ForwardStatus> {
         self.forwards.lock().ok().and_then(|f| {
             f.iter()
                 .find(|e| e.spec.local_addr == local_addr)
-                .map(|e| e.spec.clone())
+                .map(|e| ForwardStatus {
+                    spec: e.spec.clone(),
+                    binding: e.binding.clone(),
+                    error: match &e.state {
+                        EntryState::Active(_) => None,
+                        EntryState::Disabled(reason) => Some(reason.clone()),
+                    },
+                })
         })
     }
 
@@ -4568,10 +4654,6 @@ mod tests {
             peer_agent,
             target_host: "127.0.0.1".to_string(),
             target_port: 9,
-            name: None,
-            kind: crate::names::NameKind::Agent,
-            pinned_machine: None,
-            persistent: false,
         };
 
         let first = service.add_forward(spec(peer)).await.expect("first bind");
@@ -4580,8 +4662,8 @@ mod tests {
         assert!(first.port() != 0 && second.port() != 0);
         let listed = service.list_forwards();
         assert_eq!(listed.len(), 2);
-        assert!(listed.iter().any(|entry| entry.spec.local_addr == first));
-        assert!(listed.iter().any(|entry| entry.spec.local_addr == second));
+        assert!(listed.iter().any(|entry| entry.local_addr == first));
+        assert!(listed.iter().any(|entry| entry.local_addr == second));
 
         assert!(service.remove_forward(first));
         assert!(!service.remove_forward(first));
@@ -4629,10 +4711,6 @@ mod tests {
             peer_agent: AgentId([7; 32]),
             target_host: "127.0.0.1".to_string(),
             target_port: 9,
-            name: None,
-            kind: crate::names::NameKind::Agent,
-            pinned_machine: None,
-            persistent: false,
         };
 
         for _ in 0..24 {
@@ -5773,16 +5851,20 @@ mod tests {
         let wrong = MachineId([0xEE; 32]);
         assert_ne!(wrong, bob.machine_id());
         let bound = alice_fwd
-            .add_forward(ForwardSpec {
-                local_addr: "127.0.0.1:0".parse().expect("loopback"),
-                peer_agent: bob.agent_id(),
-                target_host: "127.0.0.1".to_string(),
-                target_port,
-                name: Some("machine:box.me".to_string()),
-                kind: crate::names::NameKind::Machine,
-                pinned_machine: Some(wrong),
-                persistent: true,
-            })
+            .add_forward_with(
+                ForwardSpec {
+                    local_addr: "127.0.0.1:0".parse().expect("loopback"),
+                    peer_agent: bob.agent_id(),
+                    target_host: "127.0.0.1".to_string(),
+                    target_port,
+                },
+                ForwardBinding {
+                    name: Some("machine:box.me".to_string()),
+                    kind: crate::names::NameKind::Machine,
+                    pinned_machine: Some(wrong),
+                    persistent: true,
+                },
+            )
             .await
             .expect("listener");
         let mut client = TcpStream::connect(bound).await.expect("local client");

@@ -751,12 +751,14 @@ async fn forward_delete_refuses_session_and_rider_and_accepts_durable_owner() ->
         peer_agent: x0x::identity::AgentId([0x55; 32]),
         target_host: "127.0.0.1".to_string(),
         target_port: 9,
+    };
+    let binding = x0x::forward::ForwardBinding {
         name: None,
         kind: x0x::names::NameKind::Agent,
         pinned_machine: Some(x0x::identity::MachineId([0x11; 32])),
         persistent: true,
     };
-    assert!(state.forwards.remember(&spec).await?);
+    assert!(state.forwards.remember(&spec, &binding).await?);
     let policy = Arc::new(x0x::connect::ConnectPolicy::default());
     let diagnostics = Arc::new(x0x::connect::ConnectDiagnostics::new(policy.summary()));
     let forwarder = Arc::new(
@@ -764,7 +766,7 @@ async fn forward_delete_refuses_session_and_rider_and_accepts_durable_owner() ->
             .map_err(|e| anyhow::anyhow!("forwarder: {e}"))?,
     );
     forwarder
-        .add_forward(spec)
+        .add_forward_with(spec, binding)
         .await
         .map_err(|e| anyhow::anyhow!("bind: {e}"))?;
     state.forward_service = Some(Arc::clone(&forwarder));

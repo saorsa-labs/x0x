@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::ForwardSpec;
+use super::{ForwardBinding, ForwardSpec};
 use crate::identity::{AgentId, MachineId};
 use crate::names::{NameError, NameKind, NameRef, Resolved};
 
@@ -110,18 +110,21 @@ impl ForwardRecord {
     /// # Errors
     /// [`ForwardStoreError::Unpinned`] for a persistent forward without a
     /// pinned machine.
-    pub fn from_spec(spec: &ForwardSpec) -> Result<Option<Self>, ForwardStoreError> {
-        if !spec.persistent {
+    pub fn from_spec(
+        spec: &ForwardSpec,
+        binding: &ForwardBinding,
+    ) -> Result<Option<Self>, ForwardStoreError> {
+        if !binding.persistent {
             return Ok(None);
         }
-        let pinned_machine_id = spec
+        let pinned_machine_id = binding
             .pinned_machine
             .ok_or_else(|| ForwardStoreError::Unpinned(spec.local_addr.to_string()))?;
         Ok(Some(Self {
             id: spec.local_addr.to_string(),
             local_addr: spec.local_addr,
-            name: spec.name.clone(),
-            kind: spec.kind,
+            name: binding.name.clone(),
+            kind: binding.kind,
             pinned_agent_id: spec.peer_agent,
             pinned_machine_id,
             target_host: spec.target_host.clone(),
@@ -129,7 +132,7 @@ impl ForwardRecord {
         }))
     }
 
-    /// The forward this record describes (persistent, pinned).
+    /// The tunnel half of this record (the pre-ADR-0074 [`ForwardSpec`]).
     #[must_use]
     pub fn to_spec(&self) -> ForwardSpec {
         ForwardSpec {
@@ -137,6 +140,15 @@ impl ForwardRecord {
             peer_agent: self.pinned_agent_id,
             target_host: self.target_host.clone(),
             target_port: self.target_port,
+        }
+    }
+
+    /// Name, machine pin, and persistence for this record.
+    ///
+    /// A stored record is always persistent and pinned.
+    #[must_use]
+    pub fn binding(&self) -> ForwardBinding {
+        ForwardBinding {
             name: self.name.clone(),
             kind: self.kind,
             pinned_machine: Some(self.pinned_machine_id),
@@ -547,8 +559,12 @@ impl ForwardStore {
     ///
     /// # Errors
     /// `Unusable`, `Unpinned` or `Invalid`.
-    pub fn check(&self, spec: &ForwardSpec) -> Result<(), ForwardStoreError> {
-        let Some(mut record) = ForwardRecord::from_spec(spec)? else {
+    pub fn check(
+        &self,
+        spec: &ForwardSpec,
+        binding: &ForwardBinding,
+    ) -> Result<(), ForwardStoreError> {
+        let Some(mut record) = ForwardRecord::from_spec(spec, binding)? else {
             return Ok(());
         };
         // Before binding, a requested `:0` has no port yet; the kernel
@@ -568,8 +584,12 @@ impl ForwardStore {
     /// `Unusable`, `Unpinned`, `Invalid`, `Full`, `Write` (disk unchanged),
     /// or `Unconfirmed` (the new record is in memory and on disk; durability
     /// is not confirmed).
-    pub async fn remember(&self, spec: &ForwardSpec) -> Result<bool, ForwardStoreError> {
-        let Some(record) = ForwardRecord::from_spec(spec)? else {
+    pub async fn remember(
+        &self,
+        spec: &ForwardSpec,
+        binding: &ForwardBinding,
+    ) -> Result<bool, ForwardStoreError> {
+        let Some(record) = ForwardRecord::from_spec(spec, binding)? else {
             return Ok(false);
         };
         validate(&record)?;
@@ -623,9 +643,9 @@ impl ForwardStore {
 pub fn restore_decision(
     record: &ForwardRecord,
     resolution: Option<Result<Resolved, NameError>>,
-) -> Result<ForwardSpec, String> {
+) -> Result<(ForwardSpec, ForwardBinding), String> {
     let Some(name) = &record.name else {
-        return Ok(record.to_spec());
+        return Ok((record.to_spec(), record.binding()));
     };
     let resolved = match resolution {
         Some(Ok(resolved)) => resolved,
@@ -648,7 +668,7 @@ pub fn restore_decision(
             hex::encode(record.pinned_machine_id.as_bytes()),
         ));
     }
-    Ok(record.to_spec())
+    Ok((record.to_spec(), record.binding()))
 }
 
 #[cfg(test)]
