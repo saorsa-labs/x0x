@@ -2925,28 +2925,12 @@ impl OwnerSyncService {
         // Kind 4: issuance journal lines (latest per agent, owner-scoped).
         if let Some(path) = self.journal_path.as_ref() {
             let owner_hex = hex::encode(owner_kp.user_id().0);
-            let mut latest: BTreeMap<String, crate::profile::IssuedCertRecord> = BTreeMap::new();
-            for record in crate::profile::IssuedCertRecord::load(path).await {
-                if record.user_id != owner_hex {
-                    continue;
-                }
-                let keep = latest
-                    .get(&record.agent_id)
-                    .is_none_or(|old| record.issued_at >= old.issued_at);
-                if keep {
-                    latest.insert(record.agent_id.clone(), record);
-                }
-            }
-            for (agent_hex, record) in latest {
+            let lines = crate::profile::IssuedCertRecord::load(path).await;
+            for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {
                 self.mint_or_log(
                     SyncKind::IssuanceJournal,
                     &agent_hex,
-                    SyncValue::IssuanceJournal {
-                        agent_id: record.agent_id,
-                        cert_digest: record.cert_digest,
-                        issued_at: record.issued_at,
-                        not_after: record.not_after,
-                    },
+                    value,
                     owner_kp,
                     local_machine,
                 )
@@ -3054,16 +3038,22 @@ impl OwnerSyncService {
                 agent_id,
                 cert_digest,
                 issued_at,
-                ..
+                not_after,
             } => {
-                self.apply_journal_line(agent_id, cert_digest, *issued_at);
+                self.apply_journal_line(agent_id, cert_digest, *issued_at, *not_after);
             }
         }
     }
 
     /// Append a synced journal line to the local file when missing
     /// (idempotent; fire-and-forget).
-    fn apply_journal_line(&self, agent_hex: &str, cert_digest: &str, issued_at: u64) {
+    fn apply_journal_line(
+        &self,
+        agent_hex: &str,
+        cert_digest: &str,
+        issued_at: u64,
+        not_after: Option<u64>,
+    ) {
         let Some(path) = self.journal_path.clone() else {
             return;
         };
@@ -3074,26 +3064,18 @@ impl OwnerSyncService {
         let cert_digest = cert_digest.to_string();
         tokio::spawn(async move {
             let existing = crate::profile::IssuedCertRecord::load(&path).await;
-            if existing
-                .iter()
-                .any(|r| r.agent_id == agent_hex && r.cert_digest == cert_digest)
-            {
-                return; // already local
+            // Already local, unless the local line lacks the expiry the
+            // synced value carries (a line from before #1357); the new line
+            // then supplies it (see `latest_journal_values`).
+            if existing.iter().any(|r| {
+                r.agent_id == agent_hex
+                    && r.cert_digest == cert_digest
+                    && (r.not_after.is_some() || not_after.is_none())
+            }) {
+                return;
             }
-            let record = crate::profile::IssuedCertRecord {
-                user_id: owner_hex,
-                agent_id: agent_hex,
-                cert_digest,
-                issued_at,
-                not_after: None,
-                // ADR-0039 fields are not part of the Tier-1 sync value:
-                // a synced line records the issuance fact (digest + time);
-                // mode defaults to Acp (the pre-ADR-0039 line shape) and
-                // no certificate bytes travel Tier 1 (Tier-3 boundary).
-                mode: crate::profile::CertMode::Acp,
-                label: None,
-                cert_b64: None,
-            };
+            let record =
+                synced_journal_line(owner_hex, agent_hex, cert_digest, issued_at, not_after);
             if let Err(e) = crate::profile::IssuedCertRecord::append(&path, &record).await {
                 tracing::warn!(
                     target: "x0x::owner_sync",
@@ -3121,6 +3103,78 @@ impl OwnerSyncService {
             self.sync_all().await;
         }
     }
+}
+
+/// The local journal line for a synced `IssuanceJournal` value. It keeps
+/// the value's `not_after`: a line without it would make this device mint
+/// a different value for the same key (#1357, see
+/// [`latest_journal_values`]).
+fn synced_journal_line(
+    owner_hex: String,
+    agent_hex: String,
+    cert_digest: String,
+    issued_at: u64,
+    not_after: Option<u64>,
+) -> crate::profile::IssuedCertRecord {
+    crate::profile::IssuedCertRecord {
+        user_id: owner_hex,
+        agent_id: agent_hex,
+        cert_digest,
+        issued_at,
+        not_after,
+        // ADR-0039 fields are not part of the Tier-1 sync value: a synced
+        // line records the issuance fact (digest, time and expiry); mode
+        // defaults to Acp (the pre-ADR-0039 line shape) and no certificate
+        // bytes travel Tier 1 (Tier-3 boundary).
+        mode: crate::profile::CertMode::Acp,
+        label: None,
+        cert_b64: None,
+    }
+}
+
+/// The `IssuanceJournal` value each agent's latest journal line mints:
+/// owner-scoped (`owner_hex`), latest `issued_at` per agent, later lines
+/// winning ties.
+///
+/// #1357: a digest names exactly one certificate, so its `not_after` is
+/// fixed. A line with the same digest but no `not_after` (a synced line
+/// written before the expiry travelled with it) does not replace a known
+/// expiry. Otherwise two owner devices mint `Some` and `None` for the same
+/// key in turn: each mint bumps the store generation, which starts the
+/// next sync pass at once, so the pair spins without end.
+fn latest_journal_values(
+    lines: Vec<crate::profile::IssuedCertRecord>,
+    owner_hex: &str,
+) -> BTreeMap<String, SyncValue> {
+    let mut latest: BTreeMap<String, crate::profile::IssuedCertRecord> = BTreeMap::new();
+    for mut record in lines {
+        if record.user_id != owner_hex {
+            continue;
+        }
+        if let Some(old) = latest.get(&record.agent_id) {
+            if record.issued_at < old.issued_at {
+                continue;
+            }
+            if record.cert_digest == old.cert_digest {
+                record.not_after = record.not_after.or(old.not_after);
+            }
+        }
+        latest.insert(record.agent_id.clone(), record);
+    }
+    latest
+        .into_iter()
+        .map(|(agent_hex, record)| {
+            (
+                agent_hex,
+                SyncValue::IssuanceJournal {
+                    agent_id: record.agent_id,
+                    cert_digest: record.cert_digest,
+                    issued_at: record.issued_at,
+                    not_after: record.not_after,
+                },
+            )
+        })
+        .collect()
 }
 
 impl Drop for OwnerSyncService {
@@ -5457,5 +5511,94 @@ mod home_pointer_election_tests {
         // Stale entries are pruned: memory is bounded by recent machines.
         assert!(limiter.allow(&MachineId([3; 32]), t0 + interval * 3));
         assert_eq!(limiter.last.len(), 1, "expired entries must be pruned");
+    }
+}
+
+/// #1357: an `IssuanceJournal` value must survive the sync round trip, or
+/// two owner devices re-mint it in turn without end.
+#[cfg(test)]
+mod issuance_journal_sync_tests {
+    use super::*;
+
+    const OWNER: &str = "aa";
+
+    /// An issuing device's own journal line (not a synced one).
+    fn line(
+        digest: &str,
+        issued_at: u64,
+        not_after: Option<u64>,
+    ) -> crate::profile::IssuedCertRecord {
+        crate::profile::IssuedCertRecord {
+            user_id: OWNER.to_string(),
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at,
+            not_after,
+            mode: crate::profile::CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        }
+    }
+
+    fn fields(value: &SyncValue) -> (String, String, u64, Option<u64>) {
+        match value {
+            SyncValue::IssuanceJournal {
+                agent_id,
+                cert_digest,
+                issued_at,
+                not_after,
+            } => (
+                agent_id.clone(),
+                cert_digest.clone(),
+                *issued_at,
+                *not_after,
+            ),
+            other => panic!("not a journal value: {other:?}"),
+        }
+    }
+
+    /// The issuing device's line has a `not_after`. A receiving device
+    /// writes the synced line and mints from its own journal: it must mint
+    /// the same value, so its mint is a no-op. Before the fix the synced
+    /// line dropped `not_after`, the receiver minted `None`, and the two
+    /// devices replaced each other's record on every pass.
+    #[test]
+    fn a_synced_expiring_line_mints_the_value_it_came_from() {
+        let origin = latest_journal_values(vec![line("d1", 100, Some(5_000))], OWNER);
+        let sent = origin.get("bb").expect("origin value");
+        let (agent, digest, issued_at, not_after) = fields(sent);
+        let received = synced_journal_line(OWNER.to_string(), agent, digest, issued_at, not_after);
+        let receiver = latest_journal_values(vec![received], OWNER);
+        assert_eq!(receiver.get("bb"), Some(sent));
+    }
+
+    /// A pre-fix synced line (same digest, no `not_after`) never hides a
+    /// known expiry, in either order; a newer issuance still wins.
+    #[test]
+    fn a_line_without_expiry_does_not_replace_a_known_one() {
+        for lines in [
+            vec![line("d1", 100, None), line("d1", 100, Some(5_000))],
+            vec![line("d1", 100, Some(5_000)), line("d1", 100, None)],
+        ] {
+            let values = latest_journal_values(lines, OWNER);
+            assert_eq!(fields(&values["bb"]).3, Some(5_000));
+        }
+        let renewed = latest_journal_values(
+            vec![line("d1", 100, Some(5_000)), line("d2", 200, Some(9_000))],
+            OWNER,
+        );
+        assert_eq!(fields(&renewed["bb"]).1, "d2");
+        assert_eq!(fields(&renewed["bb"]).3, Some(9_000));
+        let other_owner = latest_journal_values(
+            vec![synced_journal_line(
+                "cc".into(),
+                "bb".into(),
+                "d1".into(),
+                1,
+                None,
+            )],
+            OWNER,
+        );
+        assert!(other_owner.is_empty());
     }
 }
