@@ -22,6 +22,8 @@ macro_rules! staging_guide_regression_tests {
                 Clean,
                 CheckWriteLock,
                 CancelWhileLocked,
+                #[cfg(not(feature = "upgrade-test-signing"))]
+                FleetIdentityAfterDue,
             }
 
             #[derive(Default)]
@@ -100,6 +102,10 @@ macro_rules! staging_guide_regression_tests {
             }
 
             async fn run(cut: Cut) {
+                #[cfg(not(feature = "upgrade-test-signing"))]
+                let fresh_fleet_identity = matches!(cut, Cut::FleetIdentityAfterDue);
+                #[cfg(feature = "upgrade-test-signing")]
+                let fresh_fleet_identity = false;
                 let deadline = Instant::now() + Duration::from_secs(30);
                 let base = std::env::var_os("X0X_UPGRADE_STAGING_EVIDENCE_DIR")
                     .map(PathBuf::from)
@@ -113,9 +119,20 @@ macro_rules! staging_guide_regression_tests {
                 let install = data.join("x0xd");
                 let _raw = apply::current_binary_path_seam::install(install.clone());
                 let installed = fs::read(&install).unwrap();
-                let _readback = restart::systemd_readback_seam::install(staging_readback(
+                let mut readback = Some(restart::systemd_readback_seam::install(staging_readback(
                     one_call_scenario("0", "5"), &runtime,
-                ));
+                )));
+                let readback_api_addr = runtime.restart_context.api_addr;
+                let mut tracked_scenario = if fresh_fleet_identity {
+                    let authority: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                        env!("CARGO_MANIFEST_DIR"), "/.deployment/authority-inventory.json"
+                    ))).unwrap();
+                    let unit = Path::new(authority["instances"][0]["unit"]["destination"]
+                        .as_str().unwrap()).file_name().unwrap().to_str().unwrap();
+                    let mut scenario = staging_readback(one_call_scenario("0", "5"), &runtime);
+                    scenario.cgroup = format!("0::/system.slice/{unit}");
+                    Some(scenario)
+                } else { None };
                 let (observed, mut observations) = tokio::sync::mpsc::unbounded_channel();
                 runtime.staging.observed = Some(Arc::new(move |decision| {
                     let _ = observed.send(decision);
@@ -196,6 +213,26 @@ macro_rules! staging_guide_regression_tests {
                 assert_eq!(observations.try_recv().unwrap(), staging::Decision::Due);
                 let receipt = staging::receipt_path(&request).unwrap();
                 let first_receipt = fs::read(&receipt).unwrap();
+                if fresh_fleet_identity {
+                    assert_eq!(staging::read_receipt(&request).unwrap().unwrap().window_minutes, 0);
+                    // The download is still paused and the first identity
+                    // worker has finished. Drop the old global guard FIRST;
+                    // dropping it after install would erase the new scenario.
+                    drop(readback.take());
+                    readback = Some(restart::systemd_readback_seam::install(
+                        tracked_scenario.take().unwrap(),
+                    ));
+                    // Validate the raw fixture through the production reader
+                    // and floor policy: an invalid readback is not this proof.
+                    let identity = restart::resolve_staging_identity(
+                        true, &install, Some(&data), readback_api_addr,
+                    ).await.unwrap();
+                    let policy = crate::upgrade::fleet_policy::effective_staging_window(
+                        0, &install, &identity,
+                    ).unwrap();
+                    assert_eq!(policy.minimum_window_minutes, 60);
+                    assert_eq!(fs::read(&receipt).unwrap(), first_receipt);
+                }
                 let held_record = if matches!(cut, Cut::HoldAfterDue) {
                     let _lock = crate::upgrade::acquire_host_upgrade_lock(&install).unwrap();
                     Some(write_hold(&install, &manifest))
@@ -246,7 +283,7 @@ macro_rules! staging_guide_regression_tests {
                 assert!(apply_lock.try_lock().is_ok());
                 assert!(!fs::read_dir(&data).unwrap().any(|entry| entry.unwrap()
                     .file_name().to_string_lossy().starts_with("SKILL.md.tmp.")));
-                if matches!(cut, Cut::HoldAfterDue | Cut::CancelWhileLocked) {
+                if matches!(cut, Cut::HoldAfterDue | Cut::CancelWhileLocked) || fresh_fleet_identity {
                     assert_eq!(fs::read(&guide).unwrap(), old, "no guide write may cross a current refusal");
                     assert_eq!(attempts.load(Ordering::SeqCst), 0);
                     assert_eq!(fs::read(receipt).unwrap(), first_receipt);
@@ -263,6 +300,9 @@ macro_rules! staging_guide_regression_tests {
                     assert_eq!(events.lock_result.load(Ordering::SeqCst), 1,
                         "actual write must hold the canonical install lock");
                 }
+                // Retain the current raw readback until all actual owned work
+                // above has drained, including a scheduled refusal retry.
+                drop(readback);
             }
 
             #[tokio::test(start_paused = true)]
@@ -273,6 +313,12 @@ macro_rules! staging_guide_regression_tests {
             async fn staging_guide_actual_write_holds_canonical_install_lock() { run(Cut::CheckWriteLock).await; }
             #[tokio::test(start_paused = true)]
             async fn staging_guide_cancelled_before_install_drains_without_writes() { run(Cut::CancelWhileLocked).await; }
+
+            #[cfg(not(feature = "upgrade-test-signing"))]
+            #[tokio::test(start_paused = true)]
+            async fn fleet_guide_fresh_identity_refuses_existing_zero_receipt_after_download() {
+                run(Cut::FleetIdentityAfterDue).await;
+            }
         }
     };
 }
