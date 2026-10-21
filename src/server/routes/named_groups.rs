@@ -6318,9 +6318,46 @@ where
         state,
         &gss_publication_guard,
         None,
+        PublishNotDurable::Yes,
         mutate,
     )
     .await
+}
+
+/// ADR 0109 §4 "S3 publishes to the live map only when both writes are
+/// Durable": the S3 variant of
+/// [`persist_named_groups_quarantine_clear_gated`]. On `ReplacedNotDurable`
+/// the cleared candidate is NOT published. The live record stays
+/// contained, and memory is saved again so that the visible file holds the
+/// marker too. The caller retries later. The manual clear routes keep the
+/// #759 rule (publish on `ReplacedNotDurable`), so they use the other
+/// entry point.
+pub(in crate::server) async fn persist_named_groups_quarantine_clear_durable_only<F>(
+    state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let gss_publication_guard = state.gss_publication_gate.write().await;
+    persist_named_groups_quarantine_clear_gated_unlocked(
+        state,
+        &gss_publication_guard,
+        None,
+        PublishNotDurable::No,
+        mutate,
+    )
+    .await
+}
+
+/// Whether a gated quarantine clear publishes its candidate on
+/// `ReplacedNotDurable` (#759, the manual clear) or only on `Durable`
+/// (ADR 0109 §4, S3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishNotDurable {
+    Yes,
+    No,
 }
 
 /// Caller holds P and G. Record replacements retain the existing TreeKEM
@@ -6329,6 +6366,7 @@ async fn persist_named_groups_quarantine_clear_gated_unlocked<F>(
     state: &AppState,
     _gss_publication_guard: &tokio::sync::RwLockWriteGuard<'_, ()>,
     rebind_group_id: Option<&str>,
+    publish_not_durable: PublishNotDurable,
     mutate: F,
 ) -> std::io::Result<AtomicWriteOutcome>
 where
@@ -6363,6 +6401,23 @@ where
         if let Some(group_id) = rebind_group_id {
             discard_rebind_journal(state, group_id).await;
         }
+    }
+    if matches!(outcome, Ok(AtomicWriteOutcome::ReplacedNotDurable))
+        && publish_not_durable == PublishNotDurable::No
+    {
+        // ADR 0109 §4: nothing is published. The visible file holds the
+        // candidate, so memory (still contained) is saved again. Until
+        // that save is durable, the next persist must confirm memory
+        // first.
+        let resaved = save_named_groups_checked_unlocked(state).await;
+        if !matches!(resaved, Ok(AtomicWriteOutcome::Durable)) {
+            state
+                .named_groups_requires_durability_confirmation
+                .store(true, Ordering::Release);
+        } else if let Some(group_id) = rebind_group_id {
+            discard_rebind_journal(state, group_id).await;
+        }
+        return outcome;
     }
     if matches!(
         outcome,
@@ -7068,6 +7123,7 @@ async fn persist_named_group_info_inner(
             state,
             &_gss_publication_guard,
             Some(&key),
+            PublishNotDurable::Yes,
             |groups| store_named_group_info_locked(groups, &key, info),
         )
         .await;
@@ -11537,16 +11593,21 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     }
     // ADR 0109 §2: an admin-armed ATA (held in the S3 sidecar) gates the
     // pages the same way, inside its attested segment.
-    if let Some(sequence) = group_recovery::armed_admin_sequence(state, &response_info).await {
-        if !catchup_page_within_attested_sequence(&events, &response_info.state_hash, &sequence) {
-            tracing::warn!(
-                group_id = %LogHexId::group(&response.group_id),
-                sender = %LogHexId::agent(&sender_hex),
-                "ADR 0109 S3: TreeKEM catch-up page leaves the admin-attested sequence; adopting nothing"
-            );
-            return;
+    let admin_gated = match group_recovery::armed_admin_sequence(state, &response_info).await {
+        Some(sequence) => {
+            if !catchup_page_within_attested_sequence(&events, &response_info.state_hash, &sequence)
+            {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&response.group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    "ADR 0109 S3: TreeKEM catch-up page leaves the admin-attested sequence; adopting nothing"
+                );
+                return;
+            }
+            true
         }
-    }
+        None => false,
+    };
     // #1113: a catch-up page is one batch. A truncated page from this peer
     // means that peer still owes a later page. Another peer's last page,
     // and a member-keyed KeyPackage reply, do not close this peer's stream.
@@ -11561,6 +11622,28 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     SELF_LEAVE_REKEY_BATCH
         .scope((), async {
             for event in events {
+                // ADR 0109 §2: the page gate above is checked once. Each
+                // commit of an admin-gated page is checked again on the
+                // record the earlier commits left, so a commit that removes
+                // or demotes the signer stops the rest of the page.
+                if admin_gated {
+                    if let Some(commit) = named_group_metadata_event_commit(&event) {
+                        if !group_recovery::armed_page_link_admitted(
+                            state,
+                            &response.group_id,
+                            commit,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&response.group_id),
+                                revision = commit.revision,
+                                "ADR 0109 S3: the signer has no Active admin seat after the applied commits; the rest of the catch-up page is refused"
+                            );
+                            break;
+                        }
+                    }
+                }
                 let recovery_event = member_joined_kp_cache_entry(&event)
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
