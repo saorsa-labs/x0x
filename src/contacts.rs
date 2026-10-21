@@ -224,6 +224,9 @@ pub struct ContactStore {
     revoked_keys: HashSet<[u8; 32]>,
     revocations: Vec<RevocationRecord>,
     storage_path: PathBuf,
+    /// ADR-0074 §4: woken on every persisted change so live tailnet streams
+    /// are re-checked promptly after a trust change. `None` wakes nothing.
+    change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// Serializable format for the contacts file.
@@ -252,6 +255,7 @@ impl ContactStore {
             revoked_keys: HashSet::new(),
             revocations: Vec::new(),
             storage_path,
+            change_notify: None,
         };
         // Best-effort load from disk
         let _ = store.load();
@@ -373,8 +377,24 @@ impl ContactStore {
     }
 
     /// Get a mutable reference to a contact by agent ID.
+    ///
+    /// Wakes ADR-0074 §4 reauth when `change_notify` is set. A `&mut Contact`
+    /// cannot report which fields change, so every mutable access is a
+    /// conservative recheck. Callers typically hold an external `RwLock`
+    /// across the mutation, so reauth that reads contacts waits until unlock
+    /// (after e.g. `Blocked` is set). Persisting mutators such as
+    /// [`Self::set_trust`] / [`Self::remove`] also notify via `save`.
     pub fn get_mut(&mut self, agent_id: &AgentId) -> Option<&mut Contact> {
+        if let Some(notify) = &self.change_notify {
+            notify.notify_one();
+        }
         self.contacts.get_mut(&agent_id.0)
+    }
+
+    /// Wake `notify` on every future change to the store (ADR-0074 §4
+    /// open-stream re-check). Replaces any previously installed notifier.
+    pub(crate) fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        self.change_notify = Some(notify);
     }
 
     /// List all contacts.
@@ -550,6 +570,9 @@ impl ContactStore {
 
     /// Persist contacts and revocations to disk.
     fn save(&self) -> std::io::Result<()> {
+        if let Some(notify) = &self.change_notify {
+            notify.notify_one();
+        }
         let file = ContactsFile {
             contacts: self.contacts.values().cloned().collect(),
             revocations: self.revocations.clone(),

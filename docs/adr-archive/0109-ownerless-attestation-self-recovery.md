@@ -1,6 +1,7 @@
 # ADR 0109: Ownerless Attestation: Stale-Base Self-Recovery and Manual Re-seat (0088 S3)
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-20 13:50 BST by David Irvine (ruling pack of 20 Oct 2026, Group 2, #1356: accept now, alongside ADR 0110). ADR 0110 (S4) was accepted in the same ruling, so the S3-after-S4 order is met. The capability bit numbers in §3a and §5 were added in place in the accepting change. The status change was applied by Claude at his instruction.
 - **Date:** 2026-10-04
 - **Decision owners:** David Irvine
 - **Author:** Claude (Opus)
@@ -192,7 +193,7 @@ Refusals surface as ADR 0059's `invites_refused {reason}` diagnostics. The subje
 
 Otherwise the receiver refuses the commit with `reseat_mandate_invalid {cause}`. For checks 1 to 8 in order, `cause` is `signature`, `signer_not_admin`, `policy_mismatch`, `not_previously_seated`, `removal_mismatch`, `certificate_invalid`, `role_raised` or `binding_mismatch`, and the receiver reports the first that fails. The refusal leaves its committed state unchanged, as today's `owner_mandate_missing` refusal does. A replay on the same removal fails check 5, because the subject is seated again after the first.
 
-**Capability.** The new capability is **`group_reseat_mandate_v1`**. It means the node verifies and applies `ReseatMandateV1` commits under the rule above. Its number is allocated at acceptance, in acceptance order, as the next free bit in the README registry.
+**Capability.** The new capability is **`group_reseat_mandate_v1`**. It means the node verifies and applies `ReseatMandateV1` commits under the rule above. Its number was allocated at acceptance, in acceptance order, as the next free bit in the README registry: bit 9 (§5).
 
 **Typed states (L3).** The admin sees the route refusals above. A receiver refuses a bad commit with `reseat_mandate_invalid {cause}`. The subject shows `reseat_required` until a valid authorisation arrives, then `reseat_in_progress` (§8). The floor wait is an upgrade wait that names the members it waits for.
 
@@ -252,7 +253,7 @@ The legacy stores never change format. S3 state lives in its own files: `<data_d
 
 ### §5 Wire and capability (ADR 0093)
 
-The new capability is **`group_terminal_attest_v1`**. It means the node issues and verifies ADR 0109 attestations, answers `group_attest_request`, and consumes re-seat authorisations. Its number is allocated at acceptance, in acceptance order, as the next free bit in the README registry. §3a adds a second capability, **`group_reseat_mandate_v1`**, allocated the same way.
+The new capability is **`group_terminal_attest_v1`**. It means the node issues and verifies ADR 0109 attestations, answers `group_attest_request`, and consumes re-seat authorisations. Its number was allocated at acceptance, in acceptance order, as the next free bit in the README registry: bit 8. §3a adds a second capability, **`group_reseat_mandate_v1`**, allocated the same way: bit 9. ADR 0110 (S4) comes first in 0088's order and holds bits 4 to 7. The accepting change (20 Oct 2026) added both rows to the registry in `docs/adr/README.md`.
 
 - `group_attest_request` (typed DM): group, requester, head revision and hash, and the live `RecoveryRef`s with their causes.
 - `group_attest_response`: `attested {ata}`, `on_chain {admin_head}`, `not_on_chain {admin_head}`, `reseat {authorisation, invite}` or `refused {reason}`. The reasons are `attester_quarantined`, `attester_behind`, `not_an_admin`, `not_a_member`, `banned_or_revoked`, `base_beyond_retention` and `rate_limited`.
@@ -449,7 +450,7 @@ Setup S0′ is S0 without step 3, which leaves the clocks aligned.
 
 ## Rulings and open questions
 
-**Blocking Accept:** None: ready for David's Accept. Acceptance order is the only remaining gate: S3 is accepted after S4 (§10).
+**Acceptance (David, 20 Oct 2026 13:50 BST, Group 2, #1356):** this ADR is Accepted, alongside ADR 0110 (S4) in the same ruling. That meets the acceptance order (§10). The capability bits are allocated: `group_terminal_attest_v1` = 8 and `group_reseat_mandate_v1` = 9 (§5).
 
 David ruled this ADR's questions Q1–Q7 on 2026-10-04 (D77–D83), with the cross-slice rulings D64, D65 and D97 that touch it:
 

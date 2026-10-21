@@ -179,7 +179,10 @@ fn grant_policy(targets: &[&str]) -> ConnectPolicy {
         owner_allow: Vec::new(),
         grant_allow: vec![ConnectOwnerEntry {
             description: Some("sharees".to_string()),
-            targets: targets.iter().map(|t| t.parse().unwrap()).collect(),
+            targets: targets
+                .iter()
+                .map(|t| crate::connect::OwnerTarget::Exact(t.parse().unwrap()))
+                .collect(),
         }],
     })
 }
@@ -427,7 +430,9 @@ async fn connect_grant_needs_an_explicit_grant_entry() {
         allow: Vec::new(),
         owner_allow: vec![ConnectOwnerEntry {
             description: None,
-            targets: vec!["127.0.0.1:22".parse().unwrap()],
+            targets: vec![crate::connect::OwnerTarget::Exact(
+                "127.0.0.1:22".parse().unwrap(),
+            )],
         }],
         grant_allow: Vec::new(),
     });

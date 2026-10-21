@@ -146,6 +146,11 @@ pub(crate) struct AuthenticatedMachineBinding {
 /// identity announcements and inbound DMs. At the generous capacity ceiling,
 /// the least-recently-used binding is evicted and every eviction is logged;
 /// subsequent DMs from that agent degrade to the observable claim fallback.
+///
+/// When `set_change_notify` is installed, every mutation that changes
+/// a retained machine, its expiry metadata, or drops a binding (clear /
+/// eviction) wakes ADR-0074 §4 stream reauth — including the DM attestation
+/// writer `record_authenticated_machine_binding`.
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
@@ -153,6 +158,8 @@ pub struct AuthenticatedMachineBindingCache {
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
+    /// ADR-0074 §4: wake open-stream reauth after a retained-machine change.
+    change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl Default for AuthenticatedMachineBindingCache {
@@ -163,6 +170,7 @@ impl Default for AuthenticatedMachineBindingCache {
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
+            change_notify: None,
         }
     }
 }
@@ -185,6 +193,20 @@ impl AuthenticatedMachineBindingCache {
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
+            change_notify: None,
+        }
+    }
+
+    /// Wake `notify` on every future retained-machine / expiry / clear /
+    /// eviction mutation (ADR-0074 §4). Replaces any previously installed
+    /// notifier.
+    pub(crate) fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        self.change_notify = Some(notify);
+    }
+
+    fn notify_changed(&self) {
+        if let Some(notify) = &self.change_notify {
+            notify.notify_one();
         }
     }
 
@@ -263,7 +285,11 @@ impl AuthenticatedMachineBindingCache {
     ) -> bool {
         match self.entries.get_mut(agent_id) {
             Some(binding) if binding.cert_digest == Some(digest) => {
+                let changed = binding.cert_not_after != cert_not_after;
                 binding.cert_not_after = cert_not_after;
+                if changed {
+                    self.notify_changed();
+                }
                 true
             }
             _ => false,
@@ -283,7 +309,12 @@ impl AuthenticatedMachineBindingCache {
             self.recency
                 .remove(&(existing.last_used.0, existing.last_used.1, agent_id.0));
             existing.last_used = tick;
+            let mut authority_changed = false;
             if announced_at >= existing.announced_at {
+                authority_changed = existing.machine_id != machine_id
+                    || existing.cert_not_after != cert_not_after
+                    || existing.cert_digest != cert_digest
+                    || existing.announced_at != announced_at;
                 self.by_machine.remove(&(existing.machine_id.0, agent_id.0));
                 self.by_machine.insert((machine_id.0, agent_id.0));
                 existing.machine_id = machine_id;
@@ -293,6 +324,9 @@ impl AuthenticatedMachineBindingCache {
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
+            if authority_changed {
+                self.notify_changed();
+            }
             return;
         }
 
@@ -326,6 +360,8 @@ impl AuthenticatedMachineBindingCache {
             },
         );
         self.recency.insert((tick.0, tick.1, agent_id.0));
+        // New retained binding (and any capacity eviction above) wakes reauth.
+        self.notify_changed();
     }
 
     /// The retained binding for `agent_id`, without touching its recency
@@ -343,9 +379,13 @@ impl AuthenticatedMachineBindingCache {
     /// Tests use it to empty the registry while a transport connection stays up.
     #[cfg(test)]
     pub(crate) fn clear_for_test(&mut self) {
+        let had_entries = !self.entries.is_empty();
         self.entries.clear();
         self.by_machine.clear();
         self.recency.clear();
+        if had_entries {
+            self.notify_changed();
+        }
     }
 
     fn resolve_evidence(&mut self, agent_id: &AgentId) -> Option<AuthenticatedMachineBinding> {

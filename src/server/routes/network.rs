@@ -677,6 +677,79 @@ pub(in crate::server) async fn state_sync_diagnostics(
     }))
 }
 
+/// Domain-separation tag for the #1383 version/policy digest. Bumping this
+/// changes every digest at once; field order below is frozen with it.
+pub(in crate::server) const VERSION_POLICY_DIGEST_TAG: &str = "x0x-version-policy-digest-v1";
+
+/// The exact digest preimage for #1383: the tag, the daemon version, then
+/// every `DaemonUpdateConfig` field in declaration order, pipe-separated as
+/// `key=value`. Reported verbatim in the response so a census can recompute
+/// the digest without reverse-engineering the format.
+pub(in crate::server) fn version_policy_digest_input(
+    version: &str,
+    cfg: &crate::server::state::DaemonUpdateConfig,
+) -> String {
+    format!(
+        "{}|current_version={version}|enabled={}|rollout_window_minutes={}|stop_on_upgrade={}|fallback_check_interval_minutes={}|repo={}|include_prereleases={}|gossip_updates={}",
+        VERSION_POLICY_DIGEST_TAG,
+        cfg.enabled,
+        cfg.rollout_window_minutes,
+        cfg.stop_on_upgrade,
+        cfg.fallback_check_interval_minutes,
+        cfg.repo,
+        cfg.include_prereleases,
+        cfg.gossip_updates,
+    )
+}
+
+/// SHA-256 of [`version_policy_digest_input`], lower-case hex. The #1167 M1
+/// census compares this across machines; the preimage is local-only until an
+/// approved announcement change carries it on the wire.
+pub(in crate::server) fn version_policy_digest(
+    version: &str,
+    cfg: &crate::server::state::DaemonUpdateConfig,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let input = version_policy_digest_input(version, cfg);
+    hex::encode(Sha256::digest(input.as_bytes()))
+}
+
+/// GET /diagnostics/upgrade — the local machine's version and update-policy
+/// digest (#1383, David's 20 Oct 2026 option-B ruling: local only, no wire
+/// change, no capability bit). Read-only view of what `GET /upgrade` would
+/// act on; no network check is performed here.
+///
+/// #1384 (D35): `minimum_supported_version` and `support_window` ship as
+/// explicit nulls — fleet-level policy David sets later; a null IS the
+/// published state ("no fleet minimum published yet"), not a missing field.
+/// They are deliberately outside the digest preimage: they are centrally
+/// published values, not per-machine policy, so they add nothing to a
+/// machine-to-machine census comparison.
+pub(in crate::server) async fn upgrade_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let version = env!("CARGO_PKG_VERSION");
+    let cfg = &state.update_config;
+    let input = version_policy_digest_input(version, cfg);
+    Json(serde_json::json!({
+        "ok": true,
+        "current_version": version,
+        "update_policy": {
+            "enabled": cfg.enabled,
+            "rollout_window_minutes": cfg.rollout_window_minutes,
+            "stop_on_upgrade": cfg.stop_on_upgrade,
+            "fallback_check_interval_minutes": cfg.fallback_check_interval_minutes,
+            "repo": cfg.repo,
+            "include_prereleases": cfg.include_prereleases,
+            "gossip_updates": cfg.gossip_updates,
+        },
+        "minimum_supported_version": serde_json::Value::Null,
+        "support_window": serde_json::Value::Null,
+        "version_policy_digest": version_policy_digest(version, cfg),
+        "digest_input": input,
+    }))
+}
+
 #[cfg(test)]
 mod participation_diagnostics_tests {
     use super::*;
@@ -1119,6 +1192,126 @@ mod participation_diagnostics_tests {
             body["outer_v1_receipts"].as_u64(),
             Some(1),
             "valid outer V1 must increment receipt counter via diagnostics"
+        );
+
+        agent.shutdown().await;
+    }
+
+    /// #1383: the digest preimage is a frozen public format — a census
+    /// recomputes the digest from these exact bytes. Any change here is a
+    /// format change and must bump `VERSION_POLICY_DIGEST_TAG`.
+    #[test]
+    fn version_policy_digest_preimage_is_frozen() {
+        let cfg = crate::server::state::DaemonUpdateConfig {
+            rollout_window_minutes: 0,
+            ..Default::default()
+        };
+        let input = version_policy_digest_input("0.48.1", &cfg);
+        assert_eq!(
+            input,
+            "x0x-version-policy-digest-v1|current_version=0.48.1|enabled=true|\
+             rollout_window_minutes=0|stop_on_upgrade=true|\
+             fallback_check_interval_minutes=2880|repo=saorsa-labs/x0x|\
+             include_prereleases=false|gossip_updates=true"
+        );
+        // Any policy drift must change the digest (the census point).
+        let mut drifted = cfg.clone();
+        drifted.rollout_window_minutes = 1440;
+        assert_ne!(
+            version_policy_digest("0.48.1", &drifted),
+            version_policy_digest("0.48.1", &cfg)
+        );
+        assert_ne!(
+            version_policy_digest("0.48.2", &cfg),
+            version_policy_digest("0.48.1", &cfg)
+        );
+    }
+
+    /// #1383: `GET /diagnostics/upgrade` reports the local version, the
+    /// update policy, and the digest of both — local only, no wire change.
+    #[tokio::test]
+    async fn upgrade_diagnostics_reports_version_policy_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .with_gossip_config(x0x::gossip::GossipConfig {
+                    relay: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .route("/diagnostics/upgrade", get(upgrade_diagnostics))
+            .with_state(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::get("/diagnostics/upgrade")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["current_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            body["update_policy"]["repo"], "saorsa-labs/x0x",
+            "default policy repo must be reported"
+        );
+        let digest = body["version_policy_digest"].as_str().unwrap();
+        assert_eq!(digest.len(), 64, "SHA-256 hex digest");
+        assert_eq!(
+            digest,
+            version_policy_digest(env!("CARGO_PKG_VERSION"), &state.update_config)
+        );
+        // The reported preimage must hash to the reported digest.
+        use sha2::{Digest, Sha256};
+        let input = body["digest_input"].as_str().unwrap();
+        assert_eq!(hex::encode(Sha256::digest(input.as_bytes())), digest);
+
+        // #1384: the D35 policy fields ship as explicit nulls — "set by
+        // David later" is the published state — and stay out of the
+        // preimage (fleet policy, not per-machine policy). The get()==Null
+        // form distinguishes a present null from an absent key: removing
+        // either field from the handler fails this test.
+        assert_eq!(
+            body.get("minimum_supported_version"),
+            Some(&serde_json::Value::Null),
+            "minimum_supported_version must be present and null"
+        );
+        assert_eq!(
+            body.get("support_window"),
+            Some(&serde_json::Value::Null),
+            "support_window must be present and null"
+        );
+        assert!(
+            !input.contains("minimum_supported_version"),
+            "fleet policy must not churn the per-machine digest"
         );
 
         agent.shutdown().await;

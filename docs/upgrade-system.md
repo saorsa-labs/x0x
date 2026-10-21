@@ -10,7 +10,168 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 - **`apply.rs`**: `apply_upgrade_from_manifest()` — downloads archive, verifies SHA-256 hash, extracts binary, performs atomic replacement with rollback. Extraction accepts only a regular file whose final path component is exactly the binary name, refuses archives holding more than one such entry, and requires the extracted file to carry the platform's native executable magic (ELF/Mach-O/MZ) (#1144). A `TempDirGuard` (RAII) removes the per-attempt `.x0x-upgrade-*` temp dir on every exit path, including early-return errors, so a failed apply never leaks the downloaded archive.
 
 - **`restart.rs`**: the #261 restart transaction — supervision classification (`RestartMode`), the `upgrade-handoff.json` intent record, the detached handoff helper, and the loud `UPGRADE_FAILED` artifact.
-- **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
+- **`journal.rs`**: private M2 record formats, bounded readers and record barriers. Unknown, corrupt or pending M2 records block apply and preserve recovery material. Reading a record does not authorize recovery.
+- **`probe.rs` / `probe_retry.rs`**: candidate execution checks, install-scoped release holds and bounded interrupted retries before replacement.
+- **`rollout.rs`**: Deterministic delay calculator salted with the MachineId and release version.
+
+### Rollout defaults and delay bounds (M2 S2b)
+
+The compiled daemon configuration defaults to a 60-minute rollout window
+(D183). An omitted update section or window has the same default. The
+calculator selects a whole-second delay strictly below a positive window,
+using the leading 64 bits of the hash and integer arithmetic. It preserves
+the zero-window calculator behavior. A minute value too large to represent
+in whole seconds uses `u64::MAX` seconds as the effective bound.
+
+The Unix startup, gossip, fallback and HTTP apply paths record the first
+eligible release beside the canonical installed binary. The private
+`upgrade-rollout-<digest>.json`
+receipt binds the actual data and identity roots, MachineId, release version,
+verified manifest digest and archive digest. Duplicate delivery, restart and
+later window changes retain the first choice. Monotonic elapsed time reduces
+the wait; a reboot keeps the last durable remainder and starts a new clock
+epoch. Wall-clock changes do not supply elapsed time.
+
+Each waiting operation releases the apply mutex and install lock.
+It waits before writing release content or starting candidate probes, and
+rechecks the receipt and unresolved upgrade records under the install lock.
+Each observation requires a successful record barrier, including a receipt
+that already says the delay is complete. Unknown or damaged records remain
+in place and refuse this apply; they do not block normal daemon startup.
+Shutdown or loss of the task cancels work before mutation admission.
+
+After a guide download, startup resolves the install again and rechecks the
+current staging and probe state under that install's lock. It holds the lock
+through the guide write and rename. A hold recorded before this admission
+keeps the prior guide. This does not defer an admitted guide update to host
+commit; transaction-bound guide promotion remains separate work.
+
+The compiled deployment inventory sets a minimum 60-minute window for a
+known or ambiguous production fleet install. An existing receipt below that
+minimum refuses apply and remains intact. Ordinary installs retain an
+explicit zero window. Only the compiled debug test key permits the fleet
+rehearsal exception.
+
+For an undersized fleet receipt, keep the configured binary in normal
+operation. Preserve the receipt and any selection or pending records, with
+their hashes. Changing the window or restarting does not reset the receipt.
+Do not edit or delete it to remove the refusal.
+
+To continue, use the normal verified Unix startup update path when a strictly
+newer eligible stable release is available. That release must pass all current
+guards and must not have its own undersized or conflicting receipt. A new
+receipt records a window of at least 60 minutes; its calculated delay can be
+zero. The old receipt remains unchanged. This is progression to another
+release, not repair of the refused release. If no eligible release is
+available, or unresolved selection, journal, pair or probe state still blocks
+apply, keep the current binary running and retain the evidence for supported
+recovery. This slice provides no command to clear these records.
+
+Selecting a newer eligible release requires a durable supersession record.
+An older waiter cannot then apply its release. The previous receipt remains
+intact; supersession does not delete it or reset the selected release's wait.
+
+This staging gate accepts canonical stable versions only. Setting
+`include_prereleases` does not allow a prerelease through the gate.
+The private `upgrade-selection-<digest>.json` record and its `.pending`
+marker retain the selected release and evidence of an incomplete write.
+An unresolved marker or damaged record refuses apply. The configured binary
+still starts normally.
+
+If this refusal occurs, preserve the selection record, pending marker and
+bound rollout receipt, with their hashes. Check the recorded participant
+roots, release version and digests. Investigate any storage or sync error
+before attempting recovery. Keep the configured binary in normal operation
+while apply remains refused. This slice provides no selection-record repair
+command. Do not delete records or edit their fields to bypass the refusal.
+Complete transaction recovery remains separate M2 work.
+
+Gossip and fallback discovery share one bounded pending release and continue
+to receive announcements during a wait. The worker drains a superseded
+operation before starting the newer release. Cancellation is checked after
+the install lock is acquired, before queued work can write records.
+An admitted replacement retains its restart continuation.
+
+If staging identity initialization fails, background apply stays disabled
+for that process. Configured release discovery and verified rebroadcast
+continue without an apply owner.
+The background owner updates the guide only after staging permits the release.
+Without that owner, these sources leave the installed guide unchanged.
+
+HTTP allows one waiting request and retains its deferred restart owner after
+mutation admission. Dropping a waiting request cancels its permit. Queued or
+running blocking work, including service-manager readback, retains that
+request's capacity slot until the worker exits.
+Each request keeps the release and verified manifest found before its staging
+wait. Later policy checks can refuse that release. The request does not select
+a newer release during the wait.
+
+`x0x upgrade --apply --now` sends authenticated
+`POST /upgrade/apply?now=true` (D185). It skips only the staging component of
+the wait. Receipt barriers, fleet history, supersession, eligibility, holds,
+mandatory probe retry waits and transaction checks still apply, including
+the final check under the install lock. It does not write a zero-window
+replacement receipt. The CLI uses no total apply-request timeout, with
+connection setup bounded to 30 seconds.
+
+Shutdown closes background intake and withdraws pre-admission writes; it does
+not claim every blocking operation is reaped before shutdown returns.
+Complete host inventory and transaction-bound guide installation remain
+separate M2 work. These staging controls do not establish a protected host
+transaction or authorize guide promotion at host commit.
+
+### Candidate execution probes (M2 S2d)
+
+Both packaged binaries accept `--upgrade-probe` as their first argument.
+The command prints JSON with the compiled `version` and `platform`, then exits.
+It runs before profiling and normal application initialization. It reads no
+configuration, takes no application lock, opens no store or socket, creates
+no identity, runs no artifact sweep and increments no boot counter.
+
+On Unix, automatic apply probes both extracted binaries before either
+installed binary changes. This includes the packaged CLI when the installed
+CLI is outside the managed install. A missing packaged executable refuses
+the apply. Each staged file and its parent directory must complete their
+sync barriers before either child starts. The child uses the captured working
+directory and environment and inherits the old process's service account.
+The check requires exit zero and the exact release version and platform.
+It limits each execution to 90 seconds, bounds output and kills and reaps a
+failed or timed-out child. A passing probe proves execution in that context;
+it does not prove later health or a successful pair transaction.
+
+The canonical installed daemon has a private adjacent record, normally
+`x0xd.upgrade-probe.json`. Different instance data roots share this install
+record and its lock. A loader error, nonzero exit, malformed response,
+version/platform mismatch or changed candidate bytes holds that release.
+Another archive for the same version cannot bypass the hold. A newer release
+can clear a known failed-release hold; it cannot clear recovery-failed or
+unknown state.
+
+A durably recorded timeout or host fault permits at most three fresh retry
+transactions, after 30, 60 and 120 minutes. Retry timers release the apply
+mutex, observe daemon shutdown and reread the record before each attempt.
+HTTP apply includes an existing interrupted retry wait in its staging gate,
+even with `now=true`. A new probe failure still returns its refusal and leaves
+retry ownership with the daemon. Startup and background discovery can resume
+a pending wait after verifying the release manifest again. Boot identity and
+monotonic time prevent a wall-clock change or daemon restart from shortening
+the recorded wait.
+
+Before a terminal record write, a durable
+`x0xd.upgrade-probe.json.pending` marker retains the prior record. It is removed
+only after the outcome's record barrier succeeds. A retained marker, an
+unknown/corrupt record, or a `running` record without a durable outcome refuses
+further apply, including a newer release. The last case cannot distinguish a
+lost failed-hold write from an interrupted probe, so it requires manual
+inspection instead of an automatic retry. Preserve both files and their
+hashes, investigate the storage fault and use a supported repair procedure;
+do not delete the marker or edit a phase to bypass the refusal. The configured
+binary still starts normally.
+
+Managed Windows apply remains refused by the restart planner. Unmanaged
+Windows keeps its released legacy apply behavior and does not claim these
+Unix M2 durability/probe guarantees. The inert flag works on both binaries
+on Windows as well.
 
 ### Binary replacement (`mod.rs`)
 
@@ -19,7 +180,98 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 - **Unix**: `fs::rename(new, target)` — atomic on the same filesystem, valid even when `target` is the running executable.
 - **Windows / non-Unix**: a running executable is locked and cannot be renamed over in place. `replace_via_sideline` moves the live binary aside to `<name>.x0xold-<nanos>` (allowed even while locked), moves the new binary into place, and rolls the sideline back if the second move fails. The sidelined file stays locked until the old process exits and is reclaimed on the next launch.
 
-`sweep_stale_upgrade_artifacts(dir, min_age)` runs once at `x0xd` startup. It removes leftover `.x0x-upgrade-*` temp dirs older than `min_age` (1h — never disturbs an in-flight apply) and `*.x0xold-*` sidelined binaries that clear the same age gate (issue #261: a handoff still in flight must not lose its rollback bytes). This reclaims debris from previously-interrupted attempts.
+At startup, `x0xd` checks recovery records before it calls
+`sweep_stale_upgrade_artifacts(dir, min_age)`. Unknown, unreadable, corrupt or
+pending M2 records suppress the sweep. A valid legacy-only handoff permits
+the sweep unless its target or backup path matches a cleanup pattern.
+The sweep removes `.x0x-upgrade-*` directories and `*.x0xold-*` sidelined
+binaries only after the same age gate (`min_age`, normally one hour).
+It must not remove retained recovery material to make startup succeed.
+
+### Recovery-record diagnosis (M2 S2a)
+
+The reader checks these three names in the effective instance data directory:
+`upgrade-journal.json`, `upgrade-handoff.json` and `upgrade-boot.json`.
+M2 records carry `schema_version: 1` and a `record_kind` of `journal`,
+`handoff` or `boot`. They record transaction state for later M2 slices.
+S2a does not activate launcher recovery or turn a parsed record into authority
+to swap, restore or start a child.
+
+On Unix, a new legacy handoff keeps all released fields and adds
+`schema_version: 1` and `record_kind: "legacy_handoff"`. Released readers
+ignore those additional fields. Both the old unversioned form and this
+marked form remain diagnostic intent. The unmanaged Windows helper keeps the
+unversioned form; this compatibility path makes no M2 directory-durability
+claim. The existing Windows managed refusal is unchanged.
+
+Unix record writes require a file sync, replacement rename and parent
+directory sync. A failed barrier is a refusal, not an acknowledgement.
+The applying daemon checks directory-sync support before download or swap.
+If the filesystem rejects it, use an operator-managed update after resolving
+the storage fault; do not bypass the failed barrier. Configured startup still
+works.
+
+For an unknown or damaged record, the configured daemon starts normally.
+It reports `unprotected/degraded` through the existing `/health` upgrade
+input and reasons. Apply and automatic recovery take no action, and cleanup
+keeps the artifacts. Restarting alone does not clear this condition.
+
+Use this procedure to investigate and resolve the condition:
+
+1. Find the effective data directory, executable paths and roots from the
+   loaded job and configuration. Inspect `/health` and the local startup log.
+   A record can contain old or invalid paths; do not use it as the authority
+   for a restore or a command to execute.
+2. Keep the original records and candidate/backup files. Save byte-for-byte
+   copies and hashes in an operator-owned private evidence directory before
+   making changes. Record contents can include launch arguments and environment.
+   Keep automatic apply disabled during maintenance.
+3. For an unknown schema, use a release or repair tool that supports that
+   schema. Do not change the version marker, truncate the record or delete it
+   to permit another apply. If no supported reader is available, retain the
+   degraded state and pass the evidence to the release owner.
+4. For corruption, reconcile every job sharing the install, including stopped
+   jobs, against independent service inventory. Check the actual daemon and
+   CLI hashes against trusted release or backup bytes. The operator must
+   repair the failed action and establish a consistent installed pair before
+   resolving intent. S2a provides no automatic record-repair or clear command.
+   Preserve the damaged bytes and record the repair and verified hashes.
+5. Only a known, resolved legacy-only handoff can use the manual procedure
+   below. Keep an evidence copy before clearing that stale diagnostic.
+   Unknown or M2 records require their supported repair procedure. After
+   repair, check the configured roots, running versions and `/health` upgrade
+   reason before deliberately enabling apply again.
+
+### Dormant pair transaction (M2 S2e)
+
+The private pair engine is implemented and tested, but no live apply path calls
+it yet. Activation requires the S2c host inventory and S3a acknowledged flush.
+The current apply path still uses its existing single-binary replacement flow.
+Do not infer pair rollback or launcher protection from this dormant module.
+
+The engine checks a verified release plan and durable passing probes under the
+existing daemon and managed-CLI install locks. It checks the installed hashes
+again before mutation. It copies each old binary beside its target, using that
+binary's prior version and a transaction ID in the backup name. It keeps every
+referenced backup and reserves the copy/restore space plus 1 GiB per filesystem.
+
+Each daemon and CLI swap has separate intent, file and progress barriers. A
+healthy OLD process can restore both members after a failed swap. Restoration
+copies the backup and retains the original rollback bytes. A separate writer
+cannot start another transaction while the first remains unresolved.
+
+Private records use `<daemon>.upgrade-pair.json` and
+`<daemon>.upgrade-pair.pending`. Resolved predecessor records are retained under
+their transaction IDs. Every archive retry repeats its durability barriers.
+Unknown or corrupt records and uncertain barriers preserve all evidence and
+refuse pair actions. These records alone do not authorize process recovery,
+child start, host commit or a storage-format change.
+
+A split CLI remains untouched and is reported with a reinstall hint. Signed
+SKILL content is copied to a transaction-specific staging file. The active
+SKILL remains unchanged. A later installer must enforce the applicable gate:
+host commit on protected paths, or matching candidate bytes and stable local
+health on unprotected paths under D195. It must retain the prior guide.
 
 ## Restart ownership is resolved before mutation (ADR-0061, #493)
 
@@ -103,10 +355,15 @@ survive the attempt and are all you need:
   will actually answer for this job — probe that one first. It is a
   *diagnosis record*, not state the daemon needs to boot.
 
+These steps apply to a valid legacy handoff, including the Unix
+`schema_version: 1`, `record_kind: "legacy_handoff"` form. For an unreadable,
+unknown or M2 record, use [recovery-record diagnosis](#recovery-record-diagnosis-m2-s2a)
+above. Do not apply the stale-legacy deletion step to those records.
+
 `<data_dir>` is the instance's data directory —
 `~/Library/Application Support/x0x` on macOS (`x0x-<name>` for named
-instances), `~/.local/share/x0x` on Linux. Read both paths out of the
-intent file if you are unsure. Note that `UPGRADE_FAILED` is **never**
+instances), `~/.local/share/x0x` on Linux. Confirm the target and backup paths
+against the loaded job and the actual installed files. Note that `UPGRADE_FAILED` is **never**
 written on this path — that artifact belongs to the transactional helper
 below; its absence is expected here.
 
@@ -192,8 +449,9 @@ previous release's binary at `<target>` by your usual means, then continue.
 
 #### 3. Reconcile the intent file and re-enter under the supervisor
 
-Delete the intent record once the running version is settled, so the next
-apply does not look like an in-flight attempt:
+After verifying the running version and resolving the legacy attempt, keep an
+evidence copy and remove the stale legacy diagnostic from its active name.
+Do not use this command for an unknown, corrupt or M2 record:
 
 ```bash
 rm <data_dir>/upgrade-handoff.json
@@ -299,8 +557,14 @@ no gossip, binds nothing, and takes no instance lock.
 1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
+4. **Authenticated HTTP apply**: Verify the release and wait for staging, then
+   recheck admission under the install lock before replacement. The CLI
+   `upgrade --apply` uses this route; `--now` skips only the staging delay.
 
-Both apply paths back off versions that fail to apply: a failed version is recorded and skipped for 30 minutes before retrying (a newer release supersedes the skip immediately). This prevents a release that can never apply in a given environment from re-downloading and re-extracting on every gossip receipt.
+Gossip and polling retain a 30-minute in-memory backoff for other apply errors.
+Unix candidate-probe failures additionally use the durable release holds and
+interrupted retry policy above. An expired in-memory backoff cannot bypass a
+durable hold.
 
 `x0xd --skip-update-check` disables self-update for that process invocation. It
 suppresses the startup GitHub check, gossip-delivered apply, manifest broadcast,

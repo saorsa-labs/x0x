@@ -46,10 +46,11 @@ Future-epoch content may be held under defined size and time limits while the re
 
 D34 rules automatic revocation eviction and rekeying within a bound. D40
 specifies designated-first, with fallback after the bound; D74 refines the
-selection to the lowest roster admin, without reachability data. ADR 0110
-remains **Proposed**: the ruling does not accept its full protocol. D69/D73
-require harness measurements for its timing values. This draft does not
-choose new bounds or waive numbered acceptance.
+selection to the lowest roster admin, without reachability data. David
+accepted ADR 0110 on 20 Oct 2026 (Group 2, #1357, option B). The timing
+values are the W3-H p99.9 measured numbers (D69/D73). The implementing PR
+body records them before any timing-dependent code merges. The fixed 2 s /
+5 s values stay rejected (D69). This draft does not choose new bounds.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
@@ -75,7 +76,7 @@ Immediate removal of the legacy system can strand supported peers. We choose a c
 
 ## Current implementation
 
-Both group crypto paths exist. With members remaining, self-leave updates the roster and removes local key state, but does not rotate the remaining members' keys. Full automatic revocation eviction and rekeying remain incomplete. Proposed old ADR 0110 contains important mechanics that this summary must preserve or explicitly supersede.
+Both group crypto paths exist. With members remaining, self-leave updates the roster and removes local key state, but does not rotate the remaining members' keys. Full automatic revocation eviction and rekeying remain incomplete. Old ADR 0110 (Accepted 20 Oct 2026; S4 code not yet merged) contains important mechanics that this summary must preserve or explicitly supersede.
 
 ## Validation
 

@@ -19,7 +19,8 @@
 //! - **Loopback-only targets.** `parse_target` rejects any non-loopback
 //!   address (and hostnames like `localhost`) as a **load-time hard error**.
 //! - **Numeric IP only.** No DNS resolution in the trusted computing base.
-//! - **Exact `host:port` only.** No port ranges, no CIDR.
+//! - **Exact `host:port` for pair/grant entries.** `principal = "owner"` may also
+//!   list loopback port ranges (`127.0.0.1:8000-8999`, ADR-0074 Q4). No CIDR.
 //! - **`deny_unknown_fields`** on every TOML struct: a misspelled key
 //!   (`taregts`, `enable`) fails loudly rather than silently yielding a
 //!   different policy.
@@ -236,8 +237,8 @@ impl ConnectAcl {
 
     /// Exact-target membership test across both selectors: the exact pair's
     /// targets, plus — only when `owner_trusted` — every `principal =
-    /// "owner"` entry's targets. Target matching stays exact `SocketAddr`
-    /// equality for both.
+    /// "owner"` entry's targets. Pair entries stay exact `SocketAddr`
+    /// equality; owner entries may match a port range (ADR-0074 Q4).
     #[must_use]
     pub fn is_allowed_for_principal(
         &self,
@@ -251,7 +252,7 @@ impl ConnectAcl {
                 && self
                     .owner_allow
                     .iter()
-                    .any(|e| e.targets.iter().any(|t| t == target)))
+                    .any(|e| e.targets.iter().any(|t| t.matches(target))))
     }
 
     /// [`Self::has_entry_for_principal`] plus — only when `grant_connect`
@@ -270,7 +271,7 @@ impl ConnectAcl {
     }
 
     /// [`Self::is_allowed_for_principal`] plus the ADR-0070 §2 grant
-    /// selector: a `principal = "grant"` entry listing exactly `target`
+    /// selector: a `principal = "grant"` entry listing `target` (exact only)
     /// matches only when `grant_port_allowed` — the requester's current
     /// `Connect { ports }` grant covers `target.port()`. Both the entry and
     /// the grant must allow the target.
@@ -288,16 +289,66 @@ impl ConnectAcl {
                 && self
                     .grant_allow
                     .iter()
-                    .any(|e| e.targets.iter().any(|t| t == target)))
+                    .any(|e| e.targets.iter().any(|t| t.matches(target))))
     }
 }
 
-/// One `principal = "owner"` entry (ADR-0070 §1): loopback targets allowed
-/// to any owner-trusted pair. Targets are explicit, exactly as for pairs.
+/// One loopback target for a `principal = "owner"` entry (ADR-0074 Q4).
+///
+/// Pair and grant entries stay exact [`SocketAddr`]s. Only owner entries may
+/// carry a [`OwnerTarget::PortRange`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerTarget {
+    /// Exact loopback `IP:port` (same rules as [`parse_target`]).
+    Exact(SocketAddr),
+    /// Inclusive port range on one loopback IP (`127.0.0.1:8000-8999`).
+    PortRange {
+        ip: std::net::IpAddr,
+        start: u16,
+        end: u16,
+    },
+}
+
+impl OwnerTarget {
+    /// Whether `target` matches this owner allow entry.
+    #[must_use]
+    pub fn matches(&self, target: &SocketAddr) -> bool {
+        match self {
+            Self::Exact(addr) => addr == target,
+            Self::PortRange { ip, start, end } => {
+                target.ip() == *ip && target.port() >= *start && target.port() <= *end
+            }
+        }
+    }
+}
+
+impl From<SocketAddr> for OwnerTarget {
+    fn from(addr: SocketAddr) -> Self {
+        Self::Exact(addr)
+    }
+}
+
+impl std::fmt::Display for OwnerTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(addr) => write!(f, "{addr}"),
+            Self::PortRange { ip, start, end } => match ip {
+                std::net::IpAddr::V6(v6) => write!(f, "[{v6}]:{start}-{end}"),
+                std::net::IpAddr::V4(v4) => write!(f, "{v4}:{start}-{end}"),
+            },
+        }
+    }
+}
+
+/// One `principal = "owner"` (or grant) entry (ADR-0070 §1 / §2).
+///
+/// Owner entries may list [`OwnerTarget::PortRange`] values (ADR-0074 Q4).
+/// Grant entries may only carry [`OwnerTarget::Exact`] — ranges are refused
+/// at load time.
 #[derive(Debug, Clone)]
 pub struct ConnectOwnerEntry {
     pub description: Option<String>,
-    pub targets: Vec<SocketAddr>,
+    pub targets: Vec<OwnerTarget>,
 }
 
 /// One allowed requester pair + their permitted loopback targets.
@@ -462,35 +513,67 @@ fn build_connect_entry(
             reason: format!("{label} must contain at least one target"),
         });
     }
-    // Each target must be a numeric-IP loopback address. parse_target is
-    // the loopback-only crown jewel — every non-loopback address (and any
-    // hostname such as `localhost`) is a hard error at load time.
-    let mut targets = Vec::with_capacity(entry.targets.len());
-    for (tidx, raw) in entry.targets.into_iter().enumerate() {
-        let addr = parse_target(&raw).map_err(|reason| ConnectAclError::Invalid {
-            path: path.display().to_string(),
-            reason: format!("{label}.targets[{tidx}]: {reason}"),
-        })?;
-        targets.push(addr);
-    }
+    // Pair/grant: exact numeric-IP loopback only. Owner: exact or port range
+    // (ADR-0074 Q4). parse_target / parse_owner_target refuse non-loopback
+    // and hostnames such as `localhost` at load time.
     Ok(match principal {
         AclPrincipal::Pair {
             agent_id,
             machine_id,
-        } => BuiltConnectEntry::Pair(ConnectAllowEntry {
-            description: entry.description,
-            agent_id,
-            machine_id,
-            targets,
-        }),
-        AclPrincipal::Owner => BuiltConnectEntry::Owner(ConnectOwnerEntry {
-            description: entry.description,
-            targets,
-        }),
-        AclPrincipal::Grant => BuiltConnectEntry::Grant(ConnectOwnerEntry {
-            description: entry.description,
-            targets,
-        }),
+        } => {
+            let mut targets = Vec::with_capacity(entry.targets.len());
+            for (tidx, raw) in entry.targets.into_iter().enumerate() {
+                let addr = parse_target(&raw).map_err(|reason| ConnectAclError::Invalid {
+                    path: path.display().to_string(),
+                    reason: format!("{label}.targets[{tidx}]: {reason}"),
+                })?;
+                targets.push(addr);
+            }
+            BuiltConnectEntry::Pair(ConnectAllowEntry {
+                description: entry.description,
+                agent_id,
+                machine_id,
+                targets,
+            })
+        }
+        AclPrincipal::Owner => {
+            let mut targets = Vec::with_capacity(entry.targets.len());
+            for (tidx, raw) in entry.targets.into_iter().enumerate() {
+                let target =
+                    parse_owner_target(&raw).map_err(|reason| ConnectAclError::Invalid {
+                        path: path.display().to_string(),
+                        reason: format!("{label}.targets[{tidx}]: {reason}"),
+                    })?;
+                targets.push(target);
+            }
+            BuiltConnectEntry::Owner(ConnectOwnerEntry {
+                description: entry.description,
+                targets,
+            })
+        }
+        AclPrincipal::Grant => {
+            let mut targets = Vec::with_capacity(entry.targets.len());
+            for (tidx, raw) in entry.targets.into_iter().enumerate() {
+                // Shared machines stay exact (ADR-0074 Q4): refuse ranges.
+                if looks_like_port_range(&raw) {
+                    return Err(ConnectAclError::Invalid {
+                        path: path.display().to_string(),
+                        reason: format!(
+                            "{label}.targets[{tidx}]: port ranges are only allowed for principal = \"owner\"; grant entries must list exact loopback host:port targets"
+                        ),
+                    });
+                }
+                let addr = parse_target(&raw).map_err(|reason| ConnectAclError::Invalid {
+                    path: path.display().to_string(),
+                    reason: format!("{label}.targets[{tidx}]: {reason}"),
+                })?;
+                targets.push(OwnerTarget::Exact(addr));
+            }
+            BuiltConnectEntry::Grant(ConnectOwnerEntry {
+                description: entry.description,
+                targets,
+            })
+        }
     })
 }
 
@@ -692,6 +775,65 @@ pub fn is_loopback(ip: std::net::IpAddr) -> bool {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
         std::net::IpAddr::V6(v6) => v6.is_loopback(),
     }
+}
+
+/// Whether `raw` looks like an `IP:start-end` port-range form (ADR-0074 Q4).
+fn looks_like_port_range(raw: &str) -> bool {
+    parse_owner_port_range(raw).is_ok()
+}
+
+/// Parse an owner allow target: exact loopback `IP:port` or inclusive
+/// `IP:start-end` port range (ADR-0074 Q4).
+///
+/// # Errors
+/// Human-readable reason (same voice as [`parse_target`]).
+pub fn parse_owner_target(raw: &str) -> Result<OwnerTarget, String> {
+    if let Ok(addr) = parse_target(raw) {
+        return Ok(OwnerTarget::Exact(addr));
+    }
+    parse_owner_port_range(raw).map(|(ip, start, end)| OwnerTarget::PortRange { ip, start, end })
+}
+
+/// Parse `127.0.0.1:8000-8999` / `[::1]:8000-8999`.
+fn parse_owner_port_range(raw: &str) -> Result<(std::net::IpAddr, u16, u16), String> {
+    let (ip_raw, ports_raw) = if let Some(bracket_end) = raw.find(']') {
+        // [::1]:8000-8999
+        let rest = raw.get(bracket_end + 1..).unwrap_or("");
+        if !rest.starts_with(':') {
+            return Err(
+                "owner port ranges must be IP:start-end (e.g. 127.0.0.1:8000-8999 or [::1]:8000-8999)"
+                    .to_string(),
+            );
+        }
+        (&raw[..=bracket_end], &rest[1..])
+    } else {
+        raw.rsplit_once(':').ok_or_else(|| {
+            "owner port ranges must be IP:start-end (e.g. 127.0.0.1:8000-8999)".to_string()
+        })?
+    };
+
+    let (start_s, end_s) = ports_raw.split_once('-').ok_or_else(|| {
+        "owner port ranges must be IP:start-end (e.g. 127.0.0.1:8000-8999)".to_string()
+    })?;
+    let start: u16 = start_s
+        .parse()
+        .map_err(|_| format!("invalid port-range start `{start_s}` (expected 1-65535)"))?;
+    let end: u16 = end_s
+        .parse()
+        .map_err(|_| format!("invalid port-range end `{end_s}` (expected 1-65535)"))?;
+    if start == 0 || end == 0 {
+        return Err("port 0 is not a connectable target".to_string());
+    }
+    if start > end {
+        return Err(format!(
+            "port-range start {start} is greater than end {end}"
+        ));
+    }
+
+    // Reuse loopback rules via a dummy exact parse of ip:start.
+    let probe = format!("{ip_raw}:{start}");
+    let addr = parse_target(&probe)?;
+    Ok((addr.ip(), start, end))
 }
 
 fn now_unix_ms() -> u64 {

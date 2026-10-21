@@ -898,6 +898,9 @@ pub struct OwnerSyncStore {
     /// This is a LOCAL linearization boundary only. It claims nothing about
     /// cross-device election ordering.
     canonical_home_gate: tokio::sync::RwLock<()>,
+    /// ADR-0074 §4: woken when the owner device set changes (an enrollment
+    /// or unenrollment).
+    device_change_notify: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
 }
 
 /// Per-device sync status surfaced by `GET /sync/devices`.
@@ -958,6 +961,25 @@ pub struct CommitOutcome {
 }
 
 impl OwnerSyncStore {
+    /// Wake `notify` on every future change to the device set (ADR-0074 §4).
+    pub(crate) fn set_device_change_notify(&self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        *self
+            .device_change_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
+    }
+
+    fn notify_device_change(&self) {
+        if let Some(notify) = self
+            .device_change_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            notify.notify_one();
+        }
+    }
+
     /// Load (or start empty under) `<data_dir>/sync`, creating the
     /// directory. **Only genuine absence is empty** (fresh install): a
     /// records/devices file that exists but is corrupt or unreadable is a
@@ -1024,6 +1046,7 @@ impl OwnerSyncStore {
             poisoned: std::sync::Mutex::new(None),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             canonical_home_gate: tokio::sync::RwLock::new(()),
+            device_change_notify: std::sync::Mutex::new(None),
         })
     }
 
@@ -1373,6 +1396,7 @@ impl OwnerSyncStore {
                     // mutation (memory matches disk) and poison.
                     drop(devices);
                     self.poison(e.to_string());
+                    self.notify_device_change();
                     return Err(e);
                 }
                 // Pre-rename failure: roll back so memory matches the
@@ -1397,6 +1421,7 @@ impl OwnerSyncStore {
         }
         drop(devices);
         self.kick();
+        self.notify_device_change();
         Ok(())
     }
 
@@ -1470,6 +1495,7 @@ impl OwnerSyncStore {
                     // Disk already holds the removal: keep it and poison.
                     drop(devices);
                     self.poison(e.to_string());
+                    self.notify_device_change();
                     return Err(e);
                 }
                 devices.insert(previous.machine_id, previous);
@@ -1484,6 +1510,7 @@ impl OwnerSyncStore {
         drop(devices);
         drop(tombstones);
         self.kick();
+        self.notify_device_change();
         Ok(true)
     }
 

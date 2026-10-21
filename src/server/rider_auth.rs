@@ -523,6 +523,9 @@ mod tests {
             ("/owner/agents/issue", Method::POST),
             ("/owner/agents/abc", Method::DELETE),
             ("/owner/riders", Method::POST),
+            // #1383: the machine census leaks the owner's device set and
+            // this machine's version/policy digest — owner-only.
+            ("/owner/machines", Method::GET),
             ("/shutdown", Method::POST),
             ("/publish", Method::POST),
             ("/direct/send", Method::POST),

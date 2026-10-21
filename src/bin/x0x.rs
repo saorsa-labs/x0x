@@ -300,6 +300,9 @@ enum Commands {
         /// With --check, only a read-only release check is performed.
         #[arg(long)]
         apply: bool,
+        /// Skip the staging delay. Eligibility, holds and transaction checks still apply.
+        #[arg(long, requires = "apply", conflicts_with = "check")]
+        now: bool,
         /// With --check, fetch the current manifest regardless of version.
         /// Does not bypass the daemon's apply checks.
         #[arg(long)]
@@ -416,6 +419,76 @@ enum Commands {
     Grant {
         #[command(subcommand)]
         sub: GrantSub,
+    },
+    /// Names for agents and machines: `[agent:|machine:]<label>.<owner>`
+    /// (ADR-0074; local petnames pinned at first use; durable API token only).
+    Names {
+        #[command(subcommand)]
+        sub: NamesSub,
+    },
+}
+
+/// `x0x names` sub-actions.
+#[derive(Subcommand)]
+enum NamesSub {
+    /// List owner petnames and pinned names.
+    List,
+    /// Resolve a name locally (no network query); pins it at first use.
+    Resolve {
+        /// `[agent:|machine:]<label>.<owner>`, e.g. `studio.me`, or a hex agent id.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Owner petnames (label -> user id), frozen at first bind.
+    Owner {
+        #[command(subcommand)]
+        sub: NamesOwnerSub,
+    },
+    /// Label machines shared with you by a received grant.
+    Machine {
+        #[command(subcommand)]
+        sub: NamesMachineSub,
+    },
+    /// Drop a pin (e.g. `agent:studio.bob`) so the name re-pins at next use.
+    Unpin {
+        /// Canonical pinned name, with its `agent:` or `machine:` prefix.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+/// `x0x names owner` sub-actions.
+#[derive(Subcommand)]
+enum NamesOwnerSub {
+    /// Bind a petname to an owner's user id.
+    Add {
+        /// Petname (lowercase DNS label; not `me`, `agent` or `machine`).
+        #[arg(value_name = "LABEL")]
+        label: String,
+        /// The owner's user id (64 hex chars).
+        #[arg(value_name = "USER_ID")]
+        user_id: String,
+    },
+    /// Remove a petname and every pin under it.
+    #[command(alias = "remove")]
+    Rm {
+        /// Petname to remove.
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
+}
+
+/// `x0x names machine` sub-actions.
+#[derive(Subcommand)]
+enum NamesMachineSub {
+    /// Label a shared machine: `machine:<label>.<owner>` -> machine id.
+    Label {
+        /// `machine:<label>.<owner>` (owner is a bound petname).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The machine id (64 hex chars).
+        #[arg(value_name = "MACHINE_ID")]
+        machine_id: String,
     },
 }
 
@@ -611,6 +684,8 @@ enum OwnerSub {
         #[command(subcommand)]
         sub: Option<OwnerRidersSub>,
     },
+    /// M1 machine census over owner-sync (#1383): devices + local version digest.
+    Machines,
     /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
     Placement,
 }
@@ -856,6 +931,8 @@ enum DiagnosticsSub {
     Gossip,
     /// Print transport connection accounting (open/active/orphaned connections, #368).
     Transport,
+    /// Print local version + update-policy digest for the M1 census (#1383).
+    Upgrade,
     /// Print ADR-0035 relay metering: advert census, selection skew, inbound dialers.
     Relay,
     /// Print direct-message counters, fan-out health, and per-peer state.
@@ -1036,7 +1113,8 @@ enum ForwardSub {
         /// Local bind address, e.g. `127.0.0.1:8022`.
         #[arg(long)]
         local: String,
-        /// Peer agent id (hex).
+        /// Peer agent: hex agent id or an agent name (`[agent:]<label>.<owner>`,
+        /// ADR-0074). `machine:` names are refused until slice 2.
         #[arg(long)]
         peer: String,
         /// Loopback target host on the peer (numeric IP). Default `127.0.0.1`.
@@ -2049,7 +2127,7 @@ fn main() -> ExitCode {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("manifest verification failed: {error}");
+                eprintln!("inert upgrade check failed: {error}");
                 ExitCode::FAILURE
             }
         };
@@ -2117,6 +2195,7 @@ async fn run(
             check,
             apply,
             force,
+            ..
         } if *check || !*apply => {
             return commands::upgrade::run(*check, *force).await;
         }
@@ -2358,6 +2437,7 @@ async fn run(
                 sub: Some(OwnerRidersSub::Revoke { token_id }),
             }) => commands::identity::owner_riders_revoke(&client, token_id).await,
             Some(OwnerSub::Placement) => commands::identity::owner_placement(&client).await,
+            Some(OwnerSub::Machines) => commands::identity::owner_machines(&client).await,
         },
         Commands::Move { sub } => match sub {
             MoveSub::Authorize {
@@ -2490,6 +2570,7 @@ async fn run(
             DiagnosticsSub::Ack => commands::network::diagnostics_ack(&client).await,
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
             DiagnosticsSub::Transport => commands::network::diagnostics_transport(&client).await,
+            DiagnosticsSub::Upgrade => commands::network::diagnostics_upgrade(&client).await,
             DiagnosticsSub::Relay => commands::network::diagnostics_relay(&client).await,
             DiagnosticsSub::Dm { agent } => {
                 commands::network::diagnostics_dm_for_agent(&client, agent.as_deref()).await
@@ -3152,11 +3233,16 @@ async fn run(
                 .await
             }
         },
-        Commands::Upgrade { .. } => {
+        Commands::Upgrade { now, .. } => {
             // The serving daemon owns installation and its writer lock. The
             // existing client carries the selected instance and bearer token.
             // --force only affects read-only checks; it cannot bypass apply.
-            let response = client.post_empty("/upgrade/apply").await?;
+            let path = if now {
+                "/upgrade/apply?now=true"
+            } else {
+                "/upgrade/apply"
+            };
+            let response = client.post_empty(path).await?;
             x0x::cli::print_value(client.format(), &response);
             Ok(())
         }
@@ -3247,6 +3333,22 @@ async fn run(
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
+        },
+        Commands::Names { sub } => match sub {
+            NamesSub::List => commands::names::list(&client).await,
+            NamesSub::Resolve { name } => commands::names::resolve(&client, &name).await,
+            NamesSub::Owner { sub } => match sub {
+                NamesOwnerSub::Add { label, user_id } => {
+                    commands::names::owner_add(&client, &label, &user_id).await
+                }
+                NamesOwnerSub::Rm { label } => commands::names::owner_remove(&client, &label).await,
+            },
+            NamesSub::Machine { sub } => match sub {
+                NamesMachineSub::Label { name, machine_id } => {
+                    commands::names::machine_label(&client, &name, &machine_id).await
+                }
+            },
+            NamesSub::Unpin { name } => commands::names::unpin(&client, &name).await,
         },
         Commands::Onboard {
             json,
@@ -3698,6 +3800,11 @@ async fn purge() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_now_cli.rs"
+    ));
+    upgrade_now_cli_regression_tests!();
     use super::*;
 
     #[test]
