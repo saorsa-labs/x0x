@@ -364,7 +364,7 @@ impl IssuedCertRecord {
         Self::append_locked(path, record).await
     }
 
-    /// [`Self::append`] for a caller that holds [`JOURNAL_WRITER`].
+    /// [`Self::append`] for a caller that holds `JOURNAL_WRITER`.
     async fn append_locked(path: &Path, record: &Self) -> std::io::Result<()> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -403,7 +403,7 @@ impl IssuedCertRecord {
     /// appended. A writer that decides from what is already in the journal
     /// (owner sync's repair of a synced line) uses this, so the read, the
     /// decision and the append are one step: every journal writer in this
-    /// process holds [`JOURNAL_WRITER`] for its read-modify-write.
+    /// process holds the journal writer lock for its read-modify-write.
     ///
     /// # Errors
     /// Returns the underlying IO error of the append.
