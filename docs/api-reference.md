@@ -3153,7 +3153,28 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 | POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`; **durable-owner** in every case) |
 | GET | `/forwards` | `x0x forward list` | List registered forwards, including persisted forwards that are down |
 | DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address and delete its persisted record (**durable-owner**) |
-| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed and machine-mismatch counters + connect-ACL snapshot |
+| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `machine_mismatch`, `socks_denied`, and the connect-ACL snapshot |
+
+`socks_denied` counts SOCKS CONNECT replies of `0x02` (the peer connect gate denied the target). The field is `0` when the SOCKS listener is off.
+
+### Loopback SOCKS5 listener
+
+The `[socks]` table is daemon config. It is not a connect-ACL entry. Full rules are in [Daemon SOCKS listener](connect-acl.md#daemon-socks-listener).
+
+```toml
+[socks]
+listen = "127.0.0.1:1080"
+```
+
+`listen` must be a loopback address (`127.0.0.0/8` or `::1`). The config loader and the listener both refuse any other address. The listener stays off until `listen` is set.
+
+Clients must use RFC 1929 username/password. The password is the daemon API token. The username is ignored. `NO AUTH` is refused with `0xFF`. A wrong token, or an empty or absent token, is refused before any ForwardV2 stream opens.
+
+CONNECT is the only command. The target is `<64-hex-agent-id>.x0x:port`. A peer connect-gate denial is SOCKS `0x02`, and that target receives zero bytes.
+
+Owner connect-ACL entries may list an inclusive loopback port range. Pair and grant targets stay exact host:port. See [docs/connect-acl.md](connect-acl.md).
+
+In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact address or inclusive port range). Pair `ConnectAllowEntry.targets` stays `Vec<SocketAddr>`. David approved this break on 20 Oct 2026 at 18:50 BST. The public module is `x0x::socks`.
 
 ### `POST /forwards` request body
 
@@ -3248,6 +3269,7 @@ Refusals are `{"ok": false, "error", "code"}`:
 |---|---|---|
 | `invalid_name` | 400 | Outside the grammar |
 | `reserved_label` | 400 | `me`/`agent`/`machine` used as a label |
+| `machine_target_unsupported` | 400 | A machine name where the caller asked for an agent only |
 | `unknown_name` | 404 | Unbound owner label, or nothing carries the name (for a forward to a machine name: no single agent is announced on that machine) |
 | `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
 | `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |

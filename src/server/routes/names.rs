@@ -333,7 +333,8 @@ pub(in crate::server) async fn names_unpin(
     }
 }
 
-/// Bind an owner petname from an imported card (ADR-0074 §1, ADR-0079).
+/// Bind an owner petname from an imported card (ADR 0074 §1, a deliberately
+/// narrower reading).
 ///
 /// The card's label is applied only when `trust` is Known or Trusted and
 /// that user has no petname yet. Unknown and Blocked return `null` and

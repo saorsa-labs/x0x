@@ -23,10 +23,72 @@ using the leading 64 bits of the hash and integer arithmetic. It preserves
 the zero-window calculator behavior. A minute value too large to represent
 in whole seconds uses `u64::MAX` seconds as the effective bound.
 
-This first S2b slice fixes the default and calculation. The running apply
-triggers still need durable first-receipt waits, the fleet minimum policy and
-the complete host participant gate. A configured window alone does not yet
-prove that an apply waits.
+The Unix startup update check records the first eligible release beside the
+canonical installed binary. The private `upgrade-rollout-<digest>.json`
+receipt binds the actual data and identity roots, MachineId, release version,
+verified manifest digest and archive digest. Duplicate delivery, restart and
+later window changes retain the first choice. Monotonic elapsed time reduces
+the wait; a reboot keeps the last durable remainder and starts a new clock
+epoch. Wall-clock changes do not supply elapsed time.
+
+The startup task releases the apply mutex and install lock while waiting.
+It waits before writing release content or starting candidate probes, and
+rechecks the receipt and unresolved upgrade records under the install lock.
+Each observation requires a successful record barrier, including a receipt
+that already says the delay is complete. Unknown or damaged records remain
+in place and refuse this apply; they do not block normal daemon startup.
+Shutdown or loss of the task cancels work before mutation admission.
+
+After a guide download, startup resolves the install again and rechecks the
+current staging and probe state under that install's lock. It holds the lock
+through the guide write and rename. A hold recorded before this admission
+keeps the prior guide. This does not defer an admitted guide update to host
+commit; transaction-bound guide promotion remains separate work.
+
+The compiled deployment inventory sets a minimum 60-minute window for a
+known or ambiguous production fleet install. An existing receipt below that
+minimum refuses apply and remains intact. Ordinary installs retain an
+explicit zero window. Only the compiled debug test key permits the fleet
+rehearsal exception.
+
+For an undersized fleet receipt, keep the configured binary in normal
+operation. Preserve the receipt and any selection or pending records, with
+their hashes. Changing the window or restarting does not reset the receipt.
+Do not edit or delete it to remove the refusal.
+
+To continue, use the normal verified Unix startup update path when a strictly
+newer eligible stable release is available. That release must pass all current
+guards and must not have its own undersized or conflicting receipt. A new
+receipt records a window of at least 60 minutes; its calculated delay can be
+zero. The old receipt remains unchanged. This is progression to another
+release, not repair of the refused release. If no eligible release is
+available, or unresolved selection, journal, pair or probe state still blocks
+apply, keep the current binary running and retain the evidence for supported
+recovery. This slice provides no command to clear these records.
+
+Selecting a newer eligible release requires a durable supersession record.
+An older waiter cannot then apply its release. The previous receipt remains
+intact; supersession does not delete it or reset the selected release's wait.
+
+This staging gate accepts canonical stable versions only. Setting
+`include_prereleases` does not allow a prerelease through the gate.
+The private `upgrade-selection-<digest>.json` record and its `.pending`
+marker retain the selected release and evidence of an incomplete write.
+An unresolved marker or damaged record refuses apply. The configured binary
+still starts normally.
+
+If this refusal occurs, preserve the selection record, pending marker and
+bound rollout receipt, with their hashes. Check the recorded participant
+roots, release version and digests. Investigate any storage or sync error
+before attempting recovery. Keep the configured binary in normal operation
+while apply remains refused. This slice provides no selection-record repair
+command. Do not delete records or edit their fields to bypass the refusal.
+Complete transaction recovery remains separate M2 work.
+
+This slice covers the Unix startup trigger. Gossip, fallback and HTTP waits,
+complete host inventory and transaction-bound guide
+installation remain separate M2 work. It does not claim that every apply
+path already honors the configured window.
 
 ### Candidate execution probes (M2 S2d)
 

@@ -139,6 +139,20 @@ pub(in crate::server) struct StartupUpdateCheckRuntime {
     /// Daemon shutdown watch; cancels the #1196 start-rate window wait so
     /// shutdown is never held up by a time-bound refusal.
     pub shutdown_watch: watch::Receiver<bool>,
+    #[cfg(unix)]
+    pub staging: StartupStagingContext,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+pub(in crate::server) struct StartupStagingContext {
+    pub install: PathBuf,
+    pub identity_root: PathBuf,
+    pub machine_id: [u8; 32],
+    #[cfg(test)]
+    pub clock: Option<crate::upgrade::staging_runtime::Clock>,
+    #[cfg(test)]
+    pub observed: Option<crate::upgrade::staging_runtime::Observer>,
 }
 
 /// Background-listener context (gossip + fallback poll): the running daemon's
@@ -168,7 +182,7 @@ fn schedule_probe_retry(
     apply_lock: Arc<Mutex<()>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    if *shutdown.borrow() {
+    if *shutdown.borrow() || shutdown.has_changed().is_err() {
         return;
     }
     let install = match x0x::upgrade::apply::current_binary_path().and_then(|path| {
@@ -317,11 +331,28 @@ where
     Fut: Future<Output = Result<x0x::upgrade::UpgradeResult, x0x::upgrade::UpgradeError>>,
 {
     let first = {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return Err(x0x::upgrade::UpgradeError::Other(
+                "upgrade cancelled by shutdown".into(),
+            ));
+        }
         let _guard = match apply_lock {
-            Some(lock) => Some(lock.lock().await),
+            Some(lock) => Some(tokio::select! {
+                guard = lock.lock() => guard,
+                _ = shutdown.changed() => return Err(x0x::upgrade::UpgradeError::Other("upgrade cancelled by shutdown".into())),
+            }),
             None => None,
         };
-        attempt().await
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return Err(x0x::upgrade::UpgradeError::Other(
+                "upgrade cancelled by shutdown".into(),
+            ));
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => Err(x0x::upgrade::UpgradeError::Other("upgrade cancelled by shutdown".into())),
+            result = attempt() => result,
+        }
         // Guard dropped here on purpose: the window wait below must not
         // hold the shared apply lock.
     };
@@ -345,10 +376,20 @@ where
         }
     }
     let _guard = match apply_lock {
-        Some(lock) => Some(lock.lock().await),
+        Some(lock) => Some(tokio::select! {
+            guard = lock.lock() => guard,
+            _ = shutdown.changed() => return first,
+        }),
         None => None,
     };
-    attempt().await
+    if *shutdown.borrow() || shutdown.has_changed().is_err() {
+        return first;
+    }
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => first,
+        result = attempt() => result,
+    }
 }
 /// Startup GitHub check. Returns Some(version) if an update was applied.
 ///
@@ -405,11 +446,8 @@ pub(in crate::server) async fn run_startup_update_check(
 
     tracing::info!(
         new_version = %verified.manifest.version,
-        "Startup check: new version available, applying immediately"
+        "Startup check: new version available"
     );
-
-    // Update SKILL.md before upgrading (independent of binary update)
-    update_skill_if_changed(&verified.manifest, &config.data_dir).await;
 
     // Broadcast to gossip so other nodes benefit from our discovery
     if let Some(agent) = agent {
@@ -433,6 +471,8 @@ pub(in crate::server) async fn run_startup_update_check(
     let mut shutdown_watch = runtime
         .as_ref()
         .map(|runtime| runtime.shutdown_watch.clone());
+    #[cfg(unix)]
+    let staging_context = runtime.as_ref().map(|runtime| runtime.staging.clone());
 
     let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
         .with_stop_on_upgrade(config.update.stop_on_upgrade);
@@ -452,16 +492,62 @@ pub(in crate::server) async fn run_startup_update_check(
             }),
     };
 
-    let attempt = || upgrader.apply_upgrade_from_manifest(&verified.manifest);
-    let result = match shutdown_watch.as_mut() {
-        // Daemon startup check: #1196 — a refusal that is ONLY the not-yet-
-        // aged-out systemd start-rate window is waited out (bounded by the
-        // readback's own remaining window) and retried once, instead of
-        // skipping the version until the 6-hourly fallback poll.
-        Some(shutdown) => apply_with_start_rate_retry(apply_lock.as_ref(), attempt, shutdown).await,
-        // Legacy no-runtime mode has no shutdown watch or retry.
-        None => attempt().await,
+    #[cfg(unix)]
+    let upgrader = if let Some(context) = staging_context {
+        let platform = x0x::upgrade::manifest::current_platform_target()
+            .ok_or(x0x::upgrade::UpgradeError::UnsupportedPlatform)?;
+        let asset = verified
+            .manifest
+            .matches_platform(platform)
+            .ok_or(x0x::upgrade::UpgradeError::NoPlatformAsset)?;
+        let upgrader = upgrader.with_staging_request(crate::upgrade::staging::StagingRequest {
+            install: context.install,
+            data_root: config.data_dir.canonicalize()?,
+            identity_root: context.identity_root,
+            machine_id: context.machine_id,
+            version: verified.manifest.version.clone(),
+            manifest_sha256: Sha256::digest(&verified.manifest_json).into(),
+            archive_sha256: asset.archive_sha256,
+            window_minutes: config.update.rollout_window_minutes,
+        });
+        #[cfg(test)]
+        let upgrader = upgrader
+            .with_staging_clock(context.clock)
+            .with_staging_observer(context.observed);
+        upgrader
+    } else {
+        upgrader
     };
+
+    let attempt = || upgrader.apply_upgrade_from_manifest(&verified.manifest);
+    let result = async {
+        #[cfg(unix)]
+        if let Some(shutdown) = shutdown_watch.as_mut() {
+            upgrader.wait_for_staging(shutdown).await?;
+            x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
+        }
+        // Staging must precede all release content writes, including the guide.
+        update_skill_while_running(
+            &verified.manifest,
+            &config.data_dir,
+            shutdown_watch.clone(),
+            #[cfg(unix)]
+            Some(&upgrader),
+        )
+        .await;
+        match shutdown_watch.as_mut() {
+            // Daemon startup check: #1196 — a refusal that is ONLY the not-yet-
+            // aged-out systemd start-rate window is waited out (bounded by the
+            // readback's own remaining window) and retried once, instead of
+            // skipping the version until the 6-hourly fallback poll.
+            Some(shutdown) => {
+                apply_with_start_rate_retry(apply_lock.as_ref(), attempt, shutdown).await
+            }
+            // Legacy no-runtime mode has no shutdown watch or retry.
+            None => attempt().await,
+        }
+    }
+    .await;
 
     match result {
         Ok(x0x::upgrade::UpgradeResult::Success { version }) => Ok(Some(version)),
@@ -878,6 +964,153 @@ pub(in crate::server) async fn run_fallback_github_poll(
 
 /// Update SKILL.md if the manifest has a different hash.
 async fn update_skill_if_changed(manifest: &ReleaseManifest, data_dir: &std::path::Path) {
+    update_skill_while_running(
+        manifest,
+        data_dir,
+        None,
+        #[cfg(unix)]
+        None,
+    )
+    .await;
+}
+
+async fn update_skill_while_running(
+    manifest: &ReleaseManifest,
+    data_dir: &std::path::Path,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    #[cfg(unix)] upgrader: Option<&crate::upgrade::apply::AutoApplyUpgrader>,
+) {
+    let writer_shutdown = shutdown.clone();
+    let update = update_skill_inner(
+        manifest,
+        data_dir,
+        writer_shutdown,
+        #[cfg(unix)]
+        upgrader,
+    );
+    match shutdown.as_mut() {
+        Some(shutdown) => {
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {}
+                _ = update => {}
+            }
+        }
+        None => update.await,
+    }
+}
+
+#[cfg(test)]
+mod skill_download_seam {
+    use std::{cell::RefCell, future::Future, pin::Pin};
+    type Download = Pin<Box<dyn Future<Output = Vec<u8>> + Send>>;
+    thread_local! {
+        static DOWNLOAD: RefCell<Option<Download>> = const { RefCell::new(None) };
+    }
+    pub(super) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DOWNLOAD.with(|download| download.borrow_mut().take());
+        }
+    }
+    pub(super) fn install(future: impl Future<Output = Vec<u8>> + Send + 'static) -> Guard {
+        DOWNLOAD.with(|download| *download.borrow_mut() = Some(Box::pin(future)));
+        Guard
+    }
+    pub(super) fn take() -> Option<Download> {
+        DOWNLOAD.with(|download| download.borrow_mut().take())
+    }
+}
+
+async fn download_skill(url: &str) -> Result<Vec<u8>, reqwest::Error> {
+    #[cfg(test)]
+    if let Some(download) = skill_download_seam::take() {
+        return Ok(download.await);
+    }
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+}
+
+#[cfg(test)]
+mod skill_install_seam {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{Arc, LazyLock, Mutex},
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Event {
+        Entered,
+        BeforeWrite,
+        Exited,
+    }
+
+    type Observer = Arc<dyn Fn(Event) + Send + Sync>;
+    static OBSERVERS: LazyLock<Mutex<HashMap<PathBuf, Observer>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVERS.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    pub(super) fn install(path: PathBuf, observer: Observer) -> Guard {
+        assert!(OBSERVERS
+            .lock()
+            .unwrap()
+            .insert(path.clone(), observer)
+            .is_none());
+        Guard(path)
+    }
+
+    pub(super) struct Active(Option<Observer>);
+
+    impl Active {
+        pub(super) fn before_write(&self) {
+            if let Some(observer) = &self.0 {
+                observer(Event::BeforeWrite);
+            }
+        }
+    }
+
+    pub(super) fn entered(path: &Path) -> Active {
+        let observer = OBSERVERS.lock().unwrap().get(path).cloned();
+        if let Some(observer) = &observer {
+            observer(Event::Entered);
+        }
+        Active(observer)
+    }
+
+    impl Drop for Active {
+        fn drop(&mut self) {
+            if let Some(observer) = &self.0 {
+                observer(Event::Exited);
+            }
+        }
+    }
+}
+
+async fn update_skill_inner(
+    manifest: &ReleaseManifest,
+    data_dir: &std::path::Path,
+    shutdown: Option<watch::Receiver<bool>>,
+    #[cfg(unix)] upgrader: Option<&crate::upgrade::apply::AutoApplyUpgrader>,
+) {
     let skill_path = data_dir.join("SKILL.md");
 
     let local_hash = match tokio::fs::read(&skill_path).await {
@@ -898,50 +1131,116 @@ async fn update_skill_if_changed(manifest: &ReleaseManifest, data_dir: &std::pat
 
     tracing::info!("Updating SKILL.md from signed manifest");
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to create HTTP client for SKILL.md: {e}");
-            return;
-        }
-    };
-
-    match client.get(&manifest.skill_url).send().await {
-        Ok(resp) => match resp.bytes().await {
-            Ok(new_contents) => {
-                let new_hash: [u8; 32] = Sha256::digest(&new_contents).into();
-                if new_hash != manifest.skill_sha256 {
-                    tracing::warn!("SKILL.md hash mismatch after download");
-                    return;
-                }
-                // The startup check and the startup manifest broadcast can
-                // both reach this write concurrently (#1086): stage the
-                // verified bytes in a unique temp file and rename it into
-                // place atomically, so readers and the other writer never
-                // observe a torn SKILL.md.
-                static SKILL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-                let tmp_path = data_dir.join(format!(
-                    "SKILL.md.tmp.{}.{}",
-                    std::process::id(),
-                    SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-                ));
-                let install = async {
-                    tokio::fs::write(&tmp_path, &new_contents).await?;
-                    tokio::fs::rename(&tmp_path, &skill_path).await
-                };
-                match install.await {
-                    Ok(()) => tracing::info!("SKILL.md updated successfully"),
-                    Err(e) => {
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                        tracing::warn!(error = %e, "Failed to install SKILL.md");
+    match download_skill(&manifest.skill_url).await {
+        Ok(new_contents) => {
+            let new_hash: [u8; 32] = Sha256::digest(&new_contents).into();
+            if new_hash != manifest.skill_sha256 {
+                tracing::warn!("SKILL.md hash mismatch after download");
+                return;
+            }
+            // Resolve the independent executable observation after the await.
+            // The earlier Due decision cannot authorize this later write.
+            #[cfg(unix)]
+            let staged_guide = match upgrader {
+                Some(upgrader) => match upgrader.guide_staging().await {
+                    Ok(staging) => staging,
+                    Err(error) => {
+                        tracing::warn!(%error, "Guide staging identity changed");
+                        return;
+                    }
+                },
+                None => None,
+            };
+            #[cfg(unix)]
+            let data_dir = if let Some((_, gate, _)) = &staged_guide {
+                match data_dir.canonicalize() {
+                    Ok(root) if root == gate.request.data_root => gate.request.data_root.as_path(),
+                    _ => {
+                        tracing::warn!("Guide staging data root changed");
+                        return;
                     }
                 }
+            } else {
+                data_dir
+            };
+            let skill_path = data_dir.join("SKILL.md");
+            // The startup check and the startup manifest broadcast can
+            // both reach this write concurrently (#1086): stage the
+            // verified bytes in a unique temp file and rename it into
+            // place atomically, so readers and the other writer never
+            // observe a torn SKILL.md.
+            static SKILL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+            let tmp_path = data_dir.join(format!(
+                "SKILL.md.tmp.{}.{}",
+                std::process::id(),
+                SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let install = x0x::upgrade::apply::run_owned_blocking(move |caller_alive| {
+                #[cfg(test)]
+                let observation = skill_install_seam::entered(&skill_path);
+                if !caller_alive.load(Ordering::Acquire)
+                    || shutdown
+                        .as_ref()
+                        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+                {
+                    return Err(x0x::upgrade::UpgradeError::Other(
+                        "guide update cancelled before install lock".into(),
+                    ));
+                }
+                #[cfg(unix)]
+                let _install_lock = staged_guide
+                    .as_ref()
+                    .map(|(install, _, _)| crate::upgrade::acquire_host_upgrade_lock(install))
+                    .transpose()?;
+                // Watch value custody orders a shutdown signal against
+                // this short atomic install. A cancelled queued worker
+                // cannot begin it after its observer has gone away.
+                let shutdown_value = shutdown.as_ref().map(watch::Receiver::borrow);
+                if !caller_alive.load(Ordering::Acquire)
+                    || shutdown_value.as_ref().is_some_and(|value| **value)
+                    || shutdown
+                        .as_ref()
+                        .is_some_and(|rx| rx.has_changed().is_err())
+                {
+                    return Err(x0x::upgrade::UpgradeError::Other(
+                        "guide update cancelled before install".into(),
+                    ));
+                }
+                #[cfg(unix)]
+                if let Some((install, gate, identity)) = &staged_guide {
+                    let clock = gate
+                        .clock()
+                        .map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))?;
+                    if let crate::upgrade::staging::Decision::Waiting(wait) =
+                        gate.observe_locked_at(install, &clock, identity)?
+                    {
+                        return Err(x0x::upgrade::UpgradeError::Other(format!(
+                            "guide staging is not due; remaining {} seconds",
+                            wait.as_secs()
+                        )));
+                    }
+                }
+                if !caller_alive.load(Ordering::Acquire) {
+                    return Err(x0x::upgrade::UpgradeError::Other(
+                        "guide update cancelled after staging check".into(),
+                    ));
+                }
+                #[cfg(test)]
+                observation.before_write();
+                let result = std::fs::write(&tmp_path, &new_contents)
+                    .and_then(|()| std::fs::rename(&tmp_path, &skill_path));
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                result.map_err(|error| x0x::upgrade::UpgradeError::Other(error.to_string()))
+            });
+            match install.await {
+                Ok(()) => tracing::info!("SKILL.md updated successfully"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to install SKILL.md");
+                }
             }
-            Err(e) => tracing::warn!(error = %e, "Failed to download SKILL.md: {e}"),
-        },
+        }
         Err(e) => tracing::warn!(error = %e, "Failed to download SKILL.md: {e}"),
     }
 }
@@ -1231,6 +1530,42 @@ fn schedule_restart_after_response(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging.rs"
+    ));
+    #[cfg(unix)]
+    staging_regression_tests!();
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging_guide.rs"
+    ));
+    staging_guide_regression_tests!();
+    #[cfg(unix)]
+    staging_runtime_regression_tests!();
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging_canonical.rs"
+    ));
+    #[cfg(unix)]
+    staging_canonical_regression_tests!();
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_fleet.rs"
+    ));
+    #[cfg(unix)]
+    fleet_startup_regression_tests!();
+    #[cfg(unix)]
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_staging_supersession.rs"
+    ));
+    #[cfg(unix)]
+    staging_supersession_regression_tests!();
+
     use super::*;
     use crate::upgrade::restart;
     use x0x::upgrade::manifest::{PlatformAsset, SCHEMA_VERSION};
@@ -1492,6 +1827,35 @@ mod tests {
         }
     }
 
+    #[allow(unused_mut)]
+    fn staging_readback(
+        mut scenario: restart::systemd_readback_seam::Scenario,
+        runtime: &StartupUpdateCheckRuntime,
+    ) -> restart::systemd_readback_seam::Scenario {
+        // These fixtures isolate start-rate behavior on an untracked unit.
+        // Fleet controls explicitly replace this cgroup after this helper.
+        scenario.cgroup = "0::/system.slice/x0x-staging-test.service".to_string();
+        #[cfg(unix)]
+        {
+            let current = crate::upgrade::apply::current_binary_path().unwrap();
+            for call in &mut scenario.calls {
+                call.show_output = call
+                    .show_output
+                    .replace(
+                        current.to_str().unwrap(),
+                        runtime.staging.install.to_str().unwrap(),
+                    )
+                    .replace(
+                        &restart::current_argv()[0],
+                        runtime.staging.install.to_str().unwrap(),
+                    );
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = runtime;
+        scenario
+    }
+
     /// The daemon-side runtime the end-to-end tests need: a restart
     /// context over the given data dir, a fresh apply lock and a live
     /// (never-signalled) shutdown watch. The returned sender keeps the
@@ -1500,6 +1864,27 @@ mod tests {
         data_dir: &std::path::Path,
     ) -> (StartupUpdateCheckRuntime, watch::Sender<bool>) {
         let (shutdown_tx, shutdown_watch) = watch::channel(false);
+        #[cfg(unix)]
+        let staging = {
+            let root = data_dir.canonicalize().unwrap();
+            let install = root.join("x0xd");
+            std::fs::write(&install, b"owned startup staging executable fixture").unwrap();
+            let started = tokio::time::Instant::now();
+            StartupStagingContext {
+                install,
+                identity_root: root,
+                machine_id: [42; 32],
+                observed: None,
+                clock: Some(Arc::new(move || {
+                    Ok(crate::upgrade::probe::ProbeClock {
+                        boot_id: "startup-fixture".into(),
+                        monotonic_ms: 1000
+                            + u64::try_from(started.elapsed().as_millis())
+                                .map_err(std::io::Error::other)?,
+                    })
+                })),
+            }
+        };
         (
             StartupUpdateCheckRuntime {
                 restart_context: listener_restart_context(
@@ -1509,6 +1894,8 @@ mod tests {
                 ),
                 upgrade_apply_lock: Arc::new(Mutex::new(())),
                 shutdown_watch,
+                #[cfg(unix)]
+                staging,
             },
             shutdown_tx,
         )
@@ -1522,15 +1909,34 @@ mod tests {
     /// and skipped until the next fallback poll.
     #[tokio::test(start_paused = true)]
     async fn startup_check_applies_after_start_rate_window_ages_out() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut config = DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.update.rollout_window_minutes = 0;
+        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        #[cfg(unix)]
+        let _observed_executable = crate::upgrade::apply::current_binary_path_seam::install(
+            data_dir.path().canonicalize().unwrap().join("x0xd"),
+        );
         // Activation entered at monotonic 1 s. The first readback observes
         // monotonic 3 s (2 s into the 10 s window — fresh activation);
         // the retry's observes monotonic 15 s (14 s in — the window has
         // aged out completely).
-        let _readback =
-            restart::systemd_readback_seam::install(restart::systemd_readback_seam::Scenario {
+        let _readback = restart::systemd_readback_seam::install(staging_readback(
+            restart::systemd_readback_seam::Scenario {
                 cgroup: "0::/system.slice/x0xd.service".to_string(),
                 invocation_id: Some(SEAM_INVOCATION_ID.to_string()),
                 calls: vec![
+                    // Unix staging identity and the first apply each observe
+                    // the pending activation; only the retry ages out. Other
+                    // platforms enter the apply path without staging readback.
+                    #[cfg(unix)]
+                    restart::systemd_readback_seam::ReadbackCall {
+                        show_output: show_for_this_process("10s", "5", 1_000_000),
+                        monotonic_now_us: 3_000_000,
+                    },
                     restart::systemd_readback_seam::ReadbackCall {
                         show_output: show_for_this_process("10s", "5", 1_000_000),
                         monotonic_now_us: 3_000_000,
@@ -1540,7 +1946,9 @@ mod tests {
                         monotonic_now_us: 15_000_000,
                     },
                 ],
-            });
+            },
+            &runtime,
+        ));
 
         // The apply attempt: counts attempts and answers as the
         // destructive half succeeding on the new version.
@@ -1560,13 +1968,6 @@ mod tests {
             signature: Vec::new(),
             gossip_payload: Vec::new(),
         });
-
-        let data_dir = tempfile::TempDir::new().unwrap();
-        let config = DaemonConfig {
-            data_dir: data_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
 
         let before = tokio::time::Instant::now();
         let result = run_startup_update_check(&config, None, Some(runtime)).await;
@@ -1600,7 +2001,21 @@ mod tests {
     /// not touch it.
     #[tokio::test(start_paused = true)]
     async fn startup_check_applies_immediately_when_start_limit_interval_is_zero() {
-        let _readback = restart::systemd_readback_seam::install(one_call_scenario("0", "5"));
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut config = DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.update.rollout_window_minutes = 0;
+        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        #[cfg(unix)]
+        let _observed_executable = crate::upgrade::apply::current_binary_path_seam::install(
+            data_dir.path().canonicalize().unwrap().join("x0xd"),
+        );
+        let _readback = restart::systemd_readback_seam::install(staging_readback(
+            one_call_scenario("0", "5"),
+            &runtime,
+        ));
         let attempts = Arc::new(AtomicU64::new(0));
         let hook_attempts = Arc::clone(&attempts);
         let _apply =
@@ -1616,12 +2031,7 @@ mod tests {
             signature: Vec::new(),
             gossip_payload: Vec::new(),
         });
-        let data_dir = tempfile::TempDir::new().unwrap();
-        let config = DaemonConfig {
-            data_dir: data_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+
         let before = tokio::time::Instant::now();
         let result = run_startup_update_check(&config, None, Some(runtime)).await;
         assert_eq!(
@@ -1644,7 +2054,21 @@ mod tests {
     /// systemd.service): same contract as interval 0.
     #[tokio::test(start_paused = true)]
     async fn startup_check_applies_immediately_when_start_limit_burst_is_zero() {
-        let _readback = restart::systemd_readback_seam::install(one_call_scenario("10s", "0"));
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut config = DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.update.rollout_window_minutes = 0;
+        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+        #[cfg(unix)]
+        let _observed_executable = crate::upgrade::apply::current_binary_path_seam::install(
+            data_dir.path().canonicalize().unwrap().join("x0xd"),
+        );
+        let _readback = restart::systemd_readback_seam::install(staging_readback(
+            one_call_scenario("10s", "0"),
+            &runtime,
+        ));
         let attempts = Arc::new(AtomicU64::new(0));
         let hook_attempts = Arc::clone(&attempts);
         let _apply =
@@ -1660,12 +2084,7 @@ mod tests {
             signature: Vec::new(),
             gossip_payload: Vec::new(),
         });
-        let data_dir = tempfile::TempDir::new().unwrap();
-        let config = DaemonConfig {
-            data_dir: data_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
+
         let before = tokio::time::Instant::now();
         let result = run_startup_update_check(&config, None, Some(runtime)).await;
         assert_eq!(

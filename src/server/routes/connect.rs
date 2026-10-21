@@ -573,12 +573,18 @@ pub(in crate::server) async fn streams_diagnostics(
             )
         })
         .unwrap_or((0, 0, 0));
+    let socks_denied = state
+        .socks_service
+        .as_ref()
+        .map(x0x::socks::SocksService::denied_count)
+        .unwrap_or(0);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "active_streams": active,
             "connect_failed": connect_failed,
             "machine_mismatch": machine_mismatch,
+            "socks_denied": socks_denied,
             "connect": state.connect_diagnostics.snapshot(),
         })),
     )

@@ -45628,6 +45628,7 @@ pub(in crate::server) mod tests {
                 x0x::connect::ConnectPolicy::default().summary(),
             )),
             forward_service: None,
+            socks_service: None,
             owner_sync,
             names: Arc::new(
                 x0x::names::NameStore::load(x0x::names::NameStore::path_in(data_dir)).await,

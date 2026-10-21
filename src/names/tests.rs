@@ -751,7 +751,7 @@ async fn pin_mismatch_is_refused_and_the_pin_is_kept() {
     );
     // A user id that is not the bound owner is refused inside the pin
     // transaction. The existing pin stays. A direct pin of that other
-    // user is still `pin_mismatch`.
+    // user is `unknown_name`: the owner recheck runs before the pin write.
     let err = resolve_with(
         &store,
         &name("studio.bob"),
@@ -772,7 +772,7 @@ async fn pin_mismatch_is_refused_and_the_pin_is_kept() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.code(), "pin_mismatch");
+    assert_eq!(err.code(), "unknown_name");
     let pin = store.get_pin("agent:studio.bob").await.unwrap().unwrap();
     assert_eq!((pin.id, pin.owner), ([1; 32], owner), "pin unchanged");
 
@@ -911,6 +911,106 @@ async fn unbind_during_resolve_does_not_leave_a_pin_for_the_old_owner() {
     );
 }
 
+/// WHY: `label_shared_machine` reads the owner, then awaits grant checks,
+/// then pins. A `DELETE /names/owners/bob` that wins before that pin must
+/// not leave `machine:box.bob`. The owner is rechecked inside the pin
+/// transaction. The resolve race above does not cover this path.
+#[tokio::test]
+async fn unbind_during_shared_machine_label_does_not_leave_a_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = crate::Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_user_key_path(dir.path().join("user.key"))
+        .with_identity_dir(dir.path())
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_peer_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+
+    let bob = user();
+    let real_kp = agent();
+    let real_machine = MachineId([9; 32]);
+    let real_id = real_kp.agent_id();
+    let real_cert = AgentCertificate::issue(&bob, &real_kp).unwrap();
+    let now = crate::dm_capability::now_unix_ms() / 1000;
+    local
+        .record_authenticated_binding_for_testing(real_id, real_machine, now)
+        .await;
+    local.identity_discovery_cache.write().await.insert(
+        real_id,
+        discovered_named(real_id, real_machine, bob.user_id(), real_cert, "srv"),
+    );
+
+    let names = std::sync::Arc::new(NameStore::in_memory());
+    names
+        .bind_owner("bob", bob.user_id(), BindSource::Manual, now)
+        .await
+        .unwrap();
+    let grant = crate::share_grant::ShareGrant::sign(
+        &bob,
+        [7; 32],
+        Grantee::Agent(local.agent_id()),
+        vec![real_id],
+        vec![ShareCap::Connect { ports: vec![22] }],
+        now.saturating_sub(10),
+        now + 3600,
+    )
+    .unwrap();
+    let grants = std::sync::Arc::new(crate::share_grant::ShareGrantStore::in_memory(
+        local.agent_id(),
+        local.user_id(),
+    ));
+    grants.accept(grant, now).await.unwrap();
+    local.install_share_grant_store(grants);
+
+    let gate = names.arm_pin_interleave();
+    let label_names = std::sync::Arc::clone(&names);
+    let labelled = tokio::spawn(async move {
+        let result = local
+            .label_shared_machine(&label_names, &name("machine:box.bob"), real_machine)
+            .await;
+        local.shutdown().await;
+        result
+    });
+    let start = std::time::Instant::now();
+    while !gate.entered.load(std::sync::atomic::Ordering::SeqCst) {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("shared-machine label did not reach the pin transaction");
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(names.unbind_owner("bob").await.unwrap());
+    gate.release
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    gate.wake.notify_waiters();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), labelled)
+        .await
+        .expect("label finished")
+        .expect("label task")
+        .expect_err("unbound owner must not pin a shared machine");
+    assert_eq!(err.code(), "unknown_name", "{err}");
+    assert!(names.owner("bob").await.unwrap().is_none());
+    assert!(
+        names.get_pin("machine:box.bob").await.unwrap().is_none(),
+        "a late shared-machine pin must not restore a name for an unbound owner"
+    );
+    assert_eq!(
+        names
+            .bind_owner("bob", bob.user_id(), BindSource::Manual, now)
+            .await
+            .unwrap(),
+        BindOutcome::Inserted,
+        "rebinding bob must not meet a stale pin"
+    );
+    assert!(
+        names.get_pin("machine:box.bob").await.unwrap().is_none(),
+        "the deleted owner's machine pin must stay absent"
+    );
+}
+
 /// WHY: two bare resolves that see different single-kind snapshots must
 /// not both insert. The kind check and the insert share one commit.
 #[tokio::test]
@@ -986,6 +1086,10 @@ async fn owner_petname_is_frozen_at_first_bind() {
     }
     assert!(store.owner("nobody").await.unwrap().is_none());
 
+    store
+        .bind_owner("bobby", u1, BindSource::Manual, NOW)
+        .await
+        .unwrap();
     store
         .pin("agent:studio.bob", u1, [3; 32], BindSource::FirstUse, NOW)
         .await

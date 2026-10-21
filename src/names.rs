@@ -858,7 +858,8 @@ pub struct NameStore {
     /// cancellation test waits until a later write is queued on this lock.
     #[cfg(test)]
     lock_waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// One-shot pause before the next pin commit. Taken by the resolver.
+    /// One-shot pause before the next pin commit. Taken by the resolver
+    /// and by [`NameStore::pin`].
     #[cfg(test)]
     pin_gate: std::sync::Mutex<Option<std::sync::Arc<PinInterleave>>>,
 }
@@ -1295,7 +1296,12 @@ impl NameStore {
     /// This is the TOFU rule: an existing pin to a different id or owner is
     /// refused with [`NameError::PinMismatch`] and never rewritten.
     ///
+    /// The commit rechecks the owner petname under the same lock as
+    /// [`Self::unbind_owner`]. A concurrent unbind that wins the lock leaves
+    /// no pin. `me` has no petname row.
+    ///
     /// # Errors
+    /// `UnknownName` when `key`'s owner label is not bound to `owner`,
     /// `PinMismatch`, a full store, or `Store`.
     pub async fn pin(
         &self,
@@ -1305,10 +1311,17 @@ impl NameStore {
         source: BindSource,
         now_unix: u64,
     ) -> Result<BindOutcome, NameError> {
-        parse_pin_key(key)?;
+        let (_, parsed) = parse_pin_key(key)?;
+        let owner_label = parsed.owner;
         let key = key.to_string();
-        self.commit(move |state| install_pin(state, key, owner, id, source, now_unix))
-            .await
+        // After the caller read the owner, before the pin lock. A test unbinds here.
+        #[cfg(test)]
+        self.wait_pin_interleave().await;
+        self.commit(move |state| {
+            require_bound_owner(state, &owner_label, owner)?;
+            install_pin(state, key, owner, id, source, now_unix)
+        })
+        .await
     }
 
     /// Remove the pin for canonical `key` (the owner's re-pin step).
