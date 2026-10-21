@@ -23,8 +23,9 @@ using the leading 64 bits of the hash and integer arithmetic. It preserves
 the zero-window calculator behavior. A minute value too large to represent
 in whole seconds uses `u64::MAX` seconds as the effective bound.
 
-The Unix startup, gossip and fallback paths record the first eligible release
-beside the canonical installed binary. The private `upgrade-rollout-<digest>.json`
+The Unix startup, gossip, fallback and HTTP apply paths record the first
+eligible release beside the canonical installed binary. The private
+`upgrade-rollout-<digest>.json`
 receipt binds the actual data and identity roots, MachineId, release version,
 verified manifest digest and archive digest. Duplicate delivery, restart and
 later window changes retain the first choice. Monotonic elapsed time reduces
@@ -97,10 +98,27 @@ continue without an apply owner.
 The background owner updates the guide only after staging permits the release.
 Without that owner, these sources leave the installed guide unchanged.
 
-HTTP waits, complete host inventory and transaction-bound guide installation
-remain separate M2 work. Shutdown closes background intake and withdraws
-pre-admission writes; it does not claim every blocking operation is reaped
-before shutdown returns.
+HTTP allows one waiting request and retains its deferred restart owner after
+mutation admission. Dropping a waiting request cancels its permit. Queued or
+running blocking work, including service-manager readback, retains that
+request's capacity slot until the worker exits.
+Each request keeps the release and verified manifest found before its staging
+wait. Later policy checks can refuse that release. The request does not select
+a newer release during the wait.
+
+`x0x upgrade --apply --now` sends authenticated
+`POST /upgrade/apply?now=true` (D185). It skips only the staging component of
+the wait. Receipt barriers, fleet history, supersession, eligibility, holds,
+mandatory probe retry waits and transaction checks still apply, including
+the final check under the install lock. It does not write a zero-window
+replacement receipt. The CLI uses no total apply-request timeout, with
+connection setup bounded to 30 seconds.
+
+Shutdown closes background intake and withdraws pre-admission writes; it does
+not claim every blocking operation is reaped before shutdown returns.
+Complete host inventory and transaction-bound guide installation remain
+separate M2 work. These staging controls do not establish a protected host
+transaction or authorize guide promotion at host commit.
 
 ### Candidate execution probes (M2 S2d)
 
@@ -132,10 +150,12 @@ unknown state.
 A durably recorded timeout or host fault permits at most three fresh retry
 transactions, after 30, 60 and 120 minutes. Retry timers release the apply
 mutex, observe daemon shutdown and reread the record before each attempt.
-HTTP apply returns its refusal without waiting through this backoff. Startup
-and background discovery can resume a pending wait after verifying the release
-manifest again. Boot identity and monotonic time prevent a wall-clock change
-or daemon restart from shortening the recorded wait.
+HTTP apply includes an existing interrupted retry wait in its staging gate,
+even with `now=true`. A new probe failure still returns its refusal and leaves
+retry ownership with the daemon. Startup and background discovery can resume
+a pending wait after verifying the release manifest again. Boot identity and
+monotonic time prevent a wall-clock change or daemon restart from shortening
+the recorded wait.
 
 Before a terminal record write, a durable
 `x0xd.upgrade-probe.json.pending` marker retains the prior record. It is removed
@@ -537,6 +557,9 @@ no gossip, binds nothing, and takes no instance lock.
 1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
+4. **Authenticated HTTP apply**: Verify the release and wait for staging, then
+   recheck admission under the install lock before replacement. The CLI
+   `upgrade --apply` uses this route; `--now` skips only the staging delay.
 
 Gossip and polling retain a 30-minute in-memory backoff for other apply errors.
 Unix candidate-probe failures additionally use the durable release holds and

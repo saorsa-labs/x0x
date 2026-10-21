@@ -1165,6 +1165,35 @@ pub async fn serve_with_options(
         })
         .await;
 
+    #[cfg(unix)]
+    let upgrade_staging = if self_update_enabled && config.update.enabled {
+        match async {
+            let identity_root = match identity_dir.clone() {
+                Some(path) => path,
+                None => crate::storage::x0x_dir().await?,
+            };
+            Ok::<_, anyhow::Error>(routes::StartupStagingContext {
+                install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                identity_root: identity_root.canonicalize()?,
+                machine_id: *agent.machine_id().as_bytes(),
+                #[cfg(test)]
+                clock: None,
+                #[cfg(test)]
+                observed: None,
+            })
+        }
+        .await
+        {
+            Ok(context) => Some(context),
+            Err(error) => {
+                tracing::warn!(%error, "HTTP upgrade staging identity is unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         key_move_ceremony_enabled: config.key_move.ceremony_enabled,
@@ -1298,6 +1327,9 @@ pub async fn serve_with_options(
         self_update_enabled,
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
+        http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+        #[cfg(unix)]
+        upgrade_staging,
         api_token,
         sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
         rider_tokens: tokio::sync::Mutex::new(

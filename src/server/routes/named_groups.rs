@@ -45612,6 +45612,9 @@ pub(in crate::server) mod tests {
             self_update_enabled: false,
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
+            http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+            #[cfg(unix)]
+            upgrade_staging: None,
             api_token: "test-token".to_string(),
             sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
             rider_tokens: tokio::sync::Mutex::new(
