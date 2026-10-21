@@ -386,6 +386,26 @@ impl IssuedCertRecord {
         }
     }
 
+    /// Append the record `decide` returns for the journal's current lines,
+    /// or nothing when it returns `None`. Returns whether a line was
+    /// appended. A writer that decides from what is already in the journal
+    /// (owner sync's repair of a synced line) uses this, so the read, the
+    /// decision and the append are one step.
+    ///
+    /// # Errors
+    /// Returns the underlying IO error of the append.
+    pub async fn append_when(
+        path: &Path,
+        decide: impl FnOnce(&[Self]) -> Option<Self>,
+    ) -> std::io::Result<bool> {
+        let existing = Self::load(path).await;
+        let Some(record) = decide(&existing) else {
+            return Ok(false);
+        };
+        Self::append(path, &record).await?;
+        Ok(true)
+    }
+
     /// Load the journal; malformed lines are skipped (the journal is
     /// advisory-authoritative, and one corrupt line must not blank the
     /// roster).
@@ -410,6 +430,65 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Codex review of #1545 (69fe33e): a writer that decides from the
+    /// journal (`append_when`) and an issuance append must not interleave.
+    /// Here the decision sees only `d1`'s history and appends `d1` again;
+    /// a renewal `d2` is issued while it decides. `d2` must end up last,
+    /// because readers take the last line per agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_decided_append_and_an_issuance_append_do_not_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CERT_JOURNAL_FILE);
+        let line = |digest: &str| IssuedCertRecord {
+            user_id: "aa".to_string(),
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(5_000),
+            mode: CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        };
+        IssuedCertRecord::append(&path, &line("d1")).await.unwrap();
+        let (deciding_tx, deciding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let decided = {
+            let path = path.clone();
+            let repair = line("d1");
+            tokio::spawn(async move {
+                IssuedCertRecord::append_when(&path, move |existing| {
+                    let saw_d2 = existing.iter().any(|r| r.cert_digest == "d2");
+                    deciding_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    (!saw_d2).then_some(repair)
+                })
+                .await
+                .unwrap()
+            })
+        };
+        deciding_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let issuance = {
+            let path = path.clone();
+            let renewal = line("d2");
+            tokio::spawn(async move { IssuedCertRecord::append(&path, &renewal).await })
+        };
+        // Give the issuance time to run while the decision is held.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        release_tx.send(()).unwrap();
+        decided.await.unwrap();
+        issuance.await.unwrap().unwrap();
+        let lines = IssuedCertRecord::load(&path).await;
+        assert_eq!(
+            lines.last().map(|r| r.cert_digest.as_str()),
+            Some("d2"),
+            "the renewal stays the last line: {lines:?}"
+        );
+    }
 
     #[tokio::test]
     async fn owner_profile_round_trips_on_disk() {

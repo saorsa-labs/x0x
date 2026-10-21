@@ -3100,19 +3100,19 @@ async fn append_synced_journal_line(
     issued_at: u64,
     not_after: Option<u64>,
 ) {
-    let existing = crate::profile::IssuedCertRecord::load(&path).await;
-    if !synced_line_needed(
-        &existing,
-        &owner_hex,
-        &agent_hex,
-        &cert_digest,
-        issued_at,
-        not_after,
-    ) {
-        return;
-    }
-    let record = synced_journal_line(owner_hex, agent_hex, cert_digest, issued_at, not_after);
-    if let Err(e) = crate::profile::IssuedCertRecord::append(&path, &record).await {
+    let appended = crate::profile::IssuedCertRecord::append_when(&path, |existing| {
+        synced_line_needed(
+            existing,
+            &owner_hex,
+            &agent_hex,
+            &cert_digest,
+            issued_at,
+            not_after,
+        )
+        .then(|| synced_journal_line(owner_hex, agent_hex, cert_digest, issued_at, not_after))
+    })
+    .await;
+    if let Err(e) = appended {
         tracing::warn!(
             target: "x0x::owner_sync",
             "failed to append synced journal line: {e}"
@@ -5672,6 +5672,31 @@ mod issuance_journal_sync_tests {
         let received = synced_journal_line(OWNER.to_string(), agent, digest, issued_at, not_after);
         let receiver = latest_journal_values(vec![received], OWNER);
         assert_eq!(receiver.get("bb"), Some(sent));
+    }
+
+    /// Codex review of #1545 (69fe33e): `issued_at` has second precision,
+    /// so a renewal can share its predecessor's second. Repairing the older
+    /// digest must not append a line after it.
+    #[test]
+    fn a_same_second_renewal_blocks_the_repair_of_the_older_digest() {
+        let existing = vec![line("d1", 100, None), line("d2", 100, Some(9_000))];
+        assert!(!synced_line_needed(
+            &existing,
+            OWNER,
+            "bb",
+            "d1",
+            100,
+            Some(5_000)
+        ));
+        // The repair still runs when the older digest is the newest line.
+        assert!(synced_line_needed(
+            &[line("d1", 100, None)],
+            OWNER,
+            "bb",
+            "d1",
+            100,
+            Some(5_000)
+        ));
     }
 
     /// A pre-fix synced line (same digest, no `not_after`) never hides a
