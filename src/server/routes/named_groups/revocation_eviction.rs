@@ -47,6 +47,7 @@ use x0x::groups::eviction::{
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
+mod handoff_log;
 pub(super) mod owner_recovery;
 pub(super) mod rebind;
 mod removal_delivery;
@@ -192,6 +193,10 @@ struct S4Inner {
     /// §1a: verified expiry hand-offs kept until this node selects the
     /// same certificate and its clock passes the raw `not_after`.
     expiry_handoffs: BTreeMap<EvictionKey, ExpiryHandoff>,
+    /// [`Self::expiry_handoffs`] changed since the last `.evh` write.
+    expiry_handoffs_dirty: bool,
+    /// The `.evh` file has a newer layout: it is never rewritten.
+    expiry_handoffs_newer_file: bool,
 }
 
 /// A kept §1a expiry hand-off.
@@ -594,7 +599,11 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
     let notify = state.agent.s4_revocation_intake().notified();
     loop {
         revocation_eviction_pass(&state).await;
-        persist_obligations(&state).await;
+        // The `.evh` drops a kept hand-off only after the `.evs` holds the
+        // row it opened.
+        if persist_obligations(&state).await {
+            handoff_log::persist(&state).await;
+        }
         dispatch_handoffs(&state).await;
         drive_exclusions(&state).await;
         drive_queued_bans(&state).await;
@@ -655,8 +664,12 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     // §1a: a kept expiry hand-off opens the work once this node selects
     // the same certificate and its clock has passed the raw `not_after`;
     // T_obs is that moment, not the own trigger time `not_after + τ`.
+    let kept_before = inner.expiry_handoffs.len();
     let handoff_triggers =
         expiry_handoff_triggers(&mut inner.expiry_handoffs, &groups, now_unix_ms);
+    if inner.expiry_handoffs.len() != kept_before {
+        inner.expiry_handoffs_dirty = true;
+    }
     for (key, trigger, incarnation, observed_ms) in handoff_triggers {
         let outcome =
             inner
@@ -1970,17 +1983,22 @@ async fn note_expiry_handoff(
         }
     }
     let key = EvictionKey::new(stable_group_id.to_string(), target);
-    state
-        .revocation_evictions
-        .inner
-        .lock()
-        .await
-        .expiry_handoffs
-        .entry(key)
-        .or_insert_with(|| ExpiryHandoff {
-            certificate_digest: expired.certificate_digest.clone(),
-            received_unix_ms: now_unix_ms(),
-        });
+    {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if inner.expiry_handoffs.contains_key(&key) {
+            return;
+        }
+        inner.expiry_handoffs.insert(
+            key,
+            ExpiryHandoff {
+                certificate_digest: expired.certificate_digest.clone(),
+                received_unix_ms: now_unix_ms(),
+            },
+        );
+        inner.expiry_handoffs_dirty = true;
+    }
+    // §2: the verified receipt time is persisted before it is used.
+    handoff_log::persist(state).await;
 }
 
 /// The carried certificate of an expiry hand-off, when its bytes hash to
@@ -3254,6 +3272,8 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.removals = removals;
     inner.queued_bans = queued_bans;
     inner.dirty = !journals.is_empty();
+    drop(inner);
+    handoff_log::load(state).await;
 }
 
 /// Read every `.evjournal` in the TreeKEM directory, classify it, and

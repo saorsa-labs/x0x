@@ -230,18 +230,39 @@ impl<const CAP: usize> HeldLog<CAP> {
 
 /// Encode one file.
 fn encode(log: &ReplayLogV1) -> Result<Vec<u8>, postcard::Error> {
-    let body = postcard::to_stdvec(log)?;
-    let mut out = HEADER_V1.to_vec();
-    out.extend_from_slice(&body);
-    out.extend_from_slice(blake3::hash(&body).as_bytes());
-    Ok(out)
+    encode_local_file(HEADER_V1, log)
 }
 
 /// Decode one file, with the ADR 0108 §5a classification of a file that
 /// cannot be used.
 fn decode(bytes: &[u8]) -> Result<ReplayLogV1, SidecarDecodeError> {
+    decode_local_file(PREFIX, MAX_SUPPORTED_VERSION, bytes)
+}
+
+/// The S4 local-file layout, shared by the held frame logs and the kept
+/// expiry hand-offs: the 8-byte `header` (`prefix`, version digit, NUL),
+/// the postcard `body`, then the BLAKE3 hash of that body.
+pub(in super::super) fn encode_local_file<T: Serialize>(
+    header: &[u8; 8],
+    body: &T,
+) -> Result<Vec<u8>, postcard::Error> {
+    let body = postcard::to_stdvec(body)?;
+    let mut out = header.to_vec();
+    out.extend_from_slice(&body);
+    out.extend_from_slice(blake3::hash(&body).as_bytes());
+    Ok(out)
+}
+
+/// Decode one [`encode_local_file`] file. A version above `max_version`
+/// is [`SidecarDecodeError::NewerFormat`]; any other fault is
+/// [`SidecarDecodeError::Damaged`].
+pub(in super::super) fn decode_local_file<T: serde::de::DeserializeOwned>(
+    prefix: &[u8],
+    max_version: u8,
+    bytes: &[u8],
+) -> Result<T, SidecarDecodeError> {
     let rest = bytes
-        .strip_prefix(PREFIX)
+        .strip_prefix(prefix)
         .ok_or(SidecarDecodeError::Damaged("missing_prefix"))?;
     let (Some(&version_byte), Some(&terminator)) = (rest.first(), rest.get(1)) else {
         return Err(SidecarDecodeError::Damaged("truncated_header"));
@@ -249,7 +270,7 @@ fn decode(bytes: &[u8]) -> Result<ReplayLogV1, SidecarDecodeError> {
     if !(b'1'..=b'9').contains(&version_byte) || terminator != 0 {
         return Err(SidecarDecodeError::Damaged("bad_header"));
     }
-    if version_byte - b'0' > MAX_SUPPORTED_VERSION {
+    if version_byte - b'0' > max_version {
         return Err(SidecarDecodeError::NewerFormat(version_byte - b'0'));
     }
     let payload = rest.get(2..).unwrap_or_default();
@@ -261,7 +282,7 @@ fn decode(bytes: &[u8]) -> Result<ReplayLogV1, SidecarDecodeError> {
     if blake3::hash(body).as_bytes().as_slice() != hash {
         return Err(SidecarDecodeError::Damaged("hash_mismatch"));
     }
-    match postcard::take_from_bytes::<ReplayLogV1>(body) {
+    match postcard::take_from_bytes::<T>(body) {
         Ok((log, [])) => Ok(log),
         _ => Err(SidecarDecodeError::Damaged("body_decode")),
     }
