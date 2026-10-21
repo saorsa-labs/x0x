@@ -3200,6 +3200,10 @@ async fn consume_reseat(
         let status = response.status();
         tracing::warn!(group_id = %LogHexId::group(group_key), %status, "ADR 0109 S3: the staged join was refused; restoring the live record");
         restore_live_record(state, &stable, &format!("join_{}", status.as_u16())).await;
+    } else {
+        // The join can return with the record already Active with keys:
+        // swap now rather than at the next worker tick.
+        swap_now_if_seated(state, &stable).await;
     }
 }
 
@@ -3304,6 +3308,84 @@ async fn restore_live_record(state: &Arc<AppState>, stable: &str, why: &str) {
     tracing::warn!(group_id = %LogHexId::group(stable), why, "ADR 0109 S3: re-seat failed; the contained live record is restored");
 }
 
+/// The live record whose stable id is `stable`, with its map key.
+async fn live_record_for(state: &AppState, stable: &str) -> Option<(String, GroupInfo)> {
+    let groups = state.named_groups.read().await;
+    groups
+        .iter()
+        .find(|(_, info)| info.stable_group_id() == stable)
+        .map(|(key, info)| (key.clone(), info.clone()))
+}
+
+/// §3 step 3: when the staged record is Active with keys, swap it in. The
+/// journal closes and the old record is retired (cause `reseat`) in one
+/// sidecar write, and the subject's `reseat_in_progress` view is cleared
+/// with it. Returns whether the record is seated (the swap is done, by
+/// this call or an earlier one, or its durable write failed and the next
+/// tick retries).
+///
+/// The worker tick calls this, and so do the staged join's return and the
+/// `recovery` object read, so a reader never sees `reseat_in_progress`
+/// for a record that is already Active. The closure re-checks the journal
+/// under the sidecar writer lock, so two concurrent callers retire the
+/// old record once.
+async fn swap_if_seated(
+    state: &AppState,
+    stable: &str,
+    live: Option<&(String, GroupInfo)>,
+    journal: &ReseatJournalV1,
+) -> bool {
+    let local = local_hex(state);
+    let seated = match live {
+        Some((key, info)) => {
+            info.has_active_member(&local)
+                && (info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+                    || state.treekem_groups.read().await.contains_key(key))
+        }
+        None => false,
+    };
+    if !seated {
+        return false;
+    }
+    let retired = RetiredRecordV1 {
+        cause: "reseat".to_string(),
+        retired_at_ms: now_ms(),
+        record: journal.live_record.clone(),
+    };
+    let mut swapped = false;
+    let swapped_ref = &mut swapped;
+    if update_sidecar(state, stable, move |body| {
+        if body.reseat_journal.take().is_some() {
+            body.retire(retired);
+            *swapped_ref = true;
+        }
+    })
+    .await
+    {
+        let mut inner = state.group_recovery.inner.lock().await;
+        inner.subjects.remove(stable);
+        inner.staging_live.remove(stable);
+        drop(inner);
+        if swapped {
+            tracing::info!(group_id = %LogHexId::group(stable), "ADR 0109 S3: re-seat swapped in; the old record is retired");
+        }
+    }
+    true
+}
+
+/// Swap in the staged record of `stable` now if it is seated. A no-op when
+/// no re-seat journal is open.
+async fn swap_now_if_seated(state: &AppState, stable: &str) {
+    let Some(journal) = sidecar_snapshot(state, stable)
+        .await
+        .and_then(|body| body.reseat_journal)
+    else {
+        return;
+    };
+    let live = live_record_for(state, stable).await;
+    let _ = swap_if_seated(state, stable, live.as_ref(), &journal).await;
+}
+
 /// Swap or fail each staged join (§3 steps 3 and 4).
 async fn reseat_progress(state: &Arc<AppState>) {
     let journals: Vec<(String, ReseatJournalV1)> = state
@@ -3315,41 +3397,9 @@ async fn reseat_progress(state: &Arc<AppState>) {
         .iter()
         .filter_map(|(group, body)| body.reseat_journal.clone().map(|j| (group.clone(), j)))
         .collect();
-    let local = local_hex(state);
     for (stable, journal) in journals {
-        let live = {
-            let groups = state.named_groups.read().await;
-            groups
-                .iter()
-                .find(|(_, info)| info.stable_group_id() == stable)
-                .map(|(key, info)| (key.clone(), info.clone()))
-        };
-        let seated = match &live {
-            Some((key, info)) => {
-                info.has_active_member(&local)
-                    && (info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
-                        || state.treekem_groups.read().await.contains_key(key))
-            }
-            None => false,
-        };
-        if seated {
-            let retired = RetiredRecordV1 {
-                cause: "reseat".to_string(),
-                retired_at_ms: now_ms(),
-                record: journal.live_record.clone(),
-            };
-            if update_sidecar(state, &stable, move |body| {
-                body.reseat_journal = None;
-                body.retire(retired);
-            })
-            .await
-            {
-                let mut inner = state.group_recovery.inner.lock().await;
-                inner.subjects.remove(&stable);
-                inner.staging_live.remove(&stable);
-                drop(inner);
-                tracing::info!(group_id = %LogHexId::group(&stable), "ADR 0109 S3: re-seat swapped in; the old record is retired");
-            }
+        let live = live_record_for(state, &stable).await;
+        if swap_if_seated(state, &stable, live.as_ref(), &journal).await {
             continue;
         }
         let failed_outcome = {
@@ -3413,6 +3463,10 @@ pub(in crate::server) async fn recovery_json(
     info: &GroupInfo,
 ) -> Option<serde_json::Value> {
     let stable = info.stable_group_id();
+    // §3 step 3: a staged record that is already Active swaps in before
+    // the object is read, so `reseat_in_progress` never outlives the swap
+    // by a worker tick.
+    swap_now_if_seated(state, stable).await;
     let refs = live_refs(state, info).await;
     let inner = state.group_recovery.inner.lock().await;
     if let Some(fault) = inner.sidecar_status.get(stable) {
