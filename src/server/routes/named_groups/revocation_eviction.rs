@@ -334,13 +334,48 @@ fn refresh_head_round(
     ask
 }
 
-/// Record one verified, applied, non-truncated catch-up page answer.
+/// How a holder's reported head relates to the local verified chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadReport {
+    /// The local head itself, or a head on the local verified chain
+    /// before it (the holder is behind, for example a survivor that has
+    /// not yet received this node's own exclusion). The holder holds
+    /// nothing this node lacks.
+    OnLocalChain,
+    /// A head this node does not have: a later head, or a sibling. This
+    /// is unresolved higher-head evidence (§2).
+    Unknown,
+}
+
+/// Classify `reported` against the local verified chain: the current head
+/// and every head the retained commit log links (each commit's own hash
+/// and its parent). A head older than the retained log cannot be proved
+/// an ancestor and stays [`HeadReport::Unknown`].
+fn classify_head_report(info: &GroupInfo, reported: &str) -> HeadReport {
+    let on_chain = reported == info.state_hash
+        || info.commit_log.iter().any(|retained| {
+            retained.commit.state_hash == reported
+                || retained.commit.prev_state_hash.as_deref() == Some(reported)
+        });
+    if on_chain {
+        HeadReport::OnLocalChain
+    } else {
+        HeadReport::Unknown
+    }
+}
+
+/// Record one verified, applied, non-truncated catch-up page answer. A
+/// holder at the local head or behind it on the local chain completes the
+/// round: it answered and holds no later head. A holder at a head this
+/// node does not have blocks the seal (the stale-replica protection).
+/// Only a report about a later or sibling head is evidence; a survivor
+/// that is behind must not block the delivery that brings it forward.
 fn note_head_report(
     rounds: &mut HashMap<String, HeadRound>,
     stable_group_id: &str,
     current_head: &str,
     sender: [u8; 32],
-    reported: &str,
+    report: HeadReport,
     now: Instant,
 ) {
     let round = rounds
@@ -349,11 +384,14 @@ fn note_head_report(
     if round.head != current_head {
         *round = HeadRound::new(current_head, now);
     }
-    if reported == current_head {
-        round.confirmed = true;
-        round.conflicting.remove(&sender);
-    } else {
-        round.conflicting.insert(sender);
+    match report {
+        HeadReport::OnLocalChain => {
+            round.confirmed = true;
+            round.conflicting.remove(&sender);
+        }
+        HeadReport::Unknown => {
+            round.conflicting.insert(sender);
+        }
     }
 }
 
@@ -491,11 +529,16 @@ pub(in crate::server) async fn note_catchup_head(
     let current = {
         let groups = state.named_groups.read().await;
         group_ids.iter().find_map(|id| {
-            crate::server::resolve_group_entry_locked(&groups, id)
-                .map(|(_, info)| (info.stable_group_id().to_string(), info.state_hash.clone()))
+            crate::server::resolve_group_entry_locked(&groups, id).map(|(_, info)| {
+                (
+                    info.stable_group_id().to_string(),
+                    info.state_hash.clone(),
+                    classify_head_report(info, reported),
+                )
+            })
         })
     };
-    let Some((stable, head)) = current else {
+    let Some((stable, head, report)) = current else {
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
@@ -508,7 +551,7 @@ pub(in crate::server) async fn note_catchup_head(
         &stable,
         &head,
         *sender.as_bytes(),
-        reported,
+        report,
         Instant::now(),
     );
 }
@@ -3083,7 +3126,7 @@ mod tests {
         let mut rounds = HashMap::new();
         let holders = [[8; 32], [9; 32]];
         refresh_head_round(&mut rounds, "g", "h1", &holders, start, wait);
-        note_head_report(&mut rounds, "g", "h1", [8; 32], "higher", start);
+        note_head_report(&mut rounds, "g", "h1", [8; 32], HeadReport::Unknown, start);
         let later = start + wait * 10;
         assert!(!rounds
             .get("g")
@@ -3092,7 +3135,14 @@ mod tests {
         // After the wait the round asks every holder again.
         let again = refresh_head_round(&mut rounds, "g", "h1", &holders, later, wait);
         assert_eq!(again, holders.to_vec());
-        note_head_report(&mut rounds, "g", "h1", [9; 32], "h1", later);
+        note_head_report(
+            &mut rounds,
+            "g",
+            "h1",
+            [9; 32],
+            HeadReport::OnLocalChain,
+            later,
+        );
         assert!(rounds
             .get("g")
             .expect("round")
@@ -3105,6 +3155,60 @@ mod tests {
             .synced("h2", 2, false, true, later, wait));
     }
 
+    /// CI W3-H `w3h_1357_red_s4_restart_intake_prepare`: the committer is
+    /// at r+1 after its own removal; the survivor that missed it is still
+    /// at r. Its report must not block the resend that brings it forward.
+    #[test]
+    fn a_holder_behind_on_the_local_chain_does_not_block_the_seal() -> anyhow::Result<()> {
+        let kp = x0x::identity::AgentKeypair::generate()?;
+        let admin = *kp.agent_id().as_bytes();
+        let mut info = group_with(admin, [2; 32]);
+        info.seal_commit(&kp, 1)?;
+        let parent = info.state_hash.clone();
+        let mut sibling = info.clone();
+        info.seal_commit(&kp, 2)?;
+        let head = info.state_hash.clone();
+        sibling.add_member(hex::encode([5; 32]), GroupRole::Member, None, None);
+        sibling.seal_commit(&kp, 3)?;
+        assert_ne!(sibling.state_hash, head);
+        let mut later = info.clone();
+        later.seal_commit(&kp, 4)?;
+
+        assert_eq!(classify_head_report(&info, &head), HeadReport::OnLocalChain);
+        assert_eq!(
+            classify_head_report(&info, &parent),
+            HeadReport::OnLocalChain
+        );
+        assert_eq!(
+            classify_head_report(&info, &later.state_hash),
+            HeadReport::Unknown
+        );
+        assert_eq!(
+            classify_head_report(&info, &sibling.state_hash),
+            HeadReport::Unknown
+        );
+
+        let wait = Duration::from_secs(13);
+        let now = Instant::now();
+        let holder = [8; 32];
+        let synced_after = |reported: &str| {
+            let mut rounds = HashMap::new();
+            refresh_head_round(&mut rounds, "g", &head, &[holder], now, wait);
+            let report = classify_head_report(&info, reported);
+            note_head_report(&mut rounds, "g", &head, holder, report, now);
+            rounds
+                .get("g")
+                .is_some_and(|round| round.synced(&head, 1, false, true, now, wait))
+        };
+        // Behind at r (our parent): synced at once.
+        assert!(synced_after(&parent));
+        // r+2, which this node does not have: not synced.
+        assert!(!synced_after(&later.state_hash));
+        // A sibling at r+1: not synced.
+        assert!(!synced_after(&sibling.state_hash));
+        Ok(())
+    }
+
     #[test]
     fn a_confirmed_round_or_no_holder_syncs_at_once() {
         let wait = Duration::from_secs(13);
@@ -3115,7 +3219,14 @@ mod tests {
             .get("g")
             .expect("round")
             .synced("h1", 1, false, true, now, wait));
-        note_head_report(&mut rounds, "g", "h1", [8; 32], "h1", now);
+        note_head_report(
+            &mut rounds,
+            "g",
+            "h1",
+            [8; 32],
+            HeadReport::OnLocalChain,
+            now,
+        );
         assert!(rounds
             .get("g")
             .expect("round")
