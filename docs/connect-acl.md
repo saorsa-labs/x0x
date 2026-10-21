@@ -4,6 +4,8 @@ The connect ACL controls which remote agents may request an outbound TCP connect
 
 **Scope:** policy engine, startup validation, diagnostics, and runtime enforcement. An enabled ACL authorizes per-flow TCP forwards; a disabled or absent ACL denies every forward request at the gate.
 
+The loopback SOCKS5 listener is separate daemon config. See [Daemon SOCKS listener](#daemon-socks-listener).
+
 ## Default behaviour
 
 No connect ACL configured → connect is **disabled** for all agents. `ConnectPolicy::default()` is `Disabled`, so an embedder that builds `ServeOptions` without supplying a connect policy gets default-deny for free.
@@ -60,7 +62,7 @@ targets = ["127.0.0.1:22"]
 It matches any **owner-trusted** requester: the agent presents a valid, unexpired `AgentCertificate` signed by this install's owner (`user.key`), its machine holds a current owner enrollment (`/sync/devices`, ADR-0041), and neither the agent, the machine nor their binding is revoked. A `Blocked` contact is never owner-trusted. An install with no owner key never matches an owner entry.
 
 - Owner trust **does not open connect by itself.** With no `principal = "owner"` entry, an owner-trusted peer is denied exactly as before. The shipped defaults contain no owner entry.
-- Targets stay explicit and exact, as for pair entries.
+- Owner entries may list an inclusive loopback port range (`127.0.0.1:8000-8999` or `[::1]:8000-8999`). Pair entries stay exact host:port. No CIDR. In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact address or inclusive port range). Pair `ConnectAllowEntry.targets` stays `Vec<SocketAddr>`. David approved this break on 20 Oct 2026 at 18:50 BST.
 - An owner entry must not also set `agent_id` or `machine_id`; an entry with neither a principal nor both ids, or with any other principal value, is a load-time error.
 - Owner entries apply to the inbound stream gate and to attested `ForwardV2` forwards. The legacy `ForwardV1` path (`require_attestation = false`) matches exact pairs only.
 - Owner entries can be added at runtime; see [Managing the ACL at runtime](#managing-the-acl-at-runtime-adr-0070-3).
@@ -97,7 +99,7 @@ x0x acl reload                             # re-read the TOML floor and the over
 ```
 
 - **Authorization:** every `/acl/*` route requires the durable API token. Session tokens and rider tokens get `403`.
-- **Validation:** the JSON body is the `[[connect.allow]]` entry schema, and it is checked by the same parser as the TOML file (`deny_unknown_fields`, loopback-only exact targets, principal rules). Invalid input returns `400` and nothing is written.
+- **Validation:** the JSON body is the `[[connect.allow]]` entry schema, and it is checked by the same parser as the TOML file (`deny_unknown_fields`, loopback-only targets, principal rules). A port range is valid only on `principal = "owner"`. Invalid input returns `400` and nothing is written.
 - **Owner and grant entries:** adding a `principal = "owner"` or `principal = "grant"` entry returns `409` on an install with no owner key, because such an install has no owner trust and holds no grants.
 - **Disabled floor:** if the TOML floor disables connect (or the file is missing), adding an entry returns `409`. API entries never turn a plane on.
 - **Reload:** `POST /acl/reload` (`x0x acl reload`) or `SIGHUP` re-reads the floor file and the overlay, then swaps the effective ACL atomically. The reload is rejected, and the last good ACL stays active, when the file or overlay is malformed or invalid, or when the reload would switch connect between enabled and disabled (that needs a restart). A rejected reload answers `422`. Its reason, plus the `reloads_ok`/`reloads_failed` counters, appears under `acl_reload` in `GET /diagnostics/connect`.
@@ -114,7 +116,7 @@ Every target is validated at **load time** — a bad target is a hard error that
 2. **Port 0 is not a connectable target.**
 3. **Loopback only.** `Ipv4Addr::is_loopback()` covers all of `127.0.0.0/8`; `Ipv6Addr::is_loopback()` covers exactly `::1`. Any other address (LAN, Internet, link-local) is rejected.
 4. **IPv4-mapped IPv6** (`[::ffff:127.0.0.1]:22`) is rejected with an actionable message: write it as `127.0.0.1:PORT`.
-5. **No port ranges or CIDR.** Exact host:port literals only. Use multiple entries for multiple targets.
+5. **Pair and grant targets stay exact host:port.** `principal = "owner"` may use an inclusive loopback port range (`127.0.0.1:8000-8999` or `[::1]:8000-8999`). No CIDR anywhere. Use multiple entries for multiple exact targets.
 
 ## Security model
 
@@ -234,6 +236,25 @@ Connect ACL summary: ConnectAclSummary {
     target_entry_count: 3,
     disabled_reason: None,
 }
+```
+
+## Daemon SOCKS listener
+
+The `[socks]` table is daemon config. It is not an entry in the connect ACL file.
+
+The listener stays off until `listen` is set.
+
+`listen` must be loopback (`127.0.0.0/8` or `::1`). Any other address is a hard load error: `x0xd` refuses to start. The listener itself also refuses that bind.
+
+Authentication is RFC 1929 username/password. The password is the daemon API token, compared in constant time. The username is ignored. `NO AUTH` is refused with `0xFF`. A wrong token, or an empty or absent token, is refused before any ForwardV2 stream opens.
+
+The listener accepts CONNECT only, to `<64-hex-agent-id>.x0x:port`. A denial from the peer connect gate is SOCKS `0x02`, and the target receives zero bytes.
+
+`GET /streams` includes `socks_denied`, the count of those connect-gate denials.
+
+```toml
+[socks]
+listen = "127.0.0.1:1080"
 ```
 
 ## See also

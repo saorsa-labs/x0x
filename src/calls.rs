@@ -1723,7 +1723,9 @@ mod tests {
         fn grant_ssh() -> crate::connect::ConnectOwnerEntry {
             crate::connect::ConnectOwnerEntry {
                 description: None,
-                targets: vec!["127.0.0.1:22".parse().expect("addr")],
+                targets: vec![crate::connect::acl::OwnerTarget::Exact(
+                    "127.0.0.1:22".parse().expect("addr"),
+                )],
             }
         }
 
