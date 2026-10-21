@@ -55,13 +55,17 @@
 //! r+1, a sibling of its own head, so X installs a `no_anchor` marker.
 //! After X's resends end, only X's pubsub writes stay held, for the rest
 //! of the run, except the frames on a DM carrier topic (each node's DM
-//! inbox and the DM bus): direct messages pass. `Agent::send_direct` sends
+//! inbox and the DM bus) that carry a message X did not send during the
+//! hold: new direct messages pass. `Agent::send_direct` sends
 //! by the gossip DM inbox when the recipient advertises it, so X's S3
 //! `group_attest_request` and its re-seat join ride pubsub frames. In DIAG
 //! PR #1530 (run 39532399450) a hold on every pubsub frame dropped them
 //! all: X wrote no direct frame after the release, its `asked` answers
 //! stayed `pending`, and its staged re-seat join ended
-//! (`staged_join_ended`). In CI run 39496687111 a full release let X's
+//! (`staged_join_ended`). When the DM carrier passed in full, X's pubsub
+//! layer replayed held DM-bus messages (its r+1′ metadata DMs) at about
+//! 116 s, and A and M1 were marked by X's r+1′; so a frame whose message
+//! ID X sent during the hold stays dropped. In CI run 39496687111 a full release let X's
 //! pubsub cache replay r+1′ to A about 26 s later, and A was marked too,
 //! which is not this case's shape (H-S3-c "holds" the fork from the main
 //! chain). X's head is on no admin's
@@ -712,7 +716,7 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
 }
 
 /// The DM carrier topic IDs among `labels`: each node's gossip DM inbox
-/// and the DM bus. A pubsub frame names its topic ID in its header.
+/// and the DM bus.
 fn dm_carrier_topics(sim: &Sim, labels: &[&str]) -> Result<Vec<[u8; 32]>> {
     let mut topics =
         vec![
@@ -726,54 +730,87 @@ fn dm_carrier_topics(sim: &Sim, labels: &[&str]) -> Result<Vec<[u8; 32]>> {
     Ok(topics)
 }
 
+/// The SG key-cache v3 wire marker before a pubsub frame's header.
+const SG_KEY_CACHE_V3_MARKER: &[u8] = b"\xffSGKC\x03";
+
+/// The topic ID and message ID of a pubsub lane write: one stream-type
+/// byte, the optional key-cache v3 marker, then the postcard
+/// `MessageHeader`. `None` when the header does not decode.
+fn pubsub_header(bytes: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    let frame = bytes.get(1..)?;
+    let frame = frame.strip_prefix(SG_KEY_CACHE_V3_MARKER).unwrap_or(frame);
+    let (header, _) =
+        postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(frame).ok()?;
+    Some((header.topic.to_bytes(), header.msg_id))
+}
+
 /// Drops writes from one node, and counts them. The node still receives.
-/// Installed holding every write; [`Self::release`] then holds only its
-/// pubsub writes that are not on a DM carrier topic, so its fork commit
-/// never reaches the main chain by gossip while its direct messages pass,
-/// by either DM transport.
+/// Installed holding every write; [`Self::release`] then passes all but
+/// its pubsub writes. A pubsub write passes only when it is on a DM
+/// carrier topic and carries a message that the node did not send during
+/// the hold, so its fork commit never reaches the main chain (not by
+/// gossip, and not by a replay of a held DM), while its new direct
+/// messages pass by either DM transport.
 struct OutboundHold {
     held: Arc<std::sync::atomic::AtomicBool>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
     pubsub_dropped: Arc<std::sync::atomic::AtomicUsize>,
+    replay_dropped: Arc<std::sync::atomic::AtomicUsize>,
     dm_passed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OutboundHold {
     fn install(sim: &Sim, node: &str, dm_topics: Vec<[u8; 32]>) -> Result<Self> {
         use crate::network::sim::{Fault, LaneClass};
+        use std::collections::HashSet;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let machine = sim.peer(node)?.0;
         let held = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
         let pubsub_dropped = Arc::new(AtomicUsize::new(0));
+        let replay_dropped = Arc::new(AtomicUsize::new(0));
         let dm_passed = Arc::new(AtomicUsize::new(0));
-        let (rule_held, rule_dropped, rule_pubsub, rule_dm) = (
+        let held_messages: Mutex<HashSet<[u8; 32]>> = Mutex::new(HashSet::new());
+        let (rule_held, rule_dropped, rule_pubsub, rule_replay, rule_dm) = (
             Arc::clone(&held),
             Arc::clone(&dropped),
             Arc::clone(&pubsub_dropped),
+            Arc::clone(&replay_dropped),
             Arc::clone(&dm_passed),
         );
         sim.fabric().add_rule(move |write| {
             if write.lane.src != machine {
                 return Fault::Pass;
             }
+            let pubsub = (write.lane.class == LaneClass::PubSub)
+                .then(|| pubsub_header(&write.bytes))
+                .flatten();
+            let Ok(mut held_ids) = held_messages.lock() else {
+                return Fault::Drop;
+            };
             if rule_held.load(Ordering::SeqCst) {
+                if let Some((_, msg_id)) = pubsub {
+                    held_ids.insert(msg_id);
+                }
                 rule_dropped.fetch_add(1, Ordering::SeqCst);
                 return Fault::Drop;
             }
             if write.lane.class != LaneClass::PubSub {
                 return Fault::Pass;
             }
-            let on_dm_carrier = write
-                .bytes
-                .windows(32)
-                .any(|window| dm_topics.iter().any(|topic| window == topic.as_slice()));
-            if on_dm_carrier {
-                rule_dm.fetch_add(1, Ordering::SeqCst);
-                Fault::Pass
-            } else {
-                rule_pubsub.fetch_add(1, Ordering::SeqCst);
-                Fault::Drop
+            match pubsub {
+                Some((_, msg_id)) if held_ids.contains(&msg_id) => {
+                    rule_replay.fetch_add(1, Ordering::SeqCst);
+                    Fault::Drop
+                }
+                Some((topic, _)) if dm_topics.contains(&topic) => {
+                    rule_dm.fetch_add(1, Ordering::SeqCst);
+                    Fault::Pass
+                }
+                _ => {
+                    rule_pubsub.fetch_add(1, Ordering::SeqCst);
+                    Fault::Drop
+                }
             }
         });
         sim.fabric()
@@ -782,6 +819,7 @@ impl OutboundHold {
             held,
             dropped,
             pubsub_dropped,
+            replay_dropped,
             dm_passed,
         })
     }
@@ -789,7 +827,8 @@ impl OutboundHold {
     fn release(&self, sim: &Sim, node: &str) {
         self.held.store(false, std::sync::atomic::Ordering::SeqCst);
         sim.fabric().mark(format!(
-            "fault: writes from {node} released, except pubsub off the DM carrier"
+            "fault: writes from {node} released, except pubsub off the DM carrier \
+             and replays of held messages"
         ));
     }
 
@@ -799,6 +838,11 @@ impl OutboundHold {
 
     fn pubsub_dropped(&self) -> usize {
         self.pubsub_dropped
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn replay_dropped(&self) -> usize {
+        self.replay_dropped
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -1079,9 +1123,10 @@ async fn fork_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     receipt.note(format!(
         "arm={arm:?} after the window: X {x_status_text}; X {}; X recovered: {x_recovered:?}; \
          X recovery first seen: {x_recovery_seen:?}; X pubsub writes since the release: \
-         {} held, {} passed on the DM carrier",
+         {} held, {} held as replays of a held message, {} passed on the DM carrier",
         x1.describe(),
         hold.pubsub_dropped(),
+        hold.replay_dropped(),
         hold.dm_passed()
     ));
     let contained = x1.marker.is_some() && x_recovered.is_none();
