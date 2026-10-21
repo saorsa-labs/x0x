@@ -4393,10 +4393,20 @@ async fn restore_record_from_journal(
                 }
             }
         }
-        None => matches!(
-            super::persist_named_group_info(state, key, record.clone()).await,
-            Ok(super::AtomicWriteOutcome::Durable)
-        ),
+        // The key is absent (the original was moved aside and any stub is
+        // gone): insert, since `persist_named_group_info` only replaces.
+        None => {
+            let restore_key = key.to_string();
+            let restored = record.clone();
+            matches!(
+                super::persist_named_groups_mutation(state, move |groups| {
+                    groups.insert(restore_key, restored);
+                    true
+                })
+                .await,
+                Ok(super::AtomicWriteOutcome::Durable)
+            )
+        }
     }
 }
 
@@ -5070,8 +5080,15 @@ mod tests {
         info.seal_commit(keypair, 1_000)?;
         assert!(info.has_active_member(&local));
         let key = info.mls_group_id.clone();
+        // `persist_named_group_info` only replaces an existing entry; a new
+        // group is inserted, then the roster is saved.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
         assert!(matches!(
-            super::super::persist_named_group_info(state, &key, info.clone()).await?,
+            super::super::save_named_groups_checked(state).await?,
             super::super::AtomicWriteOutcome::Durable
         ));
         let authorisation = ReseatAuthorisation::sign(
@@ -5418,8 +5435,15 @@ mod tests {
         );
         info.seal_commit(&admin, 1_000)?;
         let key = info.mls_group_id.clone();
+        // `persist_named_group_info` only replaces an existing entry; a new
+        // group is inserted, then the roster is saved.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
         assert!(matches!(
-            super::super::persist_named_group_info(state, &key, info.clone()).await?,
+            super::super::save_named_groups_checked(state).await?,
             super::super::AtomicWriteOutcome::Durable
         ));
         let ata = AdminTerminalAttestation::sign(
