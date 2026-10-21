@@ -657,9 +657,13 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .chain(inner.queued_bans.keys())
         .cloned()
         .collect();
+    // §4b(1): a held owner-recovery mandate is a seal too, so its group
+    // keeps a round even with no open row; its named admins are excluded.
+    let orc_rounds = inner.orc.head_round_groups();
     let open_groups: BTreeSet<String> = round_keys
         .iter()
         .map(|key| key.stable_group_id.clone())
+        .chain(orc_rounds.keys().cloned())
         .collect();
     inner
         .head_rounds
@@ -672,6 +676,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .iter()
             .filter(|key| &key.stable_group_id == stable)
             .map(|key| key.target)
+            .chain(orc_rounds.get(stable).into_iter().flatten().copied())
             .collect();
         let holders = head_holders(info, &local, &excluded);
         let ask = refresh_head_round(

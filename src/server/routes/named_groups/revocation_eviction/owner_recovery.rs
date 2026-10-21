@@ -22,7 +22,7 @@
 //! - **Receive.** The §4b(1) L4 rule, then the ordinary chained apply with
 //!   the roster change as its only mutation, then the crypto removal proof.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +36,10 @@ use x0x::groups::owner_recovery as orc;
 use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
-use super::crypto_exclusion::{write_allowed, RecipientDelivery};
+use super::crypto_exclusion::{
+    apply_round, finish_attempt, guarded_admission_for, next_attempt, write_allowed, HeadRule,
+    RecipientDelivery, RoundUpdate,
+};
 
 /// The owner node's typed state until the promoted member commits.
 pub(in crate::server) const WAITING_FOR_RECOVERY_MEMBER: &str = "waiting_for_recovery_member";
@@ -49,6 +52,11 @@ const ORC_RETAIN_TTL: Duration = Duration::from_secs(600);
 const ORC_STASH_CAP: usize = 32;
 /// A commit attempt that met a transient wait retries no sooner than this.
 const ORC_COMMIT_RETRY: Duration = Duration::from_secs(5);
+/// The per-exchange bound of one mandate, commit or catch-up frame write.
+const ORC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Recovery frames held per group for catch-up serving: the same bound as
+/// the crypto-only exclusion log.
+const ORC_LOG_PER_GROUP: usize = x0x::groups::eviction::MAX_REPLAY_FRAMES_PER_GROUP;
 
 /// The owner node's delivery of one mandate.
 #[derive(Debug, Clone)]
@@ -57,7 +65,9 @@ struct MandateDelivery {
     mandate_id: String,
     promoted: [u8; 32],
     parent_head: String,
-    status: RecipientDelivery,
+    /// The one recipient (the promoted member) and its delivery status,
+    /// kept as a map so the shared per-attempt round helpers apply.
+    recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
 }
 
@@ -88,6 +98,16 @@ struct StashedFrame {
     at: Instant,
 }
 
+/// A recovery commit frame held for catch-up serving.
+#[derive(Debug, Clone)]
+struct OrcLogEntry {
+    next_revision: u64,
+    /// The frame's result head: it is served only while this head is on
+    /// the verified chain.
+    result_head: String,
+    bytes: Arc<Vec<u8>>,
+}
+
 /// The owner-recovery state held in the S4 runtime, keyed by stable
 /// group ID.
 #[derive(Debug, Default)]
@@ -96,6 +116,166 @@ pub(super) struct OrcState {
     pending: HashMap<String, PendingMandate>,
     deliveries: HashMap<String, CommitDelivery>,
     stash: Vec<StashedFrame>,
+    /// Authored and installed recovery commits, for catch-up serving
+    /// (memory only; see [`serve_catchup`]).
+    log: HashMap<String, VecDeque<OrcLogEntry>>,
+}
+
+impl OrcState {
+    /// §2: the groups whose held mandate needs a head catch-up round
+    /// before its seal, each with the named (revoked) admins, which are
+    /// not head holders.
+    pub(super) fn head_round_groups(&self) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
+        self.pending
+            .iter()
+            .map(|(stable, pending)| {
+                (
+                    stable.clone(),
+                    pending
+                        .mandate
+                        .body
+                        .revoked_admins
+                        .iter()
+                        .map(|admin| admin.agent)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Install one planned mandate status, if the delivery still holds
+    /// mandate `mandate_id`. Returns the sends to start, after this.
+    fn install_mandate_round(
+        &mut self,
+        stable: &str,
+        mandate_id: &str,
+        update: RoundUpdate,
+    ) -> Vec<([u8; 32], u64)> {
+        match self.mandates.get_mut(stable) {
+            Some(delivery) if delivery.mandate_id == mandate_id => {
+                apply_round(&mut delivery.recipients, vec![update])
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Record the result of mandate send `attempt`; a stale attempt, or one
+    /// for a replaced mandate, changes nothing.
+    fn finish_mandate_attempt(
+        &mut self,
+        stable: &str,
+        mandate_id: &str,
+        recipient: &[u8; 32],
+        attempt: u64,
+        status: RecipientDelivery,
+    ) -> bool {
+        match self.mandates.get_mut(stable) {
+            Some(delivery) if delivery.mandate_id == mandate_id => {
+                finish_attempt(&mut delivery.recipients, recipient, attempt, status)
+            }
+            _ => false,
+        }
+    }
+
+    /// Install one commit round's planned statuses, if the delivery still
+    /// holds the commit with `result_head`, and drop a delivery that is
+    /// complete. Returns the sends to start, after this.
+    fn install_commit_round(
+        &mut self,
+        stable: &str,
+        result_head: &str,
+        updates: Vec<RoundUpdate>,
+    ) -> Vec<([u8; 32], u64)> {
+        let Some(stored) = self
+            .deliveries
+            .get_mut(stable)
+            .filter(|delivery| delivery.result_head == result_head)
+        else {
+            return Vec::new();
+        };
+        let started = apply_round(&mut stored.recipients, updates);
+        if stored
+            .recipients
+            .values()
+            .all(|status| *status == RecipientDelivery::Sent)
+        {
+            self.deliveries.remove(stable);
+        }
+        started
+    }
+
+    /// Record the result of commit send `attempt`; a stale attempt, or one
+    /// for another commit, changes nothing.
+    fn finish_commit_attempt(
+        &mut self,
+        stable: &str,
+        result_head: &str,
+        recipient: &[u8; 32],
+        attempt: u64,
+        status: RecipientDelivery,
+    ) -> bool {
+        match self.deliveries.get_mut(stable) {
+            Some(delivery) if delivery.result_head == result_head => {
+                finish_attempt(&mut delivery.recipients, recipient, attempt, status)
+            }
+            _ => false,
+        }
+    }
+
+    /// Keep a recovery commit frame for catch-up serving (bounded, by
+    /// revision, deduplicated).
+    fn remember(
+        &mut self,
+        stable_group_id: &str,
+        next_revision: u64,
+        result_head: &str,
+        bytes: Arc<Vec<u8>>,
+    ) {
+        let log = self.log.entry(stable_group_id.to_string()).or_default();
+        if log.iter().any(|entry| entry.next_revision == next_revision) {
+            return;
+        }
+        let at = log
+            .iter()
+            .position(|entry| entry.next_revision > next_revision)
+            .unwrap_or(log.len());
+        log.insert(
+            at,
+            OrcLogEntry {
+                next_revision,
+                result_head: result_head.to_string(),
+                bytes,
+            },
+        );
+        while log.len() > ORC_LOG_PER_GROUP {
+            log.pop_front();
+        }
+    }
+
+    /// The frames held for any of `group_ids` above `from_revision`, oldest
+    /// first, with their group ID and result head.
+    fn catchup_frames(
+        &self,
+        group_ids: &[String],
+        from_revision: u64,
+    ) -> Vec<(String, String, Arc<Vec<u8>>)> {
+        group_ids
+            .iter()
+            .find_map(|id| self.log.get(id).map(|log| (id, log)))
+            .map(|(id, log)| {
+                log.iter()
+                    .filter(|entry| entry.next_revision > from_revision)
+                    .map(|entry| {
+                        (
+                            id.clone(),
+                            entry.result_head.clone(),
+                            Arc::clone(&entry.bytes),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 fn agent_bytes(hex_id: &str) -> Option<[u8; 32]> {
@@ -273,7 +453,7 @@ pub(in crate::server) async fn sign_recovery_mandate(
                     mandate_id: mandate_id.clone(),
                     promoted: *promoted.as_bytes(),
                     parent_head: info.state_hash.clone(),
-                    status: RecipientDelivery::Due,
+                    recipients: BTreeMap::from([(*promoted.as_bytes(), RecipientDelivery::Due)]),
                     next_at: Instant::now(),
                 },
             );
@@ -335,10 +515,7 @@ async fn drive_mandates(state: &Arc<AppState>) {
             .orc
             .mandates
             .iter_mut()
-            .filter(|(_, delivery)| {
-                delivery.next_at <= now
-                    && !matches!(delivery.status, RecipientDelivery::InFlight(_))
-            })
+            .filter(|(_, delivery)| delivery.next_at <= now)
             .map(|(id, delivery)| {
                 delivery.next_at = now + ORC_RESEND_INTERVAL;
                 (id.clone(), delivery.clone())
@@ -354,77 +531,136 @@ async fn drive_mandates(state: &Arc<AppState>) {
         if head.as_deref() != Some(delivery.parent_head.as_str()) {
             // The commit landed (or the head moved and the mandate no
             // longer applies): the owner's wait ends.
-            state
-                .revocation_evictions
-                .inner
-                .lock()
-                .await
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            if inner
                 .orc
                 .mandates
-                .remove(&stable);
+                .get(&stable)
+                .is_some_and(|stored| stored.mandate_id == delivery.mandate_id)
+            {
+                inner.orc.mandates.remove(&stable);
+            }
             continue;
         }
-        let agent = AgentId(delivery.promoted);
-        let status = match capabilities
+        let promoted = delivery.promoted;
+        let Some(observed) = delivery.recipients.get(&promoted).copied() else {
+            continue;
+        };
+        // A running attempt owns the status. A `Sent` mandate is sent
+        // again until the commit lands: the promoted member deduplicates
+        // by head, and `Sent` means only that the carrier took it.
+        if matches!(observed, RecipientDelivery::InFlight(_)) {
+            continue;
+        }
+        let agent = AgentId(promoted);
+        if !write_allowed(state, &agent).await {
+            continue;
+        }
+        let mut refresh = false;
+        let next = match capabilities
             .verified_registry_supports(&agent, x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1)
         {
-            Some(true) => {
-                spawn_mandate_send(state, stable.clone(), agent, Arc::clone(&delivery.bytes));
-                RecipientDelivery::InFlight(super::crypto_exclusion::next_attempt())
-            }
+            Some(true) => RecipientDelivery::InFlight(next_attempt()),
             Some(false) => RecipientDelivery::Lacking,
             None => {
-                let task_state = Arc::clone(state);
-                let _spawned = state.spawn_detached(async move {
-                    task_state
-                        .agent
-                        .refresh_application_capability(
-                            agent,
-                            x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
-                        )
-                        .await;
-                });
+                refresh = true;
                 RecipientDelivery::Unknown
             }
         };
-        if let Some(stored) = state
+        // Install the status, `InFlight` included, BEFORE the send task
+        // starts: a fast completion can then never be overwritten.
+        let started = state
             .revocation_evictions
             .inner
             .lock()
             .await
             .orc
-            .mandates
-            .get_mut(&stable)
-        {
-            stored.status = status;
+            .install_mandate_round(
+                &stable,
+                &delivery.mandate_id,
+                RoundUpdate {
+                    recipient: promoted,
+                    observed,
+                    next: Some(next),
+                },
+            );
+        for (recipient, attempt) in started {
+            spawn_mandate_send(state, &stable, &delivery, AgentId(recipient), attempt);
+        }
+        if refresh {
+            let task_state = Arc::clone(state);
+            let _spawned = state.spawn_detached(async move {
+                task_state
+                    .agent
+                    .refresh_application_capability(
+                        agent,
+                        x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+                    )
+                    .await;
+            });
         }
     }
 }
 
-fn spawn_mandate_send(state: &Arc<AppState>, stable: String, agent: AgentId, bytes: Arc<Vec<u8>>) {
+/// One guarded frame write of an owner-recovery frame to `agent`: the
+/// ADR 0107 serving guard, D60, the `owner_recovery_v1` gate and `rule`,
+/// in the pre-phase and again at the write seam.
+async fn send_guarded(
+    state: &Arc<AppState>,
+    group_id: &str,
+    agent: &AgentId,
+    rule: HeadRule,
+    bytes: &[u8],
+) -> RecipientDelivery {
+    let admission = guarded_admission_for(
+        state,
+        group_id,
+        agent,
+        rule,
+        x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+    );
+    let resolve_within = std::cmp::min(x0x::dm::PINNED_RESOLUTION_WAIT, ORC_EXCHANGE_TIMEOUT / 2);
+    let exchange =
+        state
+            .agent
+            .send_direct_pinned_admitted(agent, bytes, &admission, resolve_within);
+    match tokio::time::timeout(ORC_EXCHANGE_TIMEOUT, exchange).await {
+        Ok(Ok(_)) => RecipientDelivery::Sent,
+        Ok(Err(x0x::dm::DmError::RecipientUpgradeRequired { .. })) => RecipientDelivery::Lacking,
+        Ok(Err(error)) => {
+            // An admission refusal is a withhold: the next round
+            // re-evaluates the recipient from the current state.
+            tracing::debug!(%error, "ADR 0110 S4: owner recovery send refused or failed; retrying");
+            RecipientDelivery::Due
+        }
+        Err(_) => {
+            tracing::debug!("ADR 0110 S4: owner recovery exchange deadline elapsed; retrying");
+            RecipientDelivery::Due
+        }
+    }
+}
+
+fn spawn_mandate_send(
+    state: &Arc<AppState>,
+    stable: &str,
+    delivery: &MandateDelivery,
+    agent: AgentId,
+    attempt: u64,
+) {
     let task_state = Arc::clone(state);
+    let stable = stable.to_string();
+    let mandate_id = delivery.mandate_id.clone();
+    let rule = HeadRule::Current(delivery.parent_head.clone());
+    let bytes = Arc::clone(&delivery.bytes);
     let _spawned = state.spawn_detached(async move {
-        // The promoted member deduplicates by head, so a resend until the
-        // commit lands is safe; Sent means only that the carrier took it.
-        let status = match task_state.agent.send_direct(&agent, bytes.to_vec()).await {
-            Ok(_) => RecipientDelivery::Sent,
-            Err(x0x::dm::DmError::RecipientUpgradeRequired { .. }) => RecipientDelivery::Lacking,
-            Err(error) => {
-                tracing::debug!(%error, "ADR 0110 S4: owner recovery mandate send failed; retrying");
-                RecipientDelivery::Due
-            }
-        };
-        if let Some(stored) = task_state
+        let status = send_guarded(&task_state, &stable, &agent, rule, bytes.as_slice()).await;
+        task_state
             .revocation_evictions
             .inner
             .lock()
             .await
             .orc
-            .mandates
-            .get_mut(&stable)
-        {
-            stored.status = status;
-        }
+            .finish_mandate_attempt(&stable, &mandate_id, agent.as_bytes(), attempt, status);
     });
 }
 
@@ -581,6 +817,21 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
             Some((
                 x0x::groups::eviction::WaitingCause::WaitingForReceiverUpgrade.as_str(),
                 holders,
+            )),
+        )
+        .await;
+        return;
+    }
+    // §2: a completed current catch-up round for this head and no
+    // unresolved higher-head evidence, re-read under the membership lock
+    // just before the seal. Elapsed time alone never authorizes it.
+    if !super::group_head_synced(state, &group_key).await {
+        set_wait(
+            state,
+            stable,
+            Some((
+                x0x::groups::eviction::WaitingCause::WaitingForHeadSync.as_str(),
+                Vec::new(),
             )),
         )
         .await;
@@ -924,12 +1175,19 @@ async fn finish_commit(
     let removed_ids: BTreeSet<[u8; 32]> = removed.iter().filter_map(|id| agent_bytes(id)).collect();
     let recipients = survivors(&next, &local, &removed_ids);
     {
+        let bytes = Arc::new(bytes);
         let mut inner = state.revocation_evictions.inner.lock().await;
         inner.orc.pending.remove(&stable);
+        inner.orc.remember(
+            &stable,
+            next_revision,
+            &commit.state_hash,
+            Arc::clone(&bytes),
+        );
         inner.orc.deliveries.insert(
             stable.clone(),
             CommitDelivery {
-                bytes: Arc::new(bytes),
+                bytes,
                 result_head: commit.state_hash.clone(),
                 next_revision,
                 recipients: recipients
@@ -983,23 +1241,30 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         }) else {
             // The head moved past the recovery (or the group is contained):
             // stop. Stranded members recover through catch-up.
-            state
-                .revocation_evictions
-                .inner
-                .lock()
-                .await
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            if inner
                 .orc
                 .deliveries
-                .remove(&stable);
+                .get(&stable)
+                .is_some_and(|stored| stored.result_head == delivery.result_head)
+            {
+                inner.orc.deliveries.remove(&stable);
+            }
             continue;
         };
         let active: BTreeSet<[u8; 32]> = survivors(&info, &local, &BTreeSet::new())
             .into_iter()
             .collect();
-        let mut updates: Vec<([u8; 32], Option<RecipientDelivery>)> = Vec::new();
+        let mut updates: Vec<RoundUpdate> = Vec::new();
+        let mut refreshes: Vec<AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
+            let observed = *status;
             if !active.contains(recipient) {
-                updates.push((*recipient, None));
+                updates.push(RoundUpdate {
+                    recipient: *recipient,
+                    observed,
+                    next: None,
+                });
                 continue;
             }
             if matches!(
@@ -1012,78 +1277,110 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             if !write_allowed(state, &agent).await {
                 continue;
             }
-            match capabilities
+            let next = match capabilities
                 .verified_registry_supports(&agent, x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1)
             {
-                Some(true) => {
-                    updates.push((
-                        *recipient,
-                        Some(RecipientDelivery::InFlight(
-                            super::crypto_exclusion::next_attempt(),
-                        )),
-                    ));
-                    spawn_commit_send(state, stable.clone(), agent, Arc::clone(&delivery.bytes));
-                }
-                Some(false) => updates.push((*recipient, Some(RecipientDelivery::Lacking))),
+                Some(true) => RecipientDelivery::InFlight(next_attempt()),
+                Some(false) => RecipientDelivery::Lacking,
                 None => {
-                    updates.push((*recipient, Some(RecipientDelivery::Unknown)));
-                    let task_state = Arc::clone(state);
-                    let _spawned = state.spawn_detached(async move {
-                        task_state
-                            .agent
-                            .refresh_application_capability(
-                                agent,
-                                x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
-                            )
-                            .await;
-                    });
+                    refreshes.push(agent);
+                    RecipientDelivery::Unknown
                 }
-            }
+            };
+            updates.push(RoundUpdate {
+                recipient: *recipient,
+                observed,
+                next: Some(next),
+            });
         }
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        if let Some(stored) = inner.orc.deliveries.get_mut(&stable) {
-            for (recipient, update) in updates {
-                match update {
-                    Some(status) => {
-                        stored.recipients.insert(recipient, status);
-                    }
-                    None => {
-                        stored.recipients.remove(&recipient);
-                    }
-                }
-            }
-            if stored
-                .recipients
-                .values()
-                .all(|status| *status == RecipientDelivery::Sent)
-            {
-                inner.orc.deliveries.remove(&stable);
-            }
+        // Install every status, `InFlight` included, BEFORE any send task
+        // starts: a fast completion can then never be overwritten.
+        let started = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .install_commit_round(&stable, &delivery.result_head, updates);
+        for (recipient, attempt) in started {
+            spawn_commit_send(state, &stable, &delivery, AgentId(recipient), attempt);
+        }
+        for agent in refreshes {
+            let task_state = Arc::clone(state);
+            let _spawned = state.spawn_detached(async move {
+                task_state
+                    .agent
+                    .refresh_application_capability(
+                        agent,
+                        x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+                    )
+                    .await;
+            });
         }
     }
 }
 
-fn spawn_commit_send(state: &Arc<AppState>, stable: String, agent: AgentId, bytes: Arc<Vec<u8>>) {
+fn spawn_commit_send(
+    state: &Arc<AppState>,
+    stable: &str,
+    delivery: &CommitDelivery,
+    agent: AgentId,
+    attempt: u64,
+) {
     let task_state = Arc::clone(state);
+    let stable = stable.to_string();
+    let result_head = delivery.result_head.clone();
+    let bytes = Arc::clone(&delivery.bytes);
     let _spawned = state.spawn_detached(async move {
-        let status = match task_state.agent.send_direct(&agent, bytes.to_vec()).await {
-            Ok(_) => RecipientDelivery::Sent,
-            Err(x0x::dm::DmError::RecipientUpgradeRequired { .. }) => RecipientDelivery::Lacking,
-            Err(error) => {
-                tracing::debug!(%error, "ADR 0110 S4: owner recovery commit send failed; retrying");
-                RecipientDelivery::Due
-            }
-        };
-        let mut inner = task_state.revocation_evictions.inner.lock().await;
-        if let Some(entry) = inner
+        let rule = HeadRule::Current(result_head.clone());
+        let status = send_guarded(&task_state, &stable, &agent, rule, bytes.as_slice()).await;
+        task_state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
             .orc
-            .deliveries
-            .get_mut(&stable)
-            .and_then(|delivery| delivery.recipients.get_mut(agent.as_bytes()))
-        {
-            *entry = status;
-        }
+            .finish_commit_attempt(&stable, &result_head, agent.as_bytes(), attempt, status);
     });
+}
+
+// ─── Catch-up serving ──────────────────────────────────────────────────────
+
+/// Serve the recovery commit frames this node holds for the group (any of
+/// `group_ids`) above `from_revision` to a catch-up requester, oldest
+/// first, on the distinct gated carrier only, never inside a legacy
+/// catch-up page (§4b(1) "Mixed versions"). Each write uses the guarded
+/// admission with [`HeadRule::OnChain`] and the `owner_recovery_v1` gate.
+///
+/// The log is memory only: after a restart this node serves only the
+/// frames it authors or installs again (restart durability is a later
+/// step).
+pub(in crate::server) async fn serve_catchup(
+    state: &Arc<AppState>,
+    requester: &AgentId,
+    group_ids: &[String],
+    from_revision: u64,
+) {
+    let frames = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .catchup_frames(group_ids, from_revision);
+    for (group_id, result_head, bytes) in frames {
+        let status = send_guarded(
+            state,
+            &group_id,
+            requester,
+            HeadRule::OnChain(result_head),
+            bytes.as_slice(),
+        )
+        .await;
+        if status != RecipientDelivery::Sent {
+            return;
+        }
+    }
 }
 
 // ─── Receive ───────────────────────────────────────────────────────────────
@@ -1383,6 +1680,14 @@ async fn receive_commit(
         let mut inner = state.revocation_evictions.inner.lock().await;
         inner.orc.pending.remove(&body.stable_group_id);
         inner.orc.mandates.remove(&body.stable_group_id);
+        // Any installed replica serves the frame to a survivor that
+        // missed it (catch-up, §4).
+        inner.orc.remember(
+            &body.stable_group_id,
+            body.next_revision,
+            &body.commit.state_hash,
+            Arc::new(payload.to_vec()),
+        );
     }
     tracing::info!(
         group_id = %ng::LogHexId::group(&group_key),
@@ -1405,7 +1710,8 @@ async fn receive_commit(
 pub(super) async fn status_json(state: &AppState, stable_group_id: &str) -> serde_json::Value {
     let inner = state.revocation_evictions.inner.lock().await;
     let owner = inner.orc.mandates.get(stable_group_id).map(|delivery| {
-        let (cause, advert) = match delivery.status {
+        let status = delivery.recipients.get(&delivery.promoted).copied();
+        let (cause, advert) = match status.unwrap_or(RecipientDelivery::Due) {
             RecipientDelivery::Lacking => (
                 x0x::groups::eviction::WaitingCause::WaitingForReceiverUpgrade.as_str(),
                 "lacking",
@@ -1507,6 +1813,357 @@ mod tests {
         assert_eq!(survivors(&info, &[1; 32], &removed), vec![[3u8; 32]]);
     }
 
+    fn commit_delivery(result_head: &str, recipient: [u8; 32]) -> CommitDelivery {
+        CommitDelivery {
+            bytes: Arc::new(vec![1, 2, 3]),
+            result_head: result_head.to_string(),
+            next_revision: 2,
+            recipients: BTreeMap::from([(recipient, RecipientDelivery::Due)]),
+            next_at: Instant::now(),
+        }
+    }
+
+    fn mandate_delivery(mandate_id: &str, promoted: [u8; 32]) -> MandateDelivery {
+        MandateDelivery {
+            bytes: Arc::new(vec![4, 5, 6]),
+            mandate_id: mandate_id.to_string(),
+            promoted,
+            parent_head: "parent".to_string(),
+            recipients: BTreeMap::from([(promoted, RecipientDelivery::Due)]),
+            next_at: Instant::now(),
+        }
+    }
+
+    /// #1357 (Codex P2 class): a commit send's `InFlight` status is
+    /// installed before the send starts, and a completion writes only over
+    /// its own attempt. A late round planned from an old snapshot, a stale
+    /// attempt and an attempt for a replaced commit change nothing.
+    #[test]
+    fn commit_completion_writes_only_its_own_attempt() {
+        let survivor = [7; 32];
+        let mut orc = OrcState::default();
+        orc.deliveries
+            .insert("g".into(), commit_delivery("head-1", survivor));
+        let attempt = next_attempt();
+        let started = orc.install_commit_round(
+            "g",
+            "head-1",
+            vec![RoundUpdate {
+                recipient: survivor,
+                observed: RecipientDelivery::Due,
+                next: Some(RecipientDelivery::InFlight(attempt)),
+            }],
+        );
+        assert_eq!(started, vec![(survivor, attempt)]);
+        // A stale attempt's completion is ignored.
+        assert!(!orc.finish_commit_attempt(
+            "g",
+            "head-1",
+            &survivor,
+            attempt.wrapping_add(1_000_000),
+            RecipientDelivery::Due
+        ));
+        // The send completes at once.
+        assert!(orc.finish_commit_attempt(
+            "g",
+            "head-1",
+            &survivor,
+            attempt,
+            RecipientDelivery::Sent
+        ));
+        // A late round write planned from the old `Due` snapshot changes
+        // nothing.
+        let late = orc.install_commit_round(
+            "g",
+            "head-1",
+            vec![RoundUpdate {
+                recipient: survivor,
+                observed: RecipientDelivery::Due,
+                next: Some(RecipientDelivery::InFlight(next_attempt())),
+            }],
+        );
+        assert!(late.is_empty());
+        // The complete delivery was dropped by that round, so a duplicate
+        // completion of the same attempt writes nothing.
+        assert!(!orc.deliveries.contains_key("g"));
+        assert!(!orc.finish_commit_attempt(
+            "g",
+            "head-1",
+            &survivor,
+            attempt,
+            RecipientDelivery::Due
+        ));
+
+        // An attempt for a replaced commit (another result head) is ignored.
+        orc.deliveries
+            .insert("g".into(), commit_delivery("head-1", survivor));
+        let old = next_attempt();
+        assert_eq!(
+            orc.install_commit_round(
+                "g",
+                "head-1",
+                vec![RoundUpdate {
+                    recipient: survivor,
+                    observed: RecipientDelivery::Due,
+                    next: Some(RecipientDelivery::InFlight(old)),
+                }],
+            ),
+            vec![(survivor, old)]
+        );
+        let mut replaced = commit_delivery("head-2", survivor);
+        replaced
+            .recipients
+            .insert(survivor, RecipientDelivery::InFlight(old));
+        orc.deliveries.insert("g".into(), replaced);
+        assert!(!orc.finish_commit_attempt("g", "head-1", &survivor, old, RecipientDelivery::Sent));
+        assert_eq!(
+            orc.deliveries["g"].recipients.get(&survivor),
+            Some(&RecipientDelivery::InFlight(old))
+        );
+    }
+
+    /// #1357 (Codex P2 class), mandate side: the same per-attempt rule, and
+    /// a completion for a mandate that a newer one replaced is ignored.
+    #[test]
+    fn mandate_completion_writes_only_its_own_attempt() {
+        let promoted = [9; 32];
+        let mut orc = OrcState::default();
+        orc.mandates
+            .insert("g".into(), mandate_delivery("m1", promoted));
+        let attempt = next_attempt();
+        let update = RoundUpdate {
+            recipient: promoted,
+            observed: RecipientDelivery::Due,
+            next: Some(RecipientDelivery::InFlight(attempt)),
+        };
+        // A plan for another mandate installs nothing.
+        assert!(orc.install_mandate_round("g", "m0", update).is_empty());
+        assert_eq!(
+            orc.install_mandate_round("g", "m1", update),
+            vec![(promoted, attempt)]
+        );
+        assert!(orc.finish_mandate_attempt("g", "m1", &promoted, attempt, RecipientDelivery::Sent));
+        // A late round planned from `Due` does not overwrite `Sent`.
+        assert!(orc.install_mandate_round("g", "m1", update).is_empty());
+        assert_eq!(
+            orc.mandates["g"].recipients.get(&promoted),
+            Some(&RecipientDelivery::Sent)
+        );
+
+        // The owner signs a new mandate while an attempt for the old one
+        // runs: the old completion must not touch the new delivery.
+        let old = next_attempt();
+        let mut running = mandate_delivery("m1", promoted);
+        running
+            .recipients
+            .insert(promoted, RecipientDelivery::InFlight(old));
+        orc.mandates.insert("g".into(), running);
+        orc.mandates
+            .insert("g".into(), mandate_delivery("m2", promoted));
+        assert!(!orc.finish_mandate_attempt("g", "m1", &promoted, old, RecipientDelivery::Lacking));
+        assert_eq!(
+            orc.mandates["g"].recipients.get(&promoted),
+            Some(&RecipientDelivery::Due)
+        );
+    }
+
+    /// #1357: recovery commit frames are held for catch-up serving, oldest
+    /// first, above the requested revision, deduplicated and bounded.
+    #[test]
+    fn catchup_frames_are_bounded_ordered_and_above_the_revision() {
+        let mut orc = OrcState::default();
+        let total = ORC_LOG_PER_GROUP as u64 + 2;
+        for revision in (1..=total).rev() {
+            orc.remember(
+                "g",
+                revision,
+                &format!("h{revision}"),
+                Arc::new(vec![revision as u8]),
+            );
+        }
+        orc.remember("g", total, "dup", Arc::new(vec![0]));
+        let all = orc.catchup_frames(&["x".into(), "g".into()], 0);
+        assert_eq!(all.len(), ORC_LOG_PER_GROUP);
+        let heads: Vec<&str> = all.iter().map(|(_, head, _)| head.as_str()).collect();
+        let expected: Vec<String> = (3..=total).map(|revision| format!("h{revision}")).collect();
+        assert_eq!(heads, expected);
+        assert!(all.iter().all(|(id, _, _)| id == "g"));
+        let tail = orc.catchup_frames(&["g".into()], total - 1);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].1, format!("h{total}"));
+        assert!(orc.catchup_frames(&["other".into()], 0).is_empty());
+    }
+
+    /// #1357 / ADR 0110 §2: a held mandate keeps its group in the head
+    /// catch-up rounds, and its named (revoked) admins are not holders.
+    #[test]
+    fn held_mandates_keep_a_head_round_without_their_named_admins() {
+        let mut orc = OrcState::default();
+        let mandate = orc::SignedOwnerRecoveryMandateV1 {
+            body: orc::OwnerRecoveryMandateBodyV1 {
+                stable_group_id: "g".into(),
+                parent_head: "parent".into(),
+                parent_revision: 1,
+                revoked_admins: vec![
+                    orc::RevokedAdminV1 {
+                        agent: [1; 32],
+                        revocation_hashes: vec![[0; 32]],
+                    },
+                    orc::RevokedAdminV1 {
+                        agent: [2; 32],
+                        revocation_hashes: vec![[0; 32]],
+                    },
+                ],
+                promoted: [3; 32],
+                promoted_certificate_digest: String::new(),
+                owner_public_key: Vec::new(),
+                issued_at_ms: 0,
+            },
+            signature: Vec::new(),
+        };
+        assert!(orc.head_round_groups().is_empty());
+        orc.pending.insert(
+            "g".into(),
+            PendingMandate {
+                mandate,
+                wait: None,
+                next_at: Instant::now(),
+                received_at: Instant::now(),
+            },
+        );
+        let rounds = orc.head_round_groups();
+        assert_eq!(
+            rounds.get("g"),
+            Some(&BTreeSet::from([[1u8; 32], [2u8; 32]]))
+        );
+    }
+
+    fn advertise(state: &AppState, peer: AgentId, bits: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "verified capability advert"
+        );
+    }
+
+    /// #1357 / ADR 0110 §3, D60: a recovery commit or mandate write goes
+    /// through the guarded admission with the `owner_recovery_v1` gate,
+    /// evaluated again at the write seam. A recipient whose advert lacks
+    /// bit 7 is refused; one that became ineligible (removed, banned, the
+    /// head moved, or the group quarantined) after a passing pre-phase is
+    /// refused by the seam and by a fresh pre-phase. Daemon-level (an
+    /// in-process `AppState`); CI only.
+    #[tokio::test]
+    async fn recovery_egress_refuses_an_ineligible_recipient() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::super::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let survivor = AgentId([0x78; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let group_id = "0c".repeat(16);
+        let mut info = GroupInfo::new("orc".into(), String::new(), admin, group_id.clone());
+        info.add_member(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        let rule = HeadRule::Current(info.state_hash.clone());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        let admit = |rule: HeadRule| {
+            guarded_admission_for(
+                &state,
+                &stable,
+                &survivor,
+                rule,
+                x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+            )
+        };
+
+        // An advert with every other S4 bit but not bit 7 is refused.
+        advertise(
+            &state,
+            survivor,
+            x0x::dm::CapabilityRegistry::current().bits
+                & !x0x::dm::CapabilityRegistry::OWNER_RECOVERY_V1,
+        );
+        assert!(
+            admit(rule.clone())().await.is_none(),
+            "a recipient lacking owner_recovery_v1 is refused"
+        );
+
+        advertise(
+            &state,
+            survivor,
+            x0x::dm::CapabilityRegistry::current().bits,
+        );
+        let seam = admit(rule.clone())().await;
+        assert!(
+            seam.is_some_and(|seam| seam()),
+            "an eligible recipient is admitted"
+        );
+
+        type Change = fn(&mut GroupInfo, &str);
+        let changes: [(&str, Change); 4] = [
+            ("removed", |info, member| {
+                info.remove_member(member, None);
+            }),
+            ("banned", |info, member| {
+                info.ban_member(member, None);
+            }),
+            ("head moved", |info, _| {
+                info.secret_epoch = info.secret_epoch.saturating_add(1);
+                info.recompute_state_hash();
+            }),
+            ("quarantined", |info, _| {
+                info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                    revision: 1,
+                    state_hash: "other".into(),
+                    committed_by: String::new(),
+                    observed_at_ms: 0,
+                    snapshot: x0x::groups::ForkSnapshot {
+                        terminal_commit: info.terminal_commit_header(),
+                        conflicting_commit: info.terminal_commit_header(),
+                        classification: None,
+                    },
+                    no_anchor: true,
+                });
+            }),
+        ];
+        for (label, change) in changes {
+            let seam = admit(rule.clone())()
+                .await
+                .unwrap_or_else(|| panic!("{label}: the pre-phase must admit first"));
+            {
+                let mut groups = state.named_groups.write().await;
+                let stored = groups.get_mut(&group_id).expect("group");
+                change(stored, &survivor_hex);
+            }
+            assert!(!seam(), "{label}: the seam must refuse the write");
+            assert!(
+                admit(rule.clone())().await.is_none(),
+                "{label}: a fresh pre-phase must refuse"
+            );
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+        }
+        Ok(())
+    }
+
     /// ADR 0110 §4b(1) end to end in one daemon, for a `SignedPublic`
     /// `OwnerCertified` group: the owner route signs a mandate for this
     /// node's own agent, the promoted member authors the commit (A
@@ -1599,6 +2256,45 @@ mod tests {
 
         let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+        // ADR 0110 §2: no seal before a completed current catch-up round.
+        try_commit(&state, &stable).await;
+        let held = state
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .cloned()
+            .unwrap();
+        assert_eq!(held.state_hash, info.state_hash, "no seal before head sync");
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let wait = inner.orc.pending.get(&stable).and_then(|p| p.wait.clone());
+            assert_eq!(
+                wait.map(|(cause, _)| cause),
+                Some(x0x::groups::eviction::WaitingCause::WaitingForHeadSync.as_str())
+            );
+            assert!(inner.orc.head_round_groups().contains_key(&stable));
+        }
+        // The restart minimum elapses and a holder confirms this head.
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait).await;
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                super::super::HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: true,
+                    conflicting: BTreeSet::new(),
+                },
+            );
         try_commit(&state, &stable).await;
 
         let committed = state
@@ -1631,6 +2327,17 @@ mod tests {
             panic!("an X0XORC1 commit frame");
         };
         orc::verify_commit_signatures(&frame).unwrap();
+        // The committed frame is held for catch-up serving.
+        let served = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .catchup_frames(std::slice::from_ref(&stable), info.state_revision);
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].1, committed.state_hash);
+        assert_eq!(served[0].2.as_slice(), bytes.as_slice());
         let revocations = verified_agent_revocations(&state).await;
         orc::validate_against_parent(&frame.body, &info, 0, &revocations, now_unix()).unwrap();
 
