@@ -6035,6 +6035,379 @@ mod tests {
         Ok(())
     }
 
+    /// The links of `ahead` after `base`'s head, in order.
+    fn links_after(base: &GroupInfo, ahead: &GroupInfo) -> Vec<RetainedCommit> {
+        ahead
+            .commit_log
+            .iter()
+            .filter(|entry| entry.commit.revision > base.state_revision)
+            .cloned()
+            .collect()
+    }
+
+    fn sign_ata(
+        signer: &x0x::identity::AgentKeypair,
+        subject: &str,
+        from: &GroupInfo,
+        links: &[RetainedCommit],
+    ) -> anyhow::Result<AdminTerminalAttestation> {
+        Ok(AdminTerminalAttestation::sign(
+            AtaFields {
+                group: from.stable_group_id().to_string(),
+                subject: subject.to_string(),
+                attested_by: hex::encode(signer.agent_id().as_bytes()),
+                signer_public_key: hex::encode(signer.public_key().as_bytes()),
+                from_revision: from.state_revision,
+                from_state_hash: from.state_hash.clone(),
+                sequence: links
+                    .iter()
+                    .map(|link| link.commit.state_hash.clone())
+                    .collect(),
+                segment_terminal_revision: links
+                    .last()
+                    .map_or(from.state_revision, |link| link.commit.revision),
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            signer,
+        )?)
+    }
+
+    /// Codex P1 G3 (#1533 round 3), ADR 0109 §2 "If the signer stops
+    /// being an active admin after an applied link, the gate stops
+    /// there", join-carry path: a served link that demotes or removes the
+    /// ATA's signer applies, and the attested links after it do not.
+    #[tokio::test]
+    async fn join_carry_stops_after_the_link_that_unseats_the_signer() -> anyhow::Result<()> {
+        for removal in [false, true] {
+            let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+            let local = local_hex(&state);
+            let owner = x0x::identity::AgentKeypair::generate()?;
+            let owner_hex = hex::encode(owner.agent_id().as_bytes());
+            let signer = x0x::identity::AgentKeypair::generate()?;
+            let signer_hex = hex::encode(signer.agent_id().as_bytes());
+            let mut base = GroupInfo::new(
+                "adr0109-unseated-signer".to_string(),
+                String::new(),
+                owner.agent_id(),
+                "5109".repeat(16),
+            );
+            base.add_member(
+                signer_hex.clone(),
+                x0x::groups::GroupRole::Admin,
+                Some(owner_hex.clone()),
+                None,
+            );
+            base.seal_commit(&owner, 1_000)?;
+            assert!(!base.has_active_member(&local), "a pre-Welcome joiner");
+            let key = base.mls_group_id.clone();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(key.clone(), base.clone());
+            assert!(matches!(
+                super::super::save_named_groups_checked(&state).await?,
+                super::super::AtomicWriteOutcome::Durable
+            ));
+            let mut ahead = base.clone();
+            if removal {
+                ahead.remove_member(&signer_hex, Some(owner_hex.clone()));
+            } else {
+                ahead.set_member_role(&signer_hex, x0x::groups::GroupRole::Member);
+            }
+            ahead.seal_commit(&owner, 2_000)?;
+            ahead.name = "renamed".to_string();
+            ahead.seal_commit(&owner, 3_000)?;
+            let links = links_after(&base, &ahead);
+            assert_eq!(links.len(), 2);
+            let mut joined = ahead.clone();
+            joined.add_member(
+                local.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(owner_hex.clone()),
+                None,
+            );
+            joined.seal_commit(&owner, 4_000)?;
+            let terminal = joined
+                .commit_log
+                .last()
+                .map(|entry| entry.commit.clone())
+                .ok_or_else(|| anyhow::anyhow!("terminal"))?;
+            let event = super::super::NamedGroupMetadataEvent::GroupMetadataUpdated {
+                group_id: base.stable_group_id().to_string(),
+                revision: terminal.revision,
+                actor: owner_hex.clone(),
+                name: None,
+                description: None,
+                commit: Some(terminal.clone()),
+            };
+            let ata = sign_ata(&signer, &local, &base, &links)?;
+            assert!(ata.signer_verified_on(&base));
+            let _ = apply_join_carry(&state, &key, &links, &terminal, &event, &ata).await;
+            let head = state
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .map(|info| info.state_hash.clone());
+            assert_eq!(
+                head.as_deref(),
+                Some(links[0].commit.state_hash.as_str()),
+                "removal={removal}: the link that unseats the signer applies; the link after it does not (base {}, second link {})",
+                base.state_hash,
+                links[1].commit.state_hash
+            );
+        }
+        Ok(())
+    }
+
+    /// Codex P1 G3 (#1533 round 3), the same rule on the catch-up page
+    /// path: the page gate is checked before the page, and each commit is
+    /// checked again against the record the earlier commits left. A page
+    /// whose first commit demotes the signer adopts that commit only.
+    #[tokio::test]
+    async fn catchup_page_stops_after_the_commit_that_demotes_the_signer() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let owner = x0x::identity::AgentKeypair::generate()?;
+        let owner_hex = hex::encode(owner.agent_id().as_bytes());
+        let signer = x0x::identity::AgentKeypair::generate()?;
+        let signer_hex = hex::encode(signer.agent_id().as_bytes());
+        let other_hex = "33".repeat(32);
+        let mut base = GroupInfo::new(
+            "adr0109-demoted-page".to_string(),
+            String::new(),
+            owner.agent_id(),
+            "6109".repeat(16),
+        );
+        for (member, role) in [
+            (&signer_hex, x0x::groups::GroupRole::Admin),
+            (&local, x0x::groups::GroupRole::Member),
+            (&other_hex, x0x::groups::GroupRole::Member),
+        ] {
+            base.add_member(member.clone(), role, Some(owner_hex.clone()), None);
+        }
+        base.seal_commit(&owner, 1_000)?;
+        let key = base.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), base.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let mut ahead = base.clone();
+        ahead.set_member_role(&signer_hex, x0x::groups::GroupRole::Member);
+        ahead.seal_commit(&owner, 2_000)?;
+        ahead.set_member_role(&other_hex, x0x::groups::GroupRole::Admin);
+        ahead.seal_commit(&owner, 3_000)?;
+        let links = links_after(&base, &ahead);
+        assert_eq!(links.len(), 2);
+        let ata = sign_ata(&signer, &local, &base, &links)?;
+        let stable = base.stable_group_id().to_string();
+        let kept = ata.clone();
+        assert!(update_sidecar(&state, &stable, move |body| body.active_ata = Some(kept)).await);
+        assert_eq!(
+            armed_admin_sequence(&state, &base).await,
+            Some(ata.fields.sequence.clone()),
+            "the page gate is armed with the whole sequence"
+        );
+        let events = [(&signer_hex, &links[0]), (&other_hex, &links[1])]
+            .into_iter()
+            .map(
+                |(agent, link)| super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
+                    group_id: stable.clone(),
+                    revision: link.commit.revision,
+                    actor: owner_hex.clone(),
+                    agent_id: agent.clone(),
+                    role: if *agent == signer_hex {
+                        x0x::groups::GroupRole::Member
+                    } else {
+                        x0x::groups::GroupRole::Admin
+                    },
+                    commit: Some(link.commit.clone()),
+                },
+            )
+            .collect();
+        super::super::handle_treekem_catchup_response(
+            &state,
+            &owner.agent_id(),
+            true,
+            super::super::TreeKemCatchupResponse {
+                message_type: "treekem_catchup_response".to_string(),
+                group_id: key.clone(),
+                events,
+                truncated: false,
+                responder_state_hash: None,
+            },
+        )
+        .await;
+        let head = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .map(|info| info.state_hash.clone());
+        assert_eq!(
+            head.as_deref(),
+            Some(links[0].commit.state_hash.as_str()),
+            "the demoting commit applies; the commit after it does not (base {}, second commit {})",
+            base.state_hash,
+            links[1].commit.state_hash
+        );
+        Ok(())
+    }
+
+    /// A contained record for G4/G5: `signer` (the owner, an Active
+    /// admin) committed a rename after `base`; this node holds a marker on
+    /// that commit and a verified ATA whose one-link segment ends at it.
+    async fn marker_fixture(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(String, GroupInfo, AdminTerminalAttestation)> {
+        let local = local_hex(state);
+        let signer = x0x::identity::AgentKeypair::generate()?;
+        let signer_hex = hex::encode(signer.agent_id().as_bytes());
+        let mut base = GroupInfo::new(
+            "adr0109-marker-retire".to_string(),
+            String::new(),
+            signer.agent_id(),
+            "7109".repeat(16),
+        );
+        base.add_member(
+            local.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(signer_hex.clone()),
+            None,
+        );
+        base.seal_commit(&signer, 1_000)?;
+        let mut info = base.clone();
+        info.name = "renamed".to_string();
+        info.seal_commit(&signer, 2_000)?;
+        let links = links_after(&base, &info);
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: info.state_revision,
+            state_hash: info.state_hash.clone(),
+            committed_by: signer_hex,
+            observed_at_ms: now_ms(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: false,
+        });
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let ata = sign_ata(&signer, &local, &base, &links)?;
+        let kept = ata.clone();
+        assert!(
+            update_sidecar(state, info.stable_group_id(), move |body| body.active_ata =
+                Some(kept))
+            .await
+        );
+        Ok((key, info, ata))
+    }
+
+    async fn live_marker(state: &AppState, key: &str) -> bool {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(key)
+            .is_some_and(|info| info.fork_quarantine.is_some())
+    }
+
+    async fn disk_marker(state: &AppState, key: &str) -> anyhow::Result<bool> {
+        Ok(legacy_entry(&state.named_groups_path, key)
+            .await?
+            .is_some_and(|info| info.fork_quarantine.is_some()))
+    }
+
+    /// Codex P1 G4 (#1533 round 3), ADR 0109 §4 "S3 publishes to the live
+    /// map only when both writes are Durable": a marker retirement whose
+    /// write lands but whose directory fsync fails keeps the marker, in
+    /// memory and in the visible file, and retires on a later durable
+    /// write.
+    #[tokio::test]
+    async fn marker_retirement_with_a_failed_directory_fsync_keeps_the_marker() -> anyhow::Result<()>
+    {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _ata) = marker_fixture(&state).await?;
+        let fault = super::super::set_save_fault(
+            &state,
+            super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert!(!retire_marker_attested(&state, &key, &info).await);
+        drop(fault);
+        assert!(
+            live_marker(&state, &key).await,
+            "ReplacedNotDurable publishes nothing: the live record stays contained"
+        );
+        assert!(
+            disk_marker(&state, &key).await?,
+            "the visible file holds the marker again"
+        );
+        // The retry is durable, and only then is the marker gone.
+        assert!(retire_marker_attested(&state, &key, &info).await);
+        assert!(!live_marker(&state, &key).await);
+        assert!(!disk_marker(&state, &key).await?);
+        Ok(())
+    }
+
+    /// Codex P2 G5 (#1533 round 3), ADR 0109 §2 "Retirement": the terminal
+    /// cleanup retires the matching marker before it deletes the ATA (the
+    /// marker's retirement needs it). A restart between the two steps
+    /// still retires the ATA.
+    #[tokio::test]
+    async fn terminal_retirement_retires_the_marker_before_the_ata() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _ata) = marker_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        retire_converged(&state, &key).await;
+        assert!(!live_marker(&state, &key).await, "the marker is retired");
+        assert!(!disk_marker(&state, &key).await?);
+        assert!(sidecar_snapshot(&state, &stable)
+            .await
+            .is_none_or(|body| body.active_ata.is_none()));
+
+        // A crash after the durable marker retirement, before the ATA is
+        // deleted: the reloaded ATA still matches the head and retires.
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _ata) = marker_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(retire_marker_attested(&state, &key, &info).await);
+        let reloaded = super::super::load_named_groups_merged(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+        )
+        .await?;
+        *state.named_groups.write().await = reloaded;
+        state.group_recovery.inner.lock().await.sidecars.clear();
+        load_sidecars(&state).await;
+        reconcile_loaded_atas(&state).await;
+        assert!(!live_marker(&state, &key).await);
+        assert!(sidecar_snapshot(&state, &stable)
+            .await
+            .is_some_and(|body| body.active_ata.is_some()));
+        retire_converged(&state, &key).await;
+        assert!(sidecar_snapshot(&state, &stable)
+            .await
+            .is_none_or(|body| body.active_ata.is_none()));
+        drop(dir);
+        Ok(())
+    }
+
     /// The placeholder record a legacy store view holds for `key`.
     async fn legacy_entry(path: &FsPath, key: &str) -> anyhow::Result<Option<GroupInfo>> {
         let bytes = tokio::fs::read(path).await?;
