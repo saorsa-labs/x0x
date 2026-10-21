@@ -104,18 +104,41 @@ refuses a mismatched answer instead of admitting it:
 
 - **No pin row**: trust-on-first-use, exactly as before #1112. No
   production address is pinned today.
-- **Answer inside the pin set**: the dial proceeds.
+- **Answer inside the pin set**: the dial proceeds, and a match at this
+  address clears any live rejection recorded for THIS address.
 - **Answer outside the pin set**: the dial returns an error — the hint is
   dropped, never a trust anchor and never a hard join failure. The
-  rejected identity is recorded on the node, and `peer_admission` answers
-  `Suppressed` for it from then on, so gossip eligibility and keepalives
-  exclude it too. No connection is torn down: the close APIs are
-  identity-scoped, and the same identity may hold a valid connection
-  through another address (a concurrent dial that matched its pin); a
-  leftover transport connection dies by the pool's idle eviction. The
-  capability-hint selector additionally validates the observed
-  (seed address, identity) pair itself, because inbound connections and
-  id-based dials never pass the address-dial seam.
+  refusal is SCOPED to the mismatching address/session and does three
+  things:
+  - records a bounded, expiring backoff entry for the address (10
+    minutes) with the answered identity and the connection generation it
+    arrived on. The entry refuses re-dials of that address pre-socket
+    until it expires or a dial matches the pin set again — never a
+    process-lifetime tombstone;
+  - closes the answered connection with a plain transport disconnect
+    (#292 invariant-F style). ant-quic's NAT-traversal coordinator
+    selection reuses any live connection to a seed address and never
+    consults x0x's rejection set, so a live leftover kept the rejected
+    seed usable as coordinator/relay assistance. The close is
+    identity-scoped (the only close API); if the same identity holds a
+    valid connection at another address, the redial paths re-establish
+    it and it is admitted again at once, because no guard suppresses the
+    identity as a whole;
+  - evicts the answered identity's row from the shared bootstrap cache,
+    so cache-reading coordinator selection cannot surface it while the
+    backoff lives.
+
+The guards (`peer_admission`, the receive pump's frame drop, both
+guarded-send policy checks) refuse only the mismatching session: a live
+rejection entry must name the CURRENT connection's generation, so a valid
+connection of the same identity elsewhere — a different generation —
+stays admitted whatever the dial completion order. The guarded-send
+policy is recomputed inside the post-`open_uni` callback, so a rejection
+that lands while a stream waits for credit refuses the bytes there. The
+capability-hint selector additionally validates the observed
+(seed address, identity) pair itself, because inbound connections and
+id-based dials never pass the address-dial seam; that exclusion is
+pair-scoped, not identity-wide.
 
 The pin set is per address, never per host: the UDP/443 and UDP/5483
 listeners on one seed host are separate `x0xd` instances with separate
@@ -128,9 +151,10 @@ for the six `:5483` seed listeners only (git history,
 cross-confirmed by the May 2026 soak captures), and they are six months
 old. A pin that no longer matches a live seed key would refuse that seed
 for every client. Pinning is a deliberate operator change, made when the
-live fleet keys are verified. The rejection set grows only with dial
-rate against pinned addresses; a cap or TTL is future work if it ever
-matters.
+live fleet keys are verified. The pin table and its helpers are
+crate-private (`pub(crate)`): pinning is an operator-compiled behaviour,
+not a public API. Rejection entries expire on their own TTL, so the set
+cannot grow unbounded with dial rate against pinned addresses.
 
 ### Capability hints: an observed operator tier, plus the ADR-0071 tiers (#1112)
 
@@ -153,8 +177,10 @@ one verified tier:
   evidence no announcement can forge: listing a seed address in an
   announcement buys nothing.
 
-Identities rejected by a seed-pin mismatch are excluded from every tier.
-A relayed connection's observed address names the relay, not the peer, so
+A pin-mismatched (observed address, identity) PAIR is excluded from every
+tier — pair-scoped, never identity-wide, so a mismatch at one seed address
+does not cost the same identity its valid, pinned origin at another. A
+relayed connection's observed address names the relay, not the peer, so
 it is never operator-tier evidence.
 
 **Open decision (recorded with David).** David's 20 Oct 2026 #1112

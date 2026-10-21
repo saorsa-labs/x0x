@@ -5539,7 +5539,6 @@ async fn collect_coordinator_hints(
     // advertise — the supply-side choice skew.
     let bootstrap_ips = bootstrap_ip_set();
     let seed_addrs = bootstrap_seed_addrs();
-    let seed_pin_rejected = network.seed_pin_rejected_snapshot();
     let cache = machine_cache.read().await;
     select_capability_hints(
         &origins,
@@ -5547,7 +5546,6 @@ async fn collect_coordinator_hints(
         own_machine_id,
         &bootstrap_ips,
         &seed_addrs,
-        &seed_pin_rejected,
         selection_skew,
     )
 }
@@ -5575,15 +5573,18 @@ async fn collect_coordinator_hints(
 ///   `docs/trust-and-connectivity.md`) — until he decides, the ADR stands.
 ///
 /// Identities rejected by a seed-pin mismatch are excluded from both
-/// tiers. Hints are deduplicated, capped to `MAX_COORDINATOR_HINTS` each,
-/// and returned in stable order. The announcer never hints itself.
+/// tiers PAIR-SCOPED (review round 7): only the origin whose observed
+/// address mismatched its pin set is skipped — a mismatch at one seed
+/// address never suppresses the same identity's valid, pinned origin at
+/// another address, and no dial completion order changes that. Hints are
+/// deduplicated, capped to `MAX_COORDINATOR_HINTS` each, and returned in
+/// stable order. The announcer never hints itself.
 fn select_capability_hints(
     origins: &[network::PeerOrigin],
     cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
     own_machine_id: identity::MachineId,
     bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
     seed_addrs: &std::collections::HashSet<std::net::SocketAddr>,
-    seed_pin_rejected: &std::collections::HashSet<[u8; 32]>,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
     /// Upper bound on hint list length. Keeps the signed payload small and
@@ -5595,7 +5596,7 @@ fn select_capability_hints(
 
     for origin in origins {
         let mid = identity::MachineId(origin.peer_id.0);
-        if mid == own_machine_id || seed_pin_rejected.contains(&origin.peer_id.0) {
+        if mid == own_machine_id {
             continue;
         }
         // Operator tier: the OBSERVED transport address of a DIRECT path
@@ -15397,17 +15398,16 @@ impl Agent {
         };
         const PHASE1_PEER_CANDIDATES: usize = 12;
         let mut cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
-        // #1112 (review round 3): cached joins take the pin verdict too.
-        // A cached identity a pin mismatch rejected never returns through
-        // this tier, and a cached peer that lists a pinned seed address
-        // but is not in that address's pin set is a poisoned cache row —
-        // dial it by id never (drop the row, keep the cache untouched for
-        // ant-quic's own accounting).
-        let rejected = network.seed_pin_rejected_snapshot();
+        // #1112 (review round 3, scoped round 7): cached joins take the
+        // pin verdict PAIR-SCOPED. A cached peer that lists a pinned seed
+        // address but is not in that address's pin set is a poisoned cache
+        // row — dial it by id never (drop the row, keep the cache untouched
+        // for ant-quic's own accounting). A row whose addresses do not
+        // mismatch stays a candidate even if some OTHER seed address
+        // mismatched the identity: the rejection is scoped to that
+        // address, and the dial seam plus its bounded backoff refuse the
+        // bad address on any later dial.
         cached_peers.retain(|peer| {
-            if rejected.contains(&peer.peer_id.0) {
-                return false;
-            }
             !peer.preferred_addresses().into_iter().any(|addr| {
                 matches!(
                     network::seed_pin_check(network::pinned_seed_peer_ids(addr), peer.peer_id.0),
@@ -40810,15 +40810,12 @@ mod peer_connected_handler_integration_tests {
                 ),
             );
             let skew = SelectionSkew::default();
-            let no_rejections: std::collections::HashSet<[u8; 32]> =
-                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[issue1112_origin([0x11; 32], "203.0.113.10:52000", true)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
-                &no_rejections,
                 &skew,
             );
             assert!(
@@ -40846,15 +40843,12 @@ mod peer_connected_handler_integration_tests {
                 ),
             );
             let skew = SelectionSkew::default();
-            let no_rejections: std::collections::HashSet<[u8; 32]> =
-                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[issue1112_origin([0x11; 32], "198.51.100.99:52000", true)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
-                &no_rejections,
                 &skew,
             );
             assert_eq!(coordinators, vec![community]);
@@ -40886,8 +40880,6 @@ mod peer_connected_handler_integration_tests {
                 issue1112_machine(own, &["142.93.199.50:443".parse().unwrap()], None, None),
             );
             let skew = SelectionSkew::default();
-            let no_rejections: std::collections::HashSet<[u8; 32]> =
-                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[
                     issue1112_origin([0x22; 32], "142.93.199.50:5483", true),
@@ -40900,7 +40892,6 @@ mod peer_connected_handler_integration_tests {
                 own,
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
-                &no_rejections,
                 &skew,
             );
             assert!(coordinators.contains(&seed_host));
@@ -40920,32 +40911,55 @@ mod peer_connected_handler_integration_tests {
         }
 
         #[test]
-        fn issue1112_pin_rejected_identity_is_never_a_hint() {
-            // Review round 3: an identity a seed-pin mismatch rejected must
-            // not return through the cache tiers — not even the operator
-            // tier, whose observed seed-IP evidence it genuinely holds.
+        fn issue1112_pin_mismatch_exclusion_is_pair_scoped_not_identity_wide() {
+            // Review round 7: a seed-pin mismatch excludes the mismatching
+            // (address, identity) PAIR only. The selector's pair check
+            // (`seed_pin_gate`) is live the moment an operator pins rows;
+            // the identity-wide skip it used to carry is gone, because a
+            // rejection recorded at one seed address must not suppress the
+            // same identity's valid, pinned origin at another address —
+            // whatever the dial completion order. With the production pin
+            // table empty every pair is TOFU, so a healthy seed origin is
+            // hinted regardless of what happened at other addresses.
             let mut cache = std::collections::HashMap::new();
-            let rejected_seed = identity::MachineId([0x33; 32]);
-            cache.insert(
-                rejected_seed,
-                issue1112_machine(rejected_seed, &[], None, None),
-            );
-            let mut rejected: std::collections::HashSet<[u8; 32]> =
-                std::collections::HashSet::new();
-            rejected.insert([0x33; 32]);
+            let seed_host = identity::MachineId([0x33; 32]);
+            cache.insert(seed_host, issue1112_machine(seed_host, &[], None, None));
             let skew = SelectionSkew::default();
             let (coordinators, relays) = select_capability_hints(
-                &[issue1112_origin([0x33; 32], "142.93.199.50:5483", true)],
+                &[
+                    // The same identity seen at two distinct seed
+                    // listeners: no pin row rejects either pair, so both
+                    // origins are eligible — the ordering of any mismatch
+                    // elsewhere cannot change that.
+                    issue1112_origin([0x33; 32], "142.93.199.50:5483", true),
+                    issue1112_origin([0x33; 32], "147.182.234.192:443", true),
+                ],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
-                &rejected,
                 &skew,
             );
-            assert!(
-                relays.is_empty() && coordinators.is_empty(),
-                "a pin-rejected identity must not become a hint on any tier"
+            assert_eq!(coordinators, vec![seed_host]);
+            assert_eq!(relays, vec![seed_host]);
+            // The pair verdict itself — the only thing that can exclude an
+            // origin — stays scoped to the address that mismatched.
+            let pins = [network::SeedPeerPin {
+                addr: "142.93.199.50:5483",
+                expected_peer_ids: &[&[0xAA; 32]],
+            }];
+            assert!(matches!(
+                network::seed_pin_gate_in(&pins, "142.93.199.50:5483".parse().unwrap(), [0x33; 32]),
+                network::SeedPinVerdict::Mismatch { .. }
+            ));
+            assert_eq!(
+                network::seed_pin_gate_in(
+                    &pins,
+                    "147.182.234.192:443".parse().unwrap(),
+                    [0x33; 32]
+                ),
+                network::SeedPinVerdict::Unpinned,
+                "the other address's pair is untouched by the mismatch"
             );
         }
 
@@ -40963,15 +40977,12 @@ mod peer_connected_handler_integration_tests {
                 issue1112_machine(nated, &["142.93.199.50:61234".parse().unwrap()], None, None),
             );
             let skew = SelectionSkew::default();
-            let no_rejections: std::collections::HashSet<[u8; 32]> =
-                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[issue1112_origin([0x66; 32], "142.93.199.50:61234", true)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
-                &no_rejections,
                 &skew,
             );
             assert!(
@@ -40998,15 +41009,12 @@ mod peer_connected_handler_integration_tests {
                 ),
             );
             let skew = SelectionSkew::default();
-            let no_rejections: std::collections::HashSet<[u8; 32]> =
-                std::collections::HashSet::new();
             let (coordinators, relays) = select_capability_hints(
                 &[issue1112_origin([0x44; 32], "142.93.199.50:5483", false)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
-                &no_rejections,
                 &skew,
             );
             assert!(
