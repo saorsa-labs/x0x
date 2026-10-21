@@ -90,6 +90,9 @@ pub(super) struct WsSession {
     /// Session token from the GUI URL, when this socket presented one.
     /// A hidden tab keeps it so `gui.visible` can deliver a pending banner.
     gui_session_token: Option<String>,
+    /// Bumped on every hide. A delayed reveal must not mark the tab visible
+    /// after a newer hide.
+    visible_epoch: Arc<AtomicU64>,
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
     /// The drain owns the `JoinHandle`; this is only the abort handle.
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
@@ -115,6 +118,7 @@ fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
         receives_direct: false,
         visible_gui: visible_gui_flag(visible_gui),
         gui_session_token: None,
+        visible_epoch: Arc::new(AtomicU64::new(0)),
         topic_forwarders: HashMap::new(),
     }
 }
@@ -1252,6 +1256,7 @@ async fn handle_ws_connection(
         receives_direct: direct_mode,
         visible_gui: Arc::clone(&visible_gui),
         gui_session_token: session_token.clone(),
+        visible_epoch: Arc::new(AtomicU64::new(0)),
         topic_forwarders: HashMap::new(),
     };
     let Some(armed) = arm_navigation_and_advertise_session(
@@ -2082,6 +2087,7 @@ async fn handle_ws_command(
                 };
                 let was_visible = session.is_visible_gui();
                 if !visible {
+                    session.visible_epoch.fetch_add(1, Ordering::AcqRel);
                     session.set_visible_gui(false);
                     None
                 } else if was_visible {
@@ -2089,36 +2095,51 @@ async fn handle_ws_command(
                 } else {
                     // Stay hidden until the pending frame is queued. A show
                     // that arrives after that frame must not be overwritten
-                    // by the view this tab was opened for.
-                    session.gui_session_token()
+                    // by the view this tab was opened for. Remember the
+                    // epoch so a hide that lands while the queue is full
+                    // is not undone when the frame finally fits.
+                    Some((
+                        session.gui_session_token(),
+                        session.visible_epoch.load(Ordering::Acquire),
+                        Arc::clone(&session.visible_epoch),
+                    ))
                 }
             };
-            if let Some(token) = reveal {
-                if let Some(pending) = state
-                    .gui_show
-                    .take_pending_for_session(&token, std::time::Instant::now())
-                {
-                    match tx.try_send(outbound_gui_show(pending.clone())) {
-                        Ok(()) => mark_gui_session_visible(state, session_id).await,
-                        Err(_) => {
-                            // The queue is full or gone. Hold the show until
-                            // a slot accepts it, and stay hidden so a newer
-                            // navigation cannot land in front of that frame.
-                            let state = Arc::clone(state);
-                            let tx = tx.clone();
-                            let session_id = session_id.to_string();
-                            tokio::spawn(async move {
-                                let frame = outbound_gui_show(pending.clone());
-                                if tx.send(frame).await.is_ok() {
-                                    mark_gui_session_visible(&state, &session_id).await;
-                                } else {
-                                    state.gui_show.enqueue_pending(pending);
+            if let Some((token, epoch, epoch_cell)) = reveal {
+                let still_current = move || epoch_cell.load(Ordering::Acquire) == epoch;
+                if let Some(token) = token {
+                    if let Some(pending) = state
+                        .gui_show
+                        .take_pending_for_session(&token, std::time::Instant::now())
+                    {
+                        match tx.try_send(outbound_gui_show(pending.clone())) {
+                            Ok(()) => {
+                                if still_current() {
+                                    mark_gui_session_visible(state, session_id).await;
                                 }
-                            });
+                            }
+                            Err(_) => {
+                                // The queue is full or gone. Hold the show until
+                                // a slot accepts it, and stay hidden so a newer
+                                // navigation cannot land in front of that frame.
+                                let state = Arc::clone(state);
+                                let tx = tx.clone();
+                                let session_id = session_id.to_string();
+                                tokio::spawn(async move {
+                                    let frame = outbound_gui_show(pending.clone());
+                                    if tx.send(frame).await.is_ok() {
+                                        if still_current() {
+                                            mark_gui_session_visible(&state, &session_id).await;
+                                        }
+                                    } else {
+                                        state.gui_show.enqueue_pending(pending);
+                                    }
+                                });
+                            }
                         }
+                    } else if still_current() {
+                        mark_gui_session_visible(state, session_id).await;
                     }
-                } else {
-                    mark_gui_session_visible(state, session_id).await;
                 }
             }
         }
@@ -2478,6 +2499,7 @@ mod tests {
                 receives_direct: false,
                 visible_gui: visible_gui_flag(false),
                 gui_session_token: None,
+                visible_epoch: Arc::new(AtomicU64::new(0)),
                 topic_forwarders: HashMap::new(),
             },
         );
@@ -2733,6 +2755,72 @@ mod tests {
         .expect("visibility follows the queued show");
         assert!(visible);
         assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// WHY: a reveal that waits for a full queue must not mark the tab
+    /// visible after a newer hide. Otherwise later shows navigate a hidden tab.
+    #[tokio::test]
+    async fn delayed_reveal_does_not_undo_a_newer_hide() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "hide-while-full";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "hide-gui").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("hide-gui")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "hide-gui",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        handle_ws_command(
+            &state,
+            "hide-gui",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(matches!(rx.try_recv(), Ok(WsOutbound::Pong)));
+        match rx.recv().await.expect("opened show still queued") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
+            other => panic!("expected the preserved gui.show, got {other:?}"),
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            !state
+                .ws_sessions
+                .read()
+                .await
+                .get("hide-gui")
+                .expect("session")
+                .is_visible_gui(),
+            "a hide that arrived while the queue was full stays hidden"
+        );
     }
 
     /// Next frame, with a deadline: a missing frame is a FAILURE here, never
