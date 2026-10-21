@@ -3060,29 +3060,14 @@ impl OwnerSyncService {
         let Some(owner_hex) = self.owner_kp().map(|kp| hex::encode(kp.user_id().0)) else {
             return;
         };
-        let agent_hex = agent_hex.to_string();
-        let cert_digest = cert_digest.to_string();
-        tokio::spawn(async move {
-            let existing = crate::profile::IssuedCertRecord::load(&path).await;
-            // Already local, unless the local line lacks the expiry the
-            // synced value carries (a line written before #1542); the new line
-            // then supplies it (see `latest_journal_values`).
-            if existing.iter().any(|r| {
-                r.agent_id == agent_hex
-                    && r.cert_digest == cert_digest
-                    && (r.not_after.is_some() || not_after.is_none())
-            }) {
-                return;
-            }
-            let record =
-                synced_journal_line(owner_hex, agent_hex, cert_digest, issued_at, not_after);
-            if let Err(e) = crate::profile::IssuedCertRecord::append(&path, &record).await {
-                tracing::warn!(
-                    target: "x0x::owner_sync",
-                    "failed to append synced journal line: {e}"
-                );
-            }
-        });
+        tokio::spawn(append_synced_journal_line(
+            path,
+            owner_hex,
+            agent_hex.to_string(),
+            cert_digest.to_string(),
+            issued_at,
+            not_after,
+        ));
     }
 
     /// Spawn the periodic + on-change pass loop (owned by the daemon's
@@ -3102,6 +3087,36 @@ impl OwnerSyncService {
             }
             self.sync_all().await;
         }
+    }
+}
+
+/// Append the synced journal line to the local journal file when this
+/// device needs it (body of [`OwnerSyncService::apply_journal_line`]).
+async fn append_synced_journal_line(
+    path: PathBuf,
+    owner_hex: String,
+    agent_hex: String,
+    cert_digest: String,
+    issued_at: u64,
+    not_after: Option<u64>,
+) {
+    let existing = crate::profile::IssuedCertRecord::load(&path).await;
+    // Already local, unless the local line lacks the expiry the synced
+    // value carries (a line written before #1542); the new line then
+    // supplies it (see `latest_journal_values`).
+    if existing.iter().any(|r| {
+        r.agent_id == agent_hex
+            && r.cert_digest == cert_digest
+            && (r.not_after.is_some() || not_after.is_none())
+    }) {
+        return;
+    }
+    let record = synced_journal_line(owner_hex, agent_hex, cert_digest, issued_at, not_after);
+    if let Err(e) = crate::profile::IssuedCertRecord::append(&path, &record).await {
+        tracing::warn!(
+            target: "x0x::owner_sync",
+            "failed to append synced journal line: {e}"
+        );
     }
 }
 
@@ -3999,6 +4014,70 @@ mod tests {
         .expect("owner sync service");
         agent.install_owner_device_store(Arc::clone(service.store()));
         (agent, service)
+    }
+
+    /// #1542 (Codex review of #1545): repairing an older certificate's
+    /// line must not hide a newer issuance. The owner roster reads the
+    /// journal's last line per agent, so a synced line for an older digest
+    /// appended after a renewal rolled the roster back to the older
+    /// certificate, its expiry, mode and label.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_synced_line_never_replaces_a_newer_issuance_in_the_roster() {
+        install_loopback_socket_boundary();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x85; 32];
+        let (agent, _service) = live_owner_device(dir.path(), "alice", seed).await;
+        let journal = agent
+            .cert_journal_path()
+            .expect("journal path")
+            .to_path_buf();
+        let owner_hex = hex::encode(UserKeypair::from_seed(&seed).expect("owner").user_id().0);
+        let target = "b".repeat(64);
+        let line = |digest: &str, issued_at, not_after, label: Option<&str>| {
+            crate::profile::IssuedCertRecord {
+                user_id: owner_hex.clone(),
+                agent_id: target.clone(),
+                cert_digest: digest.to_string(),
+                issued_at,
+                not_after,
+                mode: crate::profile::CertMode::Acp,
+                label: label.map(str::to_string),
+                cert_b64: None,
+            }
+        };
+        // A pre-fix synced line for d1 (no expiry), then the renewal d2.
+        for record in [
+            line("d1", 100, None, None),
+            line("d2", 200, Some(9_000), Some("renewed")),
+        ] {
+            crate::profile::IssuedCertRecord::append(&journal, &record)
+                .await
+                .expect("append");
+        }
+        // A late sync of d1 that carries its expiry arrives.
+        append_synced_journal_line(
+            journal.clone(),
+            owner_hex.clone(),
+            target.clone(),
+            "d1".to_string(),
+            100,
+            Some(5_000),
+        )
+        .await;
+        let roster = agent.owner_issued_certificates().await;
+        let entry = roster
+            .iter()
+            .find(|cert| cert.agent_id == target)
+            .expect("roster entry");
+        assert_eq!(
+            (
+                entry.digest.as_str(),
+                entry.not_after,
+                entry.label.as_deref()
+            ),
+            ("d2", Some(9_000), Some("renewed")),
+            "the newest issuance stays in the roster"
+        );
     }
 
     async fn loopback_addr(agent: &crate::Agent) -> std::net::SocketAddr {
