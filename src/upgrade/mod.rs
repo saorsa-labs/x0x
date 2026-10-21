@@ -21,6 +21,7 @@ pub mod rollout;
 pub mod signature;
 pub(crate) mod staging;
 pub(crate) mod staging_runtime;
+pub(crate) mod staging_selection;
 pub mod verification_probe;
 
 #[cfg(unix)]

@@ -30,13 +30,33 @@ type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + 
 async fn inspect_probe_admission(
     install: PathBuf,
     version: String,
-    staged: bool,
+    staging: Option<(super::staging_runtime::Gate, restart::RestartPlan)>,
 ) -> Result<super::probe::Admission, UpgradeError> {
+    if let Some((gate, plan)) = staging {
+        return run_owned_blocking(move |caller_alive| {
+            let _lock = super::acquire_host_upgrade_lock(&install)?;
+            let check_custody = || {
+                if caller_alive.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(UpgradeError::Other(
+                        "staging probe admission cancelled before record I/O".into(),
+                    ))
+                }
+            };
+            check_custody()?;
+            ensure_canonical_install(&install)?;
+            // Selection or refusal evidence can change after the first gate
+            // releases its lock. Recheck before probe inspection can write.
+            gate.check_apply_policy(&install, &plan)?;
+            check_custody()?;
+            super::probe::inspect_admission(&install, &version)
+                .map_err(|error| UpgradeError::Other(error.to_string()))
+        })
+        .await;
+    }
     tokio::task::spawn_blocking(move || {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
-        if staged {
-            ensure_canonical_install(&install)?;
-        }
         super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))
     })
@@ -832,12 +852,16 @@ impl AutoApplyUpgrader {
                 gate.require_due(&install, &staging_plan)
             })
             .await?;
+            #[cfg(test)]
+            pre_probe_admission_seam::run(&target_path);
         }
         #[cfg(unix)]
         if let super::probe::Admission::Waiting { retry_after } = inspect_probe_admission(
             target_path.clone(),
             manifest.version.clone(),
-            self.staging.is_some(),
+            self.staging
+                .clone()
+                .map(|gate| (gate, restart_plan.clone())),
         )
         .await?
         {
@@ -1226,6 +1250,53 @@ pub(crate) mod current_binary_path_seam {
 
     pub(super) fn observation() -> Option<PathBuf> {
         OBSERVATION.with(|slot| slot.borrow().clone())
+    }
+}
+
+/// Observe the actual gap between staged admission and the separate probe
+/// lock. The hook changes no input and runs after the first lock is released.
+#[cfg(all(test, unix))]
+pub(crate) mod pre_probe_admission_seam {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{LazyLock, Mutex},
+    };
+
+    type Hook = Box<dyn FnOnce(&Path) + Send>;
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct Guard {
+        target: PathBuf,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.remove(&self.target);
+            }
+        }
+    }
+
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        let mut hooks = HOOKS.lock().expect("probe admission seam poisoned");
+        assert!(
+            !hooks.contains_key(&target),
+            "probe admission seam already installed"
+        );
+        hooks.insert(target.clone(), hook);
+        Guard { target }
+    }
+
+    pub(super) fn run(target: &Path) {
+        let hook = HOOKS
+            .lock()
+            .expect("probe admission seam poisoned")
+            .remove(target);
+        if let Some(hook) = hook {
+            hook(target);
+        }
     }
 }
 

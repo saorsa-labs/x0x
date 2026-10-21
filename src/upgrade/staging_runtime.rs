@@ -59,6 +59,29 @@ impl Gate {
         self.checked_request(install, policy).map(|_| ())
     }
 
+    /// Recheck refusal evidence under the separate probe-preflight lock using
+    /// the actual captured restart plan. This does not acknowledge a receipt
+    /// or require its delay to be due.
+    pub fn check_apply_policy(
+        &self,
+        install: &Path,
+        plan: &restart::RestartPlan,
+    ) -> Result<(), UpgradeError> {
+        self.checked_request(install, self.apply_policy(install, plan)?)
+            .map(|_| ())
+    }
+
+    fn apply_policy(
+        &self,
+        install: &Path,
+        plan: &restart::RestartPlan,
+    ) -> Result<fleet_policy::WindowPolicy, UpgradeError> {
+        self.check_install(install)?;
+        self.check_data_root(&plan.data_root)?;
+        fleet_policy::effective_window(self.request.window_minutes, install, plan)
+            .map_err(|error| UpgradeError::Other(error.to_string()))
+    }
+
     fn check_install(&self, install: &Path) -> Result<(), UpgradeError> {
         if std::fs::canonicalize(install).map_err(|error| UpgradeError::Other(error.to_string()))?
             != self.request.install
@@ -87,6 +110,8 @@ impl Gate {
         self.check_install(install)?;
         let mut request = self.request.clone();
         request.window_minutes = policy.window_minutes;
+        // A stale waiter must refuse before any receipt or probe-state write.
+        super::staging_selection::check_request(&request).map_err(error)?;
         // This read MUST precede observe: observing even a due receipt writes
         // an acknowledged clock tick. Preserve an older undersized receipt
         // byte-for-byte instead of resetting its first-receipt history.
@@ -135,7 +160,8 @@ impl Gate {
             probe::Admission::Ready => Duration::ZERO,
             probe::Admission::Waiting { retry_after } => retry_after,
         };
-        let decision = staging::observe(&request, clock).map_err(error)?;
+        let decision =
+            super::staging_selection::observe_selected(&request, clock).map_err(error)?;
         let remaining = match decision {
             staging::Decision::Due => retry,
             staging::Decision::Waiting(wait) => wait.max(retry),
@@ -152,10 +178,7 @@ impl Gate {
         install: &Path,
         plan: &restart::RestartPlan,
     ) -> Result<(), UpgradeError> {
-        self.check_install(install)?;
-        self.check_data_root(&plan.data_root)?;
-        let policy = fleet_policy::effective_window(self.request.window_minutes, install, plan)
-            .map_err(|error| UpgradeError::Other(error.to_string()))?;
+        let policy = self.apply_policy(install, plan)?;
         let clock = self
             .clock()
             .map_err(|error| UpgradeError::Other(error.to_string()))?;
