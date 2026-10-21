@@ -2386,8 +2386,10 @@ mod tests {
                 cgroup: "0::/system.slice/x0xd.service".to_string(),
                 invocation_id: Some(SEAM_INVOCATION_ID.to_string()),
                 calls: vec![
-                    // Staging identity and the first apply each observe the
-                    // same still-pending activation; only the retry ages out.
+                    // Unix staging identity and the first apply each observe
+                    // the pending activation; only the retry ages out. Other
+                    // platforms enter the apply path without staging readback.
+                    #[cfg(unix)]
                     restart::systemd_readback_seam::ReadbackCall {
                         show_output: show_for_this_process("10s", "5", 1_000_000),
                         monotonic_now_us: 3_000_000,
