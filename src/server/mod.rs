@@ -1887,7 +1887,7 @@ pub async fn serve_with_options(
                 Some(submit)
             }
             Err(error) => {
-                tracing::warn!(%error, "Background upgrade staging identity is unavailable");
+                tracing::warn!(%error, "Background upgrade apply disabled: staging identity is unavailable; release discovery remains enabled");
                 None
             }
         }

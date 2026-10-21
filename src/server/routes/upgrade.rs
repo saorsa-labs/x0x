@@ -678,7 +678,7 @@ impl BackgroundRuntime {
     pub(in crate::server) fn spawn_source<F>(
         enabled: bool,
         submit: Option<BackgroundSubmit>,
-        source: impl FnOnce(BackgroundSubmit) -> F,
+        source: impl FnOnce(Option<BackgroundSubmit>) -> F,
     ) -> Option<tokio::task::JoinHandle<()>>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -686,7 +686,8 @@ impl BackgroundRuntime {
         if !enabled {
             return None;
         }
-        submit.map(|submit| tokio::spawn(source(submit)))
+        // Missing apply authority must not disable configured release relay.
+        Some(tokio::spawn(source(submit)))
     }
 }
 
@@ -1033,7 +1034,7 @@ fn background_staging_request(
 /// signed bytes; the shared owner alone performs the potentially long wait.
 pub(in crate::server) async fn run_gossip_update_listener(
     agent: Arc<Agent>,
-    submit: BackgroundSubmit,
+    submit: Option<BackgroundSubmit>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -1096,7 +1097,7 @@ fn verify_gossip_release(payload: &[u8]) -> Option<VerifiedRelease> {
 /// release input and network publication, leaving dedup and submission intact.
 async fn run_gossip_update_driver<S, Publish, PublishFuture>(
     releases: S,
-    submit: BackgroundSubmit,
+    submit: impl Into<Option<BackgroundSubmit>>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     mut publish: Publish,
     mut shutdown: watch::Receiver<bool>,
@@ -1105,6 +1106,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
     Publish: FnMut(Vec<u8>) -> PublishFuture,
     PublishFuture: Future<Output = Result<(), String>>,
 {
+    let submit = submit.into();
     futures::pin_mut!(releases);
     let mut rebroadcasted = HashMap::new();
     loop {
@@ -1143,7 +1145,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
                 _ = shutdown.changed() => return,
             }
         }
-        if let Err(error) = submit.submit(verified) {
+        if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
             tracing::warn!(%error, "Gossip release was not queued");
         }
     }
@@ -1152,7 +1154,7 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
 pub(in crate::server) async fn run_fallback_github_poll(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
-    submit: BackgroundSubmit,
+    submit: Option<BackgroundSubmit>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     shutdown: watch::Receiver<bool>,
 ) {
@@ -1202,7 +1204,7 @@ pub(in crate::server) async fn run_fallback_github_poll(
 async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFuture>(
     ticks: S,
     mut check: Check,
-    submit: BackgroundSubmit,
+    submit: impl Into<Option<BackgroundSubmit>>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
     mut publish: Publish,
     mut shutdown: watch::Receiver<bool>,
@@ -1213,6 +1215,7 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
     Publish: FnMut(Vec<u8>) -> PublishFuture,
     PublishFuture: Future<Output = Result<(), String>>,
 {
+    let submit = submit.into();
     futures::pin_mut!(ticks);
     loop {
         if *shutdown.borrow() || shutdown.has_changed().is_err() {
@@ -1234,7 +1237,10 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
                 continue;
             }
         };
-        if submit.in_retry_backoff(&verified) {
+        if let Some(submit) = submit
+            .as_ref()
+            .filter(|submit| submit.in_retry_backoff(&verified))
+        {
             if let Err(error) = submit.submit(verified) {
                 tracing::warn!(%error, "Fallback release backoff could not be observed");
             }
@@ -1250,7 +1256,7 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
             }
             _ = shutdown.changed() => return,
         }
-        if let Err(error) = submit.submit(verified) {
+        if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
             tracing::warn!(%error, "Fallback release was not queued");
         }
     }
