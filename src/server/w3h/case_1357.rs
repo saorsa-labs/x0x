@@ -690,6 +690,40 @@ async fn settled(
     .await
 }
 
+/// Every label in `holders` can resolve `member_hex`'s TreeKEM KeyPackage
+/// for a removal without the network (the remove route's lookup). Bounded
+/// by [`SETUP`]; a timeout is an error, so the arm is INFRA.
+async fn key_packages_held(
+    sim: &Sim,
+    holders: &[&'static str],
+    group: &str,
+    member_hex: &str,
+) -> Result<()> {
+    if holders.is_empty() {
+        return Ok(());
+    }
+    sim.until(
+        "every promoted admin holds B's authority-signed KeyPackage",
+        SETUP,
+        async |s: &Sim| {
+            for holder in holders {
+                let Ok(state) = s.state(holder) else {
+                    return false;
+                };
+                if !crate::server::routes::named_groups::holds_member_key_package_for_removal(
+                    &state, group, member_hex,
+                )
+                .await
+                {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await
+}
+
 /// Whether `label` holds a revocation record whose subject is `subject_hex`.
 async fn holds_revocation(sim: &Sim, label: &str, subject_hex: &str) -> Result<bool> {
     let (status, body) = sim
@@ -1252,6 +1286,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         ),
         Err(error) => ((false, error.clone()), (false, error.clone())),
     };
+    // B's authority-signed KeyPackage reaches the other admins only by A's
+    // one direct message after B's seat (its resend is 8 s later, after A
+    // is held). So, before any hold or trigger, every promoted admin (a
+    // possible author of B's removal while A is away) must hold it by the
+    // remove route's own lookup. A miss here is INFRA, not the S4 path.
+    key_packages_held(sim, arm.promoted, &group, &b_hex).await?;
     if arm.hold == Hold::Offline {
         sim.set_online("A", false)?;
     }

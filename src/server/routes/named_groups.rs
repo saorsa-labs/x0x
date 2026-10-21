@@ -9775,6 +9775,48 @@ async fn recover_member_treekem_key_package(
     recover_member_treekem_key_package_locked(state, group_id, member_agent_id).await
 }
 
+/// W3-H (#1357, test builds only): whether this node can resolve
+/// `member_agent_id`'s TreeKEM KeyPackage for a removal with no network
+/// step, by the lookup [`resolve_member_treekem_kp_for_removal_locked`]
+/// uses: the roster's current package, or a cached authority-attested
+/// `MemberJoined` that the recovery would install. Read-only.
+#[cfg(test)]
+pub(in crate::server) async fn holds_member_key_package_for_removal(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+) -> bool {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == group_id)
+            })
+            .cloned()
+    };
+    let Some(info) = info else {
+        return false;
+    };
+    let Some(member) = info.members_v2.get(member_agent_id) else {
+        return false;
+    };
+    if current_member_treekem_key_package(member).is_some() {
+        return true;
+    }
+    if member.state == x0x::groups::GroupMemberState::Removed {
+        return false;
+    }
+    let key = join_result_key(group_id, member_agent_id);
+    state
+        .treekem_member_key_packages
+        .get(&key)
+        .await
+        .is_some_and(|event| verify_authority_attested_member_joined_recovery(&info, &event))
+}
+
 async fn recover_member_treekem_key_package_locked(
     state: &Arc<AppState>,
     group_id: &str,
