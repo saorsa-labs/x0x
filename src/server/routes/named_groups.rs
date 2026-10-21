@@ -13193,6 +13193,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 roster_lock_already_held,
                             )
                             .await;
+                            // ADR 0109 §2: a capable pre-Welcome joiner
+                            // keeps its walk-valid served chain and refused
+                            // terminal in the S3 sidecar, so a later ATA
+                            // can apply them (rule (b)).
+                            if !anchored_gap
+                                && !adopt_chain.is_empty()
+                                && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                            {
+                                group_recovery::keep_served_chain(
+                                    state,
+                                    &current,
+                                    &commit,
+                                    &adopt_chain,
+                                    &event_for_log,
+                                )
+                                .await;
+                            }
                             // Convergence only for the v2 owner-anchored
                             // stale-base gap: the frontier gate above missed
                             // it (the
