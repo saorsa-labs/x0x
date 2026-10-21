@@ -2196,14 +2196,27 @@ pub(super) async fn apply_join_carry(
         tracing::info!(group_id = %LogHexId::group(&group_key), armed_from, "ADR 0109 S3: provisional signer verified by its promotion path in the served chain");
     }
     let segment_links = ata.fields.sequence.len().min(chain.len());
-    for link in chain.iter().take(segment_links) {
+    let mut applied_links = 0usize;
+    for (index, link) in chain.iter().take(segment_links).enumerate() {
+        // §2: past the promotion prefix, each link needs the signer's
+        // Active admin seat on the record the earlier links left.
+        if index >= armed_from && !attested_link_admitted(ata, &next, &link.commit) {
+            tracing::info!(group_id = %LogHexId::group(&group_key), revision = link.commit.revision, "ADR 0109 S3: the signer has no Active admin seat after the applied links; the rest of the batch is refused");
+            break;
+        }
         match s3::apply_link_state_only(&next, link) {
-            Ok(applied) => next = applied,
+            Ok(applied) => {
+                next = applied;
+                applied_links += 1;
+            }
             Err(reason) => {
                 tracing::info!(group_id = %LogHexId::group(&group_key), reason, revision = link.commit.revision, "ADR 0109 S3: attested link refused");
                 return false;
             }
         }
+    }
+    if applied_links == 0 {
+        return false;
     }
     // Keep the served chain, the ATA and the terminal event beside the
     // record (§4). The event is what a later segment replays when this
@@ -2256,6 +2269,54 @@ pub(super) async fn apply_join_carry(
         "ADR 0109 S3: stale-base join catching up under an admin terminal attestation"
     );
     true
+}
+
+/// ADR 0109 §2 per-link signer eligibility, the one check that the join
+/// carry and the catch-up page path both use: "If the signer stops being
+/// an active admin after an applied link, the gate stops there". `current`
+/// is the record after the links applied so far. `link` may apply only
+/// while the signer is an Active admin on `current` and `link` is the next
+/// hash of the ATA's sequence after the head.
+fn attested_link_admitted(
+    ata: &AdminTerminalAttestation,
+    current: &GroupInfo,
+    link: &GroupStateCommit,
+) -> bool {
+    // A signer without the seat gets only the links already applied, so
+    // no next hash is in the gate sequence.
+    let Some(sequence) = s3::armed_gate_sequence(ata, current) else {
+        return false;
+    };
+    let next = if current.state_hash == ata.fields.from_state_hash {
+        0
+    } else {
+        match sequence.iter().position(|hash| *hash == current.state_hash) {
+            Some(at) => at + 1,
+            None => return false,
+        }
+    };
+    sequence.get(next) == Some(&link.state_hash)
+}
+
+/// The catch-up page side of [`attested_link_admitted`]: before each
+/// commit of a page that the admin-armed gate admitted, read the record
+/// that the earlier commits left and check the armed ATA on it again. The
+/// page gate is checked once for the page; this check is per commit.
+pub(super) async fn armed_page_link_admitted(
+    state: &AppState,
+    group_id: &str,
+    link: &GroupStateCommit,
+) -> bool {
+    let Some(group_key) = super::resolve_named_group_storage_key(state, group_id).await else {
+        return false;
+    };
+    let Some(current) = state.named_groups.read().await.get(&group_key).cloned() else {
+        return false;
+    };
+    let Some(ata) = armed_admin_ata(state, &current).await else {
+        return false;
+    };
+    attested_link_admitted(&ata, &current, link)
 }
 
 /// §2: keep a pre-Welcome joiner's walk-valid served chain and its refused
@@ -2460,7 +2521,8 @@ async fn live_refs(state: &AppState, info: &GroupInfo) -> Vec<RecoveryRef> {
 
 /// Retire the admin-armed ATA once its exact segment terminal is durably
 /// applied (§2 "Retirement"), with the S3 state that went with it. A
-/// marker's retirement never touches it, and it never touches a marker.
+/// marker's retirement never touches it. It never clears a marker itself:
+/// a marker that retires under this ATA retires first, by its own rule.
 pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
     let Some(group_key) = super::resolve_named_group_storage_key(state, group_id).await else {
         return;
@@ -2502,6 +2564,15 @@ pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
                 reason: "segment_exhausted".to_string(),
             };
         }
+        return;
+    }
+    // §2 "Retirement": the marker's retirement needs the ATA, so a
+    // matching marker retires first, durably. When it does not, the ATA
+    // stays and the worker tries again. A crash after the marker retires
+    // keeps the ATA (its head is on the sequence), and the next pass
+    // retires it here. A sibling marker does not match and is untouched.
+    if marker_retires_under(&info, &ata) && !retire_marker_attested(state, &group_key, &info).await
+    {
         return;
     }
     if !update_sidecar(state, &stable, |body| {
@@ -2761,21 +2832,14 @@ async fn retire_marker_attested(state: &Arc<AppState>, group_key: &str, info: &G
     let Some(ata) = body.active_ata else {
         return false;
     };
-    let applied = info.commit_log.iter().any(|entry| {
-        entry.commit.revision == marker.revision
-            && entry.commit.state_hash == marker.state_hash
-            && entry
-                .commit
-                .committed_by
-                .eq_ignore_ascii_case(&marker.committed_by)
-    }) && ata.fields.sequence.contains(&marker.state_hash)
-        && ata.signer_verified_on(info);
-    if !applied {
+    if !marker_retires_under(info, &ata) {
         return false;
     }
     let identity = RecoveryRef::from_marker(marker);
     let key = group_key.to_string();
-    let outcome = super::persist_named_groups_quarantine_clear_gated(state, move |groups| {
+    // ADR 0109 §4: S3 publishes only a Durable write. A not-durable write
+    // keeps the marker live, and the worker retries.
+    let outcome = super::persist_named_groups_quarantine_clear_durable_only(state, move |groups| {
         let Some(info) = crate::server::resolve_group_entry_mut_locked(groups, &key) else {
             return false;
         };
@@ -2800,6 +2864,24 @@ async fn retire_marker_attested(state: &Arc<AppState>, group_key: &str, info: &G
         "ADR 0109 S3: marker retired (attested_catchup): its evidenced commit applied under a verified ATA"
     );
     true
+}
+
+/// §2 "Retirement": `info`'s marker retires under `ata`. Its evidenced
+/// commit `(revision, state_hash, committed_by)` is applied, on the ATA's
+/// sequence, and the signer is verified.
+fn marker_retires_under(info: &GroupInfo, ata: &AdminTerminalAttestation) -> bool {
+    let Some(marker) = info.fork_quarantine.as_ref() else {
+        return false;
+    };
+    info.commit_log.iter().any(|entry| {
+        entry.commit.revision == marker.revision
+            && entry.commit.state_hash == marker.state_hash
+            && entry
+                .commit
+                .committed_by
+                .eq_ignore_ascii_case(&marker.committed_by)
+    }) && ata.fields.sequence.contains(&marker.state_hash)
+        && ata.signer_verified_on(info)
 }
 
 /// Decide whether this node asks now, and whom (§2 "Requests").
