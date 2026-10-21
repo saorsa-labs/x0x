@@ -12,8 +12,9 @@
 //! - Default = [`acl::ConnectPolicy::Disabled`] (default-deny for embedders).
 //! - Targets are **loopback only** (`127.0.0.0/8`, `::1`) and **numeric IP
 //!   only** (no `localhost`); enforced at load time as a hard error.
-//! - Matching is **exact** `(agent, machine, SocketAddr)` triples — no ranges,
-//!   no CIDR. `127.0.0.1:22` does not grant `\[::1\]:22`.
+//! - Matching is **exact** `(agent, machine, SocketAddr)` for pair/grant entries.
+//!   `principal = "owner"` may list loopback port ranges (ADR-0074 Q4). No CIDR.
+//!   `127.0.0.1:22` does not grant `\[::1\]:22`.
 //! - [`LoadMode`] is **reused** from `exec::acl` so the
 //!   missing-at-default-vs-explicit semantics stay bit-identical forever.
 
@@ -25,8 +26,9 @@ pub use crate::exec::acl::LoadMode;
 pub use acl::{
     compose_connect_policy, connect_reload_compatible, default_connect_acl_path,
     default_connect_acl_path_for, is_loopback, load_connect_policy, parse_connect_policy,
-    parse_target, validate_connect_entry_spec, ConnectAcl, ConnectAclEntrySpec, ConnectAclError,
-    ConnectAclSummary, ConnectAllowEntry, ConnectOwnerEntry, ConnectPolicy,
+    parse_owner_target, parse_target, validate_connect_entry_spec, ConnectAcl, ConnectAclEntrySpec,
+    ConnectAclError, ConnectAclSummary, ConnectAllowEntry, ConnectOwnerEntry, ConnectPolicy,
+    OwnerTarget,
 };
 pub use diagnostics::{ConnectDiagnostics, ConnectDiagnosticsSnapshot};
 pub use gate::{
