@@ -9085,6 +9085,115 @@ mod cancellation_tests {
             "the late rename of a cancelled unenroll must not lose a later tombstone: {replay:?}"
         );
     }
+
+    /// Codex review of #1545 (17e0dae3), P2: a session commit from
+    /// machine 2 is cancelled during the rename of the register. Its
+    /// revocation read guard must stay held until the rename lands, as
+    /// for a commit that is not cancelled (#1055 RC2). Otherwise a
+    /// revocation of machine 2 completes first, and the commit of the
+    /// revoked machine lands after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_commit_cancelled_during_its_rename_holds_off_a_revocation() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let alice = remote_profile(&dir.path().join("remote"), &owner, "Alice").await;
+        let local = Arc::new(
+            OwnerSyncStore::load(&dir.path().join("local"))
+                .await
+                .expect("store"),
+        );
+        local
+            .enroll(OwnerEnrollment::sign(machine(2), &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("enroll machine 2");
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+
+        let (reached, release) = hold_rename(&local.dir.join(RECORDS_FILE));
+        let commit = {
+            let (local, revocations) = (Arc::clone(&local), Arc::clone(&revocations));
+            let owner_id = owner.user_id();
+            tokio::spawn(async move {
+                let peer = machine(2);
+                let admission = SessionAdmission {
+                    store: &local,
+                    revocations: Some(revocations.as_ref()),
+                    owner: &owner_id,
+                    peer: &peer,
+                };
+                local.commit_session_batch(vec![alice], &admission).await
+            })
+        };
+        cancel_at_rename(reached, commit).await;
+        assert!(
+            revocations.try_write().is_err(),
+            "a revocation must wait while the cancelled commit can still land"
+        );
+        release.send(()).expect("release the held rename");
+        let _revoking = tokio::time::timeout(Duration::from_secs(10), revocations.write())
+            .await
+            .expect("the revocation proceeds once the commit has landed");
+        assert_eq!(
+            local.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(profile("Alice")),
+            "the commit landed before the revocation"
+        );
+    }
+
+    /// Codex review of #1545 (17e0dae3), P2 class: a register write stops
+    /// after its rename and before its directory fsync, so `New` is
+    /// visible but not durable. A restart loads `New` and can act on it
+    /// (a journal recovery removes its intent, a settle removes an
+    /// obligation). The load must make what it read durable first, or a
+    /// later host crash brings back `Old` under those actions.
+    #[tokio::test]
+    async fn a_restart_makes_the_state_it_loads_durable() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join(SYNC_DIR).join(RECORDS_FILE);
+        let mint = |human: &'static str| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                let store = OwnerSyncStore::load(&dir).await.expect("store");
+                store
+                    .mint(
+                        SyncKind::OwnerProfile,
+                        "owner",
+                        &profile(human),
+                        &owner_kp(7),
+                        machine(1),
+                    )
+                    .await
+                    .expect("mint");
+            }
+        };
+        mint("Old").await;
+        let old = std::fs::read(&path).expect("old register");
+        mint("New").await;
+        let new = std::fs::read(&path).expect("new register");
+        // Model the stop: only `Old` is durable, `New` is visible.
+        std::fs::write(&path, &old).expect("write old");
+        crate::profile::crash_sim::note_durable(&path);
+        std::fs::write(&path, &new).expect("write new");
+
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert_eq!(
+            restarted
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("New"))
+        );
+        drop(restarted);
+        crate::profile::crash_sim::crash(&[&path]);
+        let after_crash = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        assert_eq!(
+            after_crash
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("New")),
+            "a host crash must not take back the register that a restart loaded"
+        );
+    }
 }
 
 /// #1055 (ADR 0084 findings 3–4): unenroll must leave a durable tombstone

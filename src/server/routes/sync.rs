@@ -1255,6 +1255,50 @@ mod tests {
         assert_keeps(&state, "Carol", "after a restart").await;
     }
 
+    /// Codex review of #1545 (17e0dae3), P2: with `Alice` owed, `PUT
+    /// /profile` saves `Bob`, and the process stops after the rename and
+    /// before the directory fsync: `Bob` is visible, not durable, and
+    /// `Alice` stays owed. The restart loads `Bob` and settles `Alice`
+    /// durably. A host crash then brings back `Old`. The restart after it
+    /// must not publish `Old` over the synced name.
+    #[tokio::test]
+    async fn a_crash_after_a_restart_that_settled_a_visible_save_keeps_the_save() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x8F; 32];
+        let (pending_path, profile_path) = {
+            let state = state_owing_alice(dir.path(), seed).await;
+            let service = state.owner_sync.as_ref().expect("owned state wires sync");
+            let old = std::fs::read(&state.profile_path).expect("old profile");
+            service.store().fail_next_discharge();
+            assert_eq!(put_name(&state, "Bob").await, StatusCode::OK);
+            // Model the stop: only `Old` is durable, `Bob` is visible.
+            let bob = std::fs::read(&state.profile_path).expect("bob profile");
+            std::fs::write(&state.profile_path, &old).expect("write old");
+            crate::profile::crash_sim::note_durable(&state.profile_path);
+            std::fs::write(&state.profile_path, &bob).expect("write bob");
+            (
+                service.store().pending_applies_path(),
+                state.profile_path.clone(),
+            )
+        };
+        {
+            let state = owned_state(dir.path(), seed)
+                .await
+                .expect("restarted state");
+            let service = state.owner_sync.as_ref().expect("owned state wires sync");
+            DaemonView::attach(service, &state).await;
+        }
+        crate::profile::crash_sim::crash(&[&pending_path, &profile_path]);
+
+        let state = owned_state(dir.path(), seed)
+            .await
+            .expect("restarted state");
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        DaemonView::attach(service, &state).await;
+        service.sync_all().await;
+        assert_keeps(&state, "Bob", "after the second restart").await;
+    }
+
     /// Codex review of #1545 (0f55c78), P2: the reconcile reads the live
     /// name `Old` and finds no owed names; a session then commits `Alice`
     /// before the reconcile mints. The mint must not put `Old` over
