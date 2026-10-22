@@ -139,6 +139,8 @@ struct S4Inner {
     budgets: HashMap<EvictionKey, RowBudget>,
     /// The revocation-set generation at the last full reconciliation.
     reconciled_generation: Option<u64>,
+    /// [`revocation_seats`] at the last full reconciliation.
+    reconciled_seats: Option<[u8; 32]>,
     /// The `.evs` file was read (or found absent) at startup.
     loaded: bool,
     sidecar: SidecarStatus,
@@ -799,9 +801,10 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
 
 /// One worker pass: intake, scan, reconcile, evaluate. It never commits.
 pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
-    let revocations = collect_verified_agent_revocations(state).await;
     let groups = snapshot_groups(state).await;
     let leaves = snapshot_retained_leaves(state, &groups).await;
+    let revocations =
+        collect_verified_agent_revocations(state, revocation_seats(&groups, &leaves)).await;
     let revoked_admins = revoked_admins_in(state, &groups).await;
     // §2: the open higher-head evidence of each group, read before the S4
     // state lock (lock order: never hold it across these reads).
@@ -1112,15 +1115,34 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         let changed_designation = designation.as_ref().is_some_and(|designation| {
             row.designated != Some(designation.designated) || row.ranks != designation.ranks
         });
+        // §2 (L175, L194; #1508 r7, Codex P2 6): the consumed budget is
+        // written while it still gates a fallback rank, so a restart
+        // resumes it and cannot extend the window. One stagger past the
+        // last rank's offset (and past the completion bound) it gates
+        // nothing more, so a long wait does not rewrite the sidecar on
+        // every tick.
+        let ranks = designation
+            .as_ref()
+            .map_or(row.ranks.len(), |designation| designation.ranks.len());
+        let budget_cap = s4::duration_ms(
+            runtime
+                .timing
+                .fallback_offset(ranks.saturating_add(1))
+                .max(runtime.timing.completion_bound),
+        );
+        let mut budget_moved = false;
         if let Some(row) = inner.store.get_mut(&key) {
-            row.elapsed_budget_ms = s4::duration_ms(elapsed);
+            let elapsed_ms = s4::duration_ms(elapsed);
+            budget_moved =
+                elapsed_ms != row.elapsed_budget_ms && row.elapsed_budget_ms < budget_cap;
+            row.elapsed_budget_ms = elapsed_ms;
             row.boot_id = boot_id;
             if let Some(designation) = &designation {
                 row.designated = Some(designation.designated);
                 row.ranks = designation.ranks.clone();
             }
         }
-        if changed_designation {
+        if changed_designation || budget_moved {
             inner.dirty = true;
         }
         inner.store.set_waiting(&key, evaluation.waiting.clone());
@@ -1158,7 +1180,16 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
 /// Drain the intake queue and, when needed, rescan the whole revocation
 /// set. Only records that this node's own set holds are kept: the hook
 /// already verified them, and the check guards against a stale queue.
-async fn collect_verified_agent_revocations(state: &AppState) -> Vec<VerifiedAgentRevocation> {
+///
+/// `seats` is [`revocation_seats`] of this pass's snapshot. §1 (#1508 r7,
+/// Codex P1 4): a revocation creates work only where its target has a
+/// seat or a retained leaf, so a record consumed before a delayed
+/// `MemberAdded` or a catch-up seats its target must be read again when
+/// the seats change, although the set's generation did not.
+async fn collect_verified_agent_revocations(
+    state: &AppState,
+    seats: [u8; 32],
+) -> Vec<VerifiedAgentRevocation> {
     let intake = state.agent.s4_revocation_intake();
     let (mut items, reconcile_all) = intake.drain();
     let revocation_set = state.agent.revocation_set();
@@ -1166,7 +1197,9 @@ async fn collect_verified_agent_revocations(state: &AppState) -> Vec<VerifiedAge
     let generation = set.generation();
     let full = {
         let inner = state.revocation_evictions.inner.lock().await;
-        reconcile_all || inner.reconciled_generation != Some(generation)
+        reconcile_all
+            || inner.reconciled_generation != Some(generation)
+            || inner.reconciled_seats != Some(seats)
     };
     if full {
         for record in set.all_records() {
@@ -1183,14 +1216,45 @@ async fn collect_verified_agent_revocations(state: &AppState) -> Vec<VerifiedAge
     items.retain(|item| set.contains_hash(&item.record_hash));
     drop(set);
     if full {
-        state
-            .revocation_evictions
-            .inner
-            .lock()
-            .await
-            .reconciled_generation = Some(generation);
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner.reconciled_generation = Some(generation);
+        inner.reconciled_seats = Some(seats);
     }
     items
+}
+
+/// A digest of the seats that a revocation can create work on: per group,
+/// each roster entry with its seat state, retained leaf and incarnation,
+/// the inputs that [`derive_triggers`] reads besides the revocations.
+fn revocation_seats(groups: &[(String, GroupInfo)], leaves: &RetainedLeaves) -> [u8; 32] {
+    let mut sorted: Vec<&GroupInfo> = groups.iter().map(|(_, info)| info).collect();
+    sorted.sort_by(|a, b| a.stable_group_id().cmp(b.stable_group_id()));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"x0x.s4.revocation-seats.v1");
+    for info in sorted {
+        let stable = info.stable_group_id();
+        hasher.update(&(stable.len() as u64).to_le_bytes());
+        hasher.update(stable.as_bytes());
+        hasher.update(&[u8::from(info.withdrawn)]);
+        for member in info.members_v2.values() {
+            let target = super::parse_agent_id_hex(&member.agent_id)
+                .map(|agent| *agent.as_bytes())
+                .unwrap_or_default();
+            hasher.update(&target);
+            hasher.update(&[
+                u8::from(is_seated(member.state)),
+                match leaves.tracks(stable, &target) {
+                    Some(true) => 1,
+                    Some(false) => 0,
+                    None => 2,
+                },
+            ]);
+            let incarnation = ce::seat_incarnation(info, &member.agent_id).unwrap_or_default();
+            hasher.update(&(incarnation.len() as u64).to_le_bytes());
+            hasher.update(incarnation.as_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// Every group with its roster map key. Withdrawn groups are kept so
