@@ -39,7 +39,12 @@
 //!   Resends stop once the head moves past the result (no old crypto
 //!   material after an epoch change). The `InFlight` status of a recipient
 //!   is installed, with a per-attempt token, before its send task starts,
-//!   and a completion writes only over its own token.
+//!   and a completion writes only over its own token. A successful write
+//!   is `Sent`, not delivered (§3 "survivor convergence, not a transport
+//!   ACK, proves delivery"): the recipient is asked for its head and sent
+//!   the frame again on each round until its verified catch-up answer
+//!   names the result head ([`note_survivor_head`]). Only then is it
+//!   `Converged`, and only a delivery whose recipients all converged ends.
 //! - **Restart** (`resume_crypto_exclusions` in the parent). A saved frame
 //!   is resent only after the group's head is synced
 //!   ([`super::group_head_synced`], not elapsed time alone) and only while
@@ -104,8 +109,16 @@ pub(super) enum RecipientDelivery {
     /// A send is running. The token names the attempt: only that
     /// attempt's completion may replace this status.
     InFlight(u64),
-    /// The carrier accepted the frame.
+    /// The carrier accepted the frame. This is not delivery (§3 "survivor
+    /// convergence, not a transport ACK, proves delivery"): the recipient
+    /// can stop before it installs the frame. Each later round asks the
+    /// recipient for its head and sends the frame again, until
+    /// [`Self::Converged`].
     Sent,
+    /// The recipient reported the frame's result as its own head, on a
+    /// verified, applied catch-up answer ([`note_survivor_head`]). Only
+    /// this status ends the recipient's delivery.
+    Converged,
     /// The recipient's current verified advert lacks the bit: stranded
     /// until it upgrades (§6).
     Lacking,
@@ -373,6 +386,77 @@ pub(super) fn finish_attempt(
             true
         }
         _ => false,
+    }
+}
+
+// ─── Survivor convergence (§3) ─────────────────────────────────────────────
+
+/// §3 "survivor convergence, not a transport ACK, proves delivery": a
+/// delivery is complete only when every remaining recipient converged. A
+/// recipient that left the survivors is dropped from the map by the round.
+pub(super) fn all_converged(recipients: &BTreeMap<[u8; 32], RecipientDelivery>) -> bool {
+    recipients
+        .values()
+        .all(|status| *status == RecipientDelivery::Converged)
+}
+
+/// Record that `sender` reported `reported` as its head. A recipient of a
+/// delivery whose result is `reported` converged: it installed the
+/// exclusion. A running attempt is replaced too, so its late completion
+/// (it writes only over its own `InFlight` token) changes nothing.
+pub(super) fn note_converged(
+    recipients: &mut BTreeMap<[u8; 32], RecipientDelivery>,
+    result_head: &str,
+    sender: &[u8; 32],
+    reported: &str,
+) {
+    if result_head == reported {
+        if let Some(status) = recipients.get_mut(sender) {
+            *status = RecipientDelivery::Converged;
+        }
+    }
+}
+
+/// §3 survivor convergence for the S4 deliveries of one group. The
+/// catch-up response handler reports each verified, applied answer
+/// through [`super::note_catchup_head`]; that answer names the
+/// responder's own head. It is the convergence evidence for the
+/// crypto-only exclusion deliveries and the saved-removal deliveries of
+/// `stable_group_id` whose result is that head.
+pub(super) fn note_survivor_head(
+    inner: &mut super::S4Inner,
+    stable_group_id: &str,
+    sender: &[u8; 32],
+    reported: &str,
+) {
+    for (key, delivery) in &mut inner.ce.deliveries {
+        if key.stable_group_id == stable_group_id {
+            note_converged(
+                &mut delivery.recipients,
+                &delivery.result_head,
+                sender,
+                reported,
+            );
+        }
+    }
+    super::removal_delivery::note_survivor_head(
+        &mut inner.removals,
+        stable_group_id,
+        sender,
+        reported,
+    );
+}
+
+/// Ask each of `peers` for a catch-up page of `group_id`, on the existing
+/// request path, detached (an offline peer must not hold the worker).
+/// The answer reports the peer's head ([`note_survivor_head`]).
+pub(super) fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<AgentId>) {
+    for peer in peers {
+        let task_state = Arc::clone(state);
+        let group_id = group_id.to_string();
+        let _spawned = state.spawn_detached(async move {
+            super::super::request_treekem_catchup_page(&task_state, &group_id, &peer).await;
+        });
     }
 }
 
@@ -1062,6 +1146,7 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             survivors(&info, &local, &key.target).into_iter().collect();
         let mut updates: Vec<RoundUpdate> = Vec::new();
         let mut refreshes: Vec<AgentId> = Vec::new();
+        let mut head_asks: Vec<AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
             let observed = *status;
             if !active.contains(recipient) {
@@ -1074,11 +1159,17 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+                RecipientDelivery::Converged | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
             let agent = AgentId(*recipient);
+            // §3: a written frame is not a delivered one. Ask the
+            // recipient for its head (its convergence evidence) and send
+            // the frame again, admitted afresh, until it converges.
+            if *status == RecipientDelivery::Sent {
+                head_asks.push(agent);
+            }
             if !write_allowed(state, &agent).await {
                 continue;
             }
@@ -1107,16 +1198,13 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
                 continue;
             };
             let started = apply_round(&mut stored.recipients, updates);
-            if stored
-                .recipients
-                .values()
-                .all(|status| *status == RecipientDelivery::Sent)
-            {
+            if all_converged(&stored.recipients) {
                 inner.ce.deliveries.remove(&key);
                 inner.dirty = true;
             }
             started
         };
+        ask_heads(state, &key.stable_group_id, head_asks);
         for (recipient, attempt) in started {
             spawn_send(
                 state,
@@ -1208,6 +1296,12 @@ fn spawn_send(
             Ok(Ok(_)) => RecipientDelivery::Sent,
             Ok(Err(x0x::dm::DmError::RecipientUpgradeRequired { .. })) => {
                 RecipientDelivery::Lacking
+            }
+            // The in-process stand-in reports an admitted exchange with its
+            // marker error (test builds only), as for the class-K shares.
+            #[cfg(test)]
+            Ok(Err(error)) if error.to_string().contains(x0x::dm::PINNED_STANDIN_ADMITTED) => {
+                RecipientDelivery::Sent
             }
             Ok(Err(error)) => {
                 // An admission refusal is a withhold: the next round
@@ -3010,6 +3104,154 @@ mod daemon_tests {
         assert_eq!(
             inner.store.get(&key).map(|row| row.phase),
             Some(Phase::Complete)
+        );
+        Ok(())
+    }
+
+    /// The delivery status of `recipient` in the live delivery of `key`.
+    async fn delivery_status(
+        state: &AppState,
+        key: &EvictionKey,
+        recipient: &AgentId,
+    ) -> Option<RecipientDelivery> {
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .ce
+            .deliveries
+            .get(key)
+            .and_then(|delivery| delivery.recipients.get(recipient.as_bytes()).copied())
+    }
+
+    /// Run one real delivery round and wait until no send of it runs.
+    async fn delivery_round(state: &Arc<AppState>, key: &EvictionKey, recipient: &AgentId) {
+        drive_deliveries(state).await;
+        for _ in 0..200 {
+            if !matches!(
+                delivery_status(state, key, recipient).await,
+                Some(RecipientDelivery::InFlight(_))
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #1508 r7 F5 (Codex P1), ADR 0110 §3: "survivor convergence, not a
+    /// transport ACK, proves delivery". The frame write to a survivor
+    /// succeeds, and the survivor stops before it installs the frame (a
+    /// crash). The delivery stays tracked and is sent again on the resend
+    /// interval, and the row stays `committed_delivery_pending`. Only the
+    /// survivor's own head report at the exclusion's result (the call of
+    /// the catch-up response handler, [`super::super::note_catchup_head`])
+    /// ends its delivery; then the row completes.
+    #[tokio::test]
+    async fn a_written_frame_without_survivor_convergence_keeps_the_delivery() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the GSS crypto-only exclusion committed");
+        let result_head = ce::decode_frame(&frame)
+            .expect("frame")
+            .body
+            .commit
+            .state_hash;
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        advertise_crypto_exclusion(&fx.state, survivor);
+        let phase = |state: Arc<AppState>| {
+            let key = key.clone();
+            async move {
+                let inner = state.revocation_evictions.inner.lock().await;
+                inner.store.get(&key).map(|row| row.phase)
+            }
+        };
+
+        // The first round writes the frame; the carrier takes it.
+        delivery_round(&fx.state, &key, &survivor).await;
+        assert_eq!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Sent),
+            "the frame write to the survivor succeeded"
+        );
+        // The survivor stopped before it installed the frame. The next
+        // rounds, after the resend interval, must keep the delivery.
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        assert!(
+            fx.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .delivering()
+                .contains(&key),
+            "a transport success without convergence keeps the delivery"
+        );
+        assert_eq!(
+            phase(Arc::clone(&fx.state)).await,
+            Some(Phase::CommittedDeliveryPending),
+            "the obligation does not complete on a transport success"
+        );
+
+        // The survivor restarts, installs the frame and reports its head.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        let survivor_head = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(survivor_head.as_deref(), Some(result_head.as_str()));
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            survivor_head.as_deref(),
+        )
+        .await;
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        assert!(
+            !fx.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .delivering()
+                .contains(&key),
+            "the survivor's convergence ends the delivery"
+        );
+        assert_eq!(
+            phase(Arc::clone(&fx.state)).await,
+            Some(Phase::Complete),
+            "the obligation completes once every survivor converged"
         );
         Ok(())
     }

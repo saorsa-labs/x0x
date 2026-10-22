@@ -865,7 +865,7 @@ pub(super) fn stage_reference(
 
 /// [`stage_reference`] with an optional serve `guard` (ADR 0110 §3).
 #[allow(clippy::too_many_arguments)]
-fn stage_reference_entry(
+pub(super) fn stage_reference_entry(
     store: &ControlBlobState,
     agent: &Agent,
     recipient: &AgentId,

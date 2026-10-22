@@ -708,7 +708,9 @@ pub(in crate::server) async fn seal_probe_for_test(
 /// §2: the catch-up response handler calls this for each verified,
 /// applied, non-truncated page that carries the responder's saved head
 /// (`responder_state_hash`). The sender is an active, unrevoked member;
-/// the handler checked that.
+/// the handler checked that. §3: the same answer is the sender's survivor
+/// convergence evidence for the S4 deliveries of the group
+/// ([`crypto_exclusion::note_survivor_head`]).
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
@@ -737,6 +739,9 @@ pub(in crate::server) async fn note_catchup_head(
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
+    // §3: the answer is also the sender's convergence evidence for the
+    // S4 deliveries of this group whose result is the reported head.
+    crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), reported);
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;
