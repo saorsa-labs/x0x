@@ -902,6 +902,13 @@ pub struct OwnerSyncStore {
     /// live names until the test releases it.
     #[cfg(test)]
     name_mint_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: hold the next discharge of pending applies before
+    /// it takes any lock until the test releases it.
+    #[cfg(test)]
+    discharge_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: fail the next register write before its rename.
+    #[cfg(test)]
+    fail_next_register_write: std::sync::atomic::AtomicBool,
     /// Test injection: fail every synced journal append.
     #[cfg(test)]
     fail_journal_append: std::sync::atomic::AtomicBool,
@@ -1095,6 +1102,10 @@ impl OwnerSyncStore {
             #[cfg(test)]
             name_mint_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
+            discharge_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_register_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             fail_journal_append: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_discharge: std::sync::atomic::AtomicBool::new(false),
@@ -1205,6 +1216,13 @@ impl OwnerSyncStore {
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
+        #[cfg(test)]
+        if self
+            .fail_next_register_write
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(SyncError::Io("injected register write failure".into()));
+        }
         Self::write_atomically(
             &self.dir.join(RECORDS_FILE),
             &bytes,
@@ -1326,6 +1344,25 @@ impl OwnerSyncStore {
     #[cfg(test)]
     async fn pause_before_name_mint(&self) {
         Self::take_pause(&self.name_mint_pause).await;
+    }
+
+    /// Hold the next discharge of pending applies before it takes any
+    /// lock: it signals `reached` and then waits for `release`.
+    #[cfg(test)]
+    pub(crate) fn pause_next_discharge(
+        &self,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        Self::arm_pause(&self.discharge_pause, reached, release);
+    }
+
+    /// Test injection: fail the next register write before its rename, so
+    /// the commit rolls back after its pending applies are durable.
+    #[cfg(test)]
+    pub(crate) fn fail_next_register_write(&self) {
+        self.fail_next_register_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -2067,6 +2104,8 @@ impl OwnerSyncStore {
         &self,
         done: &[VersionedRecord],
     ) -> Result<(), SyncError> {
+        #[cfg(test)]
+        Self::take_pause(&self.discharge_pause).await;
         let mut pending = self.pending_apply.lock().await;
         for record in done {
             if let Some(entry) = pending.get_mut(&pending_key(record)) {
