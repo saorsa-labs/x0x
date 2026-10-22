@@ -1341,13 +1341,26 @@ type TrackedLeaves = (Vec<[u8; 32]>, u64);
 /// A GSS `MlsEncrypted` group has no tree. Its entry holds the Removed
 /// members that still hold the current secret
 /// ([`ce::gss_secret_retained`], #1508 review P1), with the secret epoch.
+///
+/// A TreeKEM member whose leaf this node cannot decide from the tree (no
+/// committed KeyPackage here, and not in the local leaf map) is in
+/// `undecided`. It is neither retained nor excluded: its work stays
+/// pending (#1508 review P1).
 #[derive(Default)]
 struct RetainedLeaves {
     by_group: HashMap<String, Option<TrackedLeaves>>,
+    undecided: HashMap<String, BTreeSet<[u8; 32]>>,
 }
 
 impl RetainedLeaves {
     fn tracks(&self, stable_group_id: &str, agent: &[u8; 32]) -> Option<bool> {
+        if self
+            .undecided
+            .get(stable_group_id)
+            .is_some_and(|agents| agents.contains(agent))
+        {
+            return None;
+        }
         match self.by_group.get(stable_group_id) {
             Some(Some((tracked, _))) => Some(tracked.contains(agent)),
             Some(None) => None,
@@ -1405,13 +1418,23 @@ async fn snapshot_retained_leaves(
         };
         let entry = match tree.try_lock() {
             Ok(group) => {
-                let tracked = info
-                    .members_v2
-                    .values()
-                    .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
-                    .filter(|agent| group.tracks_member(agent))
-                    .map(|agent| *agent.as_bytes())
-                    .collect();
+                let mut tracked = Vec::new();
+                for member in info.members_v2.values() {
+                    let Ok(agent) = super::parse_agent_id_hex(&member.agent_id) else {
+                        continue;
+                    };
+                    match super::member_treekem_leaf_present(&group, member) {
+                        Some(true) => tracked.push(*agent.as_bytes()),
+                        Some(false) => {}
+                        None => {
+                            leaves
+                                .undecided
+                                .entry(stable.clone())
+                                .or_default()
+                                .insert(*agent.as_bytes());
+                        }
+                    }
+                }
                 Some((tracked, group.epoch()))
             }
             Err(_) => None,
@@ -1671,10 +1694,50 @@ fn reconcile_completion(
 /// §2 amendment to ADR 0016 §6: a non-designated admin that asks to
 /// remove, ban or seal an S4 target before its ranked fallback time queues
 /// and hands off the request and gets `waiting_for_designated_admin`; it
-/// must not rekey that target early. Returns the `202` response to send,
-/// or `None` when the request may proceed (no open obligation, or this
-/// node is designated or past its fallback time).
+/// must not rekey that target early. A designated or fallback admin obeys
+/// the rest of the same evaluation as the worker (#1508 review P1): while
+/// the row needs `waiting_for_head_sync` or `waiting_for_durable_intake`,
+/// or this node may not seal (`local_committer_ineligible`), the request is
+/// queued with that cause and nothing seals from stale state. Returns the
+/// `202` response to send, or `None` when the request may proceed.
 pub(in crate::server) async fn s4_manual_request_gate(
+    state: &Arc<AppState>,
+    group_key: &str,
+    target_hex: &str,
+    kind: ManualRequestKind,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    // Bring intake up to date first, so a request that races the worker
+    // still sees a just-verified revocation.
+    // The intake that pass took is written now, as the worker would, so a
+    // writable sidecar does not hold the request on
+    // `waiting_for_durable_intake` only because the next tick has not run.
+    revocation_eviction_pass(state).await;
+    persist_obligations(state).await;
+    manual_request_gate(state, group_key, target_hex, kind).await
+}
+
+/// [`s4_manual_request_gate`] again under the group's membership lock,
+/// just before the route mutates anything: the head or the intake may have
+/// changed since the first check. It does not run a pass (the pass takes
+/// the membership lock).
+pub(in crate::server) async fn s4_manual_request_recheck_under_lock(
+    state: &Arc<AppState>,
+    group_key: &str,
+    target_hex: &str,
+    kind: ManualRequestKind,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    manual_request_gate(state, group_key, target_hex, kind).await
+}
+
+/// The causes that stop a designated or fallback admin's manual request.
+fn blocks_manual_request(cause: WaitingCause) -> bool {
+    matches!(
+        cause,
+        WaitingCause::WaitingForHeadSync | WaitingCause::LocalCommitterIneligible
+    )
+}
+
+async fn manual_request_gate(
     state: &Arc<AppState>,
     group_key: &str,
     target_hex: &str,
@@ -1690,78 +1753,117 @@ pub(in crate::server) async fn s4_manual_request_gate(
         })?;
         info.stable_group_id().to_string()
     };
-    // Bring intake up to date first, so a request that races the worker
-    // still sees a just-verified revocation.
-    revocation_eviction_pass(state).await;
     let key = EvictionKey::new(stable.clone(), *target.as_bytes());
-    let mut inner = state.revocation_evictions.inner.lock().await;
-    // §1a/D135 (#1508 review): the reconciliation above can end the row
-    // of the worker's own prepared removal (a rebind landed while the
-    // journal was written). That removal stops; it never continues as an
-    // ordinary removal of the renewed seat.
-    if s4_prepared_removal_of(&key)
-        && inner.store.get(&key).map(|row| row.phase) != Some(Phase::Prepared)
-    {
-        return Some(s4_exclusion_cancelled_response());
-    }
-    let row = inner.store.get(&key)?;
-    if !row.phase.is_open() {
-        return None;
-    }
-    let evaluation = inner.evaluations.get(&key)?;
-    let CommitPermission::Wait {
-        designated,
-        remaining,
-    } = evaluation.permission.clone()?
-    else {
-        return None;
+    let permission = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        // §1a/D135 (#1508 review): the reconciliation can end the row of
+        // the worker's own prepared removal (a rebind landed while the
+        // journal was written). That removal stops; it never continues as
+        // an ordinary removal of the renewed seat.
+        // The worker's own removal skips the rest of the gate: it checked
+        // the head and the intake itself just before it sealed.
+        if s4_prepared_removal_of(&key) {
+            return (inner.store.get(&key).map(|row| row.phase) != Some(Phase::Prepared))
+                .then(s4_exclusion_cancelled_response);
+        }
+        let row = inner.store.get(&key)?;
+        if !row.phase.is_open() {
+            return None;
+        }
+        let permission = inner.evaluations.get(&key)?.permission.clone()?;
+        let stored = row
+            .waiting
+            .as_ref()
+            .map(|waiting| waiting.cause)
+            .filter(|cause| blocks_manual_request(*cause))
+            // Durability is read live, as the evaluation computes it.
+            .or_else(|| {
+                (inner.sidecar.state.writable() && inner.not_durable.contains_key(&key))
+                    .then_some(WaitingCause::WaitingForDurableIntake)
+            });
+        match permission {
+            CommitPermission::Wait {
+                designated,
+                remaining,
+            } => Err((designated, remaining)),
+            CommitPermission::Designated | CommitPermission::Fallback { .. } => Ok(stored),
+            CommitPermission::NotEligible => return None,
+        }
     };
-    let rank = row
-        .ranks
-        .iter()
-        .position(|id| id == state.agent.agent_id().as_bytes())
-        .map(|index| index.saturating_add(1));
+    let (status, waiting) = match permission {
+        Err((designated, remaining)) => {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let rank = inner
+                .store
+                .get(&key)
+                .and_then(|row| {
+                    row.ranks
+                        .iter()
+                        .position(|id| id == state.agent.agent_id().as_bytes())
+                })
+                .map(|index| index.saturating_add(1));
+            drop(inner);
+            let now_ms = now_unix_ms();
+            (
+                WaitingCause::WaitingForDesignatedAdmin,
+                serde_json::json!({
+                    "cause": WaitingCause::WaitingForDesignatedAdmin.as_str(),
+                    "designated_admin": hex::encode(designated),
+                    "detail": "rank",
+                    "local_rank": rank,
+                    "remaining_ms": s4::duration_ms(remaining),
+                    "fallback_at_unix_ms": now_ms.saturating_add(s4::duration_ms(remaining)),
+                }),
+            )
+        }
+        Ok(stored) => {
+            // §2: re-read the head just before the seal, as the worker does
+            // (`commit_removal`); the stored evaluation may be a pass old.
+            let cause = match stored {
+                Some(cause) => cause,
+                None if !group_head_synced(state, group_key).await => {
+                    WaitingCause::WaitingForHeadSync
+                }
+                None => return None,
+            };
+            (cause, serde_json::json!({ "cause": cause.as_str() }))
+        }
+    };
     let now_ms = now_unix_ms();
-    if kind == ManualRequestKind::Ban {
-        // §2: an accepted ban must be applied as a ban, after the
-        // designated removal or at this node's fallback time, and must
-        // survive a restart (the `.evs` v2 extension).
-        inner.queued_bans.entry(key.clone()).or_insert(now_ms);
-        inner.dirty = true;
+    {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        if kind == ManualRequestKind::Ban {
+            // §2: an accepted ban must be applied as a ban, after the
+            // designated removal or at this node's fallback time, and must
+            // survive a restart (the `.evs` v2 extension).
+            inner.queued_bans.entry(key.clone()).or_insert(now_ms);
+            inner.dirty = true;
+        }
+        inner
+            .queued_manual
+            .entry(key)
+            .or_default()
+            .push(QueuedManual {
+                kind,
+                queued_at_unix_ms: now_ms,
+            });
     }
-    inner
-        .queued_manual
-        .entry(key)
-        .or_default()
-        .push(QueuedManual {
-            kind,
-            queued_at_unix_ms: now_ms,
-        });
-    drop(inner);
     if kind == ManualRequestKind::Ban && !persist_obligations(state).await {
         tracing::warn!(
             group_id = %super::LogHexId::group(&stable),
             "ADR 0110 S4: a queued manual ban is not durable yet; the worker retries the write"
         );
     }
-    let designated_hex = hex::encode(designated);
     Some((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
             "ok": true,
             "queued": true,
-            "status": WaitingCause::WaitingForDesignatedAdmin.as_str(),
+            "status": status.as_str(),
             "group_id": stable,
             "target": target_hex.to_ascii_lowercase(),
             "request": kind.as_str(),
-            "waiting": {
-                "cause": WaitingCause::WaitingForDesignatedAdmin.as_str(),
-                "designated_admin": designated_hex,
-                "detail": "rank",
-                "local_rank": rank,
-                "remaining_ms": s4::duration_ms(remaining),
-                "fallback_at_unix_ms": now_ms.saturating_add(s4::duration_ms(remaining)),
-            },
+            "waiting": waiting,
         })),
     ))
 }
@@ -2648,9 +2750,12 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
         inner.dirty = true;
     }
     // The legacy transaction is durable (or refused): reconcile the `.evs`
-    // and only then retire the S4 journal.
-    persist_obligations(state).await;
-    remove_file_durably(&journal_path).await;
+    // and only then retire the S4 journal. While the `.evs` is not durable
+    // the journal is the only durable copy of a committed event (#1508
+    // review P1); a restart adopts it.
+    if persist_obligations(state).await {
+        remove_file_durably(&journal_path).await;
+    }
 }
 
 tokio::task_local! {
@@ -5052,6 +5157,178 @@ mod tests {
             row.elapsed_budget_ms >= 1_200,
             "the consumed budget is resumed, not restarted: {} ms",
             row.elapsed_budget_ms
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1: a survivor that joined through a Welcome has only
+    /// its own leaf in its local leaf map. A self-leaver's retained leaf
+    /// must still count, read from the tree against the committed
+    /// KeyPackage, and a member with no committed KeyPackage is undecided,
+    /// never "no leaf".
+    #[tokio::test]
+    async fn a_welcome_joiner_sees_a_self_leavers_retained_leaf() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "e4".repeat(16);
+        let group_id_bytes = hex::decode(&group_id)?;
+        let creator = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let mut creator_group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes, creator, &[3u8; 32])?;
+        let leaver = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let leaver_kp = x0x::mls::TreeKemMlsGroup::prepare_member(leaver, &[4u8; 32])?
+            .key_package_bytes()
+            .to_vec();
+        creator_group.add_member(leaver, &leaver_kp)?;
+        let local = state.agent.agent_id();
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(local, &[5u8; 32])?;
+        let local_kp = prepared.key_package_bytes().to_vec();
+        let added = creator_group.add_member(local, &local_kp)?;
+        let local_group = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+        assert!(
+            !local_group.tracks_member(&leaver),
+            "premise: a Welcome joiner's leaf map lacks the leaver"
+        );
+
+        let mut info = GroupInfo::new("welcome".into(), String::new(), creator, group_id.clone());
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        let creator_hex = hex::encode(creator.as_bytes());
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        for (member, kp) in [
+            (&leaver_hex, &leaver_kp),
+            (&hex::encode(local.as_bytes()), &local_kp),
+        ] {
+            info.add_member(
+                member.clone(),
+                GroupRole::Member,
+                Some(creator_hex.clone()),
+                None,
+            );
+            info.set_member_treekem_key_package(
+                member,
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, kp),
+            );
+        }
+        info.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let stable = info.stable_group_id().to_string();
+        state.treekem_groups.write().await.insert(
+            group_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(local_group)),
+        );
+
+        let groups = vec![(group_id.clone(), info.clone())];
+        let leaves = snapshot_retained_leaves(&state, &groups).await;
+        assert_eq!(leaves.tracks(&stable, leaver.as_bytes()), Some(true));
+        let triggers = derive_triggers(&groups, &leaves, &[], 0);
+        assert!(
+            triggers
+                .iter()
+                .any(|(key, trigger, _)| key.target == *leaver.as_bytes()
+                    && matches!(trigger, EvictionTrigger::SelfLeave { .. })),
+            "the retained leaf opens the self-leave work"
+        );
+
+        // Without the committed KeyPackage there is no evidence either way.
+        if let Some(member) = info.members_v2.get_mut(&leaver_hex) {
+            member.treekem_key_package_b64 = None;
+        }
+        let groups = vec![(group_id, info)];
+        let leaves = snapshot_retained_leaves(&state, &groups).await;
+        assert_eq!(leaves.tracks(&stable, leaver.as_bytes()), None);
+        Ok(())
+    }
+
+    /// #1508 review P1: a designated (or fallback) admin's manual remove
+    /// or ban obeys the full evaluation. While the head is not synced or
+    /// the intake is not durable it is queued with that cause; it never
+    /// seals from stale state.
+    #[tokio::test]
+    async fn a_designated_manual_request_waits_for_head_sync_and_intake() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let target_hex = hex::encode(target.as_bytes());
+        let group_id = "e5".repeat(16);
+        let mut info = group_with(*state.agent.agent_id().as_bytes(), *target.as_bytes());
+        info.mls_group_id = group_id.clone();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        let key = EvictionKey::new(stable.clone(), *target.as_bytes());
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &key,
+                EvictionTrigger::AgentRevocation {
+                    record_hash: [1; 32],
+                    record_bytes: vec![1],
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            inner.evaluations.insert(
+                key.clone(),
+                StoredEvaluation {
+                    permission: Some(CommitPermission::Designated),
+                    action: RowAction::None,
+                    stable_group_key: group_id.clone(),
+                },
+            );
+        }
+        let status_of = |resp: Option<(StatusCode, Json<serde_json::Value>)>| {
+            resp.map(|(code, Json(body))| (code, body["status"].as_str().map(str::to_string)))
+        };
+
+        // The restart sync wait has not passed: the head is not synced.
+        let resp = s4_manual_request_recheck_under_lock(
+            &state,
+            &group_id,
+            &target_hex,
+            ManualRequestKind::Remove,
+        )
+        .await;
+        assert_eq!(
+            status_of(resp),
+            Some((
+                StatusCode::ACCEPTED,
+                Some("waiting_for_head_sync".to_string())
+            ))
+        );
+
+        // A non-durable intake waits too.
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .mark_not_durable(&key);
+        let resp = s4_manual_request_recheck_under_lock(
+            &state,
+            &group_id,
+            &target_hex,
+            ManualRequestKind::Ban,
+        )
+        .await;
+        assert_eq!(
+            status_of(resp),
+            Some((
+                StatusCode::ACCEPTED,
+                Some("waiting_for_durable_intake".to_string())
+            ))
+        );
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .queued_bans
+                .contains_key(&key),
+            "the accepted ban is queued"
         );
         Ok(())
     }

@@ -1833,11 +1833,24 @@ pub(in crate::server) async fn receive(
         let refused = ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::EpochMismatch);
         return unhold_unless_kept(state, stable, refused).await;
     }
-    // The cryptographic removal proof: the target's leaf is gone.
-    if guard.tracks_member(&target) {
-        refuse(&mut guard, "crypto_exclusion_leaf_retained");
-        let refused = ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::LeafMismatch);
-        return unhold_unless_kept(state, stable, refused).await;
+    // The cryptographic removal proof: the tree no longer holds the
+    // target's committed leaf. The local leaf map alone is not proof; with
+    // no evidence the frame stays pending (#1508 review P1).
+    let leaf_present = info
+        .members_v2
+        .get(&hex::encode(target.as_bytes()))
+        .and_then(|member| ng::member_treekem_leaf_present(&guard, member));
+    match leaf_present {
+        Some(false) => {}
+        Some(true) => {
+            refuse(&mut guard, "crypto_exclusion_leaf_retained");
+            let refused = ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::LeafMismatch);
+            return unhold_unless_kept(state, stable, refused).await;
+        }
+        None => {
+            refuse(&mut guard, "crypto_exclusion_leaf_unproven");
+            return ReceiveOutcome::LocalFailure;
+        }
     }
     if let Err(error) = ng::persist_treekem_and_named_groups_atomic_with_info(
         state,

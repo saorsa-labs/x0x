@@ -9650,6 +9650,20 @@ fn current_member_treekem_key_package(member: &x0x::groups::GroupMember) -> Opti
     (blake3::hash(package.as_bytes()).to_hex().as_str() == expected_hash).then(|| package.clone())
 }
 
+/// Whether `member` still holds a leaf in `group`, read from the tree
+/// against the member's committed KeyPackage. `None` when this node has no
+/// evidence either way; a caller must keep that pending, never read it as a
+/// removal (#1508 review P1).
+pub(in crate::server) fn member_treekem_leaf_present(
+    group: &x0x::mls::TreeKemMlsGroup,
+    member: &x0x::groups::GroupMember,
+) -> Option<bool> {
+    let agent = parse_agent_id_hex(&member.agent_id).ok()?;
+    let package =
+        current_member_treekem_key_package(member).and_then(|kp_b64| BASE64.decode(kp_b64).ok());
+    group.member_leaf_present(&agent, package.as_deref())
+}
+
 /// Install a recovered KeyPackage while the caller holds this group's
 /// [`group_membership_lock`]. Keeping resolution and mutation under the same
 /// guard prevents a stale full-`GroupInfo` write-back from erasing the package.
@@ -22502,6 +22516,18 @@ pub(in crate::server) async fn remove_named_group_member(
     {
         return resp;
     }
+    // ADR 0110 §2 (#1508 review P1): the full S4 evaluation again, under
+    // the lock: no seal from a stale head or a non-durable intake.
+    if let Some(resp) = revocation_eviction::s4_manual_request_recheck_under_lock(
+        &state,
+        &id,
+        &agent_id_hex,
+        revocation_eviction::ManualRequestKind::Remove,
+    )
+    .await
+    {
+        return resp;
+    }
     {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(&id) {
@@ -22661,8 +22687,10 @@ pub(in crate::server) async fn remove_named_group_member(
         let persisted = persist_named_group_info(&state, &id, next).await;
         purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
         if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
+            // #1508 review P1: a `ReplacedNotDurable` write leaves the new
+            // roster live; its saved event is then kept and delivered.
             barrier
-                .abandon(&state, &delivery_roster, &agent_id_hex)
+                .not_durable(&state, &delivery_roster, &agent_id_hex, &event)
                 .await;
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -26448,15 +26476,22 @@ async fn remove_treekem_named_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
-        barrier.abandon(&state, &next, &agent_id_hex).await;
-        rollback_treekem_group_after_failed_install(
-            &state,
-            &id,
-            &next,
-            &rollback_snapshot,
-            &mut guard,
-            "member_remove_persist_failed",
-        );
+        // #1508 review P1: an installed epoch is never rolled back, and its
+        // saved event is kept and delivered.
+        let installed = self_leave_persist_left_epoch_installed(&e);
+        if !barrier
+            .persist_failed(&state, &next, &agent_id_hex, &event, installed)
+            .await
+        {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "member_remove_persist_failed",
+            );
+        }
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after removal: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -29578,6 +29613,18 @@ pub(in crate::server) async fn ban_group_member(
     {
         return resp;
     }
+    // ADR 0110 §2 (#1508 review P1): the full S4 evaluation again, under
+    // the lock: no seal from a stale head or a non-durable intake.
+    if let Some(resp) = revocation_eviction::s4_manual_request_recheck_under_lock(
+        &state,
+        &id,
+        &agent_id_hex,
+        revocation_eviction::ManualRequestKind::Ban,
+    )
+    .await
+    {
+        return resp;
+    }
     let groups = state.named_groups.read().await;
     // #1166 S3: the admin trio runs in the group-access core, under this
     // lock take, before the TreeKEM delegation below.
@@ -29671,8 +29718,10 @@ pub(in crate::server) async fn ban_group_member(
     let persisted = persist_named_group_info(&state, &id, next).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
+        // #1508 review P1: a `ReplacedNotDurable` write leaves the new
+        // roster live; its saved event is then kept and delivered.
         barrier
-            .abandon(&state, &delivery_roster, &agent_id_hex)
+            .not_durable(&state, &delivery_roster, &agent_id_hex, &event)
             .await;
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -29933,15 +29982,22 @@ async fn ban_treekem_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
-        barrier.abandon(&state, &next, &agent_id_hex).await;
-        rollback_treekem_group_after_failed_install(
-            &state,
-            &id,
-            &next,
-            &rollback_snapshot,
-            &mut guard,
-            "member_ban_persist_failed",
-        );
+        // #1508 review P1: an installed epoch is never rolled back, and its
+        // saved event is kept and delivered.
+        let installed = self_leave_persist_left_epoch_installed(&e);
+        if !barrier
+            .persist_failed(&state, &next, &agent_id_hex, &event, installed)
+            .await
+        {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "member_ban_persist_failed",
+            );
+        }
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after ban: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
