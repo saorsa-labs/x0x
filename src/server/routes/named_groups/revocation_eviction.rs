@@ -3554,6 +3554,8 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.rebuilt_from = rebuilt_from;
     inner.rebuilding = rebuilding;
     inner.file_exists = file_exists;
+    // A receipt that ran before this load keeps its held frames.
+    ce_state.keep_live_held_log(&mut inner.ce);
     inner.ce = ce_state;
     inner.removals = removals;
     inner.queued_bans = queued_bans;

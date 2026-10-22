@@ -1,5 +1,6 @@
 //! ADR 0110 §4a and §4b(1) restart durability (#1508 review): the held
-//! log of the certificate-rebind and owner-recovery frames.
+//! log of the certificate-rebind and owner-recovery frames, and of the
+//! received `CryptoExclusionV1` frames (§4, #1508 review Codex P1).
 //!
 //! A survivor that missed a rebind or a recovery commit can get it only
 //! from a node that holds the exact signed frame: ordinary catch-up cannot
@@ -11,8 +12,9 @@
 //! ([`write_received`]), so a restarted receiver serves the frame to a
 //! survivor that missed it while the author is offline (#1508 review F2).
 //!
-//! - **File.** `<data_dir>/treekem/<stem>.crblog` (rebind) or
-//!   `<stem>.orclog` (owner recovery), with the `.evjournal` stem rule.
+//! - **File.** `<data_dir>/treekem/<stem>.crblog` (rebind),
+//!   `<stem>.orclog` (owner recovery) or `<stem>.celog` (crypto-only
+//!   exclusion), with the `.evjournal` stem rule.
 //!   It is local state, not a wire format: the header `X0XRPL1\0`, the
 //!   postcard [`ReplayLogV1`], then the BLAKE3 hash of that body. The
 //!   frames are the bytes that go on the wire, unchanged.
@@ -48,6 +50,9 @@ use super::super::S4Inner;
 pub(in super::super) const REBIND_EXTENSION: &str = "crblog";
 /// Extension of the owner-recovery log.
 pub(in super::super) const RECOVERY_EXTENSION: &str = "orclog";
+/// Extension of the crypto-only exclusion log. It holds the received
+/// frames; an authored frame is durable in its `.evs` row.
+pub(in super::super) const CE_EXTENSION: &str = "celog";
 
 const PREFIX: &[u8] = b"X0XRPL";
 const HEADER_V1: &[u8; 8] = b"X0XRPL1\0";
@@ -147,6 +152,23 @@ impl<const CAP: usize> HeldLog<CAP> {
         );
         while log.len() > CAP {
             log.pop_front();
+        }
+    }
+
+    /// Hold every frame of `other` too, with the [`Self::remember`] rule.
+    /// This log's load state is kept: `other` is a rebuilt view that holds
+    /// no file frames.
+    pub(in super::super) fn absorb(&mut self, other: Self) {
+        for (stable, frames) in other.log {
+            for e in frames {
+                self.remember(
+                    &stable,
+                    e.next_revision,
+                    &e.result_head,
+                    e.bytes,
+                    e.authored,
+                );
+            }
         }
     }
 
