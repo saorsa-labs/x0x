@@ -152,9 +152,10 @@ fn peer_ref_accepts_hex_and_forward_peer_refuses_machine_names() {
         PeerRef::parse_forward_peer("studio.me").unwrap(),
         PeerRef::Name(_)
     ));
-    let err = PeerRef::parse_forward_peer("machine:studio.me").unwrap_err();
-    assert_eq!(err.code(), "machine_target_unsupported", "{err}");
-    // A bare label that resolves to a machine is refused the same way.
+    assert!(matches!(
+        PeerRef::parse_forward_peer("machine:studio.me").unwrap(),
+        PeerRef::Name(_)
+    ));
     let resolved = Resolved {
         name: "machine:studio.me".into(),
         kind: NameKind::Machine,
@@ -163,13 +164,15 @@ fn peer_ref_accepts_hex_and_forward_peer_refuses_machine_names() {
         machine_id: Some(MachineId([3; 32])),
         newly_pinned: false,
     };
-    let err = require_agent_target(&resolved, &name("studio.me")).unwrap_err();
-    assert_eq!(err.code(), "machine_target_unsupported");
+    let (agent, pinned) = forward_target(&resolved, &name("machine:studio.me")).unwrap();
+    assert_eq!(agent, AgentId([2; 32]));
+    assert_eq!(pinned, Some(MachineId([3; 32])));
 }
 
 /// WHY (Claude #1494 e338df79): a bare label that resolves to a machine must
-/// not pin when the consumer is agent-only (forwards). `resolve_with_options`
-/// checks kind before `pin`.
+/// not pin when the caller asked for an agent-only resolution.
+/// `resolve_with_options` checks kind before `pin`. `POST /forwards` does
+/// not use that flag: a machine name is pinned and bound (ADR-0074 slice 2).
 #[tokio::test]
 async fn agent_only_resolve_refuses_machine_before_pinning() {
     let store = NameStore::in_memory();

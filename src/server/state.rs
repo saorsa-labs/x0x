@@ -129,6 +129,14 @@ pub struct ServeOptions {
     /// never replace or restart the host application. Updater-owned manifest
     /// broadcast/listener side effects are gated with the install paths.
     pub self_update_enabled: bool,
+    /// Path of the daemon TOML that produced `DaemonConfig`, when known.
+    /// Used by ADR 0083 to re-read `[gui_show]` on `POST /acl/reload`.
+    pub daemon_config_path: Option<std::path::PathBuf>,
+    /// Config path `POST /acl/reload` can read.
+    ///
+    /// The daemon passes the loaded config, or the default config path
+    /// when startup loaded no file. Stop does not create or modify it.
+    pub gui_show_write_path: Option<std::path::PathBuf>,
 }
 
 pub(super) const fn effective_self_update_enabled(
@@ -511,6 +519,10 @@ pub struct DaemonConfig {
     /// WebSocket session tuning (`[ws]` in TOML).
     #[serde(default)]
     pub ws: DaemonWsConfig,
+
+    /// ADR 0083 agent-initiated GUI show (`[gui_show]`).
+    #[serde(default)]
+    pub gui_show: x0x::gui::GuiShowConfig,
 }
 
 /// WebSocket session tuning (`[ws]` in the daemon TOML).
@@ -824,6 +836,7 @@ impl Default for DaemonConfig {
             network_id: None,
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
+            gui_show: x0x::gui::GuiShowConfig::default(),
         }
     }
 }
@@ -983,8 +996,9 @@ pub(super) struct AppState {
     /// catch-up requests, the KV-store delta direct deliveries and the
     /// outgoing file-chunk streams, and since #1288 the WebSocket session
     /// loop and its child tasks (the writer, the direct-message, call, and
-    /// keepalive forwarders, and the shared and per-session topic
-    /// forwarders). None of them owns a write that an abort
+    /// keepalive forwarders, the shared and per-session topic forwarders,
+    /// and the queued GUI reveal that waits on a full outbound queue). None
+    /// of them owns a write that an abort
     /// could cut: the most a send leaves behind is the outbound DM history
     /// row that `Agent::send_direct_with_history` enqueues synchronously
     /// after a successful send, and the history writer owns that
@@ -1325,6 +1339,8 @@ pub(super) struct AppState {
     /// ADR-0070 §3: API-managed connect/exec ACL entries over the TOML
     /// floor, and hot reload (`/acl/*`).
     pub(super) acl_admin: Arc<super::acl_admin::AclAdmin>,
+    /// ADR 0083: local GUI show runtime (`[gui_show]`, rate limit, opener).
+    pub(super) gui_show: x0x::gui::GuiShowRuntime,
     /// Connect-ACL allow/deny counters + policy summary for
     /// `/diagnostics/connect`. Counters reflect live forwards when connect is
     /// enabled (the forwarder calls `record_allowed`/`record_denied`) and read
@@ -1346,6 +1362,10 @@ pub(super) struct AppState {
     /// (`<data_dir>/names.json`). An unreadable file refuses every name
     /// operation (fail closed); hex ids keep working.
     pub(super) names: Arc<x0x::names::NameStore>,
+    /// ADR-0074 §2 persistent forwards (`<data_dir>/forwards.json`),
+    /// restored at start. An unreadable file restores nothing and refuses
+    /// persistent adds (fail closed); `--ephemeral` forwards still work.
+    pub(super) forwards: Arc<x0x::forward::store::ForwardStore>,
     /// Per-instance fault-injection cell for `save_named_groups_checked_unlocked`.
     /// Each test that calls `set_save_fault` arms and RAII-clears this; because it
     /// lives on the `AppState` rather than in a process-global static, parallel

@@ -400,17 +400,18 @@ pub(super) fn all_converged(recipients: &BTreeMap<[u8; 32], RecipientDelivery>) 
         .all(|status| *status == RecipientDelivery::Converged)
 }
 
-/// Record that `sender` reported `reported` as its head. A recipient of a
-/// delivery whose result is `reported` converged: it installed the
-/// exclusion. A running attempt is replaced too, so its late completion
-/// (it writes only over its own `InFlight` token) changes nothing.
+/// Record that `sender` holds each head in `installed`: its reported head
+/// and that head's ancestors on the local chain. A recipient of a delivery
+/// whose result is in `installed` converged: it installed the transition.
+/// A running attempt is replaced too, so its late completion (it writes
+/// only over its own `InFlight` token) changes nothing.
 pub(super) fn note_converged(
     recipients: &mut BTreeMap<[u8; 32], RecipientDelivery>,
     result_head: &str,
     sender: &[u8; 32],
-    reported: &str,
+    installed: &BTreeSet<String>,
 ) {
-    if result_head == reported {
+    if installed.contains(result_head) {
         if let Some(status) = recipients.get_mut(sender) {
             *status = RecipientDelivery::Converged;
         }
@@ -420,14 +421,15 @@ pub(super) fn note_converged(
 /// §3 survivor convergence for the S4 deliveries of one group. The
 /// catch-up response handler reports each verified, applied answer
 /// through [`super::note_catchup_head`]; that answer names the
-/// responder's own head. It is the convergence evidence for the
-/// crypto-only exclusion deliveries and the saved-removal deliveries of
-/// `stable_group_id` whose result is that head.
+/// responder's own head; `installed` is that head and its ancestors on
+/// the local chain. It is the convergence evidence for the crypto-only
+/// exclusion, saved-removal, certificate-rebind and owner-recovery commit
+/// deliveries of `stable_group_id` whose result the responder holds.
 pub(super) fn note_survivor_head(
     inner: &mut super::S4Inner,
     stable_group_id: &str,
     sender: &[u8; 32],
-    reported: &str,
+    installed: &BTreeSet<String>,
 ) {
     for (key, delivery) in &mut inner.ce.deliveries {
         if key.stable_group_id == stable_group_id {
@@ -435,7 +437,7 @@ pub(super) fn note_survivor_head(
                 &mut delivery.recipients,
                 &delivery.result_head,
                 sender,
-                reported,
+                installed,
             );
         }
     }
@@ -443,8 +445,10 @@ pub(super) fn note_survivor_head(
         &mut inner.removals,
         stable_group_id,
         sender,
-        reported,
+        installed,
     );
+    super::rebind::note_survivor_head(&mut inner.rebind, stable_group_id, sender, installed);
+    super::owner_recovery::note_survivor_head(&mut inner.orc, stable_group_id, sender, installed);
 }
 
 /// Ask each of `peers` for a catch-up page of `group_id`, on the existing

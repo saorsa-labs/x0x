@@ -79,9 +79,12 @@ Auth-class labels used throughout this reference:
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
   route, (#1386) `POST /forwards` in every case (including plain hex
-  `peer_agent`), and every `/names*` route. The join-request list,
-  approve and reject are not on this list. They take one class that
-  depends on the group: see **Join-request admin (#1347)** below.
+  `peer_agent`), (#1392) `POST /gui/show`, `DELETE /forwards/:local_addr`
+  (David, 20 Oct 2026, 17:54 BST: a session token or a rider token is
+  refused, the same rule as `POST /forwards`), and every `/names*` route.
+  The join-request list, approve and reject are not on this list. They
+  take one class that depends on the group: see **Join-request admin
+  (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
@@ -986,7 +989,11 @@ open the sync gate; non-enrolled machines are refused at stream accept.
 omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
 lifetime; omitted = until deleted). Response: `machine_id`, `enrolled_at_ms`,
 `expires_at_ms` (null = no expiry), `device_count`. A persistence failure is a
-`500` — success is never reported on a swallowed write.
+`500` — success is never reported on a swallowed write. A `409
+enrollment_tombstoned` means the machine has an unenroll tombstone at or after
+this enrollment's `enrolled_at_ms` (it was deleted after being enrolled, or
+the enrollment is a restore/replay): re-enroll with a freshly issued
+enrollment whose `enrolled_at_ms` is strictly later than the delete time.
 
 **GET /owner/machines (#1383, M1 census)** — the owner's machine census over
 owner-sync. One row per enrolled device with its last-sync status; the local
@@ -1042,10 +1049,18 @@ synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
 boundary), so a synced roster row is not itself mint-capable for riders.
 
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
-machine is refused; existing streams are not torn down mid-flight. `404` when
-the machine is not enrolled; `400` for a malformed id — but the owner gate runs
-FIRST: on a daemon with no owner identity the DELETE answers `409 no owner
-identity configured` regardless of the id's shape.
+machine is refused, and a live session from it stops at its next admission
+re-check (phase or page boundary, or before its commit — #1055). The DELETE
+also writes a durable unenroll tombstone (persisted in
+`<data_dir>/sync/unenroll_tombstones.json`, a versioned envelope) — including
+on the `404` (not enrolled) path — that refuses any later enroll, restore or
+replay whose `enrolled_at_ms` is at or before the delete time; re-enrolling
+requires a freshly issued enrollment with a strictly later `enrolled_at_ms`.
+A corrupt tombstone file or an unknown envelope version fails the daemon
+load closed — never a silent fallback to an empty tombstone store. `404` when
+the machine is not enrolled; `400` for a malformed id — but the owner gate
+runs FIRST: on a daemon with no owner identity the DELETE answers `409 no
+owner identity configured` regardless of the id's shape.
 
 ## Placement and agent key-move (ADR-0043)
 
@@ -3290,6 +3305,29 @@ does not appear in `x0x routes`. What ships today is **point-to-point
 |---|---|---|---|
 | GET | `/gui` | `x0x gui` | Open the embedded browser UI |
 | GET | `/gui/` | — | Alias for `/gui` |
+| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). **durable-owner**: a GUI session bearer and a rider token receive a typed `403`. Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `navigated` means a visible GUI tab accepted the `gui.show` frame on its outbound queue (`gui=1` only while the tab is visible; the tab then sends `gui.visible`). A full queue does not accept the frame. An agent socket, a hidden tab, a tab whose session has expired, and a visible tab that cannot take the frame do not count, and the daemon opens a browser instead. A blocked sender, including this daemon's agent, is `refused`. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). The daemon re-reads `[gui_show]` from the file startup loaded when it serves `POST /acl/reload`. The reload response has no `gui_show` field. That route answers `422` only when an ACL plane fails. |
+
+#### Example: local show
+
+```bash
+# Open or navigate the local GUI to the People view.
+# $TOKEN is the durable owner API token. A GUI session bearer or a rider
+# token receives a typed 403.
+curl -s -X POST http://127.0.0.1:12700/gui/show \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"view":"people"}'
+# { "outcome": "opened", "machine_id": "<hex>", "request_id": "<hex>" }
+
+x0x show people
+x0x show groups/<group_id>/board
+```
+
+`POST /gui/show` requires the durable owner API token (**durable-owner**). A GUI session bearer receives a typed `403`. A rider token receives a typed `403`. The refusal uses the same gate as `POST /forwards`. David approved this on 22 Oct 2026 at 13:30 BST.
+
+View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
+
+Stop does not rewrite the daemon config file. Stop turns local show off in memory first, then writes `gui_show_local_disabled` in the data directory. If that write fails, shows are already off in this process. The WebSocket error frame reports the failure. To turn local show back on, delete `gui_show_local_disabled`. The next show, and `POST /acl/reload`, see that the marker is gone. A daemon config that already sets `local_enabled = true` does not cancel Stop, because Stop does not change that file. After the marker is gone, that config applies again. A file that sets `local_enabled = false` stays off. A file that omits the key uses the default, which is on. There is no new unblock route. Stop does not write `gui_show_blocked.json`. The opener does not inherit daemon stderr. A failed launch revokes the fresh session. The daemon queues the origin banner before it starts the platform opener. It removes that banner when the opener reports a confirmed failure (`no_display`). A queued origin banner stays until the current session token expires. That token lasts 10 minutes, and a refresh starts those 10 minutes again. That includes a hidden tab revealed later. The daemon delivers the banner when the tab sends `gui.visible` with `visible: true`. An opener that is still running at the 2 second deadline counts as `opened` and is not killed. `gui.block` has no success frame. A GUI tab whose session refresh fails sends `gui.visible` with `visible: false` and stops offering `gui=1`, so a later show opens a browser.
 
 ## Error handling
 
@@ -3405,7 +3443,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped` and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped` and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
@@ -3534,10 +3572,10 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service (**durable-owner** in every case) |
-| GET | `/forwards` | `x0x forward list` | List registered forwards |
-| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address |
-| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `socks_denied`, and the connect-ACL snapshot |
+| POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`; **durable-owner** in every case) |
+| GET | `/forwards` | `x0x forward list` | List registered forwards, including persisted forwards that are down |
+| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address and delete its persisted record (**durable-owner**) |
+| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `machine_mismatch`, `socks_denied`, and the connect-ACL snapshot |
 
 `socks_denied` counts SOCKS CONNECT replies of `0x02` (the peer connect gate denied the target). The field is `0` when the SOCKS listener is off.
 
@@ -3565,17 +3603,46 @@ In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact addres
 ```json
 {
   "local_addr": "127.0.0.1:8022",
-  "peer_agent": "<peer agent id hex>",
+  "peer_agent": "<peer agent id hex, or a name>",
   "target_host": "127.0.0.1",
-  "target_port": 22
+  "target_port": 22,
+  "ephemeral": false
 }
 ```
 
-`POST /forwards` requires the durable owner API token (**durable-owner**) in every case. Session and rider tokens receive a typed `403`, including a plain hex `peer_agent` that writes no name or pin. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward.
+`POST /forwards` and `DELETE /forwards/:local_addr` require the durable owner API token (**durable-owner**). David ruled this for `DELETE /forwards/:local_addr` on 20 Oct 2026 at 17:54 BST: a session token or a rider token receives a typed `403`, the same rule as `POST /forwards`. That includes a plain hex `peer_agent` that writes no name or pin, and a delete of an ephemeral forward. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward and could delete any forward.
 
-`local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
+`local_addr` must be loopback. `target_host` must be a numeric loopback IP (no DNS). `POST /forwards` returns `409` when connect is disabled (no ACL loaded). `DELETE /forwards/:local_addr` still removes a saved record in that state and returns `404` when the address is not saved. No running forwarder is required. The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
 
-`peer_agent` also accepts an agent name (`studio.me`, `agent:studio.bob`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. The response then carries the canonical `name`. A `machine:` name, or a bare label that resolves to a machine, is refused with `400` `machine_target_unsupported`. This lasts until forwards check that the stream reaches the pinned `MachineId` (ADR-0074 slice 2). Name errors use the codes listed under Names.
+`peer_agent` also accepts a name (`studio.me`, `agent:studio.bob`, `machine:box.me`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. A machine name opens streams to the one agent that machine's daemon announces. The response carries the canonical `name`, its `kind`, `pinned_machine_id` and `persistent`. Name errors use the codes listed under Names.
+
+**Machine binding (ADR-0074 §1).** A forward with a pinned machine (every machine-name forward and every persistent forward) checks, on every stream, that the stream reached that `MachineId` before any forward-header byte is sent. On a mismatch (the agent moved, or discovery changed) the stream is reset with zero header bytes, the local TCP connection closes, and `GET /streams` `machine_mismatch` counts it.
+
+**Persistence (ADR-0074 §2).** Forwards persist by default in `<data_dir>/forwards.json` (versioned JSON, unknown fields rejected, mode `0600`, written durably). `"ephemeral": true` (`x0x forward add --ephemeral`) keeps a forward in memory only. A persistent forward records `{id, local_addr, name?, kind, pinned_agent_id, pinned_machine_id, target_host, target_port}`, where `id` is the bound `local_addr`. For an agent or hex target, the pinned machine is the machine the agent is bound to when the forward is added; if that is not known yet, a persistent add returns `409` `machine_unknown` (retry once the peer is discovered, or add it as ephemeral). A persistent add returns `503` `forward_store` when `forwards.json` is unreadable or cannot be written, and `409` `forward_store_full` at 1024 forwards. An unreadable file does not block an ephemeral add, and it does not block deletion of a live ephemeral forward. Deleting a persistent forward still returns `503` `forward_store` until the file can be updated. The corrupt file is never overwritten.
+
+At daemon start each persisted forward is re-bound. A named forward is first re-resolved through the name store, where its pin applies, and comes up only if the name still denotes exactly its pinned agent (and, for a machine name, its pinned machine). Otherwise it stays down and is never retargeted: `GET /forwards` lists it with `enabled: false` and an `error` starting with a code — `name_changed` (the name now resolves to another key; delete and re-add the forward to re-pin), a name error code such as `unknown_name`, or `bind_failed` (the port is busy). Forwards that are down are retried every 10 s, so a peer that is discovered after startup comes back without user action; startup never waits for them. An unreadable `forwards.json` restores nothing, is never overwritten, and is reported as `store_error` in `GET /forwards`. When connect is disabled (no ACL loaded) the file is kept and nothing is restored. `GET /forwards` still lists each saved record, with `enabled` false and `error` `connect_disabled: connect forwarding is disabled (no connect ACL loaded)`. `DELETE /forwards/:local_addr` still removes the saved record. No forwarder is required. A persistent add whose record would not load back (for example a non-loopback `target_host`) is refused with `400` `invalid_forward` before the port is bound.
+
+`GET /forwards` returns:
+
+```json
+{
+  "forwards": [
+    {
+      "local_addr": "127.0.0.1:8022",
+      "peer_agent": "<hex>",
+      "target_host": "::1",
+      "target_port": 22,
+      "name": "machine:box.me",
+      "kind": "machine",
+      "pinned_machine_id": "<hex>",
+      "persistent": true,
+      "enabled": true,
+      "error": null
+    }
+  ],
+  "store_error": null
+}
+```
 
 ## Names (ADR-0074)
 
@@ -3624,8 +3691,8 @@ Refusals are `{"ok": false, "error", "code"}`:
 |---|---|---|
 | `invalid_name` | 400 | Outside the grammar |
 | `reserved_label` | 400 | `me`/`agent`/`machine` used as a label |
-| `machine_target_unsupported` | 400 | A machine name where only agents are accepted (`POST /forwards`) |
-| `unknown_name` | 404 | Unbound owner label, or nothing carries the name |
+| `machine_target_unsupported` | 400 | A machine name where the caller asked for an agent only |
+| `unknown_name` | 404 | Unbound owner label, or nothing carries the name (for a forward to a machine name: no single agent is announced on that machine) |
 | `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
 | `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
 | `ambiguous_kind` | 409 | A bare label names both an agent and a machine, even when a pin exists. Retry with `agent:` or `machine:` |

@@ -308,6 +308,16 @@ fn collect_plane_keys(prefix: &str, value: &toml::Value, out: &mut Vec<String>) 
     }
 }
 
+/// Whether startup must refuse a named instance.
+///
+/// A loaded config file with no top-level `network_id` would join prod
+/// without saying so. No config file is allowed: unset means prod. Stop
+/// must not create a file that turns this allowance into a refusal.
+#[must_use]
+pub fn named_instance_refuses_startup(config_file_loaded: bool, network_id: Option<&str>) -> bool {
+    config_file_loaded && network_id.is_none()
+}
+
 /// The startup error for a named instance (`--name`) whose config file sets no
 /// top-level `network_id` (David, 2026-09-29): it would silently join prod.
 #[must_use]

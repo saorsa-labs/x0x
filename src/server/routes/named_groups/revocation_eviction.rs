@@ -468,6 +468,26 @@ fn classify_head_report(info: &GroupInfo, reported: &str) -> HeadReport {
     }
 }
 
+/// The heads a responder that reports `reported` holds (§3 survivor
+/// convergence): the reported head and its ancestors on the local
+/// retained chain. A head off the local chain counts only for itself.
+fn installed_heads(info: &GroupInfo, reported: &str) -> BTreeSet<String> {
+    let mut heads = BTreeSet::from([reported.to_string()]);
+    let mut at = reported;
+    while let Some(prev) = info
+        .commit_log
+        .iter()
+        .find(|retained| retained.commit.state_hash == at)
+        .and_then(|retained| retained.commit.prev_state_hash.as_deref())
+    {
+        if !heads.insert(prev.to_string()) {
+            break;
+        }
+        at = prev;
+    }
+    heads
+}
+
 /// Record one verified, applied, non-truncated catch-up page answer. A
 /// holder at the local head or behind it on the local chain completes the
 /// round: it answered and holds no later head. A holder at a head this
@@ -731,17 +751,18 @@ pub(in crate::server) async fn note_catchup_head(
                     info.stable_group_id().to_string(),
                     info.state_hash.clone(),
                     classify_head_report(info, reported),
+                    installed_heads(info, reported),
                 )
             })
         })
     };
-    let Some((stable, head, report)) = current else {
+    let Some((stable, head, report, installed)) = current else {
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
     // §3: the answer is also the sender's convergence evidence for the
-    // S4 deliveries of this group whose result is the reported head.
-    crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), reported);
+    // S4 deliveries of this group whose result it holds.
+    crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), &installed);
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;
@@ -4817,6 +4838,92 @@ mod tests {
             row.earliest_handoff_receipt_unix_ms,
             Some((not_after + 1) * 1000),
             "T_obs is the raw not_after"
+        );
+        Ok(())
+    }
+
+    /// ADR 0115 §3 (#1508 review r8 P1): a roster certificate is not
+    /// provenance. An attacker that owns a group certifies a victim's key
+    /// under its own user key, seats the victim, and hands off an issuer
+    /// revocation signed by that user key. The receiver must not accept it
+    /// as authority to revoke the victim globally. The control: a verified
+    /// self-revocation on the same hand-off path is accepted.
+    #[tokio::test]
+    async fn a_handoff_revocation_needs_certificate_provenance_not_a_roster_seat(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let attacker = x0x::identity::UserKeypair::generate()?;
+        let victim = x0x::identity::AgentKeypair::generate()?;
+        let victim_hex = hex::encode(victim.agent_id().as_bytes());
+        let sender = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let forged = x0x::identity::AgentCertificate::issue(&attacker, &victim)?;
+        let group_id = "a7".repeat(16);
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        let mut info = GroupInfo::new("s4-prov".into(), String::new(), local, group_id.clone());
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(attacker.user_id());
+        info.add_member(
+            victim_hex.clone(),
+            GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+        );
+        info.add_member(
+            hex::encode(sender.as_bytes()),
+            GroupRole::Admin,
+            Some(local_hex),
+            None,
+        );
+        info.set_member_certificate(&victim_hex, forged)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state.named_groups.write().await.insert(group_id, info);
+
+        let now = now_unix_ms() / 1000;
+        let subject = x0x::revocation::RevokedSubject::Agent(victim.agent_id());
+        let issuer_revocation = x0x::revocation::RevocationRecord::sign(
+            subject.clone(),
+            attacker.public_key(),
+            attacker.secret_key(),
+            now,
+            None,
+        )?;
+        let self_revocation = x0x::revocation::RevocationRecord::sign(
+            subject,
+            victim.public_key(),
+            victim.secret_key(),
+            now,
+            None,
+        )?;
+        let handoff = |record: &x0x::revocation::RevocationRecord| -> anyhow::Result<Vec<u8>> {
+            Ok(s4::encode_handoff(&s4::EvictionHandoffV1 {
+                stable_group_id: stable.clone(),
+                target: *victim.agent_id().as_bytes(),
+                observed_parent_head: String::new(),
+                revocation_records: vec![bincode::serialize(record)?],
+                self_leave_commit: None,
+                expired_certificate: None,
+                renewed_certificate: None,
+            })?)
+        };
+        let holds = |record: &x0x::revocation::RevocationRecord| {
+            let set = state.agent.revocation_set();
+            let hash = record.record_hash();
+            async move { set.read().await.contains_hash(&hash) }
+        };
+
+        receive_handoff(&state, sender, &handoff(&issuer_revocation)?).await;
+        assert!(
+            !holds(&issuer_revocation).await,
+            "a roster certificate issued by a foreign owner authorized a global revocation"
+        );
+        receive_handoff(&state, sender, &handoff(&self_revocation)?).await;
+        assert!(
+            holds(&self_revocation).await,
+            "control: a self-revocation on the hand-off path is accepted"
         );
         Ok(())
     }

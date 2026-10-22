@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 215,
+  "endpoint_count": 216,
   "endpoints": [
     {
       "category": "status",
@@ -3308,6 +3308,30 @@
       }
     },
     {
+      "category": "gui",
+      "cli_name": "show",
+      "description": "Show a GUI view to the human (ADR 0083 local show)",
+      "method": "POST",
+      "path": "/gui/show",
+      "request": {
+        "fields": [
+          {
+            "cli": "VIEW",
+            "in": "body",
+            "name": "view",
+            "required": true
+          },
+          {
+            "cli": "--on",
+            "in": "body",
+            "name": "target_machine",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
       "category": "connect",
       "cli_name": "forward add",
       "description": "Add a local port forward to a peer's loopback service",
@@ -3338,6 +3362,12 @@
             "in": "body",
             "name": "target_port",
             "required": true
+          },
+          {
+            "cli": "--ephemeral",
+            "in": "body",
+            "name": "ephemeral",
+            "required": false
           }
         ],
         "kind": "fields"

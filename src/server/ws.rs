@@ -9,8 +9,8 @@
 //! `state::AppState` are `pub(super)`; everything else is private.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -84,9 +84,185 @@ pub(super) struct WsSession {
     subscribed_topics: HashSet<String>,
     /// Whether this session receives direct messages.
     receives_direct: bool,
+    /// ADR 0083: this socket is a visible GUI tab. `gui=1` sets the initial
+    /// value. `gui.visible` updates it when the tab is shown or hidden.
+    visible_gui: Arc<AtomicBool>,
+    /// Session token from the GUI URL, when this socket presented one.
+    /// A hidden tab keeps it so `gui.visible` can deliver a pending banner.
+    gui_session_token: Option<String>,
+    /// Latest `gui.visible` request. A reveal that waits for a queue slot
+    /// applies this value when the frame is queued. A later show or hide
+    /// replaces it, so the drained queue converges to the latest request.
+    /// The request and the visibility write share `visible_mu`.
+    requested_visible: AtomicBool,
+    /// Serialises a visibility request with the write that follows a queued show.
+    visible_mu: Mutex<()>,
+    /// Reveals whose opened view is still waiting for a queue slot.
+    reveal_inflight: Arc<AtomicUsize>,
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
     /// The drain owns the `JoinHandle`; this is only the abort handle.
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
+    /// This socket's outbound queue.
+    ///
+    /// `POST /gui/show` confirms a slot here before it returns `navigated`.
+    /// Placeholder sessions used by tests that never deliver a frame leave
+    /// this empty.
+    show_outbound: Option<mpsc::Sender<WsOutbound>>,
+}
+
+/// Build a placeholder agent WS session (not a visible GUI tab).
+#[cfg(test)]
+pub(super) fn test_ws_session(id: &str) -> WsSession {
+    test_ws_session_kind(id, false)
+}
+
+/// Build a placeholder visible-GUI WS session for navigate-in-place tests.
+#[cfg(test)]
+pub(super) fn test_gui_ws_session(id: &str) -> WsSession {
+    test_ws_session_kind(id, true)
+}
+
+#[cfg(test)]
+fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
+    WsSession {
+        id: id.to_string(),
+        subscribed_topics: HashSet::new(),
+        receives_direct: false,
+        visible_gui: visible_gui_flag(visible_gui),
+        gui_session_token: None,
+        requested_visible: AtomicBool::new(visible_gui),
+        visible_mu: Mutex::new(()),
+        reveal_inflight: Arc::new(AtomicUsize::new(0)),
+        topic_forwarders: HashMap::new(),
+        show_outbound: None,
+    }
+}
+
+fn visible_gui_flag(visible: bool) -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(visible))
+}
+
+impl WsSession {
+    /// Live visible GUI tab. A hidden tab and an agent socket are not.
+    pub(super) fn is_visible_gui(&self) -> bool {
+        self.visible_gui.load(Ordering::Acquire)
+    }
+
+    /// The GUI tab reports `document.visibilityState`.
+    pub(super) fn set_visible_gui(&self, visible: bool) {
+        self.visible_gui.store(visible, Ordering::Release);
+    }
+
+    fn gui_session_token(&self) -> Option<String> {
+        self.gui_session_token.clone()
+    }
+
+    /// Queue one `gui.show` on this visible tab when its GUI session is live.
+    ///
+    /// Returns `true` only when `session_live` accepts this socket's session
+    /// token and the outbound queue accepts the frame. A hidden tab, a tab
+    /// with no token, an expired or revoked token, a session with no queue,
+    /// and a full or closed queue return `false`. The token is checked
+    /// before the frame is queued. This does not close the socket: a show
+    /// that cannot be queued is not a navigation, and the caller opens a
+    /// browser.
+    pub(super) fn try_accept_gui_show(
+        &self,
+        show: &GuiShowFrame,
+        session_live: impl Fn(&str) -> bool,
+    ) -> bool {
+        if !self.is_visible_gui() {
+            return false;
+        }
+        let Some(token) = self.gui_session_token.as_deref() else {
+            return false;
+        };
+        if token.is_empty() || !session_live(token) {
+            return false;
+        }
+        let Some(tx) = &self.show_outbound else {
+            return false;
+        };
+        tx.try_send(WsOutbound::GuiShow {
+            view: show.view.clone(),
+            banner: show.banner.clone(),
+            agent_id: show.agent_id.clone(),
+            machine_id: show.machine_id.clone(),
+            rider: show.rider,
+            request_id: show.request_id.clone(),
+        })
+        .is_ok()
+    }
+}
+
+/// One `gui.show` frame offered to a live tab's outbound queue.
+pub(super) struct GuiShowFrame {
+    pub(super) view: String,
+    pub(super) banner: String,
+    pub(super) agent_id: String,
+    pub(super) machine_id: String,
+    pub(super) rider: bool,
+    pub(super) request_id: String,
+}
+
+/// Receiver for a test tab's outbound queue.
+#[cfg(test)]
+pub(super) struct GuiShowQueueProbe {
+    rx: Mutex<mpsc::Receiver<WsOutbound>>,
+}
+
+#[cfg(test)]
+impl GuiShowQueueProbe {
+    /// `gui.show` view and banner pairs buffered on this queue.
+    ///
+    /// Other frames, including the filler that saturates the queue, are
+    /// discarded.
+    pub(super) fn gui_shows(&self) -> Vec<(String, String)> {
+        let mut rx = self
+            .rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut shows = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(WsOutbound::GuiShow { view, banner, .. }) => shows.push((view, banner)),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        shows
+    }
+}
+
+/// Insert a visible GUI tab whose outbound queue the route can fill.
+///
+/// `occupied` slots are already taken. `occupied == capacity` is a
+/// saturated live tab: `try_accept_gui_show` must fail. `session_token`
+/// is the GUI session this socket presented. The route accepts a show
+/// only while that token is still live.
+#[cfg(test)]
+pub(super) fn insert_visible_gui_with_queue(
+    sessions: &mut HashMap<String, WsSession>,
+    id: &str,
+    capacity: usize,
+    occupied: usize,
+    session_token: &str,
+) -> GuiShowQueueProbe {
+    assert!(capacity > 0, "outbound capacity must be positive");
+    assert!(
+        occupied <= capacity,
+        "prefill cannot exceed the outbound capacity"
+    );
+    let (tx, rx) = mpsc::channel(capacity);
+    for _ in 0..occupied {
+        tx.try_send(WsOutbound::Pong)
+            .expect("prefill fits in the outbound queue");
+    }
+    let mut session = test_gui_ws_session(id);
+    session.gui_session_token = Some(session_token.to_string());
+    session.show_outbound = Some(tx);
+    sessions.insert(id.to_string(), session);
+    GuiShowQueueProbe { rx: Mutex::new(rx) }
 }
 
 /// Shared state for a single gossip topic subscription shared across WS sessions.
@@ -196,6 +372,16 @@ enum WsOutbound {
     /// ADR-0073: a call lifecycle transition.
     #[serde(rename = "call.state")]
     CallState { call: serde_json::Value },
+    /// ADR 0083: navigate an open GUI tab to a validated view.
+    #[serde(rename = "gui.show")]
+    GuiShow {
+        view: String,
+        banner: String,
+        agent_id: String,
+        machine_id: String,
+        rider: bool,
+        request_id: String,
+    },
 }
 
 /// Client → Server WebSocket command.
@@ -218,6 +404,13 @@ enum WsInbound {
     SendDirect { agent_id: String, payload: String },
     #[serde(rename = "ping")]
     Ping,
+    /// ADR 0083: origin-banner "Stop local shows" (slice 1).
+    #[serde(rename = "gui.block")]
+    GuiBlock { agent_id: String },
+    /// ADR 0083: the GUI tab reports whether it is actually visible.
+    /// A hidden tab must stop counting as a live GUI.
+    #[serde(rename = "gui.visible")]
+    GuiVisible { visible: bool },
 }
 
 /// Backfill request carried on `Subscribe` (ADR-0023 §7).
@@ -470,6 +663,8 @@ fn detach_ws_session(
     direct_mode: bool,
     direct_backfill: Option<usize>,
     durable_owner: bool,
+    visible_gui: bool,
+    session_token: Option<String>,
 ) -> tokio::sync::oneshot::Sender<axum::extract::ws::WebSocket> {
     let (socket_tx, socket_rx) = tokio::sync::oneshot::channel();
     let session_state = Arc::clone(&state);
@@ -486,6 +681,8 @@ fn detach_ws_session(
             direct_mode,
             direct_backfill,
             durable_owner,
+            visible_gui,
+            session_token,
         )
         .await;
     });
@@ -496,11 +693,20 @@ fn detach_ws_session(
 pub(super) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
-    let socket_tx = detach_ws_session(state, false, None, actor.is_durable_owner());
+    let (visible_gui, session_token) = crate::gui::parse_gui_ws_query(raw.as_deref());
+    let socket_tx = detach_ws_session(
+        state,
+        false,
+        None,
+        actor.is_durable_owner(),
+        visible_gui,
+        session_token,
+    );
     ws.on_upgrade(move |socket| async move {
         let _ = socket_tx.send(socket);
     })
@@ -519,11 +725,20 @@ pub(super) async fn ws_direct_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<DirectWsParams>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
     >,
 ) -> impl IntoResponse {
-    let socket_tx = detach_ws_session(state, true, params.backfill, actor.is_durable_owner());
+    let (visible_gui, session_token) = crate::gui::parse_gui_ws_query(raw.as_deref());
+    let socket_tx = detach_ws_session(
+        state,
+        true,
+        params.backfill,
+        actor.is_durable_owner(),
+        visible_gui,
+        session_token,
+    );
     ws.on_upgrade(move |socket| async move {
         let _ = socket_tx.send(socket);
     })
@@ -948,6 +1163,234 @@ async fn feed_direct_backfill_rows(
     hashes
 }
 
+/// Subscribe to navigation broadcasts (`call.*` and `gui.show`).
+///
+/// `handle_ws_connection` calls this before it inserts the session.
+/// Broadcast does not replay. A `gui.show` sent once the session is visible
+/// stays queued on this receiver.
+fn subscribe_navigation(state: &AppState) -> broadcast::Receiver<super::sse::SseEvent> {
+    state.broadcast_tx.subscribe()
+}
+
+/// ADR-0073: forward `call.*` and `gui.show` onto one session queue.
+///
+/// A hidden tab skips `gui.show`. Call events still forward. `None` means
+/// shutdown has closed admission and the task was not started.
+fn spawn_navigation_forwarder(
+    state: &AppState,
+    mut call_rx: broadcast::Receiver<super::sse::SseEvent>,
+    call_tx: mpsc::Sender<WsOutbound>,
+    call_stats: Arc<WsOutboundStats>,
+    call_slow_close: tokio_util::sync::CancellationToken,
+    call_counted: Arc<AtomicBool>,
+    show_visible: Arc<AtomicBool>,
+) -> Option<tokio::task::AbortHandle> {
+    spawn_ws_task(state, async move {
+        loop {
+            let event = match call_rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let out = match event.event_type.as_str() {
+                "call.incoming" => WsOutbound::CallIncoming { call: event.data },
+                "call.state" => WsOutbound::CallState { call: event.data },
+                "gui.show" => {
+                    // `POST /gui/show` does not use this broadcast. It
+                    // confirms a slot on the session queue first. A full
+                    // queue here still drops the frame and closes the
+                    // socket, and reconnect does not replay the broadcast.
+                    if !show_visible.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let view = event
+                        .data
+                        .get("view")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let banner = event
+                        .data
+                        .get("banner")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let agent_id = event
+                        .data
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let machine_id = event
+                        .data
+                        .get("machine_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let rider = event
+                        .data
+                        .get("rider")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let request_id = event
+                        .data
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    WsOutbound::GuiShow {
+                        view,
+                        banner,
+                        agent_id,
+                        machine_id,
+                        rider,
+                        request_id,
+                    }
+                }
+                _ => continue,
+            };
+            if !feed_critical(&call_tx, out, &call_stats, &call_slow_close, &call_counted) {
+                break;
+            }
+        }
+    })
+}
+
+/// Navigation arm plus the session row it protects.
+struct ArmedNavigation {
+    forwarder: tokio::task::AbortHandle,
+    /// `broadcast_tx.receiver_count()` on the line before `ws_sessions.insert`.
+    /// The navigation receiver is already included. Tests use this to fail the
+    /// old insert-then-subscribe order.
+    #[cfg(test)]
+    receivers_at_insert: usize,
+}
+
+/// Subscribe, start the navigation forwarder, then insert `session`.
+///
+/// A spawn failure returns `None` before the insert. The caller must not
+/// abandon a session in that case: nothing was advertised.
+/// Resolve the token the upgrade captured, then queue its banner.
+///
+/// Refresh may already have moved the banner. The returned token is the
+/// one the socket stores. Only a visible tab (`gui=1`) takes the banner
+/// here. That tab is already visible, so a later `gui.visible` true does
+/// not take it again.
+fn open_gui_show_for_upgrade(
+    state: &AppState,
+    outbound_tx: &mpsc::Sender<WsOutbound>,
+    visible: bool,
+    captured: Option<&str>,
+) -> (Option<String>, Option<crate::gui::PendingGuiShow>) {
+    let token = captured.map(|token| state.gui_show.current_gui_session_token(token));
+    let opened = queue_pending_gui_show(state, outbound_tx, visible, token.as_deref());
+    (token, opened)
+}
+
+/// Queue the show this window was opened for, before the session is visible.
+///
+/// Only a visible GUI tab (`gui=1`) may take it. `session_token` is the
+/// token the socket will store. A take still follows a refresh that lands
+/// after that resolve. An agent socket leaves every pending show queued.
+/// The returned value is what was queued, so the caller can put it back
+/// when the session is not admitted.
+fn queue_pending_gui_show(
+    state: &AppState,
+    outbound_tx: &mpsc::Sender<WsOutbound>,
+    visible: bool,
+    session_token: Option<&str>,
+) -> Option<crate::gui::PendingGuiShow> {
+    if !visible {
+        return None;
+    }
+    let token = session_token?;
+    let pending = state
+        .gui_show
+        .take_pending_for_session(token, std::time::Instant::now())?;
+    match outbound_tx.try_send(outbound_gui_show(pending.clone())) {
+        Ok(()) => Some(pending),
+        Err(_) => {
+            state.gui_show.enqueue_pending(pending);
+            None
+        }
+    }
+}
+
+/// Point a GUI socket at the token from `POST /auth/session/refresh`.
+///
+/// The pending banner is rebound in that same refresh. A socket looks the
+/// banner up by the token stored on it. A socket that is already registered
+/// is updated here. An upgrade that authenticated with `from_token` but has
+/// not registered yet still holds that token: the successor is recorded
+/// first, and registration adopts it before the session is inserted.
+pub(super) async fn rebind_gui_ws_tokens(state: &AppState, from_token: &str, to_token: &str) {
+    if from_token.is_empty() || to_token.is_empty() || from_token == to_token {
+        return;
+    }
+    state
+        .gui_show
+        .note_gui_session_successor(from_token, to_token);
+    let mut sessions = state.ws_sessions.write().await;
+    for session in sessions.values_mut() {
+        adopt_refreshed_gui_token(session, state);
+    }
+}
+
+/// Store the token the pending banner uses now.
+///
+/// Call this while holding `ws_sessions`'s write lock. Refresh records the
+/// successor before it takes that lock, then updates sockets under it, so a
+/// registration cannot keep a token the banner has already left.
+fn adopt_refreshed_gui_token(session: &mut WsSession, state: &AppState) {
+    let Some(token) = session.gui_session_token.clone() else {
+        return;
+    };
+    let current = state.gui_show.current_gui_session_token(&token);
+    if current != token {
+        session.gui_session_token = Some(current);
+    }
+}
+
+async fn arm_navigation_and_advertise_session(
+    state: &AppState,
+    mut session: WsSession,
+    outbound_tx: &mpsc::Sender<WsOutbound>,
+    stats: &Arc<WsOutboundStats>,
+    slow_close: &tokio_util::sync::CancellationToken,
+    slow_close_counted: &Arc<AtomicBool>,
+) -> Option<ArmedNavigation> {
+    let call_rx = subscribe_navigation(state);
+    let show_visible = Arc::clone(&session.visible_gui);
+    let forwarder = spawn_navigation_forwarder(
+        state,
+        call_rx,
+        outbound_tx.clone(),
+        Arc::clone(stats),
+        slow_close.clone(),
+        Arc::clone(slow_close_counted),
+        show_visible,
+    )?;
+    // The route confirms this queue before it reports `navigated`. The
+    // sender has to be on the session before insert: that insert is what
+    // makes the tab visible to `POST /gui/show`.
+    session.show_outbound = Some(outbound_tx.clone());
+    // Sample immediately before insert. Subscribe and spawn are above this
+    // line. Moving the insert above them drops `receivers_at_insert` back to
+    // the pre-subscribe count and fails
+    // `visible_gui_subscribes_before_it_is_advertised`.
+    #[cfg(test)]
+    let receivers_at_insert = state.broadcast_tx.receiver_count();
+    let mut sessions = state.ws_sessions.write().await;
+    adopt_refreshed_gui_token(&mut session, state);
+    let session_id = session.id.clone();
+    sessions.insert(session_id, session);
+    Some(ArmedNavigation {
+        forwarder,
+        #[cfg(test)]
+        receivers_at_insert,
+    })
+}
+
 /// Core WebSocket connection lifecycle.
 async fn handle_ws_connection(
     socket: axum::extract::ws::WebSocket,
@@ -955,10 +1398,13 @@ async fn handle_ws_connection(
     direct_mode: bool,
     direct_backfill: Option<usize>,
     durable_owner: bool,
+    visible_gui: bool,
+    session_token: Option<String>,
 ) {
     use axum::extract::ws::Message;
     use futures::StreamExt as FutStreamExt;
 
+    let visible_gui = visible_gui_flag(visible_gui);
     let session_id = uuid::Uuid::new_v4().to_string();
     let (mut ws_tx, mut ws_rx) = socket.split();
     // WS1.1: bounded outbound queue (was the only unbounded channel in
@@ -974,18 +1420,53 @@ async fn handle_ws_connection(
     let slow_close_counted = Arc::new(AtomicBool::new(false));
     let stats = Arc::clone(&state.ws_outbound_stats);
 
-    // Register session
+    // Queue this window's pending show before the session is visible.
+    // A newer `gui.show` broadcast is delivered after that frame, so it
+    // cannot be overwritten by the view this window was opened for.
+    // If the forwarder is not admitted, put the pending show back.
+    // Resolve the upgrade token first. Refresh may already have moved
+    // the banner, and a `gui=1` tab will not take it on a later
+    // `gui.visible` because it is already visible.
+    let (session_token, opened_show) = open_gui_show_for_upgrade(
+        &state,
+        &outbound_tx,
+        visible_gui.load(Ordering::Acquire),
+        session_token.as_deref(),
+    );
+
+    // Subscribe and start the gui.show forwarder, then insert. A concurrent
+    // show can observe the session as soon as the insert returns. Broadcast
+    // does not replay, so the receiver must already exist. Do not insert the
+    // session before this call.
     let session = WsSession {
         id: session_id.clone(),
         subscribed_topics: HashSet::new(),
         receives_direct: direct_mode,
+        visible_gui: Arc::clone(&visible_gui),
+        gui_session_token: session_token.clone(),
+        requested_visible: AtomicBool::new(visible_gui.load(Ordering::Relaxed)),
+        visible_mu: Mutex::new(()),
+        reveal_inflight: Arc::new(AtomicUsize::new(0)),
         topic_forwarders: HashMap::new(),
+        show_outbound: None,
     };
-    state
-        .ws_sessions
-        .write()
-        .await
-        .insert(session_id.clone(), session);
+    let Some(armed) = arm_navigation_and_advertise_session(
+        &state,
+        session,
+        &outbound_tx,
+        &stats,
+        &slow_close,
+        &slow_close_counted,
+    )
+    .await
+    else {
+        // The forwarder was not admitted. The session was not inserted.
+        if let Some(pending) = opened_show {
+            state.gui_show.enqueue_pending(pending);
+        }
+        return;
+    };
+    let call_forwarder = armed.forwarder;
 
     tracing::info!(session_id = %session_id, direct_mode, "WebSocket session opened");
 
@@ -1027,7 +1508,7 @@ async fn handle_ws_connection(
         tracing::debug!(session_id = %writer_session_id, "WebSocket writer stopped");
         let _ = sink_tx.send(ws_tx);
     }) else {
-        abandon_ws_session(&state, &session_id, &[]).await;
+        abandon_ws_session(&state, &session_id, &[call_forwarder]).await;
         return;
     };
 
@@ -1127,44 +1608,12 @@ async fn handle_ws_connection(
             tracing::debug!(session_id = %sid, "Direct message forwarder stopped");
         });
         if admitted.is_none() {
-            abandon_ws_session(&state, &session_id, &[writer_abort]).await;
+            abandon_ws_session(&state, &session_id, &[writer_abort, call_forwarder]).await;
             return;
         }
         admitted
     } else {
         None
-    };
-
-    // ADR-0073: forward `call.*` events from the daemon event channel to
-    // every WS session (plain and direct), so a GUI tab rings.
-    let call_tx = outbound_tx.clone();
-    let call_stats = Arc::clone(&stats);
-    let call_slow_close = slow_close.clone();
-    let call_counted = Arc::clone(&slow_close_counted);
-    let mut call_rx = state.broadcast_tx.subscribe();
-    let Some(call_forwarder) = spawn_ws_task(&state, async move {
-        loop {
-            let event = match call_rx.recv().await {
-                Ok(event) => event,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            };
-            let out = match event.event_type.as_str() {
-                "call.incoming" => WsOutbound::CallIncoming { call: event.data },
-                "call.state" => WsOutbound::CallState { call: event.data },
-                _ => continue,
-            };
-            if !feed_critical(&call_tx, out, &call_stats, &call_slow_close, &call_counted) {
-                break;
-            }
-        }
-    }) else {
-        let mut children = vec![writer_abort];
-        if let Some(direct) = direct_handle {
-            children.push(direct);
-        }
-        abandon_ws_session(&state, &session_id, &children).await;
-        return;
     };
 
     // Spawn keepalive pinger (30s interval). The keepalive is the reliable
@@ -1351,6 +1800,18 @@ fn live_topic_message(
         // Raw live gossip plane: outside ADR-0066 row 25, and the one
         // per-frame path that takes no marker lock.
         quarantine: None,
+    }
+}
+
+/// ADR 0083 origin banner for one GUI socket.
+fn outbound_gui_show(pending: crate::gui::PendingGuiShow) -> WsOutbound {
+    WsOutbound::GuiShow {
+        view: pending.view,
+        banner: pending.banner,
+        agent_id: pending.agent_id,
+        machine_id: pending.machine_id,
+        rider: pending.rider,
+        request_id: pending.request_id,
     }
 }
 
@@ -1788,6 +2249,228 @@ async fn handle_ws_command(
                 );
             }
         }
+
+        WsInbound::GuiBlock { agent_id } => {
+            let aid = match parse_agent_id_hex(&agent_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    feed_droppable(tx, WsOutbound::Error { message: e }, stats);
+                    return;
+                }
+            };
+            if aid == state.agent.agent_id() {
+                // Local Stop writes the data-dir marker and turns show off
+                // in memory. There is no success frame. A marker write
+                // failure uses the existing error frame. Show stays off.
+                if let Err(message) = state.gui_show.disable_local_show() {
+                    feed_droppable(tx, WsOutbound::Error { message }, stats);
+                }
+                return;
+            }
+            state.gui_show.block_agent(&aid);
+        }
+
+        WsInbound::GuiVisible { visible } => {
+            let reveal = {
+                let sessions = state.ws_sessions.read().await;
+                let Some(session) = sessions.get(session_id) else {
+                    return;
+                };
+                // Stay hidden until the pending frame is queued. A show that
+                // arrives after that frame must not be overwritten by the
+                // view this tab was opened for. Store every request. The
+                // reveal that is waiting for a slot applies the latest one
+                // when the frame fits, so a later show or hide wins.
+                begin_gui_visibility_request(session, visible)
+            };
+            if let Some(token) = reveal {
+                if let Some(pending) = state
+                    .gui_show
+                    .take_pending_for_session(&token, std::time::Instant::now())
+                {
+                    match tx.try_send(outbound_gui_show(pending.clone())) {
+                        Ok(()) => {
+                            apply_requested_gui_visibility(state, session_id).await;
+                        }
+                        Err(_) => {
+                            // The queue is full or gone. Hold the show until
+                            // a slot accepts it. Stay hidden while it waits.
+                            let armed = {
+                                let sessions = state.ws_sessions.read().await;
+                                if let Some(session) = sessions.get(session_id) {
+                                    begin_queued_reveal(session);
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if !armed {
+                                state.gui_show.enqueue_pending(pending);
+                                return;
+                            }
+                            // The worker holds this AppState until a slot
+                            // accepts the frame. The shutdown drain must own
+                            // that task. A closed admission does not start it:
+                            // the banner goes back and the waiting reveal ends.
+                            let worker_state = Arc::clone(state);
+                            let worker_tx = tx.clone();
+                            let worker_session = session_id.to_string();
+                            let queued = pending.clone();
+                            if spawn_ws_task(state, async move {
+                                let frame = outbound_gui_show(queued.clone());
+                                let sent = worker_tx.send(frame).await.is_ok();
+                                finish_queued_reveal(&worker_state, &worker_session, sent).await;
+                                if !sent {
+                                    worker_state.gui_show.enqueue_pending(queued);
+                                }
+                            })
+                            .is_none()
+                            {
+                                finish_queued_reveal(state, session_id, false).await;
+                                state.gui_show.enqueue_pending(pending);
+                            }
+                        }
+                    }
+                } else {
+                    apply_requested_gui_visibility(state, session_id).await;
+                }
+            }
+        }
+    }
+}
+
+fn visibility_lock(session: &WsSession) -> std::sync::MutexGuard<'_, ()> {
+    session
+        .visible_mu
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record `gui.visible`. Returns the session token when a hidden tab asks
+/// to be shown and this socket has a token to match a pending banner.
+fn begin_gui_visibility_request(session: &WsSession, visible: bool) -> Option<String> {
+    let _guard = visibility_lock(session);
+    session.requested_visible.store(visible, Ordering::Release);
+    if !visible {
+        session.set_visible_gui(false);
+        return None;
+    }
+    if session.is_visible_gui() {
+        return None;
+    }
+    session.gui_session_token()
+}
+
+fn begin_queued_reveal(session: &WsSession) {
+    let _guard = visibility_lock(session);
+    session.reveal_inflight.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Mark the tab visible when the latest request is a show and no reveal
+/// is still waiting for a queue slot.
+fn restore_requested_visibility(session: &WsSession) {
+    let _guard = visibility_lock(session);
+    if session.reveal_inflight.load(Ordering::Acquire) == 0
+        && session.requested_visible.load(Ordering::Acquire)
+    {
+        session.set_visible_gui(true);
+    }
+}
+
+async fn apply_requested_gui_visibility(state: &AppState, session_id: &str) {
+    if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+        restore_requested_visibility(session);
+    }
+}
+
+/// The queued frame has left the wait. Apply the latest visibility request
+/// when the send was accepted and this was the last waiting reveal.
+async fn finish_queued_reveal(state: &AppState, session_id: &str, sent: bool) {
+    let sessions = state.ws_sessions.read().await;
+    let Some(session) = sessions.get(session_id) else {
+        return;
+    };
+    let _guard = visibility_lock(session);
+    session.reveal_inflight.fetch_sub(1, Ordering::AcqRel);
+    if sent
+        && session.reveal_inflight.load(Ordering::Acquire) == 0
+        && session.requested_visible.load(Ordering::Acquire)
+    {
+        session.set_visible_gui(true);
+    }
+}
+
+/// A full outbound queue with one pending origin banner. The receiver stays
+/// in this value so the reveal worker remains blocked on `send` until the
+/// caller drops it or the shutdown drain aborts the worker.
+#[cfg(test)]
+pub(super) struct FullQueueBannerHold {
+    _tx: mpsc::Sender<WsOutbound>,
+    _rx: mpsc::Receiver<WsOutbound>,
+    pub(super) reveal_inflight: usize,
+    pub(super) visible: bool,
+    pub(super) pending: bool,
+}
+
+/// Drive the real full-queue `gui.visible` path. The returned hold keeps the
+/// only queue slot occupied, so the banner worker stays parked on send.
+#[cfg(test)]
+pub(super) async fn arm_full_queue_banner_reveal(state: &Arc<AppState>) -> FullQueueBannerHold {
+    let token = "full-queue-shutdown";
+    let session_id = "full-queue-shutdown";
+    state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+        view: "network".to_string(),
+        banner: "Opened by test on test".to_string(),
+        agent_id: "aa".repeat(32),
+        machine_id: "bb".repeat(32),
+        rider: false,
+        request_id: "req".to_string(),
+        session_token: token.to_string(),
+        created_at: std::time::Instant::now(),
+    });
+    state.ws_sessions.write().await.insert(
+        session_id.to_string(),
+        WsSession {
+            id: session_id.to_string(),
+            subscribed_topics: HashSet::new(),
+            receives_direct: false,
+            visible_gui: visible_gui_flag(false),
+            gui_session_token: Some(token.to_string()),
+            requested_visible: AtomicBool::new(false),
+            visible_mu: Mutex::new(()),
+            reveal_inflight: Arc::new(AtomicUsize::new(0)),
+            topic_forwarders: HashMap::new(),
+            show_outbound: None,
+        },
+    );
+    let (tx, rx) = mpsc::channel::<WsOutbound>(1);
+    let stats = WsOutboundStats::default();
+    tx.try_send(WsOutbound::Pong)
+        .expect("fill the only outbound slot");
+    handle_ws_command(
+        state,
+        session_id,
+        r#"{"type":"gui.visible","visible":true}"#,
+        &tx,
+        &stats,
+        false,
+    )
+    .await;
+    tokio::task::yield_now().await;
+    let (reveal_inflight, visible) = {
+        let sessions = state.ws_sessions.read().await;
+        let session = sessions.get(session_id).expect("session");
+        (
+            session.reveal_inflight.load(Ordering::Acquire),
+            session.is_visible_gui(),
+        )
+    };
+    FullQueueBannerHold {
+        _tx: tx,
+        _rx: rx,
+        reveal_inflight,
+        visible,
+        pending: state.gui_show.has_pending_session(token),
     }
 }
 
@@ -2136,8 +2819,942 @@ mod tests {
                 id: session_id.to_string(),
                 subscribed_topics: HashSet::new(),
                 receives_direct: false,
+                visible_gui: visible_gui_flag(false),
+                gui_session_token: None,
+                requested_visible: AtomicBool::new(false),
+                visible_mu: Mutex::new(()),
+                reveal_inflight: Arc::new(AtomicUsize::new(0)),
                 topic_forwarders: HashMap::new(),
+                show_outbound: None,
             },
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_local_show_persists_disabled_and_reload_reenables() {
+        let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n",
+        )
+        .expect("config");
+        state.gui_show.set_config_path(Some(path.clone()));
+        let own = hex::encode(state.agent.agent_id().as_bytes());
+        let cmd = serde_json::json!({
+            "type": "gui.block",
+            "agent_id": own,
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s-self", &cmd, &tx, &stats, false).await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "gui.block has no success frame"
+        );
+        assert!(
+            !state.gui_show.config().local_enabled,
+            "stop applies local_enabled = false"
+        );
+        assert!(
+            !state.gui_show.is_blocked(&state.agent.agent_id()),
+            "stop must not use the block list"
+        );
+        assert!(!dir.path().join("gui_show_blocked.json").exists());
+        let original = "[gui_show]\nlocal_enabled = true\nremote_enabled = true\n";
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("config"),
+            original,
+            "stop leaves the daemon config unchanged"
+        );
+        assert!(dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .is_file());
+        std::fs::write(&path, original).expect("human sets local_enabled = true");
+        state
+            .gui_show
+            .reload_from_disk()
+            .expect("reload of an unchanged config");
+        assert!(
+            !state.gui_show.config().local_enabled,
+            "an unchanged local_enabled = true does not cancel Stop"
+        );
+        assert!(dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .is_file());
+        std::fs::remove_file(dir.path().join(crate::gui::show::LOCAL_SHOW_STOP_FILE))
+            .expect("delete marker");
+        assert!(
+            state.gui_show.config().local_enabled,
+            "deleting the marker turns local show back on"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_without_a_config_path_persists_and_has_no_success_frame() {
+        let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let own = hex::encode(state.agent.agent_id().as_bytes());
+        let cmd = serde_json::json!({
+            "type": "gui.block",
+            "agent_id": own,
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s-embedded", &cmd, &tx, &stats, false).await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "gui.block has no success frame"
+        );
+        assert!(
+            !state.gui_show.config().local_enabled,
+            "stop applies without a daemon config path"
+        );
+        assert!(dir
+            .path()
+            .join(crate::gui::show::LOCAL_SHOW_STOP_FILE)
+            .is_file());
+        assert!(!dir.path().join("config.toml").exists());
+        assert!(!state.gui_show.is_blocked(&state.agent.agent_id()));
+    }
+
+    #[tokio::test]
+    async fn other_agent_block_persists_without_a_success_frame() {
+        let (state, dir) = crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let other = crate::identity::AgentId([9u8; 32]);
+        let cmd = serde_json::json!({
+            "type": "gui.block",
+            "agent_id": hex::encode(other.as_bytes()),
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s-other", &cmd, &tx, &stats, false).await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "gui.block has no success frame on the existing socket"
+        );
+        assert!(state.gui_show.is_blocked(&other));
+        assert!(dir.path().join("gui_show_blocked.json").exists());
+    }
+
+    #[tokio::test]
+    async fn hidden_tab_receives_pending_banner_when_it_becomes_visible() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "hidden-session-token";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "hidden-gui").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("hidden-gui")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(
+            &state,
+            "hidden-gui",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a tab that stays hidden must not take the banner"
+        );
+        assert!(state.gui_show.has_pending_session(token));
+        handle_ws_command(
+            &state,
+            "hidden-gui",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        match rx.recv().await.expect("banner") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "people"),
+            other => panic!("expected gui.show, got {other:?}"),
+        }
+        assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// A hidden tab refreshes its session before the WebSocket reconnects.
+    /// The banner was minted for the original token. The new connection
+    /// must still receive it (ADR 0083 §5).
+    #[tokio::test]
+    async fn hidden_tab_refresh_before_reconnect_keeps_the_pending_banner() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-refresh".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by other on other".to_string(),
+            agent_id: "cc".repeat(32),
+            machine_id: "dd".repeat(32),
+            rider: false,
+            request_id: "req-other".to_string(),
+            session_token: "other-tab".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("refresh body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("refresh json");
+        let fresh = json["session_token"]
+            .as_str()
+            .expect("new session token")
+            .to_string();
+        assert_ne!(fresh, old);
+        assert!(
+            !state.gui_show.has_pending_session(&old),
+            "the original token must not keep the banner after refresh"
+        );
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let opened = queue_pending_gui_show(&state, &tx, true, Some(&fresh));
+        assert!(
+            opened.is_some(),
+            "the reconnect with the refreshed token must take the banner"
+        );
+        match rx.recv().await.expect("banner") {
+            WsOutbound::GuiShow { view, banner, .. } => {
+                assert_eq!(view, "people");
+                assert!(
+                    banner.contains("Opened by test on test"),
+                    "the refreshed tab must still show the origin banner: {banner}"
+                );
+            }
+            other => panic!("expected gui.show, got {other:?}"),
+        }
+        assert!(
+            state.gui_show.has_pending_session("other-tab"),
+            "another tab's banner must stay queued"
+        );
+    }
+
+    /// The socket is already open and hidden when refresh runs. `gui.visible`
+    /// then looks up the token stored on that socket.
+    #[tokio::test]
+    async fn open_hidden_socket_keeps_the_banner_across_refresh() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-open".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "hidden-refresh").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("hidden-refresh")
+            .expect("session")
+            .gui_session_token = Some(old.clone());
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(
+            &state,
+            "hidden-refresh",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        match rx.recv().await.expect("banner") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "people"),
+            other => panic!("expected gui.show, got {other:?}"),
+        }
+    }
+
+    /// The upgrade authenticated with the old token, then refresh ran, then
+    /// the socket registered. The banner has moved. `gui.visible` must still
+    /// deliver it. Without the successor recorded for that late registration,
+    /// the tab is marked visible and the banner stays queued.
+    #[tokio::test]
+    async fn refresh_before_registration_keeps_the_banner_on_the_socket() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-late".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by other on other".to_string(),
+            agent_id: "cc".repeat(32),
+            machine_id: "dd".repeat(32),
+            rider: false,
+            request_id: "req-other".to_string(),
+            session_token: "other-tab".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        // Authenticated, not registered. This is the token the upgrade captured.
+        let session = WsSession {
+            id: "late-upgrade".to_string(),
+            subscribed_topics: HashSet::new(),
+            receives_direct: false,
+            visible_gui: visible_gui_flag(false),
+            gui_session_token: Some(old.clone()),
+            requested_visible: AtomicBool::new(false),
+            visible_mu: Mutex::new(()),
+            reveal_inflight: Arc::new(AtomicUsize::new(0)),
+            topic_forwarders: HashMap::new(),
+            show_outbound: None,
+        };
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("refresh body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("refresh json");
+        let fresh = json["session_token"]
+            .as_str()
+            .expect("new session token")
+            .to_string();
+        assert_ne!(fresh, old);
+        assert!(
+            !state.gui_show.has_pending_session(&old),
+            "refresh moves the banner off the token the upgrade captured"
+        );
+        assert!(state.gui_show.has_pending_session(&fresh));
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            session,
+            &tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("the upgrade registers after refresh");
+        {
+            let sessions = state.ws_sessions.read().await;
+            let registered = sessions.get("late-upgrade").expect("session");
+            assert!(
+                !registered.is_visible_gui(),
+                "registration leaves the hidden tab hidden"
+            );
+            assert_eq!(
+                registered.gui_session_token(),
+                Some(fresh.clone()),
+                "the socket must follow the banner onto the refreshed token"
+            );
+        }
+        handle_ws_command(
+            &state,
+            "late-upgrade",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        match rx.try_recv() {
+            Ok(WsOutbound::GuiShow { view, banner, .. }) => {
+                assert_eq!(view, "people");
+                assert!(
+                    banner.contains("Opened by test on test"),
+                    "gui.visible must deliver the origin banner: {banner}"
+                );
+            }
+            other => panic!(
+                "gui.visible missed the banner and would mark the tab visible without it: {other:?}"
+            ),
+        }
+        assert!(
+            state
+                .ws_sessions
+                .read()
+                .await
+                .get("late-upgrade")
+                .expect("session")
+                .is_visible_gui(),
+            "the tab becomes visible once the banner is queued"
+        );
+        assert!(!state.gui_show.has_pending_session(&fresh));
+        assert!(
+            state.gui_show.has_pending_session("other-tab"),
+            "another tab's banner must stay queued"
+        );
+        armed.forwarder.abort();
+    }
+
+    /// The tab connects with `gui=1`, so it is visible before any
+    /// `gui.visible` frame. Refresh has already moved the banner off the
+    /// token the upgrade captured. The open path must take that banner.
+    /// A later `gui.visible` true does not: the tab is already visible.
+    #[tokio::test]
+    async fn visible_upgrade_keeps_the_banner_when_refresh_runs_first() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-visible".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by other on other".to_string(),
+            agent_id: "cc".repeat(32),
+            machine_id: "dd".repeat(32),
+            rider: false,
+            request_id: "req-other".to_string(),
+            session_token: "other-tab".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("refresh body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("refresh json");
+        let fresh = json["session_token"]
+            .as_str()
+            .expect("new session token")
+            .to_string();
+        assert_ne!(fresh, old);
+        assert!(
+            !state.gui_show.has_pending_session(&old),
+            "refresh moves the banner off the token the upgrade captured"
+        );
+        assert!(state.gui_show.has_pending_session(&fresh));
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        // Production still holds `old` from the upgrade. `gui=1` is visible.
+        let (token, opened) = open_gui_show_for_upgrade(&state, &tx, true, Some(&old));
+        assert!(
+            opened.is_some(),
+            "a visible upgrade must take the banner after refresh moved it"
+        );
+        assert_eq!(token.as_deref(), Some(fresh.as_str()));
+        match rx.try_recv() {
+            Ok(WsOutbound::GuiShow { view, banner, .. }) => {
+                assert_eq!(view, "people");
+                assert!(
+                    banner.contains("Opened by test on test"),
+                    "the open path must deliver the origin banner: {banner}"
+                );
+            }
+            other => {
+                panic!("gui=1 missed the banner; a later gui.visible would skip it: {other:?}")
+            }
+        }
+        let mut session = test_gui_ws_session("visible-refresh");
+        session.gui_session_token = token;
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            session,
+            &tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("the visible upgrade registers after refresh");
+        {
+            let sessions = state.ws_sessions.read().await;
+            let registered = sessions.get("visible-refresh").expect("session");
+            assert!(
+                registered.is_visible_gui(),
+                "gui=1 stays visible, so gui.visible true will not deliver"
+            );
+            assert_eq!(registered.gui_session_token(), Some(fresh.clone()));
+        }
+        handle_ws_command(
+            &state,
+            "visible-refresh",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "gui.visible must not be what delivers the banner on a gui=1 tab"
+        );
+        assert!(!state.gui_show.has_pending_session(&fresh));
+        assert!(
+            state.gui_show.has_pending_session("other-tab"),
+            "another tab's banner must stay queued"
+        );
+        armed.forwarder.abort();
+    }
+
+    /// WHY: a full outbound queue used to drop the opened view after it had
+    /// been taken. The tab was then marked visible, so the banner was gone.
+    #[tokio::test]
+    async fn saturated_queue_keeps_the_opened_show_until_it_fits() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "saturated-session";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "saturated-gui").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("saturated-gui")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "saturated-gui",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(WsOutbound::Pong)),
+            "the filler stays; the opened show is not dropped to make room"
+        );
+        assert!(
+            !state
+                .ws_sessions
+                .read()
+                .await
+                .get("saturated-gui")
+                .expect("session")
+                .is_visible_gui(),
+            "the tab stays hidden until the opened show is queued"
+        );
+        match rx.recv().await.expect("opened show") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
+            other => panic!("expected the preserved gui.show, got {other:?}"),
+        }
+        let visible = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state
+                    .ws_sessions
+                    .read()
+                    .await
+                    .get("saturated-gui")
+                    .expect("session")
+                    .is_visible_gui()
+                {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("visibility follows the queued show");
+        assert!(visible);
+        assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// WHY: a reveal that waits for a full queue must not mark the tab
+    /// visible after a newer hide. Otherwise later shows navigate a hidden tab.
+    #[tokio::test]
+    async fn delayed_reveal_does_not_undo_a_newer_hide() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "hide-while-full";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "hide-gui").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("hide-gui")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "hide-gui",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        handle_ws_command(
+            &state,
+            "hide-gui",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(matches!(rx.try_recv(), Ok(WsOutbound::Pong)));
+        match rx.recv().await.expect("opened show still queued") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
+            other => panic!("expected the preserved gui.show, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sessions = state.ws_sessions.read().await;
+        let session = sessions.get("hide-gui").expect("session");
+        assert_eq!(session.reveal_inflight.load(Ordering::Acquire), 0);
+        assert!(
+            !session.is_visible_gui(),
+            "a hide that arrived while the queue was full stays hidden"
+        );
+    }
+
+    /// WHY: a full queue, then visible true, false, then true, used to drop
+    /// the last show. The waiting reveal kept the first epoch. When the
+    /// queue drained, that stale epoch left the tab hidden, so a later show
+    /// opened another browser instead of navigating this tab.
+    #[tokio::test]
+    async fn full_queue_show_hide_show_restores_the_visible_tab() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "show-hide-show";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "show-hide-show").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("show-hide-show")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        for visible in [true, false, true] {
+            let command = format!(r#"{{"type":"gui.visible","visible":{visible}}}"#);
+            handle_ws_command(&state, "show-hide-show", &command, &tx, &stats, false).await;
+        }
+        {
+            let sessions = state.ws_sessions.read().await;
+            let session = sessions.get("show-hide-show").expect("session");
+            assert_eq!(session.reveal_inflight.load(Ordering::Acquire), 1);
+            assert!(
+                !session.is_visible_gui(),
+                "the tab stays hidden until the opened show is queued"
+            );
+        }
+        assert!(matches!(rx.try_recv(), Ok(WsOutbound::Pong)));
+        match rx.recv().await.expect("opened show still queued") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
+            other => panic!("expected the preserved gui.show, got {other:?}"),
+        }
+        let visible = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sessions = state.ws_sessions.read().await;
+                let session = sessions.get("show-hide-show").expect("session");
+                if session.reveal_inflight.load(Ordering::Acquire) == 0 && session.is_visible_gui()
+                {
+                    return true;
+                }
+                drop(sessions);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the drained queue restores the latest show");
+        assert!(visible);
+        assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// WHY: shutdown closes detached-task admission before this handler
+    /// runs. The worker must not start. The banner returns to the queue and
+    /// the tab stays hidden, with no task left holding `AppState`.
+    #[tokio::test]
+    async fn full_queue_banner_is_refused_when_admission_is_closed() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        {
+            let mut admission = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = admission.take().expect("admission starts open");
+            assert!(
+                running.is_empty(),
+                "closing admission must not detach a task the test state already owns"
+            );
+        }
+        let token = "admission-closed";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "admission-closed").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("admission-closed")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "admission-closed",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        tokio::task::yield_now().await;
+        {
+            let sessions = state.ws_sessions.read().await;
+            let session = sessions.get("admission-closed").expect("session");
+            assert_eq!(session.reveal_inflight.load(Ordering::Acquire), 0);
+            assert!(
+                !session.is_visible_gui(),
+                "a refused reveal must leave the tab hidden"
+            );
+        }
+        assert!(
+            state.gui_show.has_pending_session(token),
+            "a refused reveal must put the banner back"
+        );
+        let state_weak = Arc::downgrade(&state);
+        drop(state);
+        assert_eq!(
+            state_weak.strong_count(),
+            0,
+            "a refused reveal must not leave a task holding AppState"
+        );
+        drop(rx);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn repeated_reveal_stays_hidden_until_the_banner_is_queued() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "reveal-twice";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "reveal-twice").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("reveal-twice")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "reveal-twice",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        handle_ws_command(
+            &state,
+            "reveal-twice",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(
+            !state
+                .ws_sessions
+                .read()
+                .await
+                .get("reveal-twice")
+                .expect("session")
+                .is_visible_gui(),
+            "a second reveal must not mark the tab visible while the banner is still waiting"
+        );
+        assert!(matches!(rx.try_recv(), Ok(WsOutbound::Pong)));
+        match rx.recv().await.expect("opened show still queued") {
+            WsOutbound::GuiShow { view, .. } => assert_eq!(view, "network"),
+            other => panic!("expected the preserved gui.show, got {other:?}"),
+        }
+        let mut visible = false;
+        for _ in 0..50 {
+            if state
+                .ws_sessions
+                .read()
+                .await
+                .get("reveal-twice")
+                .expect("session")
+                .is_visible_gui()
+            {
+                visible = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            visible,
+            "the tab becomes visible once the opened view is queued"
         );
     }
 
@@ -3665,5 +5282,196 @@ mod tests {
             }
         }
         bodies
+    }
+
+    /// A visible GUI session subscribes to `gui.show` before it is advertised.
+    ///
+    /// `arm_navigation_and_advertise_session` is the order
+    /// `handle_ws_connection` uses: subscribe, spawn the forwarder, sample
+    /// `broadcast_tx.receiver_count()`, then `ws_sessions.insert`. The old
+    /// order inserted first. `receivers_at_insert` then omitted this socket,
+    /// so the assertion fails. Broadcast does not replay.
+    ///
+    /// A second task sends `gui.show` as soon as it sees a visible GUI
+    /// session. The forwarder must place a `GuiShow` frame on that session's
+    /// outbound queue before the deadline.
+    #[tokio::test]
+    async fn visible_gui_subscribes_before_it_is_advertised() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let before = state.broadcast_tx.receiver_count();
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+
+        let state_watch = Arc::clone(&state);
+        let watcher = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let visible = state_watch
+                    .ws_sessions
+                    .read()
+                    .await
+                    .values()
+                    .any(WsSession::is_visible_gui);
+                if visible {
+                    let _ = state_watch.broadcast_tx.send(crate::server::sse::SseEvent {
+                        event_type: "gui.show".to_string(),
+                        data: serde_json::json!({
+                            "view": "people",
+                            "banner": "origin",
+                            "agent_id": "aa",
+                            "machine_id": "bb",
+                            "rider": false,
+                            "request_id": "cc",
+                        }),
+                    });
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            test_gui_ws_session("visible-gui"),
+            &outbound_tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("navigation forwarder admitted");
+        assert!(
+            armed.receivers_at_insert > before,
+            "navigation subscribe must raise receiver_count before the session is visible; old insert-then-subscribe order left the count at {before}, saw {}",
+            armed.receivers_at_insert
+        );
+        assert!(
+            state
+                .ws_sessions
+                .read()
+                .await
+                .values()
+                .any(WsSession::is_visible_gui),
+            "production advertise inserts a visible GUI session"
+        );
+
+        let view = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(WsOutbound::GuiShow { view, .. }) => return view,
+                    Some(_) => continue,
+                    None => panic!("outbound queue closed before gui.show"),
+                }
+            }
+        })
+        .await
+        .expect("gui.show missed: visible session had no navigation receiver");
+        assert_eq!(view, "people");
+        armed.forwarder.abort();
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_show_is_queued_before_a_newer_navigation() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let token = "opened-window";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+
+        assert!(
+            queue_pending_gui_show(&state, &outbound_tx, true, Some(token)).is_some(),
+            "the opened window's show is taken before the session is visible"
+        );
+        match outbound_rx.try_recv() {
+            Ok(WsOutbound::GuiShow { view, .. }) => assert_eq!(view, "network"),
+            other => panic!("pending show must already be queued, got {other:?}"),
+        }
+        assert!(
+            !state
+                .ws_sessions
+                .read()
+                .await
+                .values()
+                .any(WsSession::is_visible_gui),
+            "the pending frame is queued before any GUI session is advertised"
+        );
+
+        let state_watch = Arc::clone(&state);
+        let watcher = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let visible = state_watch
+                    .ws_sessions
+                    .read()
+                    .await
+                    .values()
+                    .any(WsSession::is_visible_gui);
+                if visible {
+                    let _ = state_watch.broadcast_tx.send(crate::server::sse::SseEvent {
+                        event_type: "gui.show".to_string(),
+                        data: serde_json::json!({
+                            "view": "people",
+                            "banner": "newer",
+                            "agent_id": "aa",
+                            "machine_id": "bb",
+                            "rider": false,
+                            "request_id": "newer",
+                        }),
+                    });
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            test_gui_ws_session("visible-gui"),
+            &outbound_tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("navigation forwarder admitted");
+        let newer = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match outbound_rx.recv().await {
+                    Some(WsOutbound::GuiShow { view, .. }) => return view,
+                    Some(_) => continue,
+                    None => panic!("outbound queue closed"),
+                }
+            }
+        })
+        .await
+        .expect("the newer navigation is delivered after the pending show");
+        assert_eq!(newer, "people");
+        armed.forwarder.abort();
+        watcher.abort();
     }
 }

@@ -58,8 +58,8 @@ use x0x::identity::{AgentCertificate, AgentId};
 use x0x::logging::LogHexId;
 
 use super::crypto_exclusion::{
-    apply_round, finish_attempt, guarded_admission_for, head_rule_admits, next_attempt,
-    write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
+    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 
 pub(super) mod replay_log;
@@ -1271,10 +1271,12 @@ async fn prune_admin_waits(state: &AppState) {
 /// `gate` gives each recipient's write inputs, read before the plan:
 /// `None` when D60 withholds the write this round (agent, machine or
 /// binding revocation), else its `certificate_rebind_v1` support. A
-/// recipient no longer Active (`active`) is dropped. A `Sent` or
-/// `InFlight` recipient is left alone. Every planned change names the
-/// status it read, so [`apply_round`] applies it only while that status is
-/// still stored. Returns the updates and the recipients whose support is
+/// recipient no longer Active (`active`) is dropped. A `Converged` or
+/// `InFlight` recipient is left alone. A `Sent` recipient is sent the
+/// frame again: a write is not delivery (ADR 0110 §3), so it is retried
+/// until the recipient's head shows it installed the rebind. Every planned
+/// change names the status it read, so [`apply_round`] applies it only
+/// while that status is still stored. Returns the updates and the recipients whose support is
 /// unknown (an advert refresh is due).
 fn plan_round(
     recipients: &BTreeMap<[u8; 32], RecipientDelivery>,
@@ -1295,7 +1297,7 @@ fn plan_round(
         }
         if matches!(
             observed,
-            RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+            RecipientDelivery::Converged | RecipientDelivery::InFlight(_)
         ) {
             continue;
         }
@@ -1320,10 +1322,39 @@ fn plan_round(
 }
 
 /// Install one round's plan into the stored delivery under the runtime
-/// lock. Returns the `(recipient, attempt)` sends to start, after the lock
-/// is released: each one's `InFlight` status exists before its task runs.
-fn install_round(delivery: &mut Delivery, updates: Vec<RoundUpdate>) -> Vec<([u8; 32], u64)> {
-    apply_round(&mut delivery.recipients, updates)
+/// lock, and drop the delivery once every recipient converged (ADR 0110
+/// §3: survivor convergence, not a write, proves delivery). Returns the
+/// `(recipient, attempt)` sends to start, after the lock is released:
+/// each one's `InFlight` status exists before its task runs.
+fn install_round(
+    rebind: &mut RebindState,
+    key: &(String, String),
+    updates: Vec<RoundUpdate>,
+) -> Vec<([u8; 32], u64)> {
+    let Some(delivery) = rebind.deliveries.get_mut(key) else {
+        return Vec::new();
+    };
+    let started = apply_round(&mut delivery.recipients, updates);
+    if all_converged(&delivery.recipients) {
+        rebind.deliveries.remove(key);
+    }
+    started
+}
+
+/// §3 survivor convergence ([`super::crypto_exclusion::note_survivor_head`]):
+/// `sender` holds each head in `installed`, so it converged in each rebind
+/// delivery of `stable_group_id` whose result is one of them.
+pub(super) fn note_survivor_head(
+    rebind: &mut RebindState,
+    stable_group_id: &str,
+    sender: &[u8; 32],
+    installed: &BTreeSet<String>,
+) {
+    for ((stable, result_head), delivery) in &mut rebind.deliveries {
+        if stable == stable_group_id {
+            note_converged(&mut delivery.recipients, result_head, sender, installed);
+        }
+    }
 }
 
 /// Record the result of send attempt `attempt` to `recipient`. Only that
@@ -1414,16 +1445,22 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         };
         let active: BTreeSet<[u8; 32]> = other_active_members(&info, &local).into_iter().collect();
         let mut gates: HashMap<[u8; 32], Option<Option<bool>>> = HashMap::new();
+        let mut head_asks: Vec<AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
             if !active.contains(recipient)
                 || matches!(
                     status,
-                    RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+                    RecipientDelivery::Converged | RecipientDelivery::InFlight(_)
                 )
             {
                 continue;
             }
             let agent = AgentId(*recipient);
+            // §3: a written frame is not an installed one. Ask the
+            // recipient for its head (its convergence evidence).
+            if *status == RecipientDelivery::Sent {
+                head_asks.push(agent);
+            }
             let gate = if write_allowed(state, &agent).await {
                 Some(capabilities.verified_registry_supports(
                     &agent,
@@ -1439,21 +1476,12 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         });
         // Install every status, `InFlight` included, BEFORE any send task
         // starts: a fast completion can then never be overwritten.
-        let started = {
-            let mut inner = state.revocation_evictions.inner.lock().await;
-            let Some(stored) = inner.rebind.deliveries.get_mut(&key) else {
-                continue;
-            };
-            let started = install_round(stored, updates);
-            if stored
-                .recipients
-                .values()
-                .all(|status| *status == RecipientDelivery::Sent)
-            {
-                inner.rebind.deliveries.remove(&key);
-            }
-            started
-        };
+        let started = install_round(
+            &mut state.revocation_evictions.inner.lock().await.rebind,
+            &key,
+            updates,
+        );
+        ask_heads(state, &key.0, head_asks);
         for (recipient, attempt) in started {
             spawn_send(
                 state,
@@ -2065,11 +2093,7 @@ mod tests {
         let (updates, refreshes) = plan_round(&snapshot, &active, |_| Some(Some(true)));
         assert!(refreshes.is_empty());
         let stale_plan = updates.clone();
-        let started = rebind
-            .deliveries
-            .get_mut(&key)
-            .map(|delivery| install_round(delivery, updates))
-            .unwrap_or_default();
+        let started = install_round(&mut rebind, &key, updates);
         let [(recipient, attempt)] = started.as_slice() else {
             panic!("exactly one send starts: {started:?}");
         };
@@ -2089,11 +2113,7 @@ mod tests {
         ));
         // A late write of a plan made from the old `Due` snapshot changes
         // nothing, and starts no second send.
-        let late = rebind
-            .deliveries
-            .get_mut(&key)
-            .map(|delivery| install_round(delivery, stale_plan))
-            .unwrap_or_default();
+        let late = install_round(&mut rebind, &key, stale_plan);
         assert!(late.is_empty());
         assert_eq!(
             rebind.deliveries[&key].recipients.get(&survivor),
@@ -2109,9 +2129,63 @@ mod tests {
         ));
     }
 
+    /// ADR 0110 §3 (#1508 review r8 P1): a successful write is `Sent`,
+    /// not delivered. A recipient that took the frame but did not install
+    /// the rebind keeps the delivery, and the next round sends the frame
+    /// again. Only its head report that holds the result head ends it.
+    #[test]
+    fn a_written_rebind_without_install_keeps_retrying() {
+        let survivor = [5; 32];
+        let key = ("g".to_string(), "r".to_string());
+        let mut rebind = RebindState::default();
+        rebind.deliveries.insert(
+            key.clone(),
+            delivery_to(&[(survivor, RecipientDelivery::Due)]),
+        );
+        let active = BTreeSet::from([survivor]);
+        let round = |rebind: &mut RebindState| {
+            let snapshot = rebind.deliveries[&key].recipients.clone();
+            let (updates, _) = plan_round(&snapshot, &active, |_| Some(Some(true)));
+            install_round(rebind, &key, updates)
+        };
+        let &[(_, attempt)] = round(&mut rebind).as_slice() else {
+            panic!("one send starts");
+        };
+        assert!(complete_send(
+            &mut rebind,
+            &key,
+            &survivor,
+            attempt,
+            RecipientDelivery::Sent
+        ));
+        // The receiver crashed before it persisted the rebind: no install.
+        let resend = round(&mut rebind);
+        assert_eq!(
+            resend.len(),
+            1,
+            "a write without an install is retried, not complete"
+        );
+        let &[(_, resent)] = resend.as_slice() else {
+            panic!("one resend starts");
+        };
+        assert!(complete_send(
+            &mut rebind,
+            &key,
+            &survivor,
+            resent,
+            RecipientDelivery::Sent
+        ));
+        // A head report of a later head on the chain through "r" is the
+        // recipient's convergence evidence: the delivery ends.
+        let installed = BTreeSet::from(["r".to_string(), "r2".to_string()]);
+        note_survivor_head(&mut rebind, "g", &survivor, &installed);
+        assert!(round(&mut rebind).is_empty());
+        assert!(!rebind.deliveries.contains_key(&key));
+    }
+
     /// A round drops recipients that left the roster, withholds a D60
-    /// refusal without changing its status, leaves `InFlight` and `Sent`
-    /// alone, and marks lacking and unknown support (refresh due).
+    /// refusal without changing its status, leaves `InFlight` alone, and
+    /// marks lacking and unknown support (refresh due).
     #[test]
     fn a_round_plans_from_the_gate_and_the_roster() {
         let (due, gone, withheld, lacking, unknown, busy) =

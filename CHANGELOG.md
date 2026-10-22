@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-kind gossip efficiency counters on `GET /diagnostics/gossip` (#1170).**
+  `per_kind.current` is the open interval and `per_kind.last_completed` is the
+  previous finished interval. Every reader receives the same
+  `last_completed` until the next rotation. Each interval reports
+  `bus_dispatched` / `bus_dropped`, `delivered`, and `published` per PlumTree
+  message kind, with `since_ts` and `window_secs`. `window_secs` includes a
+  fraction of a second and is never `0` for a non-empty interval. The health
+  verdict lists kinds over a 40% share of bus events. `delivered` and
+  `published` are Eager PlumTree traffic; same-daemon `local:` hand-offs are
+  not counted. Per-kind verify CPU is not in this slice. The receive pump
+  still peeks a PubSub kind only under ADR 0013 pressure.
+
 ### Changed
 
 - **`x0xd --check-updates` now only reports update availability (#1370).**
