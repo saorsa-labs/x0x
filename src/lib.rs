@@ -5511,23 +5511,49 @@ fn deserialize_machine_announcement(
         .deserialize(payload)
 }
 
-/// #1112 (round 10): a cached row whose address list names a pinned seed
-/// address that excludes its identity is refused at cache CONSUMPTION —
-/// the join tiers never dial it, whatever wrote the row. The seam evicts
-/// a mismatched identity's row on refusal, but a delayed ant-quic
+/// #1112 (round 10, refactored round 21): the cache-consumption fence is
+/// ADDRESS-scoped, like every other #1112 verdict. The seam evicts a
+/// mismatched identity's row on refusal, but a delayed ant-quic
 /// reachability write (`observe_direct_reachability` off connection
-/// completion) can re-create the row afterwards; this pair check is the
-/// durable fence.
-fn cached_row_pinned_mismatch(
+/// completion) can re-create the row afterwards; the pair checks here
+/// are the durable fence.
+fn cached_addr_pinned_mismatch(peer_id: &ant_quic::PeerId, addr: &std::net::SocketAddr) -> bool {
+    matches!(
+        network::seed_pin_check(network::pinned_seed_peer_ids(*addr), peer_id.0),
+        network::SeedPinVerdict::Mismatch { .. }
+    )
+}
+
+/// The addresses of a cached row the pin verdict still allows. Phase 0
+/// dials only these (#1112 round 21, Codex P2: a mismatching sibling
+/// address costs itself, not the row's valid addresses — the whole-row
+/// drop used to lose every join path a mixed row still had).
+fn cached_row_addresses_allowed(
+    peer_id: &ant_quic::PeerId,
+    addresses: &[std::net::SocketAddr],
+) -> Vec<std::net::SocketAddr> {
+    addresses
+        .iter()
+        .filter(|addr| !cached_addr_pinned_mismatch(peer_id, addr))
+        .copied()
+        .collect()
+}
+
+/// A row is refused at consumption only when EVERY address mismatches a
+/// pin set that excludes the identity — a fully poisoned row is dialled
+/// by id never (#1112 round 3; the cache itself stays untouched for
+/// ant-quic's own accounting). A MIXED row keeps its Phase 1 candidacy
+/// (round 21): an id dial cannot be steered per address, so the
+/// post-dial pair partition and the live-session guards refuse a
+/// landing on the bad address instead.
+fn cached_row_fully_pinned_mismatch(
     peer_id: &ant_quic::PeerId,
     addresses: &[std::net::SocketAddr],
 ) -> bool {
-    addresses.iter().any(|addr| {
-        matches!(
-            network::seed_pin_check(network::pinned_seed_peer_ids(*addr), peer_id.0),
-            network::SeedPinVerdict::Mismatch { .. }
-        )
-    })
+    !addresses.is_empty()
+        && addresses
+            .iter()
+            .all(|addr| cached_addr_pinned_mismatch(peer_id, addr))
 }
 
 /// Compute coordinator / relay hint lists for an announcement.
@@ -14801,19 +14827,19 @@ impl Agent {
         // phase starts no dial, and a cancellation ends its dial batch.
         if let Some(ref cache) = self.bootstrap_cache {
             let coordinators = cache.select_coordinators(6).await;
-            // #1112 (round 10): fence rejected pairs at cache consumption
-            // — the seam evicts a mismatched row, but a delayed ant-quic
-            // reachability write can re-create it; the pair check here is
-            // the durable filter, before any dial is spent.
-            let coordinators: Vec<_> = coordinators
-                .into_iter()
-                .filter(|peer| {
-                    !cached_row_pinned_mismatch(&peer.peer_id, &peer.preferred_addresses())
-                })
-                .collect();
+            // #1112 (round 10, address-scoped round 21): fence rejected
+            // pairs at cache consumption — the seam evicts a mismatched
+            // row, but a delayed ant-quic reachability write can re-create
+            // it; the pair check here is the durable filter, before any
+            // dial is spent. Round 21 (Codex P2): only the MISMATCHING
+            // addresses drop — a row with a stale pinned seed address and
+            // a valid address keeps the valid one (the whole-row filter
+            // used to lose both join paths).
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
                 .iter()
-                .flat_map(|peer| peer.preferred_addresses())
+                .flat_map(|peer| {
+                    cached_row_addresses_allowed(&peer.peer_id, &peer.preferred_addresses())
+                })
                 .collect();
 
             if !coordinator_addrs.is_empty() && !self.shutdown_token.is_cancelled() {
@@ -14833,16 +14859,12 @@ impl Agent {
                 // the same pin verdict as the seed tiers — a pinned
                 // address that answered with an identity outside its pin
                 // set never becomes a join candidate, on any join path.
-                let (admitted, _pin_rejected): (Vec<_>, Vec<_>) =
-                    succeeded.into_iter().partition(|(addr, peer_id)| {
-                        !matches!(
-                            network::seed_pin_check(
-                                network::pinned_seed_peer_ids(*addr),
-                                peer_id.0
-                            ),
-                            network::SeedPinVerdict::Mismatch { .. }
-                        )
-                    });
+                // Round 21: one shared per-address predicate
+                // (`cached_addr_pinned_mismatch`) backs every consumption
+                // check, pre- and post-dial.
+                let (admitted, _pin_rejected): (Vec<_>, Vec<_>) = succeeded
+                    .into_iter()
+                    .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(peer_id, addr));
                 all_connected.extend(admitted.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
@@ -15430,17 +15452,21 @@ impl Agent {
         };
         const PHASE1_PEER_CANDIDATES: usize = 12;
         let mut cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
-        // #1112 (review round 3, scoped round 7): cached joins take the
-        // pin verdict PAIR-SCOPED. A cached peer that lists a pinned seed
-        // address but is not in that address's pin set is a poisoned cache
-        // row — dial it by id never (drop the row, keep the cache untouched
-        // for ant-quic's own accounting). A row whose addresses do not
-        // mismatch stays a candidate even if some OTHER seed address
-        // mismatched the identity: the rejection is scoped to that
-        // address, and the dial seam plus its bounded backoff refuse the
-        // bad address on any later dial.
-        cached_peers
-            .retain(|peer| !cached_row_pinned_mismatch(&peer.peer_id, &peer.preferred_addresses()));
+        // #1112 (review round 3, scoped rounds 7 and 21): cached joins
+        // take the pin verdict PAIR-SCOPED, and an id dial cannot be
+        // steered per address — so only a FULLY poisoned row (every
+        // address mismatches a pin set that excludes the identity) is
+        // dropped; the cache itself stays untouched for ant-quic's own
+        // accounting. A MIXED row (stale pinned seed address + valid
+        // address) stays a candidate (round 21, Codex P2: the whole-row
+        // drop used to lose the valid address too). If the id dial lands
+        // on the bad address anyway, the post-dial pair partition below
+        // and the live-session guards refuse that landing, and the dial
+        // seam plus its bounded backoff refuse the address on any later
+        // address dial.
+        cached_peers.retain(|peer| {
+            !cached_row_fully_pinned_mismatch(&peer.peer_id, &peer.preferred_addresses())
+        });
         if cached_peers.is_empty() || stop.is_cancelled() {
             return;
         }
@@ -15448,10 +15474,19 @@ impl Agent {
         let (succeeded, _failed) = self
             .connect_cached_peers_parallel_tracked(network, &cached_peers, stop)
             .await;
-        candidates.extend(succeeded.iter().copied());
+        // #1112 (round 21): ant-quic's id dial tries every cached address
+        // of a row, so a mixed row's landing can be the mismatching
+        // address — this tier takes the same post-dial pair partition as
+        // Phase 0 (round 2): a pinned address that answered with an
+        // identity outside its pin set never becomes a join candidate, on
+        // any join path.
+        let (admitted, _pin_rejected): (Vec<_>, Vec<_>) = succeeded
+            .into_iter()
+            .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(peer_id, addr));
+        candidates.extend(admitted.iter().copied());
         tracing::info!(
             "Phase 1: {}/{} cached peers connected",
-            succeeded.len(),
+            admitted.len(),
             cached_peers.len()
         );
     }
@@ -40997,7 +41032,8 @@ mod peer_connected_handler_integration_tests {
             // re-create it. The join tiers fence rejected pairs at cache
             // CONSUMPTION — the row is never dialled, whatever wrote it.
             // Runtime-RED before the consumption fence: Phase 0 dialled
-            // whatever `select_coordinators` returned.
+            // whatever `select_coordinators` returned. Round 21 keeps the
+            // fence address-scoped (see the mixed-row test below).
             const PINNED_KEY: [u8; 32] = [0xAE; 32];
             const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
                 addr: "198.51.100.7:5483",
@@ -41006,20 +41042,69 @@ mod peer_connected_handler_integration_tests {
             let _pins = network::override_dial_pins_for_test(&PINS);
             let rejected = ant_quic::PeerId([0x77; 32]);
             let pinned_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
-            // The rewritten row (the delayed writer's product).
+            // The rewritten row (the delayed writer's product): every
+            // address mismatches, so no tier touches it.
             assert!(
-                cached_row_pinned_mismatch(&rejected, &[pinned_addr]),
+                cached_row_fully_pinned_mismatch(&rejected, &[pinned_addr]),
                 "a re-created row for a mismatching pair is refused at consumption"
             );
+            assert!(
+                cached_row_addresses_allowed(&rejected, &[pinned_addr]).is_empty(),
+                "a fully poisoned row contributes no dial address"
+            );
             // Other addresses, and the pinned member itself, stay eligible.
-            assert!(!cached_row_pinned_mismatch(
+            assert!(!cached_row_fully_pinned_mismatch(
                 &rejected,
                 &["203.0.113.9:40000".parse().unwrap()]
             ));
-            assert!(!cached_row_pinned_mismatch(
+            assert!(!cached_row_fully_pinned_mismatch(
                 &ant_quic::PeerId(PINNED_KEY),
                 &[pinned_addr]
             ));
+        }
+
+        #[test]
+        fn issue1112_mixed_cache_row_keeps_its_valid_addresses() {
+            // Review round 21 (Codex P2: a valid cached address was
+            // discarded with a mismatching one): the consumption fence is
+            // ADDRESS-scoped. A row listing stale pinned seed address A
+            // (whose pin set excludes the identity) and valid address B
+            // keeps B on every join path: Phase 0 dials only B (A is
+            // filtered out before any dial is spent), and Phase 1 keeps
+            // the row — an id dial cannot be steered per address, so a
+            // landing on A is refused by the post-dial pair partition
+            // and the live-session guards, never by losing B. Runtime-RED
+            // before round 21: the any-mismatch row drop removed the row
+            // — and with it B — from both tiers.
+            const PINNED_KEY: [u8; 32] = [0xAF; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&PINNED_KEY],
+            }];
+            let _pins = network::override_dial_pins_for_test(&PINS);
+            let rejected = ant_quic::PeerId([0x66; 32]);
+            let bad_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
+            let good_addr: std::net::SocketAddr = "203.0.113.9:40000".parse().unwrap();
+            let mixed_row = [bad_addr, good_addr];
+            // Phase 0: only the valid address is dialled.
+            assert_eq!(
+                cached_row_addresses_allowed(&rejected, &mixed_row),
+                vec![good_addr],
+                "a mismatching sibling address must not cost the row its valid address"
+            );
+            // Phase 1: the mixed row stays a candidate; a fully poisoned
+            // row still drops, and the pinned member itself is untouched.
+            assert!(!cached_row_fully_pinned_mismatch(&rejected, &mixed_row));
+            assert!(cached_row_fully_pinned_mismatch(&rejected, &[bad_addr]));
+            assert!(!cached_row_fully_pinned_mismatch(
+                &ant_quic::PeerId(PINNED_KEY),
+                &[bad_addr]
+            ));
+            // The post-dial pair partition (round 21) uses the same
+            // per-address verdict: a landing on the bad address never
+            // becomes a join candidate; a landing on the good one does.
+            assert!(cached_addr_pinned_mismatch(&rejected, &bad_addr));
+            assert!(!cached_addr_pinned_mismatch(&rejected, &good_addr));
         }
 
         #[test]
