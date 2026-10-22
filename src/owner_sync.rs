@@ -5889,6 +5889,63 @@ mod issuance_journal_sync_tests {
         }
     }
 
+    /// Codex review of #1545 (3b18ea7): the register accepts `d1@100` and
+    /// then `d2@100`, but each accepted record's journal append is its own
+    /// task, so the appends can run in the other order. The journal must
+    /// still end on the register's winner `d2`. If it ends on `d1`, the
+    /// next reconcile mints the older certificate over the register.
+    #[tokio::test]
+    async fn reordered_appends_keep_the_register_winner() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let journal = dir.path().join(crate::profile::CERT_JOURNAL_FILE);
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let value = |digest: &str, not_after| SyncValue::IssuanceJournal {
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(not_after),
+        };
+        let (d1, d2) = (value("d1", 5_000), value("d2", 9_000));
+        for accepted in [&d1, &d2] {
+            store
+                .mint(
+                    SyncKind::IssuanceJournal,
+                    "bb",
+                    accepted,
+                    &owner,
+                    machine(2),
+                )
+                .await
+                .expect("commit");
+        }
+
+        // The tasks for d2 and then d1 run: the reverse of commit order.
+        for applied in [&d2, &d1] {
+            let (agent_id, cert_digest, issued_at, not_after) = fields(applied);
+            append_synced_journal_line(
+                journal.clone(),
+                owner_hex.clone(),
+                agent_id,
+                cert_digest,
+                issued_at,
+                not_after,
+            )
+            .await;
+        }
+
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        let minted = latest_journal_values(lines, &owner_hex);
+        assert_eq!(
+            minted.get("bb"),
+            Some(&d2),
+            "the journal must end on the register's winner"
+        );
+    }
+
     /// A pre-fix synced line (same digest, no `not_after`) never hides a
     /// known expiry, in either order; a newer issuance still wins.
     #[test]
