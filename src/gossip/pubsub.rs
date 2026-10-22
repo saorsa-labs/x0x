@@ -2710,15 +2710,6 @@ impl PubSubManager {
         self.plumtree.stage_stats()
     }
 
-    /// Cheap cumulative per-[`MessageKind`] outer ML-DSA verify meters.
-    ///
-    /// Atomic loads only — does not call [`Self::stage_stats`]. Reads never
-    /// reset the counters. Used by `#1170` / Track E M1 `per_kind` diagnostics.
-    #[must_use]
-    pub fn verify_by_kind_stats(&self) -> saorsa_gossip_pubsub::PerKindVerifyMeterSnapshot {
-        self.plumtree.verify_by_kind_stats()
-    }
-
     /// Snapshot of inbound frames/bytes per (topic class, PlumTree kind).
     ///
     /// Surfaced at `GET /diagnostics/gossip` as `inbound_by_topic` (#674)
@@ -3377,6 +3368,12 @@ impl PubSubManager {
         // counters (#674), the Leaf refuse gate, and the IWANT repair
         // tracker — no crypto.
         let inspected = saorsa_gossip_pubsub::inspect_message_header(&data);
+        // #1170: the worker already inspected this header for routing. Count
+        // the frame as bus-dispatched here so the receive pump can keep ADR
+        // 0013's steady-state path free of a kind peek.
+        if let Some(header) = inspected.as_ref() {
+            crate::gossip::per_kind::per_kind_counters().record_bus_dispatched(header.kind);
+        }
         let ordinary_frame = inspected
             .as_ref()
             .filter(|header| !header.hop_local_control);
@@ -3411,9 +3408,11 @@ impl PubSubManager {
         // Recovery, cancellation, a replay, and a failed verification drain
         // with the id absent.
         //
-        // #1170: outer ML-DSA verify cost is attributed per MessageKind inside
-        // saorsa-gossip (`verify_by_kind_stats`). Do not call `stage_stats()`
-        // or re-count verifies on this hot path.
+        // Outer ML-DSA verify stays inside saorsa-gossip. Do not call
+        // `stage_stats()` or re-count verifies on this hot path. The pinned
+        // crate has no per-kind verify meter, so diagnostics leave
+        // `verify_ok` / `verify_err` at zero rather than sampling a shared
+        // stage counter across workers.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
@@ -9963,17 +9962,21 @@ mod tests {
         assert_eq!(decoded.payload, Bytes::from("signed-modern"));
     }
 
-    /// #1170: `handle_incoming` must attribute outer verify via the native
-    /// gossip meter (not `stage_stats` deltas) and merge into `per_kind`.
+    /// #1170: `handle_incoming` counts bus dispatch from the header it already
+    /// inspects. It does not sample `stage_stats` for verify time.
     #[tokio::test]
-    async fn issue1170_handle_incoming_wires_native_verify_by_kind() {
-        let meter = crate::gossip::per_kind::PerKindGossipCounters::new();
+    async fn issue1170_handle_incoming_counts_inspected_kind_as_dispatched() {
         let manager = PubSubManager::new(test_node().await, test_support::signing_context())
             .expect("manager");
         let topic = "issue1170-verify-wire";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let _sub = manager.subscribe(topic.to_string()).await;
-        let before = manager.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        let before = crate::gossip::per_kind::per_kind_counters()
+            .snapshot()
+            .kinds
+            .get("eager")
+            .map(|row| row.bus_dispatched)
+            .unwrap_or(0);
 
         let inner = remote_signed_inner(topic, Bytes::from("verify-wire"));
         let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, true);
@@ -9981,21 +9984,15 @@ mod tests {
             .handle_incoming(PeerId::new([0x17; 32]), None, frame)
             .await;
 
-        let after = manager.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        let after = crate::gossip::per_kind::per_kind_counters()
+            .snapshot()
+            .kinds
+            .get("eager")
+            .map(|row| row.bus_dispatched)
+            .unwrap_or(0);
         assert!(
-            after.attempts > before.attempts,
-            "native meter must count the Eager verify: before={before:?} after={after:?}"
-        );
-        assert_eq!(
-            after.failures, before.failures,
-            "valid signature must not increment failures"
-        );
-        let snap = meter.snapshot_with_verify(manager.verify_by_kind_stats());
-        let eager = snap.kinds.get("eager").expect("eager row");
-        assert!(eager.verify_ok.count >= 1);
-        assert_eq!(
-            eager.verify_err.count,
-            after.failures.saturating_sub(before.failures)
+            after > before,
+            "inspected Eager frame must count as bus_dispatched: before={before} after={after}"
         );
     }
 
@@ -10032,8 +10029,7 @@ mod tests {
             .expect("local delivery timeout")
             .expect("subscriber closed");
 
-        let global_after = crate::gossip::per_kind::per_kind_counters()
-            .snapshot_with_verify(manager.verify_by_kind_stats());
+        let global_after = crate::gossip::per_kind::per_kind_counters().snapshot();
         let pub_after = global_after
             .kinds
             .get("eager")

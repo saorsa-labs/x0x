@@ -10,10 +10,12 @@ All notable changes to this project will be documented in this file.
   `per_kind` reports rolling-window `verify_ok` / `verify_err` (count and
   `total_ns`), `bus_dispatched` / `bus_dropped`, `delivered`, and `published`
   per PlumTree message kind, with `since_ts` and an M1 health verdict that
-  flags kinds over a 40% share of verify CPU or bus pressure. Verify rows
-  come from saorsa-gossip `verify_by_kind_stats()`; `delivered` /
-  `published` are Eager-only. Needs the pending saorsa-gossip release that
-  ships that API (PR #122) before CI can compile.
+  flags kinds over a 40% share of verify CPU or bus events. `delivered` /
+  `published` are Eager-only. `window_secs` is the elapsed length of the
+  reported interval. `verify_ok` / `verify_err` stay zero while the pinned
+  saorsa-gossip crate has no per-kind verify meter (saorsa-gossip PR #122 is
+  merged upstream and is not in the published 0.5.90 crate). The receive
+  pump still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
 

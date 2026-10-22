@@ -6,20 +6,22 @@
 //! cumulatives. When the window elapses, the previous completed interval is
 //! retained so a slow poller still sees the measurement.
 //!
-//! Outer-frame verify ok/err comes from saorsa-gossip's native
-//! [`saorsa_gossip_pubsub::PlumtreePubSub::verify_by_kind_stats`] (cumulative,
-//! never reset by a read). x0x does not re-count verifies on the receive path.
 //! `delivered` and `published` are Eager-only (local subscriber hand-off and
-//! local mesh publish). The gossip `failures` counter counts ML-DSA signature
-//! verify failures only; it excludes ADR-012 payload-hash mismatches and
-//! RejectV1 policy rejections.
+//! local mesh publish). Verify rows are a caller-supplied cumulative. The
+//! pinned saorsa-gossip 0.5.90 crate has no per-kind verify meter, so
+//! diagnostics pass an empty cumulative and `verify_ok` / `verify_err` stay
+//! zero. x0x does not sample `stage_stats()` on the receive path.
+//!
+//! The reporting clock starts when the meter is created, with a zero
+//! baseline taken at that same moment. `window_secs` is the elapsed seconds
+//! of the interval being reported. Rotation checks and the baseline update
+//! share one lock.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use saorsa_gossip_pubsub::{KindVerifyCounters, PerKindVerifyMeterSnapshot};
 use saorsa_gossip_types::MessageKind;
 use serde::Serialize;
 
@@ -95,11 +97,40 @@ struct LocalKindCumulative {
     published: u64,
 }
 
+/// Cumulative outer-verify observations for one kind.
+///
+/// `attempts` includes successes and failures. `failures` is the error count.
+/// `total_ns` is wall time for every attempt. The diagnostics row puts that
+/// time on `verify_ok` because this cumulative does not split time by outcome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct WindowBaseline {
-    verify: [KindVerifyCounters; PER_KIND_NAMES.len()],
-    local: [LocalKindCumulative; PER_KIND_NAMES.len()],
+struct KindVerifyCumulative {
+    attempts: u64,
+    failures: u64,
+    total_ns: u64,
+}
+
+/// One cumulative verify snapshot, indexed like [`PER_KIND_NAMES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifyByKind {
+    by_kind: [KindVerifyCumulative; PER_KIND_NAMES.len()],
+}
+
+impl Default for VerifyByKind {
+    fn default() -> Self {
+        Self {
+            by_kind: [KindVerifyCumulative::default(); PER_KIND_NAMES.len()],
+        }
+    }
+}
+
+/// Clock, baseline, and the interval they describe. One lock covers all three
+/// so two readers cannot both rotate.
+#[derive(Debug)]
+struct WindowState {
+    started: Instant,
     since_ts_ms: u64,
+    verify: [KindVerifyCumulative; PER_KIND_NAMES.len()],
+    local: [LocalKindCumulative; PER_KIND_NAMES.len()],
 }
 
 /// Count plus cumulative nanoseconds (verify paths).
@@ -164,18 +195,16 @@ pub struct PerKindGossipSnapshot {
     pub health: PerKindHealthVerdict,
 }
 
-/// Map native verify counters into the diagnostics `verify_ok` / `verify_err`
-/// shape. Time is not split by outcome upstream (`total_ns` covers all
-/// attempts); failure count comes from the native `failures` field.
+/// Map verify cumulatives into the diagnostics `verify_ok` / `verify_err`
+/// shape. Time is not split by outcome (`total_ns` covers all attempts).
 fn kind_row_from_parts(
-    verify: KindVerifyCounters,
+    verify: KindVerifyCumulative,
     local: LocalKindCumulative,
 ) -> KindCountersSnapshot {
     let ok = verify.attempts.saturating_sub(verify.failures);
     KindCountersSnapshot {
         verify_ok: CountAndNs {
             count: ok,
-            // All verify wall time; native meter does not split ok vs err ns.
             total_ns: verify.total_ns,
         },
         verify_err: CountAndNs {
@@ -190,10 +219,10 @@ fn kind_row_from_parts(
 }
 
 fn saturating_verify_delta(
-    cur: KindVerifyCounters,
-    base: KindVerifyCounters,
-) -> KindVerifyCounters {
-    KindVerifyCounters {
+    cur: KindVerifyCumulative,
+    base: KindVerifyCumulative,
+) -> KindVerifyCumulative {
+    KindVerifyCumulative {
         attempts: cur.attempts.saturating_sub(base.attempts),
         failures: cur.failures.saturating_sub(base.failures),
         total_ns: cur.total_ns.saturating_sub(base.total_ns),
@@ -213,9 +242,9 @@ fn saturating_local_delta(
 }
 
 fn rows_from_delta(
-    verify: &PerKindVerifyMeterSnapshot,
+    verify: &VerifyByKind,
     local: &[LocalKindCumulative; PER_KIND_NAMES.len()],
-    baseline: &WindowBaseline,
+    baseline: &WindowState,
 ) -> [KindCountersSnapshot; PER_KIND_NAMES.len()] {
     let mut rows = [KindCountersSnapshot::default(); PER_KIND_NAMES.len()];
     for (index, row) in rows.iter_mut().enumerate() {
@@ -252,10 +281,7 @@ fn snapshot_from_rows(
 #[derive(Debug)]
 pub struct PerKindGossipCounters {
     slots: [KindSlot; PER_KIND_NAMES.len()],
-    window_started: Mutex<Instant>,
-    baseline: Mutex<WindowBaseline>,
-    /// Last fully completed window (retained across reads after rotation).
-    last_completed: Mutex<Option<(u64, [KindCountersSnapshot; PER_KIND_NAMES.len()])>>,
+    window_state: Mutex<WindowState>,
     window: Duration,
     cpu_share_threshold: f64,
     bus_share_threshold: f64,
@@ -279,9 +305,12 @@ impl PerKindGossipCounters {
     pub fn with_window(window: Duration) -> Self {
         Self {
             slots: std::array::from_fn(|_| KindSlot::default()),
-            window_started: Mutex::new(Instant::now()),
-            baseline: Mutex::new(WindowBaseline::default()),
-            last_completed: Mutex::new(None),
+            window_state: Mutex::new(WindowState {
+                started: Instant::now(),
+                since_ts_ms: unix_ms_now().max(1),
+                verify: [KindVerifyCumulative::default(); PER_KIND_NAMES.len()],
+                local: [LocalKindCumulative::default(); PER_KIND_NAMES.len()],
+            }),
             window,
             cpu_share_threshold: PER_KIND_CPU_SHARE_THRESHOLD,
             bus_share_threshold: PER_KIND_BUS_SHARE_THRESHOLD,
@@ -292,75 +321,37 @@ impl PerKindGossipCounters {
         std::array::from_fn(|i| self.slots[i].load())
     }
 
-    /// Ensure the window clock is running. Baseline counters stay at zero so
-    /// the first snapshot reports absolute cumulatives since process start.
-    fn ensure_started(&self) {
-        let Ok(mut baseline) = self.baseline.lock() else {
-            return;
-        };
-        if baseline.since_ts_ms != 0 {
-            return;
-        }
-        baseline.since_ts_ms = unix_ms_now().max(1);
-        if let Ok(mut started) = self.window_started.lock() {
-            *started = Instant::now();
-        }
+    fn lock_window(&self) -> MutexGuard<'_, WindowState> {
+        self.window_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Advance the window when elapsed. Preserves the completed interval in
-    /// `last_completed` instead of discarding it. Cumulative counters are
-    /// never cleared.
-    fn maybe_rotate(
-        &self,
-        verify: &PerKindVerifyMeterSnapshot,
-        local: &[LocalKindCumulative; PER_KIND_NAMES.len()],
-    ) -> bool {
-        self.ensure_started();
-        let Ok(started) = self.window_started.lock() else {
-            return false;
-        };
-        if started.elapsed() < self.window {
-            return false;
+    /// Move the open interval's start into the past. Tests use this to
+    /// exercise a delayed first read and a slow poll without sleeping.
+    #[cfg(test)]
+    fn backdate(&self, by: Duration) {
+        let mut state = self.lock_window();
+        if let Some(started) = state.started.checked_sub(by) {
+            state.started = started;
         }
-        drop(started);
-
-        let Ok(mut baseline) = self.baseline.lock() else {
-            return false;
-        };
-        // A zero since_ts means ensure_started lost the race; do not rotate.
-        if baseline.since_ts_ms == 0 {
-            return false;
-        }
-        let completed = rows_from_delta(verify, local, &baseline);
-        let completed_since = baseline.since_ts_ms;
-        if let Ok(mut last) = self.last_completed.lock() {
-            *last = Some((completed_since, completed));
-        }
-        baseline.verify = verify.by_kind;
-        baseline.local = *local;
-        baseline.since_ts_ms = unix_ms_now().max(1);
-        if let Ok(mut started) = self.window_started.lock() {
-            *started = Instant::now();
-        }
-        true
+        let millis = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        state.since_ts_ms = state.since_ts_ms.saturating_sub(millis).max(1);
     }
 
-    /// Zero the reporting window by re-baselining at the current cumulatives.
-    /// Does not clear process-lifetime counters. Used by tests.
-    pub fn rolling_reset(&self) {
-        let verify = PerKindVerifyMeterSnapshot::default();
+    /// Re-baseline the open interval at the current cumulatives.
+    ///
+    /// Does not clear process-lifetime counters. The verify argument is the
+    /// cumulative the next snapshot will subtract from, so a later read of
+    /// that same cumulative reports an empty verify delta.
+    #[cfg(test)]
+    fn rolling_reset(&self, verify: &VerifyByKind) {
         let local = self.load_local();
-        if let Ok(mut baseline) = self.baseline.lock() {
-            baseline.verify = verify.by_kind;
-            baseline.local = local;
-            baseline.since_ts_ms = unix_ms_now().max(1);
-        }
-        if let Ok(mut started) = self.window_started.lock() {
-            *started = Instant::now();
-        }
-        if let Ok(mut last) = self.last_completed.lock() {
-            *last = None;
-        }
+        let mut state = self.lock_window();
+        state.verify = verify.by_kind;
+        state.local = local;
+        state.since_ts_ms = unix_ms_now().max(1);
+        state.started = Instant::now();
     }
 
     pub fn record_bus_dispatched(&self, kind: MessageKind) {
@@ -387,46 +378,50 @@ impl PerKindGossipCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Snapshot using an empty native verify meter (x0x-local signals only).
+    /// Snapshot using an empty verify cumulative (x0x-local signals only).
     #[must_use]
     pub fn snapshot(&self) -> PerKindGossipSnapshot {
-        self.snapshot_with_verify(PerKindVerifyMeterSnapshot::default())
+        self.snapshot_with_verify(&VerifyByKind::default())
     }
 
-    /// Snapshot merging cumulative native per-kind verify stats.
+    /// Snapshot the delta from the open baseline to `verify` and the local
+    /// counters.
     ///
-    /// When the rolling window has elapsed, returns the **previous completed
-    /// interval** (not an empty in-progress window). Otherwise returns the
-    /// in-progress delta since the current window start. Reads never clear
-    /// cumulative counters.
+    /// When the open interval has already run for at least the rotation
+    /// target, this returns that whole interval and opens a new one. The
+    /// returned `window_secs` is the elapsed time of the interval, which is
+    /// longer than the rotation target when the reader was late. A second
+    /// read then returns the new interval. Reads never clear cumulative
+    /// counters. The check and the baseline update hold one lock.
     #[must_use]
-    pub fn snapshot_with_verify(
-        &self,
-        verify: PerKindVerifyMeterSnapshot,
-    ) -> PerKindGossipSnapshot {
+    fn snapshot_with_verify(&self, verify: &VerifyByKind) -> PerKindGossipSnapshot {
         let local = self.load_local();
-        let rotated = self.maybe_rotate(&verify, &local);
-        if rotated {
-            if let Ok(last) = self.last_completed.lock() {
-                if let Some((since_ts, rows)) = last.as_ref() {
-                    return snapshot_from_rows(
-                        rows,
-                        *since_ts,
-                        self.window.as_secs(),
-                        self.cpu_share_threshold,
-                        self.bus_share_threshold,
-                    );
-                }
-            }
+        let mut state = self.lock_window();
+        let elapsed = state.started.elapsed();
+        if elapsed >= self.window {
+            let rows = rows_from_delta(verify, &local, &state);
+            let since_ts = state.since_ts_ms;
+            let window_secs = elapsed.as_secs();
+            state.verify = verify.by_kind;
+            state.local = local;
+            state.since_ts_ms = unix_ms_now().max(1);
+            state.started = Instant::now();
+            return snapshot_from_rows(
+                &rows,
+                since_ts,
+                window_secs,
+                self.cpu_share_threshold,
+                self.bus_share_threshold,
+            );
         }
-
-        self.ensure_started();
-        let baseline = self.baseline.lock().map(|b| *b).unwrap_or_default();
-        let rows = rows_from_delta(&verify, &local, &baseline);
+        let rows = rows_from_delta(verify, &local, &state);
+        let since_ts = state.since_ts_ms;
+        let window_secs = elapsed.as_secs();
+        drop(state);
         snapshot_from_rows(
             &rows,
-            baseline.since_ts_ms,
-            self.window.as_secs(),
+            since_ts,
+            window_secs,
             self.cpu_share_threshold,
             self.bus_share_threshold,
         )
@@ -474,14 +469,6 @@ pub fn per_kind_gossip_stats() -> PerKindGossipSnapshot {
     PER_KIND_COUNTERS.snapshot()
 }
 
-/// Snapshot merging saorsa-gossip native per-kind verify meters.
-#[must_use]
-pub fn per_kind_gossip_stats_with_verify(
-    verify: PerKindVerifyMeterSnapshot,
-) -> PerKindGossipSnapshot {
-    PER_KIND_COUNTERS.snapshot_with_verify(verify)
-}
-
 /// Process-wide meter for instrumentation call sites.
 #[must_use]
 pub fn per_kind_counters() -> &'static PerKindGossipCounters {
@@ -494,12 +481,12 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    fn verify_snap(by_kind: [KindVerifyCounters; 9]) -> PerKindVerifyMeterSnapshot {
-        PerKindVerifyMeterSnapshot { by_kind }
+    fn verify_snap(by_kind: [KindVerifyCumulative; 9]) -> VerifyByKind {
+        VerifyByKind { by_kind }
     }
 
-    fn v(attempts: u64, failures: u64, total_ns: u64) -> KindVerifyCounters {
-        KindVerifyCounters {
+    fn v(attempts: u64, failures: u64, total_ns: u64) -> KindVerifyCumulative {
+        KindVerifyCumulative {
             attempts,
             failures,
             total_ns,
@@ -512,28 +499,31 @@ mod tests {
         meter.record_bus_dispatched(MessageKind::IHave);
         meter.record_delivered(MessageKind::Eager);
         meter.record_published(MessageKind::Eager);
-        let before = meter.snapshot_with_verify(verify_snap({
-            let mut a = [KindVerifyCounters::default(); 9];
+        let verify = verify_snap({
+            let mut a = [KindVerifyCumulative::default(); 9];
             a[0] = v(1, 0, 1_000);
             a
-        }));
+        });
+        let before = meter.snapshot_with_verify(&verify);
         assert!(before.kinds.contains_key("eager"));
         assert!(before.since_ts > 0);
+        assert_eq!(before.kinds["eager"].verify_ok.count, 1);
 
         thread::sleep(Duration::from_millis(2));
-        meter.rolling_reset();
-        let after = meter.snapshot();
+        meter.rolling_reset(&verify);
+        let after = meter.snapshot_with_verify(&verify);
         assert!(
             after.kinds.is_empty(),
-            "re-baseline must zero the window delta: {after:?}"
+            "re-baseline at the current verify cumulative must zero the delta: {after:?}"
         );
         assert!(
             after.since_ts >= before.since_ts,
             "since_ts must not go backwards"
         );
         meter.record_bus_dropped(MessageKind::IWant);
-        let again = meter.snapshot();
+        let again = meter.snapshot_with_verify(&verify);
         assert_eq!(again.kinds["iwant"].bus_dropped, 1);
+        assert!(!again.kinds.contains_key("eager"));
     }
 
     #[test]
@@ -541,11 +531,11 @@ mod tests {
         let meter = PerKindGossipCounters::with_window(Duration::from_millis(40));
         meter.record_bus_dispatched(MessageKind::Eager);
         let verify1 = verify_snap({
-            let mut a = [KindVerifyCounters::default(); 9];
+            let mut a = [KindVerifyCumulative::default(); 9];
             a[1] = v(2, 1, 500);
             a
         });
-        let mid = meter.snapshot_with_verify(verify1);
+        let mid = meter.snapshot_with_verify(&verify1);
         assert_eq!(mid.kinds["eager"].bus_dispatched, 1);
         assert_eq!(mid.kinds["ihave"].verify_ok.count, 1);
         assert_eq!(mid.kinds["ihave"].verify_err.count, 1);
@@ -553,7 +543,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(50));
         // No new traffic — a slow poller must still see the completed window.
-        let completed = meter.snapshot_with_verify(verify1);
+        let completed = meter.snapshot_with_verify(&verify1);
         assert_eq!(
             completed.kinds["eager"].bus_dispatched, 1,
             "elapsed-window read must not discard the measurement: {completed:?}"
@@ -562,7 +552,7 @@ mod tests {
         assert_eq!(completed.since_ts, mid.since_ts);
 
         // Next read is a fresh in-progress window (empty until new events).
-        let next = meter.snapshot_with_verify(verify1);
+        let next = meter.snapshot_with_verify(&verify1);
         assert!(
             next.kinds.is_empty(),
             "new window starts empty after reporting completed: {next:?}"
@@ -573,8 +563,8 @@ mod tests {
     #[test]
     fn health_verdict_flags_kind_over_cpu_share() {
         let meter = PerKindGossipCounters::new();
-        let snap = meter.snapshot_with_verify(verify_snap({
-            let mut a = [KindVerifyCounters::default(); 9];
+        let snap = meter.snapshot_with_verify(&verify_snap({
+            let mut a = [KindVerifyCumulative::default(); 9];
             a[1] = v(1, 0, 900);
             a[0] = v(1, 0, 100);
             a
@@ -598,8 +588,8 @@ mod tests {
     fn verify_err_uses_native_failures_counter() {
         let meter = PerKindGossipCounters::new();
         let row = meter
-            .snapshot_with_verify(verify_snap({
-                let mut a = [KindVerifyCounters::default(); 9];
+            .snapshot_with_verify(&verify_snap({
+                let mut a = [KindVerifyCumulative::default(); 9];
                 a[0] = v(3, 1, 75);
                 a
             }))
@@ -635,12 +625,12 @@ mod tests {
         // under their own kinds (no cross-kind bleed in the snapshot math).
         let total = (threads * per_thread) as u64;
         let verify = verify_snap({
-            let mut a = [KindVerifyCounters::default(); 9];
+            let mut a = [KindVerifyCumulative::default(); 9];
             a[0] = v(total / 2, 0, total * 10);
             a[1] = v(total - total / 2, 3, total * 5);
             a
         });
-        let snap = meter.snapshot_with_verify(verify);
+        let snap = meter.snapshot_with_verify(&verify);
         let eager_bus = snap
             .kinds
             .get("eager")
@@ -663,8 +653,8 @@ mod tests {
         meter.record_bus_dropped(MessageKind::IWant);
         meter.record_delivered(MessageKind::Eager);
         meter.record_published(MessageKind::Eager);
-        let snap = meter.snapshot_with_verify(verify_snap({
-            let mut a = [KindVerifyCounters::default(); 9];
+        let snap = meter.snapshot_with_verify(&verify_snap({
+            let mut a = [KindVerifyCumulative::default(); 9];
             a[0] = v(1, 0, 10);
             a[1] = v(1, 1, 5);
             a
@@ -690,5 +680,88 @@ mod tests {
         assert!(json["kinds"]["eager"]["delivered"].is_u64());
         assert!(json["kinds"]["eager"]["published"].is_u64());
         assert!(json["health"]["cpu_share_threshold"].is_f64());
+    }
+
+    #[test]
+    fn delayed_first_read_aligns_timestamp_with_counts() {
+        let meter = PerKindGossipCounters::new();
+        meter.record_bus_dispatched(MessageKind::Eager);
+        meter.backdate(Duration::from_secs(2 * 60 * 60));
+        let snap = meter.snapshot();
+        assert_eq!(snap.kinds["eager"].bus_dispatched, 1);
+        assert!(
+            snap.window_secs >= 2 * 60 * 60,
+            "a late first read must report the real elapsed seconds, not the 60s target: {snap:?}"
+        );
+        let now = unix_ms_now();
+        assert!(
+            snap.since_ts + 60_000 < now,
+            "since_ts must stay at the interval start, not jump to the read: since={} now={now}",
+            snap.since_ts
+        );
+    }
+
+    #[test]
+    fn slow_poll_reports_elapsed_interval_then_opens_a_new_one() {
+        let meter = PerKindGossipCounters::with_window(Duration::from_secs(60));
+        meter.record_bus_dropped(MessageKind::IWant);
+        meter.backdate(Duration::from_secs(5 * 60));
+        let completed = meter.snapshot();
+        assert_eq!(completed.kinds["iwant"].bus_dropped, 1);
+        assert!(
+            completed.window_secs >= 5 * 60,
+            "slow poll must label the real gap: {completed:?}"
+        );
+        let next = meter.snapshot();
+        assert!(
+            next.kinds.is_empty(),
+            "the read after the late interval is a new window: {next:?}"
+        );
+        assert!(next.since_ts > completed.since_ts);
+        assert!(next.window_secs < 60);
+    }
+
+    #[test]
+    fn concurrent_readers_rotate_once() {
+        let meter = Arc::new(PerKindGossipCounters::with_window(Duration::from_secs(60)));
+        for _ in 0..100 {
+            meter.record_bus_dispatched(MessageKind::Eager);
+        }
+        meter.backdate(Duration::from_secs(120));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = Arc::clone(&meter);
+            handles.push(thread::spawn(move || m.snapshot()));
+        }
+        let snaps: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("join"))
+            .collect();
+        let full = snaps
+            .iter()
+            .filter(|snap| {
+                snap.kinds
+                    .get("eager")
+                    .is_some_and(|row| row.bus_dispatched == 100)
+            })
+            .count();
+        let fresh = snaps
+            .iter()
+            .filter(|snap| !snap.kinds.contains_key("eager"))
+            .count();
+        assert_eq!(
+            full, 1,
+            "one reader reports the completed interval: {snaps:?}"
+        );
+        assert_eq!(
+            fresh,
+            snaps.len() - 1,
+            "other readers must not replace it with a partial delta: {snaps:?}"
+        );
+        assert!(snaps.iter().all(|snap| {
+            snap.kinds
+                .get("eager")
+                .is_none_or(|row| row.bus_dispatched == 100)
+        }));
     }
 }

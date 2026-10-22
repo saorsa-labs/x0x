@@ -644,15 +644,11 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "relay_fanout": state.agent.gossip_relay_fanout().unwrap_or_default(),
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "inner_envelope_verify": x0x::gossip::inner_verify_stats(),
-                // #1170 / Track E M1: per-MessageKind verify, bus, delivered,
+                // #1170 / Track E M1: per-MessageKind bus, delivered, and
                 // published counters with a rolling window and health verdict.
-                // Verify rows come from saorsa-gossip's native meter.
-                "per_kind": x0x::gossip::per_kind_gossip_stats_with_verify(
-                    state
-                        .agent
-                        .gossip_verify_by_kind_stats()
-                        .unwrap_or_default(),
-                ),
+                // `verify_ok` / `verify_err` stay zero: pinned saorsa-gossip
+                // 0.5.90 has no per-kind verify meter.
+                "per_kind": x0x::gossip::per_kind_gossip_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
                 "discovery_cache_entries": {
                     "agents": agents,
