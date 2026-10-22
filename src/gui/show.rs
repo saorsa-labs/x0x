@@ -3,7 +3,7 @@
 //! Holds `[gui_show]` config, the rate limiter, the per-agent block list, and
 //! the platform opener behind a test seam.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -271,6 +271,12 @@ impl ShowOpener for CapturingOpener {
 /// Daemon-side state for local (and later remote) GUI show.
 pub struct GuiShowRuntime {
     config: Mutex<GuiShowConfig>,
+    /// Embedder or last TOML `[gui_show]`, without the Stop override.
+    ///
+    /// Stop forces the published `local_enabled` off. It does not write
+    /// this copy. Deleting the marker restores it when no daemon config
+    /// file is available to re-read.
+    supplied_config: Mutex<GuiShowConfig>,
     rate_limit: Mutex<GuiShowRateLimit>,
     blocked: Mutex<HashSet<[u8; 32]>>,
     opener: Mutex<Arc<dyn ShowOpener>>,
@@ -297,6 +303,13 @@ pub struct GuiShowRuntime {
     local_stopped: AtomicBool,
     /// Shows waiting for the GUI window that was opened for each one.
     pending: Mutex<VecDeque<PendingGuiShow>>,
+    /// Session token a refresh replaced, for an upgrade that authenticated
+    /// with the old token and registers after the refresh.
+    ///
+    /// The pending banner moves to the new token in that refresh. A socket
+    /// already in the roster is updated there too. This map is what a later
+    /// registration consults, so `gui.visible` still finds the banner.
+    session_successors: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl std::fmt::Debug for GuiShowRuntime {
@@ -319,7 +332,8 @@ impl GuiShowRuntime {
         let local_stop_path = data_dir.join(LOCAL_SHOW_STOP_FILE);
         let blocked = load_blocked(&blocked_path);
         let runtime = Self {
-            config: Mutex::new(config),
+            config: Mutex::new(config.clone()),
+            supplied_config: Mutex::new(config),
             rate_limit: Mutex::new(GuiShowRateLimit::default()),
             blocked: Mutex::new(blocked),
             opener: Mutex::new(opener),
@@ -330,6 +344,7 @@ impl GuiShowRuntime {
             stop_persisted: AtomicBool::new(false),
             local_stopped: AtomicBool::new(false),
             pending: Mutex::new(VecDeque::new()),
+            session_successors: Mutex::new(HashMap::new()),
         };
         // Honour a stop recorded before this process. The marker wins over
         // a config that already says `local_enabled = true`, because Stop
@@ -366,7 +381,18 @@ impl GuiShowRuntime {
     /// `local_enabled` off in the same critical section as the store. A
     /// reload cannot publish `true` after Stop, including when the marker
     /// file was never created.
-    pub fn set_config(&self, mut config: GuiShowConfig) {
+    pub fn set_config(&self, config: GuiShowConfig) {
+        if let Ok(mut supplied) = self.supplied_config.lock() {
+            *supplied = config.clone();
+        }
+        self.publish_config(config);
+    }
+
+    /// Store `config`, with Stop still forcing `local_enabled` off.
+    ///
+    /// The supplied copy is unchanged. Callers that replace the embedder
+    /// or TOML value use [`Self::set_config`].
+    fn publish_config(&self, mut config: GuiShowConfig) {
         if let Ok(mut guard) = self.config.lock() {
             if self.local_stop_path.is_file() {
                 config.local_enabled = false;
@@ -377,6 +403,13 @@ impl GuiShowRuntime {
             }
             *guard = config;
         }
+    }
+
+    fn supplied_snapshot(&self) -> GuiShowConfig {
+        self.supplied_config
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     fn local_stop_in_force(&self) -> bool {
@@ -392,7 +425,8 @@ impl GuiShowRuntime {
     /// The stop marker stays in force while the file exists, including when
     /// the daemon config already says `local_enabled = true`. Deleting the
     /// marker returns control to that config. With no config file, deleting
-    /// the marker turns local show back on.
+    /// the marker restores the configuration supplied to this process. The
+    /// default is on. An embedder that passed `local_enabled = false` stays off.
     pub fn reload_from_disk(&self) -> Result<(), String> {
         let had_config_path = self.stored_config_path().is_some();
         let Some(path) = self.reload_config_path() else {
@@ -422,9 +456,7 @@ impl GuiShowRuntime {
         }
         self.stop_persisted.store(true, Ordering::SeqCst);
         self.local_stopped.store(true, Ordering::SeqCst);
-        let mut config = self.config_snapshot();
-        config.local_enabled = false;
-        self.set_config(config);
+        self.publish_config(self.supplied_snapshot());
     }
 
     /// A human deleted a marker this process had saved.
@@ -432,8 +464,8 @@ impl GuiShowRuntime {
     /// A failed marker write sets [`Self::local_stopped`] and leaves
     /// `stop_persisted` false, so this returns without turning show on.
     /// With a daemon config, the file's `[gui_show]` applies again once the
-    /// saved marker is gone. With no file, local show returns to the default
-    /// (on).
+    /// saved marker is gone. With no file, show returns to the configuration
+    /// supplied to this process. Stop does not replace that value.
     fn lift_stop_if_marker_deleted(&self) {
         if self.local_stop_path.is_file() {
             return;
@@ -443,9 +475,7 @@ impl GuiShowRuntime {
         }
         self.local_stopped.store(false, Ordering::SeqCst);
         let Some(path) = self.reload_config_path() else {
-            let mut config = self.config_snapshot();
-            config.local_enabled = true;
-            self.set_config(config);
+            self.set_config(self.supplied_snapshot());
             return;
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -509,9 +539,7 @@ impl GuiShowRuntime {
     }
 
     fn remember_local_stop(&self) {
-        let mut config = self.config_snapshot();
-        config.local_enabled = false;
-        self.set_config(config);
+        self.publish_config(self.supplied_snapshot());
     }
 
     fn write_local_stop_file(&self) -> Result<(), String> {
@@ -587,6 +615,51 @@ impl GuiShowRuntime {
             queue.retain(|item| pending_is_fresh(item, now));
             queue.push_back(pending);
         }
+    }
+
+    /// Remember that `from_token` was refreshed to `to_token`.
+    ///
+    /// An upgrade can authenticate with `from_token` and register only after
+    /// this refresh. The banner already sits on `to_token`. Registration
+    /// reads the map so the socket does too. Older tokens in the chain point
+    /// at the newest one. Entries older than the session token TTL are dropped.
+    pub(crate) fn note_gui_session_successor(&self, from_token: &str, to_token: &str) {
+        if from_token.is_empty() || to_token.is_empty() || from_token == to_token {
+            return;
+        }
+        let Ok(mut map) = self.session_successors.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        map.retain(|_, (_, noted)| now.saturating_duration_since(*noted) <= PENDING_FRESHNESS);
+        for (next, noted) in map.values_mut() {
+            if next == from_token {
+                *next = to_token.to_string();
+                *noted = now;
+            }
+        }
+        map.insert(from_token.to_string(), (to_token.to_string(), now));
+    }
+
+    /// Token a GUI socket should store after any refreshes of `token`.
+    pub(crate) fn current_gui_session_token(&self, token: &str) -> String {
+        let Ok(mut map) = self.session_successors.lock() else {
+            return token.to_string();
+        };
+        let now = Instant::now();
+        map.retain(|_, (_, noted)| now.saturating_duration_since(*noted) <= PENDING_FRESHNESS);
+        let mut current = token.to_string();
+        for _ in 0..8 {
+            let Some((next, _)) = map.get(&current) else {
+                break;
+            };
+            if next == &current {
+                break;
+            }
+            let next = next.clone();
+            current = next;
+        }
+        current
     }
 
     /// Keep a queued origin banner when this GUI session token is refreshed.
@@ -1075,6 +1148,47 @@ mod tests {
         assert!(
             restarted.config().local_enabled,
             "the next serve of the same data directory follows the deleted marker"
+        );
+    }
+
+    /// `serve(config)` passed `local_enabled = false` and has no config file.
+    /// A marker from an earlier process forces Stop on top of that setting.
+    /// Deleting the marker must restore the embedder's false, not enable show.
+    #[test]
+    fn deleting_a_stale_stop_marker_restores_an_embedder_disable() {
+        let data = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            data.path().join(LOCAL_SHOW_STOP_FILE),
+            b"local_enabled = false\n",
+        )
+        .expect("stale marker from a previous run");
+        let rt = GuiShowRuntime::new(
+            GuiShowConfig {
+                local_enabled: false,
+                remote_enabled: true,
+            },
+            None,
+            data.path(),
+            Arc::new(CapturingOpener::new()),
+        );
+        assert!(
+            !rt.config().local_enabled,
+            "the stale marker keeps show off"
+        );
+        assert!(rt.config().remote_enabled);
+        std::fs::remove_file(data.path().join(LOCAL_SHOW_STOP_FILE)).expect("delete marker");
+        assert!(
+            !rt.config().local_enabled,
+            "removing Stop restores the embedder's disabled setting"
+        );
+        assert!(rt.config().remote_enabled);
+        assert!(
+            rt.reload_from_disk().is_ok(),
+            "reload with no config file is not an error"
+        );
+        assert!(
+            !rt.config().local_enabled,
+            "reload must not enable show when the embedder passed false"
         );
     }
 

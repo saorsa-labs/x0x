@@ -1180,26 +1180,44 @@ fn queue_pending_gui_show(
     }
 }
 
-/// Point a hidden GUI socket at the token from `POST /auth/session/refresh`.
+/// Point a GUI socket at the token from `POST /auth/session/refresh`.
 ///
-/// The pending banner is rebound in that same refresh. A socket that is
-/// already open still looks the banner up by the token it connected with,
-/// so that token has to move too.
+/// The pending banner is rebound in that same refresh. A socket looks the
+/// banner up by the token stored on it. A socket that is already registered
+/// is updated here. An upgrade that authenticated with `from_token` but has
+/// not registered yet still holds that token: the successor is recorded
+/// first, and registration adopts it before the session is inserted.
 pub(super) async fn rebind_gui_ws_tokens(state: &AppState, from_token: &str, to_token: &str) {
     if from_token.is_empty() || to_token.is_empty() || from_token == to_token {
         return;
     }
+    state
+        .gui_show
+        .note_gui_session_successor(from_token, to_token);
     let mut sessions = state.ws_sessions.write().await;
     for session in sessions.values_mut() {
-        if session.gui_session_token.as_deref() == Some(from_token) {
-            session.gui_session_token = Some(to_token.to_string());
-        }
+        adopt_refreshed_gui_token(session, state);
+    }
+}
+
+/// Store the token the pending banner uses now.
+///
+/// Call this while holding `ws_sessions`'s write lock. Refresh records the
+/// successor before it takes that lock, then updates sockets under it, so a
+/// registration cannot keep a token the banner has already left.
+fn adopt_refreshed_gui_token(session: &mut WsSession, state: &AppState) {
+    let Some(token) = session.gui_session_token.clone() else {
+        return;
+    };
+    let current = state.gui_show.current_gui_session_token(&token);
+    if current != token {
+        session.gui_session_token = Some(current);
     }
 }
 
 async fn arm_navigation_and_advertise_session(
     state: &AppState,
-    session: WsSession,
+    mut session: WsSession,
     outbound_tx: &mpsc::Sender<WsOutbound>,
     stats: &Arc<WsOutboundStats>,
     slow_close: &tokio_util::sync::CancellationToken,
@@ -1222,8 +1240,10 @@ async fn arm_navigation_and_advertise_session(
     // `visible_gui_subscribes_before_it_is_advertised`.
     #[cfg(test)]
     let receivers_at_insert = state.broadcast_tx.receiver_count();
+    let mut sessions = state.ws_sessions.write().await;
+    adopt_refreshed_gui_token(&mut session, state);
     let session_id = session.id.clone();
-    state.ws_sessions.write().await.insert(session_id, session);
+    sessions.insert(session_id, session);
     Some(ArmedNavigation {
         forwarder,
         #[cfg(test)]
@@ -2884,6 +2904,140 @@ mod tests {
             WsOutbound::GuiShow { view, .. } => assert_eq!(view, "people"),
             other => panic!("expected gui.show, got {other:?}"),
         }
+    }
+
+    /// The upgrade authenticated with the old token, then refresh ran, then
+    /// the socket registered. The banner has moved. `gui.visible` must still
+    /// deliver it. Without the successor recorded for that late registration,
+    /// the tab is marked visible and the banner stays queued.
+    #[tokio::test]
+    async fn refresh_before_registration_keeps_the_banner_on_the_socket() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-late".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by other on other".to_string(),
+            agent_id: "cc".repeat(32),
+            machine_id: "dd".repeat(32),
+            rider: false,
+            request_id: "req-other".to_string(),
+            session_token: "other-tab".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        // Authenticated, not registered. This is the token the upgrade captured.
+        let session = WsSession {
+            id: "late-upgrade".to_string(),
+            subscribed_topics: HashSet::new(),
+            receives_direct: false,
+            visible_gui: visible_gui_flag(false),
+            gui_session_token: Some(old.clone()),
+            requested_visible: AtomicBool::new(false),
+            visible_mu: Mutex::new(()),
+            reveal_inflight: Arc::new(AtomicUsize::new(0)),
+            topic_forwarders: HashMap::new(),
+        };
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("refresh body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("refresh json");
+        let fresh = json["session_token"]
+            .as_str()
+            .expect("new session token")
+            .to_string();
+        assert_ne!(fresh, old);
+        assert!(
+            !state.gui_show.has_pending_session(&old),
+            "refresh moves the banner off the token the upgrade captured"
+        );
+        assert!(state.gui_show.has_pending_session(&fresh));
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            session,
+            &tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("the upgrade registers after refresh");
+        {
+            let sessions = state.ws_sessions.read().await;
+            let registered = sessions.get("late-upgrade").expect("session");
+            assert!(
+                !registered.is_visible_gui(),
+                "registration leaves the hidden tab hidden"
+            );
+            assert_eq!(
+                registered.gui_session_token(),
+                Some(fresh.clone()),
+                "the socket must follow the banner onto the refreshed token"
+            );
+        }
+        handle_ws_command(
+            &state,
+            "late-upgrade",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        match rx.try_recv() {
+            Ok(WsOutbound::GuiShow { view, banner, .. }) => {
+                assert_eq!(view, "people");
+                assert!(
+                    banner.contains("Opened by test on test"),
+                    "gui.visible must deliver the origin banner: {banner}"
+                );
+            }
+            other => panic!(
+                "gui.visible missed the banner and would mark the tab visible without it: {other:?}"
+            ),
+        }
+        assert!(
+            state
+                .ws_sessions
+                .read()
+                .await
+                .get("late-upgrade")
+                .expect("session")
+                .is_visible_gui(),
+            "the tab becomes visible once the banner is queued"
+        );
+        assert!(!state.gui_show.has_pending_session(&fresh));
+        assert!(
+            state.gui_show.has_pending_session("other-tab"),
+            "another tab's banner must stay queued"
+        );
+        armed.forwarder.abort();
     }
 
     /// WHY: a full outbound queue used to drop the opened view after it had
