@@ -103,10 +103,35 @@ pub(in crate::server) async fn gui_show(
         session_token: session.clone(),
         created_at: Instant::now(),
     });
-    let state_for_open = Arc::clone(&state);
-    let opened = tokio::task::spawn_blocking(move || state_for_open.gui_show.open_url(&url))
+    // The launch runs on the blocking pool. That pool cannot be aborted, and
+    // the opener lock used to queue every launch behind the previous wait.
+    // Track the launch, and give it only the opener and the stop flag: it
+    // must not keep this `AppState` (and the Agent and database) alive.
+    let Some(opener) = state.gui_show.opener_for_launch() else {
+        state.sessions.revoke(&session);
+        state.gui_show.drop_pending_for_session(&session);
+        return json_outcome(GuiShowOutcome::NoDisplay, machine_id, request_id);
+    };
+    let stop = state.gui_show.open_stop_flag();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let admitted = state.spawn_detached(async move {
+        let opened = tokio::task::spawn_blocking(move || {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                false
+            } else {
+                opener.open_until(&url, &stop)
+            }
+        })
         .await
-        .unwrap_or_default();
+        .unwrap_or(false);
+        let _ = tx.send(opened);
+    });
+    if !admitted {
+        state.sessions.revoke(&session);
+        state.gui_show.drop_pending_for_session(&session);
+        return json_outcome(GuiShowOutcome::NoDisplay, machine_id, request_id);
+    }
+    let opened = rx.await.unwrap_or(false);
     if opened {
         json_outcome(GuiShowOutcome::Opened, machine_id, request_id)
     } else {
@@ -691,5 +716,112 @@ mod tests {
                 .map(|e| e.cli_name),
             Some("show")
         );
+    }
+
+    /// Three slow opens used to share one mutex and an `Arc<AppState>` on
+    /// the blocking pool. Shutdown's 2s grace then returned while those
+    /// launches still held the Agent and the database.
+    #[tokio::test]
+    async fn concurrent_opens_finish_at_shutdown_without_holding_state() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct Release(Arc<AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct SlowOpen {
+            entered: Arc<AtomicUsize>,
+            in_flight: Arc<AtomicUsize>,
+            release: Arc<AtomicBool>,
+        }
+        impl SlowOpen {
+            fn park(&self, stop: &AtomicBool) -> bool {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                // One wait with no stop check. A drain that joins this launch
+                // is still inside it. A drain that does not track it returns
+                // during the wait.
+                std::thread::sleep(Duration::from_millis(200));
+                while !stop.load(Ordering::Acquire) && !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                false
+            }
+        }
+        impl ShowOpener for SlowOpen {
+            fn open(&self, _url: &str) -> bool {
+                self.park(&AtomicBool::new(false))
+            }
+            fn open_until(&self, _url: &str, stop: &AtomicBool) -> bool {
+                self.park(stop)
+            }
+        }
+
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let _release_on_drop = Release(Arc::clone(&release));
+        state.gui_show.replace_opener_for_test(Arc::new(SlowOpen {
+            entered: Arc::clone(&entered),
+            in_flight: Arc::clone(&in_flight),
+            release: Arc::clone(&release),
+        }));
+        let baseline = Arc::strong_count(&state);
+        let app = router(Arc::clone(&state));
+        let mut joins = Vec::new();
+        for _ in 0..3 {
+            let app = app.clone();
+            joins.push(tokio::spawn(async move {
+                let _ = post_show(&app, json!({ "view": "people" })).await;
+            }));
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            ready.is_ok(),
+            "three launches did not run together; entered={}",
+            entered.load(Ordering::SeqCst)
+        );
+        for join in &joins {
+            join.abort();
+        }
+        for join in joins {
+            let _ = join.await;
+        }
+        drop(app);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            3,
+            "aborting the HTTP handlers stopped the browser opens"
+        );
+        assert_eq!(
+            Arc::strong_count(&state),
+            baseline,
+            "an in-flight browser open still holds AppState"
+        );
+        let started = Instant::now();
+        crate::server::drain_server_tasks(&state, Vec::new()).await;
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "browser opens outlived the shutdown drain"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited out the serialized opens: {:?}",
+            started.elapsed()
+        );
+        Ok(())
     }
 }

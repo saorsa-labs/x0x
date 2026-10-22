@@ -141,6 +141,17 @@ pub struct GuiShowResponse {
 pub trait ShowOpener: Send + Sync {
     /// Open `url` in the platform browser. Returns `true` on success.
     fn open(&self, url: &str) -> bool;
+
+    /// Open `url`, returning when `stop` is set.
+    ///
+    /// Shutdown sets `stop` and then joins the launch. A launch that ignores
+    /// `stop` keeps running after that join: the blocking pool cannot abort it.
+    fn open_until(&self, url: &str, stop: &AtomicBool) -> bool {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        self.open(url)
+    }
 }
 
 /// Production opener: `open` / `xdg-open` / `cmd /C start`.
@@ -149,11 +160,24 @@ pub struct PlatformOpener;
 
 impl ShowOpener for PlatformOpener {
     fn open(&self, url: &str) -> bool {
+        self.open_until(url, open_stop_never())
+    }
+
+    fn open_until(&self, url: &str, stop: &AtomicBool) -> bool {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
         match platform_opener_spawn(url) {
-            Some(Ok(child)) => opener_displayed(child, OPENER_WAIT),
+            Some(Ok(child)) => opener_displayed_until(child, OPENER_WAIT, stop),
             Some(Err(_)) | None => false,
         }
     }
+}
+
+/// A stop flag that is never set. Tests of the display wait use it.
+fn open_stop_never() -> &'static AtomicBool {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    &NEVER
 }
 
 /// Start the platform opener. `None` means this OS has no opener.
@@ -202,9 +226,21 @@ fn silenced_stdio(cmd: &mut std::process::Command) {
 /// A zero exit within `bound` is a display. A nonzero exit is not. A child
 /// that is still running at `bound` is a display: on Linux, `xdg-open` can
 /// remain running after it has opened the application.
+#[cfg(test)]
 fn opener_display_confirmed(child: &mut std::process::Child, bound: Duration) -> bool {
+    opener_display_confirmed_until(child, bound, open_stop_never())
+}
+
+fn opener_display_confirmed_until(
+    child: &mut std::process::Child,
+    bound: Duration,
+    stop: &AtomicBool,
+) -> bool {
     let deadline = Instant::now() + bound;
     loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
             Ok(None) if Instant::now() >= deadline => return true,
@@ -239,8 +275,17 @@ fn retain_opener_until_exit(mut child: std::process::Child) {
 }
 
 /// Confirm a display, then hand the process to [`retain_opener_until_exit`].
-fn opener_displayed(mut child: std::process::Child, bound: Duration) -> bool {
-    let confirmed = opener_display_confirmed(&mut child, bound);
+#[cfg(test)]
+fn opener_displayed(child: std::process::Child, bound: Duration) -> bool {
+    opener_displayed_until(child, bound, open_stop_never())
+}
+
+fn opener_displayed_until(
+    mut child: std::process::Child,
+    bound: Duration,
+    stop: &AtomicBool,
+) -> bool {
+    let confirmed = opener_display_confirmed_until(&mut child, bound, stop);
     retain_opener_until_exit(child);
     confirmed
 }
@@ -306,6 +351,11 @@ pub struct GuiShowRuntime {
     /// rejects a later reload of `local_enabled = true`. Cleared only when
     /// a marker this process saved is deleted.
     local_stopped: AtomicBool,
+    /// Set by the shutdown drain. An in-flight launch polls it and returns.
+    ///
+    /// The launch runs on the blocking pool, which shutdown cannot abort.
+    /// The drain sets this flag, then joins the tracked launch.
+    open_stop: Arc<AtomicBool>,
     /// Shows waiting for the GUI window that was opened for each one.
     pending: Mutex<VecDeque<PendingGuiShow>>,
     /// Session token a refresh replaced, for an upgrade that authenticated
@@ -349,6 +399,7 @@ impl GuiShowRuntime {
             local_stop_path,
             stop_persisted: AtomicBool::new(false),
             local_stopped: AtomicBool::new(false),
+            open_stop: Arc::new(AtomicBool::new(false)),
             pending: Mutex::new(VecDeque::new()),
             session_successors: Mutex::new(HashMap::new()),
         };
@@ -594,9 +645,25 @@ impl GuiShowRuntime {
             .unwrap_or(false)
     }
 
-    /// Open a GUI URL via the configured opener.
-    pub fn open_url(&self, url: &str) -> bool {
-        self.opener.lock().map(|g| g.open(url)).unwrap_or(false)
+    /// Opener for one launch.
+    ///
+    /// The mutex only publishes the opener. The launch must not run under
+    /// it: the platform wait lasts up to [`OPENER_WAIT`], and holding the
+    /// lock queues later launches behind that wait.
+    pub(crate) fn opener_for_launch(&self) -> Option<Arc<dyn ShowOpener>> {
+        self.opener.lock().ok().map(|guard| Arc::clone(&guard))
+    }
+
+    /// Flag the shutdown drain sets so an in-flight launch returns.
+    pub(crate) fn open_stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.open_stop)
+    }
+
+    /// Ask every in-flight browser launch to return.
+    ///
+    /// The shutdown drain calls this before it joins those launches.
+    pub(crate) fn stop_opening(&self) {
+        self.open_stop.store(true, Ordering::Release);
     }
 
     /// Test seam: replace the opener without rebuilding `AppState`.
@@ -1435,6 +1502,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn opener_stop_flag_ends_the_display_wait() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let _guard = KillOnDrop(pid);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        assert!(
+            !opener_display_confirmed_until(&mut child, OPENER_WAIT, &stop),
+            "shutdown must end the display wait"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the display wait ignored the stop flag: {:?}",
+            started.elapsed()
+        );
+        retain_opener_until_exit(child);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn opener_silenced_stdio_hides_the_session_url_on_failure() {
         let dir = tempfile::tempdir().expect("tempdir");
         let record = dir.path().join("stderr-target");
@@ -1923,6 +2018,7 @@ const SESSION_REFRESH_MS = 8*60*1000;
 let sessionExpired = false;
 let sessionRefreshing = false;
 let sessionIssuedAt = 0;
+let sessionClockKnown = true;
 "#,
             fn_source(html, "function guiTabVisible()", "function liveGuiTab()"),
             live,
@@ -2026,6 +2122,109 @@ let sessionIssuedAt = 0;
         assert!(
             output.status.success(),
             "expired session still advertises a live GUI\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn delayed_bootstrap_does_not_advertise_an_expired_token() {
+        let html = include_str!("x0x-gui.html");
+        let source = format!(
+            "{}\n{}\n{}",
+            r#"
+let now = 9 * 60 * 1000;
+Date.now = () => now;
+const store = {};
+const sessionStorage = {
+  getItem(k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+  setItem(k, v) { store[k] = String(v); },
+  removeItem(k) { delete store[k]; }
+};
+const location = {
+  origin: 'http://127.0.0.1:9',
+  pathname: '/gui',
+  search: '?token=minted-token',
+  hash: '#/people'
+};
+const history = { replaceState() { location.search = ''; } };
+const BASE = location.origin;
+const document = {
+  visibilityState: 'visible',
+  createElement() { return {}; },
+  getElementById() { return { appendChild() {} }; }
+};
+let daemonToken = 'minted-token';
+let daemonExpiry = 10 * 60 * 1000;
+const sent = [];
+function wsSend(obj) { sent.push(obj); }
+async function apiWith(token, path) {
+  if (path !== '/auth/session/refresh') return null;
+  if (token !== daemonToken || now >= daemonExpiry) {
+    return { _http_ok: false, _http_status: 401 };
+  }
+  daemonToken = 'refreshed-' + now;
+  daemonExpiry = now + 10 * 60 * 1000;
+  return { _http_ok: true, session_token: daemonToken, expires_in: 600 };
+}
+"#,
+            fn_source(
+                html,
+                "function readSessionToken()",
+                "function readOwnerToken()"
+            ),
+            r#"
+(async () => {
+  if (sessionClockKnown) {
+    throw new Error('page load adopted a clock the daemon did not issue');
+  }
+  await bootstrapGuiSession();
+  if (!sessionClockKnown) {
+    throw new Error('bootstrap did not confirm the daemon issue time');
+  }
+  if (SESSION_TOKEN === 'minted-token') {
+    throw new Error('bootstrap did not refresh the minted token');
+  }
+  now = 11 * 60 * 1000;
+  if (now >= daemonExpiry) {
+    throw new Error('refresh did not extend the daemon TTL');
+  }
+  if (!liveGuiTab()) {
+    throw new Error('a token the daemon still accepts must stay a live tab');
+  }
+  if (wsUrl().indexOf('gui=1') < 0) {
+    throw new Error('a live tab omitted gui=1: ' + wsUrl());
+  }
+  // Mint at 0, load at 11. The token is already dead. This tab must not
+  // suppress a browser open.
+  now = 11 * 60 * 1000;
+  daemonToken = 'late-token';
+  daemonExpiry = 10 * 60 * 1000;
+  location.search = '?token=late-token';
+  sessionExpired = false;
+  sessionRefreshing = false;
+  SESSION_TOKEN = readSessionToken();
+  noteSessionClock();
+  await bootstrapGuiSession();
+  if (liveGuiTab()) {
+    throw new Error('a token that expired before load still suppresses a browser open');
+  }
+  if (wsUrl().indexOf('gui=1') >= 0) {
+    throw new Error('a late load advertised gui=1: ' + wsUrl());
+  }
+})().catch((error) => { console.error(error); process.exit(1); });
+"#
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("delayed-bootstrap.js");
+        std::fs::write(&script, source).expect("write script");
+        let output = std::process::Command::new("node")
+            .arg(&script)
+            .output()
+            .expect("node runs the delayed bootstrap");
+        assert!(
+            output.status.success(),
+            "a delayed GUI load advertised an expired token\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );

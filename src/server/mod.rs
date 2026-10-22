@@ -3281,6 +3281,10 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
+    // Browser launches sit on the blocking pool, which abort does not stop.
+    // Tell them to return before the join below. The launch task does not
+    // hold `AppState`.
+    state.gui_show.stop_opening();
     // #1288 row 2: REST `/subscribe` forwarders. A topic in
     // `[history] record_topics` makes the forwarder clone `HistoryHandle`,
     // which holds `history.db`. Dropping the map would detach that task and
