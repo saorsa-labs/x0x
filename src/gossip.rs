@@ -21,9 +21,8 @@ pub use participation::{
     RelayMetering, RELAY_BYTES_SEMANTICS,
 };
 pub use per_kind::{
-    per_kind_gossip_stats, CountAndNs, KindCountersSnapshot, PerKindGossipSnapshot,
-    PerKindHealthVerdict, PER_KIND_BUS_SHARE_THRESHOLD, PER_KIND_CPU_SHARE_THRESHOLD,
-    PER_KIND_ROLLING_WINDOW,
+    per_kind_gossip_stats, KindCountersSnapshot, PerKindGossipSnapshot, PerKindHealthVerdict,
+    PerKindInterval, PER_KIND_BUS_SHARE_THRESHOLD, PER_KIND_ROLLING_WINDOW,
 };
 pub use pubsub::{
     inner_verify_stats, InboundByTopicSnapshot, InnerVerifyStats, InnerVerifyStatsSnapshot,

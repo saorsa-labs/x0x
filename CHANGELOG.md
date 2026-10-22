@@ -7,15 +7,16 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **Per-kind gossip efficiency counters on `GET /diagnostics/gossip` (#1170).**
-  `per_kind` reports rolling-window `verify_ok` / `verify_err` (count and
-  `total_ns`), `bus_dispatched` / `bus_dropped`, `delivered`, and `published`
-  per PlumTree message kind, with `since_ts` and an M1 health verdict that
-  flags kinds over a 40% share of verify CPU or bus events. `delivered` /
-  `published` are Eager-only. `window_secs` is the elapsed length of the
-  reported interval. `verify_ok` / `verify_err` stay zero while the pinned
-  saorsa-gossip crate has no per-kind verify meter (saorsa-gossip PR #122 is
-  merged upstream and is not in the published 0.5.90 crate). The receive
-  pump still peeks a PubSub kind only under ADR 0013 pressure.
+  `per_kind.current` is the open interval and `per_kind.last_completed` is the
+  previous finished interval. Every reader receives the same
+  `last_completed` until the next rotation. Each interval reports
+  `bus_dispatched` / `bus_dropped`, `delivered`, and `published` per PlumTree
+  message kind, with `since_ts` and `window_secs`. `window_secs` includes a
+  fraction of a second and is never `0` for a non-empty interval. The health
+  verdict lists kinds over a 40% share of bus events. `delivered` and
+  `published` are Eager PlumTree traffic; same-daemon `local:` hand-offs are
+  not counted. Per-kind verify CPU is not in this slice. The receive pump
+  still peeks a PubSub kind only under ADR 0013 pressure.
 
 ### Changed
 

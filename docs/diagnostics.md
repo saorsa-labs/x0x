@@ -182,36 +182,38 @@ already held state at least as new.
 
 ## Per-kind efficiency counters (#1170 / Track E M1)
 
-`GET /diagnostics/gossip` exposes `per_kind` for the four efficiency signals
-per PlumTree `MessageKind`:
+`GET /diagnostics/gossip` exposes `per_kind` for bus pressure, local delivery,
+and outbound publish per PlumTree `MessageKind`. Per-kind verify CPU is not
+in this slice. The pinned saorsa-gossip 0.5.90 crate has no per-kind verify
+meter, and x0x does not sample `stage_stats()` on the receive path.
+
+`per_kind.current` is the open interval. `per_kind.last_completed` is the
+previous finished interval, or `null` until the first rotation. A read does
+not hide that finished interval. Every reader receives the same
+`last_completed` until the next rotation replaces it. Use `last_completed`
+for a stable rate. Use `current` for the interval that is still open.
+
+Both intervals use this shape:
 
 | Field | Meaning |
 |---|---|
-| `since_ts` | Unix milliseconds when the reported interval started. The clock starts when the meter is created, together with a zero baseline, so a delayed first read does not relabel older counts with the read time. |
-| `window_secs` | Elapsed seconds of the reported interval. The meter rotates after 60 seconds. A late read keeps the whole gap and sets `window_secs` to that gap, which can be longer than 60. Rate is Δcount / `window_secs`. |
-| `kinds.<kind>.verify_ok` / `verify_err` | Outer-frame ML-DSA verify observations for that kind (`count` and `total_ns`). These stay zero on the pinned saorsa-gossip 0.5.90 crate: it has no per-kind verify meter. x0x does not sample `stage_stats()` on the receive path, because that snapshot is shared across workers. When a cumulative is supplied, `verify_err.count` is its `failures` field and wall time is reported under `verify_ok` (`total_ns` is not split by outcome). |
+| `since_ts` | Unix milliseconds when the interval started. The clock starts when the meter is created, together with a zero baseline, so a delayed first read does not relabel older counts with the read time. |
+| `window_secs` | Elapsed seconds of the interval, including a fraction of a second. The meter rotates after 60 seconds. A late read keeps the whole gap, which can be longer than 60. A non-empty interval is never `0`, so the rate Δcount / `window_secs` stays defined. An empty interval that has just opened may be `0`. |
 | `kinds.<kind>.bus_dispatched` / `bus_dropped` | `bus_dispatched` counts frames whose header the pubsub worker already inspected for routing. `bus_dropped` counts recv-pump sheds (ADR 0013) and `try_send` full drops. The pump peeks a kind only after the shed threshold, or after `try_send` reports Full. A closed channel is not counted. A frame with no inspectable header is omitted from `bus_dispatched`. |
-| `kinds.<kind>.delivered` | Local subscriber hand-offs. **Eager-only** (control kinds do not deliver payloads to subscribers). |
-| `kinds.<kind>.published` | Local mesh publishes. **Eager-only** (local publish emits Eager wire frames). |
-| `health.cpu_pressure_kinds` | Kinds whose share of verify `total_ns` exceeds `cpu_share_threshold` (default 0.40). |
+| `kinds.<kind>.delivered` | PlumTree deliveries to a local subscriber. **Eager-only.** Control kinds do not deliver payloads. Same-daemon `local:` hand-offs are not counted. |
+| `kinds.<kind>.published` | Local mesh publishes. **Eager-only.** A local publish emits Eager wire frames. A `local:` publish does not. |
 | `health.bus_pressure_kinds` | Kinds whose share of `bus_dispatched + bus_dropped` exceeds `bus_share_threshold` (default 0.40). |
 
 Kind keys match `inbound_by_topic` / `outbound_by_kind`. Untouched kinds are
-omitted. Rates use Δcount / `window_secs` for the reported interval; do not
-cross a window boundary. With verify rows at zero, `cpu_pressure_kinds` is
-empty.
+omitted. Rates use Δcount / `window_secs` inside one interval. Do not add
+`current` to `last_completed`.
 
-The health lists are a share of the interval. A kind that carries most of the
-traffic, commonly `eager`, is listed whenever its share is above 0.40. That is
-the share signal. It is not, by itself, a fault.
+`health.bus_pressure_kinds` is a share of that interval. A kind that carries
+most of the traffic, commonly `eager`, is listed when its share is above
+0.40. That is the share signal. It is not, by itself, a fault.
 
 The counters are process-wide. Every agent in the process adds to the same
 bus, delivered, and published totals.
-
-`verify_err.count`, when a cumulative is supplied, counts ML-DSA signature
-verify failures only. It excludes ADR-012 payload-hash mismatches and RejectV1
-policy rejections. x0x does not call `stage_stats()` or re-count verifies on
-the receive path.
 
 ## Soak instrumentation (#288)
 

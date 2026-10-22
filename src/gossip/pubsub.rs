@@ -1243,7 +1243,8 @@ fn deliver_copied_notification(
                 stats
                     .delivered_to_subscriber
                     .fetch_add(1, Ordering::Relaxed);
-                // Local subscriber deliveries are Eager payloads (#1170).
+                // PlumTree delivered an Eager payload to a subscriber (#1170).
+                // `local:` topics do not use this path.
                 crate::gossip::per_kind::per_kind_counters().record_delivered(MessageKind::Eager);
                 index += 1;
             }
@@ -3322,8 +3323,8 @@ impl PubSubManager {
                     self.stats
                         .delivered_to_subscriber
                         .fetch_add(1, Ordering::Relaxed);
-                    crate::gossip::per_kind::per_kind_counters()
-                        .record_delivered(MessageKind::Eager);
+                    // `local:` hand-offs never enter PlumTree. Do not count
+                    // them as Eager deliveries (#1170).
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3409,10 +3410,9 @@ impl PubSubManager {
         // with the id absent.
         //
         // Outer ML-DSA verify stays inside saorsa-gossip. Do not call
-        // `stage_stats()` or re-count verifies on this hot path. The pinned
-        // crate has no per-kind verify meter, so diagnostics leave
-        // `verify_ok` / `verify_err` at zero rather than sampling a shared
-        // stage counter across workers.
+        // `stage_stats()` or re-count verifies on this hot path. This slice
+        // does not publish per-kind verify CPU: the pinned crate has no
+        // per-kind verify meter.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
@@ -4907,6 +4907,7 @@ mod tests {
     use super::*;
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
+    use saorsa_gossip_types::MessageKind;
 
     /// A fresh signing context. Production managers always sign, and since
     /// #1114 nothing unsigned is delivered, so a fixture whose test relies on
@@ -9971,12 +9972,10 @@ mod tests {
         let topic = "issue1170-verify-wire";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let _sub = manager.subscribe(topic.to_string()).await;
-        let before = crate::gossip::per_kind::per_kind_counters()
-            .snapshot()
-            .kinds
-            .get("eager")
-            .map(|row| row.bus_dispatched)
-            .unwrap_or(0);
+        // Lifetime totals ignore a rolling-window rotation between the two
+        // reads. A window snapshot can reset under plain `cargo test`.
+        let counters = crate::gossip::per_kind::per_kind_counters();
+        let before = counters.lifetime_bus_dispatched(MessageKind::Eager);
 
         let inner = remote_signed_inner(topic, Bytes::from("verify-wire"));
         let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, true);
@@ -9984,12 +9983,7 @@ mod tests {
             .handle_incoming(PeerId::new([0x17; 32]), None, frame)
             .await;
 
-        let after = crate::gossip::per_kind::per_kind_counters()
-            .snapshot()
-            .kinds
-            .get("eager")
-            .map(|row| row.bus_dispatched)
-            .unwrap_or(0);
+        let after = counters.lifetime_bus_dispatched(MessageKind::Eager);
         assert!(
             after > before,
             "inspected Eager frame must count as bus_dispatched: before={before} after={after}"
@@ -10008,17 +10002,11 @@ mod tests {
             sends: Vec::new(),
         });
 
-        let global_before = crate::gossip::per_kind::per_kind_counters().snapshot();
-        let pub_before = global_before
-            .kinds
-            .get("eager")
-            .map(|r| r.published)
-            .unwrap_or(0);
-        let del_before = global_before
-            .kinds
-            .get("eager")
-            .map(|r| r.delivered)
-            .unwrap_or(0);
+        // Lifetime totals ignore a rolling-window rotation between the two
+        // reads. A window snapshot can reset under plain `cargo test`.
+        let counters = crate::gossip::per_kind::per_kind_counters();
+        let pub_before = counters.lifetime_published(MessageKind::Eager);
+        let del_before = counters.lifetime_delivered(MessageKind::Eager);
 
         manager
             .publish(topic.clone(), Bytes::from("forward-wire"))
@@ -10029,17 +10017,8 @@ mod tests {
             .expect("local delivery timeout")
             .expect("subscriber closed");
 
-        let global_after = crate::gossip::per_kind::per_kind_counters().snapshot();
-        let pub_after = global_after
-            .kinds
-            .get("eager")
-            .map(|r| r.published)
-            .unwrap_or(0);
-        let del_after = global_after
-            .kinds
-            .get("eager")
-            .map(|r| r.delivered)
-            .unwrap_or(0);
+        let pub_after = counters.lifetime_published(MessageKind::Eager);
+        let del_after = counters.lifetime_delivered(MessageKind::Eager);
         assert!(
             pub_after > pub_before,
             "publish path must record Eager published: before={pub_before} after={pub_after}"
@@ -10047,6 +10026,40 @@ mod tests {
         assert!(
             del_after > del_before,
             "forward/deliver path must record Eager delivered: before={del_before} after={del_after}"
+        );
+    }
+
+    /// #1170: a `local:` hand-off stays on this daemon and is not an Eager
+    /// PlumTree delivery.
+    #[tokio::test]
+    async fn issue1170_local_handoff_is_not_an_eager_delivery() {
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
+        let topic = "local:issue1170-not-eager".to_string();
+        let mut sub = manager.subscribe(topic.clone()).await;
+        let counters = crate::gossip::per_kind::per_kind_counters();
+        let delivered_before = counters.lifetime_delivered(MessageKind::Eager);
+        let published_before = counters.lifetime_published(MessageKind::Eager);
+
+        manager
+            .publish(topic, Bytes::from("local-only"))
+            .await
+            .expect("local publish");
+        let message = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("local delivery")
+            .expect("subscriber closed");
+        assert_eq!(message.payload, Bytes::from("local-only"));
+
+        assert_eq!(
+            counters.lifetime_delivered(MessageKind::Eager),
+            delivered_before,
+            "local: hand-off must not count as Eager delivered"
+        );
+        assert_eq!(
+            counters.lifetime_published(MessageKind::Eager),
+            published_before,
+            "local: hand-off must not count as Eager published"
         );
     }
 
