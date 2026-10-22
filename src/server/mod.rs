@@ -3493,6 +3493,14 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
             );
         }
     }
+    // #1545: the owner-sync store runs each durable write in its own task,
+    // so an abort above stops only the wait of its caller. Wait for those
+    // writes, and refuse new ones, before the instance locks are released:
+    // a daemon restarted on this data dir must not see a late write land
+    // over its own state.
+    if let Some(sync) = state.owner_sync.as_ref() {
+        sync.store().release_write_custody().await;
+    }
 }
 
 /// Whether two directory paths refer to the same directory, tolerating

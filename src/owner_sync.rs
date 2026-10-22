@@ -969,6 +969,14 @@ pub struct OwnerSyncStore {
     /// lock until the write and the memory update are done
     /// (`replace_pending`).
     pending_apply: Arc<tokio::sync::Mutex<PendingApplies>>,
+    /// #1545: the custody of this store's files. Each durable write of a
+    /// store file holds a read guard of it for the whole write
+    /// (`run_to_completion`); the value is `true` once the store has
+    /// given up its files (`release_write_custody`). Shutdown takes the
+    /// write guard, so it waits for every write in flight, and every write
+    /// after it is refused. No write can then land after the daemon has
+    /// released its data directory to a restarted daemon.
+    write_custody: Arc<tokio::sync::RwLock<bool>>,
     /// Test injection: hold a synced journal append after its decision
     /// read until the test releases it.
     #[cfg(test)]
@@ -1236,6 +1244,7 @@ impl OwnerSyncStore {
                     .collect(),
                 epoch: 0,
             })),
+            write_custody: Arc::new(tokio::sync::RwLock::new(false)),
             #[cfg(test)]
             journal_check_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1351,15 +1360,41 @@ impl OwnerSyncStore {
     /// memory update after it are done: no later writer can start before
     /// the write lands, and memory ends as the disk holds it.
     ///
+    /// The task also holds the store's write custody (`write_custody`)
+    /// until `work` ends, so shutdown waits for it
+    /// (`release_write_custody`). After shutdown, `work` does not run.
+    ///
     /// # Errors
     ///
-    /// The error of `work`, or [`SyncError::Io`] when its task fails.
+    /// The error of `work`; [`SyncError::Io`] when its task fails, or when
+    /// the store has released its files.
     async fn run_to_completion<T: Send + 'static>(
+        &self,
         work: impl std::future::Future<Output = Result<T, SyncError>> + Send + 'static,
     ) -> Result<T, SyncError> {
-        tokio::spawn(work)
-            .await
-            .map_err(|e| SyncError::Io(format!("durable write task failed: {e}")))?
+        let custody = Arc::clone(&self.write_custody).read_owned().await;
+        if *custody {
+            return Err(SyncError::Io(
+                "owner sync store has released its files: write refused".into(),
+            ));
+        }
+        tokio::spawn(async move {
+            let out = work.await;
+            drop(custody);
+            out
+        })
+        .await
+        .map_err(|e| SyncError::Io(format!("durable write task failed: {e}")))?
+    }
+
+    /// #1545: give up the store's files before the daemon releases its
+    /// data directory. Waits for every durable write in flight, including
+    /// one whose caller shutdown aborted, and refuses every later write
+    /// (`run_to_completion`). The wait has no bound: a write cannot be
+    /// stopped once it has started, and only the end of the process (which
+    /// also ends the write) may come first.
+    pub(crate) async fn release_write_custody(&self) {
+        *self.write_custody.write().await = true;
     }
 
     /// Write `next` durably as the register, and then make it the register
@@ -1398,7 +1433,7 @@ impl OwnerSyncStore {
         let fail_after_rename = self.fail_after_rename_for_testing();
         let poisoned = Arc::clone(&self.poisoned);
         let generation = Arc::clone(&self.generation_tx);
-        Self::run_to_completion(async move {
+        self.run_to_completion(async move {
             match Self::write_atomically(&path, &bytes, fail_after_rename).await {
                 Ok(()) => {
                     *records = next;
@@ -1434,18 +1469,21 @@ impl OwnerSyncStore {
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|e| SyncError::Io(format!("encode devices: {e}")))?;
-        Self::write_atomically(
-            &self.dir.join(DEVICES_FILE),
-            &bytes,
-            self.fail_after_rename_for_testing(),
-        )
-        .await
-        .map_err(|e| match e {
-            DurableWriteError::BeforeRename(io) => SyncError::Io(format!("persist devices: {io}")),
-            DurableWriteError::AfterRename(io) => {
-                SyncError::Poisoned(format!("devices replaced but not durable: {io}"))
-            }
+        let path = self.dir.join(DEVICES_FILE);
+        let fail_after_rename = self.fail_after_rename_for_testing();
+        self.run_to_completion(async move {
+            Self::write_atomically(&path, &bytes, fail_after_rename)
+                .await
+                .map_err(|e| match e {
+                    DurableWriteError::BeforeRename(io) => {
+                        SyncError::Io(format!("persist devices: {io}"))
+                    }
+                    DurableWriteError::AfterRename(io) => {
+                        SyncError::Poisoned(format!("devices replaced but not durable: {io}"))
+                    }
+                })
         })
+        .await
     }
 
     /// Persist the unenroll tombstones; errors propagate (see
@@ -1466,20 +1504,21 @@ impl OwnerSyncStore {
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|e| SyncError::Io(format!("encode tombstones: {e}")))?;
-        Self::write_atomically(
-            &self.dir.join(TOMBSTONES_FILE),
-            &bytes,
-            self.fail_after_rename_for_testing(),
-        )
-        .await
-        .map_err(|e| match e {
-            DurableWriteError::BeforeRename(io) => {
-                SyncError::Io(format!("persist tombstones: {io}"))
-            }
-            DurableWriteError::AfterRename(io) => {
-                SyncError::Poisoned(format!("tombstones replaced but not durable: {io}"))
-            }
+        let path = self.dir.join(TOMBSTONES_FILE);
+        let fail_after_rename = self.fail_after_rename_for_testing();
+        self.run_to_completion(async move {
+            Self::write_atomically(&path, &bytes, fail_after_rename)
+                .await
+                .map_err(|e| match e {
+                    DurableWriteError::BeforeRename(io) => {
+                        SyncError::Io(format!("persist tombstones: {io}"))
+                    }
+                    DurableWriteError::AfterRename(io) => {
+                        SyncError::Poisoned(format!("tombstones replaced but not durable: {io}"))
+                    }
+                })
         })
+        .await
     }
 
     /// Poison the store: a durable write crossed the rename but could not
@@ -2245,7 +2284,7 @@ impl OwnerSyncStore {
         let bytes = serde_json::to_vec(&PersistedRecords { records })
             .map_err(|e| SyncError::Io(format!("encode journal intent: {e}")))?;
         let path = self.dir.join(JOURNAL_INTENT_FILE);
-        Self::run_to_completion(async move {
+        self.run_to_completion(async move {
             Self::write_atomically(&path, &bytes, false)
                 .await
                 .map_err(|e| match e {
@@ -2265,7 +2304,7 @@ impl OwnerSyncStore {
     /// back.
     async fn remove_journal_intent<H: Send + 'static>(&self, held: H) -> Result<H, SyncError> {
         let path = self.dir.join(JOURNAL_INTENT_FILE);
-        Self::run_to_completion(async move {
+        self.run_to_completion(async move {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2372,7 +2411,7 @@ impl OwnerSyncStore {
                 .collect(),
         })
         .map_err(|e| SyncError::Io(format!("encode pending applies: {e}")))?;
-        Self::run_to_completion(async move {
+        self.run_to_completion(async move {
             Self::write_atomically(&path, &bytes, false)
                 .await
                 .map_err(|e| match e {
@@ -8773,6 +8812,49 @@ mod cancellation_tests {
         assert!(
             restarted.pending_applies().await.is_empty(),
             "a cancelled note must not restore the discharged Alice on disk"
+        );
+    }
+
+    /// Codex review of #1545 (3a28bef1): once shutdown has released the
+    /// store's files, a write that starts later is refused and leaves the
+    /// disk as it was.
+    #[tokio::test]
+    async fn a_write_after_the_release_of_custody_is_refused() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        store
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile("A"),
+                &owner,
+                machine(1),
+            )
+            .await
+            .expect("mint A");
+        store.release_write_custody().await;
+        let refused = store
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile("B"),
+                &owner,
+                machine(1),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(SyncError::Io(e)) if e.contains("released its files")),
+            "a write after the release must be refused by the custody: {refused:?}"
+        );
+        drop(store);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert_eq!(
+            restarted
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("A")),
+            "a refused write leaves the disk as it was"
         );
     }
 
