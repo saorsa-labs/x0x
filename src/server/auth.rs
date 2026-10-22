@@ -412,6 +412,10 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/history/retain"
                     // ADR-0074 §1: named forwards resolve (and pin) a name.
                     | "/forwards"
+                    // #1392: David approved 22 Oct 2026 13:30 BST. Show is
+                    // an owner act. A GUI session bearer and a rider token
+                    // are refused, the same as POST /forwards.
+                    | "/gui/show"
             ) || is_two_segment_action(path, "delegate")
                 || is_group_quarantine_clear(path)
         }
@@ -932,6 +936,7 @@ mod tests {
             (Method::POST, "/home/rename"),
             (Method::POST, "/home/seat"),
             (Method::POST, "/upgrade/apply"),
+            (Method::POST, "/gui/show"),
         ] {
             // The route is classified durable-owner…
             assert!(
@@ -1567,5 +1572,16 @@ mod tests {
             "/forwards/127.0.0.1:8022"
         ));
         assert!(!requires_durable_owner(&Method::POST, "/agent/card/import"));
+    }
+
+    #[test]
+    fn gui_show_requires_durable_owner() {
+        // #1392: David approved 22 Oct 2026 13:30 BST. POST /gui/show
+        // requires the durable owner token. GET /gui stays a browser surface.
+        assert!(requires_durable_owner(&Method::POST, "/gui/show"));
+        assert!(!requires_durable_owner(&Method::GET, "/gui"));
+        assert!(!requires_durable_owner(&Method::GET, "/gui/"));
+        assert!(!requires_durable_owner(&Method::POST, "/gui"));
+        assert!(!requires_durable_owner(&Method::GET, "/gui/show"));
     }
 }

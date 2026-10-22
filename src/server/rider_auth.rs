@@ -544,6 +544,8 @@ mod tests {
             ("/history", Method::DELETE),
             ("/files/send", Method::POST),
             ("/forwards", Method::POST),
+            // #1392: show is an owner act. A rider token is refused.
+            ("/gui/show", Method::POST),
         ];
         for (path, method) in forbidden {
             assert!(

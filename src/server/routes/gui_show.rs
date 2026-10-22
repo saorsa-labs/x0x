@@ -6,16 +6,21 @@
 //! `navigated` is returned only when that tab's GUI session is still valid
 //! and its outbound queue accepts the frame. The response never contains a
 //! URL or session token.
+//!
+//! The route requires the durable owner API token. `auth_middleware` refuses
+//! a GUI session bearer and a rider token before this handler runs. The
+//! handler repeats that check.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use super::super::rider_auth::ActorContext;
 use super::super::state::AppState;
 use super::super::ws::GuiShowFrame;
 use crate::gui::{
@@ -26,8 +31,22 @@ use crate::gui::{
 /// POST /gui/show
 pub(in crate::server) async fn gui_show(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
     Json(req): Json<GuiShowRequest>,
 ) -> Response {
+    // David approved 22 Oct 2026 13:30 BST (#1392). Same refusal as
+    // `POST /forwards`: the middleware returns 403 before extractors, and
+    // this check refuses a non-durable actor when that layer is absent.
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "/gui/show requires the durable API token (not a session token)"
+            })),
+        )
+            .into_response();
+    }
+
     let machine_id = hex::encode(state.agent.machine_id().as_bytes());
     let request_id = new_request_id();
 
@@ -211,8 +230,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn router(state: Arc<AppState>) -> axum::Router {
+        // Behaviour tests call the handler as the durable owner. The auth
+        // test below drives the real middleware and the non-durable actors.
         axum::Router::new()
             .route("/gui/show", post(gui_show))
+            .layer(Extension(ActorContext::Owner { durable: true }))
             .with_state(state)
     }
 
@@ -269,6 +291,132 @@ mod tests {
                 "durable token must not appear"
             );
         }
+        Ok(())
+    }
+
+    async fn post_show_as(
+        app: &axum::Router,
+        bearer: &str,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/gui/show")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({ "view": "people" }).to_string(),
+            ))?;
+        let resp = app.clone().oneshot(req).await?;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await?;
+        Ok((status, serde_json::from_slice(&bytes).unwrap_or_default()))
+    }
+
+    /// David approved 22 Oct 2026 13:30 BST (#1392). A GUI session bearer
+    /// and a rider token are refused. The durable owner token is accepted.
+    #[tokio::test]
+    async fn gui_show_refuses_session_and_rider_accepts_durable_owner() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let app = axum::Router::new()
+            .route("/gui/show", post(gui_show))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let session = state.sessions.issue(Instant::now());
+        let (status, body) = post_show_as(&app, &session).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "GUI session bearer must be refused: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durable API token"),
+            "session 403 must name the durable requirement: {body}"
+        );
+
+        let rider = {
+            let mut store = state.rider_tokens.lock().await;
+            let (token, _record) = store
+                .issue(
+                    "aa".repeat(32),
+                    Vec::new(),
+                    None,
+                    60,
+                    String::new(),
+                    None,
+                    None,
+                    crate::server::rider_auth::unix_now_secs(),
+                )
+                .await?;
+            token
+        };
+        let (status, body) = post_show_as(&app, &rider).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "rider token must be refused: {body}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("denied"),
+            "rider 403 must be the route denial: {body}"
+        );
+
+        // The handler refuses a non-durable actor even when middleware is
+        // absent. This fails if the handler check is removed.
+        for actor in [
+            ActorContext::Owner { durable: false },
+            ActorContext::Rider {
+                sub_agent_id: "aa".repeat(32),
+                token_id: 1,
+                token_hash: "hash".to_string(),
+                groups: Vec::new(),
+            },
+        ] {
+            let bare = axum::Router::new()
+                .route("/gui/show", post(gui_show))
+                .layer(Extension(actor))
+                .with_state(Arc::clone(&state));
+            let (status, body) = post_show_as(&bare, "not-a-token").await?;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "handler must refuse a non-durable actor: {body}"
+            );
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable API token"),
+                "handler 403 must name the durable requirement: {body}"
+            );
+        }
+
+        assert!(
+            cap.urls.lock().expect("opener lock").is_empty(),
+            "a refused caller must not open a browser"
+        );
+
+        let (status, body) = post_show_as(&app, "test-token").await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "durable owner token must be accepted: {body}"
+        );
+        let outcome = body["outcome"].as_str().unwrap_or("");
+        assert!(
+            outcome == "opened" || outcome == "navigated",
+            "durable owner token must reach the handler: {body}"
+        );
         Ok(())
     }
 
