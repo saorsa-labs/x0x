@@ -7000,6 +7000,64 @@ mod issuance_journal_sync_tests {
         );
     }
 
+    /// Codex review of #1545 (758f62c), P2: as in
+    /// `an_interrupted_commit_does_not_override_a_later_same_second_renewal`,
+    /// but the intent of the interrupted `d1` commit cannot be decoded
+    /// after the restart. The recovery must not delete it and go on: the
+    /// journal then holds `d1` with no record that it came from the
+    /// register, so the same-second `d2` is accepted without a journal
+    /// line and the reconcile publishes `d1` over it. The recovery fails
+    /// closed and keeps the intent; no journal commit or mint runs.
+    #[tokio::test]
+    async fn an_undecodable_journal_intent_fails_closed() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let d0 = journal_value("d0", 50, 1_000);
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r0 = remote_record(&remote, &owner, &d0).await;
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r0).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r1], &owner.user_id()).await;
+        drop(local);
+        let intent = local_dir.join(SYNC_DIR).join(JOURNAL_INTENT_FILE);
+        std::fs::write(&intent, b"{\"records\": [").expect("corrupt the intent");
+
+        // The restart; `d2` arrives before the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        let delivered = local.commit_batch(vec![r2], &owner.user_id()).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d0),
+            "no journal commit or mint may change the register: {lines:?}"
+        );
+        assert!(
+            delivered.is_err(),
+            "a journal commit must fail while the intent cannot be decoded"
+        );
+        assert_eq!(
+            std::fs::read(&intent).expect("the intent is kept"),
+            b"{\"records\": [",
+            "the recovery must keep the undecodable intent"
+        );
+    }
+
     /// Codex review of #1545 (bab382f), P2: a local renewal `d2` is
     /// cancelled after its journal rename and before the write's
     /// bookkeeping, as a caller cancellation during the rename await can
