@@ -3049,6 +3049,65 @@ mod daemon_tests {
         lagging_peer_installs(&fx, &parent, relay, &frames[0], &result_head).await
     }
 
+    /// #1508 review (Codex P1, boot race): a frame received before the S4
+    /// load runs stays held after the load. The interleaving is a second
+    /// receipt that did its once-per-process `.celog` load before
+    /// `load_persisted_obligations` replaced the runtime, and writes its
+    /// frame after it. That write must keep the first frame in the file.
+    #[tokio::test]
+    async fn a_frame_received_before_the_s4_load_stays_held_after_it() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+
+        // The worker's boot load runs after the receipt.
+        super::super::load_persisted_obligations(&fx.replica).await;
+        let held_now = fx
+            .replica
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .catchup_frames(std::slice::from_ref(&fx.stable), parent.state_revision);
+        assert!(
+            held_now.len() == 1 && held_now[0].2.as_slice() == frame.as_slice(),
+            "the live held frame survives the load (held {})",
+            held_now.len()
+        );
+
+        // The second receipt's frame write lands after the load.
+        let ext = super::super::rebind::replay_log::CE_EXTENSION;
+        let later = Arc::new(b"X0XCE1\0later frame".to_vec());
+        let at = (parent.state_revision.saturating_add(2), "later-head");
+        assert!(
+            super::super::rebind::replay_log::write_received(
+                &fx.replica,
+                ext,
+                held,
+                &fx.stable,
+                at,
+                &later
+            )
+            .await
+        );
+        let on_disk =
+            super::super::rebind::replay_log::tests::frames_on_disk(&fx.replica, ext, &fx.stable)
+                .await;
+        assert!(
+            on_disk
+                .iter()
+                .any(|held| held.frame == frame && held.result_head == result_head),
+            "the first frame is still durable ({} frames on disk)",
+            on_disk.len()
+        );
+        Ok(())
+    }
+
     /// #1508 review (Codex P1): the received frame is durable before the
     /// state it carries is installed. The install fails (a crash at that
     /// point); after the restart the node installs its own copy and serves
