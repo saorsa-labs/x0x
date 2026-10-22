@@ -3458,3 +3458,189 @@ mod daemon_tests {
         Ok(())
     }
 }
+
+/// #1508 r6: sibling `CryptoExclusionV1` frames (ADR 0110 §2 fork
+/// containment, §4 L249 receiver checks). Each test drives the real
+/// receive function on an offline daemon (no network node).
+#[cfg(test)]
+mod sibling_tests {
+    use super::super::rebind::restart_tests::{hold_persisted, offline_daemon};
+    use super::*;
+    use anyhow::{Context as _, Result};
+    use x0x::identity::{AgentKeypair, UserKeypair};
+
+    /// A GSS `MlsEncrypted` `OwnerCertified` group created by `creator`,
+    /// with `admin` a second admin, a bystander and `members` Members.
+    /// `target` leaves without a rotation (`parent`, retained), and
+    /// `creator` then removes the bystander with a rotation on it
+    /// (`head`). Two GSS exclusions of one target on one parent have the
+    /// same state, so the own branch is another commit.
+    struct Race {
+        parent: GroupInfo,
+        head: GroupInfo,
+        target_hex: String,
+    }
+
+    fn race(
+        owner: &UserKeypair,
+        creator: &AgentKeypair,
+        admin: &AgentKeypair,
+        target: &AgentKeypair,
+        members: &[&AgentKeypair],
+    ) -> Result<Race> {
+        let now_ms = super::super::super::now_millis_u64();
+        let creator_hex = hex::encode(creator.agent_id().as_bytes());
+        let mut info = GroupInfo::new(
+            "ce-sibling".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "ca".repeat(16),
+        );
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        let bystander = AgentKeypair::generate()?;
+        let bystander_hex = hex::encode(bystander.agent_id().as_bytes());
+        for (member, role) in std::iter::once((admin, x0x::groups::GroupRole::Admin))
+            .chain(std::iter::once((
+                &bystander,
+                x0x::groups::GroupRole::Member,
+            )))
+            .chain(std::iter::once((target, x0x::groups::GroupRole::Member)))
+            .chain(members.iter().map(|m| (*m, x0x::groups::GroupRole::Member)))
+        {
+            info.add_member(
+                hex::encode(member.agent_id().as_bytes()),
+                role,
+                Some(creator_hex.clone()),
+                None,
+            );
+        }
+        info.seal_commit_evicting(creator, now_ms)?;
+        anyhow::ensure!(ce::is_gss_encrypted(&info), "a GSS MlsEncrypted group");
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let mut parent = info;
+        parent.roster_revision = parent.roster_revision.saturating_add(1);
+        parent.remove_member(&target_hex, Some(target_hex.clone()));
+        parent.seal_commit_evicting(target, now_ms + 1)?;
+        // The creator's own branch: it removes the bystander and rotates
+        // to secret epoch 1. A GSS exclusion of the target on the same
+        // parent is a sibling with another state.
+        let mut head = parent.clone();
+        head.roster_revision = head.roster_revision.saturating_add(1);
+        head.remove_member(&bystander_hex, Some(creator_hex));
+        head.secret_epoch = 1;
+        head.security_binding = Some(ce::gss_binding(1));
+        head.seal_commit_evicting(creator, now_ms + 2)?;
+        Ok(Race {
+            parent,
+            head,
+            target_hex,
+        })
+    }
+
+    /// A GSS exclusion of `target_hex` on `parent`, signed by `actor`.
+    fn exclusion(
+        parent: &GroupInfo,
+        target_hex: &str,
+        actor: &AgentKeypair,
+        next_secret_epoch: u64,
+        now_ms: u64,
+    ) -> Result<(GroupInfo, Vec<u8>)> {
+        let mut next = parent.clone();
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.secret_epoch = next_secret_epoch;
+        next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+        let commit = next.seal_commit_evicting(actor, now_ms)?;
+        let mut target = [0u8; 32];
+        hex::decode_to_slice(target_hex, &mut target)?;
+        let body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: parent.stable_group_id().to_string(),
+            actor: *actor.agent_id().as_bytes(),
+            target,
+            prior_head: parent.state_hash.clone(),
+            prior_revision: parent.state_revision,
+            next_revision: commit.revision,
+            roster_revision: next.roster_revision,
+            removal_proof_hash: ce::removal_proof_for(parent, target_hex).unwrap_or([0; 32]),
+            crypto: ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch },
+            commit: ce::CommitHeaderV1::from(&commit),
+        };
+        let frame = ce::sign(body, actor).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok((next, ce::encode_frame(&frame)?))
+    }
+
+    async fn quarantine_of(state: &AppState, stable: &str) -> Option<x0x::groups::ForkQuarantine> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(stable)
+            .and_then(|info| info.fork_quarantine.clone())
+    }
+
+    /// Codex P1 A, for `CryptoExclusionV1`: a frame that does not chain
+    /// from this node's head is checked against its retained parent
+    /// before it can be fork evidence. An unrevoked ordinary member signs
+    /// an exclusion sibling, and an admin signs one at a wrong epoch.
+    /// Neither quarantines an invite-derived receiver; each is refused
+    /// with its own reason. A valid sibling by the other admin does.
+    #[tokio::test]
+    async fn an_invalid_exclusion_sibling_quarantines_no_receiver() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let owner = UserKeypair::generate()?;
+        let creator = AgentKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let target = AgentKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        let me = receiver.agent.identity().agent_keypair();
+        let fx = race(&owner, &creator, &admin, &target, &[&member, me])?;
+        let mut head = fx.head.clone();
+        head.invite_lineage = Some(x0x::groups::InviteLineage {
+            base_revision: fx.parent.state_revision,
+            base_hash: fx.parent.state_hash.clone(),
+            seated_at_revision: Some(fx.parent.state_revision),
+            ..Default::default()
+        });
+        let stable = head.stable_group_id().to_string();
+        hold_persisted(&receiver, &head).await?;
+        let now_ms = super::super::super::now_millis_u64();
+
+        let (_, by_member) = exclusion(&fx.parent, &fx.target_hex, &member, 1, now_ms)?;
+        let outcome = receive(&receiver, member.agent_id(), &by_member).await;
+        assert_eq!(
+            quarantine_of(&receiver, &stable).await,
+            None,
+            "a member's exclusion is no fork evidence"
+        );
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::ActorIneligible)
+        );
+        let (_, wrong_epoch) = exclusion(&fx.parent, &fx.target_hex, &admin, 5, now_ms)?;
+        let outcome = receive(&receiver, admin.agent_id(), &wrong_epoch).await;
+        assert_eq!(
+            quarantine_of(&receiver, &stable).await,
+            None,
+            "an exclusion at a wrong epoch is no fork evidence"
+        );
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::EpochMismatch)
+        );
+
+        // The control: the other admin's valid exclusion on the same parent.
+        let (sibling, valid) = exclusion(&fx.parent, &fx.target_hex, &admin, 1, now_ms)?;
+        let outcome = receive(&receiver, admin.agent_id(), &valid).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::HeadMismatch)
+        );
+        let marker = quarantine_of(&receiver, &stable)
+            .await
+            .context("the valid sibling contains the group")?;
+        assert_eq!(marker.state_hash, sibling.state_hash);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+}
