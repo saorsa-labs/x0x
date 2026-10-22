@@ -33,10 +33,19 @@
 //! depth — the ACL loader already rejects non-loopback at load time, and the
 //! gate re-checks `is_loopback`).
 //!
+//! ## Persistence and machine binding (ADR-0074 §2 / §1)
+//!
+//! Forwards persist by default in [`crate::forward::store`]; `--ephemeral`
+//! opts out. A forward with a pinned [`crate::identity::MachineId`] checks
+//! `PeerStream::peer()` before any forward-header byte; a mismatch resets
+//! the stream and counts `machine_mismatch`, and never falls back to V1.
+//!
 //! The header codec and the inbound gate decision are pure functions of
 //! bytes / resolved inputs so the whole deny/allow matrix is fast unit-
 //! testable without a live QUIC pair (the real stream wiring is proven by
 //! `tests/tailnet_streams_integration.rs` + T7).
+
+pub mod store;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -981,6 +990,9 @@ pub struct ForwardDiagnostics {
     /// Shutdown increments [`Self::torn_down_shutdown`], not
     /// [`Self::torn_down_reauth`].
     torn_down_reasons: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    /// Outbound streams reset before any header byte because they reached a
+    /// different machine than the forward's pinned `MachineId` (ADR-0074 §1).
+    machine_mismatch: AtomicU64,
 }
 
 impl ForwardDiagnostics {
@@ -1047,6 +1059,16 @@ impl ForwardDiagnostics {
             .iter()
             .map(|(k, count)| ((*k).to_string(), *count))
             .collect()
+    }
+    /// Record an outbound stream refused at the machine-binding check
+    /// (ADR-0074 §1).
+    pub fn record_machine_mismatch(&self) {
+        self.machine_mismatch.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Outbound streams refused because they reached an unpinned machine.
+    #[must_use]
+    pub fn machine_mismatch(&self) -> u64 {
+        self.machine_mismatch.load(Ordering::Relaxed)
     }
     /// Current connect-failure count.
     #[must_use]
@@ -1476,18 +1498,6 @@ async fn read_header<R: tokio::io::AsyncRead + Unpin>(
     bincode::deserialize(&body).map_err(|e| ForwardError::Decode(e.to_string()))
 }
 
-/// Write a length-prefixed `ForwardHeader` to an async writer.
-async fn write_header<W: tokio::io::AsyncWrite + Unpin>(
-    w: &mut W,
-    header: &ForwardHeader,
-) -> Result<(), NetworkError> {
-    use tokio::io::AsyncWriteExt;
-    let frame = header.encode();
-    w.write_all(&frame)
-        .await
-        .map_err(|e| NetworkError::StreamError(format!("write forward header: {e}")))
-}
-
 /// Read a length-prefixed `ForwardV2Header` from an async reader.
 async fn read_header_v2<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
@@ -1509,6 +1519,9 @@ async fn read_header_v2<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// Write a length-prefixed `ForwardV2Header` to an async writer.
+///
+/// TCP forwards write through [`send_header_to_pinned`] so a machine-pin
+/// mismatch sends zero header bytes. SOCKS prepare has no pin and writes here.
 async fn write_header_v2<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     header: &ForwardV2Header,
@@ -1558,7 +1571,11 @@ impl ForwardConfig {
 // ===========================================================================
 
 /// A registered local forward (`forward add`).
-#[derive(Debug, Clone, Serialize)]
+///
+/// The fields are the pre-ADR-0074 set, so an existing struct literal keeps
+/// compiling. Name, machine pin, and persistence travel in
+/// [`ForwardBinding`], beside this spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ForwardSpec {
     /// Local loopback address the daemon binds (`127.0.0.1:PORT`).
     pub local_addr: SocketAddr,
@@ -1570,6 +1587,46 @@ pub struct ForwardSpec {
     pub target_port: u16,
 }
 
+/// Name, machine pin, and persistence for one forward.
+///
+/// [`ForwardService::add_forward`] uses [`ForwardBinding::ephemeral`].
+/// Callers that persist a forward or pin its machine pass this value to
+/// [`ForwardService::add_forward_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardBinding {
+    /// Canonical kind-prefixed name, or `None` for a hex peer.
+    pub name: Option<String>,
+    /// Agent or machine target (meaningful with `name`).
+    pub kind: crate::names::NameKind,
+    /// ADR-0074 §1 machine binding: when set, every stream this forward
+    /// opens must reach this `MachineId` (`PeerStream::peer()`), checked
+    /// before any forward-header byte is sent; a mismatch resets the
+    /// stream and counts `machine_mismatch`.
+    pub pinned_machine: Option<MachineId>,
+    /// Persisted in `forwards.json` (ADR-0074 §2); `false` for
+    /// `--ephemeral` forwards.
+    pub persistent: bool,
+}
+
+impl ForwardBinding {
+    /// No name, no machine pin, and not written to `forwards.json`.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        Self {
+            name: None,
+            kind: crate::names::NameKind::Agent,
+            pinned_machine: None,
+            persistent: false,
+        }
+    }
+}
+
+impl Default for ForwardBinding {
+    fn default() -> Self {
+        Self::ephemeral()
+    }
+}
+
 impl ForwardSpec {
     /// The peer agent id as a hex string (for REST/CLI display).
     #[must_use]
@@ -1578,10 +1635,123 @@ impl ForwardSpec {
     }
 }
 
-/// A registered forward + its cancellation token (internal).
+/// One registered forward as `GET /forwards` reports it: its spec, and the
+/// reason it is down when it is not listening (a restored forward whose
+/// name no longer resolves to its pinned ids, or whose port is busy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardStatus {
+    /// The forward.
+    pub spec: ForwardSpec,
+    /// Name, machine pin, and persistence. Not part of [`ForwardSpec`].
+    pub binding: ForwardBinding,
+    /// `None` while listening; otherwise why the forward is down.
+    pub error: Option<String>,
+}
+
+/// Whether a registered forward is listening (internal).
+enum EntryState {
+    /// Bound and registered. The accept loop has not started, so a failed
+    /// save can drop the socket before any connection is taken.
+    Held(TcpListener),
+    /// Listening. Cancelling the token stops the listener and every
+    /// connection it has already accepted.
+    Active(CancellationToken),
+    /// Registered but down, with the reason (ADR-0074 §2: a restored
+    /// forward that could not be re-resolved or re-bound).
+    Disabled(String),
+}
+
+impl EntryState {
+    fn down_reason(&self) -> Option<String> {
+        match self {
+            Self::Held(_) | Self::Active(_) => None,
+            Self::Disabled(reason) => Some(reason.clone()),
+        }
+    }
+}
+
+/// One accepted local connection waits here until the guard drops.
+///
+/// The slot belongs to one [`ForwardService`], so another test's listener
+/// is not paused.
+#[cfg(test)]
+struct AcceptedConnectionPause {
+    hit: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct AcceptedConnectionPauseGuard {
+    slot: Arc<std::sync::Mutex<Option<Arc<AcceptedConnectionPause>>>>,
+}
+
+#[cfg(test)]
+impl Drop for AcceptedConnectionPauseGuard {
+    fn drop(&mut self) {
+        let state = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(state) = state {
+            state.released.store(true, Ordering::Release);
+            state.release.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_accepted_connection(
+    slot: &Arc<std::sync::Mutex<Option<Arc<AcceptedConnectionPause>>>>,
+) {
+    let state = {
+        let guard = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = guard.as_ref() else {
+            return;
+        };
+        if state.hit.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        Arc::clone(state)
+    };
+    loop {
+        if state.released.load(Ordering::Acquire) {
+            return;
+        }
+        tokio::select! {
+            _ = state.release.notified() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    }
+}
+
+/// A registered forward + its state (internal).
 struct ForwardEntry {
     spec: ForwardSpec,
-    cancel: CancellationToken,
+    binding: ForwardBinding,
+    state: EntryState,
+}
+
+/// `add_forward` returns this when a `:0` bind lands on a forward that
+/// already owns the address. The caller retries. The colliding listener
+/// stays open until [`ForwardService::release_allocation_holds`].
+const PORT_ALLOCATION_COLLISION: &str = "allocated port belongs to another forward";
+
+pub(crate) fn is_port_allocation_collision(err: &NetworkError) -> bool {
+    matches!(
+        err,
+        NetworkError::ConnectionFailed(message) if message == PORT_ALLOCATION_COLLISION
+    )
+}
+
+/// How [`ForwardService::shutdown_and_release`] finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardShutdownReport {
+    /// Transactions still running when the 2s drain ended. They were aborted.
+    pub abandoned_transactions: usize,
 }
 
 /// Owns the inbound forward consumers + the outbound local listeners.
@@ -1600,7 +1770,32 @@ pub struct ForwardService {
     fwd_diag: Arc<ForwardDiagnostics>,
     /// Registered forwards (spec + cancellation) so `shutdown` / `remove` can
     /// tear down individual listeners and `list` can return them.
+    ///
+    /// Also the gate for [`Self::listeners_closed`]: `add_forward` checks that
+    /// flag and publishes its accept-loop [`JoinHandle`](tokio::task::JoinHandle)
+    /// while it holds this lock, and shutdown takes those handles under the
+    /// same lock. A bind that resumes after shutdown cannot publish a listener
+    /// the drain will miss.
     forwards: std::sync::Mutex<Vec<ForwardEntry>>,
+    /// Accept loops for [`Self::add_forward`]. Shutdown awaits these after it
+    /// cancels them, so the bound port is free when shutdown returns.
+    listener_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Ports from a `:0` allocation that matched a saved forward.
+    /// Held so the next allocation cannot take the same port, then released
+    /// when the add finishes or the forwarder shuts down.
+    allocation_holds: std::sync::Mutex<Vec<tokio::net::TcpListener>>,
+    /// Set under [`Self::forwards`] before listener tokens are cancelled.
+    listeners_closed: std::sync::atomic::AtomicBool,
+    /// Test-only bind addresses, consumed from the front.
+    #[cfg(test)]
+    bind_script: std::sync::Mutex<Vec<SocketAddr>>,
+    /// Test-only pause for the next connection this forwarder accepts.
+    #[cfg(test)]
+    accepted_pause: Arc<std::sync::Mutex<Option<Arc<AcceptedConnectionPause>>>>,
+    /// Add, remove, and restore transactions. `None` refuses new ones.
+    /// Shutdown drains the admitted tasks before it cancels listeners, so a
+    /// transaction cannot bind after shutdown has returned.
+    transactions: std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     inbound_token: CancellationToken,
     /// The forwarder-owned protocol acceptors (`ForwardV1`, `ForwardV2`),
     /// moved into their consumer loops by `spawn_inbound`. `None` once the
@@ -1748,6 +1943,14 @@ impl ForwardService {
             live: Arc::new(teardown::LiveStreams::new(Arc::clone(&fwd_diag))),
             fwd_diag,
             forwards: std::sync::Mutex::new(Vec::new()),
+            listener_tasks: std::sync::Mutex::new(Vec::new()),
+            allocation_holds: std::sync::Mutex::new(Vec::new()),
+            listeners_closed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            bind_script: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            accepted_pause: Arc::new(std::sync::Mutex::new(None)),
+            transactions: std::sync::Mutex::new(Some(Vec::new())),
             inbound_token: CancellationToken::new(),
             inbound_acceptors: std::sync::Mutex::new(Some((acceptor_v1, acceptor_v2))),
             inbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_STREAMS)),
@@ -1906,47 +2109,228 @@ impl ForwardService {
             handle_inbound(stream, &inbound_ctx).await;
         });
     }
+
+    fn next_bind_addr(&self, requested: SocketAddr) -> SocketAddr {
+        #[cfg(test)]
+        {
+            if let Some(addr) = self
+                .bind_script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop()
+            {
+                return addr;
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+        }
+        requested
+    }
+
+    /// Keep `listener` open so a `:0` retry cannot bind this port again.
+    pub(crate) fn hold_allocation(&self, listener: tokio::net::TcpListener) {
+        self.allocation_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(listener);
+    }
+
+    /// Close ports held back from a `:0` allocation.
+    pub(crate) fn release_allocation_holds(&self) {
+        self.allocation_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Next `add_forward` calls bind these addresses, in order, instead of
+    /// the spec address. Used to force a collision with a saved forward.
+    #[cfg(test)]
+    pub(crate) fn script_binds_for_test(&self, addrs: Vec<SocketAddr>) {
+        let mut addrs = addrs;
+        addrs.reverse();
+        *self
+            .bind_script
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = addrs;
+    }
+
     /// Register a local forward: bind `local_addr`, and for each accepted TCP
     /// connection open a peer stream, write the header, and bridge on
     /// `connected`. Returns the bound local address (useful when port = 0).
     ///
     /// # Errors
-    /// `NetworkError` if the local listener cannot be bound.
+    /// `NetworkError` if the local listener cannot be bound, or if the
+    /// forwarder has shut down. A shutdown that wins the race drops the
+    /// socket before this returns; it does not publish a listener.
+    ///
+    /// The forward is ephemeral: no name, no machine pin, and it is not
+    /// written to `forwards.json`. Use [`Self::add_forward_with`] to pin
+    /// or persist.
     pub async fn add_forward(&self, spec: ForwardSpec) -> NetworkResult<SocketAddr> {
+        self.add_forward_with(spec, ForwardBinding::ephemeral())
+            .await
+    }
+
+    /// [`Self::add_forward`] with the name, machine pin, and persistence
+    /// carried in `binding`.
+    ///
+    /// The listener accepts before this returns. That is the contract for
+    /// Rust callers.
+    ///
+    /// # Errors
+    /// Same as [`Self::add_forward`].
+    pub async fn add_forward_with(
+        &self,
+        spec: ForwardSpec,
+        binding: ForwardBinding,
+    ) -> NetworkResult<SocketAddr> {
+        let bound = self.bind_forward(spec, binding).await?;
+        self.start_accept(bound)?;
+        Ok(bound)
+    }
+
+    /// Bind `spec` and register it without accepting.
+    ///
+    /// The socket is held until [`Self::start_accept`] or
+    /// [`Self::remove_forward`]. A failed save can drop it before any
+    /// local connection is taken.
+    ///
+    /// # Errors
+    /// Same as [`Self::add_forward`].
+    pub(crate) async fn bind_forward(
+        &self,
+        spec: ForwardSpec,
+        binding: ForwardBinding,
+    ) -> NetworkResult<SocketAddr> {
+        if self.listeners_closed.load(Ordering::Acquire) {
+            return Err(NetworkError::ConnectionFailed(
+                "forwarder is shut down".to_string(),
+            ));
+        }
         self.ensure_reauth_loop();
-        let listener = TcpListener::bind(spec.local_addr).await.map_err(|e| {
-            NetworkError::ConnectionFailed(format!("bind {}: {e}", spec.local_addr))
-        })?;
+        let bind_addr = self.next_bind_addr(spec.local_addr);
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(format!("bind {bind_addr}: {e}")))?;
         let bound = listener
             .local_addr()
             .map_err(|e| NetworkError::ConnectionFailed(format!("local_addr: {e}")))?;
-        let cancel = CancellationToken::new();
+        // A kernel-assigned port must not replace a forward that already
+        // owns that address. The listener is held so the retry cannot bind
+        // it again. An explicit address still replaces that entry.
+        if spec.local_addr.port() == 0 {
+            let occupied = {
+                let forwards = self
+                    .forwards
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                forwards.iter().any(|entry| entry.spec.local_addr == bound)
+            };
+            if occupied {
+                self.hold_allocation(listener);
+                return Err(NetworkError::ConnectionFailed(
+                    PORT_ALLOCATION_COLLISION.to_string(),
+                ));
+            }
+        }
         // Register the kernel-assigned address.  Keeping the requested
         // `:0` here makes list/remove unable to identify the listener that
         // was actually opened (and makes two ephemeral forwards collide).
-        let mut registered_spec = spec.clone();
+        let mut registered_spec = spec;
         registered_spec.local_addr = bound;
-        if let Ok(mut forwards) = self.forwards.lock() {
-            forwards.push(ForwardEntry {
-                spec: registered_spec,
-                cancel: cancel.clone(),
-            });
+        let mut forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Shutdown sets `listeners_closed` under this same lock and then
+        // takes `listener_tasks`. Checking here means a bind that resumes
+        // after shutdown cannot keep the port.
+        if self.listeners_closed.load(Ordering::Acquire) {
+            drop(listener);
+            return Err(NetworkError::ConnectionFailed(
+                "forwarder is shut down".to_string(),
+            ));
         }
+        // A prior disabled entry for this address (restore that failed,
+        // then a successful re-add) is replaced.
+        forwards.retain(|e| e.spec.local_addr != bound);
+        forwards.push(ForwardEntry {
+            spec: registered_spec,
+            binding,
+            state: EntryState::Held(listener),
+        });
+        Ok(bound)
+    }
 
+    /// Start the accept loop for a forward [`Self::bind_forward`] is holding.
+    ///
+    /// Each accepted connection selects on the listener token. Cancelling
+    /// that token drops the connection, including one already taken off
+    /// the socket.
+    ///
+    /// # Errors
+    /// [`NetworkError::ConnectionFailed`] when `bound` is not a held
+    /// forward, or the forwarder has shut down. A shutdown drops the
+    /// socket before this returns.
+    pub(crate) fn start_accept(&self, bound: SocketAddr) -> NetworkResult<()> {
+        let mut forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = forwards.iter_mut().find(|e| e.spec.local_addr == bound) else {
+            return Err(NetworkError::ConnectionFailed(format!(
+                "no held forward at {bound}"
+            )));
+        };
+        if self.listeners_closed.load(Ordering::Acquire) {
+            let state = std::mem::replace(&mut entry.state, EntryState::Disabled(String::new()));
+            match state {
+                EntryState::Held(listener) => {
+                    drop(listener);
+                    entry.state = EntryState::Disabled("forwarder is shut down".to_string());
+                }
+                other => entry.state = other,
+            }
+            return Err(NetworkError::ConnectionFailed(
+                "forwarder is shut down".to_string(),
+            ));
+        }
+        let listener =
+            match std::mem::replace(&mut entry.state, EntryState::Disabled(String::new())) {
+                EntryState::Held(listener) => listener,
+                other => {
+                    entry.state = other;
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "forward at {bound} is not waiting to accept"
+                    )));
+                }
+            };
+        let cancel = CancellationToken::new();
+        let target = OutboundTarget {
+            peer_agent: entry.spec.peer_agent,
+            pinned_machine: entry.binding.pinned_machine,
+            target_host: entry.spec.target_host.clone(),
+            target_port: entry.spec.target_port,
+        };
+        entry.state = EntryState::Active(cancel.clone());
         let agent = Arc::clone(&self.agent);
         let fwd_diag = Arc::clone(&self.fwd_diag);
         let outbound_permits = Arc::clone(&self.outbound_permits);
         let per_peer = Arc::clone(&self.per_peer);
-        let peer_agent = spec.peer_agent;
-        let target_host = spec.target_host;
-        let target_port = spec.target_port;
         let require_attestation = self.require_attestation;
         let live = Arc::clone(&self.live);
-        tokio::spawn(async move {
+        #[cfg(test)]
+        let accepted_pause = Arc::clone(&self.accepted_pause);
+        // Publish the accept loop before the lock is released, so shutdown
+        // cannot miss it.
+        let handle = tokio::spawn(async move {
             tracing::info!(
                 target: "x0x::forward",
                 local = %bound,
-                peer = %hex::encode(peer_agent.as_bytes()),
+                peer = %hex::encode(target.peer_agent.as_bytes()),
                 "outbound forward listener started"
             );
             loop {
@@ -1968,7 +2352,7 @@ impl ForwardService {
                 // FIX 3: cap outbound driven connections. Over-cap TCP
                 // accepts are dropped (the client sees a refused connection)
                 // + counted rather than spawning unbounded.
-                let admission = match admit_to(&outbound_permits, &per_peer, peer_agent) {
+                let admission = match admit_to(&outbound_permits, &per_peer, target.peer_agent) {
                     Some(a) => a,
                     None => {
                         fwd_diag.record_over_cap();
@@ -1983,38 +2367,148 @@ impl ForwardService {
                 let agent = Arc::clone(&agent);
                 let fwd_diag = Arc::clone(&fwd_diag);
                 let live = Arc::clone(&live);
-                let target_host = target_host.clone();
+                let target = target.clone();
+                let drive_cancel = cancel.clone();
+                #[cfg(test)]
+                let accepted_pause = Arc::clone(&accepted_pause);
                 tokio::spawn(async move {
                     let _admission = admission;
-                    fwd_diag.enter_stream();
-                    let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
-                    drive_outbound(
-                        agent,
-                        peer_agent,
-                        target_host,
-                        target_port,
-                        tcp,
-                        require_attestation,
-                        &live,
-                    )
-                    .await;
+                    tokio::select! {
+                        _ = drive_cancel.cancelled() => {}
+                        _ = async move {
+                            fwd_diag.enter_stream();
+                            let _guard = StreamLeaveGuard(Arc::clone(&fwd_diag));
+                            #[cfg(test)]
+                            pause_accepted_connection(&accepted_pause).await;
+                            drive_outbound(
+                                agent,
+                                &target,
+                                tcp,
+                                require_attestation,
+                                &live,
+                                &fwd_diag,
+                            )
+                            .await;
+                        } => {}
+                    }
                 });
             }
         });
-        Ok(bound)
+        self.reap_finished_listener_tasks();
+        self.listener_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(handle);
+        Ok(())
     }
 
-    /// Snapshot of registered forwards (for `GET /forwards` / `x0x forward list`).
+    /// Hold the next connection this forwarder accepts until the guard drops.
+    #[cfg(test)]
+    pub(crate) fn arm_accepted_connection_pause_for_testing(&self) -> AcceptedConnectionPauseGuard {
+        let state = Arc::new(AcceptedConnectionPause {
+            hit: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        });
+        *self
+            .accepted_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
+        AcceptedConnectionPauseGuard {
+            slot: Arc::clone(&self.accepted_pause),
+        }
+    }
+
+    /// `true` once an accepted connection has entered the test pause.
+    #[cfg(test)]
+    pub(crate) fn accepted_connection_pause_entered_for_testing(&self) -> bool {
+        self.accepted_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|state| state.hit.load(Ordering::Acquire))
+    }
+
+    /// Register `spec` and `binding` as a forward that is down for `reason`
+    /// (ADR-0074 §2: a restored forward whose name did not re-resolve to its
+    /// pinned ids, or whose port could not be bound). It is listed with its
+    /// reason and never listens; a later successful [`Self::add_forward`]
+    /// for the same address replaces it. An active forward on that address
+    /// is left alone.
+    pub fn add_disabled(&self, spec: ForwardSpec, binding: ForwardBinding, reason: String) {
+        if let Ok(mut forwards) = self.forwards.lock() {
+            if forwards.iter().any(|e| {
+                e.spec.local_addr == spec.local_addr
+                    && matches!(e.state, EntryState::Active(_) | EntryState::Held(_))
+            }) {
+                return;
+            }
+            forwards.retain(|e| e.spec.local_addr != spec.local_addr);
+            forwards.push(ForwardEntry {
+                spec,
+                binding,
+                state: EntryState::Disabled(reason),
+            });
+        }
+    }
+
+    /// Snapshot of registered forward specs.
+    ///
+    /// This is the pre-ADR-0074 return type. Name, machine pin, persistence,
+    /// and a down reason are on [`Self::list_forward_status`].
     #[must_use]
     pub fn list_forwards(&self) -> Vec<ForwardSpec> {
+        self.list_forward_status()
+            .into_iter()
+            .map(|status| status.spec)
+            .collect()
+    }
+
+    /// Snapshot of registered forwards, including ones that are down.
+    ///
+    /// `GET /forwards` uses this. `error` is `None` while the listener is up.
+    #[must_use]
+    pub fn list_forward_status(&self) -> Vec<ForwardStatus> {
         self.forwards
             .lock()
-            .map(|f| f.iter().map(|e| e.spec.clone()).collect())
+            .map(|f| {
+                f.iter()
+                    .map(|e| ForwardStatus {
+                        spec: e.spec.clone(),
+                        binding: e.binding.clone(),
+                        error: e.state.down_reason(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    /// Remove a forward by its bound local address. Cancels the listener.
-    /// Returns `true` if a forward was removed.
+    /// The registered forward bound to `local_addr`, if any.
+    #[must_use]
+    pub fn forward_at(&self, local_addr: SocketAddr) -> Option<ForwardSpec> {
+        self.forward_status_at(local_addr).map(|status| status.spec)
+    }
+
+    /// The registered forward bound to `local_addr`, including its binding
+    /// and down reason.
+    #[must_use]
+    pub fn forward_status_at(&self, local_addr: SocketAddr) -> Option<ForwardStatus> {
+        self.forwards.lock().ok().and_then(|f| {
+            f.iter()
+                .find(|e| e.spec.local_addr == local_addr)
+                .map(|e| ForwardStatus {
+                    spec: e.spec.clone(),
+                    binding: e.binding.clone(),
+                    error: e.state.down_reason(),
+                })
+        })
+    }
+
+    /// Remove a forward by its bound local address.
+    ///
+    /// Cancels the listener and drops every connection it has already
+    /// accepted. A forward that is bound but not yet accepting drops its
+    /// socket. Returns `true` if a forward was removed.
     pub fn remove_forward(&self, local_addr: SocketAddr) -> bool {
         let mut removed = false;
         if let Ok(mut forwards) = self.forwards.lock() {
@@ -2022,25 +2516,215 @@ impl ForwardService {
                 .iter()
                 .position(|e| e.spec.local_addr == local_addr)
             {
-                forwards[pos].cancel.cancel();
+                match std::mem::replace(
+                    &mut forwards[pos].state,
+                    EntryState::Disabled(String::new()),
+                ) {
+                    EntryState::Active(cancel) => cancel.cancel(),
+                    EntryState::Held(listener) => drop(listener),
+                    EntryState::Disabled(_) => {}
+                }
                 forwards.remove(pos);
                 removed = true;
             }
         }
+        self.reap_finished_listener_tasks();
         removed
     }
 
+    /// Drop accept-loop handles that have already exited.
+    ///
+    /// [`Self::remove_forward`] cancels the listener and returns before that
+    /// task finishes. The next add or remove drops the finished handle, so
+    /// completed listeners do not stay in memory until shutdown.
+    fn reap_finished_listener_tasks(&self) {
+        self.listener_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|task| !task.is_finished());
+    }
+
     /// Tear down every listener + the inbound consumer.
+    ///
+    /// This cancels listeners and refuses later binds. It does not wait for
+    /// accept loops to drop their sockets, and it does not drain in-flight
+    /// add, remove, or restore transactions. `shutdown_and_release` does both,
+    /// and the daemon shutdown path uses that.
     pub fn shutdown(&self) {
         // Cancel live bridges before stopping reauth (`inbound_token`).
         // Otherwise shutdown leaves registrations that reauth no longer
         // guards while the Agent may still be alive (Codex P2 / #1388).
         self.live.cancel_all("shutdown");
         self.inbound_token.cancel();
-        if let Ok(forwards) = self.forwards.lock() {
-            for entry in forwards.iter() {
-                entry.cancel.cancel();
+        self.cancel_listener_tokens();
+    }
+
+    /// Close admission, drain in-flight add/remove/restore transactions,
+    /// cancel every listener, and wait until those accept loops drop their
+    /// sockets.
+    ///
+    /// A transaction still inside `add_forward` when this starts is allowed
+    /// to finish. Its listener is in [`Self::listener_tasks`] before the
+    /// transaction returns, and the cancel below observes it. A bind that
+    /// starts after the cancel finds [`Self::listeners_closed`] and drops
+    /// the socket before publishing a listener.
+    pub(crate) async fn shutdown_and_release(&self) -> ForwardShutdownReport {
+        let abandoned_transactions = self.close_and_drain_transactions().await;
+        self.release_allocation_holds();
+        self.shutdown();
+        self.await_listener_tasks().await;
+        if abandoned_transactions > 0 {
+            tracing::warn!(
+                target: "x0x::forward",
+                abandoned_transactions,
+                "forward shutdown abandoned in-flight transactions after 2s"
+            );
+        }
+        ForwardShutdownReport {
+            abandoned_transactions,
+        }
+    }
+
+    /// Run `work` as one forward transaction. The task stays in
+    /// [`Self::transactions`] until it finishes, including when the caller
+    /// is dropped. [`Self::shutdown_and_release`] awaits it before
+    /// cancelling listeners.
+    ///
+    /// # Errors
+    /// [`ForwardTransactionError::Closed`] when shutdown has already closed
+    /// admission (`work` is not started). [`ForwardTransactionError::Failed`]
+    /// when the task panics.
+    pub(crate) async fn run_transaction<T, F>(&self, work: F) -> Result<T, ForwardTransactionError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut guard = self
+                .transactions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(tasks) = guard.as_mut() else {
+                return Err(ForwardTransactionError::Closed);
+            };
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(tokio::spawn(async move {
+                let _ = done_tx.send(work.await);
+            }));
+        }
+        match done_rx.await {
+            Ok(value) => Ok(value),
+            Err(_) => Err(ForwardTransactionError::Failed(
+                "forward transaction ended before it returned".to_string(),
+            )),
+        }
+    }
+
+    /// `true` once [`Self::shutdown_and_release`] has closed transaction
+    /// admission and is waiting for the admitted tasks (or has finished).
+    #[cfg(test)]
+    pub(crate) fn transactions_closed(&self) -> bool {
+        self.transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    async fn close_and_drain_transactions(&self) -> usize {
+        let tasks = self
+            .transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
+        let abort_handles: Vec<_> = tasks
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let pending = futures::future::join_all(tasks);
+        tokio::pin!(pending);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), pending.as_mut())
+            .await
+            .is_err()
+        {
+            let abandoned = abort_handles
+                .iter()
+                .filter(|handle| !handle.is_finished())
+                .count();
+            for handle in &abort_handles {
+                handle.abort();
             }
+            let _ = pending.await;
+            abandoned
+        } else {
+            0
+        }
+    }
+
+    /// Set the closed flag and cancel active listeners under `forwards`.
+    /// Does not take the accept-loop tasks: [`Self::shutdown`] is
+    /// synchronous and must not detach them. [`Self::await_listener_tasks`]
+    /// takes them under the same lock after this returns.
+    fn cancel_listener_tokens(&self) {
+        let mut forwards = self
+            .forwards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.listeners_closed.store(true, Ordering::Release);
+        for entry in forwards.iter_mut() {
+            let state = std::mem::replace(&mut entry.state, EntryState::Disabled(String::new()));
+            match state {
+                EntryState::Active(cancel) => {
+                    entry.state = EntryState::Active(cancel.clone());
+                    cancel.cancel();
+                }
+                EntryState::Held(listener) => {
+                    drop(listener);
+                    let cancel = CancellationToken::new();
+                    cancel.cancel();
+                    entry.state = EntryState::Active(cancel);
+                }
+                disabled => entry.state = disabled,
+            }
+        }
+    }
+
+    async fn await_listener_tasks(&self) {
+        // `add_forward` publishes its accept loop while it holds `forwards`,
+        // and only after it has observed `listeners_closed == false`. Taking
+        // the handles under that lock, after shutdown stored `true` under
+        // it, collects every loop that was published and refuses any later
+        // one.
+        let handles = {
+            let _forwards = self
+                .forwards
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(
+                &mut *self
+                    .listener_tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let aborts: Vec<_> = handles
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect();
+        let pending = futures::future::join_all(handles);
+        tokio::pin!(pending);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), pending.as_mut())
+            .await
+            .is_err()
+        {
+            for abort in &aborts {
+                abort.abort();
+            }
+            let _ = pending.await;
         }
     }
 
@@ -2076,6 +2760,24 @@ impl ForwardService {
             &self.fwd_diag,
         )
         .await
+    }
+}
+
+/// Why [`ForwardService::run_transaction`] did not return the task's value.
+#[derive(Debug)]
+pub(crate) enum ForwardTransactionError {
+    /// Shutdown has closed admission. The task was not started.
+    Closed,
+    /// The transaction task panicked or was aborted.
+    Failed(String),
+}
+
+impl std::fmt::Display for ForwardTransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => f.write_str("forward admission is closed"),
+            Self::Failed(error) => write!(f, "forward transaction failed: {error}"),
+        }
     }
 }
 
@@ -2259,8 +2961,9 @@ fn fail_held(
 
 /// Shared ForwardV2 open, sign, header write, and response read.
 ///
-/// Does not bridge and does not reset the stream. [`try_outbound_v2`] and
-/// [`prepare_outbound_v2_for_socks`] map [`V2DriveFail`] on their own.
+/// Does not bridge and does not reset the stream. [`prepare_outbound_v2_for_socks`]
+/// maps [`V2DriveFail`] on its own. TCP forwards keep the pinned-machine check
+/// in [`try_outbound_v2`] and do not use this path.
 async fn open_signed_forward_v2(
     agent: &Arc<crate::Agent>,
     peer_agent: &AgentId,
@@ -2293,10 +2996,6 @@ async fn open_signed_forward_v2(
         return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
     }
 
-    // ADR-0043: the V2 attestation is an agent-key signature. A
-    // quiesced/quarantined machine produces none. ADR-0074 §4 races the
-    // gate against reauth cancel so a stalled move-state lock cannot hold
-    // the stream past the 5 s bound.
     match wait_signing_gate_or_cancel(guard.token(), agent.signing_gate_allows(&agent.agent_id()))
         .await
     {
@@ -2312,8 +3011,6 @@ async fn open_signed_forward_v2(
         }
         Ok(true) => {}
     }
-    // The header carries the opener's public key so the verifier doesn't
-    // depend on announce propagation (#204 soak fix).
     let mut header = ForwardV2Header::new(
         target_host.to_string(),
         target_port,
@@ -2401,13 +3098,169 @@ fn map_socks_v2_fail(fail: V2DriveFail, peer_agent: &AgentId) -> PrepareSocksErr
         }
         V2DriveFail::AfterOpen(opened) => {
             let V2AfterOpen {
-                mut stream, guard, ..
+                kind,
+                mut stream,
+                guard,
             } = *opened;
+            match &kind {
+                V2AfterOpenKind::SignFailed(error) => {
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer_agent.as_bytes()),
+                        error = %error,
+                        "socks prepare: sign failed"
+                    );
+                }
+                V2AfterOpenKind::ReadFailed(error) => {
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer_agent.as_bytes()),
+                        error = %error,
+                        "socks prepare: response read failed"
+                    );
+                }
+                V2AfterOpenKind::Cancelled
+                | V2AfterOpenKind::SigningGateRefused
+                | V2AfterOpenKind::WriteFailed => {
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer_agent.as_bytes()),
+                        "socks prepare: forward v2 did not complete"
+                    );
+                }
+            }
             teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
             drop(guard);
             PrepareSocksError::Failed
         }
         V2DriveFail::AlreadyReset => PrepareSocksError::Failed,
+    }
+}
+
+/// Where an outbound forward opens and what it must reach.
+#[derive(Debug, Clone)]
+struct OutboundTarget {
+    peer_agent: AgentId,
+    /// ADR-0074 §1: the machine every stream must reach, if pinned.
+    pinned_machine: Option<MachineId>,
+    target_host: String,
+    target_port: u16,
+}
+
+/// Result of [`send_header_to_pinned`].
+#[derive(Debug)]
+enum HeaderSend {
+    /// The stream reaches the pinned machine (or nothing is pinned) and the
+    /// whole header frame was written.
+    Sent,
+    /// The stream reaches a different machine than the pinned one. Nothing
+    /// was written.
+    MachineMismatch {
+        pinned: MachineId,
+        actual: MachineId,
+    },
+    /// The write itself failed.
+    Failed,
+}
+
+/// ADR-0074 §1 machine binding: write the forward-header `frame` only when
+/// the stream's transport-authenticated peer (`PeerStream::peer()`) is the
+/// pinned machine. On a mismatch not one byte of the header is written, so
+/// the peer never learns the target.
+async fn send_header_to_pinned<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    peer: MachineId,
+    pinned: Option<MachineId>,
+    frame: &[u8],
+) -> HeaderSend {
+    use tokio::io::AsyncWriteExt;
+    if let Some(pinned) = pinned {
+        if pinned != peer {
+            return HeaderSend::MachineMismatch {
+                pinned,
+                actual: peer,
+            };
+        }
+    }
+    match w.write_all(frame).await {
+        Ok(()) => HeaderSend::Sent,
+        Err(e) => {
+            tracing::debug!(target: "x0x::forward", error = %e, "write forward header failed");
+            HeaderSend::Failed
+        }
+    }
+}
+
+/// Reset a stream refused at the machine-binding check and count it.
+fn refuse_machine_mismatch(
+    stream: &mut PeerStream,
+    pinned: MachineId,
+    actual: MachineId,
+    fwd_diag: &ForwardDiagnostics,
+) {
+    fwd_diag.record_machine_mismatch();
+    // Reset (not finish): the peer sees an aborted stream with zero header
+    // bytes. A reset on an already-closed stream is harmless.
+    let _ = stream.send_mut().reset(ant_quic::VarInt::from_u32(0));
+    tracing::warn!(
+        target: "x0x::forward",
+        pinned = %hex::encode(pinned.as_bytes()),
+        actual = %hex::encode(actual.as_bytes()),
+        "outbound forward refused: stream reached a different machine than pinned (machine_mismatch)"
+    );
+}
+
+/// What [`write_pinned_header`] did with the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedHeader {
+    /// `PeerStream::peer()` is the pinned machine (or nothing is pinned)
+    /// and the header frame was written.
+    Sent,
+    /// The stream reaches a different machine. It has been reset, and no
+    /// header version may be tried on it.
+    Refused,
+    /// The write failed. A V2 attempt may fall back to V1.
+    Failed,
+}
+
+/// How a V2 outbound attempt continues after [`PinnedHeader`].
+///
+/// `Stop` is the machine-binding refusal: the attempt is finished, and
+/// [`drive_outbound`] must not open a V1 stream. `Fallback` is only a
+/// failed write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterPin {
+    Continue,
+    Stop,
+    Fallback,
+}
+
+fn after_pin(header: PinnedHeader) -> AfterPin {
+    match header {
+        PinnedHeader::Sent => AfterPin::Continue,
+        PinnedHeader::Refused => AfterPin::Stop,
+        PinnedHeader::Failed => AfterPin::Fallback,
+    }
+}
+
+/// ADR-0074 §1: read [`PeerStream::peer`] and write `frame` only when that
+/// machine is the pin. A mismatch resets the stream and counts
+/// `machine_mismatch`. Callers turn [`PinnedHeader::Refused`] into a
+/// finished attempt ([`AfterPin::Stop`]), never a V1 retry.
+async fn write_pinned_header(
+    stream: &mut PeerStream,
+    pinned: Option<MachineId>,
+    frame: &[u8],
+    fwd_diag: &ForwardDiagnostics,
+) -> PinnedHeader {
+    let actual = stream.peer();
+    match send_header_to_pinned(stream.send_mut(), actual, pinned, frame).await {
+        HeaderSend::Sent => PinnedHeader::Sent,
+        HeaderSend::MachineMismatch { pinned, actual } => {
+            refuse_machine_mismatch(stream, pinned, actual, fwd_diag);
+            PinnedHeader::Refused
+        }
+        HeaderSend::Failed => PinnedHeader::Failed,
     }
 }
 
@@ -2420,18 +3273,19 @@ fn map_socks_v2_fail(fail: V2DriveFail, peer_agent: &AgentId) -> PrepareSocksErr
 /// falls back to `ForwardV1` so mixed-fleet upgrades degrade gracefully.
 async fn drive_outbound(
     agent: Arc<crate::Agent>,
-    peer_agent: AgentId,
-    target_host: String,
-    target_port: u16,
+    target: &OutboundTarget,
     tcp: TcpStream,
     require_attestation: bool,
     live: &Arc<teardown::LiveStreams>,
+    fwd_diag: &ForwardDiagnostics,
 ) {
+    let peer_agent = target.peer_agent;
     // Try ForwardV2 (attestation). On peer rejection (old software), fall
     // back to ForwardV1 — but ONLY when require_attestation is false. When
     // true (the default) there is no fallback: a peer that cannot handle V2
-    // simply cannot forward (#204 must-fix 1).
-    match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp, live).await {
+    // simply cannot forward (#204 must-fix 1). A machine-binding refusal is
+    // `Done`, never a fallback.
+    match try_outbound_v2(&agent, target, tcp, live, fwd_diag).await {
         OutboundOutcome::Done => (),
         OutboundOutcome::PeerRejectedV2(tcp) => {
             if require_attestation {
@@ -2446,7 +3300,7 @@ async fn drive_outbound(
                     peer = %hex::encode(peer_agent.as_bytes()),
                     "outbound forward: peer does not support ForwardV2 — falling back to V1"
                 );
-                drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp, live).await;
+                drive_outbound_v1(&agent, target, tcp, live, fwd_diag).await;
             }
         }
     }
@@ -2465,7 +3319,7 @@ enum OutboundOutcome {
 ///
 /// A stalled move-state lock must not keep the registered stream (and its
 /// TCP/permit) alive past reauth cancel — same pattern as the header write
-/// and response read in [`open_signed_forward_v2`].
+/// and response read that follow in [`try_outbound_v2`].
 pub(crate) async fn wait_signing_gate_or_cancel(
     cancel: &CancellationToken,
     gate: impl std::future::Future<Output = bool>,
@@ -2473,114 +3327,151 @@ pub(crate) async fn wait_signing_gate_or_cancel(
     teardown::wait_cancellable(cancel, gate).await
 }
 
-/// Attempt a `ForwardV2` outbound forward.
-///
-/// Open, sign, write, and read go through [`open_signed_forward_v2`].
-/// [`map_outbound_v2_fail`] keeps the V1 fallback: open failure, a refused
-/// signing gate, a sign failure, and a header-write failure return the TCP.
-/// Cancel resets both halves and finishes. A response-read error closes the
-/// local TCP and does not fall back to V1.
+/// Attempt a `ForwardV2` outbound forward. Returns `PeerRejectedV2` only when
+/// the failure is specifically the peer not understanding the V2 protocol
+/// byte (the write to the opened stream fails immediately).
 async fn try_outbound_v2(
     agent: &Arc<crate::Agent>,
-    peer_agent: &AgentId,
-    target_host: &str,
-    target_port: u16,
+    target: &OutboundTarget,
     tcp: TcpStream,
     live: &Arc<teardown::LiveStreams>,
+    fwd_diag: &ForwardDiagnostics,
 ) -> OutboundOutcome {
-    match open_signed_forward_v2(agent, peer_agent, target_host, target_port, live).await {
-        Err(fail) => map_outbound_v2_fail(fail, tcp, peer_agent),
-        Ok(ready) => {
-            finish_outbound(ready.stream, [ready.response], peer_agent, tcp, ready.guard).await;
-            OutboundOutcome::Done
-        }
-    }
-}
-
-/// TCP-forward mapping. V1 fallback stays here: open, signing-gate refusal,
-/// sign failure, and header-write failure return the TCP. Cancel resets both
-/// halves and finishes. A response-read error closes the local TCP.
-fn map_outbound_v2_fail(
-    fail: V2DriveFail,
-    tcp: TcpStream,
-    peer_agent: &AgentId,
-) -> OutboundOutcome {
-    match fail {
-        V2DriveFail::Open(error) => {
+    let peer_agent = &target.peer_agent;
+    let mut stream = match agent
+        .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
             tracing::info!(
                 target: "x0x::forward",
                 peer = %hex::encode(peer_agent.as_bytes()),
-                error = %error,
+                error = %e,
                 "outbound forward v2: could not open peer stream"
             );
-            OutboundOutcome::PeerRejectedV2(tcp)
+            return OutboundOutcome::PeerRejectedV2(tcp);
         }
-        V2DriveFail::AfterOpen(opened) => {
-            let V2AfterOpen {
-                kind,
-                mut stream,
-                guard,
-            } = *opened;
-            match kind {
-                V2AfterOpenKind::Cancelled => {
-                    teardown::deny_pre_bridge(&mut stream, Some(&tcp));
-                    drop(guard);
-                    OutboundOutcome::Done
-                }
-                V2AfterOpenKind::SigningGateRefused => {
-                    tracing::info!(
-                        target: "x0x::forward",
-                        peer = %hex::encode(peer_agent.as_bytes()),
-                        "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
-                    );
-                    drop(guard);
-                    drop(stream);
-                    OutboundOutcome::PeerRejectedV2(tcp)
-                }
-                V2AfterOpenKind::SignFailed(error) => {
-                    tracing::warn!(
-                        target: "x0x::forward",
-                        error = %error,
-                        "outbound forward v2: failed to sign attestation — falling back to V1"
-                    );
-                    drop(guard);
-                    drop(stream);
-                    OutboundOutcome::PeerRejectedV2(tcp)
-                }
-                V2AfterOpenKind::WriteFailed => {
-                    // Header write failed: the peer likely reset after the
-                    // unknown V2 protocol byte. Return the TCP for V1.
-                    drop(guard);
-                    drop(stream);
-                    OutboundOutcome::PeerRejectedV2(tcp)
-                }
-                V2AfterOpenKind::ReadFailed(error) => {
-                    tracing::info!(
-                        target: "x0x::forward",
-                        peer = %hex::encode(peer_agent.as_bytes()),
-                        %error,
-                        "outbound forward v2: peer closed/reset before connect response — closing local TCP"
-                    );
-                    drop(guard);
-                    drop(stream);
-                    OutboundOutcome::Done
-                }
-            }
-        }
-        V2DriveFail::AlreadyReset => OutboundOutcome::Done,
+    };
+    // ADR-0074 §4: register before the header/response window so a trust
+    // loss while waiting still hits the ≤5 s bound.
+    let guard = live.register(
+        teardown::StreamGate::Outbound {
+            peer_agent: *peer_agent,
+            machine: stream.peer(),
+        },
+        teardown::StreamAuthority::PeerTrust,
+    );
+    agent.stream_reauth_signal().notify_one();
+    if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+        return OutboundOutcome::Done;
     }
+
+    // ADR-0043 AgentSigningGate (review r2 C2): the V2 attestation is an
+    // agent-key signature — a quiesced/quarantined machine produces none.
+    // Fail toward the V1 fallback exactly like a signing error would; the
+    // V1 path carries no agent signature (transport-machine context only,
+    // filtered receiver-side by B/P).
+    // ADR-0074 §4: race the gate against reauth cancel so a stalled
+    // move-state lock cannot hold sockets/permits past the 5 s bound.
+    match wait_signing_gate_or_cancel(guard.token(), agent.signing_gate_allows(&agent.agent_id()))
+        .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return OutboundOutcome::Done;
+        }
+        Ok(false) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
+            );
+            return OutboundOutcome::PeerRejectedV2(tcp);
+        }
+        Ok(true) => {}
+    }
+    // Build + sign the V2 header with the local agent keypair. The header
+    // carries the opener's public key so the verifier doesn't depend on
+    // announce propagation (#204 soak fix).
+    let mut header = ForwardV2Header::new(
+        target.target_host.clone(),
+        target.target_port,
+        agent.agent_id(),
+        agent
+            .identity()
+            .agent_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+        stream.peer(),
+    );
+    if let Err(e) = header.sign(agent.identity().agent_keypair()) {
+        tracing::warn!(
+            target: "x0x::forward",
+            error = %e,
+            "outbound forward v2: failed to sign attestation — falling back to V1"
+        );
+        return OutboundOutcome::PeerRejectedV2(tcp);
+    }
+    // ADR-0074 §1: check PeerStream::peer() before any header byte.
+    // ADR-0074 §4: cancel during the write resets both halves.
+    // A mismatch is `AfterPin::Stop`: this attempt is finished, and the
+    // caller must not fall back to V1.
+    let frame = header.encode();
+    let header = match teardown::wait_cancellable(
+        guard.token(),
+        write_pinned_header(&mut stream, target.pinned_machine, &frame, fwd_diag),
+    )
+    .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return OutboundOutcome::Done;
+        }
+        Ok(header) => header,
+    };
+    match after_pin(header) {
+        AfterPin::Continue => {}
+        AfterPin::Stop => return OutboundOutcome::Done,
+        AfterPin::Fallback => {
+            // Peer likely reset after unknown V2 protocol byte — fall back.
+            return OutboundOutcome::PeerRejectedV2(tcp);
+        }
+    }
+    // Read the peer's connect-response byte.
+    let mut resp = [0u8; 1];
+    match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return OutboundOutcome::Done;
+        }
+        Ok(Err(error)) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                %error,
+                "outbound forward v2: peer closed/reset before connect response — closing local TCP"
+            );
+            return OutboundOutcome::Done;
+        }
+        Ok(Ok(())) => {}
+    }
+    finish_outbound(stream, resp, peer_agent, tcp, guard).await;
+    OutboundOutcome::Done
 }
 
 /// Legacy `ForwardV1` outbound forward (no attestation). Used for pre-#204
 /// peers and as a last-resort fallback.
 async fn drive_outbound_v1(
     agent: &Arc<crate::Agent>,
-    peer_agent: &AgentId,
-    target_host: &str,
-    target_port: u16,
+    target: &OutboundTarget,
     tcp: TcpStream,
     live: &Arc<teardown::LiveStreams>,
+    fwd_diag: &ForwardDiagnostics,
 ) {
+    let peer_agent = &target.peer_agent;
     let mut stream = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV1)
         .await
@@ -2609,17 +3500,25 @@ async fn drive_outbound_v1(
         return;
     }
     let header = ForwardHeader {
-        target_host: target_host.to_string(),
-        target_port,
+        target_host: target.target_host.clone(),
+        target_port: target.target_port,
     };
-    match teardown::wait_cancellable(guard.token(), write_header(stream.send_mut(), &header)).await
+    let frame = header.encode();
+    let header = match teardown::wait_cancellable(
+        guard.token(),
+        write_pinned_header(&mut stream, target.pinned_machine, &frame, fwd_diag),
+    )
+    .await
     {
         Err(teardown::Cancelled) => {
             teardown::deny_pre_bridge(&mut stream, Some(&tcp));
             return;
         }
-        Ok(Err(_)) => return,
-        Ok(Ok(())) => {}
+        Ok(header) => header,
+    };
+    match after_pin(header) {
+        AfterPin::Continue => {}
+        AfterPin::Stop | AfterPin::Fallback => return,
     }
     let mut resp = [0u8; 1];
     match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
@@ -2677,6 +3576,7 @@ async fn finish_outbound(
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3986,6 +4886,56 @@ mod tests {
         panic!("listener {addr} did not close within bounded wait");
     }
 
+    /// WHY: each add publishes an accept-loop handle, and remove only
+    /// cancels it. Without a reap, finished handles stay until shutdown
+    /// and grow with every add/remove cycle.
+    #[tokio::test]
+    async fn removed_listener_handles_do_not_accumulate() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(Arc::clone(&agent), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+        let spec = ForwardSpec {
+            local_addr: "127.0.0.1:0".parse().expect("loopback address"),
+            peer_agent: AgentId([7; 32]),
+            target_host: "127.0.0.1".to_string(),
+            target_port: 9,
+        };
+
+        for _ in 0..24 {
+            let bound = service.add_forward(spec.clone()).await.expect("bind");
+            assert!(service.remove_forward(bound));
+            wait_until_bindable(bound).await;
+        }
+        let mut left = usize::MAX;
+        for _ in 0..100 {
+            service.reap_finished_listener_tasks();
+            left = service
+                .listener_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            if left == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(left, 0, "finished accept-loop handles must be dropped");
+        service.shutdown();
+        agent.shutdown().await;
+    }
+
     #[tokio::test]
     async fn decide_inbound_attested_matrix() {
         let kp = AgentKeypair::generate().unwrap();
@@ -4985,6 +5935,255 @@ mod tests {
             matches!(denied_in, Err(PeerGateError::Network(_))),
             "cert expired during discovery-lock wait must deny inbound: {denied_in:?}"
         );
+    }
+
+    // ── ADR-0074 §1 machine binding (slice 2) ─────────────────────────────
+
+    /// Everything the peer side of `w` received once the writer is gone.
+    async fn received(mut peer_side: tokio::io::DuplexStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        peer_side
+            .read_to_end(&mut got)
+            .await
+            .expect("read peer side");
+        got
+    }
+
+    fn signed_frame() -> Vec<u8> {
+        let opener = AgentKeypair::generate().expect("keypair");
+        let mut header = ForwardV2Header::new(
+            "::1".to_string(),
+            22,
+            opener.agent_id(),
+            opener.public_key().as_bytes().to_vec(),
+            MachineId([0x11; 32]),
+        );
+        header.sign(&opener).expect("sign");
+        header.encode()
+    }
+
+    /// WHY (ADR-0074 §1): a pinned forward whose stream reaches another
+    /// machine must be refused BEFORE the forward header goes out — the
+    /// header names the target service and carries the opener's signed
+    /// attestation, so a wrong machine must learn neither. Zero bytes on
+    /// the stream, for both header versions.
+    #[tokio::test]
+    async fn peer_mismatch_sends_no_header_bytes() {
+        let pinned = MachineId([0x11; 32]);
+        let actual = MachineId([0x22; 32]);
+        let v1 = ForwardHeader {
+            target_host: "127.0.0.1".to_string(),
+            target_port: 22,
+        }
+        .encode();
+        for frame in [signed_frame(), v1] {
+            let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
+            let outcome =
+                send_header_to_pinned(&mut opener_side, actual, Some(pinned), &frame).await;
+            assert!(
+                matches!(
+                    outcome,
+                    HeaderSend::MachineMismatch { pinned: p, actual: a } if p == pinned && a == actual
+                ),
+                "mismatch must be refused, got {outcome:?}"
+            );
+            drop(opener_side);
+            assert!(
+                received(peer_side).await.is_empty(),
+                "no header byte may reach an unpinned machine"
+            );
+        }
+    }
+
+    /// WHY: the check must not break the forwards it protects — the right
+    /// machine, or an unpinned (ephemeral agent) forward, gets the exact
+    /// header frame.
+    #[tokio::test]
+    async fn pinned_or_unpinned_peer_receives_the_exact_header() {
+        let pinned = MachineId([0x11; 32]);
+        let frame = signed_frame();
+        for pin in [Some(pinned), None] {
+            let (mut opener_side, peer_side) = tokio::io::duplex(64 * 1024);
+            let outcome = send_header_to_pinned(&mut opener_side, pinned, pin, &frame).await;
+            assert!(matches!(outcome, HeaderSend::Sent), "{outcome:?}");
+            drop(opener_side);
+            assert_eq!(received(peer_side).await, frame);
+        }
+    }
+
+    /// WHY: the pin has to travel with the listener the daemon restores,
+    /// not only with the header helper. A local client on the restored
+    /// port must be refused before any header byte, and must not fall
+    /// back to V1, when the stream's machine is not the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn listener_refuses_a_wrong_machine_before_any_header_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
+            return;
+        };
+        let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
+            alice.shutdown().await;
+            return;
+        };
+        let alice = Arc::new(alice);
+        let bob = Arc::new(bob);
+        link_loopback_pair(&alice, &bob).await;
+
+        let (target_port, target_bytes, target_cancel) = spawn_counting_target().await;
+        let target = SocketAddr::from(([127, 0, 0, 1], target_port));
+        let bob_policy = allow_exact(&alice, target);
+        let bob_diag = Arc::new(ConnectDiagnostics::new(bob_policy.summary()));
+        let bob_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&bob), bob_policy, bob_diag, true)
+                .expect("bob forwarder"),
+        );
+        bob_fwd.spawn_inbound();
+
+        let alice_policy = Arc::new(ConnectPolicy::default());
+        let alice_diag = Arc::new(ConnectDiagnostics::new(alice_policy.summary()));
+        let alice_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&alice), alice_policy, alice_diag, true)
+                .expect("alice forwarder"),
+        );
+        let wrong = MachineId([0xEE; 32]);
+        assert_ne!(wrong, bob.machine_id());
+        let bound = alice_fwd
+            .add_forward_with(
+                ForwardSpec {
+                    local_addr: "127.0.0.1:0".parse().expect("loopback"),
+                    peer_agent: bob.agent_id(),
+                    target_host: "127.0.0.1".to_string(),
+                    target_port,
+                },
+                ForwardBinding {
+                    name: Some("machine:box.me".to_string()),
+                    kind: crate::names::NameKind::Machine,
+                    pinned_machine: Some(wrong),
+                    persistent: true,
+                },
+            )
+            .await
+            .expect("listener");
+        let mut client = TcpStream::connect(bound).await.expect("local client");
+        client
+            .write_all(b"secret-target")
+            .await
+            .expect("local write");
+
+        let counted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if alice_fwd.diagnostics().machine_mismatch() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        target_cancel.cancel();
+        alice_fwd.shutdown();
+        bob_fwd.shutdown();
+        alice.shutdown().await;
+        bob.shutdown().await;
+
+        assert!(
+            counted.is_ok(),
+            "the listener must count a pin mismatch from the outbound driver"
+        );
+        assert_eq!(
+            target_bytes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a wrong machine must receive no header and no V1 fallback"
+        );
+    }
+
+    fn resolved_machine(agent: AgentId, machine: MachineId) -> crate::names::Resolved {
+        crate::names::Resolved {
+            name: "machine:box.me".to_string(),
+            kind: crate::names::NameKind::Machine,
+            owner: crate::identity::UserId([0x33; 32]),
+            agent_id: Some(agent),
+            machine_id: Some(machine),
+            newly_pinned: false,
+        }
+    }
+
+    fn peer_stream(
+        machine: MachineId,
+        send: crate::network::StreamSend,
+        recv: crate::network::StreamRecv,
+    ) -> PeerStream {
+        PeerStream::new(
+            vec![AgentId([0x44; 32])],
+            machine,
+            StreamProtocol::ForwardV2,
+            send,
+            recv,
+        )
+    }
+
+    /// WHY (replaces slice 1's interim refusal of `machine:` forwards):
+    /// machine names are allowed only because the peer check exists. The
+    /// check is `PeerStream::peer()`, the same read `try_outbound_v2` and
+    /// `drive_outbound_v1` use. A mismatch resets the stream (the peer sees
+    /// connection reset, not a finished header) and [`after_pin`] says
+    /// stop, so V2 does not fall back to V1. The matching machine is the
+    /// positive control: the same path writes the exact frame and continues.
+    #[tokio::test]
+    async fn machine_pin_uses_peer_stream_and_does_not_fall_back() {
+        let box_machine = MachineId([0x11; 32]);
+        let elsewhere = MachineId([0x22; 32]);
+        let resolved = resolved_machine(AgentId([0x44; 32]), box_machine);
+        let name = crate::names::NameRef::parse("machine:box.me").expect("name");
+        let (agent, pinned) = crate::names::forward_target(&resolved, &name).expect("target");
+        assert_eq!(agent, AgentId([0x44; 32]));
+        assert_eq!(pinned, Some(box_machine), "a machine name must pin");
+        assert_eq!(after_pin(PinnedHeader::Refused), AfterPin::Stop);
+        assert_eq!(after_pin(PinnedHeader::Failed), AfterPin::Fallback);
+        assert_eq!(after_pin(PinnedHeader::Sent), AfterPin::Continue);
+
+        let v1 = ForwardHeader {
+            target_host: "127.0.0.1".to_string(),
+            target_port: 22,
+        }
+        .encode();
+        let diag = ForwardDiagnostics::default();
+        for frame in [signed_frame(), v1] {
+            let ((send, recv), (_peer_send, mut peer_recv)) =
+                crate::network::sim::connected_bi_halves().await;
+            let mut stream = peer_stream(elsewhere, send, recv);
+            assert_eq!(stream.peer(), elsewhere);
+            let outcome = write_pinned_header(&mut stream, pinned, &frame, &diag).await;
+            assert_eq!(outcome, PinnedHeader::Refused, "{outcome:?}");
+            assert_eq!(after_pin(outcome), AfterPin::Stop);
+            let err = peer_recv
+                .read_exact(&mut [0u8; 1])
+                .await
+                .expect_err("a reset stream has no header byte");
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+            drop(stream);
+
+            let ((send, recv), (_peer_send, mut peer_recv)) =
+                crate::network::sim::connected_bi_halves().await;
+            let mut stream = peer_stream(box_machine, send, recv);
+            assert_eq!(stream.peer(), box_machine);
+            let before = diag.machine_mismatch();
+            let outcome = write_pinned_header(&mut stream, pinned, &frame, &diag).await;
+            assert_eq!(outcome, PinnedHeader::Sent, "{outcome:?}");
+            assert_eq!(after_pin(outcome), AfterPin::Continue);
+            assert_eq!(diag.machine_mismatch(), before);
+            let mut got = vec![0u8; frame.len()];
+            peer_recv
+                .read_exact(&mut got)
+                .await
+                .expect("the pinned machine receives the header");
+            assert_eq!(got, frame);
+            drop(stream);
+        }
+        assert_eq!(diag.machine_mismatch(), 2);
     }
 
     fn offline_agent_paths(dir: &std::path::Path) -> crate::AgentBuilder {

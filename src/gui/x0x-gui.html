@@ -217,6 +217,13 @@ tr:hover td{background:rgba(255,255,255,.01)}
 .toast.error{border-left:3px solid var(--rd)}
 .toast.warning{border-left:3px solid var(--am)}
 .toast.info{border-left:3px solid var(--cy)}
+/* ADR 0083 origin banner — non-dismissable for 3s */
+#gui-show-banner{position:fixed;top:0;left:0;right:0;z-index:1100;display:none;align-items:center;justify-content:space-between;gap:var(--sp4);padding:10px 16px;background:var(--bg3);border-bottom:1px solid var(--cy);color:var(--tx);font-size:13px;box-shadow:0 4px 20px rgba(0,0,0,.45)}
+#gui-show-banner.visible{display:flex}
+#gui-show-banner .banner-text{flex:1;min-width:0}
+#gui-show-banner button{flex-shrink:0;border-color:var(--rd);color:var(--rd);font-size:12px;padding:6px 12px}
+#gui-show-banner button.banner-dismiss{border-color:var(--bd);color:var(--tx)}
+#gui-show-banner button:disabled{opacity:.4;cursor:not-allowed;border-color:var(--bd);color:var(--tx3)}
 
 /* Modal */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);z-index:500;display:flex;align-items:center;justify-content:center;animation:fadeIn .2s}
@@ -570,6 +577,11 @@ tr:hover td{background:rgba(255,255,255,.01)}
 <body>
 <a href="#main" class="skip-link">Skip to content</a>
 <button id="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')" aria-label="Toggle navigation">&#9776;</button>
+<div id="gui-show-banner" role="status" aria-live="polite">
+  <span class="banner-text" id="gui-show-banner-text"></span>
+  <button type="button" class="banner-dismiss" id="gui-show-banner-dismiss" disabled>Hide</button>
+  <button type="button" id="gui-show-banner-block" disabled>Stop local shows</button>
+</div>
 
 <div id="app">
 
@@ -686,7 +698,9 @@ function readSessionToken(){
     const token=params.get('token')||'';
     if(token){
       sessionStorage.setItem('x0x_session_token',token);
-      sessionStorage.setItem('x0x_session_issued_at',String(Date.now()));
+      // The daemon started this TTL at mint. Page-load time is later, so
+      // storing Date.now() here would keep liveGuiTab true after expiry.
+      sessionStorage.removeItem('x0x_session_issued_at');
       params.delete('token');
       const qs=params.toString();
       history.replaceState(null,'',location.pathname+(qs?'?'+qs:'')+location.hash);
@@ -697,7 +711,34 @@ function readSessionToken(){
 }
 let SESSION_TOKEN=readSessionToken();
 // Built per connect so a reconnect uses the current (refreshed) token.
-function wsUrl(){return BASE.replace(/^http/,'ws')+'/ws/direct'+(SESSION_TOKEN?'?token='+SESSION_TOKEN:'')}
+function guiTabVisible(){
+  return document.visibilityState==='visible';
+}
+// An expired session keeps its WebSocket. It must not stay a live GUI:
+// /gui/show would navigate this tab, and view requests on the dead token
+// answer 401, so a working browser never opens.
+function liveGuiTab(){
+  // A URL token has no confirmed issue time until bootstrap refreshes it.
+  // Advertising before that navigates /gui/show at a tab whose views 401.
+  if(SESSION_TOKEN&&!sessionClockKnown)return false;
+  const overdue=sessionIssuedAt>0&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS;
+  return !sessionExpired&&!overdue&&guiTabVisible();
+}
+function wsUrl(){
+  const base=BASE.replace(/^http/,'ws')+'/ws/direct';
+  // gui=1 marks a visible GUI tab with a usable session. A hidden tab omits
+  // it, and so does an expired session, so the daemon opens a browser
+  // instead of navigating a tab the human cannot use. Agent clients omit it.
+  if(SESSION_TOKEN){
+    return liveGuiTab()
+      ? base+'?token='+SESSION_TOKEN+'&gui=1'
+      : base+'?token='+SESSION_TOKEN;
+  }
+  return liveGuiTab() ? base+'?gui=1' : base;
+}
+function advertiseGuiVisibility(){
+  wsSend({type:'gui.visible', visible: liveGuiTab()});
+}
 let ws=null;
 const wsSubs=new Set();
 
@@ -710,30 +751,51 @@ async function api(path,opt){return apiWith(SESSION_TOKEN,path,opt)}
 // streams are authenticated at connect and keep running; reconnects read the
 // current SESSION_TOKEN.
 const SESSION_REFRESH_MS=8*60*1000;
-let sessionIssuedAt=(()=>{try{return Number(sessionStorage.getItem('x0x_session_issued_at'))||0}catch(e){return 0}})();
+let sessionIssuedAt=0;
+let sessionClockKnown=false;
+function noteSessionClock(){
+  try{sessionIssuedAt=Number(sessionStorage.getItem('x0x_session_issued_at'))||0}catch(e){sessionIssuedAt=0}
+  // A stored stamp exists only after a refresh succeeded, so it is the
+  // daemon's issue time. A token taken from the URL cleared that stamp.
+  sessionClockKnown=sessionIssuedAt>0;
+}
+noteSessionClock();
 let sessionExpired=false,sessionRefreshing=false;
 async function refreshSession(){
   // One refresh at a time: the old token dies on success, so a second
   // concurrent call would present a revoked token and read as "expired".
   if(!SESSION_TOKEN||sessionExpired||sessionRefreshing)return;
   sessionRefreshing=true;
+  // An overdue token is not a live tab. Say so before the request, or
+  // /gui/show still navigates this tab while the refresh is in flight.
+  advertiseGuiVisibility();
   const r=await apiWith(SESSION_TOKEN,'/auth/session/refresh',{method:'POST'});
   sessionRefreshing=false;
   if(r&&r._http_ok&&r.session_token){
     SESSION_TOKEN=r.session_token;
     sessionIssuedAt=Date.now();
+    sessionClockKnown=true;
     try{sessionStorage.setItem('x0x_session_token',SESSION_TOKEN);sessionStorage.setItem('x0x_session_issued_at',String(sessionIssuedAt))}catch(e){}
+    // The pre-request advertisement was visible:false. The new token is live.
+    advertiseGuiVisibility();
     return;
   }
   if(!r)return; // daemon unreachable: retry on the next tick
   sessionExpired=true;
+  advertiseGuiVisibility();
   const el=document.createElement('div');
   el.className='toast error';
   el.textContent='Session expired — reopen with `x0x gui`';
   document.getElementById('toasts').appendChild(el);
 }
 function maybeRefreshSession(){
-  if(document.visibilityState==='visible'&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)refreshSession();
+  if(document.visibilityState==='visible'&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)return refreshSession();
+}
+async function bootstrapGuiSession(){
+  // The URL token's TTL started at mint, which can be minutes before this
+  // document loaded. Refresh before the socket advertises a live tab, so
+  // the replacement token's issue time is this refresh.
+  if(SESSION_TOKEN&&!sessionClockKnown)await refreshSession();
 }
 
 // Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
@@ -843,6 +905,7 @@ function wsConnect(){
   ws.onopen=async()=>{
     await refreshAgentIdentity();
     S.set('connected',true);
+    advertiseGuiVisibility();
     wsSubs.forEach(t=>wsSend({type:'subscribe',topics:[t]}));
   };
   ws.onclose=()=>{S.set('connected',false);setTimeout(wsConnect,3000)};
@@ -878,7 +941,63 @@ function handleWsMsg(m){
     onGossipMessage(m.topic,m.origin,b64d(m.payload));
     return;
   }
-  if(m.type==='error'){console.warn('ws error:',m.message||m)}
+  // ADR 0083: navigate in place + origin banner.
+  if(m.type==='gui.show'){
+    onGuiShow(m);
+    return;
+  }
+  if(m.type==='error'){
+    // gui.block has no success frame. This error means show is already off
+    // and the stop marker was not saved. The banner stays up.
+    const msg=String(m.message||'');
+    if(msg.indexOf('local show is off, but the stop marker was not saved')===0){
+      toast(msg,'error');
+    }
+    console.warn('ws error:',m.message||m);
+  }
+}
+function onGuiShow(m){
+  const route=String(m.view||'').replace(/^#\/?/,'').replace(/^\//,'');
+  if(route){
+    const prev=location.hash;
+    location.hash='#/'+route;
+    if(location.hash===prev)applyHashRoute();
+  }
+  showGuiShowBanner(m.banner||'Opened by an agent', m.agent_id||'');
+}
+function hideGuiShowBanner(){
+  const bar=document.getElementById('gui-show-banner');
+  if(bar)bar.classList.remove('visible');
+}
+function showGuiShowBanner(text, agentId){
+  const bar=document.getElementById('gui-show-banner');
+  const label=document.getElementById('gui-show-banner-text');
+  const block=document.getElementById('gui-show-banner-block');
+  const hide=document.getElementById('gui-show-banner-dismiss');
+  if(!bar||!label||!block||!hide)return;
+  label.textContent=text;
+  bar.classList.add('visible');
+  block.hidden=false;
+  block.disabled=true;
+  hide.disabled=true;
+  block.onclick=null;
+  hide.onclick=null;
+  clearTimeout(showGuiShowBanner._t);
+  showGuiShowBanner._t=setTimeout(()=>{
+    hide.disabled=false;
+    hide.onclick=hideGuiShowBanner;
+    block.disabled=false;
+    block.onclick=function(){
+      if(!agentId)return;
+      if(!ws||ws.readyState!==1){
+        toast('Could not block shows from this agent','error');
+        return;
+      }
+      // No existing socket message confirms a successful gui.block.
+      // Do not hide the banner or report success until one does.
+      wsSend({type:'gui.block',agent_id:agentId});
+    };
+  },3000);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -6240,16 +6359,23 @@ async function pollAll(){
 // Apply theme on startup
 applyTheme(LS.get('theme','light'));
 
-// Init
-wsConnect();
-pollDash();
-pollContacts();
-pollGroups();
-if(!applyHashRoute())renderView();
-renderSidebar();
+// Init. Confirm the daemon token clock before the socket says this tab is live.
+async function startGui(){
+  await bootstrapGuiSession();
+  wsConnect();
+  pollDash();
+  pollContacts();
+  pollGroups();
+  if(!applyHashRoute())renderView();
+  renderSidebar();
+}
+startGui();
 window.onhashchange=applyHashRoute;
 setInterval(maybeRefreshSession,30000);
-document.addEventListener('visibilitychange',maybeRefreshSession);
+document.addEventListener('visibilitychange',async()=>{
+  if(document.visibilityState==='visible'&&sessionIssuedAt>0&&Date.now()-sessionIssuedAt>=SESSION_REFRESH_MS)await refreshSession();
+  advertiseGuiVisibility();
+});
 
 setInterval(pollAll,5000);
 setInterval(()=>{pollContacts();pollGroups()},8000);

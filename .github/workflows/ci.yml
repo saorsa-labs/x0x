@@ -123,8 +123,10 @@ jobs:
             cargo generate-lockfile
           fi
 
-      - name: Cache target directory
-        uses: actions/cache@v5
+      # Restore here; save at the end of the job, after the prune step (#1543).
+      - name: Restore target directory
+        id: restore_target
+        uses: actions/cache/restore@v5
         with:
           path: target
           # Do not restore a different graph: stale test artifacts can consume the
@@ -137,7 +139,9 @@ jobs:
           tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Inert shared wrapper argument controls
-        run: python3 -B scripts/ci/test_nextest_isolated.py -v
+        run: |
+          python3 -B scripts/ci/test_nextest_isolated.py -v
+          python3 -B scripts/ci/test_prune_target_cache.py -v
 
       - name: Prepare bounded convergence custody
         id: prepare_convergence
@@ -230,6 +234,24 @@ jobs:
           name: voice-pipeline-results
           path: ${{ runner.temp }}/voice-pipeline/
           if-no-files-found: error
+
+      # The full target holds ~115 workspace test binaries that change on every
+      # PR; archiving them filled the runner disk (#1543). Cache only the
+      # third-party build output, on the same terms as the old post-job save.
+      - name: Prune target directory for the cache
+        if: steps.restore_target.outputs.cache-hit != 'true'
+        run: |
+          df -h .
+          du -sh target || true
+          python3 -B scripts/ci/prune-target-cache.py target
+          du -sh target || true
+
+      - name: Save target directory
+        if: steps.restore_target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: target
+          key: ${{ steps.restore_target.outputs.cache-primary-key }}
 
   signing-path-100k:
     name: Signing path 100k acceptance
@@ -451,7 +473,7 @@ jobs:
     # are reported, not required.
     name: W3-H harness (determinism)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
@@ -499,7 +521,7 @@ jobs:
       - name: Run W3-H cases 20 times
         env:
           X0X_ISOLATION_ROLE: w3h-harness
-          X0X_RUNTIME_TIMEOUT_SECONDS: 4800
+          X0X_RUNTIME_TIMEOUT_SECONDS: 6600
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 20

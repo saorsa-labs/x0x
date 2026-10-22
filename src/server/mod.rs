@@ -14,6 +14,7 @@ pub use acl_admin::AclReloadTrigger;
 mod api_watchdog;
 pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
+pub(crate) use auth::SESSION_TOKEN_TTL;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
@@ -140,7 +141,7 @@ async fn finish_startup_error(
     }
     exec_service.shutdown().await;
     if let Some(forward_service) = forward_service {
-        forward_service.shutdown();
+        forward_service.shutdown_and_release().await;
     }
     agent.begin_shutdown();
     let _ = shutdown_notify.send(true);
@@ -500,6 +501,8 @@ pub async fn serve_with_options(
         exec_policy,
         connect_policy,
         self_update_enabled,
+        daemon_config_path,
+        gui_show_write_path,
     } = options;
     // `--skip-update-check` is process-scoped updater suppression. Compute one
     // effective capability before any updater path is considered, then use it
@@ -1340,12 +1343,30 @@ pub async fn serve_with_options(
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         acl_admin: Arc::clone(&acl_admin),
+        gui_show: {
+            let runtime =
+                x0x::gui::GuiShowRuntime::with_defaults(config.gui_show.clone(), &config.data_dir);
+            runtime.set_config_path(daemon_config_path);
+            runtime.set_write_path(gui_show_write_path);
+            // `with_defaults` applies a side-file stop before the config path
+            // is known. Apply again once the path is attached. The marker
+            // still forces show off when the loaded file already says
+            // `local_enabled = true`.
+            runtime.apply_persisted_local_stop();
+            runtime
+        },
         connect_diagnostics,
         forward_service,
         socks_service,
         owner_sync,
         names: Arc::new(
             x0x::names::NameStore::load(x0x::names::NameStore::path_in(&config.data_dir)).await,
+        ),
+        forwards: Arc::new(
+            x0x::forward::store::ForwardStore::load(x0x::forward::store::ForwardStore::path_in(
+                &config.data_dir,
+            ))
+            .await,
         ),
         startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
         startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
@@ -1399,6 +1420,36 @@ pub async fn serve_with_options(
     // are owned by the Agent/ExecService and stopped by their own `shutdown()`
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks = startup_tasks;
+
+    // ADR-0074 §2: bring persisted forwards back. Each named forward is
+    // re-resolved through the name store (its pin applies) and comes up
+    // only on exactly its pinned ids; anything else stays down with a
+    // reason in `GET /forwards`. Local work only — it never blocks startup
+    // on the network. Names of peers not yet discovered resolve later, so
+    // forwards still down are retried until they come up or are deleted
+    // (a retry can only ever bring a forward up on its pinned ids).
+    if state.forward_service.is_some() {
+        let restore_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                routes::connect::FORWARD_RESTORE_RETRY_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                if routes::connect::restore_forwards(&restore_state).await == 0 {
+                    return;
+                }
+            }
+        }));
+    }
 
     // Issue #600: keep the peer-table traversal that `/health` used to do
     // inline OFF the request path. The watchdog probes `/health` with a 3 s
@@ -2995,6 +3046,8 @@ pub async fn serve_with_options(
         // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
+        // ADR 0083 slice 1: local show (no remote target).
+        .route("/gui/show", post(routes::gui_show))
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))
@@ -3134,7 +3187,12 @@ pub async fn serve_with_options(
         // 0b. Forwarder listeners + inbound consumer (issue #132): stop
         //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
-            forwarder.shutdown();
+            // Drain add/remove/restore before cancelling listeners. A
+            // transaction still inside bind publishes its accept loop
+            // before it returns; the release below then waits for that
+            // socket to drop. A bind that resumes after this cancel is
+            // refused.
+            forwarder.shutdown_and_release().await;
         }
         if let Some(socks) = &state.socks_service {
             // Join the accept loop so the listen port is free before the
@@ -3264,6 +3322,10 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
+    // Browser launches sit on the blocking pool, which abort does not stop.
+    // Tell them to return before the join below. The launch task does not
+    // hold `AppState`.
+    state.gui_show.stop_opening();
     // #1288 row 2: REST `/subscribe` forwarders. A topic in
     // `[history] record_topics` makes the forwarder clone `HistoryHandle`,
     // which holds `history.db`. Dropping the map would detach that task and
@@ -3295,7 +3357,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // public-message fan-out race, the one-shot predecessor-relay fallback
     // offer, the member-keyed KeyPackage catch-up requests, the KV-store
     // delta direct deliveries, the outgoing file-chunk streams, and since
-    // #1288 the WebSocket session loop and its writer and forwarders, and the
+    // #1288 the WebSocket session loop and its writer and forwarders, the
+    // queued GUI reveal that waits on a full outbound queue, and the
     // startup self-leave catch-up backoff) and the
     // joiner's join-attempt polls and sends hold the Agent or this AppState.
     // Left running, one asleep before a delayed delivery keeps the Agent, and

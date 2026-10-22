@@ -8,8 +8,8 @@ use semver::Version;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use super::manifest::{encode_signed_manifest, ReleaseManifest};
-use super::signature::verify_manifest_signature;
+use super::manifest::{encode_signed_manifest, verify_eligible_manifest, ReleaseManifest};
+use super::signature::RELEASE_SIGNING_KEY;
 use super::UpgradeError;
 
 /// Default GitHub API base URL.
@@ -215,6 +215,15 @@ impl UpgradeMonitor {
         &self,
         release: &GitHubRelease,
     ) -> Result<VerifiedRelease, UpgradeError> {
+        self.fetch_verified_manifest_with_key(release, RELEASE_SIGNING_KEY)
+            .await
+    }
+
+    async fn fetch_verified_manifest_with_key(
+        &self,
+        release: &GitHubRelease,
+        trusted_key: &[u8],
+    ) -> Result<VerifiedRelease, UpgradeError> {
         info!("Fetching release manifest from GitHub");
 
         let manifest_asset = release
@@ -259,18 +268,7 @@ impl UpgradeMonitor {
             .await
             .map_err(|e| UpgradeError::ManifestFetchFailed(e.to_string()))?;
 
-        // Stage 1: verify manifest signature
-        verify_manifest_signature(&manifest_bytes, &sig_bytes).map_err(|e| {
-            warn!(error = %e, "Release manifest signature verification failed");
-            UpgradeError::ManifestSignatureInvalid
-        })?;
-        info!("Release manifest signature verified");
-
-        let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|e| UpgradeError::InvalidManifest(e.to_string()))?;
-
-        // Validate manifest timestamp to prevent replay of old signed manifests
-        validate_manifest_timestamp(&manifest)?;
+        let manifest = verify_eligible_manifest(&manifest_bytes, &sig_bytes, trusted_key)?;
 
         let manifest_json = manifest_bytes.to_vec();
         let signature = sig_bytes.to_vec();
@@ -317,39 +315,58 @@ pub fn version_from_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
-/// Validate that a manifest timestamp is not too old.
+/// Enforce manifest eligibility at every ingestion, forwarding and apply boundary.
 ///
-/// Rejects manifests older than `MAX_MANIFEST_AGE_SECS` to prevent indefinite
-/// replay of legitimately signed but outdated manifests.
+/// The existing name is retained for callers. In addition to timestamp limits,
+/// this checks signed channel/version consistency and the unconditional
+/// prerelease ban (D186). No configuration flag can bypass these rules.
 pub fn validate_manifest_timestamp(manifest: &ReleaseManifest) -> Result<(), UpgradeError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|error| UpgradeError::InvalidManifest(format!("invalid local clock: {error}")))?
+        .as_secs();
+    validate_manifest_at(manifest, now)
+}
 
+fn validate_manifest_at(manifest: &ReleaseManifest, now: u64) -> Result<(), UpgradeError> {
+    let version = Version::parse(&manifest.version)
+        .map_err(|error| UpgradeError::InvalidManifest(format!("invalid version: {error}")))?;
+    match manifest.channel.as_str() {
+        "stable" if version.pre.is_empty() => {}
+        "stable" | "prerelease" if (manifest.channel == "stable") != version.pre.is_empty() => {
+            return Err(UpgradeError::InvalidManifest(
+                "channel/version mismatch".into(),
+            ));
+        }
+        "prerelease" => {
+            return Err(UpgradeError::InvalidManifest(
+                "prerelease manifests are prohibited".into(),
+            ));
+        }
+        _ => {
+            return Err(UpgradeError::InvalidManifest(
+                "unknown manifest channel".into(),
+            ))
+        }
+    }
     if manifest.timestamp == 0 {
-        // Timestamp not set — allow for backward compatibility with older manifests
-        debug!("Manifest has no timestamp, skipping age check");
-        return Ok(());
+        return Err(UpgradeError::InvalidManifest(
+            "manifest timestamp is zero".into(),
+        ));
     }
-
-    if now > manifest.timestamp && (now - manifest.timestamp) > MAX_MANIFEST_AGE_SECS {
-        let age_days = (now - manifest.timestamp) / 86400;
-        warn!(
-            manifest_timestamp = manifest.timestamp,
-            age_days = age_days,
-            max_age_days = MAX_MANIFEST_AGE_SECS / 86400,
-            "Rejecting stale manifest: {} days old (max {} days)",
-            age_days,
-            MAX_MANIFEST_AGE_SECS / 86400
-        );
-        return Err(UpgradeError::InvalidManifest(format!(
-            "manifest too old: {} days (max {} days)",
-            age_days,
-            MAX_MANIFEST_AGE_SECS / 86400
-        )));
+    const MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
+    if manifest.timestamp.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
+        return Err(UpgradeError::ManifestTimestampInFuture {
+            timestamp: manifest.timestamp,
+            now,
+            max_future_skew_secs: MAX_FUTURE_SKEW_SECS,
+        });
     }
-
+    if now.saturating_sub(manifest.timestamp) > MAX_MANIFEST_AGE_SECS {
+        return Err(UpgradeError::InvalidManifest(
+            "manifest too old: exceeds 30 days".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -373,6 +390,7 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "0.19.42".to_string(),
+            channel: "stable".to_owned(),
             timestamp: now - 3600, // 1 hour ago
             assets: vec![],
             skill_url: String::new(),
@@ -386,6 +404,7 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "0.19.42".to_string(),
+            channel: "stable".to_owned(),
             timestamp: 1000000, // way in the past
             assets: vec![],
             skill_url: String::new(),
@@ -395,30 +414,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_manifest_timestamp_accepts_zero() {
+    fn validate_manifest_timestamp_rejects_zero() {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "0.19.42".to_string(),
-            timestamp: 0, // backward compat
+            channel: "stable".to_owned(),
+            timestamp: 0, // missing signed time is not eligible
             assets: vec![],
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
         };
-        assert!(validate_manifest_timestamp(&manifest).is_ok());
+        assert!(validate_manifest_timestamp(&manifest).is_err());
     }
 
     #[test]
-    fn validate_manifest_timestamp_accepts_future() {
+    fn validate_manifest_timestamp_rejects_future() {
         let far_future = 9999999999;
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "0.19.42".to_string(),
+            channel: "stable".to_owned(),
             timestamp: far_future,
             assets: vec![],
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
         };
-        assert!(validate_manifest_timestamp(&manifest).is_ok());
+        assert!(validate_manifest_timestamp(&manifest).is_err());
     }
 
     #[test]
@@ -476,14 +497,15 @@ mod tests {
 
     async fn serve_manifest_assets(
         manifest_status: &'static str,
-        manifest_body: &'static [u8],
+        manifest_body: &[u8],
         sig_status: &'static str,
-        sig_body: &'static [u8],
+        sig_body: &[u8],
     ) -> (String, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (manifest_body, sig_body) = (manifest_body.to_vec(), sig_body.to_vec());
         tokio::spawn(async move {
             for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -491,9 +513,9 @@ mod tests {
                 let n = socket.read(&mut buf).await.unwrap();
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let (status, body) = if req.starts_with("GET /manifest ") {
-                    (manifest_status, manifest_body)
+                    (manifest_status, &manifest_body)
                 } else {
-                    (sig_status, sig_body)
+                    (sig_status, &sig_body)
                 };
                 let header = format!(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
@@ -524,6 +546,104 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn signed_manifest_eligibility_on_monitor_and_apply_paths() {
+        use serde_json::{json, Value};
+        let (public, secret) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let base = json!({"schema_version": 1, "version": "99.99.99", "channel": "stable",
+            "timestamp": now, "assets": [], "skill_url": "", "skill_sha256": "00".repeat(32)});
+        for (field, value, prerelease_version, eligible) in [
+            ("channel", Some(json!("stable")), false, true),
+            ("channel", None, false, false),
+            ("channel", Some(Value::Null), false, false),
+            ("channel", Some(json!(0)), false, false),
+            ("channel", Some(json!("")), false, false),
+            ("channel", Some(json!("unknown")), false, false),
+            ("channel", Some(json!("stable")), true, false),
+            ("channel", Some(json!("prerelease")), false, false),
+            ("channel", Some(json!("prerelease")), true, false),
+            ("timestamp", None, false, false),
+            ("timestamp", Some(json!(0)), false, false),
+            ("timestamp", Some(json!(now + 3600)), false, false),
+            ("timestamp", Some(json!(u64::MAX)), false, false),
+            (
+                "timestamp",
+                Some(json!(now - MAX_MANIFEST_AGE_SECS - 60)),
+                false,
+                false,
+            ),
+        ] {
+            let mut wire = base.clone();
+            if let Some(value) = value {
+                wire[field] = value;
+            } else {
+                wire.as_object_mut().unwrap().remove(field);
+            }
+            if prerelease_version {
+                wire["version"] = json!("99.99.99-rc.1");
+            }
+            let bytes = serde_json::to_vec(&wire).unwrap();
+            let signature =
+                super::super::signature::sign_with_context(&secret.to_bytes(), &bytes).unwrap();
+            assert_eq!(
+                verify_eligible_manifest(&bytes, &signature, &public.to_bytes()).is_ok(),
+                eligible,
+                "{wire}"
+            );
+            for include in [false, true] {
+                let (url, sig_url) =
+                    serve_manifest_assets("200 OK", &bytes, "200 OK", &signature).await;
+                let monitor = UpgradeMonitor::new("test/test", "x0xd", "0.1.0")
+                    .unwrap()
+                    .with_include_prereleases(include);
+                let result = monitor
+                    .fetch_verified_manifest_with_key(
+                        &release_with_manifest_urls(url, sig_url),
+                        &public.to_bytes(),
+                    )
+                    .await;
+                assert_eq!(
+                    result.is_ok(),
+                    eligible,
+                    "include_prereleases={include}: {wire}"
+                );
+            }
+            if let Ok(manifest) = serde_json::from_slice::<ReleaseManifest>(&bytes) {
+                let result = super::super::apply::AutoApplyUpgrader::new("x0xd")
+                    .apply_upgrade_from_manifest(&manifest)
+                    .await;
+                assert_eq!(
+                    matches!(result, Err(UpgradeError::NoPlatformAsset)),
+                    eligible,
+                    "apply: {wire}"
+                );
+            }
+            let mut tampered = bytes.clone();
+            tampered.push(b' ');
+            assert!(matches!(
+                verify_eligible_manifest(&tampered, &signature, &public.to_bytes()),
+                Err(UpgradeError::ManifestSignatureInvalid)
+            ));
+        }
+        let mut manifest: ReleaseManifest = serde_json::from_value(base).unwrap();
+        manifest.timestamp = now + 300;
+        assert!(validate_manifest_at(&manifest, now).is_ok());
+        manifest.timestamp += 1;
+        assert!(matches!(
+            validate_manifest_at(&manifest, now),
+            Err(UpgradeError::ManifestTimestampInFuture {
+                max_future_skew_secs: 300,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

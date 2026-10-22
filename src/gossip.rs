@@ -7,6 +7,7 @@ pub mod config;
 mod egress;
 pub(crate) mod join_seeds;
 pub mod participation;
+pub mod per_kind;
 pub mod pubsub;
 pub(crate) mod relay_fanout;
 pub mod runtime;
@@ -18,6 +19,10 @@ pub use participation::{
     classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, resolve_participation,
     ParticipationInputs, ParticipationMode, ParticipationSelection, ParticipationSnapshot,
     RelayMetering, RELAY_BYTES_SEMANTICS,
+};
+pub use per_kind::{
+    per_kind_gossip_stats, KindCountersSnapshot, PerKindGossipSnapshot, PerKindHealthVerdict,
+    PerKindInterval, PER_KIND_BUS_SHARE_THRESHOLD, PER_KIND_ROLLING_WINDOW,
 };
 pub use pubsub::{
     inner_verify_stats, InboundByTopicSnapshot, InnerVerifyStats, InnerVerifyStatsSnapshot,

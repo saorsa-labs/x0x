@@ -1797,6 +1797,17 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "websocket",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/gui/show",
+        cli_name: "show",
+        description: "Show a GUI view to the human (ADR 0083 local show)",
+        category: "gui",
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("view", true, "VIEW"),
+            RequestField::body_as("target_machine", false, "--on"),
+        ]),
+    },
     // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
     EndpointDef {
         method: Method::Post,
@@ -1804,7 +1815,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "forward add",
         description: "Add a local port forward to a peer's loopback service",
         category: "connect",
-        request: RequestSpec::Fields(&[RequestField::body_as("local_addr", true, "--local"), RequestField::body_as("peer_agent", true, "--peer"), RequestField::body_as("target_host", true, "--target"), RequestField::body_as("target_port", true, "--target-port")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("local_addr", true, "--local"), RequestField::body_as("peer_agent", true, "--peer"), RequestField::body_as("target_host", true, "--target"), RequestField::body_as("target_port", true, "--target-port"), RequestField::body_as("ephemeral", false, "--ephemeral")]),
     },
     EndpointDef {
         method: Method::Get,

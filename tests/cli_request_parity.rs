@@ -783,6 +783,9 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/tasks.rs",
     "src/server/routes/trust.rs",
     "src/server/routes/upgrade.rs",
+    // ADR 0083: handler lives here; `GuiShowRequest` lives in src/gui/show.rs.
+    "src/server/routes/gui_show.rs",
+    "src/gui/show.rs",
 ];
 
 /// How a handler consumes request data, from its extractor signature.

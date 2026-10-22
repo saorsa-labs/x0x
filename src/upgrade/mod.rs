@@ -548,6 +548,14 @@ pub enum UpgradeError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    /// D182: distinguish future-clock skew from stale or malformed manifests.
+    #[error("manifest timestamp {timestamp} exceeds local time {now} by more than {max_future_skew_secs} seconds")]
+    ManifestTimestampInFuture {
+        timestamp: u64,
+        now: u64,
+        max_future_skew_secs: u64,
+    },
+
     #[error("manifest signature verification failed")]
     ManifestSignatureInvalid,
 

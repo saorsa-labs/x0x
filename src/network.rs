@@ -2001,19 +2001,30 @@ async fn forward_gossip_payload(
         // EXCEPT when the frame's topic is Critical: sender-side `ShedNormal`
         // already protects Critical control on the wire, and dropping the
         // receiver-side IHAVE/IWANT repair under saturation would re-open the
-        // #807 black hole. Both peeks are gated on the shed threshold, so
-        // the steady-state path keeps ADR 0009's flat try_send behavior with
-        // no decode cost. Kind eligibility keeps the cheap pre-#810 peek; the
-        // structural topic inspection only runs for already-eligible frames,
-        // and a frame whose header will not inspect falls back to the
-        // pre-#810 Normal treatment (review item 3).
-        if channel_pressure_exceeds_shed_threshold(tx.capacity(), max)
-            && saorsa_gossip_pubsub::peek_message_kind(&message.data)
-                .is_some_and(is_pubsub_shed_eligible)
+        // #807 black hole. The kind peek runs only after the shed threshold
+        // (or after `try_send` reports Full), so the steady-state path keeps
+        // ADR 0009's flat try_send behavior with no decode cost. Kind
+        // eligibility keeps the cheap pre-#810 peek; the structural topic
+        // inspection only runs for already-eligible frames, and a frame whose
+        // header will not inspect falls back to the pre-#810 Normal treatment
+        // (review item 3). `bus_dispatched` is recorded later from the header
+        // inspection `handle_incoming` already performs. A closed channel is
+        // not a `bus_dropped` event.
+        let under_pressure = channel_pressure_exceeds_shed_threshold(tx.capacity(), max);
+        let peeked_kind = if under_pressure {
+            saorsa_gossip_pubsub::peek_message_kind(&message.data)
+        } else {
+            None
+        };
+        if under_pressure
+            && peeked_kind.is_some_and(is_pubsub_shed_eligible)
             && !is_critical_pubsub_control(&message.data, topic_priority)
         {
             let depth = channel_depth(tx);
             diagnostics.record_shed_priority(stream_type, depth, max);
+            if let Some(kind) = peeked_kind {
+                crate::gossip::per_kind::per_kind_counters().record_bus_dropped(kind);
+            }
             if channel_drop_warn_limiter().should_emit(
                 channel_pressure_key(channel_name, Some(stream_type)),
                 Instant::now(),
@@ -2035,9 +2046,14 @@ async fn forward_gossip_payload(
                 diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
                 Ok(ForwardGossipOutcome::Enqueued)
             }
-            Err(mpsc::error::TrySendError::Full(_message)) => {
+            Err(mpsc::error::TrySendError::Full(returned)) => {
                 let depth = channel_depth(tx);
                 diagnostics.record_dropped_full(peer_id, stream_type, depth, max);
+                let kind =
+                    peeked_kind.or_else(|| saorsa_gossip_pubsub::peek_message_kind(&returned.data));
+                if let Some(kind) = kind {
+                    crate::gossip::per_kind::per_kind_counters().record_bus_dropped(kind);
+                }
                 if channel_drop_warn_limiter().should_emit(
                     channel_pressure_key(channel_name, Some(stream_type)),
                     Instant::now(),

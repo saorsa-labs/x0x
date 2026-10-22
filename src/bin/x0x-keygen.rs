@@ -316,6 +316,10 @@ fn generate_manifest(
     output_dir: &Path,
     base_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed_version = semver::Version::parse(version)?;
+    if !parsed_version.pre.is_empty() {
+        return Err("prerelease manifests remain prohibited (ADR 0087, D186)".into());
+    }
     let sk_bytes = std::fs::read(key_path)?;
     let secret_key = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)?;
     let repo_url = normalize_base_url(base_url.as_deref())?;
@@ -374,6 +378,7 @@ fn generate_manifest(
 
     let manifest = ReleaseManifest {
         schema_version: SCHEMA_VERSION,
+        channel: "stable".into(),
         version: version.to_string(),
         timestamp,
         assets,
@@ -381,6 +386,7 @@ fn generate_manifest(
         skill_sha256,
     };
 
+    x0x::upgrade::monitor::validate_manifest_timestamp(&manifest)?;
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
 
     // Sign the manifest JSON
@@ -404,4 +410,16 @@ fn generate_manifest(
     eprintln!("  Platforms: {}", manifest.assets.len());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn manifest_generation_refuses_prerelease_before_key_read() {
+        let unused = std::path::Path::new("unused-test-key-path");
+        let result = super::generate_manifest("99.0.0-rc.1", unused, unused, unused, unused, None);
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("prerelease manifests remain prohibited"))
+        );
+    }
 }

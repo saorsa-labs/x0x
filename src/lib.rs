@@ -229,6 +229,9 @@ pub mod api;
 /// CLI infrastructure and command implementations.
 pub mod cli;
 
+/// Embedded GUI shell, view grammar, and ADR 0083 show runtime.
+pub mod gui;
+
 /// HTTP/WebSocket server: axum router, handlers, and the daemon serving entrypoint.
 pub mod server;
 
@@ -18896,25 +18899,45 @@ impl Agent {
         .map_err(|e| e.fail_closed_admission(agent_id.0))
     }
 
-    /// Shared body for [`Self::gate_peer_outbound`] and the ADR-0074 §4
-    /// re-check. Cert expiry uses [`OwnerTrust::now_unix_secs`] immediately
-    /// before the compare (after discovery + authority awaits). With
-    /// `local_authority_only`, ADR 0115 confirmation uses only local
-    /// stores / non-blocking evidence and contended reads return Busy.
+    /// The machine [`Self::gate_peer_outbound_at`] would dial for `agent_id`
+    /// on the admission path (`local_authority_only` = false).
+    ///
+    /// A missing discovery entry or a zero routing machine is not a dial
+    /// target (the gate returns `PeerNotVerified` and does not fall back).
+    /// A non-zero cached route is used only when an authority store confirms
+    /// it; otherwise the authority stores' machine is used. `None` when the
+    /// gate would have no machine.
+    pub(crate) async fn outbound_dial_machine(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<identity::MachineId> {
+        Self::select_outbound_dial_machine(
+            &self.identity_discovery_cache,
+            &self.owner_trust,
+            &self.announced_machine_bindings,
+            &self.authenticated_machine_bindings,
+            agent_id,
+            false,
+        )
+        .await
+        .ok()
+        .map(|(machine, _)| machine)
+    }
+
+    /// Machine half of [`Self::gate_peer_outbound_at`]: the dial target and
+    /// the cached certificate expiry. Admission and reauth share this body
+    /// so a persisted forward cannot pin a route the gate would not dial.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn gate_peer_outbound_at(
+    pub(crate) async fn select_outbound_dial_machine(
         identity_discovery_cache: &tokio::sync::RwLock<
             std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
         >,
-        contact_store: &tokio::sync::RwLock<contacts::ContactStore>,
-        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
-        move_state: &tokio::sync::RwLock<key_move::MoveState>,
         owner_trust: &owner_trust::OwnerTrust,
         announced_bindings: &dm_inbox::AuthenticatedMachineBindings,
         authenticated_bindings: &dm_inbox::AuthenticatedMachineBindings,
         agent_id: &identity::AgentId,
         local_authority_only: bool,
-    ) -> Result<identity::MachineId, crate::forward::PeerGateError> {
+    ) -> Result<(identity::MachineId, Option<u64>), crate::forward::PeerGateError> {
         use crate::owner_trust::NonblockingEval;
         let (routing, cert_not_after) = {
             let cache = identity_discovery_cache.read().await;
@@ -18959,6 +18982,38 @@ impl Agent {
                     agent_id: agent_id.0,
                 },
             )?;
+        Ok((machine_id, cert_not_after))
+    }
+
+    /// Shared body for [`Self::gate_peer_outbound`] and the ADR-0074 §4
+    /// re-check. Cert expiry uses [`OwnerTrust::now_unix_secs`] immediately
+    /// before the compare (after discovery + authority awaits). With
+    /// `local_authority_only`, ADR 0115 confirmation uses only local
+    /// stores / non-blocking evidence and contended reads return Busy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gate_peer_outbound_at(
+        identity_discovery_cache: &tokio::sync::RwLock<
+            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        >,
+        contact_store: &tokio::sync::RwLock<contacts::ContactStore>,
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        move_state: &tokio::sync::RwLock<key_move::MoveState>,
+        owner_trust: &owner_trust::OwnerTrust,
+        announced_bindings: &dm_inbox::AuthenticatedMachineBindings,
+        authenticated_bindings: &dm_inbox::AuthenticatedMachineBindings,
+        agent_id: &identity::AgentId,
+        local_authority_only: bool,
+    ) -> Result<identity::MachineId, crate::forward::PeerGateError> {
+        use crate::owner_trust::NonblockingEval;
+        let (machine_id, cert_not_after) = Self::select_outbound_dial_machine(
+            identity_discovery_cache,
+            owner_trust,
+            announced_bindings,
+            authenticated_bindings,
+            agent_id,
+            local_authority_only,
+        )
+        .await?;
         // Runtime cert-expiry gate (issue #191): EP1 drops expired
         // announcements at ingest but never re-checks a cached entry on
         // the live path. Absent expiry (None) is fail-open — is_expired
