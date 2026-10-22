@@ -382,6 +382,7 @@ mod tests {
                     None,
                     None,
                     crate::server::rider_auth::unix_now_secs(),
+                    Vec::new(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("rider token issue: {e}"))?;

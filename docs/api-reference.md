@@ -79,9 +79,11 @@ Auth-class labels used throughout this reference:
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
   route, (#1386) `POST /forwards` in every case (including plain hex
-  `peer_agent`), (#1392) `POST /gui/show`, `DELETE /forwards/:local_addr`
-  (David, 20 Oct 2026, 17:54 BST: a session token or a rider token is
-  refused, the same rule as `POST /forwards`), and every `/names*` route.
+  `peer_agent`), (#1392) `POST /gui/show` (a GUI session bearer is still
+  refused; a rider token is admitted only with `gui:show`),
+  `DELETE /forwards/:local_addr` (David, 20 Oct 2026, 17:54 BST: a session
+  token or a rider token is refused, the same rule as `POST /forwards`),
+  and every `/names*` route.
   The join-request list, approve and reject are not on this list. They
   take one class that depends on the group: see **Join-request admin
   (#1347)** below.
@@ -89,9 +91,9 @@ Auth-class labels used throughout this reference:
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
-- **rider-allowed** — the three surfaces a rider token may reach (see the
-  harness-boundary section below). Rider tokens authenticate in the
-  `Authorization` header only.
+- **rider-allowed** — the surfaces a rider token may reach (see the
+  harness-boundary section below). `POST /gui/show` needs `gui:show`.
+  Rider tokens authenticate in the `Authorization` header only.
 
 **#446 resolution notes:** `POST /announce` without
 `include_user_identity` and `PATCH /groups/:id` on ordinary
@@ -645,6 +647,7 @@ authenticates as a distinct principal that may reach exactly:
   must be listed explicitly like any other group (`rider_allows_group`
   checks the explicit list only)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
+- `POST /gui/show` — only when the token's `scopes` contain `gui:show`
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
 `/shutdown`, and the rest of the `/history` family (`/history/search`,
@@ -668,12 +671,14 @@ Home encrypts record the sub-agent id as the history row's author.
 ```json
 // POST /owner/riders -> 200 (token secret returned exactly once)
 {"ok":true,"sub_agent_id":"df4eca…","token_id":1,"label":"…",
- "groups":["home"],"issued_at_unix":1788091312,"expires_at_unix":1788092212,
- "token":"bfc14e49…"}
+ "groups":["home"],"scopes":["gui:show"],"issued_at_unix":1788091312,
+ "expires_at_unix":1788092212,"token":"bfc14e49…"}
 ```
 
+`POST /owner/riders` takes `scopes`, a string array. The default is empty. The only defined value is `gui:show`. An unknown value is HTTP 400 with `reason: unknown_scope`. Nothing is stored.
+
 - `GET /owner/riders` lists records with **no secrets** — `token_id`,
-  `sub_agent_id`, `cert_digest`, `groups`, `issued_at_unix`,
+  `sub_agent_id`, `cert_digest`, `groups`, `scopes`, `issued_at_unix`,
   `expires_at_unix`, `revoked_at_unix`. Durable-owner only.
 - With the rider token: `GET /history?scope=group:home` → `200`;
   `GET /owner/agents` → `403`; `POST /agent/sign` → `403`.
@@ -2921,14 +2926,15 @@ does not appear in `x0x routes`. What ships today is **point-to-point
 |---|---|---|---|
 | GET | `/gui` | `x0x gui` | Open the embedded browser UI |
 | GET | `/gui/` | — | Alias for `/gui` |
-| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). **durable-owner**: a GUI session bearer and a rider token receive a typed `403`. Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `navigated` means a visible GUI tab accepted the `gui.show` frame on its outbound queue (`gui=1` only while the tab is visible; the tab then sends `gui.visible`). A full queue does not accept the frame. An agent socket, a hidden tab, a tab whose session has expired, and a visible tab that cannot take the frame do not count, and the daemon opens a browser instead. A blocked sender, including this daemon's agent, is `refused`. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). The daemon re-reads `[gui_show]` from the file startup loaded when it serves `POST /acl/reload`. The reload response has no `gui_show` field. That route answers `422` only when an ACL plane fails. |
+| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). An owner token must be the durable API token. A GUI session bearer receives a typed `403`. A rider token with `gui:show` is admitted. A rider without that scope receives HTTP 403 `reason: missing_scope`. Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `navigated` means a visible GUI tab accepted the `gui.show` frame on its outbound queue (`gui=1` only while the tab is visible; the tab then sends `gui.visible`). A full queue does not accept the frame. An agent socket, a hidden tab, a tab whose session has expired, and a visible tab that cannot take the frame do not count, and the daemon opens a browser instead. A blocked sender, including this daemon's agent, is `refused`. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). The daemon re-reads `[gui_show]` from the file startup loaded when it serves `POST /acl/reload`. The reload response has no `gui_show` field. That route answers `422` only when an ACL plane fails. |
 
 #### Example: local show
 
 ```bash
 # Open or navigate the local GUI to the People view.
-# $TOKEN is the durable owner API token. A GUI session bearer or a rider
-# token receives a typed 403.
+# $TOKEN is the durable owner API token, or a rider token with gui:show.
+# A GUI session bearer receives a typed 403. A rider without gui:show
+# receives HTTP 403 reason missing_scope.
 curl -s -X POST http://127.0.0.1:12700/gui/show \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -2939,7 +2945,7 @@ x0x show people
 x0x show groups/<group_id>/board
 ```
 
-`POST /gui/show` requires the durable owner API token (**durable-owner**). A GUI session bearer receives a typed `403`. A rider token receives a typed `403`. The refusal uses the same gate as `POST /forwards`. David approved this on 22 Oct 2026 at 13:30 BST.
+`POST /gui/show` still requires the durable owner API token for an owner token. A GUI session bearer still receives a typed 403. That error names the durable API token. David approved that rule on 22 Oct 2026 at 13:30 BST. A rider token with `gui:show` may call the same route `x0x show` posts. It receives the same token-free response. A rider without `gui:show` receives HTTP 403 with `reason: missing_scope`. The response is still `{outcome, machine_id, request_id}`. It never carries a URL or a session token.
 
 View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
 

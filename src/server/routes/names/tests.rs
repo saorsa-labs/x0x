@@ -587,6 +587,7 @@ async fn names_and_forwards_refuse_session_and_rider_tokens() -> anyhow::Result<
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("rider token issue: {e}"))?;
@@ -736,6 +737,7 @@ async fn forward_delete_refuses_session_and_rider_and_accepts_durable_owner() ->
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("rider token issue: {e}"))?;

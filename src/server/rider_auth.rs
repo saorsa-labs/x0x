@@ -15,6 +15,8 @@
 //!   `/shutdown` and every admin surface are permanently
 //!   rider-forbidden, so the daemon can never be turned into an
 //!   unscoped signing or exec oracle through a rider credential.
+//! - `POST /gui/show` is on that list only when the token carries
+//!   [`GUI_SHOW_SCOPE`]. A scopeless rider is `403` `missing_scope`.
 //! - An unknown, expired, or revoked bearer is `401` —
 //!   indistinguishable from any other bad token.
 //!
@@ -39,6 +41,9 @@ pub(super) const RIDER_MAX_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 /// Maximum rows a rider may pull from `GET /history` per request
 /// (owners keep the store-wide 500 cap).
 pub(super) const RIDER_HISTORY_MAX_LIMIT: usize = 100;
+
+/// The only defined rider-token scope (ADR 0083 slice 2).
+pub(super) const GUI_SHOW_SCOPE: &str = "gui:show";
 
 /// File name of the persisted rider-token store, in the daemon data dir.
 pub(super) const RIDER_TOKENS_FILE: &str = "rider-tokens.json";
@@ -76,6 +81,9 @@ pub(super) enum ActorContext {
         token_hash: String,
         /// Granted named-group ids (in addition to Home).
         groups: Vec<String>,
+        /// Rider-token scopes. Empty means the default token, which
+        /// cannot call `POST /gui/show`.
+        scopes: Vec<String>,
     },
 }
 
@@ -116,12 +124,74 @@ impl ActorContext {
 ///   `MlsEncrypted` groups, which is what Home is (ADR-0038).
 /// - `GET /history` — bounded read (scope restricted to granted groups
 ///   in the handler, limit clamped to [`RIDER_HISTORY_MAX_LIMIT`]).
-pub(super) fn rider_route_allowed(method: &axum::http::Method, path: &str) -> bool {
+/// - `POST /gui/show` — only when `scopes` contains [`GUI_SHOW_SCOPE`].
+///   The send, encrypt, and history rows ignore `scopes`.
+pub(super) fn rider_route_allowed(
+    method: &axum::http::Method,
+    path: &str,
+    scopes: &[String],
+) -> bool {
     use axum::http::Method;
+    if *method == Method::POST && path == "/gui/show" {
+        return scopes_allow_gui_show(scopes);
+    }
     match *method {
         Method::POST => is_group_send_path(path) || is_secure_encrypt_path(path),
         Method::GET => path == "/history",
         _ => false,
+    }
+}
+
+/// Shared predicate for `POST /gui/show`: the token lists `gui:show`.
+pub(super) fn scopes_allow_gui_show(scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| scope == GUI_SHOW_SCOPE)
+}
+
+/// Accept only exact `gui:show`. An empty list is the default token.
+/// Duplicates of that one scope collapse to a single entry.
+/// `Err` is the rejected scope text, with no added words.
+pub(super) fn parse_rider_scopes(scopes: &[String]) -> Result<Vec<String>, String> {
+    let mut parsed = Vec::new();
+    for scope in scopes {
+        if scope == GUI_SHOW_SCOPE {
+            if !parsed.iter().any(|known| known == GUI_SHOW_SCOPE) {
+                parsed.push(GUI_SHOW_SCOPE.to_string());
+            }
+            continue;
+        }
+        return Err(scope.clone());
+    }
+    Ok(parsed)
+}
+
+/// JSON body for a rider that reached `POST /gui/show` without the scope.
+pub(super) fn missing_gui_show_scope_body() -> serde_json::Value {
+    serde_json::json!({
+        "error": format!("rider token is missing scope {GUI_SHOW_SCOPE}"),
+        "reason": "missing_scope",
+    })
+}
+
+/// Handler admission for `POST /gui/show`. The same predicate as
+/// [`rider_route_allowed`]. Tests call the handler without middleware,
+/// so the handler repeats this check.
+pub(super) enum AdmitGuiShow {
+    /// `rider` is true only for a rider token that carries `gui:show`.
+    Allow { rider: bool },
+    /// `403` JSON. The durable-owner refusal has no `reason`.
+    Forbidden(serde_json::Value),
+}
+
+pub(super) fn admit_gui_show(actor: &ActorContext) -> AdmitGuiShow {
+    match actor {
+        ActorContext::Owner { durable: true } => AdmitGuiShow::Allow { rider: false },
+        ActorContext::Owner { durable: false } => AdmitGuiShow::Forbidden(serde_json::json!({
+            "error": "/gui/show requires the durable API token (not a session token)"
+        })),
+        ActorContext::Rider { scopes, .. } if scopes_allow_gui_show(scopes) => {
+            AdmitGuiShow::Allow { rider: true }
+        }
+        ActorContext::Rider { .. } => AdmitGuiShow::Forbidden(missing_gui_show_scope_body()),
     }
 }
 
@@ -172,6 +242,10 @@ pub(super) struct RiderTokenRecord {
     pub sub_agent_id: String,
     /// Granted named-group ids (in addition to Home).
     pub groups: Vec<String>,
+    /// Rider-token scopes. Absent on a pre-change record, which loads
+    /// as an empty list and therefore has no `gui:show`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
     /// Operator label.
     pub label: Option<String>,
     /// Unix seconds when the token was issued.
@@ -204,6 +278,33 @@ pub(super) struct ValidatedRider {
     pub sub_agent_id: String,
     pub token_hash: String,
     pub groups: Vec<String>,
+    pub scopes: Vec<String>,
+}
+
+/// `POST /owner/riders` maps [`IssueRiderError::UnknownScope`] to HTTP 400
+/// and [`IssueRiderError::Persist`] to HTTP 500.
+#[derive(Debug)]
+pub(super) enum IssueRiderError {
+    Persist(std::io::Error),
+    UnknownScope(String),
+}
+
+impl std::fmt::Display for IssueRiderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Persist(error) => write!(f, "{error}"),
+            Self::UnknownScope(scope) => write!(f, "unknown rider scope: {scope}"),
+        }
+    }
+}
+
+impl std::error::Error for IssueRiderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Persist(error) => Some(error),
+            Self::UnknownScope(_) => None,
+        }
+    }
 }
 
 /// SHA-256 hex of a token secret.
@@ -339,7 +440,12 @@ impl RiderTokenStore {
         cert_not_after: Option<u64>,
         delegation: Option<crate::groups::RiderDelegation>,
         now_unix: u64,
-    ) -> std::io::Result<(String, RiderTokenRecord)> {
+        scopes: Vec<String>,
+    ) -> Result<(String, RiderTokenRecord), IssueRiderError> {
+        let scopes = match parse_rider_scopes(&scopes) {
+            Ok(scopes) => scopes,
+            Err(scope) => return Err(IssueRiderError::UnknownScope(scope)),
+        };
         use rand::RngCore;
         let mut secret = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut secret);
@@ -351,6 +457,7 @@ impl RiderTokenStore {
             token_hash: token_hash_hex(&token),
             sub_agent_id,
             groups,
+            scopes,
             label,
             issued_at: now_unix,
             expires_at: now_unix.saturating_add(ttl_secs.max(1)),
@@ -364,7 +471,7 @@ impl RiderTokenStore {
             // Roll back the in-memory insert: the token was never
             // durably issued and must not validate.
             self.records.remove(&token_id);
-            return Err(e);
+            return Err(IssueRiderError::Persist(e));
         }
         Ok((token, record))
     }
@@ -408,6 +515,7 @@ impl RiderTokenStore {
             sub_agent_id: record.sub_agent_id.clone(),
             token_hash: record.token_hash.clone(),
             groups: record.groups.clone(),
+            scopes: record.scopes.clone(),
         })
     }
 
@@ -500,12 +608,17 @@ mod tests {
     fn rider_routes_allow_exactly_send_secure_encrypt_and_history() {
         // WHY: ADR-0039 validation — the allowlist must be minimal and
         // exact; a fuzzy match here would silently widen rider reach.
-        assert!(rider_route_allowed(&Method::POST, "/groups/abc123/send"));
         assert!(rider_route_allowed(
             &Method::POST,
-            "/groups/abc123/secure/encrypt"
+            "/groups/abc123/send",
+            &[]
         ));
-        assert!(rider_route_allowed(&Method::GET, "/history"));
+        assert!(rider_route_allowed(
+            &Method::POST,
+            "/groups/abc123/secure/encrypt",
+            &[],
+        ));
+        assert!(rider_route_allowed(&Method::GET, "/history", &[]));
     }
 
     #[test]
@@ -544,14 +657,14 @@ mod tests {
             ("/history", Method::DELETE),
             ("/files/send", Method::POST),
             ("/forwards", Method::POST),
-            // #1392: show is an owner act. A rider token is refused.
+            // Empty scopes: POST /gui/show stays forbidden.
             ("/gui/show", Method::POST),
             // Deleting a forward removes the owner's persisted record.
             ("/forwards/127.0.0.1:8022", Method::DELETE),
         ];
         for (path, method) in forbidden {
             assert!(
-                !rider_route_allowed(&method, path),
+                !rider_route_allowed(&method, path, &[]),
                 "{method} {path} must be rider-forbidden"
             );
         }
@@ -572,12 +685,12 @@ mod tests {
             "/history/",
         ] {
             assert!(
-                !rider_route_allowed(&Method::POST, path) || path == "/groups/a/b/send", // POST-only lookalike set
+                !rider_route_allowed(&Method::POST, path, &[]) || path == "/groups/a/b/send", // POST-only lookalike set
                 "lookalike {path} must not be allowed for POST"
             );
         }
-        assert!(!rider_route_allowed(&Method::GET, "/history/"));
-        assert!(!rider_route_allowed(&Method::PUT, "/history"));
+        assert!(!rider_route_allowed(&Method::GET, "/history/", &[]));
+        assert!(!rider_route_allowed(&Method::PUT, "/history", &[]));
     }
 
     #[test]
@@ -595,6 +708,7 @@ mod tests {
             token_id: 1,
             token_hash: "deadbeef".to_string(),
             groups: vec!["group-b".to_string()],
+            scopes: Vec::new(),
         };
         assert!(owner.rider_allows_group("anything"));
         assert!(rider.rider_allows_group("group-b"), "granted group");
@@ -622,6 +736,7 @@ mod tests {
                 None,
                 None,
                 1_000,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -654,6 +769,7 @@ mod tests {
                 None,
                 None,
                 1_000,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -682,6 +798,7 @@ mod tests {
                 Some(1_500),
                 None,
                 1_000,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -714,6 +831,7 @@ mod tests {
                 None,
                 None,
                 1_000,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -745,6 +863,7 @@ mod tests {
                     None,
                     None,
                     1_000,
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -758,6 +877,7 @@ mod tests {
                     None,
                     None,
                     1_000,
+                    Vec::new(),
                 )
                 .await
                 .unwrap();
@@ -773,5 +893,105 @@ mod tests {
         assert_eq!(store.revoke_for_agent(&agent, 1_030).await.unwrap(), 1);
         assert!(store.validate(&token_a, 1_031).is_none());
         assert_eq!(rec_a.token_id, 1);
+    }
+
+    #[test]
+    fn parse_rider_scopes_accepts_only_gui_show() {
+        assert_eq!(parse_rider_scopes(&[]).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_rider_scopes(&[GUI_SHOW_SCOPE.to_string(), GUI_SHOW_SCOPE.to_string()]).unwrap(),
+            vec![GUI_SHOW_SCOPE.to_string()]
+        );
+        for bad in ["not-a-scope", "", " gui:show ", "GUI:SHOW", "scratch"] {
+            let err = parse_rider_scopes(&[bad.to_string()]).unwrap_err();
+            assert_eq!(err, bad);
+        }
+    }
+
+    #[test]
+    fn gui_show_scope_admits_only_post_gui_show() {
+        let scopes = vec![GUI_SHOW_SCOPE.to_string()];
+        assert!(rider_route_allowed(&Method::POST, "/gui/show", &scopes));
+        assert!(!rider_route_allowed(&Method::POST, "/gui/show", &[]));
+        assert!(!rider_route_allowed(
+            &Method::POST,
+            "/auth/session",
+            &scopes
+        ));
+        assert!(!rider_route_allowed(&Method::POST, "/agent/sign", &scopes));
+        assert!(rider_route_allowed(
+            &Method::POST,
+            "/groups/abc123/send",
+            &[]
+        ));
+        assert!(rider_route_allowed(&Method::GET, "/history", &scopes));
+    }
+
+    #[tokio::test]
+    async fn issue_rejects_unknown_scope_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RIDER_TOKENS_FILE);
+        let mut store = RiderTokenStore::load(path.clone()).await;
+        let err = store
+            .issue(
+                "aa".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                "dd".repeat(32),
+                None,
+                None,
+                1_000,
+                vec!["not-a-scope".to_string()],
+            )
+            .await
+            .unwrap_err();
+        match err {
+            IssueRiderError::UnknownScope(scope) => assert_eq!(scope, "not-a-scope"),
+            other => panic!("expected unknown scope, got {other:?}"),
+        }
+        assert!(store.list().is_empty());
+        assert!(
+            !path.exists(),
+            "an unknown scope must not create the token file"
+        );
+        let reloaded = RiderTokenStore::load(path).await;
+        assert!(reloaded.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_without_scopes_field_validates_with_empty_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RIDER_TOKENS_FILE);
+        let mut store = RiderTokenStore::load(path.clone()).await;
+        let (token, record) = store
+            .issue(
+                "ab".repeat(32),
+                vec!["g1".to_string()],
+                None,
+                60,
+                "d1".repeat(32),
+                None,
+                None,
+                1_000,
+                vec![GUI_SHOW_SCOPE.to_string(), GUI_SHOW_SCOPE.to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.scopes, vec![GUI_SHOW_SCOPE.to_string()]);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["tokens"][&record.token_id.to_string()]
+            .as_object_mut()
+            .unwrap()
+            .remove("scopes");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let bare: RiderTokenRecord =
+            serde_json::from_value(value["tokens"][&record.token_id.to_string()].clone()).unwrap();
+        assert!(bare.scopes.is_empty());
+        let store = RiderTokenStore::load(path).await;
+        let validated = store.validate(&token, 1_010).unwrap();
+        assert!(validated.scopes.is_empty());
+        assert_eq!(validated.groups, vec!["g1".to_string()]);
     }
 }

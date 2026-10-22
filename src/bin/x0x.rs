@@ -819,6 +819,10 @@ enum OwnerRidersSub {
         /// Token lifetime seconds (default 7 days, max 90 days).
         #[arg(long, value_name = "SECS")]
         ttl_secs: Option<u64>,
+        /// Rider-token scope. Repeat the flag to pass more than one.
+        /// The only defined scope is `gui:show`.
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scopes: Vec<String>,
         /// Base64 canonical rider-delegation payload
         /// (`rider_delegation_bytes(sub, daemon, scopes, not_after)`,
         /// ADR-0039 review r3 option B). REQUIRED together with
@@ -2432,6 +2436,7 @@ async fn run(
                         ttl_secs,
                         delegation_payload_b64,
                         delegation_signature,
+                        scopes,
                     }),
             }) => {
                 commands::identity::owner_riders_issue(
@@ -2442,6 +2447,7 @@ async fn run(
                     ttl_secs,
                     delegation_payload_b64.as_deref(),
                     delegation_signature.as_deref(),
+                    &scopes,
                 )
                 .await
             }

@@ -7,9 +7,10 @@
 //! and its outbound queue accepts the frame. The response never contains a
 //! URL or session token.
 //!
-//! The route requires the durable owner API token. `auth_middleware` refuses
-//! a GUI session bearer and a rider token before this handler runs. The
-//! handler repeats that check.
+//! An owner token must be the durable API token. A GUI session bearer is
+//! refused. A rider bearer is admitted only when the token carries
+//! `gui:show`. `auth_middleware` applies that check. The handler repeats
+//! it for tests that call the handler without middleware.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use super::super::rider_auth::ActorContext;
+use super::super::rider_auth::{admit_gui_show, ActorContext, AdmitGuiShow};
 use super::super::state::AppState;
 use super::super::ws::GuiShowFrame;
 use crate::gui::{
@@ -34,18 +35,15 @@ pub(in crate::server) async fn gui_show(
     Extension(actor): Extension<ActorContext>,
     Json(req): Json<GuiShowRequest>,
 ) -> Response {
-    // David approved 22 Oct 2026 13:30 BST (#1392). Same refusal as
-    // `POST /forwards`: the middleware returns 403 before extractors, and
-    // this check refuses a non-durable actor when that layer is absent.
-    if !actor.is_durable_owner() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "/gui/show requires the durable API token (not a session token)"
-            })),
-        )
-            .into_response();
-    }
+    // David approved 22 Oct 2026 13:30 BST (#1392) for owner tokens: a GUI
+    // session bearer stays a durable-token 403. A rider is admitted only
+    // with `gui:show`. This is the same check as the middleware.
+    let rider = match admit_gui_show(&actor) {
+        AdmitGuiShow::Allow { rider } => rider,
+        AdmitGuiShow::Forbidden(body) => {
+            return (StatusCode::FORBIDDEN, Json(body)).into_response();
+        }
+    };
 
     let machine_id = hex::encode(state.agent.machine_id().as_bytes());
     let request_id = new_request_id();
@@ -83,7 +81,7 @@ pub(in crate::server) async fn gui_show(
     }
 
     let (agent_label, machine_label) = resolve_banner_labels(&state).await;
-    let banner = origin_banner(&agent_label, &machine_label, false);
+    let banner = origin_banner(&agent_label, &machine_label, rider);
     let agent_hex = hex::encode(agent_id.as_bytes());
 
     // Deliver on the tab's own queue. A broadcast would return before the
@@ -96,7 +94,7 @@ pub(in crate::server) async fn gui_show(
         banner: banner.clone(),
         agent_id: agent_hex.clone(),
         machine_id: machine_id.clone(),
-        rider: false,
+        rider,
         request_id: request_id.clone(),
     };
     let decided_at = Instant::now();
@@ -127,7 +125,7 @@ pub(in crate::server) async fn gui_show(
         banner,
         agent_id: agent_hex,
         machine_id: machine_id.clone(),
-        rider: false,
+        rider,
         request_id: request_id.clone(),
         session_token: session.clone(),
         created_at: Instant::now(),
@@ -313,7 +311,8 @@ mod tests {
     }
 
     /// David approved 22 Oct 2026 13:30 BST (#1392). A GUI session bearer
-    /// and a rider token are refused. The durable owner token is accepted.
+    /// is refused with the durable-token 403. A scopeless rider is
+    /// `missing_scope`. The durable owner token is accepted.
     #[tokio::test]
     async fn gui_show_refuses_session_and_rider_accepts_durable_owner() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
@@ -353,6 +352,7 @@ mod tests {
                     None,
                     None,
                     crate::server::rider_auth::unix_now_secs(),
+                    Vec::new(),
                 )
                 .await?;
             token
@@ -361,18 +361,18 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "rider token must be refused: {body}"
+            "scopeless rider token must be refused: {body}"
         );
+        assert_eq!(body["reason"], "missing_scope", "{body}");
         assert!(
             body["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("denied"),
-            "rider 403 must be the route denial: {body}"
+                .contains("gui:show"),
+            "scopeless rider 403 must name gui:show: {body}"
         );
 
-        // The handler refuses a non-durable actor even when middleware is
-        // absent. This fails if the handler check is removed.
+        // The handler repeats the same check when middleware is absent.
         for actor in [
             ActorContext::Owner { durable: false },
             ActorContext::Rider {
@@ -380,25 +380,27 @@ mod tests {
                 token_id: 1,
                 token_hash: "hash".to_string(),
                 groups: Vec::new(),
+                scopes: Vec::new(),
             },
         ] {
+            let session_bearer = matches!(actor, ActorContext::Owner { .. });
             let bare = axum::Router::new()
                 .route("/gui/show", post(gui_show))
                 .layer(Extension(actor))
                 .with_state(Arc::clone(&state));
             let (status, body) = post_show_as(&bare, "not-a-token").await?;
-            assert_eq!(
-                status,
-                StatusCode::FORBIDDEN,
-                "handler must refuse a non-durable actor: {body}"
-            );
-            assert!(
-                body["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("durable API token"),
-                "handler 403 must name the durable requirement: {body}"
-            );
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            if session_bearer {
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("durable API token"),
+                    "handler 403 must name the durable requirement: {body}"
+                );
+            } else {
+                assert_eq!(body["reason"], "missing_scope", "{body}");
+            }
         }
 
         assert!(
@@ -417,6 +419,65 @@ mod tests {
             outcome == "opened" || outcome == "navigated",
             "durable owner token must reach the handler: {body}"
         );
+        Ok(())
+    }
+
+    /// A rider whose token carries `gui:show` gets a token-free show response.
+    #[tokio::test]
+    async fn gui_show_scope_rider_response_has_no_token_or_url() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let tab = state.sessions.issue(Instant::now());
+        let probe = {
+            let mut sessions = state.ws_sessions.write().await;
+            crate::server::ws::insert_visible_gui_with_queue(&mut sessions, "rider-tab", 4, 0, &tab)
+        };
+        let app = axum::Router::new()
+            .route("/gui/show", post(gui_show))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let rider = {
+            let mut store = state.rider_tokens.lock().await;
+            let (token, _) = store
+                .issue(
+                    "aa".repeat(32),
+                    Vec::new(),
+                    None,
+                    60,
+                    String::new(),
+                    None,
+                    None,
+                    crate::server::rider_auth::unix_now_secs(),
+                    vec!["gui:show".to_string()],
+                )
+                .await?;
+            token
+        };
+        let (status, body) = post_show_as(&app, &rider).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "navigated", "{body}");
+        let keys = body.as_object().expect("object");
+        assert_eq!(keys.len(), 3, "{body}");
+        assert!(keys.contains_key("outcome") && keys.contains_key("machine_id"));
+        assert!(
+            keys.contains_key("request_id"),
+            "show response must not carry a token or url: {body}"
+        );
+        let raw = body.to_string();
+        assert!(!raw.contains(&rider), "{raw}");
+        assert!(
+            !raw.contains("session_token") && !raw.contains("http"),
+            "{raw}"
+        );
+        let shows = probe.gui_shows();
+        assert!(
+            shows.len() == 1 && shows[0].1.contains("(rider)"),
+            "origin banner must name the rider: {shows:?}"
+        );
+        assert!(cap.urls.lock().expect("opener lock").is_empty());
         Ok(())
     }
 

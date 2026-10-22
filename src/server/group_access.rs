@@ -2310,6 +2310,7 @@ mod tests {
             token_id: 1,
             token_hash: "bb".repeat(32),
             groups: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 
@@ -3025,6 +3026,7 @@ mod tests {
             token_id: 1,
             token_hash: "hash".to_string(),
             groups: vec!["stable".to_string()],
+            scopes: Vec::new(),
         };
         assert_eq!(
             admit_group_store_route(&granted, "stable").unwrap(),
@@ -3044,6 +3046,7 @@ mod tests {
             token_id: 2,
             token_hash: "hash".to_string(),
             groups: vec!["stab".to_string()],
+            scopes: Vec::new(),
         };
         assert_refusal(
             admit_group_store_route(&near_miss, "stable"),
@@ -3081,6 +3084,7 @@ mod tests {
             token_id: 3,
             token_hash: "hash".to_string(),
             groups: vec!["stable".to_string()],
+            scopes: Vec::new(),
         };
         // The grant cannot lift the owner-class requirement.
         assert_refusal(
