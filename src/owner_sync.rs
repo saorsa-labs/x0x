@@ -901,6 +901,10 @@ pub struct OwnerSyncStore {
     /// Test injection: fail every synced journal append.
     #[cfg(test)]
     fail_journal_append: std::sync::atomic::AtomicBool,
+    /// Test injection: fail the write of the next discharge of pending
+    /// applies.
+    #[cfg(test)]
+    fail_next_discharge: std::sync::atomic::AtomicBool,
     /// Test injection: stop the next journal-applying commit after the
     /// first of its two writes (register and journal file), as a crash
     /// between them would.
@@ -1038,6 +1042,8 @@ impl OwnerSyncStore {
             journal_read_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_journal_append: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_discharge: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             stop_between_journal_writes: std::sync::atomic::AtomicBool::new(false),
             device_change_notify: std::sync::Mutex::new(None),
@@ -1349,6 +1355,20 @@ impl OwnerSyncStore {
     pub(crate) fn set_fail_journal_append(&self, fail: bool) {
         self.fail_journal_append
             .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test injection: fail the write of the next discharge of pending
+    /// applies.
+    #[cfg(test)]
+    pub(crate) fn fail_next_discharge(&self) {
+        self.fail_next_discharge
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The file of the pending applies.
+    #[cfg(test)]
+    pub(crate) fn pending_applies_path(&self) -> PathBuf {
+        self.dir.join(APPLY_PENDING_FILE)
     }
 
     fn fail_after_rename_for_testing(&self) -> bool {
@@ -1905,6 +1925,13 @@ impl OwnerSyncStore {
         }
         if next.len() == pending.len() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_discharge
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(SyncError::Io("injected discharge failure".into()));
         }
         self.persist_pending_applies(&next).await?;
         *pending = next;

@@ -1040,6 +1040,121 @@ mod tests {
         );
     }
 
+    /// A daemon with the saved profile `Old` and an owed, committed
+    /// profile `Alice` that no pass applied yet.
+    async fn state_owing_alice(dir: &std::path::Path, seed: [u8; 32]) -> Arc<AppState> {
+        let owner = crate::identity::UserKeypair::from_seed(&seed).expect("owner key");
+        let state = owned_state(dir, seed).await.expect("state");
+        {
+            let mut profile = state.profile.write().await;
+            profile.human_name = Some("Old".into());
+            profile
+                .save_to(&state.profile_path)
+                .await
+                .expect("save the old profile");
+        }
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        DaemonView::attach(service, &state);
+        service.sync_all().await;
+        let batch = remote_alice_batch(dir, &owner).await;
+        service
+            .store()
+            .commit_batch(batch, &owner.user_id())
+            .await
+            .expect("commit");
+        state
+    }
+
+    /// `PUT /profile` with the human name `Bob`.
+    async fn put_bob(state: &Arc<AppState>) -> StatusCode {
+        let (status, _) = super::super::profile::update_profile(
+            State(Arc::clone(state)),
+            Json(super::super::profile::UpdateProfileRequest {
+                human_name: Some("Bob".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        status
+    }
+
+    /// The daemon shows and publishes the profile `Bob`.
+    async fn assert_keeps_bob(state: &AppState, why: &str) {
+        use crate::owner_sync::SyncKind;
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        assert_eq!(
+            state.profile.read().await.human_name.as_deref(),
+            Some("Bob"),
+            "{why}: the daemon must keep the local edit"
+        );
+        assert_eq!(
+            service
+                .store()
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(SyncValue::OwnerProfile {
+                human_name: Some("Bob".into())
+            }),
+            "{why}: the reconcile must publish the local edit"
+        );
+    }
+
+    /// Codex review of #1545 (f16c484), P2: `PUT /profile` folds the owed
+    /// `Alice` in, saves `Bob` and clears the obligation. The host then
+    /// crashes. The clear must be durable, or the restart applies `Alice`
+    /// again over the durable `Bob`.
+    #[tokio::test]
+    async fn a_crash_after_a_local_edit_keeps_the_edit() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x8A; 32];
+        let (pending_path, profile_path) = {
+            let state = state_owing_alice(dir.path(), seed).await;
+            assert_eq!(put_bob(&state).await, StatusCode::OK);
+            let service = state.owner_sync.as_ref().expect("owned state wires sync");
+            (
+                service.store().pending_applies_path(),
+                state.profile_path.clone(),
+            )
+        };
+        // The host crashes before any pass: every write that was not
+        // made durable is lost.
+        crate::profile::crash_sim::crash(&[&pending_path, &profile_path]);
+
+        let state = owned_state(dir.path(), seed)
+            .await
+            .expect("restarted state");
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        DaemonView::attach(service, &state);
+        service.sync_all().await;
+        assert_keeps_bob(&state, "after the crash").await;
+    }
+
+    /// Codex review of #1545 (f16c484), P2: `PUT /profile` folds the owed
+    /// `Alice` in and saves `Bob`, and then the clear of the obligation
+    /// fails. The edit is saved, so the PUT succeeds. The next pass, and a
+    /// restart, must keep `Bob` and not apply `Alice` again.
+    #[tokio::test]
+    async fn a_failed_discharge_after_a_local_edit_keeps_the_edit() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x8B; 32];
+        {
+            let state = state_owing_alice(dir.path(), seed).await;
+            let service = state.owner_sync.as_ref().expect("owned state wires sync");
+            service.store().fail_next_discharge();
+            assert_eq!(put_bob(&state).await, StatusCode::OK);
+            service.sync_all().await;
+            assert_keeps_bob(&state, "after the failed discharge").await;
+        }
+
+        let state = owned_state(dir.path(), seed)
+            .await
+            .expect("restarted state");
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        DaemonView::attach(service, &state);
+        service.sync_all().await;
+        assert_keeps_bob(&state, "after a restart").await;
+    }
+
     /// WHY: the profile mirror must never regress to defaults while the
     /// AppState lock is contended — a default read would mint a record
     /// that fights the remote winner (LWW flip-back).
