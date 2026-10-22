@@ -1209,6 +1209,12 @@ fn spawn_send(
             Ok(Err(x0x::dm::DmError::RecipientUpgradeRequired { .. })) => {
                 RecipientDelivery::Lacking
             }
+            // The in-process stand-in reports an admitted exchange with its
+            // marker error (test builds only), as for the class-K shares.
+            #[cfg(test)]
+            Ok(Err(error)) if error.to_string().contains(x0x::dm::PINNED_STANDIN_ADMITTED) => {
+                RecipientDelivery::Sent
+            }
             Ok(Err(error)) => {
                 // An admission refusal is a withhold: the next round
                 // re-evaluates the recipient from the current state.
@@ -3010,6 +3016,154 @@ mod daemon_tests {
         assert_eq!(
             inner.store.get(&key).map(|row| row.phase),
             Some(Phase::Complete)
+        );
+        Ok(())
+    }
+
+    /// The delivery status of `recipient` in the live delivery of `key`.
+    async fn delivery_status(
+        state: &AppState,
+        key: &EvictionKey,
+        recipient: &AgentId,
+    ) -> Option<RecipientDelivery> {
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .ce
+            .deliveries
+            .get(key)
+            .and_then(|delivery| delivery.recipients.get(recipient.as_bytes()).copied())
+    }
+
+    /// Run one real delivery round and wait until no send of it runs.
+    async fn delivery_round(state: &Arc<AppState>, key: &EvictionKey, recipient: &AgentId) {
+        drive_deliveries(state).await;
+        for _ in 0..200 {
+            if !matches!(
+                delivery_status(state, key, recipient).await,
+                Some(RecipientDelivery::InFlight(_))
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #1508 r7 F5 (Codex P1), ADR 0110 §3: "survivor convergence, not a
+    /// transport ACK, proves delivery". The frame write to a survivor
+    /// succeeds, and the survivor stops before it installs the frame (a
+    /// crash). The delivery stays tracked and is sent again on the resend
+    /// interval, and the row stays `committed_delivery_pending`. Only the
+    /// survivor's own head report at the exclusion's result (the call of
+    /// the catch-up response handler, [`super::super::note_catchup_head`])
+    /// ends its delivery; then the row completes.
+    #[tokio::test]
+    async fn a_written_frame_without_survivor_convergence_keeps_the_delivery() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the GSS crypto-only exclusion committed");
+        let result_head = ce::decode_frame(&frame)
+            .expect("frame")
+            .body
+            .commit
+            .state_hash;
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        advertise_crypto_exclusion(&fx.state, survivor);
+        let phase = |state: Arc<AppState>| {
+            let key = key.clone();
+            async move {
+                let inner = state.revocation_evictions.inner.lock().await;
+                inner.store.get(&key).map(|row| row.phase)
+            }
+        };
+
+        // The first round writes the frame; the carrier takes it.
+        delivery_round(&fx.state, &key, &survivor).await;
+        assert_eq!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Sent),
+            "the frame write to the survivor succeeded"
+        );
+        // The survivor stopped before it installed the frame. The next
+        // rounds, after the resend interval, must keep the delivery.
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        assert!(
+            fx.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .delivering()
+                .contains(&key),
+            "a transport success without convergence keeps the delivery"
+        );
+        assert_eq!(
+            phase(Arc::clone(&fx.state)).await,
+            Some(Phase::CommittedDeliveryPending),
+            "the obligation does not complete on a transport success"
+        );
+
+        // The survivor restarts, installs the frame and reports its head.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        let survivor_head = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(survivor_head.as_deref(), Some(result_head.as_str()));
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            survivor_head.as_deref(),
+        )
+        .await;
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        assert!(
+            !fx.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .delivering()
+                .contains(&key),
+            "the survivor's convergence ends the delivery"
+        );
+        assert_eq!(
+            phase(Arc::clone(&fx.state)).await,
+            Some(Phase::Complete),
+            "the obligation completes once every survivor converged"
         );
         Ok(())
     }
