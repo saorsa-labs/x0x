@@ -405,6 +405,43 @@ fn gss_epoch_of(binding: Option<&str>) -> Option<u64> {
     binding?.strip_prefix("gss:epoch=")?.parse().ok()
 }
 
+/// The membership incarnation of `target_hex` in `info` (ADR 0110 §1: "an
+/// old exclusion never certifies a new leaf"). S4 binds each obligation
+/// row to it, so the departure of a later seat reopens completed work and
+/// a replay of the old departure does not (#1508 review, Codex P1).
+///
+/// It is the admitted TreeKEM KeyPackage hash when the roster holds one.
+/// A GSS or legacy seat has no leaf, so it is the state hash of the
+/// commit that opened the target's newest seat: the oldest retained
+/// commit of the newest run of retained commits that seat it (Active or
+/// Pending). A rejoin opens a new run, so it is a new incarnation. `None`
+/// when no retained commit seats the target.
+#[must_use]
+pub fn seat_incarnation(info: &GroupInfo, target_hex: &str) -> Option<String> {
+    if let Some(hash) = info
+        .members_v2
+        .get(target_hex)
+        .and_then(|member| member.treekem_key_package_hash.clone())
+    {
+        return Some(hash);
+    }
+    let seated = |retained: &&crate::groups::state_commit::RetainedCommit| {
+        retained.roster.get(target_hex).is_some_and(|seat| {
+            matches!(
+                seat.state,
+                GroupMemberState::Active | GroupMemberState::Pending
+            )
+        })
+    };
+    info.commit_log
+        .iter()
+        .rev()
+        .skip_while(|retained| !seated(retained))
+        .take_while(seated)
+        .last()
+        .map(|opened| format!("seat:{}", opened.commit.state_hash))
+}
+
 /// Whether `info` is a GSS `MlsEncrypted` group: the plane of the GSS
 /// form of this exclusion.
 #[must_use]

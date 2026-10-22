@@ -607,10 +607,14 @@ impl ObligationStore {
     /// §1 intake. Duplicates and extra hashes for the same excluded leaf do
     /// not create another worker, extend a window or undo a completion.
     ///
-    /// `incarnation` is the target's current seat/leaf identity (its
-    /// KeyPackage hash when known). A completed row reopens only when a
-    /// still-applicable Agent revocation names a different incarnation, or
-    /// when a revocation arrives after a renewal terminated expiry work.
+    /// `incarnation` is the target's current seat/leaf identity
+    /// ([`crate::groups::crypto_exclusion::seat_incarnation`]). A completed
+    /// row reopens when any trigger (revocation, self-leave or certificate
+    /// expiry) names a different known incarnation: a rejoin followed by a
+    /// later departure is new work. A trigger of the row's own incarnation,
+    /// such as a replay of the old departure, never reopens it (#1508
+    /// review, Codex P1). A terminated row reopens only when a revocation
+    /// arrives after a renewal terminated expiry work.
     pub fn intake(
         &mut self,
         key: &EvictionKey,
@@ -620,6 +624,7 @@ impl ObligationStore {
         boot_id: [u8; 16],
     ) -> IntakeOutcome {
         let is_revocation = matches!(trigger, EvictionTrigger::AgentRevocation { .. });
+        let is_self_leave = matches!(trigger, EvictionTrigger::SelfLeave { .. });
         let Some(row) = self.rows.get_mut(key) else {
             let mut row = ObligationRow::new(key, now_unix_ms, boot_id);
             row.incarnation = incarnation.map(str::to_string);
@@ -633,7 +638,12 @@ impl ObligationStore {
                     (Some(old), Some(new)) => old != new,
                     _ => false,
                 };
-                if is_revocation && new_incarnation {
+                if new_incarnation {
+                    // One leave proof per incarnation: the new departure
+                    // replaces the old seat's proof.
+                    if is_self_leave {
+                        row.self_leave_commits.clear();
+                    }
                     row.absorb(trigger);
                     row.incarnation = incarnation.map(str::to_string);
                     row.reopen(now_unix_ms, boot_id);

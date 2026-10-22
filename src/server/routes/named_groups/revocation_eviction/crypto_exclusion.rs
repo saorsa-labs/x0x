@@ -752,7 +752,8 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
         outgoing_event: bytes.clone(),
         result_head: Some(commit.state_hash.clone()),
     };
-    if !super::prepare_crypto_exclusion(state, key, &journal, None).await {
+    let incarnation = ce::seat_incarnation(&info, &target_hex);
+    if !super::prepare_crypto_exclusion(state, key, &journal, incarnation).await {
         return;
     }
     // The rotated group record. A rename without the directory fsync has
