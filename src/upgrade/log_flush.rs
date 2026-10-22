@@ -2,7 +2,9 @@
 //! The transaction checks its suspend-inclusive deadline around this local wait.
 #![allow(dead_code)] // Shared privately by the daemon binary and the library.
 
+use std::any::TypeId;
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::{self, Write};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -12,6 +14,10 @@ pub(crate) const ACK_LIMIT: Duration = Duration::from_secs(30);
 const MAX_MESSAGES: usize = 1024;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+// Standard-library types preserve TypeId across the private binary/lib copies.
+pub(crate) type FlushCallback =
+    Arc<dyn Fn(Instant) -> Vec<mpsc::Receiver<io::Result<()>>> + Send + Sync>;
 
 enum Message {
     Write(Vec<u8>),
@@ -338,6 +344,100 @@ fn unavailable() -> io::Error {
 }
 fn poisoned() -> io::Error {
     io::Error::other("logging state is poisoned")
+}
+
+struct FileSink {
+    file: File,
+    parent: File,
+}
+
+// Setup must separately make newly created ancestor directories durable.
+pub(crate) fn acknowledged_file(file: File, parent: File) -> io::Result<(LogWriter, LogGuard)> {
+    if !file.metadata()?.is_file() || !parent.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid log barrier handles",
+        ));
+    }
+    start(
+        FileSink { file, parent },
+        |sink| {
+            sink.file.flush()?;
+            sink.file.sync_all()?;
+            sink.parent.sync_all()
+        },
+        MAX_MESSAGES,
+    )
+}
+impl Write for FileSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+pub(crate) fn capture(dispatch: &tracing::Dispatch) -> io::Result<FlushCallback> {
+    dispatch
+        .downcast_ref::<FlushCallback>()
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "daemon logger has no acknowledged flush bridge",
+            )
+        })
+}
+
+pub(crate) struct FlushLayer {
+    callback: FlushCallback,
+}
+impl FlushLayer {
+    pub(crate) fn new(writers: Vec<LogWriter>) -> io::Result<Self> {
+        if writers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "flush bridge has no log sinks",
+            ));
+        }
+        Ok(Self {
+            callback: Arc::new(move |deadline| {
+                let deadline = deadline.min(next_deadline());
+                writers
+                    .iter()
+                    .map(|writer| writer.request(deadline, true))
+                    .collect()
+            }),
+        })
+    }
+}
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FlushLayer {
+    unsafe fn downcast_raw(&self, id: TypeId) -> Option<*const ()> {
+        // SAFETY: each live field pointer is returned only for its exact TypeId.
+        if id == TypeId::of::<Self>() {
+            Some(std::ptr::from_ref(self).cast())
+        } else if id == TypeId::of::<FlushCallback>() {
+            Some(std::ptr::from_ref(&self.callback).cast())
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) fn flush_captured(callback: &FlushCallback, deadline: Instant) -> io::Result<()> {
+    let deadline = deadline.min(next_deadline());
+    let receivers = callback(deadline);
+    if receivers.is_empty() {
+        return Err(unavailable());
+    }
+    let mut failure = None;
+    for receiver in receivers {
+        if let Err(error) = wait_ack(&receiver, deadline) {
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

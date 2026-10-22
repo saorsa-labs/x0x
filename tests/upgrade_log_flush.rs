@@ -140,6 +140,20 @@ macro_rules! log_flush_regression_tests {
                     io::ErrorKind::Other
                 );
             }
+
+            #[test]
+            fn shutdown_log_flush_uses_the_owning_dispatch_bridge() {
+                use tracing_subscriber::layer::SubscriberExt;
+                let mut fixture = Fixture::new(None, false, 8);
+                let dispatch = tracing::Dispatch::new(
+                    tracing_subscriber::registry()
+                        .with(FlushLayer::new(vec![fixture.writer.clone()]).unwrap()),
+                );
+                fixture.writer.write_all(b"captured sink").unwrap();
+                flush_captured(&capture(&dispatch).unwrap(), Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"captured sink");
+                assert!(capture(&tracing::Dispatch::new(tracing_subscriber::registry())).is_err());
+            }
         }
     };
 }
