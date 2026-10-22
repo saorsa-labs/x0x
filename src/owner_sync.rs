@@ -1821,8 +1821,10 @@ impl OwnerSyncStore {
     /// # Errors
     ///
     /// [`SyncError::Io`] or [`SyncError::Poisoned`] when the intent cannot
-    /// be read or decoded, or the recovery cannot be written. The intent
-    /// stays for the next attempt.
+    /// be read or decoded, or the recovery cannot be written; the error of
+    /// the commit when the intent's records do not verify or do not fit.
+    /// The intent stays for the next attempt. Only an intent whose records
+    /// verify under another owner is dropped.
     async fn recover_journal_commit(&self, owner: &UserId) -> Result<(), SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
@@ -1851,14 +1853,19 @@ impl OwnerSyncStore {
                     .extend(outcome.accepted);
                 Ok(())
             }
-            Err(e @ (SyncError::Io(_) | SyncError::Poisoned(_))) => Err(e),
-            Err(e) => {
-                // The records no longer verify (for example, after an owner
-                // rotation): no session would deliver them either.
-                tracing::warn!(target: "x0x::owner_sync", error = %e, "dropped an unusable journal intent");
+            Err(SyncError::OwnerMismatch) => {
+                // The records verify, but under another owner (after an
+                // owner rotation): no session would deliver them either.
+                // `verify_owner` checks the signature first, so a changed
+                // record cannot get here.
+                tracing::warn!(target: "x0x::owner_sync", "dropped a journal intent of a previous owner");
                 self.remove_journal_intent().await;
                 Ok(())
             }
+            // Any other failure (a bad signature, a kind mismatch, a full
+            // store, I/O) fails closed and keeps the intent, as for an
+            // undecodable intent.
+            Err(e) => Err(e),
         }
     }
 
@@ -7060,6 +7067,65 @@ mod issuance_journal_sync_tests {
             std::fs::read(&intent).expect("the intent is kept"),
             b"{\"records\": [",
             "the recovery must keep the undecodable intent"
+        );
+    }
+
+    /// Codex review of #1545 (162b724), P2: as in
+    /// `an_undecodable_journal_intent_fails_closed`, but the intent stays
+    /// valid JSON and one signed byte changes, so its record does not
+    /// verify. The recovery must keep the intent and fail closed here too:
+    /// only a record that verifies under another owner can be dropped.
+    #[tokio::test]
+    async fn a_journal_intent_with_a_bad_signature_fails_closed() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let d0 = journal_value("d0", 50, 1_000);
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r0 = remote_record(&remote, &owner, &d0).await;
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r0).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r1], &owner.user_id()).await;
+        drop(local);
+        let intent = local_dir.join(SYNC_DIR).join(JOURNAL_INTENT_FILE);
+        let mut persisted: PersistedRecords =
+            serde_json::from_slice(&std::fs::read(&intent).expect("the intent")).expect("decode");
+        persisted.records[0].signature[0] ^= 0x01;
+        let corrupted = serde_json::to_vec(&persisted).expect("encode");
+        std::fs::write(&intent, &corrupted).expect("corrupt the intent");
+
+        // The restart; `d2` arrives before the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        let delivered = local.commit_batch(vec![r2], &owner.user_id()).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d0),
+            "no journal commit or mint may change the register: {lines:?}"
+        );
+        assert!(
+            delivered.is_err(),
+            "a journal commit must fail while the intent does not verify"
+        );
+        assert_eq!(
+            std::fs::read(&intent).expect("the intent is kept"),
+            corrupted,
+            "the recovery must keep the intent that does not verify"
         );
     }
 
