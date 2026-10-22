@@ -124,6 +124,62 @@ pub(in crate::server) async fn run_direct_metadata_listener(
             msg = rx.recv() => msg,
         };
         let Some(msg) = msg else { break };
+        // ADR 0110 §4: an `EvictionHandoffV1` rides the same direct
+        // carrier; its receipt is verified off this loop.
+        if msg
+            .payload
+            .starts_with(x0x::groups::eviction::EVICTION_HANDOFF_PREFIX)
+        {
+            super::revocation_eviction::spawn_handoff_receipt(
+                &state,
+                msg.sender,
+                msg.verified,
+                msg.payload,
+            );
+            continue;
+        }
+        // ADR 0110 §4: a signed `CryptoExclusionV1` rides the same direct
+        // carrier, never the metadata topic; it is verified off this loop.
+        if msg
+            .payload
+            .starts_with(x0x::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX)
+        {
+            super::revocation_eviction::crypto_exclusion::spawn_receipt(
+                &state,
+                msg.sender,
+                msg.verified,
+                msg.payload,
+            );
+            continue;
+        }
+        // ADR 0110 §4a: a signed `CertificateRebindV1` rides the same
+        // direct carrier, never the metadata topic.
+        if msg
+            .payload
+            .starts_with(x0x::groups::cert_rebind::CERTIFICATE_REBIND_PREFIX)
+        {
+            super::revocation_eviction::rebind::spawn_receipt(
+                &state,
+                msg.sender,
+                msg.verified,
+                msg.payload,
+            );
+            continue;
+        }
+        // ADR 0110 §4b(1): owner-recovery mandates and commits ride the
+        // same direct carrier; they are verified off this loop.
+        if msg
+            .payload
+            .starts_with(x0x::groups::owner_recovery::OWNER_RECOVERY_PREFIX)
+        {
+            super::revocation_eviction::owner_recovery::spawn_receipt(
+                &state,
+                msg.sender,
+                msg.verified,
+                msg.payload,
+            );
+            continue;
+        }
         let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
             continue; // not a named-group metadata event
         };

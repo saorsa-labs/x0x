@@ -552,6 +552,9 @@ impl KvSecureContext for PublicGroupKvContext {
 pub struct GssKvSecureContext {
     state: Arc<std::sync::RwLock<GssState>>,
     changes: tokio::sync::watch::Sender<u64>,
+    /// The daemon's group ciphertext hold (ADR 0110 §4). While set, every
+    /// seal fails; opens are unchanged. Clones share it.
+    seal_withheld: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Synchronous authorization view attached to an encrypted store whose wire
@@ -658,7 +661,30 @@ impl GssKvSecureContext {
         Some(Self {
             state: Arc::new(std::sync::RwLock::new(state)),
             changes,
+            seal_withheld: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Set or clear the group ciphertext hold. The daemon's refresh hook
+    /// sets it from its async boundary check (ADR 0110 §4: no eligible
+    /// admin) before every seal, because the seal itself is synchronous.
+    /// Crate-internal: it adds no public API.
+    pub(crate) fn set_seal_withheld(&self, withheld: bool) {
+        self.seal_withheld
+            .store(withheld, std::sync::atomic::Ordering::Release);
+    }
+
+    fn check_seal_allowed(&self) -> Result<()> {
+        if self
+            .seal_withheld
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(KvError::SecureRecord(
+                "no_eligible_admin: verified revocations cover every admin seat; ciphertext is withheld"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Refresh the snapshot from the authoritative group state.
@@ -881,6 +907,7 @@ impl KvSecureContext for GssKvSecureContext {
     }
 
     fn seal(&self, store_id: &KvStoreId, plaintext: &[u8]) -> Result<(u64, [u8; 24], Vec<u8>)> {
+        self.check_seal_allowed()?;
         let state = self
             .state
             .read()
@@ -895,6 +922,7 @@ impl KvSecureContext for GssKvSecureContext {
         store_id: &KvStoreId,
         payload: &[u8],
     ) -> Result<EncryptedKvStoreRecordV1> {
+        self.check_seal_allowed()?;
         let state = self
             .state
             .read()
@@ -1496,5 +1524,32 @@ mod tests {
             super::SKEW_NOTICE_LIMIT,
             "a full notice cache refuses a new author and keeps the first live notice"
         );
+    }
+
+    /// The crate-internal ciphertext hold (ADR 0110 §4) blocks every GSS
+    /// seal and leaves opens alone; clearing it restores sealing.
+    #[test]
+    fn gss_seal_hold_blocks_seals_and_keeps_opens() {
+        let owner = crate::identity::AgentKeypair::generate().expect("keypair");
+        let info = group("held-g", owner.agent_id());
+        let ctx = GssKvSecureContext::from_group(&info).expect("ctx");
+        let signing = AuthorSigning::from_keypair(&owner).expect("signing");
+        let store_id = KvStoreId::new([3; 32]);
+        let (epoch, nonce, ciphertext) = ctx.seal(&store_id, b"before").expect("seal");
+
+        ctx.clone().set_seal_withheld(true);
+        assert!(ctx.seal(&store_id, b"held").is_err());
+        assert!(ctx
+            .seal_authorized(&signing, KvMutationKind::Delta, &store_id, b"held")
+            .is_err());
+        assert_eq!(
+            ctx.open(&store_id, epoch, &nonce, &ciphertext)
+                .expect("open"),
+            b"before"
+        );
+
+        ctx.set_seal_withheld(false);
+        ctx.seal_authorized(&signing, KvMutationKind::Delta, &store_id, b"after")
+            .expect("the hold clears");
     }
 }

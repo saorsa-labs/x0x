@@ -10,6 +10,8 @@ use crate::{
     identity::{AgentCertificate, AgentId, MachineId, UserId},
 };
 mod runtime;
+#[cfg(test)]
+pub(crate) use runtime::set_w3h_inline_lookups;
 pub use runtime::{EvidenceRuntime, RuntimePolicy};
 
 use bincode::Options;
