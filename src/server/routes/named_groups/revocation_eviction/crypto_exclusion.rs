@@ -3643,4 +3643,63 @@ mod sibling_tests {
         receiver.agent.shutdown().await;
         Ok(())
     }
+
+    /// Codex P1 B, for `CryptoExclusionV1` (ADR 0110 §2): the creator
+    /// commits its own branch; the other admin's valid sibling exclusion on
+    /// the same parent then arrives. The creator's record has no invite
+    /// lineage, and it is still contained, durably across a restart.
+    #[tokio::test]
+    async fn a_valid_exclusion_sibling_contains_the_creator() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let creator = offline_daemon(dir.path(), None).await?;
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let target = AgentKeypair::generate()?;
+        let survivor = AgentKeypair::generate()?;
+        let me = creator.agent.identity().agent_keypair();
+        let fx = race(&owner, me, &admin, &target, &[&survivor])?;
+        assert!(
+            fx.head.invite_lineage.is_none(),
+            "the creator has no lineage"
+        );
+        let stable = fx.head.stable_group_id().to_string();
+        hold_persisted(&creator, &fx.head).await?;
+
+        let now_ms = super::super::super::now_millis_u64();
+        let (sibling, valid) = exclusion(&fx.parent, &fx.target_hex, &admin, 1, now_ms)?;
+        let outcome = receive(&creator, admin.agent_id(), &valid).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::HeadMismatch)
+        );
+        let marker = quarantine_of(&creator, &stable)
+            .await
+            .context("the creator is contained")?;
+        assert_eq!(marker.state_hash, sibling.state_hash);
+        assert_eq!(marker.revision, fx.head.state_revision);
+        let head = creator
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .map(|info| info.state_hash.clone());
+        assert_eq!(
+            head,
+            Some(fx.head.state_hash.clone()),
+            "no node applies both"
+        );
+
+        creator.agent.shutdown().await;
+        drop(creator);
+        let restarted = offline_daemon(dir.path(), None).await?;
+        assert_eq!(
+            quarantine_of(&restarted, &stable)
+                .await
+                .map(|marker| marker.state_hash),
+            Some(sibling.state_hash),
+            "the containment survives a restart"
+        );
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
 }
