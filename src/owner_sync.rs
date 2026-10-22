@@ -1320,6 +1320,13 @@ impl OwnerSyncStore {
         let _ = self.journal_file.set(path);
     }
 
+    /// Test injection: fail (or stop failing) every synced journal append.
+    #[cfg(test)]
+    pub(crate) fn set_fail_journal_append(&self, fail: bool) {
+        self.fail_journal_append
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn fail_after_rename_for_testing(&self) -> bool {
         self.fail_after_rename
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -2637,6 +2644,17 @@ pub trait SyncDaemonView: Send + Sync + 'static {
         display_name: Option<String>,
         machine_name: Option<String>,
     );
+    /// Completes when every earlier [`Self::apply_names`] call shows in
+    /// [`Self::profile_names`].
+    ///
+    /// An implementation may finish `apply_names` in the background. The
+    /// reconcile pass awaits this before it reads the profile: a read of
+    /// the old live names would mint them over the applied winner at a
+    /// higher version (#1545 review). The default suits an implementation
+    /// whose `apply_names` is synchronous.
+    fn names_applied(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
     /// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
     ///
     /// Proof is local: the group is in our roster and carries the terminal
@@ -3327,6 +3345,9 @@ impl OwnerSyncService {
         // Kinds 1 + 2 + 3: profile names and the Home pointer, via the
         // daemon view when attached.
         if let Some(view) = self.view() {
+            // The recovery and any session may have applied names that the
+            // live profile does not show yet.
+            view.names_applied().await;
             let names = view.profile_names();
             self.mint_or_log(
                 SyncKind::OwnerProfile,

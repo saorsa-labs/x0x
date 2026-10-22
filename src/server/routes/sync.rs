@@ -26,7 +26,8 @@ use crate::server::state::AppState;
 /// `profile_names` keeps a last-seen mirror: `apply_names` writes it
 /// synchronously so the very next reconcile pass cannot re-mint a
 /// pre-merge value (LWW flip-back), while the live `AppState` profile and
-/// its persisted file catch up in a spawned task.
+/// its persisted file catch up in a spawned task. `names_applied` waits
+/// for those tasks, because `profile_names` reads the live profile first.
 ///
 /// WHY a `Weak<AppState>`: the view is installed on the sync service the
 /// `AppState` owns (`state.owner_sync`), so an `Arc` here is a cycle
@@ -40,6 +41,9 @@ use crate::server::state::AppState;
 pub(in crate::server) struct DaemonView {
     state: Weak<AppState>,
     names: std::sync::RwLock<SyncProfileNames>,
+    /// One receiver per catch-up task that may still run; each closes
+    /// when its task ends (or is refused at shutdown).
+    pending: std::sync::Mutex<Vec<tokio::sync::watch::Receiver<()>>>,
 }
 
 impl DaemonView {
@@ -55,6 +59,7 @@ impl DaemonView {
         Self {
             state: Arc::downgrade(&state),
             names: std::sync::RwLock::new(names),
+            pending: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -171,8 +176,20 @@ impl SyncDaemonView for DaemonView {
         // in progress instead of leaving it to outlive the daemon with this
         // AppState (and `history.db`) held, and refuses one that has not
         // started, as if the sync had arrived after the stop.
+        let (done, done_rx) = tokio::sync::watch::channel(());
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // `has_changed` is `Err` once a task has ended.
+            pending.retain(|task| task.has_changed().is_ok());
+            pending.push(done_rx);
+        }
         let task_state = Arc::clone(&state);
         state.spawn_shielded(async move {
+            // Dropped when the task ends, which completes `names_applied`.
+            let _done = done;
             let state = task_state;
             let mut profile = state.profile.write().await;
             let mut changed = false;
@@ -210,6 +227,21 @@ impl SyncDaemonView for DaemonView {
                 );
             }
         });
+    }
+
+    fn names_applied(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Box::pin(async move {
+            for mut task in pending {
+                // The task never sends: `changed` returns when it drops
+                // its sender, at its end.
+                while task.changed().await.is_ok() {}
+            }
+        })
     }
 }
 
@@ -707,6 +739,85 @@ mod tests {
         assert!(
             futures_util::poll!(waiting.as_mut()).is_ready(),
             "successful pointer publication releases the rank-0 Home wait"
+        );
+    }
+
+    /// Codex review of #1545 (6bec48c), P2: `DaemonView::apply_names`
+    /// updates the live profile in a spawned task. A reconcile pass that
+    /// recovers the profile `Alice` must wait for that task, or its
+    /// `profile_names` reads the old live name and mints `Old` over
+    /// `Alice` at a higher version. The single-thread runtime does not
+    /// run the spawned task before the pass reads, unless the pass waits.
+    #[tokio::test]
+    async fn a_recovered_profile_is_not_republished_as_the_old_live_name() {
+        use crate::owner_sync::{OwnerSyncStore, SyncKind};
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state = owned_state(dir.path(), [0x87; 32]).await.expect("state");
+        state.profile.write().await.human_name = Some("Old".into());
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        service.attach_view(Arc::new(DaemonView::new(Arc::clone(&state))));
+        service.sync_all().await;
+        let owner = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+
+        // A remote device's journal renewal and profile `Alice` (version 2),
+        // committed as one batch whose journal append fails after the
+        // journal intent is durable.
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let remote_machine = crate::identity::MachineId([2; 32]);
+        remote
+            .mint(
+                SyncKind::IssuanceJournal,
+                "bb",
+                &SyncValue::IssuanceJournal {
+                    agent_id: "bb".to_string(),
+                    cert_digest: "d2".to_string(),
+                    issued_at: 100,
+                    not_after: Some(9_000),
+                },
+                owner,
+                remote_machine,
+            )
+            .await
+            .expect("remote journal mint");
+        for name in ["first", "Alice"] {
+            remote
+                .mint(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    &SyncValue::OwnerProfile {
+                        human_name: Some(name.into()),
+                    },
+                    owner,
+                    remote_machine,
+                )
+                .await
+                .expect("remote profile mint");
+        }
+        let batch = remote.records_snapshot().await;
+        let store = service.store();
+        store.set_fail_journal_append(true);
+        let failed = store.commit_batch(batch, &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
+        store.set_fail_journal_append(false);
+
+        service.sync_all().await;
+        assert_eq!(
+            store.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(SyncValue::OwnerProfile {
+                human_name: Some("Alice".into())
+            }),
+            "the reconcile must not publish the old live name"
+        );
+        assert_eq!(
+            state.profile.read().await.human_name.as_deref(),
+            Some("Alice"),
+            "the daemon must show the recovered profile"
         );
     }
 
