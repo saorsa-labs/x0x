@@ -2648,6 +2648,32 @@ mod tests {
             assert_withheld(seal_once(&state, &topic).await);
         }
 
+        /// Codex P2 (#1508 r6), ADR 0110 §4b(3): a `SignedPublic` group's
+        /// task delta is a member send too. It is refused while verified
+        /// revocations cover every admin seat, like the encrypted planes.
+        /// Before the fix the public plane returned `Ok(None)` (publish
+        /// plaintext) with no check.
+        #[tokio::test]
+        async fn public_task_write_is_refused_while_every_admin_seat_is_revoked() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b3".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+
+            // No false refusal while the admin seat is unrevoked.
+            assert!(matches!(seal_once(&state, &topic).await, Ok(None)));
+            revoke_agent(&state, &admin).await;
+            assert_withheld(seal_once(&state, &topic).await);
+        }
+
         #[tokio::test]
         async fn treekem_task_seal_is_withheld_while_every_admin_seat_is_revoked() {
             let (state, _dir) = test_state().await;
