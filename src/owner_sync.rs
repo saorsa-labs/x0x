@@ -6567,4 +6567,229 @@ mod issuance_journal_sync_tests {
             "the journal must end on the renewal: {lines:?}"
         );
     }
+
+    /// The local issuance journal line for `value`.
+    fn local_line(owner_hex: &str, value: &SyncValue) -> crate::profile::IssuedCertRecord {
+        let (agent_id, cert_digest, issued_at, not_after) = fields(value);
+        crate::profile::IssuedCertRecord {
+            user_id: owner_hex.to_string(),
+            agent_id,
+            cert_digest,
+            issued_at,
+            not_after,
+            mode: crate::profile::CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        }
+    }
+
+    /// The host crash of the #1545 durability tests: lose every journal and
+    /// register write in `local_dir` that was not made durable.
+    fn crash_device(local_dir: &Path) {
+        crate::profile::crash_sim::crash(&[
+            &local_dir.join(crate::profile::CERT_JOURNAL_FILE),
+            &local_dir.join(SYNC_DIR).join(RECORDS_FILE),
+        ]);
+    }
+
+    /// Restart the device in `local_dir` and run its first reconcile pass.
+    /// The pass must keep the register it published before the restart,
+    /// and the journal must end on that value.
+    async fn assert_restart_keeps_the_register(local_dir: &Path, owner: &UserKeypair) {
+        let (local, journal) = journal_device(local_dir).await;
+        let published = local.stored_value(SyncKind::IssuanceJournal, "bb").await;
+        mint_journal_lines(&local, &journal, owner, super::tests::machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            published,
+            "the reconcile must not roll back the published register: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &hex::encode(owner.user_id().0)).get("bb"),
+            published.as_ref(),
+            "the journal must end on the published register: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (72e8b9f), P1: a local renewal `d2` is between
+    /// its journal rename and its directory fsync, so the line is visible
+    /// but not durable. A reconcile that runs then must not publish `d2`:
+    /// if the host crashes, the register keeps `d2`, the journal comes
+    /// back as `d1`, and the next reconcile mints `d1` over the renewal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_does_not_publish_a_journal_line_before_it_is_durable() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 200, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        deliver(&local, &owner, r1).await;
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        crate::profile::journal_faults::pause_next(&journal, reached_tx, release_rx);
+        let issuance = {
+            let (journal, line) = (journal.clone(), local_line(&owner_hex, &d2));
+            tokio::spawn(
+                async move { crate::profile::IssuedCertRecord::append(&journal, &line).await },
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the issuance renames the journal")
+            .expect("rename signal");
+        let reconcile = {
+            let (local, journal, owner) = (Arc::clone(&local), journal.clone(), owner_kp(7));
+            tokio::spawn(async move {
+                mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+            })
+        };
+        // Let the reconcile run while the issuance is held (it may block).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The host crashes before the issuance's directory fsync.
+        reconcile.abort();
+        issuance.abort();
+        let _ = reconcile.await;
+        let _ = issuance.await;
+        drop((release_tx, local));
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (72e8b9f), P1: a local renewal's directory
+    /// fsync fails, so its journal line stays visible but is not durable.
+    /// The next reconcile may publish the line only after it is durable.
+    #[tokio::test]
+    async fn a_failed_journal_fsync_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 200, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        deliver(&local, &owner, r1).await;
+
+        crate::profile::journal_faults::fail_next(&journal);
+        let failed =
+            crate::profile::IssuedCertRecord::append(&journal, &local_line(&owner_hex, &d2)).await;
+        assert!(
+            failed.is_err(),
+            "the injected fsync failure fails the append"
+        );
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+
+        drop(local);
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (72e8b9f), P1: an inbound renewal's journal
+    /// append fails at the directory fsync, so the commit fails but the
+    /// line stays visible. A later session delivers the renewal again,
+    /// and the commit finds the line already there. It must make the line
+    /// durable before it writes the register.
+    #[tokio::test]
+    async fn a_commit_retry_after_a_failed_journal_fsync_does_not_roll_back_a_renewal() {
+        use super::tests::owner_kp;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+
+        crate::profile::journal_faults::fail_next(&journal);
+        let failed = local.commit_batch(vec![r2.clone()], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal fsync fails the commit");
+        // A later session delivers the renewal again.
+        deliver(&local, &owner, r2).await;
+
+        drop(local);
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (72e8b9f), P2: the register holds `d0@v1`. A
+    /// commit of the remote `d1@v2` appends its journal line, then the
+    /// daemon stops before the register write. After the restart, the
+    /// remote `d2@v3` (the same second as `d1`) arrives before any
+    /// reconcile. `d2` is ordered after `d1`, so the register and the
+    /// journal must end on `d2`. If the restart forgets that `d1` came
+    /// from the register, `d1` looks like an unpublished local issuance:
+    /// `d2`'s line is not appended, and the reconcile publishes `d1` at a
+    /// higher version over `d2`.
+    #[tokio::test]
+    async fn an_interrupted_commit_does_not_override_a_later_same_second_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let d0 = journal_value("d0", 50, 1_000);
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r0 = remote_record(&remote, &owner, &d0).await;
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r0).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r1], &owner.user_id()).await;
+        drop(local);
+
+        // The restart; `d2` arrives before the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        deliver(&local, &owner, r2).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the later renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the later renewal: {lines:?}"
+        );
+    }
 }

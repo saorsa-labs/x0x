@@ -396,6 +396,8 @@ impl IssuedCertRecord {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
+        #[cfg(test)]
+        journal_faults::after_rename(path).await?;
         // #1542: owner sync persists its register only after this append
         // returns, so the new line must survive a host crash. fsync the
         // parent directory to make the rename durable.
@@ -495,6 +497,54 @@ pub(crate) mod crash_sim {
                 }
             }
         }
+    }
+}
+
+/// Test faults for a journal write after its rename, before the directory
+/// fsync: a pause (the new line is visible but not yet durable) or a
+/// failed fsync (the new line stays visible but is not durable).
+#[cfg(test)]
+pub(crate) mod journal_faults {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    static PAUSES: Mutex<BTreeMap<PathBuf, Pause>> = Mutex::new(BTreeMap::new());
+    static FAILURES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+    /// Hold the next write of `path` after its rename: it signals
+    /// `reached` and then waits for `release`.
+    pub(crate) fn pause_next(
+        path: &Path,
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    ) {
+        PAUSES
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (reached, release));
+    }
+
+    /// Fail the directory fsync of the next write of `path`.
+    pub(crate) fn fail_next(path: &Path) {
+        FAILURES.lock().unwrap().insert(path.to_path_buf());
+    }
+
+    pub(super) async fn after_rename(path: &Path) -> std::io::Result<()> {
+        let pause = PAUSES.lock().unwrap().remove(path);
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+        if FAILURES.lock().unwrap().remove(path) {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        Ok(())
     }
 }
 
