@@ -4418,6 +4418,47 @@ async fn refuse_authorisation(state: &AppState, stable: &str, revision: u64, cau
     }
 }
 
+/// §3 subject checks anchored in this node's own verified record
+/// (#1533 review, Codex P1; Engineer ruling of 22 Oct). The invite's base
+/// roster is the signer's own claim, so it is never the authority by
+/// itself:
+/// - the signer is an Active admin (or higher) on this node's own head.
+///   Each role change in `members_v2` came through a signed commit that
+///   this node verified as it applied it, so a promotion it applied counts
+///   and a promotion it never saw does not. With no such seat the subject
+///   refuses `signer_not_admin_locally` (fail closed);
+/// - a `Removal` basis is not after the invite base it is paired with, and
+///   a commit this node holds at that revision and hash must be its own
+///   removal on its own chain ([`s3::removal_commit_on_chain`]); otherwise
+///   `basis_unknown`. A removal this node never saw (it is forked or
+///   removed) stays the signer's claim, under the signer's local authority.
+fn check_reseat_authority(
+    info: &GroupInfo,
+    authorisation: &ReseatAuthorisation,
+    local: &str,
+) -> Result<(), &'static str> {
+    let fields = &authorisation.fields;
+    if !s3::signer_is_active_admin(info, &fields.signer) {
+        return Err("signer_not_admin_locally");
+    }
+    if let ReseatBasis::Removal {
+        revision,
+        state_hash,
+    } = &fields.basis
+    {
+        if *revision > fields.invite_base_revision {
+            return Err("basis_unknown");
+        }
+        let held = info.commit_log.iter().any(|entry| {
+            entry.commit.revision == *revision && entry.commit.state_hash == *state_hash
+        });
+        if held && !s3::removal_commit_on_chain(info, local, *revision, state_hash) {
+            return Err("basis_unknown");
+        }
+    }
+    Ok(())
+}
+
 /// The subject's checks on an invite paired with an authorisation (§3).
 fn check_reseat_invite(
     invite: &x0x::groups::invite::SignedInvite,
@@ -4494,6 +4535,20 @@ async fn consume_reseat(
     }
     let refs = live_refs(state, &info).await;
     if let Err(cause) = authorisation.check_for_subject(&stable, &local, &refs, now_ms()) {
+        drop(membership_guard);
+        refuse_authorisation(state, &stable, info.state_revision, cause).await;
+        return;
+    }
+    let signer_revoked = match parse_raw(&authorisation.fields.signer) {
+        Some(raw) => agent_revoked(state, &AgentId(raw)).await,
+        None => true,
+    };
+    let anchored = if signer_revoked {
+        Err("signer_revoked")
+    } else {
+        check_reseat_authority(&info, &authorisation, &local)
+    };
+    if let Err(cause) = anchored {
         drop(membership_guard);
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
         return;
