@@ -1636,21 +1636,10 @@ pub(in crate::server) async fn receive(
     if let Err(refusal) = validated {
         drop(guard);
         if sibling {
-            // A valid competing child of a retained parent: let the shared
-            // apply hook record the fork evidence it records for any
-            // commit.
-            let _ = ng::apply_stateful_event_with_evidence(
-                state,
-                &group_key,
-                &info,
-                &commit,
-                None,
-                false,
-                None,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |_| {},
-            )
-            .await;
+            // #1508 r6 (Codex P1 B): a valid competing child of a retained
+            // parent contains the group on every record, the creator's
+            // too. Live delivery already stops on the marker.
+            super::rebind::install_sibling_evidence(state, &group_key, &info, &commit).await;
         }
         tracing::info!(
             group_id = %LogHexId::group(&group_key),

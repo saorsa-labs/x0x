@@ -1701,21 +1701,46 @@ pub(in crate::server) async fn receive(
 
 /// ADR 0110 §2 and §4a run (10) (#1508 Codex P1 B): a valid rebind on a
 /// sibling branch of this node's chain (for example, a delayed self-rebind
-/// on the parent of the seat's expiry removal) is fork evidence. Keep it
-/// with the existing fork-quarantine marker, as for any authenticated
-/// conflict, on every record: the shared fork hook skips an
-/// `OwnerCertified` record without invite lineage, such as the creator's,
-/// and it labels a self-rebind signer as unauthorized. The group is
-/// contained (no seal, delivery or key serving), no node applies both
-/// siblings, and ADR 0064's owner-anchored recovery resolves it. S4 adds
-/// no fork choice. The sibling frame is not kept for serving. The caller
-/// has checked the frame with [`cr::validate_sibling`].
+/// on the parent of the seat's expiry removal) is fork evidence. It is
+/// kept by [`install_sibling_evidence`]. The own branch's rebind
+/// deliveries and held self-rebinds for the group stop. The caller has
+/// checked the frame with [`cr::validate_sibling`].
 async fn contain_sibling(
     state: &Arc<AppState>,
     group_key: &str,
     info: &GroupInfo,
     commit: &x0x::groups::state_commit::GroupStateCommit,
 ) {
+    if install_sibling_evidence(state, group_key, info, commit).await {
+        let stable = info.stable_group_id();
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .rebind
+            .deliveries
+            .retain(|(group, _), _| group != stable);
+        inner
+            .rebind
+            .held
+            .retain(|key, _| key.stable_group_id != stable);
+    }
+}
+
+/// ADR 0110 §2 fork containment for a validated S4 sibling commit (a
+/// certificate rebind or a crypto-only exclusion, #1508 r6): keep it with
+/// the existing fork-quarantine marker, as for any authenticated
+/// conflict, on every record. The shared fork hook skips an
+/// `OwnerCertified` record without invite lineage, such as the creator's,
+/// and it labels a self-rebind signer as unauthorized. The group is
+/// contained (no seal, delivery or key serving), no node applies both
+/// siblings, and ADR 0064's owner-anchored recovery resolves it. S4 adds
+/// no fork choice. The sibling frame is not kept for serving. Returns
+/// whether the marker was installed durably.
+pub(super) async fn install_sibling_evidence(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> bool {
     use super::super as ng;
     let evidence = x0x::groups::ForkEvidence {
         revision: commit.revision,
@@ -1731,27 +1756,18 @@ async fn contain_sibling(
         commit,
         Some(ng::FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY),
     );
-    if ng::install_fork_evidence(state, group_key, evidence, quarantine, false, None).await {
-        // The own branch's rebind work for the group stops now.
-        let stable = info.stable_group_id();
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        inner
-            .rebind
-            .deliveries
-            .retain(|(group, _), _| group != stable);
-        inner
-            .rebind
-            .held
-            .retain(|key, _| key.stable_group_id != stable);
-        drop(inner);
+    let installed =
+        ng::install_fork_evidence(state, group_key, evidence, quarantine, false, None).await;
+    if installed {
         tracing::warn!(
             group_id = %LogHexId::group(group_key),
             revision = commit.revision,
             state_hash = %commit.state_hash,
             committed_by = %LogHexId::agent(&commit.committed_by),
-            "ADR 0110 S4: sibling certificate rebind kept as fork evidence; the group is contained"
+            "ADR 0110 S4: sibling commit kept as fork evidence; the group is contained"
         );
     }
+    installed
 }
 
 // ─── Status ────────────────────────────────────────────────────────────────
