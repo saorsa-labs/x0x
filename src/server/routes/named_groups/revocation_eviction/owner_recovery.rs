@@ -1777,6 +1777,11 @@ async fn receive_commit(
             reason = refusal.as_str(),
             "ADR 0110 S4: owner recovery commit refused"
         );
+        if refusal == orc::OwnerRecoveryRefusal::RecoveryHeadMismatch {
+            // The tree lock is not needed for the fork-evidence install.
+            drop(guard);
+            contain_sibling(state, &group_key, &info, &body).await;
+        }
         return if refusal == orc::OwnerRecoveryRefusal::RecoveryNotNeeded {
             // The named revocation records may still be on their way.
             ReceiveOutcome::Retained
@@ -1960,6 +1965,58 @@ async fn receive_commit(
     }
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
+}
+
+/// ADR 0110 §2 (#1508 r5): a valid recovery commit on a sibling branch of
+/// this node's chain (for example, a second owner mandate on the same
+/// parent, for another member) is fork evidence. Keep it with the
+/// existing fork-quarantine marker, as for any authenticated conflict:
+/// the group is contained (no seal, delivery or key serving), no node
+/// applies both siblings, and ADR 0064's owner-anchored recovery resolves
+/// it. S4 adds no fork choice. The sibling frame is not kept for serving.
+/// A commit that is no authenticated sibling records nothing.
+async fn contain_sibling(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &GroupInfo,
+    body: &orc::OwnerRecoveryBodyV1,
+) {
+    use super::super as ng;
+    if let Err(refusal) = orc::validate_sibling(body, info) {
+        tracing::debug!(
+            group_id = %ng::LogHexId::group(group_key),
+            reason = refusal.as_str(),
+            "ADR 0110 S4: a mismatched owner recovery is no authenticated sibling"
+        );
+        return;
+    }
+    let commit = body.commit.to_commit();
+    let evidence = x0x::groups::ForkEvidence {
+        revision: commit.revision,
+        state_hash: commit.state_hash.clone(),
+        committed_by: commit.committed_by.clone(),
+        observed_at_ms: ng::now_millis_u64(),
+    };
+    let quarantine = ng::fork_quarantine_for_evidence(
+        info,
+        &evidence,
+        &commit,
+        Some(ng::FORK_EVIDENCE_CLASSIFICATION_OWNER_ANCHORED),
+    );
+    if ng::install_fork_evidence(state, group_key, evidence, quarantine, false, None).await {
+        // The own branch's recovery work stops now, not at its next round.
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner.orc.deliveries.remove(&body.stable_group_id);
+        inner.orc.pending.remove(&body.stable_group_id);
+        drop(inner);
+        tracing::warn!(
+            group_id = %ng::LogHexId::group(group_key),
+            revision = commit.revision,
+            state_hash = %commit.state_hash,
+            committed_by = %ng::LogHexId::agent(&commit.committed_by),
+            "ADR 0110 S4: sibling owner recovery kept as fork evidence; the group is contained"
+        );
+    }
 }
 
 // ─── Status ────────────────────────────────────────────────────────────────
