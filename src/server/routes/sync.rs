@@ -2095,6 +2095,89 @@ mod tests {
         assert_keeps(&state, "Carol", "after a restart").await;
     }
 
+    /// Codex review of #1545 (3a28bef1): a mint of the register is held at
+    /// its rename, and shutdown aborts its caller. The shutdown drain must
+    /// wait for the write before the daemon gives up the data directory: a
+    /// daemon restarted on the same directory must not see the late rename
+    /// of the old write land over its own newer register.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_a_held_write_before_a_restart_can_write() {
+        use crate::identity::MachineId;
+        use crate::owner_sync::{SyncKind, SyncValue};
+        let seed = [0x8F; 32];
+        let owner = Arc::new(crate::identity::UserKeypair::from_seed(&seed).expect("owner key"));
+        let profile = |human: &str| SyncValue::OwnerProfile {
+            human_name: Some(human.into()),
+        };
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state = owned_state(dir.path(), seed).await.expect("state");
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::profile::journal_faults::pause_next_rename(
+            &dir.path().join("sync").join("records.json"),
+            reached_tx,
+            release_rx,
+        );
+        let old = {
+            let service = Arc::clone(state.owner_sync.as_ref().expect("owned state wires sync"));
+            let (owner, desired) = (Arc::clone(&owner), profile("Old"));
+            tokio::spawn(async move {
+                let _ = service
+                    .store()
+                    .mint(
+                        SyncKind::OwnerProfile,
+                        "owner",
+                        &desired,
+                        &owner,
+                        MachineId([1; 32]),
+                    )
+                    .await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the old write reaches its rename")
+            .expect("rename hook");
+
+        // Shutdown aborts the caller (as the drain does to a periodic pass
+        // past its grace); the held write ends one second from now,
+        // whatever the drain does.
+        old.abort();
+        let _ = old.await;
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let _ = release_tx.send(());
+        });
+        crate::server::drain_server_tasks(&state, Vec::new()).await;
+        drop(state);
+
+        let state = owned_state(dir.path(), seed)
+            .await
+            .expect("restarted state");
+        let store = Arc::clone(state.owner_sync.as_ref().expect("sync").store());
+        store
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile("New"),
+                &owner,
+                MachineId([1; 32]),
+            )
+            .await
+            .expect("mint after the restart");
+        releaser.join().expect("releaser");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let disk = crate::owner_sync::OwnerSyncStore::load(dir.path())
+            .await
+            .expect("reload");
+        assert_eq!(
+            disk.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(profile("New")),
+            "a write of the old daemon must not land after its shutdown"
+        );
+    }
+
     /// WHY (#1055 RC2, review of RC1): a tombstoned enroll is a REFUSAL the
     /// caller can correct, not a storage failure — the route must answer
     /// `409 enrollment_tombstoned`, never `500 failed to persist`. The
