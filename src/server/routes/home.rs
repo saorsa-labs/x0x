@@ -3889,7 +3889,7 @@ pub(in crate::server::routes) mod tests {
         let state = owned_state(dir.path(), [0x8C; 32]).await?;
         // The server startup attaches the daemon view to the sync
         // service; owned_state skips startup, so mirror it here.
-        sync_of(&state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(&state))));
+        super::super::DaemonView::attach(sync_of(&state)?, &state);
         provision_home(&state).await;
         let sync = sync_of(&state)?;
         assert!(
@@ -3927,7 +3927,7 @@ pub(in crate::server::routes) mod tests {
         let b = owned_state(dir_b.path(), [0x8D; 32]).await?;
         for state in [&a, &b] {
             // Mirror the server-startup view attachment (see above).
-            sync_of(state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(state))));
+            super::super::DaemonView::attach(sync_of(state)?, state);
         }
         let (ma, mb) = (a.agent.machine_id(), b.agent.machine_id());
         anyhow::ensure!(ma != mb, "distinct machines");
@@ -4025,7 +4025,7 @@ pub(in crate::server::routes) mod tests {
         state
             .agent
             .install_owner_device_store(Arc::clone(sync.store()));
-        sync.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(&state))));
+        super::super::DaemonView::attach(sync, &state);
         Ok(state)
     }
 

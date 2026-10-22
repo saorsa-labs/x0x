@@ -18,7 +18,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::status::ApiResponse;
-use crate::owner_sync::{OwnerEnrollment, SyncDaemonView, SyncProfileNames, SyncValue};
+use crate::owner_sync::{
+    OwnerEnrollment, OwnerSyncService, SyncDaemonView, SyncProfileNames, SyncValue,
+};
 use crate::server::state::AppState;
 
 /// Adapter over live daemon state for the sync service.
@@ -61,6 +63,11 @@ impl DaemonView {
             names: std::sync::RwLock::new(names),
             pending: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Install a view over `state` on `service`, as the daemon does.
+    pub(in crate::server) fn attach(service: &OwnerSyncService, state: &Arc<AppState>) {
+        service.attach_view(Arc::new(Self::new(Arc::clone(state))));
     }
 }
 
@@ -586,11 +593,10 @@ mod tests {
         };
         // Views attached exactly as the server startup does.
         for state in [&a, &b] {
-            state
-                .owner_sync
-                .as_ref()
-                .expect("owned state wires sync")
-                .attach_view(Arc::new(DaemonView::new(Arc::clone(state))));
+            DaemonView::attach(
+                state.owner_sync.as_ref().expect("owned state wires sync"),
+                state,
+            );
         }
         let sync_a = a.owner_sync.as_ref().expect("sync a");
         let sync_b = b.owner_sync.as_ref().expect("sync b");
@@ -750,12 +756,12 @@ mod tests {
     /// run the spawned task before the pass reads, unless the pass waits.
     #[tokio::test]
     async fn a_recovered_profile_is_not_republished_as_the_old_live_name() {
-        use crate::owner_sync::{OwnerSyncStore, SyncKind};
+        use crate::owner_sync::SyncKind;
         let dir = tempfile::tempdir().expect("tmpdir");
         let state = owned_state(dir.path(), [0x87; 32]).await.expect("state");
         state.profile.write().await.human_name = Some("Old".into());
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
-        service.attach_view(Arc::new(DaemonView::new(Arc::clone(&state))));
+        DaemonView::attach(service, &state);
         service.sync_all().await;
         let owner = state
             .agent
@@ -766,7 +772,36 @@ mod tests {
         // A remote device's journal renewal and profile `Alice` (version 2),
         // committed as one batch whose journal append fails after the
         // journal intent is durable.
-        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+        let batch = remote_alice_batch(dir.path(), owner).await;
+        let store = service.store();
+        store.set_fail_journal_append(true);
+        let failed = store.commit_batch(batch, &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
+        store.set_fail_journal_append(false);
+
+        service.sync_all().await;
+        assert_eq!(
+            store.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(SyncValue::OwnerProfile {
+                human_name: Some("Alice".into())
+            }),
+            "the reconcile must not publish the old live name"
+        );
+        assert_eq!(
+            state.profile.read().await.human_name.as_deref(),
+            Some("Alice"),
+            "the daemon must show the recovered profile"
+        );
+    }
+
+    /// A remote device's signed journal renewal and owner profile `Alice`
+    /// (version 2), for the recovery tests.
+    async fn remote_alice_batch(
+        dir: &std::path::Path,
+        owner: &crate::identity::UserKeypair,
+    ) -> Vec<crate::owner_sync::VersionedRecord> {
+        use crate::owner_sync::{OwnerSyncStore, SyncKind};
+        let remote = OwnerSyncStore::load(&dir.join("remote"))
             .await
             .expect("remote store");
         let remote_machine = crate::identity::MachineId([2; 32]);
@@ -799,25 +834,73 @@ mod tests {
                 .await
                 .expect("remote profile mint");
         }
-        let batch = remote.records_snapshot().await;
-        let store = service.store();
-        store.set_fail_journal_append(true);
-        let failed = store.commit_batch(batch, &owner.user_id()).await;
-        assert!(failed.is_err(), "a failed journal append fails the commit");
-        store.set_fail_journal_append(false);
+        remote.records_snapshot().await
+    }
 
+    /// Codex review of #1545 (f2688b2), P2: a recovery commits the profile
+    /// `Alice` and removes its journal intent, and the process stops before
+    /// the live profile catch-up saves `Alice`. The restart loads the old
+    /// profile from disk. The reconcile must apply `Alice` again, not mint
+    /// the old name over it at a higher version.
+    #[tokio::test]
+    async fn a_restart_before_the_profile_catch_up_keeps_the_recovered_profile() {
+        use crate::owner_sync::SyncKind;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x88; 32];
+        let owner = crate::identity::UserKeypair::from_seed(&seed).expect("owner key");
+        {
+            let state = owned_state(dir.path(), seed).await.expect("state");
+            {
+                let mut profile = state.profile.write().await;
+                profile.human_name = Some("Old".into());
+                profile
+                    .save_to(&state.profile_path)
+                    .await
+                    .expect("save the old profile");
+            }
+            let service = state.owner_sync.as_ref().expect("owned state wires sync");
+            DaemonView::attach(service, &state);
+            service.sync_all().await;
+
+            let batch = remote_alice_batch(dir.path(), &owner).await;
+            let store = service.store();
+            store.set_fail_journal_append(true);
+            let failed = store.commit_batch(batch, &owner.user_id()).await;
+            assert!(failed.is_err(), "a failed journal append fails the commit");
+            store.set_fail_journal_append(false);
+            // The reconcile's recovery step, and then the process stops
+            // before any record reaches the live profile.
+            store
+                .recover_interrupted_commit(&owner.user_id())
+                .await
+                .expect("recovery");
+        }
+
+        let state = owned_state(dir.path(), seed)
+            .await
+            .expect("restarted state");
+        assert_eq!(
+            state.profile.read().await.human_name.as_deref(),
+            Some("Old"),
+            "the restart loads the old profile"
+        );
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        DaemonView::attach(service, &state);
         service.sync_all().await;
         assert_eq!(
-            store.stored_value(SyncKind::OwnerProfile, "owner").await,
+            service
+                .store()
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
             Some(SyncValue::OwnerProfile {
                 human_name: Some("Alice".into())
             }),
-            "the reconcile must not publish the old live name"
+            "the reconcile must not publish the old profile over the recovered one"
         );
         assert_eq!(
             state.profile.read().await.human_name.as_deref(),
             Some("Alice"),
-            "the daemon must show the recovered profile"
+            "the daemon must show the recovered profile after the restart"
         );
     }
 

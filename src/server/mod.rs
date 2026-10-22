@@ -1540,7 +1540,7 @@ pub async fn serve_with_options(
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
-        sync.attach_view(Arc::new(routes::DaemonView::new(Arc::clone(&state))));
+        routes::DaemonView::attach(sync, &state);
         let service = Arc::clone(sync);
         let shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
