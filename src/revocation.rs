@@ -532,6 +532,9 @@ pub struct RevocationSet {
     status_event_pending: bool,
     /// Sender check for a waiting carrier. Absent means no snapshot opens.
     snapshot_authority: Option<SnapshotAuthority>,
+    /// ADR-0074 §4: woken on every change so live tailnet streams are
+    /// re-checked promptly. `None` (the default) wakes nothing.
+    change_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 /// v1 `revocations.bin` / `x0x.revocation.v1`.
@@ -674,6 +677,18 @@ impl RevocationSet {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wake `notify` on every future change to the set (ADR-0074 §4 open-
+    /// stream re-check). Replaces any previously installed notifier.
+    pub(crate) fn set_change_notify(&mut self, notify: std::sync::Arc<tokio::sync::Notify>) {
+        self.change_notify = Some(notify);
+    }
+
+    fn notify_change(&self) {
+        if let Some(notify) = &self.change_notify {
+            notify.notify_one();
+        }
     }
 
     /// A revocation file was present but could not be decoded (#1116).
@@ -1013,6 +1028,7 @@ impl RevocationSet {
         }
         if changed {
             self.change_generation = self.change_generation.saturating_add(1);
+            self.notify_change();
         }
         changed
     }
@@ -1123,6 +1139,7 @@ impl RevocationSet {
         self.bundle_retired_epochs.clear();
         self.union_bundle_retired(tombstones);
         self.change_generation = self.change_generation.saturating_add(1);
+        self.notify_change();
     }
 
     /// Remove every record matching `take` and return it with its retained
@@ -1159,6 +1176,7 @@ impl RevocationSet {
             self.insert_verified(persisted);
         }
         self.change_generation = self.change_generation.saturating_add(1);
+        self.notify_change();
         taken
     }
 
@@ -1232,6 +1250,7 @@ impl RevocationSet {
             }
         }
         self.change_generation = self.change_generation.saturating_add(1);
+        self.notify_change();
         expired.len()
     }
 
@@ -1271,6 +1290,7 @@ impl RevocationSet {
         }
         self.records_by_hash.insert(hash, persisted);
         self.change_generation = self.change_generation.saturating_add(1);
+        self.notify_change();
         true
     }
 
@@ -1495,6 +1515,7 @@ impl RevocationSet {
         }
         if changed {
             self.change_generation = self.change_generation.saturating_add(1);
+            self.notify_change();
         }
     }
 

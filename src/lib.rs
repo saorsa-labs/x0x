@@ -84,6 +84,8 @@ pub mod revocation;
 /// envelope, and the placement-ledger enforcement checks (B and P).
 pub mod key_move;
 
+pub mod names;
+
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
@@ -105,6 +107,9 @@ pub mod streams;
 
 /// Local port-forwarder over tailnet byte-streams (tailnet Phase 1, #132 T4).
 pub mod forward;
+
+/// SOCKS5 front-end over ForwardV2 (ADR-0074 §3 / #1389).
+pub mod socks;
 
 /// Contact store with trust levels for message filtering.
 pub mod contacts;
@@ -905,6 +910,10 @@ pub struct Agent {
     /// the experimental roaming-move ceremony is disabled — not just the
     /// REST surface. Loading existing move state is unaffected.
     move_ceremony_enabled: bool,
+    /// ADR-0074 §4: wakes the forward reauth loop when authority changes
+    /// (revocation, contacts, ACL reload, placement, device set, discovery
+    /// cert). Shared with the stores that raise those events.
+    stream_reauth: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -4761,9 +4770,12 @@ async fn upsert_discovered_agent(
     >,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     mut incoming: DiscoveredAgent,
-) {
+) -> bool {
     prioritize_discovery_addresses(&mut incoming.addresses);
     let mut cache = cache.write().await;
+    let agent_id = incoming.agent_id;
+    let before = cache.get(&agent_id).map(discovery_gate_inputs);
+    let mut evicted = false;
     match cache.get_mut(&incoming.agent_id) {
         Some(existing) => {
             if incoming.announced_at >= existing.announced_at {
@@ -4870,6 +4882,7 @@ async fn upsert_discovered_agent(
                     .map(|(id, _)| *id)
                 {
                     cache.remove(&stalest);
+                    evicted = true;
                 }
             }
             // E2d: a certificate arriving with a COLD entry lands too —
@@ -4882,6 +4895,21 @@ async fn upsert_discovered_agent(
             }
         }
     }
+    evicted || cache.get(&agent_id).map(discovery_gate_inputs) != before
+}
+
+/// The discovery-entry fields the stream gates read (ADR-0074 §4): the
+/// machine binding and the certificate evidence. [`upsert_discovered_agent`]
+/// reports a change to them so live streams are re-checked.
+fn discovery_gate_inputs(
+    entry: &DiscoveredAgent,
+) -> (identity::MachineId, Option<u64>, Option<[u8; 32]>, bool) {
+    (
+        entry.machine_id,
+        entry.cert_not_after,
+        entry.cert_digest,
+        entry.agent_certificate.is_some(),
+    )
 }
 
 /// #447: merge an announce-blob pair into the discovery entry the moment a
@@ -4902,7 +4930,7 @@ async fn patch_discovery_entry_when_blob_lands(
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
     agent_id: &identity::AgentId,
-) {
+) -> bool {
     let attempts = (announce_blob::BLOB_FETCH_TIMEOUT_SECS * 2).max(1);
     for _ in 0..attempts {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -4910,14 +4938,14 @@ async fn patch_discovery_entry_when_blob_lands(
             continue;
         };
         let Some(cert) = blob.agent_certificate.as_ref() else {
-            return; // anonymous pair fetched — nothing to attach
+            return false; // anonymous pair fetched — nothing to attach
         };
         if !cert.agent_id().is_ok_and(|id| id == *agent_id) || cert.user_id().ok() != blob.user_id {
             tracing::debug!(
                 agent = %hex::encode(agent_id.0),
                 "announce blob landed but binds a different agent; not patching discovery entry (#447)"
             );
-            return;
+            return false;
         }
         // x0x #1150 (r7g): the announced-binding store is taken FIRST and
         // held until the binding carries the landed expiry, so no pinned
@@ -4968,8 +4996,9 @@ async fn patch_discovery_entry_when_blob_lands(
         // depends on the blob surviving for a later lookup.
         store.record_certificate_landed(agent_id, *digest, cert.not_after());
         drop(store);
-        return;
+        return true;
     }
+    false
 }
 
 fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
@@ -5308,7 +5337,7 @@ async fn cache_verified_announcement(
     >,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     discovered_agent: DiscoveredAgent,
-) {
+) -> bool {
     upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
     let (agent_id, machine_id, announced_at, cert_digest, inline_not_after) = (
         discovered_agent.agent_id,
@@ -5334,7 +5363,7 @@ async fn cache_verified_announcement(
     #[cfg(test)]
     announced_record_barrier::park(&agent_id, announced_record_barrier::INGEST_BETWEEN_WRITES)
         .await;
-    upsert_discovered_agent(cache, cert_events, discovered_agent).await;
+    upsert_discovered_agent(cache, cert_events, discovered_agent).await
 }
 
 async fn upsert_discovered_machine_from_agent(
@@ -7186,6 +7215,22 @@ fn capability_binding_supports_durable_ack(
     binding.is_some_and(|binding| {
         binding.machine_id.0 != [0_u8; 32] && binding.capabilities.supports_durable_app_ack()
     })
+}
+
+/// Swap the effective connect policy in `holder` and signal `reauth`, so an
+/// ADR-0074 §4 open-stream re-check runs promptly after an ACL reload.
+pub(crate) fn install_connect_policy(
+    holder: &std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>,
+    reauth: &tokio::sync::Notify,
+    policy: std::sync::Arc<connect::ConnectPolicy>,
+) {
+    {
+        let mut guard = holder
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = policy;
+    }
+    reauth.notify_one();
 }
 
 impl Agent {
@@ -12342,13 +12387,23 @@ impl Agent {
     ///     }
     /// }
     /// ```
+    /// The authenticated agent→machine binding store (ADR 0115).
+    pub(crate) fn authenticated_machine_bindings(&self) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.authenticated_machine_bindings)
+    }
+
+    /// The announced-binding store (ADR 0115 class A/B).
+    pub(crate) fn announced_machine_bindings(&self) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.announced_machine_bindings)
+    }
+
     /// Test seam for #1088's frame-level listener tests (unit and the
     /// connectivity integration file): the authenticated machine-binding
     /// registry the raw delivery path consults.
     pub fn authenticated_machine_bindings_for_testing(
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
-        std::sync::Arc::clone(&self.authenticated_machine_bindings)
+        self.authenticated_machine_bindings()
     }
 
     /// Test seam (x0x #1150 r7d): the announced-binding store. Test builds
@@ -12357,7 +12412,7 @@ impl Agent {
     pub(crate) fn announced_machine_bindings_for_testing(
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
-        std::sync::Arc::clone(&self.announced_machine_bindings)
+        self.announced_machine_bindings()
     }
 
     /// Test seam for #1088: record an authenticated machine binding the
@@ -13267,6 +13322,9 @@ impl Agent {
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         // E2d: the listener's upserts fire verified-certificate events.
         let cert_events = std::sync::Arc::clone(&self.verified_cert_tx);
+        // ADR-0074 §4: a peer's machine binding or certificate changing
+        // re-checks live streams.
+        let stream_reauth = std::sync::Arc::clone(&self.stream_reauth);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let announced_machine_bindings = std::sync::Arc::clone(&self.announced_machine_bindings);
@@ -13991,8 +14049,9 @@ impl Agent {
                                 let watch_cert_events = std::sync::Arc::clone(&cert_events);
                                 let watch_digest = cert_digest;
                                 let watch_agent = converted.agent_id;
+                                let watch_reauth = std::sync::Arc::clone(&stream_reauth);
                                 tokio::spawn(async move {
-                                    patch_discovery_entry_when_blob_lands(
+                                    if patch_discovery_entry_when_blob_lands(
                                         &watch_cache,
                                         &watch_announced,
                                         &watch_blob_cache,
@@ -14000,7 +14059,12 @@ impl Agent {
                                         &watch_digest,
                                         &watch_agent,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        // ADR-0074 §4: certificate evidence
+                                        // changed; re-check live streams.
+                                        watch_reauth.notify_one();
+                                    }
                                 });
                             }
                         }
@@ -14274,7 +14338,7 @@ impl Agent {
                     now,
                     cache_freshness_ttl_secs,
                 ) {
-                    cache_verified_announcement(
+                    if cache_verified_announcement(
                         &machine_cache,
                         &announced_machine_bindings,
                         Some(&announce_blob_cache),
@@ -14282,7 +14346,10 @@ impl Agent {
                         &cert_events,
                         discovered_agent,
                     )
-                    .await;
+                    .await
+                    {
+                        stream_reauth.notify_one();
+                    }
                 } else {
                     tracing::debug!(
                         target: "x0x::discovery",
@@ -15736,6 +15803,9 @@ impl Agent {
 
     /// [`Self::authority_confirms`]; with `nonblocking_evidence` (an
     /// opted-in cold send, x0x #1207) the evidence check never blocks.
+    /// Contended store maps to false (fail closed). Gate/reauth paths that
+    /// must surface Busy call
+    /// [`owner_trust::OwnerTrust::authority_confirms_nonblocking`].
     async fn authority_confirms_with(
         &self,
         agent_id: &identity::AgentId,
@@ -17654,7 +17724,9 @@ impl Agent {
                                 )
                                 .await;
                             }
-                            upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
+                            if upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await {
+                                self.stream_reauth.notify_one();
+                            }
                             return Ok(Some(addrs));
                         }
                     }
@@ -18823,8 +18895,43 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
     ) -> error::NetworkResult<identity::MachineId> {
+        Self::gate_peer_outbound_at(
+            &self.identity_discovery_cache,
+            &self.contact_store,
+            &self.revocation_set,
+            &self.move_state,
+            &self.owner_trust,
+            &self.announced_machine_bindings,
+            &self.authenticated_machine_bindings,
+            agent_id,
+            false,
+        )
+        .await
+        .map_err(|e| e.fail_closed_admission(agent_id.0))
+    }
+
+    /// Shared body for [`Self::gate_peer_outbound`] and the ADR-0074 §4
+    /// re-check. Cert expiry uses [`OwnerTrust::now_unix_secs`] immediately
+    /// before the compare (after discovery + authority awaits). With
+    /// `local_authority_only`, ADR 0115 confirmation uses only local
+    /// stores / non-blocking evidence and contended reads return Busy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gate_peer_outbound_at(
+        identity_discovery_cache: &tokio::sync::RwLock<
+            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        >,
+        contact_store: &tokio::sync::RwLock<contacts::ContactStore>,
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        move_state: &tokio::sync::RwLock<key_move::MoveState>,
+        owner_trust: &owner_trust::OwnerTrust,
+        announced_bindings: &dm_inbox::AuthenticatedMachineBindings,
+        authenticated_bindings: &dm_inbox::AuthenticatedMachineBindings,
+        agent_id: &identity::AgentId,
+        local_authority_only: bool,
+    ) -> Result<identity::MachineId, crate::forward::PeerGateError> {
+        use crate::owner_trust::NonblockingEval;
         let (routing, cert_not_after) = {
-            let cache = self.identity_discovery_cache.read().await;
+            let cache = identity_discovery_cache.read().await;
             cache
                 .get(agent_id)
                 .map(|entry| (entry.machine_id, entry.cert_not_after))
@@ -18832,34 +18939,79 @@ impl Agent {
                     agent_id: agent_id.0,
                 })?
         };
-        // ADR 0115 §2: a route counts only when an authority
-        // store confirms it.
-        let machine_id = self
-            .authorized_routing_machine(agent_id, Some(routing))
-            .await
-            .ok_or(error::NetworkError::PeerNotVerified {
+        // Same as [`Self::authorized_routing_machine_with`]: a zero routing
+        // machine is not a route. Do not fall back to the authority store.
+        let routing = Some(routing).filter(|m| m.0 != [0u8; 32]).ok_or(
+            error::NetworkError::PeerNotVerified {
                 agent_id: agent_id.0,
-            })?;
+            },
+        )?;
+        // ADR 0115 §2: a route counts only when an authority store confirms
+        // it; otherwise the authority stores' machine is used. Admission and
+        // reauth share this body so a stale/unconfirmed cache entry cannot
+        // tear down a stream that a fresh admission would still open.
+        // ADR-0074 §4: reauth must not collapse Busy→false (PeerNotVerified).
+        let confirmed = if local_authority_only {
+            match owner_trust
+                .authority_confirms_nonblocking(agent_id, &routing)
+                .await
+            {
+                NonblockingEval::Busy => return Err(crate::forward::PeerGateError::Busy),
+                NonblockingEval::Done(confirmed) => confirmed,
+            }
+        } else {
+            owner_trust.authority_confirms(agent_id, &routing).await
+        };
+        let authority = {
+            let announced = announced_bindings.read().await.peek(agent_id);
+            let attested = authenticated_bindings.read().await.peek(agent_id);
+            identity_authority::authority_machine(announced, attested)
+        };
+        let machine_id =
+            identity_authority::authorized_machine(Some(routing), confirmed, authority).ok_or(
+                error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                },
+            )?;
         // Runtime cert-expiry gate (issue #191): EP1 drops expired
         // announcements at ingest but never re-checks a cached entry on
         // the live path. Absent expiry (None) is fail-open — is_expired
         // returns false, preserving compatibility with pre-#130 peers.
-        let expired = identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
+        // Clock after discovery + authority awaits, immediately before compare.
+        let now_secs = owner_trust.now_unix_secs();
+        let expired = identity::is_expired(cert_not_after, now_secs);
 
-        let trust_decision = Some(
-            self.owner_trust
-                .evaluate_pair(
-                    &self.contact_store,
-                    &self.identity_discovery_cache,
-                    &self.revocation_set,
+        // ADR-0074 §4: reauth shares this body — never block on evidence;
+        // contended nonblocking reads surface Busy (not Deny).
+        let trust_decision = Some(if local_authority_only {
+            match owner_trust
+                .evaluate_pair_nonblocking(
+                    contact_store,
+                    identity_discovery_cache,
+                    revocation_set,
                     agent_id,
                     &machine_id,
                 )
                 .await
-                .decision,
-        );
+            {
+                NonblockingEval::Busy => return Err(crate::forward::PeerGateError::Busy),
+                NonblockingEval::Done(pair) => pair.decision,
+            }
+        } else {
+            owner_trust
+                .evaluate_pair_with(
+                    contact_store,
+                    identity_discovery_cache,
+                    revocation_set,
+                    agent_id,
+                    &machine_id,
+                    false,
+                )
+                .await
+                .decision
+        });
         let (revoked_agent, revoked_machine, resync_required) = {
-            let revoked = self.revocation_set.read().await;
+            let revoked = revocation_set.read().await;
             (
                 revoked.is_agent_revoked(agent_id),
                 revoked.is_machine_revoked(&machine_id),
@@ -18867,15 +19019,18 @@ impl Agent {
             )
         };
         if resync_required {
-            tracing::info!(
-                target: "x0x::streams",
-                agent = %hex::encode(agent_id.as_bytes()),
-                outcome = "withhold_revocation_resync",
-                "outbound stream withheld until revocation resync"
-            );
+            if !local_authority_only {
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    outcome = "withhold_revocation_resync",
+                    "outbound stream withheld until revocation resync"
+                );
+            }
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: agent_id.0,
-            });
+            }
+            .into());
         }
         streams::stream_gate(
             agent_id,
@@ -18889,22 +19044,25 @@ impl Agent {
         // closed (retired binding / pin mismatch); absent evidence fails
         // open (§9.3) until a bundle or placement record arrives.
         let pairing = {
-            let revoked = self.revocation_set.read().await;
-            let placements = self.move_state.read().await;
+            let revoked = revocation_set.read().await;
+            let placements = move_state.read().await;
             key_move::enforce_pairing(&revoked, placements.placement_view(), agent_id, &machine_id)
         };
         if let Some(denial) = pairing {
-            tracing::info!(
-                target: "x0x::streams",
-                agent = %hex::encode(agent_id.as_bytes()),
-                machine = %hex::encode(machine_id.as_bytes()),
-                outcome = "deny_pairing",
-                reason = ?denial,
-                "outbound pairing denied (ADR-0043 B/P gate)"
-            );
+            if !local_authority_only {
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "deny_pairing",
+                    reason = ?denial,
+                    "outbound pairing denied (ADR-0043 B/P gate)"
+                );
+            }
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: agent_id.0,
-            });
+            }
+            .into());
         }
         Ok(machine_id)
     }
@@ -18949,6 +19107,40 @@ impl Agent {
         .await
     }
 
+    /// [`Self::gate_peer_machine_inbound`] for ADR-0074 §4 re-check.
+    ///
+    /// Cert expiry / grant validity use [`OwnerTrust::now_unix_secs`] inside
+    /// the eval (no caller stamp). With `local_authority_only`, ADR 0115
+    /// confirmation and grant evidence use only local / non-blocking reads;
+    /// any contended resident authority read returns Busy.
+    pub(crate) async fn gate_peer_machine_inbound_at(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        local_authority_only: bool,
+    ) -> Result<Vec<identity::AgentId>, crate::forward::PeerGateError> {
+        #![allow(clippy::too_many_arguments)]
+        Self::gate_peer_machine_inbound_for_evidence(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            None,
+            false,
+            local_authority_only,
+        )
+        .await
+    }
+
     /// [`Self::gate_peer_machine_inbound`] with the ADR-0073 × ADR-0070
     /// call-signaling input (#980), used ONLY by
     /// [`Agent::call_gate_inbound`](crate::Agent::call_gate_inbound).
@@ -18987,12 +19179,18 @@ impl Agent {
             machine_id,
             call_caller,
             false,
+            false,
         )
         .await
+        .map_err(|e| e.fail_closed_admission(machine_id.0))
     }
 
     /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
     /// peers gain evidence admission; every other check remains unchanged.
+    ///
+    /// With `local_authority_only`, confirmation and grant evaluation use
+    /// non-blocking local evidence only (ADR-0074 §4 reauth); contended
+    /// reads return Busy.
     #[allow(clippy::too_many_arguments)]
     async fn gate_peer_machine_inbound_for_evidence(
         discovery_cache: &std::sync::Arc<
@@ -19006,7 +19204,9 @@ impl Agent {
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
         evidence_only: bool,
-    ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        local_authority_only: bool,
+    ) -> Result<Vec<identity::AgentId>, crate::forward::PeerGateError> {
+        use crate::owner_trust::NonblockingEval;
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -19031,9 +19231,9 @@ impl Agent {
             );
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: machine_id.0,
-            });
+            }
+            .into());
         }
-        let now_secs = Self::unix_timestamp_secs();
         // Review r2 H5: pairing denials are PER-AGENT exclusions, not
         // machine denials. Identity-level gates (revocation/expiry/trust,
         // #192) still deny the machine; but a DEAD PAIRING (moved-away
@@ -19049,29 +19249,71 @@ impl Agent {
         let mut grant_only: Vec<identity::AgentId> = Vec::new();
         for (agent_id, cert_not_after) in &agents {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
-            // cert has expired must be refused on the live path.
+            // cert has expired must be refused on the live path. Re-read
+            // the OwnerTrust clock per agent after any prior awaits.
+            let now_secs = owner_trust.now_unix_secs();
             let expired = identity::is_expired(*cert_not_after, now_secs);
-            let pair = owner_trust
-                .evaluate_pair(
-                    contact_store,
-                    discovery_cache,
-                    revocation_set,
-                    agent_id,
-                    machine_id,
-                )
-                .await;
+            // ADR-0074 §4: local-authority reauth surfaces Busy on a
+            // contended evidence store inside owner-trust / grant eval.
+            let pair = if local_authority_only {
+                match owner_trust
+                    .evaluate_pair_nonblocking(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                    )
+                    .await
+                {
+                    NonblockingEval::Busy => {
+                        return Err(crate::forward::PeerGateError::Busy);
+                    }
+                    NonblockingEval::Done(pair) => pair,
+                }
+            } else {
+                owner_trust
+                    .evaluate_pair_with(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                        false,
+                    )
+                    .await
+            };
             if pair.owner_trusted {
                 owner_trusted.push(*agent_id);
             }
-            let access = owner_trust
-                .grant_access(
-                    contact_store,
-                    discovery_cache,
-                    revocation_set,
-                    agent_id,
-                    machine_id,
-                )
-                .await;
+            let access = if local_authority_only {
+                match owner_trust
+                    .grant_access_nonblocking(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                    )
+                    .await
+                {
+                    NonblockingEval::Busy => {
+                        return Err(crate::forward::PeerGateError::Busy);
+                    }
+                    NonblockingEval::Done(access) => access,
+                }
+            } else {
+                owner_trust
+                    .grant_access_at(
+                        contact_store,
+                        discovery_cache,
+                        revocation_set,
+                        agent_id,
+                        machine_id,
+                        true,
+                    )
+                    .await
+            };
             let has_connect_grant = !access.connect_ports.is_empty();
             // ADR-0073 × ADR-0070 (#980): only on the call-signaling gate,
             // and only for the ringing agent itself.
@@ -19115,7 +19357,8 @@ impl Agent {
                 );
                 return Err(error::NetworkError::PeerNotVerified {
                     agent_id: agent_id.0,
-                });
+                }
+                .into());
             }
             if let Err(e) = streams::stream_gate(
                 agent_id,
@@ -19133,7 +19376,7 @@ impl Agent {
                     error = %e,
                     "inbound traffic denied at identity gate (one agent on the machine failed)"
                 );
-                return Err(e);
+                return Err(e.into());
             }
             // ADR-0043 §9: B and P per (agent, machine) pairing — the
             // source pairing of an activated move dies here, permanently,
@@ -19170,16 +19413,30 @@ impl Agent {
             );
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: machine_id.0,
-            });
+            }
+            .into());
         }
 
         // ADR 0115 §2: a routing entry alone never makes an
         // agent occupy this machine. Every routed agent above can still
         // deny (fail-closed, #192); only an agent that an authority store
         // confirms on this machine is admitted.
+        // ADR-0074 §4: any Busy during local-authority confirmation retries
+        // within budget — never empty-confirmed → PeerNotVerified.
         let mut confirmed: Vec<identity::AgentId> = Vec::with_capacity(surviving.len());
         for agent_id in &surviving {
-            if owner_trust.authority_confirms(agent_id, machine_id).await {
+            if local_authority_only {
+                match owner_trust
+                    .authority_confirms_nonblocking(agent_id, machine_id)
+                    .await
+                {
+                    NonblockingEval::Busy => {
+                        return Err(crate::forward::PeerGateError::Busy);
+                    }
+                    NonblockingEval::Done(true) => confirmed.push(*agent_id),
+                    NonblockingEval::Done(false) => {}
+                }
+            } else if owner_trust.authority_confirms(agent_id, machine_id).await {
                 confirmed.push(*agent_id);
             }
         }
@@ -19192,7 +19449,8 @@ impl Agent {
             );
             return Err(error::NetworkError::PeerNotVerified {
                 agent_id: machine_id.0,
-            });
+            }
+            .into());
         }
 
         // Connect-ACL gate input: every surviving routed agent stays listed
@@ -19227,7 +19485,7 @@ impl Agent {
                 error = %e,
                 "inbound traffic denied at connect-ACL gate (unlisted peer)"
             );
-            return Err(e);
+            return Err(e.into());
         }
         // Gate cleared — the ordered, authority-confirmed agent list for
         // the stream/lane handle.
@@ -19343,11 +19601,7 @@ impl Agent {
     /// The daemon calls this once at startup with the loaded policy; library
     /// embedders that want ACL-gated streams do the same.
     pub fn set_connect_policy(&self, policy: std::sync::Arc<connect::ConnectPolicy>) {
-        let mut guard = self
-            .connect_policy
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = policy;
+        install_connect_policy(&self.connect_policy, &self.stream_reauth, policy);
     }
 
     /// The currently installed connect ACL policy (defaults to
@@ -19359,6 +19613,20 @@ impl Agent {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::sync::Arc::clone(&guard)
+    }
+
+    /// Hot-swappable connect-policy holder (ADR-0074 §4 reauth loop).
+    #[must_use]
+    pub(crate) fn connect_policy_holder(
+        &self,
+    ) -> std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>> {
+        std::sync::Arc::clone(&self.connect_policy)
+    }
+
+    /// Wake signal for the forward open-stream reauth loop (ADR-0074 §4).
+    #[must_use]
+    pub(crate) fn stream_reauth_signal(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.stream_reauth)
     }
 
     /// #1040 pre-prefix check: whether an inbound stream from `machine_id`
@@ -19482,6 +19750,7 @@ impl Agent {
                         machine_id,
                         None,
                         true,
+                        false,
                     )
                     .await
                     .ok()?;
@@ -19603,6 +19872,7 @@ impl Agent {
                         &machine_id,
                         None,
                         true,
+                        false,
                     )
                     .await
                     .is_err())
@@ -21748,9 +22018,13 @@ impl AgentBuilder {
         // listener can enforce revocation on inbound relayed envelopes. The
         // same Arc is moved into the Agent below, so the listener and the
         // Agent's `/identity/revoke` writes observe one shared set.
-        let revocation_set = std::sync::Arc::new(tokio::sync::RwLock::new(
-            storage::load_revocation_set(self.identity_dir.as_deref()).await,
-        ));
+        // ADR-0074 §4: one Notify shared by every authority-change hook and
+        // the forward reauth loop.
+        let stream_reauth = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut revocation_loaded =
+            storage::load_revocation_set(self.identity_dir.as_deref()).await;
+        revocation_loaded.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+        let revocation_set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation_loaded));
 
         // ADR-0043: load-or-generate this machine's ML-KEM-768 enrollment
         // key (beside the machine key) and load the derived move state
@@ -21866,6 +22140,8 @@ impl AgentBuilder {
                 );
             }
         }
+        let mut move_state = move_state;
+        move_state.set_change_notify(std::sync::Arc::clone(&stream_reauth));
         let move_state = std::sync::Arc::new(tokio::sync::RwLock::new(move_state));
         let move_state_load_failed =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(move_logs_corrupt));
@@ -21879,9 +22155,9 @@ impl AgentBuilder {
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("contacts.json")
         });
-        let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
-            contacts::ContactStore::new(contacts_path),
-        ));
+        let mut contact_store_inner = contacts::ContactStore::new(contacts_path);
+        contact_store_inner.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+        let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(contact_store_inner));
         // ADR 0115 D214: quarantine pre-upgrade issuer
         // revocations and bundle tombstones before anything reads them.
         let revocation_quarantine = std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -21952,18 +22228,24 @@ impl AgentBuilder {
 
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
-        let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
-            dm_inbox::AuthenticatedMachineBindingCache::default(),
-        ));
+        // ADR-0074 §4: authenticated + announced binding mutations wake
+        // stream reauth (DM attestation, announcements, cert-landed expiry).
+        let authenticated_machine_bindings = {
+            let mut cache = dm_inbox::AuthenticatedMachineBindingCache::default();
+            cache.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+            std::sync::Arc::new(tokio::sync::RwLock::new(cache))
+        };
         let owner_trust = owner_trust::OwnerTrust::new(
             identity.user_id(),
             std::sync::Arc::clone(&authenticated_machine_bindings),
         );
         // ADR 0115 §2: the announced-binding store is an
         // authority store for every OwnerTrust-held reader.
-        let announced_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
-            dm_inbox::AuthenticatedMachineBindingCache::default(),
-        ));
+        let announced_machine_bindings = {
+            let mut cache = dm_inbox::AuthenticatedMachineBindingCache::default();
+            cache.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+            std::sync::Arc::new(tokio::sync::RwLock::new(cache))
+        };
         owner_trust.install_announced_bindings(std::sync::Arc::clone(&announced_machine_bindings));
         if let Some(runtime) = gossip_runtime.as_ref() {
             // #1230: a bare agent must drop Blocked senders without a later
@@ -22071,6 +22353,7 @@ impl AgentBuilder {
             move_state,
             move_state_load_failed,
             move_ceremony_enabled: self.move_ceremony_enabled,
+            stream_reauth,
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),

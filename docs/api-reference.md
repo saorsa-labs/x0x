@@ -78,9 +78,10 @@ Auth-class labels used throughout this reference:
   (metadata presence is the marker — never the current policy axes, so
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
-  route. The join-request list, approve and reject are not on this list.
-  They take one class that depends on the group: see **Join-request admin
-  (#1347)** below.
+  route, (#1386) `POST /forwards` in every case (including plain hex
+  `peer_agent`), and every `/names*` route. The join-request list,
+  approve and reject are not on this list. They take one class that
+  depends on the group: see **Join-request admin (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
@@ -928,6 +929,7 @@ own `MemberAdded`, mint a fresh invite rather than replaying the link.
 | GET | `/sync/devices` | `x0x sync devices` | bearer | Owner device set + last-sync status |
 | POST | `/sync/devices/enroll` | `x0x sync enroll` | durable-owner (#446) | Owner-key-sign a DeviceEnrollment for a machine |
 | DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | durable-owner (#446) | Remove a machine from the device set |
+| GET | `/owner/machines` | `x0x owner machines` | owner (riders denied) | M1 machine census: enrolled devices + last-sync status + this machine's version/policy digest (#1383) |
 
 All three answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
@@ -957,6 +959,32 @@ omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
 lifetime; omitted = until deleted). Response: `machine_id`, `enrolled_at_ms`,
 `expires_at_ms` (null = no expiry), `device_count`. A persistence failure is a
 `500` — success is never reported on a swallowed write.
+
+**GET /owner/machines (#1383, M1 census)** — the owner's machine census over
+owner-sync. One row per enrolled device with its last-sync status; the local
+daemon's version and `version_policy_digest` (see
+[Upgrade](#upgrade)) ride in `this_machine`. Riders are denied on every
+`/owner/*` route; `409` when no owner identity is configured. Remote rows
+carry no version fields in v1 — per-machine digests arrive only with a later
+approved announcement change (local-only surface by David's 20 Oct 2026
+ruling).
+
+```json
+{
+  "ok": true,
+  "owner_user_id": "02492c…",
+  "this_machine": {
+    "machine_id": "e55130…",
+    "version": "0.48.1",
+    "version_policy_digest": "9f86d0…"
+  },
+  "machines": [
+    {"machine_id":"e55130…","enrolled_at_ms":1788090728080,
+     "expires_at_ms":null,"last_session_ms":null,"last_session_ok":null,
+     "is_this_machine":true}
+  ]
+}
+```
 
 **Enrollment is per-machine and must be bilateral.** A daemon dials sync only
 to machines in *its own* enrolled set (minus itself), and the receiving side
@@ -2593,11 +2621,52 @@ Run a command on **another** agent's machine. Disabled by default; every request
 |---|---|---|---|
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart |
+| GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
+
+**Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
+daemon's `current_version`, the full `update_policy` object
+(`enabled`, `rollout_window_minutes`, `stop_on_upgrade`,
+`fallback_check_interval_minutes`, `repo`, `include_prereleases`,
+`gossip_updates`), and `version_policy_digest` — SHA-256 (lower-case hex) of
+the `digest_input` string, which is returned verbatim:
+
+```
+x0x-version-policy-digest-v1|current_version=<version>|enabled=<bool>|rollout_window_minutes=<u64>|stop_on_upgrade=<bool>|fallback_check_interval_minutes=<u64>|repo=<owner/repo>|include_prereleases=<bool>|gossip_updates=<bool>
+```
+
+Field order is frozen with the `x0x-version-policy-digest-v1` tag; any change
+bumps the tag. This surface is local only by David's 20 Oct 2026 #1383
+ruling: no capability bit, no new field in signed machine announcements.
+Remote machines' digests reach an owner only through a later approved
+announcement change; until then the owner-side census is
+`GET /owner/machines` (see [Device sync](#device-sync-adr-0041-tier-1)).
+
+**Minimum supported version and support window (#1384, D35).** The same
+response carries `minimum_supported_version` and `support_window`. Both ship
+as explicit `null` — by David's 20 Oct 2026 ruling the fields exist now and
+the VALUES are set by David later; `null` is the published state ("no fleet
+minimum published yet"), not a missing field. They are not part of the
+digest preimage: they are centrally published fleet policy, not per-machine
+policy, so they add nothing to a machine-to-machine census comparison. When
+David sets them, the change is a value substitution here and in the daemon —
+no wire or code-shape change.
 
 **The serving daemon owns installation.** `x0x upgrade --apply` sends an
 authenticated `POST /upgrade/apply` through the normal daemon client, using
 the selected `--name` or `--api` and its bearer token. It does not install
 from the CLI process. Apply fails if no daemon is available.
+
+On Unix, apply waits for the durable staging receipt without holding the
+apply mutex or install lock. The optional query `now=true`, sent by
+`x0x upgrade --apply --now`, skips only the staging delay. It retains release
+eligibility, fleet receipt checks, durable holds, probe retry waits and
+transaction checks. It does not reset or discard a receipt. The query
+defaults to `false` and requires the same durable owner token as ordinary
+apply. `--now` requires `--apply` and conflicts with `--check`.
+
+The CLI bounds connection setup to 30 seconds but sets no total timeout for
+these apply requests. A staging wait can exceed an hour. Other CLI requests
+retain their normal timeout.
 
 Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
 installation. `x0x upgrade --check` is a standalone GitHub release check and
@@ -3093,10 +3162,31 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service |
+| POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service (**durable-owner** in every case) |
 | GET | `/forwards` | `x0x forward list` | List registered forwards |
 | DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address |
-| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed counter + connect-ACL snapshot |
+| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `socks_denied`, and the connect-ACL snapshot |
+
+`socks_denied` counts SOCKS CONNECT replies of `0x02` (the peer connect gate denied the target). The field is `0` when the SOCKS listener is off.
+
+### Loopback SOCKS5 listener
+
+The `[socks]` table is daemon config. It is not a connect-ACL entry. Full rules are in [Daemon SOCKS listener](connect-acl.md#daemon-socks-listener).
+
+```toml
+[socks]
+listen = "127.0.0.1:1080"
+```
+
+`listen` must be a loopback address (`127.0.0.0/8` or `::1`). The config loader and the listener both refuse any other address. The listener stays off until `listen` is set.
+
+Clients must use RFC 1929 username/password. The password is the daemon API token. The username is ignored. `NO AUTH` is refused with `0xFF`. A wrong token, or an empty or absent token, is refused before any ForwardV2 stream opens.
+
+CONNECT is the only command. The target is `<64-hex-agent-id>.x0x:port`. A peer connect-gate denial is SOCKS `0x02`, and that target receives zero bytes.
+
+Owner connect-ACL entries may list an inclusive loopback port range. Pair and grant targets stay exact host:port. See [docs/connect-acl.md](connect-acl.md).
+
+In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact address or inclusive port range). Pair `ConnectAllowEntry.targets` stays `Vec<SocketAddr>`. David approved this break on 20 Oct 2026 at 18:50 BST. The public module is `x0x::socks`.
 
 ### `POST /forwards` request body
 
@@ -3109,6 +3199,65 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 }
 ```
 
+`POST /forwards` requires the durable owner API token (**durable-owner**) in every case. Session and rider tokens receive a typed `403`, including a plain hex `peer_agent` that writes no name or pin. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward.
+
 `local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
+
+`peer_agent` also accepts an agent name (`studio.me`, `agent:studio.bob`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. The response then carries the canonical `name`. A `machine:` name, or a bare label that resolves to a machine, is refused with `400` `machine_target_unsupported`. This lasts until forwards check that the stream reaches the pinned `MachineId` (ADR-0074 slice 2). Name errors use the codes listed under Names.
+
+## Names (ADR-0074)
+
+These are local names for agents and machines: `[agent:|machine:]<label>.<owner>`. Labels are lowercase DNS labels (`[a-z0-9-]`, 1–63 characters, no leading or trailing `-`). `me`, `agent` and `machine` are reserved. A 64-character hex agent id stays valid wherever a name is accepted.
+
+- **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of two ways:
+  - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`. A signed card binds that label only when the contact is Known or Trusted and that user has no petname yet. Unknown and Blocked stay unbound: `owner_label` is null and the name store is unchanged. `POST /names/owners` still binds a label explicitly.
+  - `POST /names/owners`.
+
+  A petname is frozen at first bind. Binding it to another key returns `409` `pin_mismatch` until the label is removed.
+- **Agent label.** This is the announced self-name, mapped to a label the same way. It resolves only to an agent whose valid, unexpired, unrevoked `AgentCertificate` chains to the owner.
+- **Machine label, own machines (`me`).** This is the ADR-0036 `machine_name` synced across your devices. It resolves only for a machine with a current ADR-0041 `OwnerEnrollment` by you.
+- **Machine label, shared machines.** You label these yourself with `POST /names/machines`. They resolve only while the machine hosts a certified agent of an active, unrevoked `ShareGrant` you received from that owner.
+- **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. A bare name that matches both an agent and a machine returns `409` `ambiguous_kind`, even when a pin already exists. Retry with `agent:` or `machine:`. `pin_mismatch` is returned only when the single remaining candidate's kind differs from the existing pin, and that call does not write a second pin. To re-pin on purpose, delete the pin.
+
+Resolution is local and makes no network query. It adds no trust: every identity, contact and connect-ACL gate still applies. All `/names` routes need the durable API token. Session and rider tokens get `403`. Names persist in `<data_dir>/names.json` (versioned JSON, mode `0600`). If that file is unreadable, every name operation fails with `503` `name_store`, but hex ids keep working.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/names` | `x0x names list` | Owner petnames and pins |
+| POST | `/names/resolve` | `x0x names resolve <NAME>` | Resolve a name; pins it at first use |
+| POST | `/names/owners` | `x0x names owner add <LABEL> <USER_ID>` | Bind an owner petname |
+| DELETE | `/names/owners/:label` | `x0x names owner rm <LABEL>` | Remove a petname and every pin under it |
+| POST | `/names/machines` | `x0x names machine label <NAME> <MACHINE_ID>` | Label a shared machine (`machine:<label>.<owner>`) |
+| DELETE | `/names/pins/:name` | `x0x names unpin <NAME>` | Drop a pin (e.g. `agent:studio.bob`) |
+
+`POST /names/resolve` takes `{"name": "studio.me"}` and returns:
+
+```json
+{
+  "ok": true,
+  "name": "agent:studio.me",
+  "kind": "agent",
+  "owner_user_id": "<hex>",
+  "agent_id": "<hex>",
+  "machine_id": null,
+  "newly_pinned": true
+}
+```
+
+For a machine name, `machine_id` is the machine. `agent_id` is the one agent that a stream to that machine would open to, or `null` when no single agent qualifies. For a shared machine, only a granted agent can qualify.
+
+Refusals are `{"ok": false, "error", "code"}`:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_name` | 400 | Outside the grammar |
+| `reserved_label` | 400 | `me`/`agent`/`machine` used as a label |
+| `machine_target_unsupported` | 400 | A machine name where only agents are accepted (`POST /forwards`) |
+| `unknown_name` | 404 | Unbound owner label, or nothing carries the name |
+| `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
+| `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
+| `ambiguous_kind` | 409 | A bare label names both an agent and a machine, even when a pin exists. Retry with `agent:` or `machine:` |
+| `pin_mismatch` | 409 | The name is pinned to another key. The body carries `pinned` and `current` |
+| `name_store` | 503 | `names.json` is unreadable (fail closed) |
 
 See also: [docs/api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)

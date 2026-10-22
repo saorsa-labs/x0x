@@ -96,6 +96,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Delete, "/sync/devices/:machine_id", sync_routes_wired),
     covered!(Get, "/owner/agents", daemon_api_profile_round_trip),
     covered!(
+        Get,
+        "/owner/machines",
+        owner_machines_lists_enrolled_devices_and_local_digest
+    ),
+    covered!(
         Post,
         "/owner/agents/issue",
         rider_issuance_journals_and_roster_lists
@@ -146,6 +151,11 @@ const COVERED: &[CoveredEndpoint] = &[
         Get,
         "/diagnostics/transport",
         daemon_api_diagnostics_transport
+    ),
+    covered!(
+        Get,
+        "/diagnostics/upgrade",
+        upgrade_diagnostics_reports_version_policy_digest
     ),
     covered!(Get, "/diagnostics/relay", daemon_api_diagnostics_relay),
     covered!(Get, "/diagnostics/dm", daemon_api_diagnostics_dm),
@@ -616,12 +626,25 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/grants", grant_routes_wired),
     covered!(Delete, "/grants/:id", grant_routes_wired),
     covered!(Get, "/grants/received", grant_routes_wired),
+    // ── Names (ADR-0074 §1) ─────────────────────────────────────────────
+    covered!(Get, "/names", names_routes_wired),
+    covered!(Post, "/names/resolve", names_routes_wired),
+    covered!(Post, "/names/owners", names_routes_wired),
+    covered!(Delete, "/names/owners/:label", names_routes_wired),
+    covered!(Post, "/names/machines", names_routes_wired),
+    covered!(Delete, "/names/pins/:name", names_routes_wired),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/network.rs",
         include_str!("../src/server/routes/network.rs"),
+    ),
+    // #1383: the owner machine census route's coverage lives in the
+    // owner route lib tests.
+    (
+        "src/server/routes/owner.rs",
+        include_str!("../src/server/routes/owner.rs"),
     ),
     (
         "tests/daemon_api_integration.rs",
@@ -675,6 +698,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/grants.rs",
         include_str!("../src/server/routes/grants.rs"),
+    ),
+    (
+        "src/server/routes/names/tests.rs",
+        include_str!("../src/server/routes/names/tests.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",
@@ -1143,6 +1170,7 @@ fn categories_are_valid() {
         "history",
         "acl",
         "grants",
+        "names",
     ];
 
     for ep in ENDPOINTS {

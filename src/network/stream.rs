@@ -75,6 +75,18 @@ mod test_halves {
                 Self::Sim(send) => send.finish(),
             }
         }
+
+        /// Abrupt reset (ant-quic `SendStream::reset`); used by ADR-0074 §4
+        /// open-stream teardown. Simulated halves finish instead.
+        pub fn reset(&mut self, code: ant_quic::VarInt) -> io::Result<()> {
+            match self {
+                Self::Quic(send) => send.reset(code).map_err(io::Error::other),
+                Self::Sim(send) => {
+                    let _ = code;
+                    send.finish()
+                }
+            }
+        }
     }
 
     impl StreamRecv {
@@ -83,6 +95,18 @@ mod test_halves {
             match self {
                 Self::Quic(recv) => recv.read_exact(buf).await.map_err(io::Error::other),
                 Self::Sim(recv) => AsyncReadExt::read_exact(recv, buf).await.map(|_| ()),
+            }
+        }
+
+        /// Abrupt stop (ant-quic `RecvStream::stop`); used by ADR-0074 §4
+        /// open-stream teardown. Simulated halves are a no-op.
+        pub fn stop(&mut self, code: ant_quic::VarInt) -> io::Result<()> {
+            match self {
+                Self::Quic(recv) => recv.stop(code).map_err(io::Error::other),
+                Self::Sim(_recv) => {
+                    let _ = code;
+                    Ok(())
+                }
             }
         }
 

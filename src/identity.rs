@@ -18,6 +18,23 @@ use hex;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+#[cfg(test)]
+pub(crate) mod ml_dsa_verify_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn get() -> u64 {
+        COUNT.with(Cell::get)
+    }
+}
+
 /// Length of a PeerId in bytes (SHA-256 hash output).
 pub const PEER_ID_LENGTH: usize = 32;
 
@@ -687,6 +704,8 @@ impl AgentCertificate {
             self.not_after,
         );
 
+        #[cfg(test)]
+        ml_dsa_verify_count::bump();
         ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
             &user_pubkey,
             &message,

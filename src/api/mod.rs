@@ -484,6 +484,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/owner/machines",
+        cli_name: "owner machines",
+        description: "M1 machine census over owner-sync: enrolled devices + last-sync status + local version/policy digest (#1383)",
+        category: "identity",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/owner/agents/issue",
         cli_name: "owner agents issue",
@@ -650,6 +658,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/diagnostics/transport",
         cli_name: "diagnostics transport",
         description: "Transport connection accounting (zombie-connection hunt, #368)",
+        category: "network",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/upgrade",
+        cli_name: "diagnostics upgrade",
+        description: "Local version + update-policy digest for the M1 census (#1383; local only, no wire change)",
         category: "network",
         request: RequestSpec::None,
     },
@@ -1746,7 +1762,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "upgrade --apply",
         description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)",
         category: "upgrade",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query("now", false)]),
     },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
@@ -1911,6 +1927,64 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "grant received",
         description: "List share grants that name this install as grantee",
         category: "grants",
+        request: RequestSpec::None,
+    },
+    // ── Names (ADR-0074 §1; durable owner token only) ───────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/names",
+        cli_name: "names list",
+        description: "List owner petnames and pinned names",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/resolve",
+        cli_name: "names resolve",
+        description: "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
+        category: "names",
+        // Positional NAME — dump-request must not synthesize `--name`
+        // (collides with the global instance `--name` flag).
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/owners",
+        cli_name: "names owner add",
+        description: "Bind a local owner petname to a user id (frozen at first bind)",
+        category: "names",
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("label", true, "LABEL"),
+            RequestField::body_as("user_id", true, "USER_ID"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/owners/:label",
+        cli_name: "names owner rm",
+        description: "Remove a local owner petname and every pin under it",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/machines",
+        cli_name: "names machine label",
+        description: "Label a shared machine (machine:<label>.<owner> -> machine id)",
+        category: "names",
+        // Same positional NAME rule as `/names/resolve` (global `--name` clash).
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("name", true, "NAME"),
+            RequestField::body_as("machine_id", true, "MACHINE_ID"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/pins/:name",
+        cli_name: "names unpin",
+        description: "Drop a TOFU pin so the name re-pins at next use",
+        category: "names",
         request: RequestSpec::None,
     },
 ];

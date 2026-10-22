@@ -177,12 +177,28 @@ jobs:
           name: test-results
           path: target/nextest/
 
+      # Cargo marks the x0x binary test=false. Select its real parser/registry
+      # controls explicitly after preserving the broad suite's results above.
+      - name: M2 CLI apply-now parser and registry controls
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        id: upgrade_now_cli
+        env:
+          X0X_ISOLATION_ROLE: m2-cli-now-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --all-features --bin x0x -- -E 'test(upgrade_now_cli_regressions)' --no-tests=fail
+
       # The workspace all-features lane exercises the debug seam. Also run the
       # committed H controls with the default production trust root in isolation.
       - name: M2 default-key and debug-signing controls
         env:
           X0X_ISOLATION_ROLE: m2-signing-controls
         run: bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
+
+      # Library fleet guards must also use the production key, not the
+      # all-features debug rehearsal key that permits zero-minute windows.
+      - name: M2 production fleet staging controls
+        env:
+          X0X_ISOLATION_ROLE: m2-fleet-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --lib -- -E 'test(fleet_)' --no-tests=fail
 
 
       # Run after the workspace artifact is uploaded so this nextest invocation
@@ -266,6 +282,20 @@ jobs:
           mkdir -m 700 "${artifact}"
           test ! -e "${artifact}/proof.json"
 
+      - name: Sample signing-path build resources
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          nohup bash -c '
+            while true; do
+              date -u
+              free -m
+              df -h / "$RUNNER_TEMP"
+              sleep 30
+            done
+          ' >>"${artifact}/resources.log" 2>&1 </dev/null &
+          echo "$!" >"${artifact}/resources.pid"
+
       - name: Run exact ignored 100k signing-path test
         id: signing_test
         shell: bash
@@ -287,6 +317,18 @@ jobs:
           fi
           python3 -B scripts/ci/validate-703-signing-proof.py \
             "${RUNNER_TEMP}/issue703-signing-test/proof.json"
+
+      - name: Print signing-path resource samples
+        if: always()
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          if [[ -f "${artifact}/resources.pid" ]]; then
+            kill "$(cat "${artifact}/resources.pid")" 2>/dev/null || true
+          fi
+          if [[ -f "${artifact}/resources.log" ]]; then
+            tail -n 120 "${artifact}/resources.log"
+          fi
 
       - name: Upload signing-path acceptance custody
         if: always()
@@ -409,7 +451,7 @@ jobs:
     # are reported, not required.
     name: W3-H harness (determinism)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
@@ -530,6 +572,14 @@ jobs:
           --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=RED
           --require w3h_818_control_ownerless_invite_after_the_removal_joins
           --expect w3h_818_control_ownerless_invite_after_the_removal_joins=GREEN
+          --require w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes
+          --expect w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes=RED
+          --require w3h_1023_restart_one_holder_online_admits
+          --expect w3h_1023_restart_one_holder_online_admits=GREEN
+          --require w3h_1023_control_holders_never_return_fail_closed
+          --expect w3h_1023_control_holders_never_return_fail_closed=GREEN
+          --require w3h_1023_control_holder_returns_recovers
+          --expect w3h_1023_control_holder_returns_recovers=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer

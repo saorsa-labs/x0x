@@ -56,6 +56,8 @@ use crate::identity::{AgentId, AgentKeypair, MachineId};
 use crate::streams::{PeerStream, StreamProtocol};
 use crate::trust::TrustDecision;
 
+pub(crate) mod teardown;
+
 // Import the ant-quic stream halves under stable names for the bridge helper,
 // plus the ML-DSA-65 sign/verify primitives for ForwardV2 attestation.
 use crate::network::{StreamRecv as HighLevelRecvStream, StreamSend as HighLevelSendStream};
@@ -459,18 +461,23 @@ fn decide_inbound(
 
 /// Verification context bundled to keep `decide_inbound_attested` arg-count
 /// under the clippy threshold (#204).
-struct AttestationVerifyCtx {
+pub(crate) struct AttestationVerifyCtx {
     discovery_cache: std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>,
     >,
     contact_store: std::sync::Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
     own_machine_id: MachineId,
-    now_ms: u64,
+    /// Unix-ms clock set at construction (system / ReauthCtx). Freshness and
+    /// post-await cert expiry read `(clock)()`; callers cannot stamp `now`.
+    clock: teardown::Clock,
     revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
     move_state: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
     /// ADR-0070 §1 owner trust: feeds the trust decision and the
     /// `principal = "owner"` connect-ACL selector.
     owner_trust: crate::owner_trust::OwnerTrust,
+    /// When true (ADR-0074 §4 re-check), grant evaluation uses only local
+    /// authority stores — no EvidenceV1 wait/lookup.
+    local_authority_only: bool,
 }
 
 /// Inbound gate decision for a `ForwardV2` attested stream (#204).
@@ -496,12 +503,13 @@ struct AttestationVerifyCtx {
 /// Fail-closed on: agent not in cache, no cached key, wrong machine,
 /// recipient mismatch, stale/future timestamp, signature failure, trust
 /// rejection, or ACL denial.
-async fn decide_inbound_attested(
+/// Also returns the authority the stream is admitted under (ADR-0074 §4).
+async fn decide_inbound_attested_with_authority(
     header: &ForwardV2Header,
     policy: &ConnectPolicy,
     peer_machine: &MachineId,
     ctx: &AttestationVerifyCtx,
-) -> Result<SocketAddr, ConnectDenialReason> {
+) -> Result<(SocketAddr, teardown::StreamAuthority), ConnectDenialReason> {
     // Resolve the target first (same as V1 — a non-loopback target is
     // refused before the attestation check, so an unverified peer learns
     // nothing about which agents exist).
@@ -533,8 +541,9 @@ async fn decide_inbound_attested(
         );
         return Err(ConnectDenialReason::AttestationFailed);
     }
+    let now_ms = (ctx.clock)();
     // Stale: older than the TTL window.
-    if ctx.now_ms
+    if now_ms
         > header
             .issued_at_ms
             .saturating_add(FORWARD_V2_ATTESTATION_TTL_MS)
@@ -543,23 +552,19 @@ async fn decide_inbound_attested(
             target: "x0x::forward",
             reason = "stale_attestation",
             issued_at_ms = header.issued_at_ms,
-            now_ms = ctx.now_ms,
+            now_ms,
             ttl_ms = FORWARD_V2_ATTESTATION_TTL_MS,
             "forward v2 attestation denied: attestation older than TTL"
         );
         return Err(ConnectDenialReason::AttestationFailed);
     }
     // Future: more than the skew allowance ahead of our clock.
-    if header.issued_at_ms
-        > ctx
-            .now_ms
-            .saturating_add(FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS)
-    {
+    if header.issued_at_ms > now_ms.saturating_add(FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS) {
         tracing::warn!(
             target: "x0x::forward",
             reason = "future_attestation",
             issued_at_ms = header.issued_at_ms,
-            now_ms = ctx.now_ms,
+            now_ms,
             skew_ms = FORWARD_V2_ATTESTATION_FUTURE_SKEW_MS,
             "forward v2 attestation denied: attestation dated beyond clock-skew allowance"
         );
@@ -628,50 +633,285 @@ async fn decide_inbound_attested(
         }
     }
 
+    // The opener is now cryptographically authenticated: authorize that
+    // specific agent against current authority. The same check re-runs on
+    // every live stream (ADR-0074 §4, `teardown`).
+    let authority = match authorize_attested_opener(
+        &header.opener_agent_id,
+        peer_machine,
+        &target,
+        policy,
+        ctx,
+    )
+    .await
+    {
+        LocalAuthorityOutcome::Allow(a) => a,
+        LocalAuthorityOutcome::Deny(d) => return Err(d.connect_reason()),
+        // Admission uses blocking evidence reads; Busy is reauth-only.
+        LocalAuthorityOutcome::Busy => return Err(ConnectDenialReason::AttestationFailed),
+    };
+    Ok((target, authority))
+}
+
+/// [`decide_inbound_attested_with_authority`] without the authority (the
+/// gate-matrix tests compare the admitted target only).
+#[cfg(test)]
+async fn decide_inbound_attested(
+    header: &ForwardV2Header,
+    policy: &ConnectPolicy,
+    peer_machine: &MachineId,
+    ctx: &AttestationVerifyCtx,
+) -> Result<SocketAddr, ConnectDenialReason> {
+    decide_inbound_attested_with_authority(header, policy, peer_machine, ctx)
+        .await
+        .map(|(target, _)| target)
+}
+
+/// Outcome of a local-authority gate or authorize evaluation (crate-private).
+///
+/// `Busy` means any nonblocking authority read performed during this
+/// evaluation was contended (`try_usable` → `Err`). Teardown retries on Busy
+/// and treats Deny as a fresh authority verdict — it must not probe agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalAuthorityOutcome<T, E> {
+    Allow(T),
+    Deny(E),
+    Busy,
+}
+
+/// Gate error for local-authority (`local_authority_only`) peer gates.
+///
+/// `Busy` when any resident's nonblocking authority read during that eval
+/// was contended (`try_usable` → `Err`, or `try_confirms_pairing` → `None`).
+#[derive(Debug)]
+pub(crate) enum PeerGateError {
+    Busy,
+    Network(NetworkError),
+}
+
+impl From<NetworkError> for PeerGateError {
+    fn from(e: NetworkError) -> Self {
+        Self::Network(e)
+    }
+}
+
+impl PeerGateError {
+    pub(crate) fn into_outcome<T>(self) -> LocalAuthorityOutcome<T, NetworkError> {
+        match self {
+            Self::Busy => LocalAuthorityOutcome::Busy,
+            Self::Network(e) => LocalAuthorityOutcome::Deny(e),
+        }
+    }
+
+    /// Admission / new-stream fail-closed mapping (Busy is not a public error).
+    pub(crate) fn fail_closed_admission(self, agent_id: [u8; 32]) -> NetworkError {
+        match self {
+            Self::Busy => NetworkError::PeerNotVerified { agent_id },
+            Self::Network(e) => e,
+        }
+    }
+}
+
+/// Reauth wrapper for [`crate::Agent::gate_peer_outbound_at`].
+///
+/// Busy comes from the gate itself when the peer agent's nonblocking
+/// authority read was contended.
+pub(crate) async fn gate_peer_outbound_outcome(
+    ctx: &teardown::ReauthCtx,
+    peer_agent: &AgentId,
+) -> LocalAuthorityOutcome<MachineId, NetworkError> {
+    match crate::Agent::gate_peer_outbound_at(
+        &ctx.discovery_cache,
+        &ctx.contact_store,
+        &ctx.revocation_set,
+        &ctx.move_state,
+        &ctx.owner_trust,
+        &ctx.announced_bindings,
+        &ctx.authenticated_bindings,
+        peer_agent,
+        true,
+    )
+    .await
+    {
+        Ok(machine) => LocalAuthorityOutcome::Allow(machine),
+        Err(e) => e.into_outcome(),
+    }
+}
+
+/// Reauth wrapper for [`crate::Agent::gate_peer_machine_inbound_at`].
+///
+/// Busy when **any** resident agent's nonblocking authority read was
+/// contended (not only the attested opener).
+pub(crate) async fn gate_peer_machine_inbound_outcome(
+    ctx: &teardown::ReauthCtx,
+    machine: &MachineId,
+) -> LocalAuthorityOutcome<Vec<AgentId>, NetworkError> {
+    match crate::Agent::gate_peer_machine_inbound_at(
+        &ctx.discovery_cache,
+        &ctx.contact_store,
+        &ctx.revocation_set,
+        &ctx.move_state,
+        &ctx.connect_policy,
+        &ctx.owner_trust,
+        machine,
+        true,
+    )
+    .await
+    {
+        Ok(agents) => LocalAuthorityOutcome::Allow(agents),
+        Err(e) => e.into_outcome(),
+    }
+}
+
+/// Why [`authorize_attested_opener`] refused (internal). Maps onto the wire
+/// [`ConnectDenialReason`] exactly as the pre-split gate did, and onto a
+/// finer teardown reason for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthzDenial {
+    /// The connect gate refused.
+    Gate(ConnectDenialReason),
+    /// The opener is absent from the discovery cache.
+    AgentUnknown,
+    /// The opener's cached machine is not the transport peer.
+    AgentNotOnMachine,
+    /// The opener or its machine is revoked.
+    Revoked,
+    /// The opener's certificate has expired.
+    CertExpired,
+    /// The opener's trust decision is not `Accept`.
+    TrustRejected,
+    /// ADR-0043: the (agent, machine) pairing is retired.
+    PairingRetired,
+}
+
+impl AuthzDenial {
+    /// The typed denial frame the opener sees at admission.
+    fn connect_reason(self) -> ConnectDenialReason {
+        match self {
+            Self::Gate(reason) => reason,
+            Self::AgentNotOnMachine => ConnectDenialReason::AgentNotOnMachine,
+            Self::AgentUnknown
+            | Self::Revoked
+            | Self::CertExpired
+            | Self::TrustRejected
+            | Self::PairingRetired => ConnectDenialReason::AttestationFailed,
+        }
+    }
+}
+
+/// Authorization half of the attested (`ForwardV2`) inbound gate: every
+/// check that depends on current authority rather than on the header bytes.
+/// Admission runs it after the attestation checks; the ADR-0074 §4 re-check
+/// runs it again on every live stream, so a stream is kept exactly while a
+/// fresh admission would still pass.
+///
+/// Returns the authority the stream holds: the ACL entry kind that matched
+/// and, for a grant, the Connect grants covering the target port.
+///
+/// When a nonblocking authority read inside this path is contended,
+/// returns [`LocalAuthorityOutcome::Busy`].
+pub(crate) async fn authorize_attested_opener(
+    opener: &AgentId,
+    peer_machine: &MachineId,
+    target: &SocketAddr,
+    policy: &ConnectPolicy,
+    ctx: &AttestationVerifyCtx,
+) -> LocalAuthorityOutcome<teardown::StreamAuthority, AuthzDenial> {
+    use crate::owner_trust::NonblockingEval;
+
+    let agent = {
+        let cache = ctx.discovery_cache.read().await;
+        cache.get(opener).cloned()
+    };
+    let Some(agent) = agent else {
+        return LocalAuthorityOutcome::Deny(AuthzDenial::AgentUnknown);
+    };
+    if agent.machine_id != *peer_machine {
+        return LocalAuthorityOutcome::Deny(AuthzDenial::AgentNotOnMachine);
+    }
+
     // ── Trust evaluation (#204 must-fix 3): evaluate the attested agent's
     // real trust — NOT a hard-coded Accept. A Blocked-but-announced agent
     // must be denied here (same pattern as the stream gate).
     // ADR-0070 §1: owner trust is an input to that decision, and the only
     // way a `principal = "owner"` ACL entry can match.
-    let pair = ctx
-        .owner_trust
-        .evaluate_pair(
-            &ctx.contact_store,
-            &ctx.discovery_cache,
-            &ctx.revocation_set,
-            &header.opener_agent_id,
-            peer_machine,
-        )
-        .await;
+    // ADR-0074 §4: reauth (`local_authority_only`) surfaces Busy on a
+    // contended evidence store inside owner-trust / grant eval.
+    let pair = if ctx.local_authority_only {
+        match ctx
+            .owner_trust
+            .evaluate_pair_nonblocking(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+            )
+            .await
+        {
+            NonblockingEval::Busy => return LocalAuthorityOutcome::Busy,
+            NonblockingEval::Done(pair) => pair,
+        }
+    } else {
+        ctx.owner_trust
+            .evaluate_pair_with(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+                false,
+            )
+            .await
+    };
 
     // ADR-0070 §2: a current ShareGrant whose Connect ports cover THIS
     // target lets a `principal = "grant"` entry match, and raises the trust
     // decision for this target only. Blocked/pin mismatch get no grant.
-    let grant_port_allowed = ctx
-        .owner_trust
-        .grant_access(
-            &ctx.contact_store,
-            &ctx.discovery_cache,
-            &ctx.revocation_set,
-            &header.opener_agent_id,
-            peer_machine,
-        )
-        .await
-        .allows_connect_port(target.port());
+    // Grant expiry uses OwnerTrust's construction-injected clock (no now arg).
+    let access = if ctx.local_authority_only {
+        match ctx
+            .owner_trust
+            .grant_access_nonblocking(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+            )
+            .await
+        {
+            NonblockingEval::Busy => return LocalAuthorityOutcome::Busy,
+            NonblockingEval::Done(access) => access,
+        }
+    } else {
+        ctx.owner_trust
+            .grant_access_at(
+                &ctx.contact_store,
+                &ctx.discovery_cache,
+                &ctx.revocation_set,
+                opener,
+                peer_machine,
+                true,
+            )
+            .await
+    };
+    let grant_port_allowed = access.allows_connect_port(target.port());
     let decision = pair.decision.with_owner_trust(grant_port_allowed);
 
-    // The opener is now cryptographically authenticated: ACL-check that
-    // specific agent with its REAL trust decision.
-    evaluate_connect_gate_for_principals(
+    // ACL-check that specific agent with its REAL trust decision.
+    if let Err(reason) = evaluate_connect_gate_for_principals(
         /* verified */ true,
         Some(decision),
         policy,
-        &header.opener_agent_id,
+        opener,
         peer_machine,
         pair.owner_trusted,
         grant_port_allowed,
-        &target,
-    )?;
+        target,
+    ) {
+        return LocalAuthorityOutcome::Deny(AuthzDenial::Gate(reason));
+    }
 
     // The machine-level gate may have excluded a moved-away co-resident
     // while accepting a live agent on the same machine. Authenticate the
@@ -679,36 +919,39 @@ async fn decide_inbound_attested(
     // and a stale discovery binding must not resurrect that dead pairing.
     // Snapshot only this placement, then release its lock before reading
     // revocation state; no shared locks are held across another lock await.
-    let placement = ctx
-        .move_state
-        .read()
-        .await
-        .placement(&header.opener_agent_id)
-        .cloned();
+    let placement = ctx.move_state.read().await.placement(opener).cloned();
     let placements = placement
-        .map(|record| std::collections::HashMap::from([(header.opener_agent_id, record)]))
+        .map(|record| std::collections::HashMap::from([(*opener, record)]))
         .unwrap_or_default();
     let revoked = ctx.revocation_set.read().await;
-    crate::streams::stream_gate(
-        &header.opener_agent_id,
+    // Read clock immediately before expiry — not a stamp captured pre-await.
+    let now_secs = (ctx.clock)() / 1000;
+    if let Err(e) = crate::streams::stream_gate(
+        opener,
         Some(decision),
-        revoked.is_agent_revoked(&header.opener_agent_id),
+        revoked.is_agent_revoked(opener),
         revoked.is_machine_revoked(peer_machine),
-        crate::identity::is_expired(agent.cert_not_after, ctx.now_ms / 1000),
-    )
-    .map_err(|_| ConnectDenialReason::AttestationFailed)?;
-    if crate::key_move::enforce_pairing(
-        &revoked,
-        &placements,
-        &header.opener_agent_id,
-        peer_machine,
-    )
-    .is_some()
-    {
-        return Err(ConnectDenialReason::AttestationFailed);
+        crate::identity::is_expired(agent.cert_not_after, now_secs),
+    ) {
+        let denial = match e {
+            NetworkError::PeerRevoked { .. } => AuthzDenial::Revoked,
+            NetworkError::PeerNotVerified { .. } => AuthzDenial::CertExpired,
+            _ => AuthzDenial::TrustRejected,
+        };
+        return LocalAuthorityOutcome::Deny(denial);
+    }
+    if crate::key_move::enforce_pairing(&revoked, &placements, opener, peer_machine).is_some() {
+        return LocalAuthorityOutcome::Deny(AuthzDenial::PairingRetired);
     }
 
-    Ok(target)
+    LocalAuthorityOutcome::Allow(teardown::StreamAuthority::classify(
+        policy,
+        opener,
+        peer_machine,
+        pair.owner_trusted,
+        target,
+        &access.connect_grant_ids,
+    ))
 }
 
 /// Forwarder-owned diagnostics beyond the connect ACL's allow/deny counters
@@ -730,6 +973,14 @@ pub struct ForwardDiagnostics {
     /// Streams reset because the forward header did not arrive within
     /// `HEADER_READ_TIMEOUT` (FIX 2).
     header_timeout: AtomicU64,
+    /// Live streams torn down because their authority is gone (ADR-0074 §4).
+    torn_down_reauth: AtomicU64,
+    /// Live streams torn down by process/service shutdown (not trust-loss).
+    torn_down_shutdown: AtomicU64,
+    /// Teardown reasons for debug (`revoked`, `trust_rejected`, `shutdown`, …).
+    /// Shutdown increments [`Self::torn_down_shutdown`], not
+    /// [`Self::torn_down_reauth`].
+    torn_down_reasons: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>,
 }
 
 impl ForwardDiagnostics {
@@ -756,6 +1007,46 @@ impl ForwardDiagnostics {
     /// Record a header-read timeout (FIX 2).
     pub fn record_header_timeout(&self) {
         self.header_timeout.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a live stream torn down for `reason` (ADR-0074 §4).
+    pub(crate) fn record_torn_down(&self, reason: &'static str) {
+        self.torn_down_reauth.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self
+            .torn_down_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reasons.entry(reason).or_insert(0) += 1;
+    }
+    /// Record a live stream torn down by shutdown (not trust-loss).
+    pub(crate) fn record_torn_down_shutdown(&self) {
+        self.torn_down_shutdown.fetch_add(1, Ordering::Relaxed);
+        let mut reasons = self
+            .torn_down_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reasons.entry("shutdown").or_insert(0) += 1;
+    }
+    /// Live streams torn down because their authority is gone (ADR-0074 §4).
+    /// Logged as `torn_down_total` on each teardown.
+    #[must_use]
+    pub(crate) fn torn_down_reauth(&self) -> u64 {
+        self.torn_down_reauth.load(Ordering::Relaxed)
+    }
+    /// Live streams torn down by shutdown (not trust-loss).
+    #[must_use]
+    pub(crate) fn torn_down_shutdown(&self) -> u64 {
+        self.torn_down_shutdown.load(Ordering::Relaxed)
+    }
+    /// Teardown reasons for debug (`revoked`, `trust_rejected`,
+    /// `target_not_allowed`, `shutdown`, ...).
+    #[must_use]
+    pub(crate) fn torn_down_reasons(&self) -> std::collections::BTreeMap<String, u64> {
+        self.torn_down_reasons
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(k, count)| ((*k).to_string(), *count))
+            .collect()
     }
     /// Current connect-failure count.
     #[must_use]
@@ -802,6 +1093,12 @@ pub(crate) struct InboundCtx {
     pub require_attestation: bool,
     /// ADR-0070 §1 owner trust for the attested (`ForwardV2`) gate.
     pub owner_trust: crate::owner_trust::OwnerTrust,
+    /// ADR-0074 §4 registry of live forward streams (re-checked on every
+    /// authority change; see [`teardown`]).
+    pub live: Arc<teardown::LiveStreams>,
+    /// Wake the open-stream reauth loop after early registration so a
+    /// revocation that landed in the admit→register gap is applied promptly.
+    pub reauth: Arc<tokio::sync::Notify>,
 }
 
 /// Drive the inbound half of a forward: read the header, run the connect
@@ -875,7 +1172,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
     // cached agent key, confirm machine binding, ACL-check the single
     // authenticated agent (#204). ForwardV1: legacy multi-agent fail-closed
     // (#192), kept for backward compatibility with pre-#204 peers.
-    let target = match stream.protocol() {
+    let (target, gate, authority) = match stream.protocol() {
         StreamProtocol::ForwardV2 => {
             // FIX 2: bound the header read (larger budget for the ~3.3 KB
             // ML-DSA-65 signature). Reset + count on timeout.
@@ -903,21 +1200,33 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                         return;
                     }
                 };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
             let verify_ctx = AttestationVerifyCtx {
                 discovery_cache: Arc::clone(&ctx.discovery_cache),
                 contact_store: Arc::clone(&ctx.contact_store),
                 own_machine_id: ctx.own_machine_id,
-                now_ms,
+                clock: teardown::system_clock(),
                 revocation_set: Arc::clone(&ctx.revocation_set),
                 move_state: Arc::clone(&ctx.move_state),
                 owner_trust: ctx.owner_trust.clone(),
+                local_authority_only: false,
             };
-            match decide_inbound_attested(&header, &ctx.policy, &machine_id, &verify_ctx).await {
-                Ok(addr) => addr,
+            match decide_inbound_attested_with_authority(
+                &header,
+                &ctx.policy,
+                &machine_id,
+                &verify_ctx,
+            )
+            .await
+            {
+                Ok((addr, authority)) => (
+                    addr,
+                    teardown::StreamGate::InboundAttested {
+                        opener: header.opener_agent_id,
+                        machine: machine_id,
+                        target: addr,
+                    },
+                    authority,
+                ),
                 Err(reason) => {
                     ctx.connect_diag.record_denied(reason);
                     send_denial(&mut stream, reason).await;
@@ -976,7 +1285,14 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                     }
                 };
             match decide_inbound(&header, &ctx.policy, &agents, &machine_id) {
-                Ok(addr) => addr,
+                Ok(addr) => (
+                    addr,
+                    teardown::StreamGate::InboundLegacy {
+                        machine: machine_id,
+                        target: addr,
+                    },
+                    teardown::StreamAuthority::AclEntry,
+                ),
                 Err(reason) => {
                     ctx.connect_diag.record_denied(reason);
                     send_denial(&mut stream, reason).await;
@@ -1004,10 +1320,30 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
         return;
     }
 
-    // Connect the local loopback target with a bounded timeout.
-    let local = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
-        Ok(Ok(tcp)) => tcp,
-        Ok(Err(e)) => {
+    // ADR-0074 §4: register before the connect/response window so a
+    // revocation in that gap is visible to the reauth loop (≤5 s), not only
+    // after the 30 s sweep. Kick a pass now; abort if already cancelled.
+    let live = ctx.live.register(gate, authority);
+    ctx.reauth.notify_one();
+    if live.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, None);
+        return;
+    }
+
+    // Connect the local loopback target with a bounded timeout; abort early
+    // if reauth tears the registration down while we wait.
+    let local = match teardown::wait_cancellable(
+        live.token(),
+        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)),
+    )
+    .await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, None);
+            return;
+        }
+        Ok(Ok(Ok(tcp))) => tcp,
+        Ok(Ok(Err(e))) => {
             ctx.fwd_diag.record_connect_failed();
             tracing::info!(
                 target: "x0x::forward",
@@ -1018,7 +1354,7 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
             );
             return;
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             ctx.fwd_diag.record_connect_failed();
             tracing::info!(
                 target: "x0x::forward",
@@ -1029,20 +1365,33 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
             return;
         }
     };
+    if live.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&local));
+        return;
+    }
 
     // Signal connected, then bridge. The connect-allow counter records that
     // the gate admitted this flow.
     ctx.connect_diag.record_allowed();
-    if stream
-        .send_mut()
-        .write_all(&encode_response_connected())
-        .await
-        .is_err()
+    match teardown::wait_cancellable(
+        live.token(),
+        stream.send_mut().write_all(&encode_response_connected()),
+    )
+    .await
     {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&local));
+            return;
+        }
+        Ok(Err(_)) => return,
+        Ok(Ok(())) => {}
+    }
+    if live.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&local));
         return;
     }
     let (send, recv) = stream.into_split();
-    bridge(local, send, recv).await;
+    bridge(local, send, recv, live.token()).await;
 }
 
 /// RAII guard that decrements the active-stream counter when a forward task ends.
@@ -1080,24 +1429,31 @@ async fn send_denial(stream: &mut PeerStream, reason: ConnectDenialReason) {
 /// flowing. On a copy error the writer is left unfinished, so dropping the
 /// QUIC send stream resets it and the truncation surfaces as an error rather
 /// than a well-formed but short stream.
-async fn bridge(tcp: TcpStream, mut send: HighLevelSendStream, mut recv: HighLevelRecvStream) {
-    use tokio::io::AsyncWriteExt;
-    // Split the TCP socket into owned read/write halves so the two copy tasks
-    // can run concurrently without overlapping mutable borrows.
+async fn bridge(
+    tcp: TcpStream,
+    mut send: HighLevelSendStream,
+    mut recv: HighLevelRecvStream,
+    cancel: &CancellationToken,
+) {
+    // #961: split the TCP so each direction can half-close independently.
+    // When the local client is done writing, we finish the QUIC send half
+    // (FIN) without resetting the stream — the peer can still drain its
+    // response. A full reset only happens on error or reauth teardown.
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let to_stream = async {
-        if tokio::io::copy(&mut tcp_read, &mut send).await.is_ok() {
-            // `SendStream::poll_shutdown` is `finish()`: queues a FIN; the
-            // connection retransmits buffered data even after drop.
-            let _ = send.shutdown().await;
-        }
-    };
-    let from_stream = async {
-        if tokio::io::copy(&mut recv, &mut tcp_write).await.is_ok() {
-            let _ = tcp_write.shutdown().await;
-        }
-    };
-    tokio::join!(to_stream, from_stream);
+    // ADR-0074 §4: `cancel` fires when the stream's authority is gone. Both
+    // halves reset with DROPPED_UNFINISHED_ERROR_CODE (same as main's deny
+    // drop path) and TCP linger 0 / RST so neither end keeps a half-open
+    // zombie. Reauth teardowns are counted in `torn_down_reauth`.
+    let torn_down =
+        teardown::bridge_io(&mut tcp_read, &mut tcp_write, &mut recv, &mut send, cancel).await;
+    if torn_down {
+        teardown::reset_quic(&mut send, &mut recv);
+        // Linger 0 + forget the write half so drop does not send FIN first
+        // (OwnedWriteHalf::drop calls shutdown(Write) unless forgotten). The
+        // read-half drop then closes the socket with RST (ADR-0074 §4).
+        teardown::reset_tcp(&tcp_write);
+        tcp_write.forget();
+    }
 }
 
 /// Read a length-prefixed `ForwardHeader` from an async reader.
@@ -1278,6 +1634,10 @@ pub struct ForwardService {
     /// (#204 must-fix 1). Set `[forward] require_attestation = false` in the
     /// daemon TOML to allow V1 for mixed-version deployments.
     require_attestation: bool,
+    /// ADR-0074 §4: live bridged streams, re-checked when authority changes.
+    live: Arc<teardown::LiveStreams>,
+    /// Ensures the reauth loop is spawned once.
+    reauth_started: std::sync::atomic::AtomicBool,
 }
 
 /// RAII per-peer slot: decrements the per-peer counter (and prunes the entry
@@ -1381,10 +1741,12 @@ impl ForwardService {
         // The agent owns the effective (hot-swappable) connect policy; the
         // forwarder reads it per stream rather than pinning a copy.
         agent.set_connect_policy(policy);
+        let fwd_diag = Arc::new(ForwardDiagnostics::default());
         Ok(Self {
             agent,
             connect_diag,
-            fwd_diag: Arc::new(ForwardDiagnostics::default()),
+            live: Arc::new(teardown::LiveStreams::new(Arc::clone(&fwd_diag))),
+            fwd_diag,
             forwards: std::sync::Mutex::new(Vec::new()),
             inbound_token: CancellationToken::new(),
             inbound_acceptors: std::sync::Mutex::new(Some((acceptor_v1, acceptor_v2))),
@@ -1396,6 +1758,7 @@ impl ForwardService {
             discovery_cache,
             contact_store,
             require_attestation,
+            reauth_started: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1424,6 +1787,7 @@ impl ForwardService {
     /// the acceptors already moved into their loops and returns without
     /// spawning duplicates. Returns immediately.
     pub fn spawn_inbound(self: &Arc<Self>) {
+        self.ensure_reauth_loop();
         let acceptors = self
             .inbound_acceptors
             .lock()
@@ -1438,6 +1802,31 @@ impl ForwardService {
         };
         self.spawn_acceptor_loop(acceptor_v1);
         self.spawn_acceptor_loop(acceptor_v2);
+    }
+
+    fn ensure_reauth_loop(&self) {
+        if self.reauth_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let ctx = teardown::ReauthCtx {
+            discovery_cache: Arc::clone(&self.discovery_cache),
+            contact_store: Arc::clone(&self.contact_store),
+            revocation_set: Arc::clone(&self.revocation_set),
+            move_state: Arc::clone(&self.move_state),
+            connect_policy: self.agent.connect_policy_holder(),
+            owner_trust: self.agent.owner_trust().clone(),
+            announced_bindings: self.agent.announced_machine_bindings(),
+            authenticated_bindings: self.agent.authenticated_machine_bindings(),
+            own_machine_id: self.agent.machine_id(),
+            clock: teardown::system_clock(),
+        };
+        teardown::spawn_reauth_loop(
+            Arc::clone(&self.live),
+            ctx,
+            self.agent.stream_reauth_signal(),
+            self.inbound_token.clone(),
+            Some(teardown::REAUTH_SWEEP_INTERVAL),
+        );
     }
 
     /// Drain one protocol acceptor until shutdown or accept-loop stop,
@@ -1511,6 +1900,8 @@ impl ForwardService {
                 own_machine_id: this.agent.machine_id(),
                 require_attestation: this.require_attestation,
                 owner_trust: this.agent.owner_trust().clone(),
+                live: Arc::clone(&this.live),
+                reauth: this.agent.stream_reauth_signal(),
             };
             handle_inbound(stream, &inbound_ctx).await;
         });
@@ -1522,6 +1913,7 @@ impl ForwardService {
     /// # Errors
     /// `NetworkError` if the local listener cannot be bound.
     pub async fn add_forward(&self, spec: ForwardSpec) -> NetworkResult<SocketAddr> {
+        self.ensure_reauth_loop();
         let listener = TcpListener::bind(spec.local_addr).await.map_err(|e| {
             NetworkError::ConnectionFailed(format!("bind {}: {e}", spec.local_addr))
         })?;
@@ -1549,6 +1941,7 @@ impl ForwardService {
         let target_host = spec.target_host;
         let target_port = spec.target_port;
         let require_attestation = self.require_attestation;
+        let live = Arc::clone(&self.live);
         tokio::spawn(async move {
             tracing::info!(
                 target: "x0x::forward",
@@ -1589,6 +1982,7 @@ impl ForwardService {
                 };
                 let agent = Arc::clone(&agent);
                 let fwd_diag = Arc::clone(&fwd_diag);
+                let live = Arc::clone(&live);
                 let target_host = target_host.clone();
                 tokio::spawn(async move {
                     let _admission = admission;
@@ -1601,6 +1995,7 @@ impl ForwardService {
                         target_port,
                         tcp,
                         require_attestation,
+                        &live,
                     )
                     .await;
                 });
@@ -1637,12 +2032,382 @@ impl ForwardService {
 
     /// Tear down every listener + the inbound consumer.
     pub fn shutdown(&self) {
+        // Cancel live bridges before stopping reauth (`inbound_token`).
+        // Otherwise shutdown leaves registrations that reauth no longer
+        // guards while the Agent may still be alive (Codex P2 / #1388).
+        self.live.cancel_all("shutdown");
         self.inbound_token.cancel();
         if let Ok(forwards) = self.forwards.lock() {
             for entry in forwards.iter() {
                 entry.cancel.cancel();
             }
         }
+    }
+
+    /// ADR-0074 §3: open a ForwardV2 tunnel for SOCKS without bridging yet.
+    ///
+    /// On [`Ok`], the peer's connect gate allowed `127.0.0.1:port` and the
+    /// caller should send the SOCKS success reply then [`PreparedSocksTunnel::bridge`].
+    /// [`PrepareSocksError::Denied`] means the peer refused and zero bytes
+    /// reached the target.
+    pub async fn prepare_socks_tunnel(
+        &self,
+        peer: &AgentId,
+        target_port: u16,
+    ) -> Result<PreparedSocksTunnel, PrepareSocksError> {
+        // ADR-0074 §4: a SOCKS-only embedder (`ForwardService::new` +
+        // `ForwardSocksConnector`) never calls `spawn_inbound` or
+        // `add_forward`. Start the same monitor so a local trust downgrade
+        // still tears the tunnel down.
+        self.ensure_reauth_loop();
+        // Same global outbound / per-peer caps as `add_forward`. The permit
+        // stays inside the returned tunnel until `bridge` finishes.
+        let Some(admission) = self.admit(*peer, false) else {
+            self.fwd_diag.record_over_cap();
+            return Err(PrepareSocksError::Failed);
+        };
+        prepare_outbound_v2_for_socks(
+            &self.agent,
+            peer,
+            "127.0.0.1",
+            target_port,
+            &self.live,
+            admission,
+            &self.fwd_diag,
+        )
+        .await
+    }
+}
+
+/// Outcome of [`ForwardService::prepare_socks_tunnel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareSocksError {
+    /// Peer connect gate denied the target (SOCKS `0x02`).
+    Denied,
+    /// Stream open / attestation / transport failure (SOCKS `0x04`).
+    Failed,
+}
+
+/// A peer stream that has cleared the remote connect gate and is ready to bridge.
+pub struct PreparedSocksTunnel {
+    /// `None` after [`Self::bridge`] takes the stream, or when Drop resets it.
+    stream: Option<PeerStream>,
+    guard: teardown::LiveStreamGuard,
+    /// Outbound admission. Held until [`Self::bridge`] returns.
+    admission: Admission,
+    /// Active-stream count for `/streams`. Held for the tunnel lifetime,
+    /// including [`Self::bridge`], and released on drop.
+    active: StreamLeaveGuard,
+}
+
+impl PreparedSocksTunnel {
+    /// Bridge `client` to the prepared peer stream until either side closes.
+    pub async fn bridge(mut self, tcp: TcpStream) {
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        if self.guard.token().is_cancelled() {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return;
+        }
+        let (send, recv) = stream.into_split();
+        bridge(tcp, send, recv, self.guard.token()).await;
+        // Admission and the active-stream guard drop with `self`.
+        let _caps = (&self.admission, &self.active);
+    }
+}
+
+impl Drop for PreparedSocksTunnel {
+    fn drop(&mut self) {
+        // A session that won the race after prepare, then lost cancel or the
+        // client, must not leave the admitted QUIC stream open.
+        if let Some(stream) = self.stream.as_mut() {
+            teardown::deny_pre_bridge(stream, None::<&TcpStream>);
+        }
+    }
+}
+
+/// Open ForwardV2, write the attested header, read the peer response.
+/// Does not take a local TCP — the SOCKS layer writes its reply first.
+async fn prepare_outbound_v2_for_socks(
+    agent: &Arc<crate::Agent>,
+    peer_agent: &AgentId,
+    target_host: &str,
+    target_port: u16,
+    live: &Arc<teardown::LiveStreams>,
+    admission: Admission,
+    fwd_diag: &Arc<ForwardDiagnostics>,
+) -> Result<PreparedSocksTunnel, PrepareSocksError> {
+    let ready =
+        match open_signed_forward_v2(agent, peer_agent, target_host, target_port, live).await {
+            Ok(ready) => ready,
+            Err(fail) => return Err(map_socks_v2_fail(fail, peer_agent)),
+        };
+    match response_connected(ready.response) {
+        Some(true) => {
+            fwd_diag.enter_stream();
+            Ok(PreparedSocksTunnel {
+                stream: Some(ready.stream),
+                guard: ready.guard,
+                admission,
+                active: StreamLeaveGuard(Arc::clone(fwd_diag)),
+            })
+        }
+        Some(false) => {
+            // Peer denied — reset the QUIC halves; target got zero bytes.
+            let mut stream = ready.stream;
+            teardown::deny_pre_bridge(&mut stream, None);
+            drop(ready.guard);
+            Err(PrepareSocksError::Denied)
+        }
+        None => {
+            let mut stream = ready.stream;
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            Err(PrepareSocksError::Failed)
+        }
+    }
+}
+
+/// ForwardV2 stream that has a connect-response byte and is not yet bridged.
+struct V2Handshake {
+    stream: PeerStream,
+    guard: teardown::LiveStreamGuard,
+    response: u8,
+}
+
+/// Why [`open_signed_forward_v2`] stopped before a response byte.
+enum V2DriveFail {
+    /// `open_peer_stream` failed. No stream was opened.
+    Open(Box<NetworkError>),
+    /// A stream was opened. The caller resets or drops it.
+    AfterOpen(Box<V2AfterOpen>),
+    /// [`PreBridgeReset`] already reset the stream. Nothing remains to close.
+    AlreadyReset,
+}
+
+/// Resets a ForwardV2 stream when preparation is dropped before the caller
+/// takes the stream. A peer that keeps QUIC up and withholds the response
+/// byte must not leave the stream or its admission behind.
+struct PreBridgeReset {
+    stream: Option<PeerStream>,
+}
+
+impl PreBridgeReset {
+    fn arm(stream: PeerStream) -> Self {
+        Self {
+            stream: Some(stream),
+        }
+    }
+
+    fn stream_mut(&mut self) -> Option<&mut PeerStream> {
+        self.stream.as_mut()
+    }
+
+    fn disarm(&mut self) -> Option<PeerStream> {
+        self.stream.take()
+    }
+}
+
+impl Drop for PreBridgeReset {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.as_mut() {
+            teardown::deny_pre_bridge(stream, None::<&TcpStream>);
+        }
+    }
+}
+
+struct V2AfterOpen {
+    kind: V2AfterOpenKind,
+    stream: PeerStream,
+    guard: teardown::LiveStreamGuard,
+}
+
+enum V2AfterOpenKind {
+    Cancelled,
+    SigningGateRefused,
+    SignFailed(ForwardError),
+    WriteFailed,
+    ReadFailed(std::io::Error),
+}
+
+fn v2_after_open(
+    kind: V2AfterOpenKind,
+    stream: PeerStream,
+    guard: teardown::LiveStreamGuard,
+) -> V2DriveFail {
+    V2DriveFail::AfterOpen(Box::new(V2AfterOpen {
+        kind,
+        stream,
+        guard,
+    }))
+}
+
+/// Hand `held` to the caller, or report that Drop already reset it.
+fn fail_held(
+    held: &mut PreBridgeReset,
+    kind: V2AfterOpenKind,
+    guard: teardown::LiveStreamGuard,
+) -> V2DriveFail {
+    match held.disarm() {
+        Some(stream) => v2_after_open(kind, stream, guard),
+        None => {
+            drop(guard);
+            V2DriveFail::AlreadyReset
+        }
+    }
+}
+
+/// Shared ForwardV2 open, sign, header write, and response read.
+///
+/// Does not bridge and does not reset the stream. [`try_outbound_v2`] and
+/// [`prepare_outbound_v2_for_socks`] map [`V2DriveFail`] on their own.
+async fn open_signed_forward_v2(
+    agent: &Arc<crate::Agent>,
+    peer_agent: &AgentId,
+    target_host: &str,
+    target_port: u16,
+    live: &Arc<teardown::LiveStreams>,
+) -> Result<V2Handshake, V2DriveFail> {
+    let mut held = match agent
+        .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
+        .await
+    {
+        Ok(stream) => PreBridgeReset::arm(stream),
+        Err(error) => return Err(V2DriveFail::Open(Box::new(error))),
+    };
+    // ADR-0074 §4: register before the header/response window so a trust
+    // loss while waiting still hits the ≤5 s bound. `held` resets the stream
+    // if this future is dropped while the peer withholds the response byte.
+    let Some(machine) = held.stream_mut().map(|stream| stream.peer()) else {
+        return Err(V2DriveFail::AlreadyReset);
+    };
+    let guard = live.register(
+        teardown::StreamGate::Outbound {
+            peer_agent: *peer_agent,
+            machine,
+        },
+        teardown::StreamAuthority::PeerTrust,
+    );
+    agent.stream_reauth_signal().notify_one();
+    if guard.token().is_cancelled() {
+        return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
+    }
+
+    // ADR-0043: the V2 attestation is an agent-key signature. A
+    // quiesced/quarantined machine produces none. ADR-0074 §4 races the
+    // gate against reauth cancel so a stalled move-state lock cannot hold
+    // the stream past the 5 s bound.
+    match wait_signing_gate_or_cancel(guard.token(), agent.signing_gate_allows(&agent.agent_id()))
+        .await
+    {
+        Err(teardown::Cancelled) => {
+            return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
+        }
+        Ok(false) => {
+            return Err(fail_held(
+                &mut held,
+                V2AfterOpenKind::SigningGateRefused,
+                guard,
+            ));
+        }
+        Ok(true) => {}
+    }
+    // The header carries the opener's public key so the verifier doesn't
+    // depend on announce propagation (#204 soak fix).
+    let mut header = ForwardV2Header::new(
+        target_host.to_string(),
+        target_port,
+        agent.agent_id(),
+        agent
+            .identity()
+            .agent_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+        machine,
+    );
+    if let Err(error) = header.sign(agent.identity().agent_keypair()) {
+        return Err(fail_held(
+            &mut held,
+            V2AfterOpenKind::SignFailed(error),
+            guard,
+        ));
+    }
+    let written = {
+        let Some(stream) = held.stream_mut() else {
+            return Err(fail_held(&mut held, V2AfterOpenKind::WriteFailed, guard));
+        };
+        teardown::wait_cancellable(guard.token(), write_header_v2(stream.send_mut(), &header)).await
+    };
+    match written {
+        Err(teardown::Cancelled) => {
+            return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
+        }
+        Ok(Err(_)) => return Err(fail_held(&mut held, V2AfterOpenKind::WriteFailed, guard)),
+        Ok(Ok(())) => {}
+    }
+    let mut resp = [0u8; 1];
+    let read = {
+        let Some(stream) = held.stream_mut() else {
+            return Err(fail_held(
+                &mut held,
+                V2AfterOpenKind::ReadFailed(std::io::Error::other(
+                    "forward v2 stream already reset",
+                )),
+                guard,
+            ));
+        };
+        teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await
+    };
+    match read {
+        Err(teardown::Cancelled) => {
+            return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
+        }
+        Ok(Err(error)) => {
+            return Err(fail_held(
+                &mut held,
+                V2AfterOpenKind::ReadFailed(std::io::Error::other(error)),
+                guard,
+            ));
+        }
+        Ok(Ok(())) => {}
+    }
+    if guard.token().is_cancelled() {
+        return Err(fail_held(&mut held, V2AfterOpenKind::Cancelled, guard));
+    }
+    let Some(stream) = held.disarm() else {
+        drop(guard);
+        return Err(V2DriveFail::AlreadyReset);
+    };
+    Ok(V2Handshake {
+        stream,
+        guard,
+        response: resp[0],
+    })
+}
+
+/// SOCKS maps every open/sign/write/read/cancel failure to `Failed`.
+/// A `connected == false` byte is handled by the caller as `Denied`.
+fn map_socks_v2_fail(fail: V2DriveFail, peer_agent: &AgentId) -> PrepareSocksError {
+    match fail {
+        V2DriveFail::Open(error) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                error = %error,
+                "socks prepare: could not open ForwardV2"
+            );
+            PrepareSocksError::Failed
+        }
+        V2DriveFail::AfterOpen(opened) => {
+            let V2AfterOpen {
+                mut stream, guard, ..
+            } = *opened;
+            teardown::deny_pre_bridge(&mut stream, None::<&TcpStream>);
+            drop(guard);
+            PrepareSocksError::Failed
+        }
+        V2DriveFail::AlreadyReset => PrepareSocksError::Failed,
     }
 }
 
@@ -1660,12 +2425,13 @@ async fn drive_outbound(
     target_port: u16,
     tcp: TcpStream,
     require_attestation: bool,
+    live: &Arc<teardown::LiveStreams>,
 ) {
     // Try ForwardV2 (attestation). On peer rejection (old software), fall
     // back to ForwardV1 — but ONLY when require_attestation is false. When
     // true (the default) there is no fallback: a peer that cannot handle V2
     // simply cannot forward (#204 must-fix 1).
-    match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp).await {
+    match try_outbound_v2(&agent, &peer_agent, &target_host, target_port, tcp, live).await {
         OutboundOutcome::Done => (),
         OutboundOutcome::PeerRejectedV2(tcp) => {
             if require_attestation {
@@ -1680,7 +2446,7 @@ async fn drive_outbound(
                     peer = %hex::encode(peer_agent.as_bytes()),
                     "outbound forward: peer does not support ForwardV2 — falling back to V1"
                 );
-                drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp).await;
+                drive_outbound_v1(&agent, &peer_agent, &target_host, target_port, tcp, live).await;
             }
         }
     }
@@ -1695,86 +2461,114 @@ enum OutboundOutcome {
     PeerRejectedV2(TcpStream),
 }
 
-/// Attempt a `ForwardV2` outbound forward. Returns `PeerRejectedV2` only when
-/// the failure is specifically the peer not understanding the V2 protocol
-/// byte (the write to the opened stream fails immediately).
+/// ADR-0074: race the signing-gate await against live-stream cancel.
+///
+/// A stalled move-state lock must not keep the registered stream (and its
+/// TCP/permit) alive past reauth cancel — same pattern as the header write
+/// and response read in [`open_signed_forward_v2`].
+pub(crate) async fn wait_signing_gate_or_cancel(
+    cancel: &CancellationToken,
+    gate: impl std::future::Future<Output = bool>,
+) -> Result<bool, teardown::Cancelled> {
+    teardown::wait_cancellable(cancel, gate).await
+}
+
+/// Attempt a `ForwardV2` outbound forward.
+///
+/// Open, sign, write, and read go through [`open_signed_forward_v2`].
+/// [`map_outbound_v2_fail`] keeps the V1 fallback: open failure, a refused
+/// signing gate, a sign failure, and a header-write failure return the TCP.
+/// Cancel resets both halves and finishes. A response-read error closes the
+/// local TCP and does not fall back to V1.
 async fn try_outbound_v2(
     agent: &Arc<crate::Agent>,
     peer_agent: &AgentId,
     target_host: &str,
     target_port: u16,
     tcp: TcpStream,
+    live: &Arc<teardown::LiveStreams>,
 ) -> OutboundOutcome {
-    let mut stream = match agent
-        .open_peer_stream(peer_agent, StreamProtocol::ForwardV2)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
+    match open_signed_forward_v2(agent, peer_agent, target_host, target_port, live).await {
+        Err(fail) => map_outbound_v2_fail(fail, tcp, peer_agent),
+        Ok(ready) => {
+            finish_outbound(ready.stream, [ready.response], peer_agent, tcp, ready.guard).await;
+            OutboundOutcome::Done
+        }
+    }
+}
+
+/// TCP-forward mapping. V1 fallback stays here: open, signing-gate refusal,
+/// sign failure, and header-write failure return the TCP. Cancel resets both
+/// halves and finishes. A response-read error closes the local TCP.
+fn map_outbound_v2_fail(
+    fail: V2DriveFail,
+    tcp: TcpStream,
+    peer_agent: &AgentId,
+) -> OutboundOutcome {
+    match fail {
+        V2DriveFail::Open(error) => {
             tracing::info!(
                 target: "x0x::forward",
                 peer = %hex::encode(peer_agent.as_bytes()),
-                error = %e,
+                error = %error,
                 "outbound forward v2: could not open peer stream"
             );
-            return OutboundOutcome::PeerRejectedV2(tcp);
+            OutboundOutcome::PeerRejectedV2(tcp)
         }
-    };
-
-    // ADR-0043 AgentSigningGate (review r2 C2): the V2 attestation is an
-    // agent-key signature — a quiesced/quarantined machine produces none.
-    // Fail toward the V1 fallback exactly like a signing error would; the
-    // V1 path carries no agent signature (transport-machine context only,
-    // filtered receiver-side by B/P).
-    if !agent.signing_gate_allows(&agent.agent_id()).await {
-        tracing::info!(
-            target: "x0x::forward",
-            peer = %hex::encode(peer_agent.as_bytes()),
-            "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
-        );
-        return OutboundOutcome::PeerRejectedV2(tcp);
+        V2DriveFail::AfterOpen(opened) => {
+            let V2AfterOpen {
+                kind,
+                mut stream,
+                guard,
+            } = *opened;
+            match kind {
+                V2AfterOpenKind::Cancelled => {
+                    teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+                    drop(guard);
+                    OutboundOutcome::Done
+                }
+                V2AfterOpenKind::SigningGateRefused => {
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer_agent.as_bytes()),
+                        "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
+                    );
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::PeerRejectedV2(tcp)
+                }
+                V2AfterOpenKind::SignFailed(error) => {
+                    tracing::warn!(
+                        target: "x0x::forward",
+                        error = %error,
+                        "outbound forward v2: failed to sign attestation — falling back to V1"
+                    );
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::PeerRejectedV2(tcp)
+                }
+                V2AfterOpenKind::WriteFailed => {
+                    // Header write failed: the peer likely reset after the
+                    // unknown V2 protocol byte. Return the TCP for V1.
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::PeerRejectedV2(tcp)
+                }
+                V2AfterOpenKind::ReadFailed(error) => {
+                    tracing::info!(
+                        target: "x0x::forward",
+                        peer = %hex::encode(peer_agent.as_bytes()),
+                        %error,
+                        "outbound forward v2: peer closed/reset before connect response — closing local TCP"
+                    );
+                    drop(guard);
+                    drop(stream);
+                    OutboundOutcome::Done
+                }
+            }
+        }
+        V2DriveFail::AlreadyReset => OutboundOutcome::Done,
     }
-    // Build + sign the V2 header with the local agent keypair. The header
-    // carries the opener's public key so the verifier doesn't depend on
-    // announce propagation (#204 soak fix).
-    let mut header = ForwardV2Header::new(
-        target_host.to_string(),
-        target_port,
-        agent.agent_id(),
-        agent
-            .identity()
-            .agent_keypair()
-            .public_key()
-            .as_bytes()
-            .to_vec(),
-        stream.peer(),
-    );
-    if let Err(e) = header.sign(agent.identity().agent_keypair()) {
-        tracing::warn!(
-            target: "x0x::forward",
-            error = %e,
-            "outbound forward v2: failed to sign attestation — falling back to V1"
-        );
-        return OutboundOutcome::PeerRejectedV2(tcp);
-    }
-    // Write the V2 header. If this fails the peer likely reset the stream
-    // after reading the unknown V2 protocol byte (old software) — fall back.
-    if write_header_v2(stream.send_mut(), &header).await.is_err() {
-        return OutboundOutcome::PeerRejectedV2(tcp);
-    }
-    // Read the peer's connect-response byte.
-    let mut resp = [0u8; 1];
-    if let Err(error) = stream.recv_mut().read_exact(&mut resp).await {
-        tracing::info!(
-            target: "x0x::forward",
-            peer = %hex::encode(peer_agent.as_bytes()),
-            %error,
-            "outbound forward v2: peer closed/reset before connect response — closing local TCP"
-        );
-        return OutboundOutcome::Done;
-    }
-    finish_outbound(stream, resp, peer_agent, tcp).await;
-    OutboundOutcome::Done
 }
 
 /// Legacy `ForwardV1` outbound forward (no attestation). Used for pre-#204
@@ -1785,6 +2579,7 @@ async fn drive_outbound_v1(
     target_host: &str,
     target_port: u16,
     tcp: TcpStream,
+    live: &Arc<teardown::LiveStreams>,
 ) {
     let mut stream = match agent
         .open_peer_stream(peer_agent, StreamProtocol::ForwardV1)
@@ -1801,32 +2596,71 @@ async fn drive_outbound_v1(
             return;
         }
     };
+    let guard = live.register(
+        teardown::StreamGate::Outbound {
+            peer_agent: *peer_agent,
+            machine: stream.peer(),
+        },
+        teardown::StreamAuthority::PeerTrust,
+    );
+    agent.stream_reauth_signal().notify_one();
+    if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+        return;
+    }
     let header = ForwardHeader {
         target_host: target_host.to_string(),
         target_port,
     };
-    if write_header(stream.send_mut(), &header).await.is_err() {
-        return;
+    match teardown::wait_cancellable(guard.token(), write_header(stream.send_mut(), &header)).await
+    {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return;
+        }
+        Ok(Err(_)) => return,
+        Ok(Ok(())) => {}
     }
     let mut resp = [0u8; 1];
-    if let Err(error) = stream.recv_mut().read_exact(&mut resp).await {
-        tracing::info!(
-            target: "x0x::forward",
-            peer = %hex::encode(peer_agent.as_bytes()),
-            %error,
-            "outbound forward v1: peer closed/reset before connect response — closing local TCP"
-        );
-        return;
+    match teardown::wait_cancellable(guard.token(), stream.recv_mut().read_exact(&mut resp)).await {
+        Err(teardown::Cancelled) => {
+            teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+            return;
+        }
+        Ok(Err(error)) => {
+            tracing::info!(
+                target: "x0x::forward",
+                peer = %hex::encode(peer_agent.as_bytes()),
+                %error,
+                "outbound forward v1: peer closed/reset before connect response — closing local TCP"
+            );
+            return;
+        }
+        Ok(Ok(())) => {}
     }
-    finish_outbound(stream, resp, peer_agent, tcp).await;
+    finish_outbound(stream, resp, peer_agent, tcp, guard).await;
 }
 
 /// Shared tail: interpret the connect-response byte and bridge on `connected`.
-async fn finish_outbound(stream: PeerStream, resp: [u8; 1], peer_agent: &AgentId, tcp: TcpStream) {
+///
+/// ADR-0074 §4 ("both ends enforce"): the stream was registered as soon as
+/// the peer stream opened (before the header/response window), so a trust
+/// loss during that window still tears it down within the 5 s bound.
+async fn finish_outbound(
+    mut stream: PeerStream,
+    resp: [u8; 1],
+    peer_agent: &AgentId,
+    tcp: TcpStream,
+    guard: teardown::LiveStreamGuard,
+) {
+    if guard.token().is_cancelled() {
+        teardown::deny_pre_bridge(&mut stream, Some(&tcp));
+        return;
+    }
     match response_connected(resp[0]) {
         Some(true) => {
             let (send, recv) = stream.into_split();
-            bridge(tcp, send, recv).await;
+            bridge(tcp, send, recv, guard.token()).await;
         }
         Some(false) => {
             tracing::info!(
@@ -2410,7 +3244,7 @@ mod tests {
                     discovery_cache: cache,
                     contact_store: contacts,
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2418,6 +3252,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2453,7 +3288,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2461,6 +3296,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2487,7 +3323,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2495,6 +3331,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2522,7 +3359,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2530,6 +3367,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2555,7 +3393,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2563,6 +3401,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2590,7 +3429,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, stranger_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2598,6 +3437,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2626,7 +3466,7 @@ mod tests {
                     discovery_cache: cache_with_agent(&opener_kp, opener_machine),
                     contact_store: trusted_store(opener),
                     own_machine_id: recipient_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2634,6 +3474,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await,
@@ -2715,10 +3556,11 @@ mod tests {
             discovery_cache: cache,
             contact_store: contacts,
             own_machine_id: recipient,
-            now_ms: now_ms(),
+            clock: Arc::new(now_ms),
             revocation_set: revoked,
             move_state: moves,
             owner_trust: crate::owner_trust::OwnerTrust::default(),
+            local_authority_only: false,
         };
         let good = v2_wire_round_trip(&signed_v2_header("127.0.0.1", 22, &b, recipient)).await;
         assert_eq!(
@@ -2743,12 +3585,13 @@ mod tests {
             discovery_cache: cache.clone(),
             contact_store: trusted_store(kp.agent_id()),
             own_machine_id: recipient,
-            now_ms: now_ms(),
+            clock: Arc::new(now_ms),
             revocation_set: Arc::new(tokio::sync::RwLock::new(
                 crate::revocation::RevocationSet::new(),
             )),
             move_state: Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new())),
             owner_trust: crate::owner_trust::OwnerTrust::default(),
+            local_authority_only: false,
         };
         let target = "127.0.0.1:22".parse().unwrap();
         let policy = policy_with_allow(kp.agent_id(), machine, target);
@@ -2909,6 +3752,184 @@ mod tests {
         assert!(ForwardConfig::secure().require_attestation);
     }
 
+    /// RC12 / Codex P2 (#1388): `ForwardService::shutdown` cancels every live
+    /// registration before the inbound/reauth token, so a bridge closes
+    /// immediately while the Agent stays alive.
+    #[tokio::test]
+    async fn shutdown_cancels_live_streams_while_agent_alive() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Explicit paths (incl. absent user.key) so unit runs without
+        // nextest's X0X_HOME — avoids #456 real-home panic in Agent::build.
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_user_key_path(dir.path().join("user.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(agent.clone(), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+
+        let guard = service.live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: AgentId([0x51; 32]),
+                machine: MachineId([0xB0; 32]),
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert_eq!(service.live.len(), 1);
+        assert!(!guard.token().is_cancelled());
+
+        service.shutdown();
+
+        assert!(
+            guard.token().is_cancelled(),
+            "shutdown must cancel live bridge tokens immediately"
+        );
+        assert_eq!(service.live.len(), 0, "shutdown must drain live registry");
+        assert_eq!(service.diagnostics().torn_down_reauth(), 0);
+        assert_eq!(service.diagnostics().torn_down_shutdown(), 1);
+        assert_eq!(
+            service.diagnostics().torn_down_reasons().get("shutdown"),
+            Some(&1)
+        );
+        // Agent stays alive: do not call agent.shutdown(); Arc still usable.
+        assert!(!agent.shutdown_token().is_cancelled());
+        assert!(!agent.agent_id().as_bytes().is_empty());
+    }
+
+    /// RC13 / #1488: `ForwardService::shutdown` closes the live registry so a
+    /// register that lands afterward cannot obtain an uncancelled bridge token,
+    /// while the Agent stays alive (#456 explicit identity paths).
+    #[tokio::test]
+    async fn shutdown_late_register_cancelled_while_agent_alive() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Explicit paths (incl. absent user.key) so unit runs without
+        // nextest's X0X_HOME — avoids #456 real-home panic in Agent::build.
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_user_key_path(dir.path().join("user.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(agent.clone(), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+
+        // Shutdown first; Agent stays alive — do not call agent.shutdown().
+        service.shutdown();
+        assert!(!agent.shutdown_token().is_cancelled());
+
+        let late = service.live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: AgentId([0x51; 32]),
+                machine: MachineId([0xB0; 32]),
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert!(
+            late.token().is_cancelled(),
+            "register after ForwardService::shutdown must yield a cancelled token"
+        );
+        assert!(!agent.shutdown_token().is_cancelled());
+        assert_eq!(
+            service.diagnostics().torn_down_reauth(),
+            0,
+            "empty/late shutdown path must not count as trust-loss"
+        );
+    }
+
+    /// RC13 / #1488: a handler that stalls before `live.register`, then resumes
+    /// after `ForwardService::shutdown` while the Agent is still alive, must
+    /// see a cancelled registration and must not start bridging.
+    ///
+    /// Unit-style oneshot barrier; no real QUIC.
+    #[tokio::test]
+    async fn shutdown_cancels_registration_resumed_after_pending_handler() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_user_key_path(dir.path().join("user.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = ForwardService::new(agent.clone(), policy, diagnostics, true)
+            .expect("forward acceptor registration");
+
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let live = Arc::clone(&service.live);
+        let join = tokio::spawn(async move {
+            let _ = pending_tx.send(());
+            let _ = resume_rx.await;
+            let guard = live.register(
+                teardown::StreamGate::Outbound {
+                    peer_agent: AgentId([0x51; 32]),
+                    machine: MachineId([0xB0; 32]),
+                },
+                teardown::StreamAuthority::PeerTrust,
+            );
+            let token = guard.token().clone();
+            let mut bridge_started = false;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {}
+                _ = async {
+                    bridge_started = true;
+                    std::future::pending::<()>().await
+                } => {}
+            }
+            (token.is_cancelled(), bridge_started)
+        });
+
+        pending_rx.await.expect("handler reached pending point");
+        service.shutdown();
+        assert!(
+            !agent.shutdown_token().is_cancelled(),
+            "Agent must stay alive across ForwardService::shutdown"
+        );
+        resume_tx.send(()).expect("resume pending handler");
+        let (cancelled, bridge_started) = join.await.expect("handler join");
+        assert!(
+            cancelled,
+            "registration resumed after shutdown must be cancelled"
+        );
+        assert!(
+            !bridge_started,
+            "cancelled registration must not start bridging"
+        );
+        assert_eq!(
+            service.diagnostics().torn_down_reauth(),
+            0,
+            "pending-handler race must not count as trust-loss"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "binds loopback TCP listeners; run only in the isolated integration tier"]
     async fn port_zero_forwards_are_listed_and_removed_by_bound_address() {
@@ -2987,7 +4008,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -2995,6 +4016,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3012,7 +4034,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3020,6 +4042,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3039,7 +4062,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3047,6 +4070,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3065,7 +4089,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3073,6 +4097,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3091,7 +4116,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3099,6 +4124,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3117,7 +4143,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3125,6 +4151,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3171,7 +4198,7 @@ mod tests {
                     discovery_cache: cache,
                     contact_store: contacts,
                     own_machine_id: own_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3179,6 +4206,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 },
             )
             .await
@@ -3213,7 +4241,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: own_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3221,6 +4249,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3249,7 +4278,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: other_machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3257,6 +4286,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3288,7 +4318,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3296,6 +4326,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3327,7 +4358,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: ts,
+                    clock: Arc::new(move || ts),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3335,6 +4366,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3363,7 +4395,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3371,6 +4403,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3434,7 +4467,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3442,6 +4475,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3458,7 +4492,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3466,6 +4500,7 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
@@ -3530,7 +4565,7 @@ mod tests {
                     discovery_cache: cache.clone(),
                     contact_store: contacts.clone(),
                     own_machine_id: machine,
-                    now_ms: now_ms(),
+                    clock: Arc::new(now_ms),
                     revocation_set: Arc::new(tokio::sync::RwLock::new(
                         crate::revocation::RevocationSet::new()
                     )),
@@ -3538,11 +4573,1015 @@ mod tests {
                         crate::key_move::MoveState::new()
                     )),
                     owner_trust: crate::owner_trust::OwnerTrust::default(),
+                    local_authority_only: false,
                 }
             )
             .await
             .unwrap(),
             target,
         );
+    }
+
+    /// ADR-0074 §4 bound after an applied reauth event (same as teardown tests).
+    const EVENT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// WHY (Codex P2 / RC6): `try_outbound_v2` races the signing-gate await
+    /// against the live-stream cancel token. A forever-pending gate (stalled
+    /// move-state lock) must return [`teardown::Cancelled`] within the 5 s
+    /// bound so the handler can [`teardown::deny_pre_bridge`] / RST TCP and
+    /// drop the registry entry (permit release via guard drop).
+    #[tokio::test]
+    async fn signing_gate_wait_cancel_closes_tcp_and_clears_registry_within_5s() {
+        use std::io::ErrorKind;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let server = listener.accept().await.unwrap().0;
+
+        let diag = Arc::new(ForwardDiagnostics::default());
+        let live = Arc::new(teardown::LiveStreams::new(Arc::clone(&diag)));
+        let guard = live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: AgentId([0x51; 32]),
+                machine: MachineId([0xB0; 32]),
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert_eq!(live.len(), 1);
+
+        let token = guard.token().clone();
+        let started = Instant::now();
+        let stalled = tokio::spawn(async move {
+            wait_signing_gate_or_cancel(&token, std::future::pending::<bool>()).await
+        });
+        tokio::task::yield_now().await;
+        guard.token().cancel();
+
+        let result = tokio::time::timeout(EVENT_BOUND, stalled)
+            .await
+            .expect("signing-gate wait must resolve within ADR-0074 5s bound")
+            .expect("join");
+        assert!(
+            matches!(result, Err(teardown::Cancelled)),
+            "stalled signing-gate wait must return Cancelled on live-stream cancel"
+        );
+        assert!(
+            started.elapsed() <= EVENT_BOUND,
+            "cancel must interrupt within {EVENT_BOUND:?}, took {:?}",
+            started.elapsed()
+        );
+
+        // Handler path after Cancelled: deny_pre_bridge RSTs TCP (QUIC half
+        // needs real PeerStream halves — covered elsewhere).
+        teardown::reset_tcp(&server);
+        drop(server);
+
+        let mut buf = [0u8; 8];
+        match client.read(&mut buf).await {
+            Ok(0) => panic!("got clean EOF (FIN); expected ConnectionReset from linger-0 close"),
+            Ok(n) => panic!("unexpected {n} bytes from reset peer"),
+            Err(err) => assert_eq!(
+                err.kind(),
+                ErrorKind::ConnectionReset,
+                "expected ConnectionReset, got {err:?}"
+            ),
+        }
+
+        drop(guard);
+        assert_eq!(
+            live.len(),
+            0,
+            "LiveStreamGuard drop must remove the stream from the registry"
+        );
+    }
+
+    /// WHY (Codex P2 / RC6): cancel during the signing-gate wait maps to
+    /// [`OutboundOutcome::Done`] (after deny_pre_bridge), never
+    /// [`OutboundOutcome::PeerRejectedV2`]. Refuse (`Ok(false)`) alone falls
+    /// back to V1.
+    #[tokio::test]
+    async fn signing_gate_cancel_is_done_not_peer_rejected_v2() {
+        let cancel = CancellationToken::new();
+        let wait = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { wait_signing_gate_or_cancel(&cancel, std::future::pending::<bool>()).await }
+        });
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(EVENT_BOUND, wait)
+            .await
+            .expect("cancel must resolve within ADR-0074 5s bound")
+            .expect("join");
+
+        // Same branch table as try_outbound_v2's signing-gate match.
+        let outcome = match result {
+            Err(teardown::Cancelled) => "Done",
+            Ok(false) => "PeerRejectedV2",
+            Ok(true) => "Continue",
+        };
+        assert_eq!(
+            outcome, "Done",
+            "cancel during signing-gate wait must be Done, not PeerRejectedV2"
+        );
+
+        // Refuse stays on the V1-fallback path (still distinct from cancel).
+        let refuse = wait_signing_gate_or_cancel(&CancellationToken::new(), async { false }).await;
+        assert!(matches!(refuse, Ok(false)));
+        let refuse_outcome = match refuse {
+            Err(teardown::Cancelled) => "Done",
+            Ok(false) => "PeerRejectedV2",
+            Ok(true) => "Continue",
+        };
+        assert_eq!(refuse_outcome, "PeerRejectedV2");
+    }
+
+    /// WHY (Codex P2 on #1488 RC10): forward admission uses construction-injected
+    /// clocks. `authorize_attested_opener` awaits `evaluate_pair_with` then
+    /// `grant_access_at` (OwnerTrust clock, no caller now). A grant that expires
+    /// during the contact-store wait must be denied.
+    #[tokio::test]
+    async fn authorize_attested_opener_denies_grant_expired_during_contact_lock_wait() {
+        use crate::connect::acl::ConnectOwnerEntry;
+        use crate::identity::{MachineKeypair, UserKeypair};
+        use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let owner = UserKeypair::generate().expect("owner keygen");
+        let local_agent = AgentKeypair::generate().expect("local agent").agent_id();
+        let remote_kp = AgentKeypair::generate().expect("remote agent");
+        let remote_agent = remote_kp.agent_id();
+        let remote_machine = MachineKeypair::generate()
+            .expect("remote machine")
+            .machine_id();
+
+        let t0 = 1_700_000_000u64;
+        let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            remote_agent,
+            remote_machine,
+            t0,
+        )
+        .await;
+        let clock_secs = Arc::new(AtomicU64::new(t0));
+        let clock_for_trust = Arc::clone(&clock_secs);
+        let trust = crate::owner_trust::OwnerTrust::new(Some(owner.user_id()), bindings)
+            .with_clock(Arc::new(move || clock_for_trust.load(Ordering::SeqCst)));
+
+        let grants = Arc::new(ShareGrantStore::in_memory(
+            local_agent,
+            Some(owner.user_id()),
+        ));
+        let expiry = t0 + 2;
+        let grant = ShareGrant::sign(
+            &owner,
+            [0xA2; 32],
+            Grantee::Agent(remote_agent),
+            vec![local_agent],
+            vec![ShareCap::Connect { ports: vec![22] }],
+            t0.saturating_sub(60),
+            expiry,
+        )
+        .expect("sign short-lived grant");
+        grants.accept(grant, t0).await.expect("accept grant");
+        trust.install_share_grant_store(grants);
+
+        let target: SocketAddr = "127.0.0.1:22".parse().unwrap();
+        let policy = ConnectPolicy::Enabled(ConnectAcl {
+            loaded_from: "test".into(),
+            loaded_at_unix_ms: 0,
+            allow: Vec::new(),
+            owner_allow: Vec::new(),
+            grant_allow: vec![ConnectOwnerEntry {
+                description: None,
+                targets: vec![crate::connect::acl::OwnerTarget::Exact(target)],
+            }],
+        });
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let contacts = Arc::new(tokio::sync::RwLock::new(ContactStore::new(
+            dir.path().join("contacts.json"),
+        )));
+        let cache = cache_with_agent(&remote_kp, remote_machine);
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let move_state = Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new()));
+
+        let clock_for_ctx = Arc::clone(&clock_secs);
+        let ctx = AttestationVerifyCtx {
+            discovery_cache: Arc::clone(&cache),
+            contact_store: Arc::clone(&contacts),
+            own_machine_id: MachineId([0x0A; 32]),
+            clock: Arc::new(move || clock_for_ctx.load(Ordering::SeqCst).saturating_mul(1000)),
+            revocation_set: Arc::clone(&revocations),
+            move_state: Arc::clone(&move_state),
+            owner_trust: trust.clone(),
+            local_authority_only: false,
+        };
+
+        let live =
+            authorize_attested_opener(&remote_agent, &remote_machine, &target, &policy, &ctx).await;
+        assert!(
+            matches!(live, LocalAuthorityOutcome::Allow(_)),
+            "control: grant must admit Connect at T0: {live:?}"
+        );
+
+        let held = contacts.write().await;
+        let pending = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let contacts = Arc::clone(&contacts);
+            let revocations = Arc::clone(&revocations);
+            let move_state = Arc::clone(&move_state);
+            let trust = trust.clone();
+            let policy = policy.clone();
+            let clock_for_ctx = Arc::clone(&clock_secs);
+            async move {
+                let ctx = AttestationVerifyCtx {
+                    discovery_cache: cache,
+                    contact_store: contacts,
+                    own_machine_id: MachineId([0x0A; 32]),
+                    clock: Arc::new(move || {
+                        clock_for_ctx.load(Ordering::SeqCst).saturating_mul(1000)
+                    }),
+                    revocation_set: revocations,
+                    move_state,
+                    owner_trust: trust,
+                    local_authority_only: false,
+                };
+                authorize_attested_opener(&remote_agent, &remote_machine, &target, &policy, &ctx)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        clock_secs.store(expiry + 1, Ordering::SeqCst);
+        drop(held);
+
+        let denied = pending.await.expect("authorize task");
+        assert!(
+            matches!(denied, LocalAuthorityOutcome::Deny(_)),
+            "grant that expired during contact-lock wait must not admit: {denied:?}"
+        );
+    }
+
+    /// WHY (RC10): gate expiry must read OwnerTrust's clock after the
+    /// discovery-cache await, not a caller stamp taken before it. Holding the
+    /// discovery write lock parks the gate's cache read; advancing the clock
+    /// past `cert_not_after` before release must Deny the new lane.
+    #[tokio::test]
+    async fn gate_peer_denies_cert_expired_during_discovery_lock_wait() {
+        use crate::identity::MachineKeypair;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let remote_kp = AgentKeypair::generate().expect("remote agent");
+        let remote_agent = remote_kp.agent_id();
+        let remote_machine = MachineKeypair::generate()
+            .expect("remote machine")
+            .machine_id();
+
+        let t0 = 1_700_000_000u64;
+        let cert_not_after = t0 + 10;
+        let cache = cache_with_agent(&remote_kp, remote_machine);
+        {
+            let mut guard = cache.write().await;
+            let entry = guard.get_mut(&remote_agent).expect("cached");
+            entry.cert_not_after = Some(cert_not_after);
+        }
+
+        let clock = Arc::new(AtomicU64::new(t0));
+        let clock_task = Arc::clone(&clock);
+        let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            remote_agent,
+            remote_machine,
+            t0,
+        )
+        .await;
+        let announced = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &announced,
+            remote_agent,
+            remote_machine,
+            t0,
+        )
+        .await;
+        let trust = crate::owner_trust::OwnerTrust::new(None, Arc::clone(&bindings))
+            .with_clock(Arc::new(move || clock_task.load(Ordering::SeqCst)));
+        trust.install_announced_bindings(Arc::clone(&announced));
+
+        let contacts = trusted_store(remote_agent);
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let move_state = Arc::new(tokio::sync::RwLock::new(crate::key_move::MoveState::new()));
+        let connect_policy = Arc::new(std::sync::RwLock::new(Arc::new(ConnectPolicy::default())));
+
+        let live = crate::Agent::gate_peer_outbound_at(
+            &cache,
+            &contacts,
+            &revocations,
+            &move_state,
+            &trust,
+            &announced,
+            &bindings,
+            &remote_agent,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(live, Ok(m) if m == remote_machine),
+            "control: unexpired cert must admit outbound: {live:?}"
+        );
+        let live_in = crate::Agent::gate_peer_machine_inbound_at(
+            &cache,
+            &contacts,
+            &revocations,
+            &move_state,
+            &connect_policy,
+            &trust,
+            &remote_machine,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(live_in, Ok(ref agents) if agents == &[remote_agent]),
+            "control: unexpired cert must admit inbound: {live_in:?}"
+        );
+
+        let held = cache.write().await;
+        let pending_out = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let contacts = Arc::clone(&contacts);
+            let revocations = Arc::clone(&revocations);
+            let move_state = Arc::clone(&move_state);
+            let trust = trust.clone();
+            let announced = Arc::clone(&announced);
+            let bindings = Arc::clone(&bindings);
+            async move {
+                crate::Agent::gate_peer_outbound_at(
+                    &cache,
+                    &contacts,
+                    &revocations,
+                    &move_state,
+                    &trust,
+                    &announced,
+                    &bindings,
+                    &remote_agent,
+                    false,
+                )
+                .await
+            }
+        });
+        let pending_in = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let contacts = Arc::clone(&contacts);
+            let revocations = Arc::clone(&revocations);
+            let move_state = Arc::clone(&move_state);
+            let connect_policy = Arc::clone(&connect_policy);
+            let trust = trust.clone();
+            async move {
+                crate::Agent::gate_peer_machine_inbound_at(
+                    &cache,
+                    &contacts,
+                    &revocations,
+                    &move_state,
+                    &connect_policy,
+                    &trust,
+                    &remote_machine,
+                    false,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Past not_after and the identity skew window so is_expired is true.
+        clock.store(
+            cert_not_after
+                .saturating_add(crate::identity::EXPIRY_CLOCK_SKEW_SECS)
+                .saturating_add(1),
+            Ordering::SeqCst,
+        );
+        drop(held);
+
+        let denied_out = pending_out.await.expect("outbound gate task");
+        assert!(
+            matches!(denied_out, Err(PeerGateError::Network(_))),
+            "cert expired during discovery-lock wait must deny outbound: {denied_out:?}"
+        );
+        let denied_in = pending_in.await.expect("inbound gate task");
+        assert!(
+            matches!(denied_in, Err(PeerGateError::Network(_))),
+            "cert expired during discovery-lock wait must deny inbound: {denied_in:?}"
+        );
+    }
+
+    fn offline_agent_paths(dir: &std::path::Path) -> crate::AgentBuilder {
+        crate::Agent::builder()
+            .with_identity_dir(dir)
+            .with_machine_key(dir.join("machine.key"))
+            .with_agent_key_path(dir.join("agent.key"))
+            .with_user_key_path(dir.join("user.key"))
+            .with_agent_cert_path(dir.join("agent.cert"))
+            .with_contact_store_path(dir.join("contacts.json"))
+            .with_peer_cache_disabled()
+    }
+
+    async fn offline_forward_service() -> (tempfile::TempDir, Arc<crate::Agent>, Arc<ForwardService>)
+    {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let agent = Arc::new(
+            offline_agent_paths(dir.path())
+                .build()
+                .await
+                .expect("offline agent build"),
+        );
+        let policy = Arc::new(ConnectPolicy::default());
+        let diagnostics = Arc::new(ConnectDiagnostics::new(policy.summary()));
+        let service = Arc::new(
+            ForwardService::new(Arc::clone(&agent), policy, diagnostics, true)
+                .expect("forward acceptor registration"),
+        );
+        (dir, agent, service)
+    }
+
+    fn peer_card(
+        agent_id: AgentId,
+        machine_id: MachineId,
+        now_secs: u64,
+    ) -> crate::DiscoveredAgent {
+        crate::DiscoveredAgent {
+            self_name: None,
+            cert_digest: None,
+            agent_id,
+            machine_id,
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: now_secs,
+            last_seen: now_secs,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
+    }
+
+    /// WHY (Codex P1 / #1505): `prepare_socks_tunnel` is the only entry a
+    /// SOCKS embedder calls. It must start ADR-0074 reauth, so blocking the
+    /// peer closes a live outbound tunnel without `spawn_inbound` or
+    /// `add_forward`.
+    #[tokio::test]
+    async fn socks_prepare_trust_downgrade_closes_live_tunnel() {
+        let (_dir, agent, service) = offline_forward_service().await;
+        let peer = AgentId([0x51; 32]);
+        let machine = MachineId([0xB0; 32]);
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        agent
+            .record_authenticated_machine_binding_for_testing(peer, machine)
+            .await;
+        agent
+            .insert_discovered_agent_for_testing(peer_card(peer, machine, now_secs))
+            .await;
+        agent.set_contact_trusted_for_testing(peer).await;
+
+        let prepared = service.prepare_socks_tunnel(&peer, 9).await;
+        match prepared {
+            Err(PrepareSocksError::Failed) => {}
+            Err(other) => panic!("offline SOCKS prepare must fail closed, got {other:?}"),
+            Ok(_) => panic!("offline agent has no QUIC peer; prepare must not succeed"),
+        }
+        assert!(
+            service
+                .inbound_acceptors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "SOCKS-only embedder must not consume inbound acceptors"
+        );
+        assert!(service.list_forwards().is_empty());
+
+        // Let the monitor consume the trust-add kick before the stream exists.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let guard = service.live.register(
+            teardown::StreamGate::Outbound {
+                peer_agent: peer,
+                machine,
+            },
+            teardown::StreamAuthority::PeerTrust,
+        );
+        assert!(
+            !guard.token().is_cancelled(),
+            "trusted peer must not be torn down at registration"
+        );
+
+        agent
+            .contacts()
+            .write()
+            .await
+            .set_trust(&peer, crate::contacts::TrustLevel::Blocked);
+        tokio::time::timeout(std::time::Duration::from_secs(5), guard.token().cancelled())
+            .await
+            .expect("local trust downgrade must close the SOCKS-path tunnel within 5s");
+        assert_eq!(service.diagnostics().torn_down_reauth(), 1);
+        assert_eq!(
+            service
+                .diagnostics()
+                .torn_down_reasons()
+                .get("trust_rejected"),
+            Some(&1)
+        );
+        service.shutdown();
+        agent.shutdown().await;
+    }
+
+    fn loopback_network_config() -> crate::network::NetworkConfig {
+        crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        }
+    }
+
+    fn refused_udp(err: &impl std::fmt::Display) -> bool {
+        let message = err.to_string();
+        let refused = message.contains("Operation not permitted")
+            && (message.contains("bind UDP socket")
+                || message.contains("network initialization failed"));
+        if refused && std::env::var("X0X_REQUIRE_NETWORK_TESTS").as_deref() == Ok("1") {
+            panic!(
+                "network setup refused but X0X_REQUIRE_NETWORK_TESTS=1 requires this test: {message}"
+            );
+        }
+        refused
+    }
+
+    async fn build_loopback_agent(dir: &std::path::Path, name: &str) -> Option<crate::Agent> {
+        let home = dir.join(name);
+        std::fs::create_dir_all(&home).expect("agent home");
+        match crate::Agent::builder()
+            .with_identity_dir(&home)
+            .with_machine_key(home.join("machine.key"))
+            .with_agent_key_path(home.join("agent.key"))
+            .with_user_key_path(home.join("user.key"))
+            .with_agent_cert_path(home.join("agent.cert"))
+            .with_contact_store_path(home.join("contacts.json"))
+            .with_peer_cache_dir(home.join("peer-cache"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+        {
+            Ok(agent) => Some(agent),
+            Err(err) if refused_udp(&err) => None,
+            Err(err) => panic!("agent build failed: {err}"),
+        }
+    }
+
+    fn normalize_loopback(addr: SocketAddr) -> SocketAddr {
+        if addr.ip().is_unspecified() {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), addr.port())
+        } else {
+            addr
+        }
+    }
+
+    fn allow_exact(opener: &crate::Agent, target: SocketAddr) -> Arc<ConnectPolicy> {
+        Arc::new(ConnectPolicy::Enabled(ConnectAcl {
+            loaded_from: "test".into(),
+            loaded_at_unix_ms: 0,
+            allow: vec![ConnectAllowEntry {
+                description: None,
+                agent_id: opener.agent_id(),
+                machine_id: opener.machine_id(),
+                targets: vec![target],
+            }],
+            owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
+        }))
+    }
+
+    async fn link_loopback_pair(alice: &Arc<crate::Agent>, bob: &Arc<crate::Agent>) {
+        alice.join_network().await.expect("alice join");
+        bob.join_network().await.expect("bob join");
+        let alice_net = alice.network().expect("alice network").clone();
+        let bob_net = bob.network().expect("bob network").clone();
+        let bob_addr = normalize_loopback(bob_net.bound_addr().await.expect("bob addr"));
+        alice_net
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice dials bob");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let linked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if alice_net.is_connected(&bob_peer).await
+                    && bob_net
+                        .is_connected(&ant_quic::PeerId(alice.machine_id().0))
+                        .await
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(linked.is_ok(), "loopback pair did not connect");
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let alice_addr = normalize_loopback(alice_net.bound_addr().await.expect("alice addr"));
+        alice
+            .insert_discovered_agent_for_testing({
+                let mut card = peer_card(bob.agent_id(), bob.machine_id(), now_secs);
+                card.addresses = vec![bob_addr];
+                card
+            })
+            .await;
+        alice.set_contact_trusted_for_testing(bob.agent_id()).await;
+        bob.insert_discovered_agent_for_testing({
+            let mut card = peer_card(alice.agent_id(), alice.machine_id(), now_secs);
+            card.addresses = vec![alice_addr];
+            card
+        })
+        .await;
+        bob.set_contact_trusted_for_testing(alice.agent_id()).await;
+        alice
+            .record_authenticated_machine_binding_for_testing(bob.agent_id(), bob.machine_id())
+            .await;
+        bob.record_authenticated_machine_binding_for_testing(alice.agent_id(), alice.machine_id())
+            .await;
+    }
+
+    async fn spawn_counting_target() -> (u16, Arc<std::sync::atomic::AtomicU64>, CancellationToken)
+    {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("target");
+        let port = listener.local_addr().expect("target addr").port();
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = CancellationToken::new();
+        let bytes_task = Arc::clone(&bytes);
+        let cancel_task = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = cancel_task.cancelled() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut sock, _)) = accepted else { break };
+                let bytes_task = Arc::clone(&bytes_task);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                bytes_task.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (port, bytes, cancel)
+    }
+
+    /// SOCKS CONNECT, one payload, then block the peer. Returns the opener's
+    /// active-stream count while the payload was in flight, and whether the
+    /// tunnel closed within 5 s of the downgrade.
+    async fn drive_socks_then_block(
+        alice: &Arc<crate::Agent>,
+        alice_fwd: &Arc<ForwardService>,
+        bob_id: AgentId,
+        target_port: u16,
+        target_bytes: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> (u64, bool) {
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOKEN: &str = "socks-rc2-token";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("socks");
+        let addr = listener.local_addr().expect("socks addr");
+        let (client_res, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut client = client_res.expect("socks client");
+        let (server, _) = accepted.expect("socks accept");
+        let host = format!("{}.x0x", hex::encode(bob_id.as_bytes()));
+        let connector = crate::socks::ForwardSocksConnector::new(Arc::clone(alice_fwd));
+        let denied = AtomicU64::new(0);
+        let cancel = CancellationToken::new();
+        let contacts = alice.contacts().clone();
+        let fwd = Arc::clone(alice_fwd);
+        let bytes = Arc::clone(target_bytes);
+
+        let handler =
+            crate::socks::handle_tcp_client(server, TOKEN, &connector, &denied, None, &cancel);
+        let client_side = async move {
+            client.write_all(&[0x05, 0x01, 0x02]).await.expect("greet");
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).await.expect("method");
+            assert_eq!(method, [0x05, 0x02]);
+            let user = b"x0x";
+            let pass = TOKEN.as_bytes();
+            let mut auth = vec![0x01, user.len() as u8];
+            auth.extend_from_slice(user);
+            auth.push(pass.len() as u8);
+            auth.extend_from_slice(pass);
+            client.write_all(&auth).await.expect("auth");
+            let mut status = [0u8; 2];
+            client.read_exact(&mut status).await.expect("auth status");
+            assert_eq!(status, [0x01, 0x00]);
+            let host_b = host.as_bytes();
+            let mut req = vec![0x05, 0x01, 0x00, 0x03, host_b.len() as u8];
+            req.extend_from_slice(host_b);
+            req.extend_from_slice(&target_port.to_be_bytes());
+            client.write_all(&req).await.expect("connect");
+            let mut resp = [0u8; 10];
+            client.read_exact(&mut resp).await.expect("connect reply");
+            assert_eq!(resp[1], 0x00, "SOCKS CONNECT must succeed");
+            client.write_all(b"ping").await.expect("payload");
+            let saw_bytes = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while bytes.load(std::sync::atomic::Ordering::SeqCst) < 4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                saw_bytes.is_ok(),
+                "proxied payload did not reach the target"
+            );
+            let active = fwd.diagnostics().active_streams();
+            contacts
+                .write()
+                .await
+                .set_trust(&bob_id, crate::contacts::TrustLevel::Blocked);
+            let torn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut buf = [0u8; 8];
+                let _ = client.read(&mut buf).await;
+                while fwd.diagnostics().torn_down_reauth() < 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            (active, torn.is_ok())
+        };
+        let (handler, counted) = tokio::join!(handler, client_side);
+        handler.expect("socks session");
+        counted
+    }
+
+    /// WHY (Codex P2 / #1505): a successful SOCKS proxy must show up in the
+    /// opener's active-stream count (`GET /streams`) while bytes flow, and a
+    /// local trust downgrade must close that tunnel. Alice never calls
+    /// `spawn_inbound` or `add_forward`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn socks_proxy_counts_active_stream_until_trust_downgrade() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
+            return;
+        };
+        let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
+            alice.shutdown().await;
+            return;
+        };
+        let alice = Arc::new(alice);
+        let bob = Arc::new(bob);
+        link_loopback_pair(&alice, &bob).await;
+
+        let (target_port, target_bytes, target_cancel) = spawn_counting_target().await;
+        let bob_policy = allow_exact(&alice, SocketAddr::from(([127, 0, 0, 1], target_port)));
+        let bob_diag = Arc::new(ConnectDiagnostics::new(bob_policy.summary()));
+        let bob_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&bob), bob_policy, bob_diag, true)
+                .expect("bob forwarder"),
+        );
+        bob_fwd.spawn_inbound();
+
+        let alice_policy = Arc::new(ConnectPolicy::default());
+        let alice_diag = Arc::new(ConnectDiagnostics::new(alice_policy.summary()));
+        let alice_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&alice), alice_policy, alice_diag, true)
+                .expect("alice forwarder"),
+        );
+        assert!(
+            alice_fwd
+                .inbound_acceptors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "opener must stay SOCKS-only: no spawn_inbound"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+
+        let counted = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            drive_socks_then_block(
+                &alice,
+                &alice_fwd,
+                bob.agent_id(),
+                target_port,
+                &target_bytes,
+            ),
+        )
+        .await;
+
+        target_cancel.cancel();
+        bob_fwd.shutdown();
+        alice_fwd.shutdown();
+        alice.shutdown().await;
+        bob.shutdown().await;
+
+        let (active_during, closed) = counted.expect("proxy session finished");
+        assert_eq!(
+            active_during, 1,
+            "GET /streams reads this counter and must be non-zero while SOCKS traffic flows"
+        );
+        assert!(
+            closed,
+            "local trust downgrade must close the live SOCKS tunnel within 5s"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+        assert_eq!(alice_fwd.diagnostics().torn_down_reauth(), 1);
+        assert_eq!(
+            alice_fwd
+                .diagnostics()
+                .torn_down_reasons()
+                .get("trust_rejected"),
+            Some(&1)
+        );
+    }
+
+    /// WHY (Codex P2 / #1505): a trusted peer that accepts ForwardV2 and
+    /// withholds the response byte must not keep the QUIC stream after the
+    /// SOCKS client disconnects. Cleanup has to beat the 10 second deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn socks_stalled_peer_resets_stream_on_client_disconnect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let Some(alice) = build_loopback_agent(dir.path(), "alice").await else {
+            return;
+        };
+        let Some(bob) = build_loopback_agent(dir.path(), "bob").await else {
+            return;
+        };
+        let alice = Arc::new(alice);
+        let bob = Arc::new(bob);
+        link_loopback_pair(&alice, &bob).await;
+
+        let bob_policy = Arc::new(ConnectPolicy::default());
+        let bob_diag = Arc::new(ConnectDiagnostics::new(bob_policy.summary()));
+        let bob_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&bob), bob_policy, bob_diag, true)
+                .expect("bob forwarder"),
+        );
+        let mut bob_v2 = bob_fwd
+            .inbound_acceptors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("bob acceptors")
+            .1;
+
+        let alice_policy = Arc::new(ConnectPolicy::default());
+        let alice_diag = Arc::new(ConnectDiagnostics::new(alice_policy.summary()));
+        let alice_fwd = Arc::new(
+            ForwardService::new(Arc::clone(&alice), alice_policy, alice_diag, true)
+                .expect("alice forwarder"),
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+
+        let (saw_header_tx, saw_header_rx) = tokio::sync::oneshot::channel();
+        let bob_hold = tokio::spawn(async move {
+            let Some(mut stream) = bob_v2.next().await else {
+                return false;
+            };
+            let header = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_header_v2(stream.recv_mut()),
+            )
+            .await;
+            let Ok(Ok(_)) = header else {
+                return false;
+            };
+            let _ = saw_header_tx.send(());
+            let mut buf = [0u8; 1];
+            // Timeout is failure: the opener must reset, not leave us blocked.
+            matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    stream.recv_mut().read(&mut buf),
+                )
+                .await,
+                Ok(Ok(0)) | Ok(Err(_))
+            )
+        });
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.expect("socks probe");
+        let port = probe.local_addr().expect("socks addr").port();
+        drop(probe);
+        let listen: SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .expect("loopback socks listen");
+        let service = crate::socks::SocksService::spawn(
+            &crate::socks::SocksConfig {
+                listen: Some(listen),
+            },
+            Arc::new("socks-rc3-token".to_string()),
+            Arc::new(crate::socks::ForwardSocksConnector::new(Arc::clone(
+                &alice_fwd,
+            ))),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("socks spawn");
+
+        let mut client = TcpStream::connect(listen).await.expect("socks client");
+        client.write_all(&[0x05, 0x01, 0x02]).await.expect("greet");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.expect("method");
+        assert_eq!(method, [0x05, 0x02]);
+        let pass = b"socks-rc3-token";
+        let mut auth = vec![0x01, 3];
+        auth.extend_from_slice(b"x0x");
+        auth.push(u8::try_from(pass.len()).expect("token fits a u8"));
+        auth.extend_from_slice(pass);
+        client.write_all(&auth).await.expect("auth");
+        let mut auth_rep = [0u8; 2];
+        client.read_exact(&mut auth_rep).await.expect("auth reply");
+        assert_eq!(auth_rep, [0x01, 0x00]);
+        let host = format!("{}.x0x", hex::encode(bob.agent_id().as_bytes()));
+        let host_b = host.as_bytes();
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host_b.len() as u8];
+        req.extend_from_slice(host_b);
+        req.extend_from_slice(&9u16.to_be_bytes());
+        client.write_all(&req).await.expect("connect");
+
+        tokio::time::timeout(std::time::Duration::from_secs(8), saw_header_rx)
+            .await
+            .expect("stalled peer must accept the ForwardV2 header")
+            .expect("header signal");
+        assert_eq!(
+            alice_fwd.live.len(),
+            1,
+            "prepare must register the live stream while the reply is withheld"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+
+        drop(client);
+        let reset = tokio::time::timeout(std::time::Duration::from_secs(2), bob_hold)
+            .await
+            .expect("peer must observe the reset within 2s of client disconnect")
+            .expect("bob task");
+        assert!(reset, "withheld ForwardV2 reply must end in a stream reset");
+        assert_eq!(
+            alice_fwd.live.len(),
+            0,
+            "dropped prepare must unregister the stream"
+        );
+        assert_eq!(alice_fwd.diagnostics().active_streams(), 0);
+        assert_eq!(alice_fwd.diagnostics().streams_over_cap(), 0);
+
+        let mut again = TcpStream::connect(listen).await.expect("second client");
+        again
+            .write_all(&[0x05, 0x01, 0x02])
+            .await
+            .expect("second greet");
+        let greeted = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            again.read_exact(&mut method),
+        )
+        .await;
+        assert!(
+            matches!(greeted, Ok(Ok(_))),
+            "listener must still admit a session after the stalled client left: {greeted:?}"
+        );
+
+        service.shutdown_and_wait().await;
+        bob_fwd.shutdown();
+        alice_fwd.shutdown();
+        alice.shutdown().await;
+        bob.shutdown().await;
     }
 }

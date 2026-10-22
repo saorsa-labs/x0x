@@ -89,7 +89,7 @@ use routes::{
     load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
     machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
+    owner_agents_issue, owner_agents_revoke, owner_machines, owner_riders_issue, owner_riders_list,
     owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
     presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust,
@@ -106,11 +106,11 @@ use routes::{
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
     update_contact, update_group_policy, update_member_role, update_named_group, update_profile,
-    update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
-    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    update_task, upgrade_diagnostics, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage,
+    ControlBlobState, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
+    PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
+    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, TreeKemCatchupRequest,
+    TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
     DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
@@ -129,9 +129,15 @@ async fn finish_startup_error(
     agent: &x0x::Agent,
     shutdown_notify: &watch::Sender<bool>,
     forward_service: Option<&x0x::forward::ForwardService>,
+    socks: Option<&x0x::socks::SocksService>,
     background_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     primary: anyhow::Error,
 ) -> anyhow::Error {
+    // Release the SOCKS listen port before exec, forward, and agent teardown.
+    // A later startup error must not leave the accept loop holding the bind.
+    if let Some(socks) = socks {
+        socks.shutdown_and_wait().await;
+    }
     exec_service.shutdown().await;
     if let Some(forward_service) = forward_service {
         forward_service.shutdown();
@@ -993,6 +999,7 @@ pub async fn serve_with_options(
                     &agent,
                     &shutdown_notify,
                     None,
+                    None,
                     &mut startup_tasks,
                     primary,
                 )
@@ -1001,6 +1008,57 @@ pub async fn serve_with_options(
         };
         fs.spawn_inbound();
         Some(fs)
+    } else {
+        None
+    };
+
+    // ADR-0074 §3: optional loopback SOCKS5 listener. Needs ForwardService
+    // (CONNECT opens ForwardV2). Non-loopback listen was refused at config load.
+    let socks_cancel = tokio_util::sync::CancellationToken::new();
+    let socks_service = if config.socks.enabled() {
+        match &forward_service {
+            Some(fs) => {
+                let connector = std::sync::Arc::new(x0x::socks::ForwardSocksConnector::new(
+                    std::sync::Arc::clone(fs),
+                ));
+                match x0x::socks::SocksService::spawn(
+                    &config.socks,
+                    std::sync::Arc::new(api_token.clone()),
+                    connector,
+                    socks_cancel.clone(),
+                )
+                .await
+                {
+                    Ok(svc) => {
+                        if let Some(listen) = config.socks.listen {
+                            tracing::info!(
+                                listen = %listen,
+                                "SOCKS5 listener started (ADR-0074 §3)"
+                            );
+                        }
+                        Some(svc)
+                    }
+                    Err(e) => {
+                        return Err(finish_startup_error(
+                            &exec_service,
+                            &agent,
+                            &shutdown_notify,
+                            forward_service.as_deref(),
+                            None,
+                            &mut startup_tasks,
+                            anyhow::anyhow!("failed to bind SOCKS5 listener: {e}"),
+                        )
+                        .await);
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "socks.listen is set but connect ACL is disabled — SOCKS5 not started"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -1027,6 +1085,7 @@ pub async fn serve_with_options(
                 &agent,
                 &shutdown_notify,
                 forward_service.as_deref(),
+                socks_service.as_ref(),
                 &mut startup_tasks,
                 primary,
             )
@@ -1053,6 +1112,7 @@ pub async fn serve_with_options(
                         &agent,
                         &shutdown_notify,
                         forward_service.as_deref(),
+                        socks_service.as_ref(),
                         &mut startup_tasks,
                         primary,
                     )
@@ -1104,6 +1164,35 @@ pub async fn serve_with_options(
             connect_diagnostics: Arc::clone(&connect_diagnostics),
         })
         .await;
+
+    #[cfg(unix)]
+    let upgrade_staging = if self_update_enabled && config.update.enabled {
+        match async {
+            let identity_root = match identity_dir.clone() {
+                Some(path) => path,
+                None => crate::storage::x0x_dir().await?,
+            };
+            Ok::<_, anyhow::Error>(routes::StartupStagingContext {
+                install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                identity_root: identity_root.canonicalize()?,
+                machine_id: *agent.machine_id().as_bytes(),
+                #[cfg(test)]
+                clock: None,
+                #[cfg(test)]
+                observed: None,
+            })
+        }
+        .await
+        {
+            Ok(context) => Some(context),
+            Err(error) => {
+                tracing::warn!(%error, "HTTP upgrade staging identity is unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
@@ -1224,7 +1313,7 @@ pub async fn serve_with_options(
         api_address: actual_api_addr,
         data_dir: config.data_dir.clone(),
         start_time: Instant::now(),
-        health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
+        health_snapshot: Arc::new(health_verdict::initial_health_snapshot(&config.data_dir)),
         broadcast_tx,
         calls: routes::calls::new_registry(),
         file_transfers: RwLock::new(HashMap::new()),
@@ -1238,6 +1327,9 @@ pub async fn serve_with_options(
         self_update_enabled,
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
+        http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+        #[cfg(unix)]
+        upgrade_staging,
         api_token,
         sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
         rider_tokens: tokio::sync::Mutex::new(
@@ -1250,7 +1342,11 @@ pub async fn serve_with_options(
         acl_admin: Arc::clone(&acl_admin),
         connect_diagnostics,
         forward_service,
+        socks_service,
         owner_sync,
+        names: Arc::new(
+            x0x::names::NameStore::load(x0x::names::NameStore::path_in(&config.data_dir)).await,
+        ),
         startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
         startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
         startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
@@ -1288,6 +1384,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut startup_tasks,
             primary,
         )
@@ -1410,7 +1507,7 @@ pub async fn serve_with_options(
         std::sync::atomic::Ordering::Release,
     );
     let evidence_state = Arc::downgrade(&state);
-    agent.start_peer_evidence(
+    if let Err(error) = agent.start_peer_evidence(
         config.data_dir.clone(),
         config.evidence.clone(),
         Arc::new(move |peer| {
@@ -1426,7 +1523,19 @@ pub async fn serve_with_options(
                     && g.members_v2.get(&peer).is_some_and(|m| m.is_active())
             }))
         }),
-    )?;
+    ) {
+        let primary = anyhow::Error::new(error);
+        return Err(finish_startup_error(
+            &exec_service,
+            &agent,
+            &state.shutdown_notify,
+            state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
+            &mut bg_tasks,
+            primary,
+        )
+        .await);
+    }
 
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
@@ -1453,6 +1562,7 @@ pub async fn serve_with_options(
                 &agent,
                 &state.shutdown_notify,
                 state.forward_service.as_deref(),
+                state.socks_service.as_ref(),
                 &mut bg_tasks,
                 primary,
             )
@@ -1476,6 +1586,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1495,6 +1606,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1507,6 +1619,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1529,6 +1642,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1546,6 +1660,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1770,18 +1885,17 @@ pub async fn serve_with_options(
 
     // Reclaim upgrade debris left by previous failed/interrupted attempts:
     // orphaned `.x0x-upgrade-*` temp dirs and `*.x0xold-*` sidelined binaries.
-    // Runs UNCONDITIONALLY (deliberately NOT gated on self_update_enabled): this
-    // is the disk-fill safety net from the Windows self-update fix and must clean
-    // a machine even when self-update is disabled. It only matches x0x-specific
-    // artifact patterns next to the binary, so it is a harmless no-op for an
-    // embedder (which never creates such artifacts) — no host files can match.
-    bg_tasks.push(tokio::spawn(async {
-        let removed = x0x::history::run_blocking(|| {
+    // Independent of self_update_enabled, but pending or unknown recovery
+    // records prevent cleanup. A validated legacy-only handoff can permit it.
+    // Never delete recovery material merely to make configured startup succeed.
+    let upgrade_record_root = config.data_dir.clone();
+    bg_tasks.push(tokio::spawn(async move {
+        let removed = x0x::history::run_blocking(move || {
             let exe = x0x::upgrade::apply::current_binary_path().ok()?;
             let dir = exe.parent()?.to_path_buf();
-            Some(x0x::upgrade::sweep_stale_upgrade_artifacts(
-                &dir,
-                Duration::from_secs(3600),
+            Some(crate::upgrade::journal::sweep_if_no_pending_records(
+                &upgrade_record_root,
+                || x0x::upgrade::sweep_stale_upgrade_artifacts(&dir, Duration::from_secs(3600)),
             ))
         })
         .await
@@ -1809,8 +1923,36 @@ pub async fn serve_with_options(
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let startup_shutdown_watch = state.shutdown_notify.subscribe();
+        #[cfg(unix)]
+        let startup_identity_dir = identity_dir.clone();
+        #[cfg(unix)]
+        let startup_machine_id = *state.agent.machine_id().as_bytes();
         bg_tasks.push(tokio::spawn(async move {
             let data_dir = startup_check_config.data_dir.clone();
+            #[cfg(unix)]
+            let staging = match async {
+                let identity_root = match startup_identity_dir {
+                    Some(path) => path,
+                    None => crate::storage::x0x_dir().await?,
+                };
+                Ok::<_, anyhow::Error>(routes::StartupStagingContext {
+                    install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                    identity_root: identity_root.canonicalize()?,
+                    machine_id: startup_machine_id,
+                    #[cfg(test)]
+                    clock: None,
+                    #[cfg(test)]
+                    observed: None,
+                })
+            }
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "Startup upgrade staging identity is unavailable");
+                    return;
+                }
+            };
             if let Err(e) = run_startup_update_check(
                 &startup_check_config,
                 None,
@@ -1822,6 +1964,8 @@ pub async fn serve_with_options(
                     ),
                     upgrade_apply_lock: startup_apply_lock,
                     shutdown_watch: startup_shutdown_watch,
+                    #[cfg(unix)]
+                    staging,
                 }),
             )
             .await
@@ -1831,32 +1975,64 @@ pub async fn serve_with_options(
         }));
     }
 
+    // One background apply owner serves both discovery paths. Actual boot
+    // identity is carried into receipts; neither source invents a participant.
+    let background_submit = if self_update_enabled
+        && config.update.enabled
+        && (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)
+    {
+        let runtime = routes::BackgroundRuntime::from_boot(
+            &config,
+            state.api_address,
+            (
+                daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx),
+                state.shutdown_notify.subscribe(),
+            ),
+            Arc::clone(&state.upgrade_apply_lock),
+            #[cfg(unix)]
+            identity_dir.clone(),
+            #[cfg(unix)]
+            *state.agent.machine_id().as_bytes(),
+        )
+        .await;
+        match runtime {
+            Ok(runtime) => {
+                let (submit, owner) = routes::background_channel(runtime);
+                bg_tasks.push(tokio::spawn(owner.run()));
+                Some(submit)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Background upgrade apply disabled: staging identity is unavailable; release discovery remains enabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Gossip-based release subscription (primary update mechanism). This
     // listener can download + install + restart, so it is gated on
     // `self_update_enabled` — embedders never replace the host binary.
-    if self_update_enabled && config.update.enabled && config.update.gossip_updates {
-        let update_config = config.update.clone();
-        let agent_for_gossip = Arc::clone(&state.agent);
-        let data_dir = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
-        let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
-        // #261: the listener's restart planner needs the bound API address
-        // (health commit) and the graceful-shutdown hook (bounded cancel).
-        let gossip_api_addr = state.api_address;
-        let gossip_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
-        bg_tasks.push(tokio::spawn(async move {
-            run_gossip_update_listener(
-                agent_for_gossip,
-                update_config,
-                data_dir,
-                upgrade_apply_lock,
-                self_published_for_gossip,
-                gossip_api_addr,
-                gossip_shutdown,
-            )
-            .await;
-        }));
-    }
+    bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
+        self_update_enabled && config.update.enabled && config.update.gossip_updates,
+        background_submit.clone(),
+        |submit| {
+            let agent_for_gossip = Arc::clone(&state.agent);
+            let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
+            // Restart context stays with the shared owner; this source only
+            // discovers verified releases and observes daemon shutdown.
+            let gossip_shutdown_watch = state.shutdown_notify.subscribe();
+            async move {
+                run_gossip_update_listener(
+                    agent_for_gossip,
+                    submit,
+                    self_published_for_gossip,
+                    gossip_shutdown_watch,
+                )
+                .await;
+            }
+        },
+    ));
 
     // Broadcast current manifest to gossip after joining the network.
     // Ensures nodes that missed the initial gossip window can still receive it.
@@ -1884,30 +2060,28 @@ pub async fn serve_with_options(
 
     // GitHub fallback poll (safety net, default every 48h). Install/restart
     // capable, so gated on `self_update_enabled` (embedders opt out).
-    if self_update_enabled
-        && config.update.enabled
-        && config.update.fallback_check_interval_minutes > 0
-    {
-        let update_config = config.update.clone();
-        let agent_for_poll = Arc::clone(&state.agent);
-        let data_dir_for_poll = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
-        let self_published_for_poll = Arc::clone(&self_published_release_manifests);
-        let poll_api_addr = state.api_address;
-        let poll_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
-        bg_tasks.push(tokio::spawn(async move {
-            run_fallback_github_poll(
-                agent_for_poll,
-                update_config,
-                data_dir_for_poll,
-                upgrade_apply_lock,
-                self_published_for_poll,
-                poll_api_addr,
-                poll_shutdown,
-            )
-            .await;
-        }));
-    }
+    bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
+        self_update_enabled
+            && config.update.enabled
+            && config.update.fallback_check_interval_minutes > 0,
+        background_submit,
+        |submit| {
+            let update_config = config.update.clone();
+            let agent_for_poll = Arc::clone(&state.agent);
+            let self_published_for_poll = Arc::clone(&self_published_release_manifests);
+            let poll_shutdown_watch = state.shutdown_notify.subscribe();
+            async move {
+                run_fallback_github_poll(
+                    agent_for_poll,
+                    update_config,
+                    submit,
+                    self_published_for_poll,
+                    poll_shutdown_watch,
+                )
+                .await;
+            }
+        },
+    ));
 
     // Background rendezvous re-advertisement (re-advertise every validity_ms / 2)
     if config.rendezvous_enabled && config.rendezvous_validity_ms > 0 {
@@ -2532,6 +2706,7 @@ pub async fn serve_with_options(
         .route("/home/rename", post(routes::home::rename_home))
         .route("/home/seat", post(routes::home::seat_home))
         .route("/owner/agents", get(owner_agents))
+        .route("/owner/machines", get(owner_machines))
         .route("/owner/agents/issue", post(owner_agents_issue))
         .route("/owner/agents/:id", delete(owner_agents_revoke))
         .route(
@@ -2756,6 +2931,7 @@ pub async fn serve_with_options(
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/state-sync", get(state_sync_diagnostics))
         .route("/diagnostics/transport", get(transport_diagnostics))
+        .route("/diagnostics/upgrade", get(upgrade_diagnostics))
         .route("/diagnostics/relay", get(relay_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))
         .route("/diagnostics/groups", get(groups_diagnostics))
@@ -2791,6 +2967,13 @@ pub async fn serve_with_options(
         )
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
+        // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
+        .route("/names", get(routes::names_list))
+        .route("/names/resolve", post(routes::names_resolve))
+        .route("/names/owners", post(routes::names_owner_bind))
+        .route("/names/owners/:label", delete(routes::names_owner_unbind))
+        .route("/names/machines", post(routes::names_machine_label))
+        .route("/names/pins/:name", delete(routes::names_unpin))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -2952,6 +3135,11 @@ pub async fn serve_with_options(
         //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
             forwarder.shutdown();
+        }
+        if let Some(socks) = &state.socks_service {
+            // Join the accept loop so the listen port is free before the
+            // process continues. Handshake sessions observe the same token.
+            socks.shutdown_and_wait().await;
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
         //    Agent's shutdown token and close its tracked-task registry NOW,
@@ -5703,6 +5891,93 @@ mod startup_update_check_tests {
             .await
             .expect("shutdown must complete despite the hung update check")
             .expect("clean shutdown");
+    }
+}
+
+#[cfg(test)]
+mod socks_startup_port_release_tests {
+    use std::time::Duration;
+
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+
+    /// A startup failure after the SOCKS listener binds must drop that
+    /// listener. The old path returned from `finish_startup_error` without
+    /// cancelling SOCKS, so the accept task kept the port.
+    #[tokio::test]
+    async fn startup_failure_after_socks_bind_releases_the_port() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("socks.startup-port-release".to_string()),
+            mdns_enabled: false,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        config.socks.listen = Some(
+            format!("127.0.0.1:{port}")
+                .parse()
+                .expect("loopback socks address"),
+        );
+
+        let profile_path = crate::profile::SelfProfile::path_in(&config.data_dir);
+        std::fs::create_dir_all(&config.data_dir).expect("data dir");
+        // `{}` parses as an empty profile. Non-JSON is what `load_from` rejects.
+        std::fs::write(&profile_path, b"not-json").expect("corrupt self-profile");
+
+        let acl = "\
+[connect]
+enabled = true
+
+[[connect.allow]]
+agent_id = \"abababababababababababababababababababababababababababababababab\"
+machine_id = \"abababababababababababababababababababababababababababababababab\"
+targets = [\"127.0.0.1:22\"]
+";
+        let connect_policy =
+            crate::connect::parse_connect_policy(std::path::Path::new("connect-acl.toml"), 0, acl)
+                .expect("minimal loopback connect acl");
+        let options = ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: false,
+            connect_policy,
+            ..ServeOptions::default()
+        };
+
+        let started =
+            tokio::time::timeout(Duration::from_secs(45), serve_with_options(config, options))
+                .await
+                .expect("startup failure must not hang");
+        let err = match started {
+            Err(err) => err,
+            Ok(_handle) => panic!("corrupt self-profile must fail startup"),
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("self-profile"),
+            "startup must fail at self-profile load after SOCKS bind, got: {chain}"
+        );
+
+        let rebound = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => return listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("SOCKS port must be free after startup failure");
+        drop(rebound);
     }
 }
 
