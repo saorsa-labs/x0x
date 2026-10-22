@@ -436,6 +436,43 @@ pub fn conflict_gate_sequence(
     Some(active.divergence_from(conflict).unwrap_or(up_to_head))
 }
 
+/// The gate sequence's next hash after the head: its first hash when the
+/// head is `from_state_hash`, else the hash after the head's position.
+/// `None` when the head is off the sequence or at its end.
+#[must_use]
+pub fn next_gate_hash<'a>(
+    from_state_hash: &str,
+    sequence: &'a [String],
+    head_state_hash: &str,
+) -> Option<&'a String> {
+    let next = if head_state_hash == from_state_hash {
+        0
+    } else {
+        sequence
+            .iter()
+            .position(|hash| hash == head_state_hash)?
+            .saturating_add(1)
+    };
+    sequence.get(next)
+}
+
+/// §2 "Conflict" for one commit that advances the head to
+/// `link_state_hash`: under a recorded conflict it applies only when it is
+/// the next hash of the common prefix ([`conflict_gate_sequence`]). With
+/// the head off the active ATA's chain the conflict does not bound it.
+#[must_use]
+pub fn conflict_admits_link(
+    active: &AdminTerminalAttestation,
+    conflict: &AdminTerminalAttestation,
+    head_state_hash: &str,
+    link_state_hash: &str,
+) -> bool {
+    conflict_gate_sequence(active, conflict, head_state_hash).is_none_or(|prefix| {
+        next_gate_hash(&active.fields.from_state_hash, &prefix, head_state_hash)
+            .is_some_and(|hash| hash == link_state_hash)
+    })
+}
+
 /// The links of `active`'s sequence up to and including the head (empty at
 /// its `from`); `None` when the head is off its chain. As a gate sequence
 /// it admits nothing past the head.

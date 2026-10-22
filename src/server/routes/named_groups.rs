@@ -13170,6 +13170,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             return ApplyMetadataResult::REJECTED;
         }
     }
+    // ADR 0109 §2 "Conflict": every route (catch-up page, DM, gossip,
+    // replay) applies commits here, so the conflict bound is checked here
+    // once, on the record loaded under the membership lock.
+    if let Some(commit) = named_group_metadata_event_commit(&event) {
+        if !group_recovery::conflict_admits_commit(state, &info, commit).await {
+            tracing::warn!(
+                group_id = %LogHexId::group(&resolved_group_key),
+                revision = commit.revision,
+                "ADR 0109 S3: commit past the attestation conflict's common prefix refused"
+            );
+            return ApplyMetadataResult::REJECTED;
+        }
+    }
 
     let event_for_log = event.clone();
 

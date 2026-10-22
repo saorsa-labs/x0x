@@ -757,12 +757,19 @@ async fn load_sidecars(state: &AppState) {
 /// matches the loaded record. Drop each such ATA, durably. Containment is
 /// kept: the marker and the legacy record are untouched, and the node asks
 /// again from its loaded head.
+///
+/// §2 "Conflict": an active ATA with a recorded conflict is never dropped
+/// here. The conflict's bound is the common prefix of the two ATAs
+/// ([`conflict_admits_commit`]), so dropping the ATA would remove the
+/// bound, not only an admitting gate. The conflict and its ATA stay until
+/// a re-seat.
 async fn reconcile_loaded_atas(state: &AppState) {
     let candidates: Vec<(String, AdminTerminalAttestation)> = {
         let inner = state.group_recovery.inner.lock().await;
         inner
             .sidecars
             .iter()
+            .filter(|(_, body)| body.attestation_conflict.is_none())
             .filter_map(|(stable, body)| body.active_ata.clone().map(|ata| (stable.clone(), ata)))
             .collect()
     };
@@ -789,7 +796,15 @@ async fn reconcile_loaded_atas(state: &AppState) {
             continue;
         }
         let from = ata.fields.from_revision;
-        if update_sidecar(state, &stable, |body| body.active_ata = None).await {
+        // A conflict recorded since the scan keeps the ATA.
+        let mut dropped = false;
+        let written = update_sidecar(state, &stable, |body| {
+            if body.attestation_conflict.is_none() {
+                dropped = body.active_ata.take().is_some();
+            }
+        })
+        .await;
+        if written && dropped {
             tracing::warn!(
                 group_id = %LogHexId::group(&stable),
                 from,
@@ -2333,15 +2348,37 @@ fn attested_link_admitted(
     let Some(sequence) = s3::armed_gate_sequence(ata, current) else {
         return false;
     };
-    let next = if current.state_hash == ata.fields.from_state_hash {
-        0
-    } else {
-        match sequence.iter().position(|hash| *hash == current.state_hash) {
-            Some(at) => at + 1,
-            None => return false,
-        }
+    s3::next_gate_hash(&ata.fields.from_state_hash, &sequence, &current.state_hash)
+        .is_some_and(|hash| *hash == link.state_hash)
+}
+
+/// ADR 0109 §2 "Conflict": "Nothing past the common prefix applies". This
+/// is the one conflict gate. The metadata apply
+/// (`apply_named_group_metadata_event_inner_serialized`) calls it for
+/// every commit, under the group's membership lock and on the record it
+/// loaded under that lock, so a catch-up page, a DM and a gossip delivery
+/// have the same bound. A commit that does not advance the head
+/// (`revision <= current.state_revision`) passes: the apply refuses it or
+/// installs a marker through the existing path ("Conflicting commits still
+/// install a marker"). A commit that advances the head applies only when
+/// it is the next hash of the common prefix ([`s3::conflict_admits_link`]).
+pub(super) async fn conflict_admits_commit(
+    state: &AppState,
+    current: &GroupInfo,
+    commit: &GroupStateCommit,
+) -> bool {
+    if commit.revision <= current.state_revision {
+        return true;
+    }
+    let Some(body) = sidecar_snapshot(state, current.stable_group_id()).await else {
+        return true;
     };
-    sequence.get(next) == Some(&link.state_hash)
+    match (body.active_ata.as_ref(), body.attestation_conflict.as_ref()) {
+        (Some(active), Some(conflict)) => {
+            s3::conflict_admits_link(active, conflict, &current.state_hash, &commit.state_hash)
+        }
+        _ => true,
+    }
 }
 
 /// The catch-up page side of [`attested_link_admitted`]: before each
@@ -2513,22 +2550,12 @@ pub(super) async fn armed_admin_ata(
 /// armed. The caller requires each catch-up page to stay inside it. An
 /// exhausted segment keeps the gate armed: the head is the sequence's last
 /// hash, so no page link fits and the gate admits nothing until the next
-/// segment arms (§2 "Segments").
+/// segment arms (§2 "Segments"). A recorded conflict's bound is not
+/// checked here: [`conflict_admits_commit`] checks it for every route.
 pub(super) async fn armed_admin_sequence(
     state: &AppState,
     info: &GroupInfo,
 ) -> Option<Vec<String>> {
-    // §2 "Conflict": a recorded conflict narrows the gate to the common
-    // prefix of the two ATAs; nothing past it applies.
-    if let Some(body) = sidecar_snapshot(state, info.stable_group_id()).await {
-        if let (Some(active), Some(conflict)) =
-            (body.active_ata.as_ref(), body.attestation_conflict.as_ref())
-        {
-            if let Some(sequence) = s3::conflict_gate_sequence(active, conflict, &info.state_hash) {
-                return Some(sequence);
-            }
-        }
-    }
     if let Some(ata) = armed_admin_ata(state, info).await {
         // §2: when an applied link left the signer without an Active admin
         // seat, the gate stops at the head.
@@ -6458,7 +6485,9 @@ mod tests {
     /// Codex P1 (#1533 round 1): a conflicting attestation must stop
     /// application at the common prefix (ADR 0109 §2 "Conflict"). Before
     /// the fix the conflict changed only the view, and the catch-up gate
-    /// kept the active ATA's full sequence.
+    /// kept the active ATA's full sequence. The bound is the shared
+    /// [`conflict_admits_commit`] gate (r5); the routes are covered by
+    /// `a_conflict_bounds_every_delivery_route_at_the_common_prefix`.
     #[tokio::test]
     async fn conflicting_attestation_narrows_the_gate_to_the_common_prefix() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
@@ -6503,8 +6532,7 @@ mod tests {
             )
         };
         let active = ata(&["a1", "a2", "a3"])?;
-        let kept = active.clone();
-        assert!(update_sidecar(&state, &stable, move |body| body.active_ata = Some(kept)).await);
+        arm_from_response(&state, &key, &info, active.clone()).await;
         assert_eq!(
             armed_admin_sequence(&state, &info).await,
             Some(active.fields.sequence.clone()),
@@ -6518,9 +6546,16 @@ mod tests {
             "the conflict is durable"
         );
         assert_eq!(body.active_ata.as_ref(), Some(&active));
-        assert_eq!(
-            armed_admin_sequence(&state, &info).await,
-            Some(vec!["a1".to_string()]),
+        let bound = |body: &GroupRecoveryV1, link: &str| {
+            matches!(
+                (body.active_ata.as_ref(), body.attestation_conflict.as_ref()),
+                (Some(active), Some(conflict))
+                    if s3::conflict_admits_link(active, conflict, &info.state_hash, link)
+            )
+        };
+        assert!(bound(&body, "a1"), "the common prefix applies");
+        assert!(
+            !bound(&body, "a2") && !bound(&body, "x2"),
             "nothing past the common prefix applies"
         );
         assert!(matches!(
@@ -6533,10 +6568,9 @@ mod tests {
         // A later agreeing ATA arms nothing: catch-up stays stopped.
         let agreeing = ata(&["a1", "a2", "a3"])?;
         arm_from_response(&state, &key, &info, agreeing).await;
-        assert_eq!(
-            armed_admin_sequence(&state, &info).await,
-            Some(vec!["a1".to_string()])
-        );
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert_eq!(body.active_ata.as_ref(), Some(&active));
+        assert!(bound(&body, "a1") && !bound(&body, "a2"));
         Ok(())
     }
 
