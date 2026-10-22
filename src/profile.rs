@@ -421,9 +421,9 @@ impl IssuedCertRecord {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
-        durable.remove(path);
         #[cfg(test)]
         journal_faults::after_rename(path).await?;
+        durable.remove(path);
         // #1542: owner sync persists its register only after this append
         // returns, so the new line must survive a host crash. fsync the
         // parent directory to make the rename durable.

@@ -6926,4 +6926,115 @@ mod issuance_journal_sync_tests {
             "the journal must end on the later renewal: {lines:?}"
         );
     }
+
+    /// Codex review of #1545 (bab382f), P2: a local renewal `d2` is
+    /// cancelled after its journal rename and before the write's
+    /// bookkeeping, as a caller cancellation during the rename await can
+    /// do. The journal was durable before the write, so a stale mark would
+    /// let the reconcile publish `d2` before it is durable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_journal_write_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 200, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        deliver(&local, &owner, r1).await;
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        crate::profile::journal_faults::pause_next(&journal, reached_tx, release_rx);
+        let issuance = {
+            let (journal, line) = (journal.clone(), local_line(&owner_hex, &d2));
+            tokio::spawn(
+                async move { crate::profile::IssuedCertRecord::append(&journal, &line).await },
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the issuance renames the journal")
+            .expect("rename signal");
+        // The caller cancels the issuance after the rename.
+        issuance.abort();
+        let _ = issuance.await;
+        drop(release_tx);
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+
+        drop(local);
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (bab382f), P2: a batch carries a journal
+    /// renewal and an owner profile. The daemon stops after the journal
+    /// write, before the register write. The restart must finish the whole
+    /// batch, not only its journal record: `commit_batch` is all or nothing.
+    #[tokio::test]
+    async fn an_interrupted_mixed_commit_recovers_the_whole_batch() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let profile = SyncValue::OwnerProfile {
+            human_name: Some("Alice".into()),
+        };
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        remote
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile,
+                &owner,
+                machine(2),
+            )
+            .await
+            .expect("remote profile mint");
+        let rp = remote
+            .records_snapshot()
+            .await
+            .into_iter()
+            .find(|r| r.kind == SyncKind::OwnerProfile)
+            .expect("remote profile record");
+        deliver(&local, &owner, r1).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r2, rp], &owner.user_id()).await;
+        drop(local);
+
+        // The restart, then the first reconcile pass finishes the commit.
+        let (local, journal) = journal_device(&local_dir).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2),
+            "the recovery must commit the journal renewal"
+        );
+        assert_eq!(
+            local.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(profile),
+            "the recovery must commit the rest of the batch"
+        );
+    }
 }
