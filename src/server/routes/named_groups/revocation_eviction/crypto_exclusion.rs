@@ -212,6 +212,19 @@ impl CeState {
     }
 }
 
+impl CeState {
+    /// The boot load (`load_persisted_obligations`) replaces the runtime
+    /// state with this rebuilt one. A receipt can run before that load
+    /// (#1508 review, Codex P1 boot race): it loaded the `.celog` and wrote
+    /// its frame. Keep that live held log, and its load state, and add the
+    /// frames rebuilt from the `.evs` rows to it. Otherwise a later frame
+    /// write would rewrite the `.celog` without the earlier frames.
+    pub(super) fn keep_live_held_log(&mut self, live: &mut CeState) {
+        let rebuilt = std::mem::replace(&mut self.log, std::mem::take(&mut live.log));
+        self.log.absorb(rebuilt);
+    }
+}
+
 fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CE_LOG_PER_GROUP> {
     &mut inner.ce.log
 }

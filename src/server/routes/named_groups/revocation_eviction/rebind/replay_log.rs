@@ -155,6 +155,23 @@ impl<const CAP: usize> HeldLog<CAP> {
         }
     }
 
+    /// Hold every frame of `other` too, with the [`Self::remember`] rule.
+    /// This log's load state is kept: `other` is a rebuilt view that holds
+    /// no file frames.
+    pub(in super::super) fn absorb(&mut self, other: Self) {
+        for (stable, frames) in other.log {
+            for e in frames {
+                self.remember(
+                    &stable,
+                    e.next_revision,
+                    &e.result_head,
+                    e.bytes,
+                    e.authored,
+                );
+            }
+        }
+    }
+
     /// The frames held for any of `group_ids` above `from_revision`, oldest
     /// first, with their group ID and result head.
     pub(in super::super) fn catchup_frames(
