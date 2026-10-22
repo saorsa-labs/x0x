@@ -237,24 +237,21 @@ async fn run_daemon() -> anyhow::Result<()> {
     // Whether a config file was actually loaded (explicit `--config`, or the
     // instance's default path). A named instance with a file must declare its
     // plane (David, 2026-09-29); one with no file keeps unset = prod.
-    let mut config_file_loaded = true;
-    let (mut config, mut config_findings) = match &config_path {
-        Some(path) => load_config(path).await?,
-        None => {
-            let config_dir_name = match &cli_instance_name {
-                Some(name) => format!("x0x-{}", name.as_str()),
-                None => "x0x".to_string(),
-            };
-            let default_path = dirs::config_dir()
-                .map(|d| d.join(&config_dir_name).join("config.toml"))
-                .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
-            if default_path.exists() {
-                load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
-            } else {
-                config_file_loaded = false;
-                (DaemonConfig::default(), Vec::new())
-            }
-        }
+    // `[gui_show]` reload follows this same path, including the default file
+    // when startup loaded it without `--config`.
+    let config_dir_name = match &cli_instance_name {
+        Some(name) => format!("x0x-{}", name.as_str()),
+        None => "x0x".to_string(),
+    };
+    let default_config_path = dirs::config_dir()
+        .map(|d| d.join(&config_dir_name).join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
+    let loaded_config_path =
+        x0x::gui::startup_config_path(config_path.as_deref().map(Path::new), &default_config_path);
+    let config_file_loaded = loaded_config_path.is_some();
+    let (mut config, mut config_findings) = match loaded_config_path.as_ref() {
+        Some(path) => load_config(path.to_str().unwrap_or("/etc/x0x/config.toml")).await?,
+        None => (DaemonConfig::default(), Vec::new()),
     };
 
     let (instance_name, effective_connect_acl_path) = resolve_instance_startup(
@@ -268,7 +265,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     // the testnet ran on prod). Without any config file, keep unset = prod
     // (install.sh / `x0x daemon start --name` write none) and only warn below.
     if let Some(name) = instance_name.as_ref() {
-        if config_file_loaded && config.network_id.is_none() {
+        if x0x::server::config::named_instance_refuses_startup(
+            config_file_loaded,
+            config.network_id.as_deref(),
+        ) {
             anyhow::bail!(x0x::server::config::named_instance_missing_network_id(
                 name.as_str()
             ));
@@ -422,6 +422,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         exec_policy,
         connect_policy,
         self_update_enabled,
+        daemon_config_path: loaded_config_path.clone(),
+        // Stop does not write this file. Reload reads the config startup
+        // loaded, or this default path when startup loaded no file.
+        gui_show_write_path: Some(loaded_config_path.unwrap_or(default_config_path)),
     };
     let handle = x0x::server::serve_with_options(config, options).await?;
 

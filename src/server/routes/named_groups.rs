@@ -46221,6 +46221,10 @@ pub(in crate::server) mod tests {
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
             acl_admin,
+            gui_show: x0x::gui::GuiShowRuntime::with_defaults(
+                x0x::gui::GuiShowConfig::default(),
+                data_dir,
+            ),
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
                 x0x::connect::ConnectPolicy::default().summary(),
             )),
@@ -46229,6 +46233,12 @@ pub(in crate::server) mod tests {
             owner_sync,
             names: Arc::new(
                 x0x::names::NameStore::load(x0x::names::NameStore::path_in(data_dir)).await,
+            ),
+            forwards: Arc::new(
+                x0x::forward::store::ForwardStore::load(
+                    x0x::forward::store::ForwardStore::path_in(data_dir),
+                )
+                .await,
             ),
             startup_catchup_obligations: std::sync::Mutex::new(HashMap::new()),
             startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),

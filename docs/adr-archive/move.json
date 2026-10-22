@@ -488,7 +488,7 @@
       "from": "docs/adr/0083-agent-initiated-gui-show.md",
       "to": "docs/adr-archive/0083-agent-initiated-gui-show.md",
       "link": "../adr-archive/0083-agent-initiated-gui-show.md",
-      "sha256": "6c01940b9de97cd8c734b28b63f563568ebab73394513502c5330a7353357c26"
+      "sha256": "65ece564d3dfa9bbe5219fc65f30250cbf32cf2734c935cefb0dc15650753a6e"
     },
     {
       "from": "docs/adr/0084-enrolled-owner-sync-admission.md",

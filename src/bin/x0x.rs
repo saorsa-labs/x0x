@@ -321,6 +321,14 @@ enum Commands {
         #[arg(long)]
         view: Option<String>,
     },
+    /// Show a GUI view to the human (ADR 0083). Local only in slice 1.
+    Show {
+        /// View route, e.g. `people`, `dm/<agent_id>`, `groups/<id>/board`.
+        view: String,
+        /// Target machine hex id or `active` (remote show; later slice).
+        #[arg(long = "on")]
+        on: Option<String>,
+    },
     /// Print all API routes. [dev]
     #[command(hide = true)]
     Routes {
@@ -1133,8 +1141,8 @@ enum ForwardSub {
         /// Local bind address, e.g. `127.0.0.1:8022`.
         #[arg(long)]
         local: String,
-        /// Peer agent: hex agent id or an agent name (`[agent:]<label>.<owner>`,
-        /// ADR-0074). `machine:` names are refused until slice 2.
+        /// Peer agent: hex agent id or a name (`[agent:|machine:]<label>.<owner>`,
+        /// ADR-0074).
         #[arg(long)]
         peer: String,
         /// Loopback target host on the peer (numeric IP). Default `127.0.0.1`.
@@ -1143,6 +1151,9 @@ enum ForwardSub {
         /// Loopback target port on the peer.
         #[arg(long)]
         target_port: u16,
+        /// Keep the forward in memory only (do not persist to forwards.json).
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
     },
     /// List registered forwards.
     List,
@@ -2389,6 +2400,7 @@ async fn run(
             }
             Ok(())
         }
+        Commands::Show { view, on } => commands::show::show(&client, &view, on.as_deref()).await,
         Commands::Profile { sub } => match sub {
             None => commands::identity::profile(&client).await,
             Some(ProfileSub::Set {
@@ -3355,13 +3367,15 @@ async fn run(
                 peer,
                 target,
                 target_port,
+                ephemeral,
             } => {
-                commands::forward::add(
+                commands::forward::add_with_ephemeral(
                     &client,
                     &local,
                     &peer,
                     target.as_deref().unwrap_or("127.0.0.1"),
                     target_port,
+                    ephemeral,
                 )
                 .await
             }
@@ -3601,6 +3615,7 @@ x0x (v{VERSION})
     |   +-- --apply        Apply through the running daemon
     |   +-- --force        Fetch current manifest with --check
     +-- gui                Open embedded web GUI
+    +-- show <view>        Show a GUI view (ADR 0083; local)
     +-- routes             Print all 130 REST API routes
     +-- tree               This command tree
     +-- ws sessions        List WebSocket sessions

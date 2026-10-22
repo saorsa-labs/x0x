@@ -123,6 +123,10 @@ pub enum NameError {
         current: String,
     },
     /// A machine name was given where only agent targets are accepted.
+    ///
+    /// `POST /forwards` does not use this: a machine name is a valid forward
+    /// target and is pinned (ADR-0074 slice 2). Agent-only resolution still
+    /// returns it, and does so before any pin is written.
     #[error("machine names are not accepted here: {0}")]
     MachineTargetUnsupported(String),
     /// The store could not be read or written (fail closed).
@@ -331,40 +335,54 @@ impl PeerRef {
         NameRef::parse(raw).map(Self::Name)
     }
 
-    /// Parse a forward peer: hex or an agent name. A `machine:` name is
-    /// refused until forwards check that the stream reaches the pinned
-    /// `MachineId` (ADR-0074 §1 machine binding, slice 2).
+    /// Parse a forward peer: hex or a name (agent or machine).
     ///
     /// # Errors
-    /// Any parse error, or [`NameError::MachineTargetUnsupported`].
+    /// Any parse error.
     pub fn parse_forward_peer(raw: &str) -> Result<Self, NameError> {
-        let peer = Self::parse(raw)?;
-        if let Self::Name(name) = &peer {
-            if name.kind == Some(NameKind::Machine) {
-                return Err(machine_forward_refusal(name));
-            }
-        }
-        Ok(peer)
+        Self::parse(raw)
     }
 }
 
-fn machine_forward_refusal(name: &NameRef) -> NameError {
-    NameError::MachineTargetUnsupported(format!(
-        "{name}: forwards to machine names need the pinned-MachineId stream check \
-         (ADR-0074 slice 2); use an agent name or hex agent id"
-    ))
-}
-
-/// Refuse a resolution that landed on a machine where only agents are
-/// accepted (forwards, until slice 2); otherwise return the agent.
+/// Where a forward to a resolved name goes: the agent its streams open to,
+/// and — for a machine name — the `MachineId` every stream must reach
+/// (ADR-0074 §1 machine binding; the forwarder checks `PeerStream::peer()`
+/// against it before any forward-header byte is sent).
 ///
 /// # Errors
-/// [`NameError::MachineTargetUnsupported`] for a machine target.
-pub fn require_agent_target(resolved: &Resolved, name: &NameRef) -> Result<AgentId, NameError> {
-    match (resolved.kind, resolved.agent_id) {
-        (NameKind::Agent, Some(agent)) => Ok(agent),
-        _ => Err(machine_forward_refusal(name)),
+/// [`NameError::UnknownName`] when a machine name has no single agent that
+/// its daemon announces (nothing to open a stream to).
+pub fn forward_target(
+    resolved: &Resolved,
+    name: &NameRef,
+) -> Result<(AgentId, Option<MachineId>), NameError> {
+    match (resolved.kind, resolved.agent_id, resolved.machine_id) {
+        (NameKind::Agent, Some(agent), _) => Ok((agent, None)),
+        (NameKind::Machine, Some(agent), Some(machine)) => Ok((agent, Some(machine))),
+        _ => Err(NameError::UnknownName(format!(
+            "{name}: no single agent is announced on that machine"
+        ))),
     }
+}
+
+/// Refuse a resolution that landed on a machine. Return the agent otherwise.
+///
+/// Existing callers keep this signature. It delegates an agent resolution
+/// to [`forward_target`]. New forward code uses [`forward_target`] directly:
+/// a machine name is a valid forward target and carries its `MachineId` pin.
+///
+/// # Errors
+/// [`NameError::MachineTargetUnsupported`] when the resolution is not an
+/// agent that has an agent id.
+#[deprecated(
+    since = "0.48.1",
+    note = "use `forward_target`; machine names are valid forward targets"
+)]
+pub fn require_agent_target(resolved: &Resolved, name: &NameRef) -> Result<AgentId, NameError> {
+    if resolved.kind != NameKind::Agent || resolved.agent_id.is_none() {
+        return Err(machine_forward_refusal(name));
+    }
+    forward_target(resolved, name).map(|(agent, _pin)| agent)
 }
 
 // ─── Candidates ────────────────────────────────────────────────────────────
@@ -1415,6 +1433,12 @@ pub async fn resolve_with(
     resolve_with_options(store, name, owner, candidates, now_unix, false).await
 }
 
+fn machine_forward_refusal(name: &NameRef) -> NameError {
+    NameError::MachineTargetUnsupported(format!(
+        "{name}: only an agent name is accepted for this resolution"
+    ))
+}
+
 /// Refuse a pin when petname `label` is not bound to `owner`.
 ///
 /// `me` has no petname row. This runs inside the pin commit, under the same
@@ -1517,7 +1541,11 @@ fn pin_bare_locked(
 }
 
 /// Like [`resolve_with`], but when `agent_only` is set, refuse a machine
-/// selection **before** pinning (forwards until ADR-0074 slice 2).
+/// selection **before** pinning.
+///
+/// `POST /forwards` passes `agent_only = false`: a machine name is a valid
+/// forward target and is pinned (ADR-0074 slice 2). An agent-only caller
+/// sets the flag so a refused machine does not write `names.json`.
 ///
 /// A bare name that matches both verified kinds is [`NameError::AmbiguousKind`]
 /// even when a pin exists. `PinMismatch` is only when the single remaining
@@ -1761,8 +1789,14 @@ impl crate::Agent {
     /// Resolve for `POST /forwards`: refuse a machine target before pinning
     /// so a refused forward does not write `names.json`.
     ///
+    /// Machine names are valid forward targets. Call [`Self::resolve_name`].
+    ///
     /// # Errors
     /// Any [`NameError`], including [`NameError::MachineTargetUnsupported`].
+    #[deprecated(
+        since = "0.48.1",
+        note = "use `resolve_name`; machine targets are valid forwards"
+    )]
     pub async fn resolve_name_for_forward(
         &self,
         names: &NameStore,

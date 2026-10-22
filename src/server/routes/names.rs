@@ -95,18 +95,6 @@ pub(in crate::server) async fn resolve(
     state.agent.resolve_name(&state.names, devices, name).await
 }
 
-/// Resolve for `POST /forwards`: refuse machine targets before pinning.
-pub(in crate::server) async fn resolve_for_forward(
-    state: &AppState,
-    name: &NameRef,
-) -> Result<Resolved, NameError> {
-    let devices = state.owner_sync.as_ref().map(|s| &**s.store());
-    state
-        .agent
-        .resolve_name_for_forward(&state.names, devices, name)
-        .await
-}
-
 fn resolved_json(resolved: &Resolved) -> serde_json::Value {
     serde_json::json!({
         "ok": true,

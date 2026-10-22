@@ -76,14 +76,15 @@ mod test_halves {
             }
         }
 
-        /// Abrupt reset (ant-quic `SendStream::reset`); used by ADR-0074 §4
-        /// open-stream teardown. Simulated halves finish instead.
+        /// Abrupt reset (ant-quic `SendStream::reset`); used by ADR-0074 §1
+        /// machine-mismatch (zero header bytes) and ADR-0074 §4 open-stream
+        /// teardown. Simulated halves abort via the sim reset path.
         pub fn reset(&mut self, code: ant_quic::VarInt) -> io::Result<()> {
             match self {
                 Self::Quic(send) => send.reset(code).map_err(io::Error::other),
                 Self::Sim(send) => {
                     let _ = code;
-                    send.finish()
+                    send.reset()
                 }
             }
         }
