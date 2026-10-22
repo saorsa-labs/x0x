@@ -1426,27 +1426,25 @@ pub async fn serve_with_options(
     // only on exactly its pinned ids; anything else stays down with a
     // reason in `GET /forwards`. Local work only — it never blocks startup
     // on the network. Names of peers not yet discovered resolve later, so
-    // forwards still down are retried until they come up or are deleted
-    // (a retry can only ever bring a forward up on its pinned ids).
+    // transient failures use a bounded backoff. Permanent failures stay down
+    // until owner action; retries can only bring up the pinned ids.
     if state.forward_service.is_some() {
         let restore_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-                routes::connect::FORWARD_RESTORE_RETRY_SECS,
-            ));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut next = tokio::time::Instant::now();
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => {}
+                    _ = tokio::time::sleep_until(next) => {}
                     _ = shutdown_rx.changed() => return,
                 }
                 if *shutdown_rx.borrow() {
                     return;
                 }
-                if routes::connect::restore_forwards(&restore_state).await == 0 {
+                let Some(deadline) = routes::connect::restore_forwards(&restore_state).await else {
                     return;
-                }
+                };
+                next = deadline;
             }
         }));
     }

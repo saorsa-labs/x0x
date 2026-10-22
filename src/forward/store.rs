@@ -18,7 +18,7 @@
 //! the file, and reports [`ForwardStoreError::Unconfirmed`] until a later
 //! write confirms the parent-directory fsync.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -293,6 +293,7 @@ pub struct ForwardStore {
     state: tokio::sync::Mutex<Vec<ForwardRecord>>,
     load_error: Option<String>,
     ops: Arc<tokio::sync::Mutex<()>>,
+    restore_retries: tokio::sync::Mutex<BTreeMap<SocketAddr, RestoreRetry>>,
     /// Set when a write crossed the rename but parent-dir fsync failed.
     /// Cleared only by a successful durable persist. While set, [`Self::commit`]
     /// re-attempts the write even when the mutate is a no-op.
@@ -308,9 +309,10 @@ pub struct ForwardStore {
 }
 
 /// Records copied for restore, with `ops` still held so add and remove wait.
-pub(crate) struct RestoreSession {
+pub(crate) struct RestoreSession<'a> {
     _ops: tokio::sync::OwnedMutexGuard<()>,
     pub(crate) records: Vec<ForwardRecord>,
+    pub(crate) retries: tokio::sync::MutexGuard<'a, BTreeMap<SocketAddr, RestoreRetry>>,
 }
 
 impl ForwardStore {
@@ -322,6 +324,7 @@ impl ForwardStore {
             state: tokio::sync::Mutex::new(Vec::new()),
             load_error: None,
             ops: Arc::new(tokio::sync::Mutex::new(())),
+            restore_retries: tokio::sync::Mutex::new(BTreeMap::new()),
             pending_durability: std::sync::atomic::AtomicBool::new(false),
             install_slot: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -340,12 +343,16 @@ impl ForwardStore {
     /// # Errors
     /// [`ForwardStoreError::Unusable`] when the file did not load. The
     /// lock is not held in that case.
-    pub(crate) async fn begin_restore(&self) -> Result<RestoreSession, ForwardStoreError> {
+    pub(crate) async fn begin_restore(&self) -> Result<RestoreSession<'_>, ForwardStoreError> {
         let ops = self.lock_ops().await;
         let records = self.records().await?;
         #[cfg(test)]
         self.pause_restore_if_armed().await;
-        Ok(RestoreSession { _ops: ops, records })
+        Ok(RestoreSession {
+            _ops: ops,
+            records,
+            retries: self.restore_retries.lock().await,
+        })
     }
 
     /// `Some` when `ops` is free. Tests use this to prove restore still holds
@@ -593,21 +600,26 @@ impl ForwardStore {
             return Ok(false);
         };
         validate(&record)?;
-        self.commit(move |records| {
-            if let Some(held) = records.iter_mut().find(|held| held.id == record.id) {
-                if *held == record {
-                    return Ok(false);
+        let result = self
+            .commit(move |records| {
+                if let Some(held) = records.iter_mut().find(|held| held.id == record.id) {
+                    if *held == record {
+                        return Ok(false);
+                    }
+                    *held = record;
+                    return Ok(true);
                 }
-                *held = record;
-                return Ok(true);
-            }
-            if records.len() >= MAX_FORWARDS {
-                return Err(ForwardStoreError::Full);
-            }
-            records.push(record);
-            Ok(true)
-        })
-        .await
+                if records.len() >= MAX_FORWARDS {
+                    return Err(ForwardStoreError::Full);
+                }
+                records.push(record);
+                Ok(true)
+            })
+            .await;
+        if result.is_ok() || result.as_ref().is_err_and(|e| e.durability_unconfirmed()) {
+            self.restore_retries.lock().await.remove(&spec.local_addr);
+        }
+        result
     }
 
     /// Delete the record bound to `local_addr`. Returns whether one existed.
@@ -619,12 +631,70 @@ impl ForwardStore {
     /// report success.
     pub async fn forget(&self, local_addr: SocketAddr) -> Result<bool, ForwardStoreError> {
         let id = local_addr.to_string();
-        self.commit(move |records| {
-            let before = records.len();
-            records.retain(|record| record.id != id);
-            Ok(records.len() != before)
-        })
-        .await
+        let result = self
+            .commit(move |records| {
+                let before = records.len();
+                records.retain(|record| record.id != id);
+                Ok(records.len() != before)
+            })
+            .await;
+        if result.is_ok() || result.as_ref().is_err_and(|e| e.durability_unconfirmed()) {
+            self.restore_retries.lock().await.remove(&local_addr);
+        }
+        result
+    }
+}
+
+/// Internal classification. The public reason text stays unchanged.
+#[derive(Debug)]
+pub(crate) enum RestoreFailure {
+    Permanent(String),
+    Transient(String),
+}
+
+impl RestoreFailure {
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::Permanent(reason) | Self::Transient(reason) => reason,
+        }
+    }
+
+    fn into_reason(self) -> String {
+        match self {
+            Self::Permanent(reason) | Self::Transient(reason) => reason,
+        }
+    }
+}
+
+/// Per-record, per-daemon retry budget. Nothing here is persisted or exposed
+/// in HTTP responses. An owner add/delete resets it after the write applies.
+#[derive(Debug)]
+pub(crate) struct RestoreRetry {
+    failures: u32,
+    pub(crate) next: Option<tokio::time::Instant>,
+}
+
+impl Default for RestoreRetry {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            next: Some(tokio::time::Instant::now()),
+        }
+    }
+}
+
+impl RestoreRetry {
+    pub(crate) fn finish(&mut self, result: &Result<(), RestoreFailure>) {
+        self.failures += 1;
+        // Initial attempt plus five retries: 10, 20, 40, 80, 160 seconds.
+        // Keep the last reason when the budget ends; do not invent an API code.
+        self.next = match result {
+            Err(RestoreFailure::Transient(_)) if self.failures <= 5 => Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(10 << (self.failures - 1)),
+            ),
+            _ => None,
+        };
     }
 }
 
@@ -644,21 +714,49 @@ pub fn restore_decision(
     record: &ForwardRecord,
     resolution: Option<Result<Resolved, NameError>>,
 ) -> Result<(ForwardSpec, ForwardBinding), String> {
+    restore_decision_classified(record, resolution).map_err(RestoreFailure::into_reason)
+}
+
+pub(crate) fn restore_decision_classified(
+    record: &ForwardRecord,
+    resolution: Option<Result<Resolved, NameError>>,
+) -> Result<(ForwardSpec, ForwardBinding), RestoreFailure> {
+    use RestoreFailure::{Permanent, Transient};
     let Some(name) = &record.name else {
         return Ok((record.to_spec(), record.binding()));
     };
     let resolved = match resolution {
         Some(Ok(resolved)) => resolved,
-        Some(Err(e @ NameError::PinMismatch { .. })) => return Err(format!("{NAME_CHANGED}: {e}")),
-        Some(Err(e)) => return Err(format!("{}: {e}", e.code())),
-        None => return Err(format!("unknown_name: {name} was not re-resolved")),
+        Some(Err(e @ NameError::PinMismatch { .. })) => {
+            return Err(Permanent(format!("{NAME_CHANGED}: {e}")))
+        }
+        Some(Err(e)) => {
+            let reason = format!("{}: {e}", e.code());
+            return Err(match e {
+                NameError::Invalid(_)
+                | NameError::Reserved(_)
+                | NameError::AmbiguousKind(_)
+                | NameError::MachineTargetUnsupported(_)
+                | NameError::PinMismatch { .. } => Permanent(reason),
+                // Discovery, credentials, candidate conflicts and store writes can recover.
+                NameError::UnknownName(_)
+                | NameError::UnverifiedOwner(_)
+                | NameError::AmbiguousName { .. }
+                | NameError::Store(_) => Transient(reason),
+            });
+        }
+        None => {
+            return Err(Transient(format!(
+                "unknown_name: {name} was not re-resolved"
+            )))
+        }
     };
     let hex_opt = |id: Option<[u8; 32]>| id.map_or_else(|| "none".to_string(), hex::encode);
     let same_agent = resolved.agent_id == Some(record.pinned_agent_id);
     let same_machine =
         record.kind != NameKind::Machine || resolved.machine_id == Some(record.pinned_machine_id);
     if resolved.kind != record.kind || !same_agent || !same_machine {
-        return Err(format!(
+        return Err(Permanent(format!(
             "{NAME_CHANGED}: {name} now resolves to {} agent {} machine {}, but the forward \
              is pinned to agent {} machine {}; re-add the forward to re-pin",
             resolved.kind.as_str(),
@@ -666,7 +764,7 @@ pub fn restore_decision(
             hex_opt(resolved.machine_id.map(|m| m.0)),
             hex::encode(record.pinned_agent_id.as_bytes()),
             hex::encode(record.pinned_machine_id.as_bytes()),
-        ));
+        )));
     }
     Ok((record.to_spec(), record.binding()))
 }

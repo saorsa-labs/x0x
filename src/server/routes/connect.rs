@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use x0x::forward::store::RestoreFailure;
 
 const DURABLE_REQUIRED: &str =
     "name management requires the durable API token (not a session or rider token)";
@@ -455,9 +456,6 @@ pub(in crate::server) async fn forward_remove(
     )
 }
 
-/// How often restored forwards that are down are re-resolved and re-bound.
-pub(in crate::server) const FORWARD_RESTORE_RETRY_SECS: u64 = 10;
-
 /// Delete the saved forward at `addr`.
 ///
 /// `forwarder` is absent when connect is disabled. The saved record is
@@ -542,7 +540,7 @@ async fn restore_one(
     state: &AppState,
     forwarder: &x0x::forward::ForwardService,
     record: &x0x::forward::store::ForwardRecord,
-) -> bool {
+) -> Result<(), RestoreFailure> {
     let resolution = match &record.name {
         None => None,
         Some(raw) => Some(match x0x::names::NameRef::parse(raw) {
@@ -557,25 +555,27 @@ async fn install_restored(
     forwarder: &x0x::forward::ForwardService,
     record: &x0x::forward::store::ForwardRecord,
     resolution: Option<Result<x0x::names::Resolved, x0x::names::NameError>>,
-) -> bool {
-    let (spec, binding) = match x0x::forward::store::restore_decision(record, resolution) {
+) -> Result<(), RestoreFailure> {
+    let (spec, binding) = match x0x::forward::store::restore_decision_classified(record, resolution)
+    {
         Ok(parts) => parts,
-        Err(reason) => {
+        Err(failure) => {
+            let reason = failure.reason();
             tracing::warn!(
                 target: "x0x::forward",
                 forward = %record.id,
                 %reason,
                 "persisted forward stays down"
             );
-            forwarder.add_disabled(record.to_spec(), record.binding(), reason);
-            return false;
+            forwarder.add_disabled(record.to_spec(), record.binding(), reason.to_owned());
+            return Err(failure);
         }
     };
     match forwarder
         .add_forward_with(spec.clone(), binding.clone())
         .await
     {
-        Ok(_) => true,
+        Ok(_) => Ok(()),
         Err(e) => {
             let reason = format!("bind_failed: {e}");
             tracing::warn!(
@@ -584,29 +584,29 @@ async fn install_restored(
                 %reason,
                 "persisted forward stays down"
             );
-            forwarder.add_disabled(spec, binding, reason);
-            false
+            forwarder.add_disabled(spec, binding, reason.clone());
+            Err(RestoreFailure::Transient(reason))
         }
     }
 }
 
 /// Copy persisted forwards under the lifecycle lock and install each one
-/// before the lock is released. `on_record` returns whether the forward is
-/// listening.
+/// before the lock is released. Only due transient failures are retried.
+/// The result is the earliest retry deadline, or None when work is finished.
 async fn restore_holding<F, Fut>(
     store: &x0x::forward::store::ForwardStore,
     forwarder: &x0x::forward::ForwardService,
     mut on_record: F,
-) -> usize
+) -> Option<tokio::time::Instant>
 where
     F: FnMut(&x0x::forward::store::ForwardRecord) -> Fut,
-    Fut: std::future::Future<Output = bool>,
+    Fut: std::future::Future<Output = Result<(), RestoreFailure>>,
 {
-    let session = match store.begin_restore().await {
+    let mut session = match store.begin_restore().await {
         Ok(session) => session,
         Err(e) => {
             tracing::warn!(target: "x0x::forward", "persisted forwards not restored: {e}");
-            return 0;
+            return None;
         }
     };
     let listening: std::collections::BTreeSet<SocketAddr> = forwarder
@@ -615,30 +615,40 @@ where
         .filter(|f| f.error.is_none())
         .map(|f| f.spec.local_addr)
         .collect();
-    let mut down = 0;
-    for record in &session.records {
+    let mut next = None;
+    let records = std::mem::take(&mut session.records);
+    for record in &records {
         if listening.contains(&record.local_addr) {
+            session.retries.remove(&record.local_addr);
             continue;
         }
-        if !on_record(record).await {
-            down += 1;
+        let retry = session.retries.entry(record.local_addr).or_default();
+        if retry
+            .next
+            .is_some_and(|at| at <= tokio::time::Instant::now())
+        {
+            retry.finish(&on_record(record).await);
+        }
+        if let Some(at) = retry.next {
+            next = Some(next.map_or(at, |previous: tokio::time::Instant| previous.min(at)));
         }
     }
-    down
+    next
 }
 
-/// Restore every persisted forward that is not already listening. Returns
-/// how many are still down. Never fails: a corrupt store restores nothing
-/// (and is reported by `GET /forwards`), a bad record stays down. Shutdown
+/// Restore due persisted forwards. Returns the next transient retry deadline.
+/// Permanent failures and exhausted retry budgets stay down until owner action.
+/// Never fails: a corrupt store restores nothing (reported by `GET /forwards`),
+/// and a bad record stays down. Shutdown
 /// that has closed admission restores nothing.
 ///
 /// The install runs as one forward transaction, so shutdown can drain it
 /// before it cancels listeners. A restore that is still between records
 /// when shutdown starts cannot bind a listener after shutdown returns.
-pub(in crate::server) async fn restore_forwards(state: &Arc<AppState>) -> usize {
-    let Some(forwarder) = state.forward_service.clone() else {
-        return 0;
-    };
+pub(in crate::server) async fn restore_forwards(
+    state: &Arc<AppState>,
+) -> Option<tokio::time::Instant> {
+    let forwarder = state.forward_service.clone()?;
     let state = Arc::clone(state);
     let installing = Arc::clone(&forwarder);
     let store = Arc::clone(&state.forwards);
@@ -656,20 +666,20 @@ async fn restore_in_transaction<F, Fut>(
     forwarder: Arc<x0x::forward::ForwardService>,
     store: Arc<x0x::forward::store::ForwardStore>,
     on_record: F,
-) -> usize
+) -> Option<tokio::time::Instant>
 where
     F: FnMut(&x0x::forward::store::ForwardRecord) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = bool> + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), RestoreFailure>> + Send + 'static,
 {
     let installing = Arc::clone(&forwarder);
     match forwarder
         .run_transaction(async move { restore_holding(&store, &installing, on_record).await })
         .await
     {
-        Ok(down) => down,
+        Ok(next) => next,
         Err(error) => {
             tracing::warn!(target: "x0x::forward", "persisted forwards not restored: {error}");
-            0
+            None
         }
     }
 }
@@ -932,7 +942,7 @@ mod tests {
         let down = restore.await.expect("restore task");
         let removed = remove.await.expect("remove task").expect("forget");
         assert!(removed, "delete removes the forward restore just opened");
-        assert_eq!(down, 0, "the stale copy did open, then delete won");
+        assert!(down.is_none(), "the stale copy did open, then delete won");
         assert!(
             forwarder.forward_at(addr).is_none(),
             "deleted forward must not stay open"
@@ -946,7 +956,7 @@ mod tests {
             async move { install_restored(&forwarder, &record, None).await }
         })
         .await;
-        assert_eq!(again, 0);
+        assert!(again.is_none());
         assert!(
             forwarder.forward_at(addr).is_none(),
             "a later restore must not reopen the deleted forward"
@@ -1003,7 +1013,7 @@ mod tests {
             async move { install_restored(&forwarder, &record, None).await }
         })
         .await;
-        assert_eq!(down, 0);
+        assert!(down.is_none());
         assert!(
             restarted.forward_at(addr).is_none(),
             "restart must not bring back the replaced target"
@@ -1421,6 +1431,213 @@ mod tests {
         forwarder.shutdown();
     }
 
+    async fn retry_fixture() -> (
+        Arc<ForwardStore>,
+        Arc<ForwardService>,
+        Reg,
+        tempfile::TempDir,
+    ) {
+        let (agent, dir) = offline_agent().await;
+        let forwarder = open_forwarder(agent);
+        let store = Arc::new(ForwardStore::in_memory());
+        let mut spec = hex_spec(free_loopback().await);
+        spec.binding.name = Some("machine:box.me".to_string());
+        spec.binding.kind = NameKind::Machine;
+        remember_reg(&store, &spec).await.expect("save");
+        (store, forwarder, spec, dir)
+    }
+
+    async fn retry_pass(
+        store: &ForwardStore,
+        forwarder: &Arc<ForwardService>,
+        attempts: &mut usize,
+        resolution: Result<x0x::names::Resolved, x0x::names::NameError>,
+    ) {
+        restore_holding(store, forwarder, |record| {
+            *attempts += 1;
+            let record = record.clone();
+            let forwarder = Arc::clone(forwarder);
+            let resolution = resolution.clone();
+            async move { install_restored(&forwarder, &record, Some(resolution)).await }
+        })
+        .await;
+    }
+
+    fn retry_resolution(agent: AgentId, machine: MachineId) -> x0x::names::Resolved {
+        x0x::names::Resolved {
+            name: "machine:box.me".to_string(),
+            kind: NameKind::Machine,
+            owner: x0x::identity::UserId([0x33; 32]),
+            agent_id: Some(agent),
+            machine_id: Some(machine),
+            newly_pinned: false,
+        }
+    }
+
+    /// WHY: a name_changed refusal must not re-resolve, even if the name
+    /// later returns to the saved ids. Only an owner action resets it.
+    #[tokio::test]
+    async fn restore_retry_permanent_stops_until_owner_readds() {
+        let (store, forwarder, spec, _dir) = retry_fixture().await;
+        tokio::time::pause();
+        let mut attempts = 0;
+        retry_pass(
+            &store,
+            &forwarder,
+            &mut attempts,
+            Ok(retry_resolution(AgentId([0x99; 32]), MachineId([0x11; 32]))),
+        )
+        .await;
+        let reason = forwarder
+            .forward_status_at(spec.spec.local_addr)
+            .unwrap()
+            .error
+            .unwrap();
+        assert!(reason.starts_with("name_changed:"));
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        retry_pass(
+            &store,
+            &forwarder,
+            &mut attempts,
+            Ok(retry_resolution(
+                spec.spec.peer_agent,
+                spec.binding.pinned_machine.unwrap(),
+            )),
+        )
+        .await;
+        assert_eq!(attempts, 1, "permanent failures must never resolve twice");
+        assert_eq!(
+            forwarder
+                .forward_status_at(spec.spec.local_addr)
+                .unwrap()
+                .error,
+            Some(reason)
+        );
+        assert!(remove_persisted(&store, &forwarder, spec.spec.local_addr)
+            .await
+            .unwrap());
+        let bound = commit_forward(&store, &forwarder, spec.spec.clone(), spec.binding.clone())
+            .await
+            .unwrap();
+        assert!(forwarder.forward_status_at(bound).unwrap().error.is_none());
+        forwarder.shutdown();
+    }
+
+    /// WHY: retries must have increasing delays and a finite attempt budget.
+    #[tokio::test]
+    async fn restore_retry_transient_backoff_and_cap() {
+        let (store, forwarder, _spec, _dir) = retry_fixture().await;
+        tokio::time::pause();
+        let mut attempts = 0;
+        let mut at = Vec::new();
+        for second in 0..=1000 {
+            let before = attempts;
+            retry_pass(
+                &store,
+                &forwarder,
+                &mut attempts,
+                Err(x0x::names::NameError::UnknownName("box.me".into())),
+            )
+            .await;
+            if attempts != before {
+                at.push(second);
+            }
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            at,
+            vec![0, 10, 30, 70, 150, 310],
+            "initial attempt plus five backed-off retries"
+        );
+        assert!(forwarder.list_forward_status()[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .starts_with("unknown_name:"));
+        forwarder.shutdown();
+    }
+
+    /// WHY: bind_failed must use the same budget and return no deadline
+    /// after exhaustion, even if the port later becomes free.
+    #[tokio::test]
+    async fn restore_retry_bind_failure_exhausts_deadline() {
+        let (store, forwarder, spec, _dir) = retry_fixture().await;
+        let occupied = tokio::net::TcpListener::bind(spec.spec.local_addr)
+            .await
+            .unwrap();
+        tokio::time::pause();
+        let mut attempts = 0;
+        for delay in [Some(10), Some(20), Some(40), Some(80), Some(160), None] {
+            let now = tokio::time::Instant::now();
+            let next = restore_holding(&store, &forwarder, |record| {
+                attempts += 1;
+                let record = record.clone();
+                let forwarder = Arc::clone(&forwarder);
+                let resolved =
+                    retry_resolution(spec.spec.peer_agent, spec.binding.pinned_machine.unwrap());
+                async move { install_restored(&forwarder, &record, Some(Ok(resolved))).await }
+            })
+            .await;
+            assert_eq!(
+                next.map(|at| at.duration_since(now)),
+                delay.map(std::time::Duration::from_secs)
+            );
+            if let Some(seconds) = delay {
+                tokio::time::advance(std::time::Duration::from_secs(seconds)).await;
+            }
+        }
+        assert_eq!(attempts, 6);
+        assert!(forwarder.list_forward_status()[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .starts_with("bind_failed:"));
+        drop(occupied);
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert!(restore_holding(&store, &forwarder, |_| async {
+            panic!("exhausted forward retried")
+        })
+        .await
+        .is_none());
+        forwarder.shutdown();
+    }
+
+    /// WHY: discovery within the budget must recover at the next deadline
+    /// with both saved ids, never an unpinned or replacement target.
+    #[tokio::test]
+    async fn restore_retry_recovers_on_pinned_ids() {
+        let (store, forwarder, spec, _dir) = retry_fixture().await;
+        tokio::time::pause();
+        let mut attempts = 0;
+        retry_pass(
+            &store,
+            &forwarder,
+            &mut attempts,
+            Err(x0x::names::NameError::UnknownName("box.me".into())),
+        )
+        .await;
+        let resolved = retry_resolution(spec.spec.peer_agent, spec.binding.pinned_machine.unwrap());
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        retry_pass(&store, &forwarder, &mut attempts, Ok(resolved.clone())).await;
+        assert_eq!(attempts, 1, "discovery must not bypass the retry deadline");
+        assert!(forwarder
+            .forward_status_at(spec.spec.local_addr)
+            .unwrap()
+            .error
+            .is_some());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        retry_pass(&store, &forwarder, &mut attempts, Ok(resolved.clone())).await;
+        assert_eq!(attempts, 2);
+        let status = forwarder.forward_status_at(spec.spec.local_addr).unwrap();
+        assert!(status.error.is_none());
+        assert_eq!(status.spec.peer_agent, spec.spec.peer_agent);
+        assert_eq!(status.binding.pinned_machine, spec.binding.pinned_machine);
+        tokio::time::advance(std::time::Duration::from_secs(1000)).await;
+        retry_pass(&store, &forwarder, &mut attempts, Ok(resolved)).await;
+        assert_eq!(attempts, 2, "an active forward no longer retries");
+        forwarder.shutdown();
+    }
+
     /// WHY: a restart has to bind the saved port again, with the pin the
     /// name still resolves to. Reloading the file is not that listener.
     #[tokio::test]
@@ -1449,7 +1666,9 @@ mod tests {
             newly_pinned: false,
         };
         assert!(
-            install_restored(&forwarder, record, Some(Ok(resolved))).await,
+            install_restored(&forwarder, record, Some(Ok(resolved)))
+                .await
+                .is_ok(),
             "restore must bind the saved forward"
         );
         let listed = forwarder.list_forward_status();
