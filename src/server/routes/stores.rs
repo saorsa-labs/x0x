@@ -7117,6 +7117,128 @@ mod tests {
         let _ = GroupPolicy::default();
     }
 
+    /// Codex P2 (#1508 r6), same class as the task-list write: ADR 0110
+    /// §4b(3) refuses every member operation while verified revocations
+    /// cover every admin seat. A put or delete on a `SignedPublic` group's
+    /// store is a member send, so the route refuses it with the typed
+    /// state and the store does not change. Before the fix the public
+    /// store took the write and published it.
+    #[tokio::test]
+    async fn public_group_store_write_is_refused_while_every_admin_seat_is_revoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let admin = crate::identity::AgentKeypair::generate().expect("admin key");
+        let group_key = "4b".repeat(16);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::Public;
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_public_group_store(&groups, &group_key, "Wiki", &state.agent.agent_id())
+                .expect("binding")
+        };
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
+        let (handle, _context, _) = open_bound_public_store(&state, &binding, snapshot_lease)
+            .await
+            .expect("public store open");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle.clone());
+        let put = |key: &str| {
+            let state = Arc::clone(&state);
+            let topic = binding.topic.clone();
+            let key = key.to_string();
+            async move {
+                let response = put_kv_value(
+                    State(state),
+                    Path((topic, key)),
+                    Json(PutValueRequest {
+                        value: BASE64.encode(b"v"),
+                        content_type: None,
+                    }),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).expect("json"),
+                )
+            }
+        };
+        let (status, body) = put("before").await;
+        assert!(status.is_success(), "no false refusal: {status} {body}");
+
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(admin.agent_id()),
+            admin.public_key(),
+            admin.secret_key(),
+            1,
+            None,
+        )
+        .expect("sign revocation");
+        assert!(state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("self-revocation verifies"));
+        let (status, body) = put("after").await;
+        assert!(
+            status == StatusCode::GONE || status == StatusCode::CONFLICT,
+            "typed refusal, got {status} {body}"
+        );
+        assert!(
+            body["error"] == "group_admin_revoked"
+                || body["error"] == "waiting_for_eligible_admin_revocation",
+            "{body}"
+        );
+        let response = delete_kv_value(
+            State(Arc::clone(&state)),
+            Path((binding.topic.clone(), "before".to_string())),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        assert!(
+            status == StatusCode::GONE || status == StatusCode::CONFLICT,
+            "a delete is refused too, got {status}"
+        );
+        assert!(
+            handle.get("after").await.ok().flatten().is_none(),
+            "no write"
+        );
+        assert!(
+            handle.get("before").await.ok().flatten().is_some(),
+            "no delete"
+        );
+        state.kv_stores.write().await.remove(&binding.topic);
+        handle.retire_and_drain().await;
+    }
+
     #[tokio::test]
     async fn public_store_open_drops_its_authorization_context() {
         let (state, _dir) = encrypted_store_test_state().await;
