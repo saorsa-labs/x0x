@@ -3816,31 +3816,39 @@ mod tests {
         );
     }
 
+    /// #1508 Codex P1: a retry asks every holder again, but it must not
+    /// erase the unresolved report. ADR 0110 §2: "no known
+    /// higher/conflicting head ... may remain unresolved". Only the
+    /// reporting holder's own later report on the local chain resolves it.
     #[test]
     fn a_conflicting_head_report_blocks_the_seal_until_resolved() {
         let wait = Duration::from_secs(13);
         let start = Instant::now();
         let mut rounds = HashMap::new();
         let mut asks = HeadRoundAsks::new();
-        let holders = [[8; 32], [9; 32]];
+        let (a, b) = ([8; 32], [9; 32]);
+        let holders = [a, b];
         refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
-        note_head_report(&mut rounds, "g", "h1", [8; 32], HeadReport::Unknown, start);
+        note_head_report(&mut rounds, "g", "h1", a, HeadReport::Unknown, start);
         let later = start + wait * 10;
         assert!(!rounds
             .get("g")
             .expect("round")
             .synced("h1", 2, false, true, later, wait));
-        // After the wait the round asks every holder again.
+        // After the wait the round asks every holder again, A included.
         let again = refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, later, wait);
         assert_eq!(again, holders.to_vec());
-        note_head_report(
-            &mut rounds,
-            "g",
-            "h1",
-            [9; 32],
-            HeadReport::OnLocalChain,
-            later,
+        // B confirms the local head. A's report is still unresolved.
+        note_head_report(&mut rounds, "g", "h1", b, HeadReport::OnLocalChain, later);
+        assert!(
+            !rounds
+                .get("g")
+                .expect("round")
+                .synced("h1", 2, false, true, later, wait),
+            "the retry kept A's unknown-head report"
         );
+        // A itself now reports a head on the local chain: resolved.
+        note_head_report(&mut rounds, "g", "h1", a, HeadReport::OnLocalChain, later);
         assert!(rounds
             .get("g")
             .expect("round")
@@ -3851,6 +3859,48 @@ mod tests {
             .get("g")
             .expect("round")
             .synced("h2", 2, false, true, later, wait));
+    }
+
+    /// #1508 Codex P1, the head-change path: a new local head starts a new
+    /// round, in [`refresh_head_round`] and in [`note_head_report`]. The
+    /// new round keeps A's unresolved report and asks A again; another
+    /// holder's confirmation does not resolve it.
+    #[test]
+    fn a_new_local_head_keeps_an_unresolved_head_report() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let (a, b) = ([8; 32], [9; 32]);
+        let holders = [a, b];
+        // The worker pass sees the new head first.
+        let mut rounds = HashMap::new();
+        let mut asks = HeadRoundAsks::new();
+        refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
+        note_head_report(&mut rounds, "g", "h1", a, HeadReport::Unknown, start);
+        let next = start + Duration::from_millis(1);
+        let asked = refresh_head_round(&mut rounds, &mut asks, "g", "h2", &holders, next, wait);
+        assert_eq!(asked, holders.to_vec(), "the new round asks A again");
+        note_head_report(&mut rounds, "g", "h2", b, HeadReport::OnLocalChain, next);
+        let round = rounds.get("g").expect("round");
+        assert!(!round.synced("h2", 2, false, true, next, wait));
+        note_head_report(&mut rounds, "g", "h2", a, HeadReport::OnLocalChain, next);
+        let round = rounds.get("g").expect("round");
+        assert!(round.synced("h2", 2, false, true, next, wait));
+        // A report arrives first for the new head.
+        let mut rounds = HashMap::new();
+        let mut asks = HeadRoundAsks::new();
+        refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
+        note_head_report(&mut rounds, "g", "h1", a, HeadReport::Unknown, start);
+        note_head_report(&mut rounds, "g", "h2", b, HeadReport::OnLocalChain, start);
+        let round = rounds.get("g").expect("round");
+        assert!(
+            !round.synced("h2", 2, false, true, start, wait),
+            "the head change in the report path kept A's report"
+        );
+        // A holder that is no longer a holder (it left, or it is now an
+        // open target) no longer blocks.
+        refresh_head_round(&mut rounds, &mut asks, "g", "h2", &[b], start, wait);
+        let round = rounds.get("g").expect("round");
+        assert!(round.synced("h2", 1, false, true, start, wait));
     }
 
     /// CI W3-H `w3h_1357_red_s4_restart_intake_prepare`: the committer is

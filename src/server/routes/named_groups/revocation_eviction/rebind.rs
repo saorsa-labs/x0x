@@ -2436,38 +2436,67 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
-    /// F3 (c): a rebind delivery restored after a restart is not resent
-    /// while the group has higher-head or conflicting-head evidence, even
-    /// though the restart wait has elapsed. It uses the same §2 gate as
-    /// the removal and crypto-exclusion deliveries. Once the evidence
-    /// resolves, the same round delivers it.
+    /// F3 (c) and #1508 Codex P1: a rebind delivery restored after a
+    /// restart, with no open row, waits for its group's §2 head sync, and
+    /// the real worker pass gives it the head round that the sync needs.
+    /// The process stops after the local commit (the authored frame is
+    /// durable at the head) and restarts through the real load and restore
+    /// path. The delivery is not resent while the group has higher-head or
+    /// conflicting-head evidence. Once the survivor answers the catch-up
+    /// with the local head ([`super::super::note_catchup_head`], the call
+    /// of the response handler), the next worker step resends it.
     #[tokio::test]
     async fn a_restored_rebind_delivery_waits_for_the_head_sync() -> Result<()> {
-        let (state, _dir) = state_past_restart_wait().await?;
+        let dir = tempfile::tempdir()?;
         let survivor = AgentId([0x5A; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
         let group_id = "c8".repeat(16);
-        let info = insert_group(&state, &group_id, &survivor).await;
-        let stable = info.stable_group_id().to_string();
-        // A crash after the local commit: the authored frame is durable at
-        // the head, and the restart restores its delivery.
         let frame = Arc::new(b"X0XCRB1\0restored frame".to_vec());
-        let at = (info.state_revision, info.state_hash.as_str());
-        let ext = replay_log::REBIND_EXTENSION;
-        assert!(replay_log::write_planned(&state, ext, held, &stable, at, &frame).await);
-        ensure_restored(&state).await;
+        let info = {
+            let author = offline_daemon(dir.path(), None).await?;
+            let info = insert_group(&author, &group_id, &survivor).await;
+            hold_persisted(&author, &info).await?;
+            let at = (info.state_revision, info.state_hash.as_str());
+            let ext = replay_log::REBIND_EXTENSION;
+            let stable = info.stable_group_id();
+            assert!(replay_log::write_planned(&author, ext, held, stable, at, &frame).await);
+            author.agent.shutdown().await;
+            info
+        };
+        // The restart: the same node over the same directory. Its restart
+        // sync wait is zero, so only the per-group head sync holds.
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the restarted state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        // The catch-up request records instead of sending.
+        state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let stable = info.stable_group_id().to_string();
         let key = (stable.clone(), info.state_hash.clone());
+        // One worker iteration: the pass, then the rebind step.
+        let worker_step = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            async move {
+                super::super::revocation_eviction_pass(&state).await;
+                drive(&state).await;
+            }
+        };
+        set_evidence(&state, &group_id, &info, HeadEvidence::Higher, true).await;
+        worker_step(&state).await;
         let scheduled = {
-            let mut inner = state.revocation_evictions.inner.lock().await;
-            let scheduled = inner
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner
                 .rebind
                 .deliveries
                 .get(&key)
-                .context("restored")?
-                .next_at;
-            inner
-                .head_rounds
-                .insert(stable.clone(), HeadRound::new(&info.state_hash, scheduled));
-            scheduled
+                .context("the restart restored the delivery")?
+                .next_at
         };
         let held_back = |state: &Arc<AppState>| {
             let state = Arc::clone(state);
@@ -2482,20 +2511,54 @@ pub(super) mod restart_tests {
                 })
             }
         };
-        for evidence in [HeadEvidence::Higher, HeadEvidence::Conflicting] {
-            set_evidence(&state, &group_id, &info, evidence, true).await;
-            drive_deliveries(&state).await;
-            assert!(
-                held_back(&state).await,
-                "{evidence:?} head evidence holds the restored delivery"
-            );
-            set_evidence(&state, &group_id, &info, evidence, false).await;
-        }
-        drive_deliveries(&state).await;
+        let asked_survivor = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            let stable = stable.clone();
+            async move {
+                let inner = state.revocation_evictions.inner.lock().await;
+                inner
+                    .head_rounds
+                    .get(&stable)
+                    .is_some_and(|round| round.asked.contains(survivor.as_bytes()))
+            }
+        };
+        // Higher-head evidence: the worker pass made a round and asked the
+        // survivor, but the delivery waits.
+        worker_step(&state).await;
+        assert!(
+            asked_survivor(&state).await,
+            "the worker pass opened a head round for the restored delivery"
+        );
+        assert!(held_back(&state).await, "higher-head evidence holds it");
+        set_evidence(&state, &group_id, &info, HeadEvidence::Higher, false).await;
+        // The survivor answers with a head this node does not have.
+        let unknown = "f0".repeat(32);
+        super::super::note_catchup_head(&state, &[group_id.clone()], &survivor_hex, Some(&unknown))
+            .await;
+        worker_step(&state).await;
+        worker_step(&state).await;
+        assert!(
+            held_back(&state).await,
+            "a conflicting head report holds it"
+        );
+        assert!(
+            asked_survivor(&state).await,
+            "the retry asks the conflicting holder again"
+        );
+        // The survivor answers again with the local head: synced.
+        super::super::note_catchup_head(
+            &state,
+            &[group_id.clone()],
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        worker_step(&state).await;
         assert!(
             !held_back(&state).await,
             "the synced group's restored delivery ran"
         );
+        state.agent.shutdown().await;
         Ok(())
     }
 }
