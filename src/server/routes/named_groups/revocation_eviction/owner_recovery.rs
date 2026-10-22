@@ -1783,7 +1783,7 @@ async fn receive_commit(
         if refusal == orc::OwnerRecoveryRefusal::RecoveryHeadMismatch {
             // The tree lock is not needed for the fork-evidence install.
             drop(guard);
-            contain_sibling(state, &group_key, &info, &body).await;
+            contain_sibling(state, &group_key, &info, &body, &revocations).await;
         }
         return if refusal == orc::OwnerRecoveryRefusal::RecoveryNotNeeded {
             // The named revocation records may still be on their way.
@@ -1994,9 +1994,12 @@ async fn contain_sibling(
     group_key: &str,
     info: &GroupInfo,
     body: &orc::OwnerRecoveryBodyV1,
+    revocations: &orc::VerifiedAgentRevocations,
 ) {
     use super::super as ng;
-    if let Err(refusal) = orc::validate_sibling(body, info) {
+    // #1508 r7 (Codex P1 1): the §4b(1) checks run against the retained
+    // parent first; an invalid alternative child stops nothing.
+    if let Err(refusal) = orc::validate_sibling(body, info, revocations, now_unix()) {
         tracing::debug!(
             group_id = %ng::LogHexId::group(group_key),
             reason = refusal.as_str(),
@@ -3760,7 +3763,7 @@ mod restart_tests {
         let b = offline_author(dir_b.path(), seed).await?;
         let owner = a.agent.identity().user_keypair().context("owner key")?;
         let admin = x0x::identity::AgentKeypair::generate()?;
-        let info = recovery_parent(
+        let mut info = recovery_parent(
             owner,
             &admin,
             [
@@ -3768,6 +3771,9 @@ mod restart_tests {
                 b.agent.identity().agent_keypair(),
             ],
         )?;
+        // #1508 r7: the parent is a sealed head, so each replica retains it
+        // and can check the other's sibling against it.
+        info.seal_commit_evicting(&admin, 1)?;
         let stable = info.stable_group_id().to_string();
         for state in [&a, &b] {
             hold_persisted(state, &info).await?;

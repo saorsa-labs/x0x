@@ -891,7 +891,12 @@ async fn pre_cutoff(
     receipt.note(format!(
         "run (1) B's self-rebind: {status} {body}; typed receiver-upgrade retries {retries:?}"
     ));
-    let accepted = status == StatusCode::OK && body["certificate_digest"] == d1.as_str();
+    // §2 (#1508 Codex P1 F3): a replica whose head is not synced yet
+    // holds the self-rebind (`409 waiting_for_head_sync`) and its worker
+    // commits it once the head is synced; the binding check below
+    // observes the commit either way.
+    let accepted = (status == StatusCode::OK && body["certificate_digest"] == d1.as_str())
+        || (status == StatusCode::CONFLICT && body["error"] == "waiting_for_head_sync");
     let mut reached: Option<Duration> = None;
     let mut seen = Observations::default();
     let waited = sim

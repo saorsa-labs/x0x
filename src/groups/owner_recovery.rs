@@ -683,16 +683,33 @@ pub fn validate_against_parent(
 
 /// ADR 0110 §2 fork containment: whether `body`, which
 /// [`validate_against_parent`] refused with `recovery_head_mismatch` on
-/// `current`, is an authenticated sibling of a commit on `current`'s
-/// retained chain. That is: the policy owner U signed its mandate for the
-/// commit's own parent; the promoted member is the actor; the commit
-/// chains exactly from that parent; and `current` retains a different
-/// commit at the same revision on the same parent. When `current` retains
-/// the parent itself, the promoted member must hold an Active seat there,
-/// with the mandate's certificate digest when the snapshot records one.
+/// `current`, is a valid recovery on a sibling branch of `current`'s
+/// retained chain. Only such a commit is fork evidence.
 ///
-/// The caller has already run [`verify_commit_signatures`], so the actor
-/// signed the frame and the embedded commit.
+/// The parent is the retained commit whose `state_hash` is the body's
+/// `prior_head`, and `current` retains a different commit at the same
+/// revision on that parent. The §4b(1) checks then run against the
+/// parent's retained roster and commit, as [`validate_against_parent`]
+/// runs them against a live parent (#1508 r7, Codex P1 1):
+///
+/// - the policy owner U signed the mandate for that parent, and the
+///   promoted member is the actor;
+/// - the named admins are exactly the parent's Admin-or-higher Active
+///   seats, and this node holds every named revocation record;
+/// - the promoted member is Active at the parent with the mandate's
+///   certificate digest, is not named and is not revoked, and the
+///   commit's certificate has that digest and verifies against U at
+///   `now_unix`;
+/// - each removed seat is a named admin with its committed leaf (TreeKEM
+///   only);
+/// - the crypto transition starts at the parent's committed epoch, with
+///   the exact security binding;
+/// - the post-state roster is the parent's with only the §4b(1) change,
+///   and the policy and metadata are the parent's.
+///
+/// A parent that is not retained cannot be checked, so its child is no
+/// sibling. The caller has already run [`verify_commit_signatures`], so
+/// the actor signed the frame and the embedded commit.
 ///
 /// # Errors
 ///
@@ -701,7 +718,12 @@ pub fn validate_against_parent(
 pub fn validate_sibling(
     body: &OwnerRecoveryBodyV1,
     current: &GroupInfo,
+    revocations: &VerifiedAgentRevocations,
+    now_unix: u64,
 ) -> Result<(), OwnerRecoveryRefusal> {
+    if current.withdrawn || current.fork_quarantine.is_some() || body.commit.withdrawn {
+        return Err(OwnerRecoveryRefusal::RecoveryGroupQuarantined);
+    }
     let Some(owner) = current.policy.admission.owner_certified_user_id() else {
         return Err(OwnerRecoveryRefusal::RecoverySignerNotOwner);
     };
@@ -727,29 +749,172 @@ pub fn validate_sibling(
             && retained.commit.revision == body.next_revision
             && retained.commit.state_hash != body.commit.state_hash
     });
-    if !sibling {
-        return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
-    }
-    if let Some(parent) = current
+    let parent = current
         .commit_log
         .iter()
-        .find(|retained| retained.commit.state_hash == body.prior_head)
-    {
-        let seated = parent
-            .roster
-            .get(&hex::encode(mandate.promoted))
-            .is_some_and(|seat| {
-                seat.state == GroupMemberState::Active
-                    && seat
-                        .certificate_digest
-                        .as_deref()
-                        .is_none_or(|digest| digest == mandate.promoted_certificate_digest)
-            });
-        if !seated {
-            return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible);
+        .find(|retained| retained.commit.state_hash == body.prior_head);
+    let Some(parent) = parent.filter(|_| sibling) else {
+        return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
+    };
+    if parent.commit.revision != body.prior_revision {
+        return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
+    }
+    validate_sibling_mandate(body, current, &parent.roster, revocations, now_unix)?;
+    validate_sibling_transition(body, current, parent)
+}
+
+/// [`validate_sibling`]'s mandate checks against the parent's retained
+/// `roster`: the named admins, their records and the promoted member.
+fn validate_sibling_mandate(
+    body: &OwnerRecoveryBodyV1,
+    current: &GroupInfo,
+    roster: &BTreeMap<String, crate::groups::state_commit::RosterMemberSnapshot>,
+    revocations: &VerifiedAgentRevocations,
+    now_unix: u64,
+) -> Result<(), OwnerRecoveryRefusal> {
+    let mandate = &body.mandate.body;
+    let mut admins: Vec<[u8; 32]> = roster
+        .iter()
+        .filter(|(_, seat)| {
+            seat.state == GroupMemberState::Active && seat.role.at_least(GroupRole::Admin)
+        })
+        .filter_map(|(id, _)| agent_bytes(id))
+        .collect();
+    admins.sort_unstable();
+    let named: Vec<[u8; 32]> = mandate.revoked_admins.iter().map(|a| a.agent).collect();
+    if admins.is_empty() || named != admins {
+        return Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
+    }
+    for admin in &mandate.revoked_admins {
+        let held = revocations.get(&admin.agent);
+        let verified = !admin.revocation_hashes.is_empty()
+            && admin
+                .revocation_hashes
+                .iter()
+                .all(|hash| held.is_some_and(|set| set.contains(hash)));
+        if !verified {
+            return Err(OwnerRecoveryRefusal::RecoveryNotNeeded);
         }
     }
+    let promoted_hex = hex::encode(mandate.promoted);
+    let revoked = revocations
+        .get(&mandate.promoted)
+        .is_some_and(|set| !set.is_empty());
+    let seated = roster.get(&promoted_hex).is_some_and(|seat| {
+        seat.state == GroupMemberState::Active
+            && seat.certificate_digest.as_deref()
+                == Some(mandate.promoted_certificate_digest.as_str())
+    });
+    if !seated || revoked || named.contains(&mandate.promoted) {
+        return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible);
+    }
+    let Some(certificate) = decode_certificate(&body.promoted_certificate) else {
+        return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible);
+    };
+    let Some(owner) = current.policy.admission.owner_certified_user_id() else {
+        return Err(OwnerRecoveryRefusal::RecoverySignerNotOwner);
+    };
+    if crate::groups::owner_cert::certificate_digest_hex(&certificate)
+        != mandate.promoted_certificate_digest
+    {
+        return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible);
+    }
+    crate::groups::owner_cert::verify_cert_against_owner(
+        owner,
+        &promoted_hex,
+        &certificate,
+        revoked,
+        now_unix,
+    )
+    .map_err(|_| OwnerRecoveryRefusal::RecoveryMemberIneligible)
+}
+
+/// [`validate_sibling`]'s removal, crypto and post-state checks against
+/// the retained `parent`.
+fn validate_sibling_transition(
+    body: &OwnerRecoveryBodyV1,
+    current: &GroupInfo,
+    parent: &crate::groups::state_commit::RetainedCommit,
+) -> Result<(), OwnerRecoveryRefusal> {
+    let kind = crypto_kind(current);
+    let named = &body.mandate.body.revoked_admins;
+    if body.removed.len() != named.len() {
+        return Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
+    }
+    for (seat, admin) in body.removed.iter().zip(named) {
+        let committed_leaf = parent
+            .roster
+            .get(&hex::encode(seat.agent))
+            .and_then(|snapshot| snapshot.treekem_key_package_hash.clone());
+        let expected_leaf = (kind == RecoveryCryptoKind::TreeKem)
+            .then_some(committed_leaf)
+            .flatten();
+        if seat.agent != admin.agent || seat.leaf_key_package_hash != expected_leaf {
+            return Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
+        }
+    }
+    let parent_binding = parent.commit.security_binding.as_deref();
+    let binding_ok = match (&body.crypto, kind) {
+        (
+            OwnerRecoveryCryptoV1::TreeKem {
+                commits,
+                next_epoch,
+            },
+            RecoveryCryptoKind::TreeKem,
+        ) => {
+            let leaves = body
+                .removed
+                .iter()
+                .filter(|seat| seat.leaf_key_package_hash.is_some())
+                .count();
+            let parent_epoch = parent_binding.and_then(|b| binding_epoch(b, "treekem:epoch="));
+            commits.len() == leaves
+                && parent_epoch.map(|epoch| epoch.saturating_add(commits.len() as u64))
+                    == Some(*next_epoch)
+                && body.commit.security_binding.as_deref()
+                    == Some(treekem_binding(*next_epoch, commits).as_str())
+        }
+        (OwnerRecoveryCryptoV1::Gss { next_secret_epoch }, RecoveryCryptoKind::Gss) => {
+            let parent_epoch = parent_binding.and_then(|b| binding_epoch(b, "gss:epoch="));
+            parent_epoch.map(|epoch| epoch.saturating_add(1)) == Some(*next_secret_epoch)
+                && body.commit.security_binding.as_deref()
+                    == Some(gss_binding(*next_secret_epoch).as_str())
+        }
+        (OwnerRecoveryCryptoV1::SignedPublic, RecoveryCryptoKind::SignedPublic) => {
+            body.commit.security_binding.as_deref() == parent_binding
+        }
+        _ => false,
+    };
+    if !binding_ok {
+        return Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
+    }
+    // The §4b(1) roster change on the parent's projection: the removed
+    // seats leave it and the actor becomes Admin. Nothing else changes.
+    let mut roster = parent.roster.clone();
+    for seat in &body.removed {
+        roster.remove(&hex::encode(seat.agent));
+    }
+    match roster.get_mut(&hex::encode(body.actor)) {
+        Some(seat) => seat.role = GroupRole::Admin,
+        None => return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible),
+    }
+    if crate::groups::state_commit::roster_root_of_projection(&roster) != body.commit.roster_root
+        || body.commit.policy_hash != parent.commit.policy_hash
+        || body.commit.public_meta_hash != parent.commit.public_meta_hash
+    {
+        return Err(OwnerRecoveryRefusal::RecoveryProofInvalid);
+    }
     Ok(())
+}
+
+/// The epoch at the start of a security `binding` after `prefix`
+/// (`treekem:epoch=N`, `treekem:epoch=N:…`, `treekem:epoch=N;…`).
+fn binding_epoch(binding: &str, prefix: &str) -> Option<u64> {
+    let rest = binding.strip_prefix(prefix)?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// The D76 hold rule (§4b(1) "Mixed versions"): the Active members whose
@@ -1128,26 +1293,17 @@ mod tests {
     /// commit with no retained sibling is not.
     #[test]
     fn only_an_owner_mandated_child_of_a_retained_parent_is_a_sibling() {
-        let f = fixture(
-            GroupConfidentiality::SignedPublic,
-            crate::mls::SecureGroupPlane::default(),
-        );
+        let f = retained_parent_fixture();
         let theirs = commit_for(&f, mandate_for(&f), 0);
         // This node committed its own recovery on the same parent: it
         // also promoted another member.
-        let mut ours = f.info.clone();
-        apply_roster_change(&mut ours, &theirs);
-        ours.members_v2
-            .get_mut(&hex::encode(f.other.agent_id().as_bytes()))
-            .expect("other seat")
-            .role = GroupRole::Admin;
-        let own = ours.seal_commit_evicting(&f.promoted, 2_000).expect("seal");
-        assert_ne!(own.state_hash, theirs.commit.state_hash);
-        assert_eq!(validate_sibling(&theirs, &ours), Ok(()));
+        let ours = own_branch(&f, &theirs);
+        assert_ne!(ours.state_hash, theirs.commit.state_hash);
+        assert_eq!(sibling_check(&theirs, &ours, &f), Ok(()));
 
         // No retained child of the parent: not a sibling.
         assert_eq!(
-            validate_sibling(&theirs, &f.info),
+            sibling_check(&theirs, &f.info, &f),
             Err(OwnerRecoveryRefusal::RecoveryHeadMismatch)
         );
         // A mandate that U did not sign.
@@ -1155,21 +1311,126 @@ mod tests {
         let stranger = UserKeypair::generate().expect("user");
         forged.mandate = sign_mandate(forged.mandate.body, &stranger).expect("sign");
         assert_eq!(
-            validate_sibling(&forged, &ours),
+            sibling_check(&forged, &ours, &f),
             Err(OwnerRecoveryRefusal::RecoverySignerNotOwner)
         );
         // The actor is not the promoted member.
         let mut wrong_actor = theirs.clone();
         wrong_actor.actor = *f.other.agent_id().as_bytes();
         assert_eq!(
-            validate_sibling(&wrong_actor, &ours),
+            sibling_check(&wrong_actor, &ours, &f),
             Err(OwnerRecoveryRefusal::RecoveryMemberIneligible)
         );
         // A commit that does not chain from the mandate's parent.
         let mut unchained = theirs;
         unchained.prior_head = "other".to_string();
         assert_eq!(
-            validate_sibling(&unchained, &ours),
+            sibling_check(&unchained, &ours, &f),
+            Err(OwnerRecoveryRefusal::RecoveryHeadMismatch)
+        );
+    }
+
+    /// [`validate_sibling`] as the receive path calls it.
+    fn sibling_check(
+        body: &OwnerRecoveryBodyV1,
+        current: &GroupInfo,
+        f: &Fixture,
+    ) -> Result<(), OwnerRecoveryRefusal> {
+        validate_sibling(body, current, &f.revocations, NOW)
+    }
+
+    /// `f` with its head sealed, so the parent of a recovery is retained.
+    fn retained_parent_fixture() -> Fixture {
+        let mut f = fixture(
+            GroupConfidentiality::SignedPublic,
+            crate::mls::SecureGroupPlane::default(),
+        );
+        f.info
+            .seal_commit_evicting(&f.admin, 500)
+            .expect("seal parent");
+        f
+    }
+
+    /// This node's own branch on `f`'s parent: a recovery that also made
+    /// `other` an Admin.
+    fn own_branch(f: &Fixture, theirs: &OwnerRecoveryBodyV1) -> GroupInfo {
+        let mut ours = f.info.clone();
+        apply_roster_change(&mut ours, theirs);
+        ours.members_v2
+            .get_mut(&hex::encode(f.other.agent_id().as_bytes()))
+            .expect("other seat")
+            .role = GroupRole::Admin;
+        ours.seal_commit_evicting(&f.promoted, 2_000).expect("seal");
+        ours
+    }
+
+    /// #1508 r7 (Codex P1 1): a mandate holder's sibling that is no valid
+    /// §4b(1) transition from the retained parent is no fork evidence. A
+    /// sibling whose parent is not retained cannot be checked, so it is
+    /// none either.
+    #[test]
+    fn an_invalid_recovery_sibling_is_no_fork_evidence() {
+        let f = retained_parent_fixture();
+        let theirs = commit_for(&f, mandate_for(&f), 0);
+        let ours = own_branch(&f, &theirs);
+        assert_eq!(sibling_check(&theirs, &ours, &f), Ok(()));
+
+        // The post-state changes another seat too.
+        let mut extra = theirs.clone();
+        let mut next = f.info.clone();
+        apply_roster_change(&mut next, &extra);
+        next.members_v2
+            .get_mut(&hex::encode(f.other.agent_id().as_bytes()))
+            .expect("other seat")
+            .role = GroupRole::Moderator;
+        extra.commit =
+            CommitHeaderV1::from(&next.seal_commit_evicting(&f.promoted, 1_500).expect("seal"));
+        assert_eq!(
+            sibling_check(&extra, &ours, &f),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
+        );
+
+        // The owner-signed mandate names a seat that is no admin at the
+        // parent, and the commit removes it.
+        let mut misnamed = theirs.clone();
+        let mut body = misnamed.mandate.body.clone();
+        body.revoked_admins = vec![RevokedAdminV1 {
+            agent: *f.other.agent_id().as_bytes(),
+            revocation_hashes: vec![[7u8; 32]],
+        }];
+        misnamed.mandate = sign_mandate(body, &f.owner).expect("sign");
+        misnamed.removed = vec![RemovedSeatV1 {
+            agent: *f.other.agent_id().as_bytes(),
+            leaf_key_package_hash: None,
+        }];
+        let mut next = f.info.clone();
+        apply_roster_change(&mut next, &misnamed);
+        misnamed.commit =
+            CommitHeaderV1::from(&next.seal_commit_evicting(&f.promoted, 1_600).expect("seal"));
+        assert_eq!(
+            sibling_check(&misnamed, &ours, &f),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
+        );
+
+        // The commit changes the security binding of a SignedPublic group.
+        let mut rebound = theirs.clone();
+        let mut next = f.info.clone();
+        apply_roster_change(&mut next, &rebound);
+        next.security_binding = Some("gss:epoch=9".to_string());
+        rebound.commit =
+            CommitHeaderV1::from(&next.seal_commit_evicting(&f.promoted, 1_700).expect("seal"));
+        assert_eq!(
+            sibling_check(&rebound, &ours, &f),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
+        );
+
+        // The parent is not retained: nothing to check the commit against.
+        let mut unretained = ours.clone();
+        unretained
+            .commit_log
+            .retain(|retained| retained.commit.state_hash != theirs.prior_head);
+        assert_eq!(
+            sibling_check(&theirs, &unretained, &f),
             Err(OwnerRecoveryRefusal::RecoveryHeadMismatch)
         );
     }

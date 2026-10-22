@@ -139,6 +139,8 @@ struct S4Inner {
     budgets: HashMap<EvictionKey, RowBudget>,
     /// The revocation-set generation at the last full reconciliation.
     reconciled_generation: Option<u64>,
+    /// [`revocation_seats`] at the last full reconciliation.
+    reconciled_seats: Option<[u8; 32]>,
     /// The `.evs` file was read (or found absent) at startup.
     loaded: bool,
     sidecar: SidecarStatus,
@@ -706,7 +708,9 @@ pub(in crate::server) async fn seal_probe_for_test(
 /// §2: the catch-up response handler calls this for each verified,
 /// applied, non-truncated page that carries the responder's saved head
 /// (`responder_state_hash`). The sender is an active, unrevoked member;
-/// the handler checked that.
+/// the handler checked that. §3: the same answer is the sender's survivor
+/// convergence evidence for the S4 deliveries of the group
+/// ([`crypto_exclusion::note_survivor_head`]).
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
@@ -735,6 +739,9 @@ pub(in crate::server) async fn note_catchup_head(
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
+    // §3: the answer is also the sender's convergence evidence for the
+    // S4 deliveries of this group whose result is the reported head.
+    crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), reported);
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;
@@ -799,9 +806,10 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
 
 /// One worker pass: intake, scan, reconcile, evaluate. It never commits.
 pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
-    let revocations = collect_verified_agent_revocations(state).await;
     let groups = snapshot_groups(state).await;
     let leaves = snapshot_retained_leaves(state, &groups).await;
+    let revocations =
+        collect_verified_agent_revocations(state, revocation_seats(&groups, &leaves)).await;
     let revoked_admins = revoked_admins_in(state, &groups).await;
     // §2: the open higher-head evidence of each group, read before the S4
     // state lock (lock order: never hold it across these reads).
@@ -1112,15 +1120,34 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         let changed_designation = designation.as_ref().is_some_and(|designation| {
             row.designated != Some(designation.designated) || row.ranks != designation.ranks
         });
+        // §2 (L175, L194; #1508 r7, Codex P2 6): the consumed budget is
+        // written while it still gates a fallback rank, so a restart
+        // resumes it and cannot extend the window. One stagger past the
+        // last rank's offset (and past the completion bound) it gates
+        // nothing more, so a long wait does not rewrite the sidecar on
+        // every tick.
+        let ranks = designation
+            .as_ref()
+            .map_or(row.ranks.len(), |designation| designation.ranks.len());
+        let budget_cap = s4::duration_ms(
+            runtime
+                .timing
+                .fallback_offset(ranks.saturating_add(1))
+                .max(runtime.timing.completion_bound),
+        );
+        let mut budget_moved = false;
         if let Some(row) = inner.store.get_mut(&key) {
-            row.elapsed_budget_ms = s4::duration_ms(elapsed);
+            let elapsed_ms = s4::duration_ms(elapsed);
+            budget_moved =
+                elapsed_ms != row.elapsed_budget_ms && row.elapsed_budget_ms < budget_cap;
+            row.elapsed_budget_ms = elapsed_ms;
             row.boot_id = boot_id;
             if let Some(designation) = &designation {
                 row.designated = Some(designation.designated);
                 row.ranks = designation.ranks.clone();
             }
         }
-        if changed_designation {
+        if changed_designation || budget_moved {
             inner.dirty = true;
         }
         inner.store.set_waiting(&key, evaluation.waiting.clone());
@@ -1158,7 +1185,16 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
 /// Drain the intake queue and, when needed, rescan the whole revocation
 /// set. Only records that this node's own set holds are kept: the hook
 /// already verified them, and the check guards against a stale queue.
-async fn collect_verified_agent_revocations(state: &AppState) -> Vec<VerifiedAgentRevocation> {
+///
+/// `seats` is [`revocation_seats`] of this pass's snapshot. §1 (#1508 r7,
+/// Codex P1 4): a revocation creates work only where its target has a
+/// seat or a retained leaf, so a record consumed before a delayed
+/// `MemberAdded` or a catch-up seats its target must be read again when
+/// the seats change, although the set's generation did not.
+async fn collect_verified_agent_revocations(
+    state: &AppState,
+    seats: [u8; 32],
+) -> Vec<VerifiedAgentRevocation> {
     let intake = state.agent.s4_revocation_intake();
     let (mut items, reconcile_all) = intake.drain();
     let revocation_set = state.agent.revocation_set();
@@ -1166,7 +1202,9 @@ async fn collect_verified_agent_revocations(state: &AppState) -> Vec<VerifiedAge
     let generation = set.generation();
     let full = {
         let inner = state.revocation_evictions.inner.lock().await;
-        reconcile_all || inner.reconciled_generation != Some(generation)
+        reconcile_all
+            || inner.reconciled_generation != Some(generation)
+            || inner.reconciled_seats != Some(seats)
     };
     if full {
         for record in set.all_records() {
@@ -1183,14 +1221,45 @@ async fn collect_verified_agent_revocations(state: &AppState) -> Vec<VerifiedAge
     items.retain(|item| set.contains_hash(&item.record_hash));
     drop(set);
     if full {
-        state
-            .revocation_evictions
-            .inner
-            .lock()
-            .await
-            .reconciled_generation = Some(generation);
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner.reconciled_generation = Some(generation);
+        inner.reconciled_seats = Some(seats);
     }
     items
+}
+
+/// A digest of the seats that a revocation can create work on: per group,
+/// each roster entry with its seat state, retained leaf and incarnation,
+/// the inputs that [`derive_triggers`] reads besides the revocations.
+fn revocation_seats(groups: &[(String, GroupInfo)], leaves: &RetainedLeaves) -> [u8; 32] {
+    let mut sorted: Vec<&GroupInfo> = groups.iter().map(|(_, info)| info).collect();
+    sorted.sort_by(|a, b| a.stable_group_id().cmp(b.stable_group_id()));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"x0x.s4.revocation-seats.v1");
+    for info in sorted {
+        let stable = info.stable_group_id();
+        hasher.update(&(stable.len() as u64).to_le_bytes());
+        hasher.update(stable.as_bytes());
+        hasher.update(&[u8::from(info.withdrawn)]);
+        for member in info.members_v2.values() {
+            let target = super::parse_agent_id_hex(&member.agent_id)
+                .map(|agent| *agent.as_bytes())
+                .unwrap_or_default();
+            hasher.update(&target);
+            hasher.update(&[
+                u8::from(is_seated(member.state)),
+                match leaves.tracks(stable, &target) {
+                    Some(true) => 1,
+                    Some(false) => 0,
+                    None => 2,
+                },
+            ]);
+            let incarnation = ce::seat_incarnation(info, &member.agent_id).unwrap_or_default();
+            hasher.update(&(incarnation.len() as u64).to_le_bytes());
+            hasher.update(incarnation.as_bytes());
+        }
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// Every group with its roster map key. Withdrawn groups are kept so
@@ -4748,6 +4817,137 @@ mod tests {
             row.earliest_handoff_receipt_unix_ms,
             Some((not_after + 1) * 1000),
             "T_obs is the raw not_after"
+        );
+        Ok(())
+    }
+
+    /// A `GSS` group of a remote admin with `target` seated as a Member,
+    /// or not yet seated, held by `state` under `group_id`.
+    async fn hold_remote_admin_group(
+        state: &AppState,
+        group_id: &str,
+        target: &x0x::identity::AgentId,
+        seated: bool,
+    ) -> anyhow::Result<GroupInfo> {
+        let admin = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let mut info = GroupInfo::new("s4-r7".into(), String::new(), admin, group_id.to_string());
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        if seated {
+            info.add_member(
+                hex::encode(target.as_bytes()),
+                GroupRole::Member,
+                Some(hex::encode(admin.as_bytes())),
+                None,
+            );
+        }
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        Ok(info)
+    }
+
+    /// A verified Agent-subject revocation of `target` in `state`'s set.
+    async fn revoke_agent(
+        state: &AppState,
+        target: &x0x::identity::AgentKeypair,
+    ) -> anyhow::Result<()> {
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(target.agent_id()),
+            target.public_key(),
+            target.secret_key(),
+            1,
+            None,
+        )?;
+        let inserted = state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)?;
+        anyhow::ensure!(inserted, "the revocation is held");
+        Ok(())
+    }
+
+    /// #1508 r7 (Codex P1 4, ADR 0110 §1): a revocation that this node
+    /// consumed before a delayed `MemberAdded` seats its target still
+    /// opens the work once the roster catch-up lands. The revocation
+    /// generation does not change and nothing requests a reconcile.
+    #[tokio::test]
+    async fn a_revocation_before_its_target_is_seated_opens_work_on_catch_up() -> anyhow::Result<()>
+    {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "a6".repeat(16);
+        let info = hold_remote_admin_group(&state, &group_id, &target.agent_id(), false).await?;
+        let key = EvictionKey::new(info.stable_group_id(), *target.agent_id().as_bytes());
+        revoke_agent(&state, &target).await?;
+        revocation_eviction_pass(&state).await;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_none(),
+            "no seat yet: no work"
+        );
+        revocation_eviction_pass(&state).await;
+
+        // The roster catch-up seats the revoked member.
+        hold_remote_admin_group(&state, &group_id, &target.agent_id(), true).await?;
+        revocation_eviction_pass(&state).await;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_some(),
+            "the seated revoked member gets eviction work"
+        );
+        Ok(())
+    }
+
+    /// #1508 r7 (Codex P2 6, ADR 0110 §2 L175/L194): the fallback budget
+    /// that a waiting row consumes is written to the `.evs`, so a restart
+    /// resumes it and cannot extend the window.
+    #[tokio::test]
+    async fn a_consumed_budget_survives_a_restart() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "a7".repeat(16);
+        let info = hold_remote_admin_group(&state, &group_id, &target.agent_id(), true).await?;
+        let key = EvictionKey::new(info.stable_group_id(), *target.agent_id().as_bytes());
+        revoke_agent(&state, &target).await?;
+        revocation_eviction_pass(&state).await;
+        assert!(persist_obligations(&state).await, "the intake is durable");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        revocation_eviction_pass(&state).await;
+        assert!(persist_obligations(&state).await);
+
+        // Restart: the S4 state is reloaded from disk.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        revocation_eviction_pass(&state).await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner
+            .store
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("the row survives"))?;
+        assert!(row.phase.is_open(), "the row still waits");
+        assert!(
+            row.elapsed_budget_ms >= 1_200,
+            "the consumed budget is resumed, not restarted: {} ms",
+            row.elapsed_budget_ms
         );
         Ok(())
     }

@@ -4,7 +4,9 @@
 //! - **Self-rebind route** ([`rebind_member_certificate`],
 //!   `POST /groups/:id/members/:agent_id/certificate/rebind`). The seat's
 //!   own agent rebinds its own certificate. Before the cutoff
-//!   `not_after − τ` on its own clock it commits the rebind. After the
+//!   `not_after − τ` on its own clock it commits the rebind once this
+//!   replica's head is synced (§2); until then it holds the rebind with
+//!   `waiting_for_head_sync` and the worker commits it. After the
 //!   cutoff the route refuses with `rebind_window_closed`, hands the
 //!   renewal to every eligible admin in an `EvictionHandoffV1`, and the
 //!   agent shows `waiting_for_admin_rebind`, naming the designated admin,
@@ -109,7 +111,10 @@ struct AdminRebindWait {
     since_unix_ms: u64,
 }
 
-/// A §4b(2) self-rebind held by the D76 rule.
+/// A self-rebind the route accepted but did not commit yet: a §4b(2)
+/// self-rebind held by the D76 rule (`holders` not empty), or a
+/// self-rebind that waits for the §2 head sync (#1508 Codex P1 F3). The
+/// worker re-checks the route's rules before it commits it.
 #[derive(Debug, Clone)]
 struct HeldSelfRebind {
     group_key: String,
@@ -130,17 +135,18 @@ pub(super) struct RebindState {
     renewals: HashMap<EvictionKey, AgentCertificate>,
     /// Seat-agent side `waiting_for_admin_rebind`.
     admin_waits: HashMap<EvictionKey, AdminRebindWait>,
-    /// §4b(2) self-rebinds held by the D76 rule.
+    /// Self-rebinds held by the §4b(2) D76 rule or for the §2 head sync.
     held: HashMap<EvictionKey, HeldSelfRebind>,
 }
 
 impl RebindState {
     /// §2 and §3: the groups whose rebind work waits for
     /// [`super::group_head_synced`] and that may have no open row: a
-    /// delivery a restart restored (#1508 review F3) and a §4b(2) held
-    /// self-rebind. The worker pass keeps a head round for each, so the
-    /// head sync can complete (#1508 Codex P1). No peer is excluded from
-    /// the holders: the self-rebind target is this node.
+    /// delivery a restart restored (#1508 review F3) and a held
+    /// self-rebind (§4b(2) or the head sync). The worker pass keeps a head
+    /// round for each, so the head sync can complete (#1508 Codex P1). No
+    /// peer is excluded from the holders: the self-rebind target is this
+    /// node.
     pub(super) fn head_round_groups(&self) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
         self.deliveries
             .iter()
@@ -360,6 +366,8 @@ pub(super) fn row_override(
 /// Why a local rebind did not commit.
 #[derive(Debug)]
 enum CommitError {
+    /// §2: this replica's head is not synced; nothing was sealed.
+    HeadNotSynced,
     Refused(cr::CertificateRebindRefusal),
     Oversized,
     Persist(String),
@@ -367,6 +375,14 @@ enum CommitError {
 
 /// Seal, check, persist and schedule delivery of one rebind. The caller
 /// holds `group_key`'s membership lock and read `info` under it.
+///
+/// §2: every local rebind seal, the self-rebind route's, the admin's and
+/// a held one's, passes [`super::group_head_synced`] here first, just
+/// before the seal and under the membership lock. A replica with no
+/// completed current catch-up round, or with unresolved higher-head
+/// evidence, seals nothing ([`CommitError::HeadNotSynced`]); a stale
+/// replica would otherwise make a sibling of a head it has not seen
+/// (#1508 Codex P1 F3).
 async fn commit_locked(
     state: &Arc<AppState>,
     group_key: &str,
@@ -375,6 +391,9 @@ async fn commit_locked(
     certificate: &AgentCertificate,
 ) -> Result<GroupInfo, CommitError> {
     use super::super as ng;
+    if !super::group_head_synced(state, group_key).await {
+        return Err(CommitError::HeadNotSynced);
+    }
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = ng::now_millis_u64();
     let (next, frame) =
@@ -465,6 +484,54 @@ async fn commit_locked(
 }
 
 // ─── Self-rebind route (§4a, §4b(2)) ───────────────────────────────────────
+
+/// The rule a self-rebind of `local`'s seat follows now. The route and the
+/// worker's held self-rebinds use the same decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfRebindRule {
+    /// After the cutoff with an eligible admin left: hand the renewal to
+    /// the admins (D155).
+    HandOff,
+    /// Before the cutoff: the D129 rule, every other Active member's
+    /// current verified advert sets `certificate_rebind_v1`.
+    Ordinary,
+    /// §4b(2): no eligible admin exists because every admin's certificate
+    /// expired. An admin's own self-rebind then runs after its cutoff,
+    /// under the D76 hold rule.
+    EveryAdminExpired,
+}
+
+/// Which [`SelfRebindRule`] applies to `local`'s `seat` on `info` at
+/// `now_unix`. `old_not_after` is the seat's committed certificate's
+/// `not_after`.
+fn self_rebind_rule(
+    info: &GroupInfo,
+    local: &[u8; 32],
+    seat: &x0x::groups::GroupMember,
+    old_not_after: Option<u64>,
+    now_unix: u64,
+) -> SelfRebindRule {
+    if cr::self_rebind_window_open(old_not_after, now_unix) {
+        return SelfRebindRule::Ordinary;
+    }
+    let admins = admins_with_expiry(info);
+    // #1533 Codex P2: past the cutoff is not expired. The exception needs
+    // this admin's own certificate expired on this node's clock too (own
+    // trigger, `not_after + τ`); before that it is still eligible and
+    // hands the renewal off.
+    let own_expired = old_not_after.is_some_and(|not_after| {
+        x0x::groups::eviction::own_expiry_trigger_due(not_after, now_unix)
+    });
+    let every_admin_expired = seat.role.at_least(GroupRole::Admin)
+        && own_expired
+        && (admins.iter().all(|(id, _)| id == local)
+            || cr::admins_needing_renewal(&admins, local, now_unix).is_some());
+    if every_admin_expired {
+        SelfRebindRule::EveryAdminExpired
+    } else {
+        SelfRebindRule::HandOff
+    }
+}
 
 /// Request body for `POST /groups/:id/members/:agent_id/certificate/rebind`.
 #[derive(Debug, Default, Deserialize)]
@@ -600,23 +667,14 @@ pub(in crate::server) async fn rebind_member_certificate(
             serde_json::json!({ "group_id": stable }),
         );
     }
-    let seat_is_admin = seat.role.at_least(GroupRole::Admin);
-    // §4b(2): no eligible admin exists because every other admin's
-    // certificate expired. An admin's own self-rebind then runs after its
-    // cutoff, under the D76 hold rule.
-    let window_open = cr::self_rebind_window_open(old_not_after, now_unix);
-    let admins = admins_with_expiry(&info);
-    let every_admin_expired = !window_open
-        && seat_is_admin
-        && (admins.iter().all(|(id, _)| *id == local)
-            || cr::admins_needing_renewal(&admins, &local, now_unix).is_some());
+    let rule = self_rebind_rule(&info, &local, &seat, old_not_after, now_unix);
     let key = EvictionKey::new(stable.clone(), local);
-    if !window_open && !every_admin_expired {
+    if rule == SelfRebindRule::HandOff {
         return hand_to_admins(&state, &info, &seat, &certificate, now_unix).await;
     }
     let others = other_active_members(&info, &local);
     let support = rebind_support(&state, &others);
-    if every_admin_expired {
+    if rule == SelfRebindRule::EveryAdminExpired {
         let holders = x0x::groups::crypto_exclusion::receiver_upgrade_holders(support.clone());
         if !holders.is_empty() {
             state
@@ -664,6 +722,35 @@ pub(in crate::server) async fn rebind_member_certificate(
         );
     }
     match commit_locked(&state, &group_key, &info, local, &certificate).await {
+        Err(CommitError::HeadNotSynced) => {
+            // §2: this replica may hold a stale head. Hold the rebind; the
+            // worker keeps a head round for the group, re-checks these
+            // rules and commits it once the head is synced.
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .held
+                .insert(
+                    key,
+                    HeldSelfRebind {
+                        group_key: group_key.clone(),
+                        certificate,
+                        holders: Vec::new(),
+                    },
+                );
+            refusal(
+                StatusCode::CONFLICT,
+                WaitingCause::WaitingForHeadSync.as_str(),
+                serde_json::json!({
+                    "group_id": stable,
+                    "state": WaitingCause::WaitingForHeadSync.as_str(),
+                    "detail": "held: this replica's head is not synced yet (ADR 0110 §2); it commits when the head is synced",
+                }),
+            )
+        }
         Ok(next) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -958,22 +1045,23 @@ pub(super) async fn try_admin_rebind(
     let Some(certificate) = usable else {
         return false;
     };
-    // §2: re-read the head and the evidence under the membership lock just
-    // before the seal. The 13 s restart wait is only a minimum: a current
-    // catch-up round with no unresolved higher-head evidence is required.
-    // A rebind is due, so an unsynced head waits; it never evicts instead.
-    if !super::group_head_synced(state, group_key).await {
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        inner.attempt_wait.insert(
-            key.clone(),
-            WaitingState::cause(WaitingCause::WaitingForHeadSync),
-        );
-        inner
-            .next_attempt
-            .insert(key.clone(), Instant::now() + super::S4_WORKER_TICK);
-        return true;
-    }
     match commit_locked(state, group_key, &info, key.target, &certificate).await {
+        // §2: `commit_locked` re-read the head and the evidence under the
+        // membership lock just before the seal. The 13 s restart wait is
+        // only a minimum: a current catch-up round with no unresolved
+        // higher-head evidence is required. A rebind is due, so an
+        // unsynced head waits; it never evicts instead.
+        Err(CommitError::HeadNotSynced) => {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.attempt_wait.insert(
+                key.clone(),
+                WaitingState::cause(WaitingCause::WaitingForHeadSync),
+            );
+            inner
+                .next_attempt
+                .insert(key.clone(), Instant::now() + super::S4_WORKER_TICK);
+            true
+        }
         Ok(_) => {
             state
                 .revocation_evictions
@@ -1000,7 +1088,7 @@ pub(super) async fn try_admin_rebind(
 
 /// One worker step: deliveries, stashed receipts, held self-rebinds and
 /// the seat agent's admin waits.
-pub(super) async fn drive(state: &Arc<AppState>) {
+pub(in crate::server) async fn drive(state: &Arc<AppState>) {
     ensure_restored(state).await;
     drive_deliveries(state).await;
     retry_stash(state).await;
@@ -1008,8 +1096,12 @@ pub(super) async fn drive(state: &Arc<AppState>) {
     prune_admin_waits(state).await;
 }
 
-/// §4b(2): re-evaluate each held self-rebind; commit it once no known
-/// Active member's current verified advert lacks the capability.
+/// Re-evaluate each held self-rebind with the route's rules
+/// ([`self_rebind_rule`]) on the current roster and clock, and commit it
+/// once no hold applies and the head is synced. §4b(2): no known Active
+/// member's current verified advert lacks the capability. §4a: every
+/// other Active member's advert sets it (D129), and the cutoff has not
+/// passed; after it the renewal goes to the admins (D155).
 async fn drive_held(state: &Arc<AppState>) {
     use super::super as ng;
     let held: Vec<(EvictionKey, HeldSelfRebind)> = {
@@ -1030,13 +1122,14 @@ async fn drive_held(state: &Arc<AppState>) {
             .await
             .get(&held.group_key)
             .cloned();
-        let Some(info) = info.filter(|info| {
-            !info.withdrawn
-                && info
-                    .members_v2
-                    .get(&hex::encode(key.target))
-                    .is_some_and(|member| member.state == GroupMemberState::Active)
-        }) else {
+        let active = info.as_ref().and_then(|info| {
+            info.members_v2
+                .get(&hex::encode(key.target))
+                .filter(|member| !info.withdrawn && member.state == GroupMemberState::Active)
+                .cloned()
+                .map(|seat| (info, seat))
+        });
+        let Some((info, seat)) = active else {
             state
                 .revocation_evictions
                 .inner
@@ -1047,31 +1140,63 @@ async fn drive_held(state: &Arc<AppState>) {
                 .remove(&key);
             continue;
         };
-        let holders = x0x::groups::crypto_exclusion::receiver_upgrade_holders(rebind_support(
-            state,
-            &other_active_members(&info, &key.target),
-        ));
-        if !holders.is_empty() {
-            if let Some(entry) = state
-                .revocation_evictions
-                .inner
-                .lock()
-                .await
-                .rebind
-                .held
-                .get_mut(&key)
-            {
-                entry.holders = holders;
+        let now_unix = now_unix_ms() / 1000;
+        let old_not_after = cr::committed_certificate(&seat).and_then(AgentCertificate::not_after);
+        let support = rebind_support(state, &other_active_members(info, &key.target));
+        let holders = match self_rebind_rule(info, &key.target, &seat, old_not_after, now_unix) {
+            SelfRebindRule::EveryAdminExpired => {
+                x0x::groups::crypto_exclusion::receiver_upgrade_holders(support)
             }
+            SelfRebindRule::Ordinary
+                if cr::rebind_allowed_for_members(support.iter().map(|(_, s)| *s)) =>
+            {
+                Vec::new()
+            }
+            rule => {
+                // §4a: rebinding is off (D129), or the cutoff passed while
+                // the rebind waited (D155). The route's outcome applies.
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .rebind
+                    .held
+                    .remove(&key);
+                if rule == SelfRebindRule::HandOff {
+                    let _refusal =
+                        hand_to_admins(state, info, &seat, &held.certificate, now_unix).await;
+                } else {
+                    refresh_unknown(state, &support);
+                    tracing::info!(
+                        group_id = %LogHexId::group(&held.group_key),
+                        "ADR 0110 S4: held self-rebind dropped; an Active member's current verified advert does not set certificate_rebind_v1"
+                    );
+                }
+                continue;
+            }
+        };
+        let hold = !holders.is_empty();
+        if let Some(entry) = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .held
+            .get_mut(&key)
+        {
+            entry.holders = holders;
+        }
+        if hold {
             continue;
         }
-        // §2: the held commit is a worker seal on a possibly old view; it
-        // waits for a current catch-up round (re-read under the lock).
-        if !super::group_head_synced(state, &held.group_key).await {
-            continue;
-        }
-        match commit_locked(state, &held.group_key, &info, key.target, &held.certificate).await {
+        match commit_locked(state, &held.group_key, info, key.target, &held.certificate).await {
             Ok(_) => {}
+            // §2: the held commit is a worker seal on a possibly old view;
+            // it waits for a current catch-up round (re-read under the
+            // lock in `commit_locked`).
+            Err(CommitError::HeadNotSynced) => {}
             Err(CommitError::Refused(refused)) => {
                 tracing::info!(
                     group_id = %LogHexId::group(&held.group_key),
@@ -1809,8 +1934,13 @@ pub(super) fn status_json(rebind: &RebindState, info: &GroupInfo) -> serde_json:
         .iter()
         .filter(|(key, _)| key.stable_group_id == stable)
         .map(|(key, held)| {
+            let cause = if held.holders.is_empty() {
+                WaitingCause::WaitingForHeadSync
+            } else {
+                WaitingCause::WaitingForReceiverUpgrade
+            };
             serde_json::json!({
-                "cause": WaitingCause::WaitingForReceiverUpgrade.as_str(),
+                "cause": cause.as_str(),
                 "agent_id": hex::encode(key.target),
                 "named": held.holders.iter().map(hex::encode).collect::<Vec<_>>(),
             })
@@ -2921,6 +3051,161 @@ pub(super) mod restart_tests {
             "the containment survives a restart"
         );
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// The self-rebind route (§4a) with this node's own renewal.
+    async fn self_rebind(
+        state: &Arc<AppState>,
+        stable: &str,
+        renewal: &AgentCertificate,
+    ) -> Result<(StatusCode, serde_json::Value)> {
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let request = RebindCertificateRequest {
+            certificate: Some(BASE64.encode(renewal.to_storage_bytes()?)),
+        };
+        let (status, Json(body)) = rebind_member_certificate(
+            State(Arc::clone(state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((stable.to_string(), local_hex)),
+            Some(Json(request)),
+        )
+        .await;
+        Ok((status, body))
+    }
+
+    /// #1508 Codex P1 F3 (ADR 0110 §2, §4a): the immediate self-rebind
+    /// passes the same head-sync gate as the background rebinds. A
+    /// restart restored a rebind delivery, so the worker keeps a head
+    /// round for the group; the survivor then reports a head this node
+    /// does not have (the catch-up response handler's call). This replica
+    /// is stale: the route must not seal. It holds the rebind with
+    /// `waiting_for_head_sync`, and the worker commits it once the
+    /// survivor reports the local head.
+    #[tokio::test]
+    async fn a_self_rebind_waits_for_the_head_sync() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let survivor = AgentKeypair::generate()?;
+        let survivor_id = survivor.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let frame = Arc::new(b"X0XCRB1\0restored frame".to_vec());
+        let info = {
+            let author = offline_daemon(dir.path(), None).await?;
+            let me = author.agent.identity().agent_keypair();
+            let info = certified_group(&owner, me, &[&survivor])?;
+            hold_persisted(&author, &info).await?;
+            let at = (info.state_revision, info.state_hash.as_str());
+            let ext = replay_log::REBIND_EXTENSION;
+            let stable = info.stable_group_id();
+            assert!(replay_log::write_planned(&author, ext, held, stable, at, &frame).await);
+            author.agent.shutdown().await;
+            info
+        };
+        let stable = info.stable_group_id().to_string();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the restarted state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // D129: the survivor's current verified advert sets the bit.
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            survivor_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        let worker_step = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            async move {
+                super::super::revocation_eviction_pass(&state).await;
+                drive(&state).await;
+            }
+        };
+        // The first step restores the delivery; the next pass opens the
+        // group's head round and asks the survivor.
+        worker_step(&state).await;
+        worker_step(&state).await;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .head_rounds
+                .get(&stable)
+                .is_some_and(|round| round.asked.contains(survivor_id.as_bytes())),
+            "the worker pass opened a head round and asked the survivor"
+        );
+        // The survivor answers the catch-up with a head this node lacks.
+        let unknown = "f0".repeat(32);
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&stable),
+            &survivor_hex,
+            Some(&unknown),
+        )
+        .await;
+        assert!(
+            !super::super::group_head_synced(&state, &stable).await,
+            "the replica holds unresolved higher-head evidence"
+        );
+
+        let me = state.agent.identity().agent_keypair();
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, me, Some(now_unix_ms() / 1000 + 1200))?;
+        let (status, body) = self_rebind(&state, &stable, &renewal).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], WaitingCause::WaitingForHeadSync.as_str());
+        assert_eq!(
+            head_of(&state, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "a stale replica seals nothing"
+        );
+        worker_step(&state).await;
+        assert_eq!(
+            head_of(&state, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the held self-rebind waits while the evidence is unresolved"
+        );
+
+        // The survivor reports the local head: synced, the rebind commits.
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&stable),
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        worker_step(&state).await;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let after = state
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .cloned()
+            .context("the group")?;
+        assert_eq!(after.state_revision, info.state_revision + 1);
+        assert_eq!(
+            after.members_v2[&local_hex].certificate_digest.as_deref(),
+            Some(x0x::groups::owner_cert::certificate_digest_hex(&renewal).as_str()),
+            "the held self-rebind committed after the head sync"
+        );
+        state.agent.shutdown().await;
         Ok(())
     }
 }

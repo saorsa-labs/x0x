@@ -1925,6 +1925,7 @@ certificate, on this daemon's clock.
 | Before the cutoff, every other Active member's current verified advert sets `certificate_rebind_v1` | `200 OK` | `{"ok": true, "group_id", "agent_id", "certificate_digest", "not_after", "state_revision", "state_hash"}` |
 | After the cutoff | `409 Conflict` | `{"ok": false, "error": "rebind_window_closed", "state": "waiting_for_admin_rebind", "designated_admin", "renewal_digest", "handed_to": [...]}`. The daemon sends the renewal to every eligible admin in an `EvictionHandoffV1`. At expiry the designated admin commits the rebind instead of the removal. |
 | Another Active member's advert does not set `certificate_rebind_v1` (lacking or unknown) | `409 Conflict` | `{"ok": false, "error": "waiting_for_receiver_upgrade", "named": [...]}`. Rebinding is off; at expiry the seat is evicted. |
+| This replica's head is not synced (§2): no completed catch-up round for the current head, or unresolved higher-head evidence | `409 Conflict` | `{"ok": false, "error": "waiting_for_head_sync", "state": "waiting_for_head_sync", "detail"}`. Nothing is sealed. The daemon holds the rebind and runs a head catch-up round; it checks the rules above again and commits the rebind when the head is synced. `GET /groups/:id` lists it in `held_self_rebinds` with cause `waiting_for_head_sync`. |
 | Every other admin's certificate is expired (§4b(2)) and this agent is an admin | as above | The self-rebind runs after the cutoff too. A known Active member whose current advert lacks the bit holds it: `409` with `waiting_for_receiver_upgrade` and `named`; the held rebind commits when the hold lifts. Unknown or offline members do not hold it. |
 | `:agent_id` is another agent, or this agent is revoked | `403 Forbidden` | `{"error": "rebind_signer_ineligible"}` |
 | The seat is not Active | `409 Conflict` | `{"error": "rebind_seat_not_active"}` |
@@ -1957,7 +1958,9 @@ digest in the frame. Receivers do not enforce the cutoff.
 ```
 
 `waiting_for_admin_rebind` ends when a rebind or a removal for the seat
-lands. `held_renewals` lists the seats for which this admin holds a
+lands. A `held_self_rebinds` entry has cause `waiting_for_receiver_upgrade`
+while a §4b(2) hold names members, and `waiting_for_head_sync` with an
+empty `named` while it waits only for the §2 head sync. `held_renewals` lists the seats for which this admin holds a
 verified renewal from a hand-off. A verified rebind ends the seat's expiry
 row with `termination_cause` `certificate_valid`. While every admin other
 than the target is expired, the row shows `waiting_for_admin_certificate_renewal`
