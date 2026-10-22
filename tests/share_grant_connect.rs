@@ -2,6 +2,11 @@
 //! forward and through SOCKS, denies the other listener listed on the same
 //! `principal = "grant"` entry, and after `revoke_share_grant` tears both
 //! live tunnels down. The peer gate is `authorize_attested_opener`.
+//!
+//! The test is `#[ignore]`. The CI tailnet job runs it with
+//! `X0X_REQUIRE_NETWORK_TESTS=1`. A refused UDP bind fails the test. The
+//! test passes only after both tunnels carry a byte and then end in EOF or
+//! reset. It does not return success when setup does not run.
 
 #![allow(
     clippy::unwrap_used,
@@ -42,7 +47,7 @@ fn loopback_network_config() -> NetworkConfig {
     }
 }
 
-async fn build_agent(dir: &TempDir, name: &str, user: Option<UserKeypair>) -> Option<x0x::Agent> {
+async fn build_agent(dir: &TempDir, name: &str, user: Option<UserKeypair>) -> x0x::Agent {
     network_gate::init_stream_tracing();
     let mut builder = x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
@@ -54,8 +59,15 @@ async fn build_agent(dir: &TempDir, name: &str, user: Option<UserKeypair>) -> Op
         builder = builder.with_user_key(user);
     }
     match builder.build().await {
-        Ok(agent) => Some(agent),
-        Err(e) if network_gate::skip_on_refused_network(&e) => None,
+        Ok(agent) => agent,
+        // `skip_on_refused_network` panics when the CI tailnet job sets
+        // `X0X_REQUIRE_NETWORK_TESTS=1`. A refused bind without that variable
+        // still fails: this test must not report success for a skipped setup.
+        Err(e) if network_gate::skip_on_refused_network(&e) => {
+            panic!(
+                "network setup refused; share_grant_connect observes the connect path and does not skip: {e}"
+            );
+        }
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
@@ -178,14 +190,24 @@ async fn spawn_probe() -> Probe {
             accepts_task.fetch_add(1, Ordering::SeqCst);
             let bytes_task = Arc::clone(&bytes_task);
             tokio::spawn(async move {
-                let mut buf = [0u8; 1];
-                if sock.read_exact(&mut buf).await.is_ok() {
-                    bytes_task.fetch_add(1, Ordering::SeqCst);
-                    let _ = sock.write_all(&buf).await;
+                // Echo every byte and stay up until the peer closes. One echo
+                // and then a discarded read lets the handler exit, so a later
+                // liveness probe would observe a close that revoke did not cause.
+                let mut buf = [0u8; 8];
+                let mut counted = false;
+                loop {
+                    let n = match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if !counted {
+                        bytes_task.fetch_add(1, Ordering::SeqCst);
+                        counted = true;
+                    }
+                    if sock.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
                 }
-                // Hold the socket so a live forward stays open until revoke.
-                let mut sink = [0u8; 8];
-                let _ = sock.read(&mut sink).await;
             });
         }
     });
@@ -273,18 +295,46 @@ async fn socks_roundtrip(client: &mut TcpStream, host: &str, port: u16, exchange
     resp[1]
 }
 
+/// EOF or a reset-class error. A data byte is not teardown.
+fn closed_by_teardown(result: &std::io::Result<usize>) -> bool {
+    match result {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(err) => matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+    }
+}
+
+#[test]
+fn closed_by_teardown_rejects_payload_and_accepts_eof_or_reset() {
+    let eof: std::io::Result<usize> = Ok(0);
+    let payload: std::io::Result<usize> = Ok(1);
+    assert!(closed_by_teardown(&eof));
+    assert!(
+        !closed_by_teardown(&payload),
+        "a data byte before or after revoke is not teardown"
+    );
+    assert!(closed_by_teardown(&Err(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "reset",
+    ))));
+    assert!(!closed_by_teardown(&Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out",
+    ))));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback ShareGrant connect; binds UDP. Integration tailnet job."]
 async fn share_grant_connect_reaches_forward_and_socks() {
     let dir = TempDir::new().unwrap();
-    let Some(alice) = build_agent(&dir, "alice", None).await else {
-        return;
-    };
-    let Some(bob) = build_agent(&dir, "bob", Some(UserKeypair::generate().unwrap())).await else {
-        alice.shutdown().await;
-        return;
-    };
-    let alice = Arc::new(alice);
-    let bob = Arc::new(bob);
+    let alice = Arc::new(build_agent(&dir, "alice", None).await);
+    let bob = Arc::new(build_agent(&dir, "bob", Some(UserKeypair::generate().unwrap())).await);
     link_pair(&alice, &bob).await;
 
     let allowed = spawn_probe().await;
@@ -385,6 +435,7 @@ async fn share_grant_connect_reaches_forward_and_socks() {
     .await
     .expect("held forward echo")
     .unwrap();
+    assert_eq!(fwd_ack[0], 0x11, "held forward must echo before revoke");
     let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let socks_addr = socks_listener.local_addr().unwrap();
     let (socks_client_res, socks_accepted) =
@@ -408,15 +459,53 @@ async fn share_grant_connect_reaches_forward_and_socks() {
         }
     });
     let held_rep = socks_roundtrip(&mut held_socks, &host, allowed.port, true).await;
+    assert_eq!(held_rep, 0x00, "held SOCKS tunnel must be up before revoke");
+    // Both sockets must still carry a byte at this moment. A close or a
+    // payload that arrived earlier must not satisfy the post-revoke read.
+    held_forward
+        .write_all(&[0x21])
+        .await
+        .expect("forward liveness write");
+    held_socks
+        .write_all(&[0x21])
+        .await
+        .expect("SOCKS liveness write");
+    let mut forward_live = [0u8; 1];
+    let mut socks_live = [0u8; 1];
+    let (forward_live_read, socks_live_read) =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                held_forward.read_exact(&mut forward_live),
+                held_socks.read_exact(&mut socks_live),
+            )
+        })
+        .await
+        .expect("both tunnels must echo before revoke");
+    forward_live_read.expect("forward closed before revoke");
+    socks_live_read.expect("SOCKS closed before revoke");
+    assert_eq!(forward_live[0], 0x21, "forward must echo before revoke");
+    assert_eq!(socks_live[0], 0x21, "SOCKS must echo before revoke");
     bob.revoke_share_grant(grant.grant_id, None)
         .await
         .expect("revoke grant");
-    let teardown = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut buf = [0u8; 1];
-        let _ = held_forward.read(&mut buf).await;
-        let _ = held_socks.read(&mut buf).await;
+    let mut forward_buf = [0u8; 1];
+    let mut socks_buf = [0u8; 1];
+    let (forward_closed, socks_closed) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            held_forward.read(&mut forward_buf),
+            held_socks.read(&mut socks_buf),
+        )
     })
-    .await;
+    .await
+    .expect("open forward and SOCKS must EOF or reset within 5s of revoke");
+    assert!(
+        closed_by_teardown(&forward_closed),
+        "forward after revoke must EOF or reset, got {forward_closed:?}"
+    );
+    assert!(
+        closed_by_teardown(&socks_closed),
+        "SOCKS after revoke must EOF or reset, got {socks_closed:?}"
+    );
     let after_forward = forward_exchange(local_ok).await;
     let after_socks = tokio::time::timeout(
         Duration::from_secs(15),
@@ -462,11 +551,6 @@ async fn share_grant_connect_reaches_forward_and_socks() {
     assert!(
         echo_bytes >= 2,
         "forward and SOCKS must both have delivered a byte, got {echo_bytes}"
-    );
-    assert_eq!(held_rep, 0x00, "held SOCKS tunnel must be up before revoke");
-    assert!(
-        teardown.is_ok(),
-        "open forward and SOCKS must unblock within 5s of revoke"
     );
     assert!(
         after_forward.is_err(),
