@@ -1562,7 +1562,7 @@ pub(in crate::server) async fn receive(
     }
     let now_unix = now_unix_ms() / 1000;
     // Set when the frame is a valid rebind on a sibling branch.
-    let mut sibling = false;
+    let mut sibling = None;
     let validated = {
         // Read the revocation set under the membership lock, immediately
         // before the apply (§3 L231).
@@ -1580,8 +1580,8 @@ pub(in crate::server) async fn receive(
                 // a frame whose parent is not retained stays unvalidated.
                 Err(cr::CertificateRebindRefusal::HeadMismatch) => {
                     match cr::validate_sibling(&body, &info, now_unix, is_revoked) {
-                        Ok(_) => {
-                            sibling = true;
+                        Ok(kind) => {
+                            sibling = Some(kind);
                             Err(cr::CertificateRebindRefusal::HeadMismatch)
                         }
                         Err(refused) => Err(refused),
@@ -1597,22 +1597,8 @@ pub(in crate::server) async fn receive(
         Err(refused) => {
             match refused {
                 cr::CertificateRebindRefusal::HeadMismatch => {
-                    if sibling {
-                        // A valid competing child of a retained parent:
-                        // the shared apply hook records the fork evidence
-                        // it records for any commit.
-                        let _ = ng::apply_stateful_event_with_evidence(
-                            state,
-                            &group_key,
-                            &info,
-                            &commit,
-                            None,
-                            false,
-                            None,
-                            x0x::groups::ActionKind::MemberSelf,
-                            |_| {},
-                        )
-                        .await;
+                    if sibling.is_some() {
+                        contain_sibling(state, &group_key, &info, &commit).await;
                     }
                     // §4a "Effect on S4 rows": a rebind that arrives after
                     // the seat's removal is refused with
@@ -1711,6 +1697,61 @@ pub(in crate::server) async fn receive(
     }
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
+}
+
+/// ADR 0110 §2 and §4a run (10) (#1508 Codex P1 B): a valid rebind on a
+/// sibling branch of this node's chain (for example, a delayed self-rebind
+/// on the parent of the seat's expiry removal) is fork evidence. Keep it
+/// with the existing fork-quarantine marker, as for any authenticated
+/// conflict, on every record: the shared fork hook skips an
+/// `OwnerCertified` record without invite lineage, such as the creator's,
+/// and it labels a self-rebind signer as unauthorized. The group is
+/// contained (no seal, delivery or key serving), no node applies both
+/// siblings, and ADR 0064's owner-anchored recovery resolves it. S4 adds
+/// no fork choice. The sibling frame is not kept for serving. The caller
+/// has checked the frame with [`cr::validate_sibling`].
+async fn contain_sibling(
+    state: &Arc<AppState>,
+    group_key: &str,
+    info: &GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) {
+    use super::super as ng;
+    let evidence = x0x::groups::ForkEvidence {
+        revision: commit.revision,
+        state_hash: commit.state_hash.clone(),
+        committed_by: commit.committed_by.clone(),
+        observed_at_ms: ng::now_millis_u64(),
+    };
+    // The signer is authenticated at the claimed parent, and the other
+    // branch is not available to apply: ADR 0064 slice 4's `signer_only`.
+    let quarantine = ng::fork_quarantine_for_evidence(
+        info,
+        &evidence,
+        commit,
+        Some(ng::FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY),
+    );
+    if ng::install_fork_evidence(state, group_key, evidence, quarantine, false, None).await {
+        // The own branch's rebind work for the group stops now.
+        let stable = info.stable_group_id();
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .rebind
+            .deliveries
+            .retain(|(group, _), _| group != stable);
+        inner
+            .rebind
+            .held
+            .retain(|key, _| key.stable_group_id != stable);
+        drop(inner);
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            revision = commit.revision,
+            state_hash = %commit.state_hash,
+            committed_by = %LogHexId::agent(&commit.committed_by),
+            "ADR 0110 S4: sibling certificate rebind kept as fork evidence; the group is contained"
+        );
+    }
 }
 
 // ─── Status ────────────────────────────────────────────────────────────────
