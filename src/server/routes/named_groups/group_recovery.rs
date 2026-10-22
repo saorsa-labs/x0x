@@ -71,16 +71,49 @@ pub(in crate::server) struct S3Runtime {
     /// A plain mutex: the roster writers read it synchronously, and it is
     /// never held across an await.
     staging: std::sync::Mutex<HashMap<String, StagingHold>>,
+    /// §2 "Conflict" and §4 at start (#1533 r8): `true` once the sidecars
+    /// on disk are loaded and reconciled ([`restore_containment`]). Until
+    /// then the in-memory map can be empty while disk holds a conflict, so
+    /// the conflict gates wait (receivers) or refuse (local seals).
+    restored: tokio::sync::watch::Sender<bool>,
+    /// [`restore_containment`] runs once.
+    restore_started: std::sync::atomic::AtomicBool,
 }
 
 impl Default for S3Runtime {
+    /// A runtime with nothing on disk to restore (in-process states). The
+    /// daemon uses [`Self::awaiting_restore`].
     fn default() -> Self {
+        Self::with_restored(true)
+    }
+}
+
+impl S3Runtime {
+    /// The daemon's runtime: the conflict gates hold until
+    /// [`restore_containment`] has loaded the sidecars.
+    pub(in crate::server) fn awaiting_restore() -> Self {
+        Self::with_restored(false)
+    }
+
+    fn with_restored(restored: bool) -> Self {
         Self {
             inner: tokio::sync::Mutex::new(S3Inner::default()),
             writer: tokio::sync::Mutex::new(()),
             placeheld: std::sync::Mutex::new(HashMap::new()),
             staging: std::sync::Mutex::new(HashMap::new()),
+            restored: tokio::sync::watch::Sender::new(restored),
+            restore_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn is_restored(&self) -> bool {
+        *self.restored.borrow()
+    }
+
+    async fn wait_restored(&self) {
+        let mut restored = self.restored.subscribe();
+        // The sender lives in `self`, so the channel does not close.
+        let _ = restored.wait_for(|done| *done).await;
     }
 }
 
@@ -1241,10 +1274,27 @@ async fn epoch_unchanged(
         == Some(captured)
 }
 
+/// What [`arm_in_place`] found in the sidecar when it installed an ATA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmSlot {
+    Installed,
+    /// A conflict is already recorded: nothing arms.
+    Stopped,
+    /// A verified active ATA diverges from this one: the conflict is
+    /// recorded beside it.
+    Conflict,
+}
+
 /// §2 "Arming" for a node whose record does not change at arming (the
 /// request path, and a provisional signer whose path verified): under the
 /// membership lock, re-check the epoch token, keep the ATA in the sidecar,
 /// then write the placeholder. Returns whether the arming is published.
+///
+/// §2 "Conflict" (#1533 r8): the compare with the active ATA and the
+/// install are one sidecar write (under the sidecar writer lock), so of
+/// two conflicting replies that arrive together the second records the
+/// conflict and never replaces the first. The callers' early checks only
+/// save work.
 async fn arm_in_place(
     state: &Arc<AppState>,
     group_key: &str,
@@ -1258,12 +1308,40 @@ async fn arm_in_place(
         tracing::info!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the group's epoch moved before arming; re-evaluated on the next answer");
         return false;
     }
-    if !update_sidecar(state, &stable, move |body| {
-        body.active_ata = Some(ata);
+    let mut slot = ArmSlot::Installed;
+    let candidate = ata.clone();
+    let written = update_sidecar(state, &stable, |body| {
+        if body.attestation_conflict.is_some() {
+            slot = ArmSlot::Stopped;
+        } else if body
+            .active_ata
+            .as_ref()
+            .is_some_and(|active| verified_conflict(active, &candidate, captured))
+        {
+            slot = ArmSlot::Conflict;
+            body.attestation_conflict = Some(candidate);
+        } else {
+            body.active_ata = Some(candidate);
+        }
     })
-    .await
-    {
-        return false;
+    .await;
+    match slot {
+        ArmSlot::Installed if written => {}
+        ArmSlot::Installed => return false,
+        ArmSlot::Stopped => {
+            show_conflict(state, captured).await;
+            return false;
+        }
+        // The record only adds containment: when its write failed,
+        // `record_conflict` holds it in memory.
+        ArmSlot::Conflict if !written => {
+            record_conflict(state, group_key, captured, ata).await;
+            return false;
+        }
+        ArmSlot::Conflict => {
+            announce_conflict(state, group_key, captured).await;
+            return false;
+        }
     }
     begin_placehold(state, group_key, captured);
     let outcome = super::save_named_groups_checked(state).await;
@@ -2365,6 +2443,8 @@ fn attested_link_admitted(
 /// installs a marker through the existing path ("Conflicting commits still
 /// install a marker"). A commit that advances the head applies only when
 /// it is the next hash of the common prefix ([`s3::conflict_admits_link`]).
+/// At start the gate waits until the sidecars are restored
+/// ([`restore_containment`], #1533 r8).
 pub(super) async fn conflict_admits_commit(
     state: &AppState,
     current: &GroupInfo,
@@ -2373,6 +2453,16 @@ pub(super) async fn conflict_admits_commit(
     if commit.revision <= current.state_revision {
         return true;
     }
+    state.group_recovery.wait_restored().await;
+    conflict_admits_head(state, current, commit).await
+}
+
+/// The bound itself, on the restored sidecar map.
+async fn conflict_admits_head(
+    state: &AppState,
+    current: &GroupInfo,
+    commit: &GroupStateCommit,
+) -> bool {
     let Some(body) = sidecar_snapshot(state, current.stable_group_id()).await else {
         return true;
     };
@@ -2382,6 +2472,27 @@ pub(super) async fn conflict_admits_commit(
         }
         _ => true,
     }
+}
+
+/// ADR 0109 §2 "Conflict" for a commit this node authors (#1533 r8): the
+/// same bound as [`conflict_admits_commit`], checked in
+/// `seal_commit_owner_certified` and the other local seal sites, so no
+/// local author seals past the common prefix. `before` is the record as
+/// it was before the seal. The callers hold the roster lock, so this never
+/// waits for the restore: before the sidecars are restored it refuses.
+pub(in crate::server) async fn local_seal_admitted(
+    state: &AppState,
+    before: &GroupInfo,
+    commit: &GroupStateCommit,
+) -> bool {
+    if commit.revision <= before.state_revision {
+        return true;
+    }
+    if !state.group_recovery.is_restored() {
+        tracing::warn!(group_id = %LogHexId::group(before.stable_group_id()), "ADR 0109 S3: a local seal before the sidecars are restored is refused");
+        return false;
+    }
+    conflict_admits_head(state, before, commit).await
 }
 
 /// The catch-up page side of [`attested_link_admitted`]: before each
@@ -2682,12 +2793,30 @@ async fn set_view(state: &AppState, stable_group_id: &str, revision: u64, view: 
 
 // ─── §2 The subject's request loop ─────────────────────────────────────────
 
+/// §2 "Conflict" and §4 at start (#1533 r8): load and reconcile the
+/// sidecars once, then open the conflict gates. The daemon awaits this
+/// before it starts any listener or worker that can apply or seal a
+/// commit, so a conflict on disk bounds the first commit. The worker calls
+/// it too; a second call waits for the first.
+pub(in crate::server) async fn restore_containment(state: &AppState) {
+    let runtime = &state.group_recovery;
+    if runtime
+        .restore_started
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        runtime.wait_restored().await;
+        return;
+    }
+    load_sidecars(state).await;
+    reconcile_loaded_atas(state).await;
+    runtime.restored.send_replace(true);
+}
+
 /// The S3 worker: loads the sidecars, resumes re-seat journals, then runs
 /// the subject's request loop and the staged-join progress check. Runs
 /// until shutdown.
 pub(in crate::server) async fn run_group_recovery_worker(state: Arc<AppState>) {
-    load_sidecars(&state).await;
-    reconcile_loaded_atas(&state).await;
+    restore_containment(&state).await;
     resume_journals(&state).await;
     ensure_placeholders(&state).await;
     let mut interval = tokio::time::interval(TICK);
@@ -3348,8 +3477,26 @@ async fn record_conflict(
                 .attestation_conflict = Some(conflict);
         }
     }
+    announce_conflict(state, group_key, info).await;
+}
+
+/// Show and log a recorded attestation conflict.
+async fn announce_conflict(state: &AppState, group_key: &str, info: &GroupInfo) {
     show_conflict(state, info).await;
     tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: conflicting admin attestations; automatic catch-up stops at their common prefix (reseat_required)");
+}
+
+/// §2 "Conflict": `candidate` diverges from `active` and both signers are
+/// verified on `roster`. A provisional ATA causes no conflict, and nor does
+/// an active ATA whose signer an applied link demoted.
+fn verified_conflict(
+    active: &AdminTerminalAttestation,
+    candidate: &AdminTerminalAttestation,
+    roster: &GroupInfo,
+) -> bool {
+    active.conflicts_with(candidate)
+        && candidate.signer_verified_on(roster)
+        && active.signer_verified_on(roster)
 }
 
 /// A refusal moves the round to the next target at once; the last one
@@ -3403,10 +3550,7 @@ async fn arm_from_response(
         // signer's diverging sequence stops automatic catch-up. An active
         // ATA whose signer an applied link demoted has stopped (§2) and no
         // longer attests its remaining links, so it causes none either.
-        if active.conflicts_with(&ata)
-            && ata.signer_verified_on(info)
-            && active.signer_verified_on(info)
-        {
+        if verified_conflict(&active, &ata, info) {
             record_conflict(state, group_key, info, ata).await;
             return;
         }
@@ -6616,6 +6760,123 @@ mod tests {
         Ok(())
     }
 
+    /// #1533 r8 Codex P1 2 (ADR 0109 §2 "Conflict"): two conflicting
+    /// replies that arrive together both pass the early check (no active
+    /// ATA yet). The compare and the install are one sidecar write, so the
+    /// second reply records the conflict and does not replace the first.
+    /// Before the fix the second `arm_in_place` installed its ATA over the
+    /// first and no conflict was recorded.
+    #[tokio::test]
+    async fn simultaneous_conflicting_replies_record_the_conflict() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, first, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let mut fields = first.fields.clone();
+        fields.sequence = vec!["a1".to_string(), "x2".to_string()];
+        let second = AdminTerminalAttestation::sign(fields, &admin)?;
+        anyhow::ensure!(first.conflicts_with(&second));
+
+        tokio::join!(
+            arm_from_response(&state, &key, &info, first.clone()),
+            arm_from_response(&state, &key, &info, second.clone()),
+        );
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        let active = body
+            .active_ata
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("one reply is armed"))?;
+        let conflict = body
+            .attestation_conflict
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the conflict is recorded"))?;
+        assert!(
+            (active == &first && conflict == &second) || (active == &second && conflict == &first),
+            "the first armed reply stays active and the other is the conflict"
+        );
+        let on_disk = sidecar_on_disk(&state, &stable).await?;
+        assert!(
+            on_disk.attestation_conflict.is_some(),
+            "the conflict is durable"
+        );
+        Ok(())
+    }
+
+    /// #1533 r8 Codex P1 1 (ADR 0109 §2 "Conflict"): every commit this
+    /// node seals passes the conflict gate, not only a rebind. This node
+    /// is the group's admin and holds a recorded conflict on its head (no
+    /// fork marker). The ordinary rename route and a direct seal through
+    /// the shared wrapper (which `crypto_exclusion::commit_locked` and
+    /// `owner_recovery::finish_commit` also use) must refuse and leave the
+    /// record unchanged. Before the fix both sealed past the common
+    /// prefix and the route persisted the new head.
+    #[tokio::test]
+    async fn a_recorded_conflict_refuses_every_local_author() -> anyhow::Result<()> {
+        use axum::extract::{Json, Path, State};
+        use axum::response::IntoResponse;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let me = state.agent.identity().agent_keypair();
+        let mut info = GroupInfo::new(
+            "adr0109-local-author".to_string(),
+            String::new(),
+            me.agent_id(),
+            "5109".repeat(16),
+        );
+        info.seal_commit(me, 1_000)?;
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        anyhow::ensure!(
+            record_conflict_at_head_for_test(&state, &info).await?,
+            "the conflict is durable"
+        );
+
+        let req: super::super::UpdateGroupRequest =
+            serde_json::from_value(serde_json::json!({ "description": "past the prefix" }))?;
+        let response = super::super::update_named_group(
+            State(Arc::clone(&state)),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Path(key.clone()),
+            Json(req),
+        )
+        .await
+        .into_response();
+        assert_ne!(response.status(), axum::http::StatusCode::OK);
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("group"))?;
+        assert_eq!(live.state_hash, info.state_hash, "the head did not move");
+        assert_eq!(live.description, info.description);
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(legacy.state_hash, info.state_hash, "nothing persisted");
+
+        // The shared wrapper itself refuses and leaves the working copy.
+        let mut next = live.clone();
+        next.description = "past the prefix".to_string();
+        let before = next.clone();
+        assert!(
+            super::super::seal_commit_owner_certified(&state, &mut next, me, 2_000)
+                .await
+                .is_err()
+        );
+        assert_eq!(next.state_hash, before.state_hash);
+        assert_eq!(next.state_revision, before.state_revision);
+        assert_eq!(next.commit_log.len(), before.commit_log.len());
+        Ok(())
+    }
+
     /// The links of `ahead` after `base`'s head, in order.
     fn links_after(base: &GroupInfo, ahead: &GroupInfo) -> Vec<RetainedCommit> {
         ahead
@@ -7077,6 +7338,64 @@ mod tests {
         Ok(())
     }
 
+    /// #1533 r8 Codex P1 3 (ADR 0109 §2 "Conflict", §4): at start, traffic
+    /// can arrive before the sidecars are loaded. The restarted state uses
+    /// the daemon's runtime (`awaiting_restore`), and both links arrive by
+    /// DM before the restore runs. The gate holds them until the restore,
+    /// then only the common prefix applies. Before the fix the gate read an
+    /// empty sidecar map and applied both links. Inert.
+    #[tokio::test]
+    async fn traffic_before_the_restore_keeps_the_conflict_bound() -> anyhow::Result<()> {
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, base, links, events, owner) = conflict_fixture(&state).await?;
+        let mut restarted = super::super::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&state.agent),
+        )
+        .await?;
+        drop(state);
+        Arc::get_mut(&mut restarted)
+            .ok_or_else(|| anyhow::anyhow!("the fresh state is not shared yet"))?
+            .group_recovery = S3Runtime::awaiting_restore();
+        assert_eq!(
+            head_of(&restarted, &key).await,
+            Some(base.state_hash.clone())
+        );
+
+        let delivery = {
+            let restarted = Arc::clone(&restarted);
+            let sender = owner.agent_id();
+            tokio::spawn(async move {
+                for event in events {
+                    let _ = super::super::apply_named_group_metadata_event(
+                        &restarted, event, sender, true, None,
+                    )
+                    .await;
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !delivery.is_finished(),
+            "the gate holds the delivery until the restore"
+        );
+        assert_eq!(
+            head_of(&restarted, &key).await,
+            Some(base.state_hash.clone()),
+            "no link applied before the restore"
+        );
+        restore_containment(&restarted).await;
+        delivery.await?;
+        assert_eq!(
+            head_of(&restarted, &key).await,
+            Some(links[0].commit.state_hash.clone()),
+            "only the common prefix applies (base {}, second link {})",
+            base.state_hash,
+            links[1].commit.state_hash
+        );
+        Ok(())
+    }
+
     /// A contained record for G4/G5: `signer` (the owner, an Active
     /// admin) committed a rename after `base`; this node holds a marker on
     /// that commit and a verified ATA whose one-link segment ends at it.
@@ -7241,6 +7560,19 @@ mod tests {
     async fn armed_fixture(
         state: &Arc<AppState>,
     ) -> anyhow::Result<(String, GroupInfo, AdminTerminalAttestation)> {
+        let (key, info, ata, _admin) = armed_fixture_with_signer(state).await?;
+        Ok((key, info, ata))
+    }
+
+    /// [`armed_fixture`], with the admin that signed the ATA.
+    async fn armed_fixture_with_signer(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(
+        String,
+        GroupInfo,
+        AdminTerminalAttestation,
+        x0x::identity::AgentKeypair,
+    )> {
         let local = local_hex(state);
         let admin = x0x::identity::AgentKeypair::generate()?;
         let admin_hex = hex::encode(admin.agent_id().as_bytes());
@@ -7284,7 +7616,7 @@ mod tests {
             },
             &admin,
         )?;
-        Ok((key, info, ata))
+        Ok((key, info, ata, admin))
     }
 
     /// Codex P1 (#1533 round 1), ADR 0109 §4: arming writes the

@@ -21,7 +21,9 @@ pub(in crate::server) use fair_admission::FairAdmission;
 #[cfg(test)]
 pub(in crate::server) use group_recovery::open_staging_journal_for_test;
 pub(in crate::server) use group_recovery::{
-    get_group_recovery, reseat_group_member, run_group_recovery_worker, S3Runtime,
+    get_group_recovery, reseat_group_member,
+    restore_containment as restore_group_recovery_containment, run_group_recovery_worker,
+    S3Runtime,
 };
 pub(in crate::server) use revocation_eviction::owner_recovery::sign_recovery_mandate;
 pub(in crate::server) use revocation_eviction::{
@@ -27202,6 +27204,9 @@ async fn owner_certified_seal_with_eviction(
                             )))
                         }
                     };
+                if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                    return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
+                }
                 // ADR-0064 r2: the explicit seal route is the ONLY local
                 // owner anchor that may clear the fork-quarantine marker —
                 // and only when the local install holds the owner USER key
@@ -27311,6 +27316,9 @@ async fn owner_certified_seal_with_eviction(
                         )))
                     }
                 };
+                if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                    return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
+                }
                 // #1187: capture the pre-eviction snapshot so a failed seal
                 // can roll the in-memory group back to what a restart loads.
                 // Fail the request BEFORE the mutation if it cannot be taken.
@@ -27470,6 +27478,9 @@ async fn owner_certified_seal_with_eviction(
                     )))
                 }
             };
+            if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
+            }
             let event = NamedGroupMetadataEvent::MemberRemoved {
                 group_id: next.stable_group_id().to_string(),
                 revision,
@@ -28500,6 +28511,33 @@ pub(in crate::server) async fn seal_commit_owner_certified(
             warranted_fetch_for_pending_seats(state, info, &still_pending);
         }
     }
+    // ADR 0109 §2 "Conflict" (#1533 r8): every ordinary local commit
+    // seals here, so the conflict bound is checked here for each of them.
+    // The check runs after the seal, so a conflict recorded meanwhile by a
+    // reply (which does not take the roster lock) still bounds it.
+    let before = info.clone();
+    let commit = seal_owner_certified_unbounded(state, info, signing_kp, now_ms).await?;
+    if group_recovery::local_seal_admitted(state, &before, &commit).await {
+        return Ok(commit);
+    }
+    *info = before;
+    Err(x0x::groups::state_commit::ApplyError::Invariant(
+        LOCAL_SEAL_CONTAINED.to_string(),
+    ))
+}
+
+/// The refusal text of a local seal past an attestation conflict's common
+/// prefix (ADR 0109 §2 "Conflict").
+pub(in crate::server) const LOCAL_SEAL_CONTAINED: &str =
+    "group_contained: an attestation conflict stops local commits at its common prefix (ADR 0109)";
+
+/// [`seal_commit_owner_certified`] without the ADR 0109 conflict bound.
+async fn seal_owner_certified_unbounded(
+    state: &AppState,
+    info: &mut x0x::groups::GroupInfo,
+    signing_kp: &crate::identity::AgentKeypair,
+    now_ms: u64,
+) -> Result<x0x::groups::GroupStateCommit, x0x::groups::state_commit::ApplyError> {
     let evidence = owner_cert_seal_evidence(state, info).await;
     // ADR 0108 §4 (#1143): `info` is the caller's working copy, which
     // already holds the seat write. Its Home scope is read from metadata,

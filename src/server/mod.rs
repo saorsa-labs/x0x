@@ -1313,7 +1313,7 @@ pub async fn serve_with_options(
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::default(),
-        group_recovery: routes::named_groups::S3Runtime::default(),
+        group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -1416,6 +1416,12 @@ pub async fn serve_with_options(
         )
         .await);
     }
+
+    // ADR 0109 §2 "Conflict" and §4 (#1533 r8): restore the S3
+    // containment from disk before any listener, worker or route can apply
+    // or seal a commit. A recorded attestation conflict then bounds the
+    // first commit after a restart.
+    routes::named_groups::restore_group_recovery_containment(&state).await;
 
     let port_file = config.data_dir.join("api.port");
 
