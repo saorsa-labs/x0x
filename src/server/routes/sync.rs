@@ -2018,4 +2018,68 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "malformed id: {body:?}");
         Ok(())
     }
+
+    /// Codex review of #1545 (b17cd8bf), round 7: `Alice` is owed.
+    /// `PUT Bob` is cancelled (the client goes away) during the rename of
+    /// its profile save, and `PUT Carol` then completes. The late rename of
+    /// Bob's save must not put Bob on disk over the durable Carol: a
+    /// restart would show Bob, and Carol's discharge of Alice would stand
+    /// on a save that the disk does not hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_put_cancelled_during_its_save_cannot_land_over_a_later_put() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state = state_owing_alice(dir.path(), [0x8E; 32]).await;
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::profile::journal_faults::pause_next_rename(
+            &state.profile_path,
+            reached_tx,
+            release_rx,
+        );
+        let bob = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { put_name(&state, "Bob").await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("Bob's save reaches its rename")
+            .expect("rename hook");
+        bob.abort();
+        let _ = bob.await;
+
+        let mut carol = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { put_name(&state, "Carol").await })
+        };
+        let early = tokio::time::timeout(std::time::Duration::from_secs(1), &mut carol).await;
+        release_tx.send(()).expect("release Bob's rename");
+        let status = match early {
+            Ok(done) => done.expect("PUT Carol"),
+            Err(_) => carol.await.expect("PUT Carol"),
+        };
+        assert_eq!(status, StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let durable = crate::profile::SelfProfile::load_from(&state.profile_path)
+            .await
+            .expect("read the profile")
+            .expect("a saved profile");
+        assert_eq!(
+            durable.human_name.as_deref(),
+            Some("Carol"),
+            "the late save of a cancelled PUT must not land over a later PUT"
+        );
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        service.sync_all().await;
+        assert_keeps(&state, "Carol", "after a cancelled PUT").await;
+        drop(state);
+
+        let state = owned_state(dir.path(), [0x8E; 32])
+            .await
+            .expect("restarted state");
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        DaemonView::attach(service, &state).await;
+        service.sync_all().await;
+        assert_keeps(&state, "Carol", "after a restart").await;
+    }
 }
