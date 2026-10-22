@@ -1605,22 +1605,40 @@ pub(in crate::server) async fn receive(
     // §3 L231: re-read the revocation set under the membership lock,
     // immediately before the apply, so a revocation that landed since the
     // early check above also refuses the frame.
+    // Set when the frame is a valid exclusion on a sibling branch.
+    let mut sibling = false;
     let validated = {
         let revocation_set = state.agent.revocation_set();
         let set = revocation_set.read().await;
+        let is_revoked = |actor: &[u8; 32]| set.is_agent_revoked(&AgentId(*actor));
         if set.is_agent_revoked(&sender) {
             Err(ce::CryptoExclusionRefusal::ActorIneligible)
         } else {
-            ce::validate_against_parent(&body, &info, current_epoch, |actor| {
-                set.is_agent_revoked(&AgentId(*actor))
-            })
+            match ce::validate_against_parent(&body, &info, current_epoch, is_revoked) {
+                // #1508 r6 (Codex P1 A): a frame that does not chain from
+                // this node's head is checked against its retained parent
+                // before it can be fork evidence. A frame that fails there
+                // is refused with that reason and records nothing; a frame
+                // whose parent is not retained stays unvalidated.
+                Err(ce::CryptoExclusionRefusal::HeadMismatch) => {
+                    match validate_sibling(&body, &info, is_revoked) {
+                        Ok(()) => {
+                            sibling = true;
+                            Err(ce::CryptoExclusionRefusal::HeadMismatch)
+                        }
+                        Err(refusal) => Err(refusal),
+                    }
+                }
+                other => other,
+            }
         }
     };
     if let Err(refusal) = validated {
         drop(guard);
-        if refusal == ce::CryptoExclusionRefusal::HeadMismatch {
-            // A competing child of our head: let the shared apply hook
-            // record the fork evidence it records for any commit.
+        if sibling {
+            // A valid competing child of a retained parent: let the shared
+            // apply hook record the fork evidence it records for any
+            // commit.
             let _ = ng::apply_stateful_event_with_evidence(
                 state,
                 &group_key,
@@ -1877,6 +1895,144 @@ async fn remove_legacy_mls_member(state: &AppState, group_key: &str, target: Age
     if removed {
         ng::save_mls_groups(state).await;
     }
+}
+
+/// ADR 0110 §2 fork containment and §4 L249 (#1508 r6, Codex P1 A):
+/// whether `body`, which [`ce::validate_against_parent`] refused with
+/// `head_mismatch` on `current`, is a valid exclusion on a sibling branch
+/// of `current`'s retained chain. Only such a frame is fork evidence.
+///
+/// The parent is the retained commit whose `state_hash` is the body's
+/// `prior_head`, and `current` retains a different commit at the same
+/// revision on that parent. The L4 checks then run against the parent's
+/// retained roster and commit: the actor is not revoked, is not the
+/// target, and is an Active admin there; the target is not Active there
+/// and is Removed with the body's removal proof; the commit keeps the
+/// parent's roster root, policy and metadata; and the epoch is the
+/// parent's committed epoch + 1 with the exact security binding (the
+/// committed leaf for the TreeKEM form).
+///
+/// The caller has already run [`ce::verify_signatures`].
+fn validate_sibling(
+    body: &ce::CryptoExclusionBodyV1,
+    current: &GroupInfo,
+    is_actor_revoked: impl Fn(&[u8; 32]) -> bool,
+) -> Result<(), ce::CryptoExclusionRefusal> {
+    use ce::CryptoExclusionRefusal as Refusal;
+    use x0x::groups::{GroupMemberState, GroupRole};
+    if body.stable_group_id != current.stable_group_id()
+        || body.commit.group_id != current.stable_group_id()
+    {
+        return Err(Refusal::GroupMismatch);
+    }
+    if current.withdrawn || current.fork_quarantine.is_some() || body.commit.withdrawn {
+        return Err(Refusal::GroupContained);
+    }
+    if body.commit.prev_state_hash.as_deref() != Some(body.prior_head.as_str()) {
+        return Err(Refusal::HeadMismatch);
+    }
+    let Some(parent) = current
+        .commit_log
+        .iter()
+        .find(|retained| retained.commit.state_hash == body.prior_head)
+    else {
+        return Err(Refusal::HeadMismatch);
+    };
+    if body.prior_revision != parent.commit.revision
+        || body.next_revision != parent.commit.revision.saturating_add(1)
+        || body.commit.revision != body.next_revision
+    {
+        return Err(Refusal::RevisionMismatch);
+    }
+    let sibling = current.commit_log.iter().any(|retained| {
+        retained.commit.prev_state_hash.as_deref() == Some(body.prior_head.as_str())
+            && retained.commit.revision == body.next_revision
+            && retained.commit.state_hash != body.commit.state_hash
+    });
+    if !sibling {
+        return Err(Refusal::HeadMismatch);
+    }
+    let actor_hex = hex::encode(body.actor);
+    let target_hex = hex::encode(body.target);
+    if body.actor == body.target
+        || is_actor_revoked(&body.actor)
+        || !parent.roster.get(&actor_hex).is_some_and(|snapshot| {
+            snapshot.state == GroupMemberState::Active && snapshot.role.at_least(GroupRole::Admin)
+        })
+    {
+        return Err(Refusal::ActorIneligible);
+    }
+    if parent
+        .roster
+        .get(&target_hex)
+        .is_some_and(|snapshot| snapshot.state == GroupMemberState::Active)
+    {
+        return Err(Refusal::TargetNotRemoved);
+    }
+    let Some(proof) = ce::removal_proof_for(current, &target_hex) else {
+        return Err(Refusal::TargetNotRemoved);
+    };
+    if proof != body.removal_proof_hash {
+        return Err(Refusal::RemovalProofMismatch);
+    }
+    // Crypto only: the membership, policy and metadata are the parent's.
+    if body.commit.roster_root != parent.commit.roster_root
+        || body.commit.policy_hash != parent.commit.policy_hash
+        || body.commit.public_meta_hash != parent.commit.public_meta_hash
+    {
+        return Err(Refusal::Malformed);
+    }
+    let parent_binding = parent
+        .commit
+        .security_binding
+        .as_deref()
+        .unwrap_or_default();
+    let (parent_epoch, next_epoch, binding) = match &body.crypto {
+        ce::CryptoExclusionCryptoV1::TreeKem {
+            leaf_key_package_hash,
+            commit,
+            next_epoch,
+        } => {
+            if current.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+                return Err(Refusal::CryptoPlaneUnsupported);
+            }
+            let leaf = current
+                .members_v2
+                .get(&target_hex)
+                .and_then(|member| member.treekem_key_package_hash.as_deref());
+            if leaf != Some(leaf_key_package_hash.as_str()) {
+                return Err(Refusal::LeafMismatch);
+            }
+            let parent_epoch = parent_binding
+                .strip_prefix("treekem:epoch=")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|epoch| epoch.parse::<u64>().ok());
+            (
+                parent_epoch,
+                *next_epoch,
+                ce::treekem_binding(*next_epoch, commit),
+            )
+        }
+        ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => {
+            if !ce::is_gss_encrypted(current) {
+                return Err(Refusal::CryptoPlaneUnsupported);
+            }
+            let parent_epoch = parent_binding
+                .strip_prefix("gss:epoch=")
+                .and_then(|epoch| epoch.parse::<u64>().ok());
+            (
+                parent_epoch,
+                *next_secret_epoch,
+                ce::gss_binding(*next_secret_epoch),
+            )
+        }
+    };
+    if parent_epoch.map(|epoch| epoch.saturating_add(1)) != Some(next_epoch)
+        || body.commit.security_binding.as_deref() != Some(binding.as_str())
+    {
+        return Err(Refusal::EpochMismatch);
+    }
+    Ok(())
 }
 
 /// Test-only: the newest frame this node holds for `stable_group_id`.
