@@ -1020,13 +1020,16 @@ boundary), so a synced roster row is not itself mint-capable for riders.
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
 machine is refused, and a live session from it stops at its next admission
 re-check (phase or page boundary, or before its commit — #1055). The DELETE
-also writes a durable unenroll tombstone — including on the `404` (not
-enrolled) path — that refuses any later enroll, restore or replay whose
-`enrolled_at_ms` is at or before the delete time; re-enrolling requires a
-freshly issued enrollment with a strictly later `enrolled_at_ms`. `404` when
-the machine is not enrolled; `400` for a malformed id — but the owner gate runs
-FIRST: on a daemon with no owner identity the DELETE answers `409 no owner
-identity configured` regardless of the id's shape.
+also writes a durable unenroll tombstone (persisted in
+`<data_dir>/sync/unenroll_tombstones.json`, a versioned envelope) — including
+on the `404` (not enrolled) path — that refuses any later enroll, restore or
+replay whose `enrolled_at_ms` is at or before the delete time; re-enrolling
+requires a freshly issued enrollment with a strictly later `enrolled_at_ms`.
+A corrupt tombstone file or an unknown envelope version fails the daemon
+load closed — never a silent fallback to an empty tombstone store. `404` when
+the machine is not enrolled; `400` for a malformed id — but the owner gate
+runs FIRST: on a daemon with no owner identity the DELETE answers `409 no
+owner identity configured` regardless of the id's shape.
 
 ## Placement and agent key-move (ADR-0043)
 

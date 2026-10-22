@@ -551,8 +551,11 @@ impl OwnerEnrollment {
     }
 }
 
-/// Typed sync failures — every one is fail-closed.
+/// Typed sync failures — every one is fail-closed. New variants can be
+/// added without a breaking change: match it outside this crate with a
+/// wildcard arm (David's approval, 20 Oct 2026, PR #1499).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SyncError {
     Io(String),
     /// Frame body exceeded [`MAX_FRAME_BYTES`], a decode failed, or a
@@ -6965,5 +6968,218 @@ mod issue_1055_tests {
             "a refused session commit stores nothing"
         );
         let _ = peer_task.await;
+    }
+
+    /// WHY (#1055, Codex RC3 verdict at af04889): the R3 corrupt-state test
+    /// covers records.json and devices.json only — the tombstone file was
+    /// the gap. It is the one state whose silent loss re-opens admission
+    /// for a machine the owner deleted, so a corrupt file or an unknown
+    /// envelope version must fail the load closed (never a silent fallback
+    /// to an empty tombstone store) and must leave the file untouched for
+    /// inspection (ADR 0085 rule 4).
+    #[tokio::test]
+    async fn corrupt_or_unknown_version_tombstone_file_fails_loud() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(3);
+        let gone = machine(8);
+        store
+            .enroll(OwnerEnrollment::sign(gone, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        assert!(store.unenroll(&gone).await.expect("delete"));
+        let tombstones_path = dir.path().join(SYNC_DIR).join(TOMBSTONES_FILE);
+        assert!(tombstones_path.exists(), "a real tombstone is on disk");
+
+        // Corrupt bytes: the load must refuse, not start empty.
+        tokio::fs::write(&tombstones_path, b"{ not json")
+            .await
+            .expect("corrupt the tombstone file");
+        let before = tokio::fs::read(&tombstones_path)
+            .await
+            .expect("read before");
+        let err = match OwnerSyncStore::load(dir.path()).await {
+            Err(e) => e,
+            Ok(_) => panic!("a corrupt tombstone file must fail the load"),
+        };
+        assert!(
+            err.to_string().contains("refusing to start")
+                && err.to_string().contains(TOMBSTONES_FILE),
+            "corrupt tombstone file must fail loud, got: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(&tombstones_path).await.expect("read after"),
+            before,
+            "the refused load must not touch the file"
+        );
+
+        // A well-formed envelope with an UNKNOWN version is still a hard
+        // error; the valid entry inside proves the refusal is about the
+        // version, not the payload.
+        let future_version = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "tombstones": [{
+                "machine_id": machine(7).0.to_vec(),
+                "deleted_at_ms": 1_234,
+            }],
+        }))
+        .expect("encode version-2 envelope");
+        tokio::fs::write(&tombstones_path, future_version)
+            .await
+            .expect("place the version-2 envelope");
+        let before = tokio::fs::read(&tombstones_path)
+            .await
+            .expect("read before");
+        let err = match OwnerSyncStore::load(dir.path()).await {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown tombstone format version must fail the load"),
+        };
+        assert!(
+            err.to_string().contains("unknown tombstone format version"),
+            "unknown version must fail loud, got: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(&tombstones_path).await.expect("read after"),
+            before,
+            "the refused load must leave the file untouched"
+        );
+    }
+
+    /// WHY (#1055, Codex RC3 verdict at af04889): a persistence failure
+    /// BEFORE the rename on the tombstone write must roll the in-memory
+    /// tombstone back, leave the device row alone (no half-delete), keep
+    /// the store usable (no poison), and keep every PREVIOUS tombstone
+    /// durable. The r5 test covers the post-rename keep-and-poison half on
+    /// a records write; this covers the roll-back half on the tombstone
+    /// write. The chmod gate matches the r3 precedent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_rename_tombstone_persistence_failure_rolls_back_and_loses_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(4);
+        let owner_id = owner.user_id();
+        let deleted = machine(5);
+        let kept = machine(6);
+        store
+            .enroll(OwnerEnrollment::sign(deleted, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("enroll A");
+        assert!(store.unenroll(&deleted).await.expect("delete A"));
+        store
+            .enroll(OwnerEnrollment::sign(kept, &owner, 2_000, None).expect("sign"))
+            .await
+            .expect("enroll B");
+
+        // A read-only sync dir makes the tombstone temp-file create fail
+        // BEFORE the rename: the old state stays on disk.
+        let sync_dir = dir.path().join(SYNC_DIR);
+        std::fs::set_permissions(&sync_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("break tombstone writes");
+        let failed = store.unenroll(&kept).await;
+        std::fs::set_permissions(&sync_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore the sync dir");
+
+        let err = failed.expect_err("the unenroll must fail on the write failure");
+        assert!(
+            !matches!(err, SyncError::Poisoned(_)),
+            "a pre-rename failure must not poison, got: {err:?}"
+        );
+        assert!(
+            matches!(err, SyncError::Io(_)),
+            "a pre-rename failure is a plain io error, got: {err:?}"
+        );
+        assert!(
+            store.poisoned_reason().is_none(),
+            "the store stays usable after a rolled-back write"
+        );
+
+        // Disk truth: B survived the failed delete (no half-delete) and
+        // A's tombstone survived with it.
+        let reloaded = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        let devices = reloaded.enrolled_devices().await;
+        assert_eq!(devices.len(), 1, "exactly one device row remains");
+        assert_eq!(devices[0].machine_id, kept.0, "the failed delete kept B");
+        assert!(
+            reloaded.is_enrolled(&kept, &owner_id).await,
+            "B is still enrolled after the failed unenroll"
+        );
+        let replay = reloaded
+            .enroll(OwnerEnrollment::sign(deleted, &owner, 1_000, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { machine }) if machine == deleted.0),
+            "A's tombstone survived the failed write, got {replay:?}"
+        );
+
+        // Recovery: the same unenroll that failed now succeeds.
+        assert!(
+            reloaded.unenroll(&kept).await.expect("recovering unenroll"),
+            "the recovered unenroll removes B"
+        );
+        assert!(!reloaded.is_enrolled(&kept, &owner_id).await);
+    }
+
+    /// WHY (#1055, Codex RC3 verdict at af04889): on the unenroll path the
+    /// tombstone is the FIRST durable write, and a failure AFTER its rename
+    /// means disk already holds it — the store must poison (never roll
+    /// memory back behind an advanced disk), a fresh load must see the
+    /// tombstone (no lost tombstone), and the poisoned instance must refuse
+    /// every further mutation.
+    #[tokio::test]
+    async fn post_rename_tombstone_failure_keeps_tombstone_and_poisons() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(5);
+        let target = machine(9);
+        store
+            .enroll(OwnerEnrollment::sign(target, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+
+        // The tombstone write crosses the rename, then its durability sync
+        // fails: disk holds the tombstone, the caller saw an error.
+        store.set_fail_after_rename_for_testing(true);
+        let err = store
+            .unenroll(&target)
+            .await
+            .expect_err("the post-rename failure must surface");
+        assert!(
+            matches!(err, SyncError::Poisoned(_)),
+            "typed poison error, got: {err:?}"
+        );
+        assert!(store.poisoned_reason().is_some(), "the store is poisoned");
+
+        // The tombstone the caller saw fail IS durable: a fresh load
+        // succeeds and keeps refusing the deleted machine.
+        let reloaded = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        let replay = reloaded
+            .enroll(OwnerEnrollment::sign(target, &owner, 1_000, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { machine }) if machine == target.0),
+            "the crossed-rename tombstone must survive the reload, got {replay:?}"
+        );
+        assert!(
+            !reloaded.is_enrolled(&target, &owner.user_id()).await,
+            "the deleted machine stays inadmissible after the reload"
+        );
+
+        // Disable the injector FIRST (R6 discipline, as in the r5 test):
+        // with it left on, the refusals below could come from the injector
+        // firing again instead of the poison flag.
+        store.set_fail_after_rename_for_testing(false);
+        let err = store
+            .unenroll(&target)
+            .await
+            .expect_err("a poisoned store refuses unenroll");
+        assert!(matches!(err, SyncError::Poisoned(_)));
+        let err = store
+            .enroll(OwnerEnrollment::sign(target, &owner, now_unix_ms() + 1, None).expect("sign"))
+            .await
+            .expect_err("a poisoned store refuses enroll");
+        assert!(matches!(err, SyncError::Poisoned(_)));
     }
 }
