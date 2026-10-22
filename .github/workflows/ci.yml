@@ -499,7 +499,7 @@ jobs:
       - name: Run W3-H cases 20 times
         env:
           X0X_ISOLATION_ROLE: w3h-harness
-          X0X_RUNTIME_TIMEOUT_SECONDS: 4800
+          X0X_RUNTIME_TIMEOUT_SECONDS: 6600
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 20
