@@ -498,6 +498,151 @@ pub fn validate_against_parent(
     Ok((signer, new_cert))
 }
 
+/// ADR 0110 §2 fork containment and §4a "Receiver checks": whether
+/// `body`, which [`validate_against_parent`] refused with
+/// `rebind_head_mismatch` on `current`, is a valid rebind on a sibling
+/// branch of `current`'s retained chain. Only such a rebind is fork
+/// evidence (#1508 Codex P1 A).
+///
+/// The parent is the retained commit whose `state_hash` is the body's
+/// `prior_head`, and `current` retains a different commit at the same
+/// revision on that parent. The §4a checks then run against the parent's
+/// retained roster: the signer is not revoked and is an Active admin there
+/// or the seat's own agent; an admin signer's selected certificate is not
+/// expired; the seat is Active with the body's old digest; the new
+/// certificate verifies against the group owner for the seat and is not
+/// the old one. The commit changes only that seat's certificate digest:
+/// its roster root is the parent's roster with the new digest, and its
+/// policy, metadata and security binding are the parent's.
+///
+/// The parent snapshot keeps digests, not certificate bytes. The old and
+/// the admin certificates are taken from `current` when their digests
+/// match. When the old bytes are held, the new certificate must expire
+/// later. Bytes that are not held do not refuse, as for the admin
+/// certificate in [`validate_against_parent`]: this node's own branch may
+/// already have replaced them, and a sibling only contains the group; it
+/// never applies.
+///
+/// The caller has already run [`verify_signatures`], so the signer signed
+/// the frame and the embedded commit.
+///
+/// # Errors
+///
+/// Returns the first failed check; `rebind_head_mismatch` when the parent
+/// is not retained or the body is no sibling of the retained chain.
+pub fn validate_sibling(
+    body: &CertificateRebindBodyV1,
+    current: &GroupInfo,
+    now_unix: u64,
+    is_revoked: impl Fn(&[u8; 32]) -> bool,
+) -> Result<RebindSigner, CertificateRebindRefusal> {
+    if body.stable_group_id != current.stable_group_id()
+        || body.commit.group_id != current.stable_group_id()
+    {
+        return Err(CertificateRebindRefusal::GroupMismatch);
+    }
+    if current.withdrawn || current.fork_quarantine.is_some() || body.commit.withdrawn {
+        return Err(CertificateRebindRefusal::GroupContained);
+    }
+    if body.commit.prev_state_hash.as_deref() != Some(body.prior_head.as_str()) {
+        return Err(CertificateRebindRefusal::HeadMismatch);
+    }
+    let Some(parent) = current
+        .commit_log
+        .iter()
+        .find(|retained| retained.commit.state_hash == body.prior_head)
+    else {
+        return Err(CertificateRebindRefusal::HeadMismatch);
+    };
+    if body.next_revision != parent.commit.revision.saturating_add(1)
+        || body.commit.revision != body.next_revision
+    {
+        return Err(CertificateRebindRefusal::RevisionMismatch);
+    }
+    let sibling = current.commit_log.iter().any(|retained| {
+        retained.commit.prev_state_hash.as_deref() == Some(body.prior_head.as_str())
+            && retained.commit.revision == body.next_revision
+            && retained.commit.state_hash != body.commit.state_hash
+    });
+    if !sibling {
+        return Err(CertificateRebindRefusal::HeadMismatch);
+    }
+    let signer_hex = hex::encode(body.signer);
+    let seat_hex = hex::encode(body.seat);
+    let signer_at_parent = parent.roster.get(&signer_hex);
+    let signer_is_admin = signer_at_parent.is_some_and(|snapshot| {
+        snapshot.state == GroupMemberState::Active && snapshot.role.at_least(GroupRole::Admin)
+    });
+    if is_revoked(&body.signer) || (!signer_is_admin && body.signer != body.seat) {
+        return Err(CertificateRebindRefusal::SignerIneligible);
+    }
+    let held_certificate = |id: &str, digest: Option<&String>| {
+        current
+            .members_v2
+            .get(id)
+            .and_then(committed_certificate)
+            .filter(|cert| Some(&owner_cert::certificate_digest_hex(cert)) == digest)
+    };
+    if body.signer != body.seat
+        && held_certificate(
+            &signer_hex,
+            signer_at_parent.and_then(|snapshot| snapshot.certificate_digest.as_ref()),
+        )
+        .and_then(AgentCertificate::not_after)
+        .is_some_and(|not_after| own_expiry_trigger_due(not_after, now_unix))
+    {
+        return Err(CertificateRebindRefusal::SignerIneligible);
+    }
+    let Some(seat) = parent
+        .roster
+        .get(&seat_hex)
+        .filter(|snapshot| snapshot.state == GroupMemberState::Active)
+    else {
+        return Err(CertificateRebindRefusal::SeatNotActive);
+    };
+    if seat.certificate_digest.as_deref() != Some(body.old_certificate_digest.as_str()) {
+        return Err(CertificateRebindRefusal::DigestMismatch);
+    }
+    let Some(owner) = current.policy.admission.owner_certified_user_id() else {
+        return Err(CertificateRebindRefusal::CertificateInvalid);
+    };
+    let Some(new_cert) = decode_certificate(&body.new_certificate) else {
+        return Err(CertificateRebindRefusal::CertificateInvalid);
+    };
+    owner_cert::verify_cert_against_owner(
+        owner,
+        &seat_hex,
+        &new_cert,
+        is_revoked(&body.seat),
+        now_unix,
+    )
+    .map_err(|_| CertificateRebindRefusal::CertificateInvalid)?;
+    let new_digest = owner_cert::certificate_digest_hex(&new_cert);
+    let old_not_after = held_certificate(&seat_hex, seat.certificate_digest.as_ref())
+        .map(AgentCertificate::not_after);
+    if new_digest == body.old_certificate_digest
+        || old_not_after.is_some_and(|old| !expires_later(new_cert.not_after(), old))
+    {
+        return Err(CertificateRebindRefusal::NotLater);
+    }
+    let mut roster = parent.roster.clone();
+    if let Some(snapshot) = roster.get_mut(&seat_hex) {
+        snapshot.certificate_digest = Some(new_digest);
+    }
+    if body.commit.roster_root != state_commit::roster_root_of_projection(&roster)
+        || body.commit.policy_hash != parent.commit.policy_hash
+        || body.commit.public_meta_hash != parent.commit.public_meta_hash
+        || body.commit.security_binding != parent.commit.security_binding
+    {
+        return Err(CertificateRebindRefusal::StateMismatch);
+    }
+    Ok(if signer_is_admin {
+        RebindSigner::Admin
+    } else {
+        RebindSigner::SeatAgent
+    })
+}
+
 /// Bind `cert` into `seat_hex`'s entry: its committed certificate and
 /// digest. Nothing else changes.
 pub fn install_certificate(info: &mut GroupInfo, seat_hex: &str, cert: AgentCertificate) {

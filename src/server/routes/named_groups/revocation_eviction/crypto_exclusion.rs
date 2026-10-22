@@ -1607,34 +1607,41 @@ pub(in crate::server) async fn receive(
     // §3 L231: re-read the revocation set under the membership lock,
     // immediately before the apply, so a revocation that landed since the
     // early check above also refuses the frame.
+    // Set when the frame is a valid exclusion on a sibling branch.
+    let mut sibling = false;
     let validated = {
         let revocation_set = state.agent.revocation_set();
         let set = revocation_set.read().await;
+        let is_revoked = |actor: &[u8; 32]| set.is_agent_revoked(&AgentId(*actor));
         if set.is_agent_revoked(&sender) {
             Err(ce::CryptoExclusionRefusal::ActorIneligible)
         } else {
-            ce::validate_against_parent(&body, &info, current_epoch, |actor| {
-                set.is_agent_revoked(&AgentId(*actor))
-            })
+            match ce::validate_against_parent(&body, &info, current_epoch, is_revoked) {
+                // #1508 r6 (Codex P1 A): a frame that does not chain from
+                // this node's head is checked against its retained parent
+                // before it can be fork evidence. A frame that fails there
+                // is refused with that reason and records nothing; a frame
+                // whose parent is not retained stays unvalidated.
+                Err(ce::CryptoExclusionRefusal::HeadMismatch) => {
+                    match validate_sibling(&body, &info, is_revoked) {
+                        Ok(()) => {
+                            sibling = true;
+                            Err(ce::CryptoExclusionRefusal::HeadMismatch)
+                        }
+                        Err(refusal) => Err(refusal),
+                    }
+                }
+                other => other,
+            }
         }
     };
     if let Err(refusal) = validated {
         drop(guard);
-        if refusal == ce::CryptoExclusionRefusal::HeadMismatch {
-            // A competing child of our head: let the shared apply hook
-            // record the fork evidence it records for any commit.
-            let _ = ng::apply_stateful_event_with_evidence(
-                state,
-                &group_key,
-                &info,
-                &commit,
-                None,
-                false,
-                None,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |_| {},
-            )
-            .await;
+        if sibling {
+            // #1508 r6 (Codex P1 B): a valid competing child of a retained
+            // parent contains the group on every record, the creator's
+            // too. Live delivery already stops on the marker.
+            super::rebind::install_sibling_evidence(state, &group_key, &info, &commit).await;
         }
         tracing::info!(
             group_id = %LogHexId::group(&group_key),
@@ -1879,6 +1886,144 @@ async fn remove_legacy_mls_member(state: &AppState, group_key: &str, target: Age
     if removed {
         ng::save_mls_groups(state).await;
     }
+}
+
+/// ADR 0110 §2 fork containment and §4 L249 (#1508 r6, Codex P1 A):
+/// whether `body`, which [`ce::validate_against_parent`] refused with
+/// `head_mismatch` on `current`, is a valid exclusion on a sibling branch
+/// of `current`'s retained chain. Only such a frame is fork evidence.
+///
+/// The parent is the retained commit whose `state_hash` is the body's
+/// `prior_head`, and `current` retains a different commit at the same
+/// revision on that parent. The L4 checks then run against the parent's
+/// retained roster and commit: the actor is not revoked, is not the
+/// target, and is an Active admin there; the target is not Active there
+/// and is Removed with the body's removal proof; the commit keeps the
+/// parent's roster root, policy and metadata; and the epoch is the
+/// parent's committed epoch + 1 with the exact security binding (the
+/// committed leaf for the TreeKEM form).
+///
+/// The caller has already run [`ce::verify_signatures`].
+fn validate_sibling(
+    body: &ce::CryptoExclusionBodyV1,
+    current: &GroupInfo,
+    is_actor_revoked: impl Fn(&[u8; 32]) -> bool,
+) -> Result<(), ce::CryptoExclusionRefusal> {
+    use ce::CryptoExclusionRefusal as Refusal;
+    use x0x::groups::{GroupMemberState, GroupRole};
+    if body.stable_group_id != current.stable_group_id()
+        || body.commit.group_id != current.stable_group_id()
+    {
+        return Err(Refusal::GroupMismatch);
+    }
+    if current.withdrawn || current.fork_quarantine.is_some() || body.commit.withdrawn {
+        return Err(Refusal::GroupContained);
+    }
+    if body.commit.prev_state_hash.as_deref() != Some(body.prior_head.as_str()) {
+        return Err(Refusal::HeadMismatch);
+    }
+    let Some(parent) = current
+        .commit_log
+        .iter()
+        .find(|retained| retained.commit.state_hash == body.prior_head)
+    else {
+        return Err(Refusal::HeadMismatch);
+    };
+    if body.prior_revision != parent.commit.revision
+        || body.next_revision != parent.commit.revision.saturating_add(1)
+        || body.commit.revision != body.next_revision
+    {
+        return Err(Refusal::RevisionMismatch);
+    }
+    let sibling = current.commit_log.iter().any(|retained| {
+        retained.commit.prev_state_hash.as_deref() == Some(body.prior_head.as_str())
+            && retained.commit.revision == body.next_revision
+            && retained.commit.state_hash != body.commit.state_hash
+    });
+    if !sibling {
+        return Err(Refusal::HeadMismatch);
+    }
+    let actor_hex = hex::encode(body.actor);
+    let target_hex = hex::encode(body.target);
+    if body.actor == body.target
+        || is_actor_revoked(&body.actor)
+        || !parent.roster.get(&actor_hex).is_some_and(|snapshot| {
+            snapshot.state == GroupMemberState::Active && snapshot.role.at_least(GroupRole::Admin)
+        })
+    {
+        return Err(Refusal::ActorIneligible);
+    }
+    if parent
+        .roster
+        .get(&target_hex)
+        .is_some_and(|snapshot| snapshot.state == GroupMemberState::Active)
+    {
+        return Err(Refusal::TargetNotRemoved);
+    }
+    let Some(proof) = ce::removal_proof_for(current, &target_hex) else {
+        return Err(Refusal::TargetNotRemoved);
+    };
+    if proof != body.removal_proof_hash {
+        return Err(Refusal::RemovalProofMismatch);
+    }
+    // Crypto only: the membership, policy and metadata are the parent's.
+    if body.commit.roster_root != parent.commit.roster_root
+        || body.commit.policy_hash != parent.commit.policy_hash
+        || body.commit.public_meta_hash != parent.commit.public_meta_hash
+    {
+        return Err(Refusal::Malformed);
+    }
+    let parent_binding = parent
+        .commit
+        .security_binding
+        .as_deref()
+        .unwrap_or_default();
+    let (parent_epoch, next_epoch, binding) = match &body.crypto {
+        ce::CryptoExclusionCryptoV1::TreeKem {
+            leaf_key_package_hash,
+            commit,
+            next_epoch,
+        } => {
+            if current.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+                return Err(Refusal::CryptoPlaneUnsupported);
+            }
+            let leaf = current
+                .members_v2
+                .get(&target_hex)
+                .and_then(|member| member.treekem_key_package_hash.as_deref());
+            if leaf != Some(leaf_key_package_hash.as_str()) {
+                return Err(Refusal::LeafMismatch);
+            }
+            let parent_epoch = parent_binding
+                .strip_prefix("treekem:epoch=")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|epoch| epoch.parse::<u64>().ok());
+            (
+                parent_epoch,
+                *next_epoch,
+                ce::treekem_binding(*next_epoch, commit),
+            )
+        }
+        ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => {
+            if !ce::is_gss_encrypted(current) {
+                return Err(Refusal::CryptoPlaneUnsupported);
+            }
+            let parent_epoch = parent_binding
+                .strip_prefix("gss:epoch=")
+                .and_then(|epoch| epoch.parse::<u64>().ok());
+            (
+                parent_epoch,
+                *next_secret_epoch,
+                ce::gss_binding(*next_secret_epoch),
+            )
+        }
+    };
+    if parent_epoch.map(|epoch| epoch.saturating_add(1)) != Some(next_epoch)
+        || body.commit.security_binding.as_deref() != Some(binding.as_str())
+    {
+        return Err(Refusal::EpochMismatch);
+    }
+    Ok(())
 }
 
 /// Test-only: the newest frame this node holds for `stable_group_id`.
@@ -3573,6 +3718,251 @@ mod daemon_tests {
             .get(&fx.group_id)
             .map(|info| (info.state_hash.clone(), info.secret_epoch));
         assert_eq!(unchanged, Some((parent.state_hash.clone(), 0)));
+        Ok(())
+    }
+}
+
+/// #1508 r6: sibling `CryptoExclusionV1` frames (ADR 0110 §2 fork
+/// containment, §4 L249 receiver checks). Each test drives the real
+/// receive function on an offline daemon (no network node).
+#[cfg(test)]
+mod sibling_tests {
+    use super::super::rebind::restart_tests::{hold_persisted, offline_daemon};
+    use super::*;
+    use anyhow::{Context as _, Result};
+    use x0x::identity::{AgentKeypair, UserKeypair};
+
+    /// A GSS `MlsEncrypted` `OwnerCertified` group created by `creator`,
+    /// with `admin` a second admin, a bystander and `members` Members.
+    /// `target` leaves without a rotation (`parent`, retained), and
+    /// `creator` then removes the bystander with a rotation on it
+    /// (`head`). Two GSS exclusions of one target on one parent have the
+    /// same state, so the own branch is another commit.
+    struct Race {
+        parent: GroupInfo,
+        head: GroupInfo,
+        target_hex: String,
+    }
+
+    fn race(
+        owner: &UserKeypair,
+        creator: &AgentKeypair,
+        admin: &AgentKeypair,
+        target: &AgentKeypair,
+        members: &[&AgentKeypair],
+    ) -> Result<Race> {
+        let now_ms = super::super::super::now_millis_u64();
+        let creator_hex = hex::encode(creator.agent_id().as_bytes());
+        let mut info = GroupInfo::new(
+            "ce-sibling".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "ca".repeat(16),
+        );
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        let bystander = AgentKeypair::generate()?;
+        let bystander_hex = hex::encode(bystander.agent_id().as_bytes());
+        for (member, role) in std::iter::once((admin, x0x::groups::GroupRole::Admin))
+            .chain(std::iter::once((
+                &bystander,
+                x0x::groups::GroupRole::Member,
+            )))
+            .chain(std::iter::once((target, x0x::groups::GroupRole::Member)))
+            .chain(members.iter().map(|m| (*m, x0x::groups::GroupRole::Member)))
+        {
+            info.add_member(
+                hex::encode(member.agent_id().as_bytes()),
+                role,
+                Some(creator_hex.clone()),
+                None,
+            );
+        }
+        info.seal_commit_evicting(creator, now_ms)?;
+        anyhow::ensure!(ce::is_gss_encrypted(&info), "a GSS MlsEncrypted group");
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let mut parent = info;
+        parent.roster_revision = parent.roster_revision.saturating_add(1);
+        parent.remove_member(&target_hex, Some(target_hex.clone()));
+        parent.seal_commit_evicting(target, now_ms + 1)?;
+        // The creator's own branch: it removes the bystander and rotates
+        // to secret epoch 1. A GSS exclusion of the target on the same
+        // parent is a sibling with another state.
+        let mut head = parent.clone();
+        head.roster_revision = head.roster_revision.saturating_add(1);
+        head.remove_member(&bystander_hex, Some(creator_hex));
+        head.secret_epoch = 1;
+        head.security_binding = Some(ce::gss_binding(1));
+        head.seal_commit_evicting(creator, now_ms + 2)?;
+        Ok(Race {
+            parent,
+            head,
+            target_hex,
+        })
+    }
+
+    /// A GSS exclusion of `target_hex` on `parent`, signed by `actor`.
+    fn exclusion(
+        parent: &GroupInfo,
+        target_hex: &str,
+        actor: &AgentKeypair,
+        next_secret_epoch: u64,
+        now_ms: u64,
+    ) -> Result<(GroupInfo, Vec<u8>)> {
+        let mut next = parent.clone();
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.secret_epoch = next_secret_epoch;
+        next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+        let commit = next.seal_commit_evicting(actor, now_ms)?;
+        let mut target = [0u8; 32];
+        hex::decode_to_slice(target_hex, &mut target)?;
+        let body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: parent.stable_group_id().to_string(),
+            actor: *actor.agent_id().as_bytes(),
+            target,
+            prior_head: parent.state_hash.clone(),
+            prior_revision: parent.state_revision,
+            next_revision: commit.revision,
+            roster_revision: next.roster_revision,
+            removal_proof_hash: ce::removal_proof_for(parent, target_hex).unwrap_or([0; 32]),
+            crypto: ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch },
+            commit: ce::CommitHeaderV1::from(&commit),
+        };
+        let frame = ce::sign(body, actor).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok((next, ce::encode_frame(&frame)?))
+    }
+
+    async fn quarantine_of(state: &AppState, stable: &str) -> Option<x0x::groups::ForkQuarantine> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(stable)
+            .and_then(|info| info.fork_quarantine.clone())
+    }
+
+    /// Codex P1 A, for `CryptoExclusionV1`: a frame that does not chain
+    /// from this node's head is checked against its retained parent
+    /// before it can be fork evidence. An unrevoked ordinary member signs
+    /// an exclusion sibling, and an admin signs one at a wrong epoch.
+    /// Neither quarantines an invite-derived receiver; each is refused
+    /// with its own reason. A valid sibling by the other admin does.
+    #[tokio::test]
+    async fn an_invalid_exclusion_sibling_quarantines_no_receiver() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let owner = UserKeypair::generate()?;
+        let creator = AgentKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let target = AgentKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        let me = receiver.agent.identity().agent_keypair();
+        let fx = race(&owner, &creator, &admin, &target, &[&member, me])?;
+        let mut head = fx.head.clone();
+        head.invite_lineage = Some(x0x::groups::InviteLineage {
+            base_revision: fx.parent.state_revision,
+            base_hash: fx.parent.state_hash.clone(),
+            seated_at_revision: Some(fx.parent.state_revision),
+            ..Default::default()
+        });
+        let stable = head.stable_group_id().to_string();
+        hold_persisted(&receiver, &head).await?;
+        let now_ms = super::super::super::now_millis_u64();
+
+        let (_, by_member) = exclusion(&fx.parent, &fx.target_hex, &member, 1, now_ms)?;
+        let outcome = receive(&receiver, member.agent_id(), &by_member).await;
+        assert_eq!(
+            quarantine_of(&receiver, &stable).await,
+            None,
+            "a member's exclusion is no fork evidence"
+        );
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::ActorIneligible)
+        );
+        let (_, wrong_epoch) = exclusion(&fx.parent, &fx.target_hex, &admin, 5, now_ms)?;
+        let outcome = receive(&receiver, admin.agent_id(), &wrong_epoch).await;
+        assert_eq!(
+            quarantine_of(&receiver, &stable).await,
+            None,
+            "an exclusion at a wrong epoch is no fork evidence"
+        );
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::EpochMismatch)
+        );
+
+        // The control: the other admin's valid exclusion on the same parent.
+        let (sibling, valid) = exclusion(&fx.parent, &fx.target_hex, &admin, 1, now_ms)?;
+        let outcome = receive(&receiver, admin.agent_id(), &valid).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::HeadMismatch)
+        );
+        let marker = quarantine_of(&receiver, &stable)
+            .await
+            .context("the valid sibling contains the group")?;
+        assert_eq!(marker.state_hash, sibling.state_hash);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Codex P1 B, for `CryptoExclusionV1` (ADR 0110 §2): the creator
+    /// commits its own branch; the other admin's valid sibling exclusion on
+    /// the same parent then arrives. The creator's record has no invite
+    /// lineage, and it is still contained, durably across a restart.
+    #[tokio::test]
+    async fn a_valid_exclusion_sibling_contains_the_creator() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let creator = offline_daemon(dir.path(), None).await?;
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let target = AgentKeypair::generate()?;
+        let survivor = AgentKeypair::generate()?;
+        let me = creator.agent.identity().agent_keypair();
+        let fx = race(&owner, me, &admin, &target, &[&survivor])?;
+        assert!(
+            fx.head.invite_lineage.is_none(),
+            "the creator has no lineage"
+        );
+        let stable = fx.head.stable_group_id().to_string();
+        hold_persisted(&creator, &fx.head).await?;
+
+        let now_ms = super::super::super::now_millis_u64();
+        let (sibling, valid) = exclusion(&fx.parent, &fx.target_hex, &admin, 1, now_ms)?;
+        let outcome = receive(&creator, admin.agent_id(), &valid).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::HeadMismatch)
+        );
+        let marker = quarantine_of(&creator, &stable)
+            .await
+            .context("the creator is contained")?;
+        assert_eq!(marker.state_hash, sibling.state_hash);
+        assert_eq!(marker.revision, fx.head.state_revision);
+        let head = creator
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .map(|info| info.state_hash.clone());
+        assert_eq!(
+            head,
+            Some(fx.head.state_hash.clone()),
+            "no node applies both"
+        );
+
+        creator.agent.shutdown().await;
+        drop(creator);
+        let restarted = offline_daemon(dir.path(), None).await?;
+        assert_eq!(
+            quarantine_of(&restarted, &stable)
+                .await
+                .map(|marker| marker.state_hash),
+            Some(sibling.state_hash),
+            "the containment survives a restart"
+        );
+        restarted.agent.shutdown().await;
         Ok(())
     }
 }
