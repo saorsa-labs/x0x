@@ -2514,6 +2514,12 @@ pub struct NetworkNode {
     /// closed before dispatch. Capped per peer (generations are never
     /// reused); a leaf mutex never held across an await or another lock.
     session_addr_ledger: Arc<Mutex<SessionAddrLedger>>,
+    /// #1112 (round 19): identities with seed-address session history,
+    /// decoupled from the ledger's detail rows so GLOBAL EVICTION of a
+    /// row (the 512-peer bound) cannot re-admit a pin-mismatched peer's
+    /// queued frames of unknown generations. Entries expire with the
+    /// same TTL as ledger rows; bounded, pruned on read.
+    session_implications: Arc<Mutex<std::collections::HashMap<AntPeerId, Instant>>>,
     /// Test-only per-node override of the rejection TTL, so the expiry
     /// path is testable without real-time waits (`#[cfg(test)]`).
     #[cfg(test)]
@@ -2973,6 +2979,7 @@ impl NetworkNode {
                 std::collections::HashMap::new(),
             )),
             session_addr_ledger: Arc::new(Mutex::new(HashMap::new())),
+            session_implications: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_seed_pin_rejection_ttl: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -4954,7 +4961,13 @@ impl NetworkNode {
     /// evaluate the pin for a frame's OWN source session after that
     /// session closes, with no rejection entry needed.
     fn note_session_address(&self, peer: AntPeerId, generation: u64, addr: SocketAddr) {
-        note_session_address_in(&self.session_addr_ledger, peer, generation, addr);
+        note_session_address_in(
+            &self.session_addr_ledger,
+            &self.session_implications,
+            peer,
+            generation,
+            addr,
+        );
     }
 
     /// The address `generation` of `peer` was observed on, if any
@@ -5066,15 +5079,42 @@ impl NetworkNode {
             .session_addr_ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(entries) = ledger.get_mut(peer_id) else {
-            return false;
+        let row_live = match ledger.get_mut(peer_id) {
+            Some(entries) => {
+                entries.retain(|(_, _, at)| now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL);
+                let live = !entries.is_empty();
+                if !live {
+                    ledger.remove(peer_id);
+                }
+                live
+            }
+            None => false,
         };
-        entries.retain(|(_, _, at)| now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL);
-        let implicated = !entries.is_empty();
-        if !implicated {
-            ledger.remove(peer_id);
+        if row_live {
+            return true;
         }
-        implicated
+        // Round 19: the implication outlives the detail row — global
+        // eviction (the peer bound) removed it, but the identity stays
+        // implicated until its own TTL horizon, so its queued frames of
+        // unknown generations cannot be re-admitted by overflow.
+        let mut implications = self
+            .session_implications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        implications.retain(|_, until| *until > now);
+        if implications.len() > 2 * SESSION_ADDR_LEDGER_MAX_PEERS {
+            // Overflow policy: bound memory by dropping the
+            // earliest-expiring implication (bounded re-admission window,
+            // at most the TTL of the dropped entry).
+            if let Some(earliest) = implications
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(k, _)| *k)
+            {
+                implications.remove(&earliest);
+            }
+        }
+        implications.contains_key(peer_id)
     }
 
     /// [`Self::seed_pin_rejects_current_session`] for callers that hold
@@ -6822,6 +6862,7 @@ impl NetworkNode {
     fn spawn_session_ledger_watcher(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let ledger = Arc::clone(&self.session_addr_ledger);
+        let implications = Arc::clone(&self.session_implications);
         tokio::spawn(async move {
             let mut lifecycle = {
                 let guard = node.read().await;
@@ -6882,7 +6923,7 @@ impl NetworkNode {
                 if link.current_connection_generation(&peer) != Some(generation) {
                     continue;
                 }
-                note_session_address_in(&ledger, peer, generation, addr);
+                note_session_address_in(&ledger, &implications, peer, generation, addr);
             }
         })
     }
@@ -6901,6 +6942,7 @@ impl NetworkNode {
         let connection_pool = Arc::clone(&self.connection_pool);
         let inbound_allowlist = self.config.inbound_allowlist.clone();
         let session_addr_ledger = Arc::clone(&self.session_addr_ledger);
+        let session_implications = Arc::clone(&self.session_implications);
         #[cfg(test)]
         let suppressed_inbound_probe = Arc::clone(&self.suppressed_inbound_probe);
 
@@ -7019,6 +7061,7 @@ impl NetworkNode {
                             if still_on_accepted && before.is_some() && before == after {
                                 note_session_address_in(
                                     &session_addr_ledger,
+                                    &session_implications,
                                     peer_conn.peer_id,
                                     before.unwrap_or_default(),
                                     addr,
@@ -7998,6 +8041,7 @@ const SESSION_ADDR_LEDGER_MAX_PEERS: usize = 512;
 /// empty.
 fn note_session_address_in(
     ledger: &Arc<Mutex<SessionAddrLedger>>,
+    implications: &Arc<Mutex<std::collections::HashMap<AntPeerId, Instant>>>,
     peer: AntPeerId,
     generation: u64,
     addr: SocketAddr,
@@ -8011,6 +8055,13 @@ fn note_session_address_in(
         return;
     }
     let now = Instant::now();
+    // Round 19: the peer is implicated for the TTL horizon, decoupled
+    // from its detail row — global eviction of the row (the peer bound)
+    // cannot re-admit its queued frames of unknown generations.
+    implications
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(peer, now + SESSION_ADDR_LEDGER_TTL);
     let mut ledger = ledger
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -11823,16 +11874,25 @@ mod tests {
         assert!(node.peer_has_session_evidence(&peer));
         assert!(node.seed_pin_rejects_frame(&link, &peer, 99));
 
-        // Age every entry past the TTL (as an idle period would).
+        // Age every entry past the TTL (as an idle period would) — the
+        // detail rows AND the implication horizons.
         {
+            let past = Instant::now() - SESSION_ADDR_LEDGER_TTL - Duration::from_secs(1);
             let mut ledger = node
                 .session_addr_ledger
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for entries in ledger.values_mut() {
                 for (_, _, at) in entries.iter_mut() {
-                    *at = Instant::now() - SESSION_ADDR_LEDGER_TTL - Duration::from_secs(1);
+                    *at = past;
                 }
+            }
+            let mut implications = node
+                .session_implications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for until in implications.values_mut() {
+                *until = past;
             }
         }
         // The reads enforce the bound: no evidence, no implication, and
@@ -11884,6 +11944,53 @@ mod tests {
         node.try_shutdown().await.unwrap();
     }
 
+    /// Round 19 (Codex P2: global ledger eviction re-admits
+    /// pin-mismatched frames): the detail row's eviction under the
+    /// global peer bound does NOT clear the identity's implication — the
+    /// implication map (TTL-bounded, same horizon) survives, so the
+    /// peer's queued frames of unknown generations stay refused. Runtime
+    /// RED before the implication map: after eviction both receive
+    /// guards returned false.
+    #[tokio::test]
+    async fn issue1112_implication_survives_global_ledger_eviction() {
+        const NOT_THE_SEED: [u8; 32] = [0xB8; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let pinned_addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
+        let node = NetworkNode::new(test_network_config(), None, None)
+            .await
+            .unwrap();
+        let link = node.node.read().await.clone().expect("live link");
+        let peer = test_ant_peer(0xD);
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        // The peer has seed-address history...
+        node.note_session_address(peer, 1, pinned_addr);
+        // ...and the global bound then evicts its detail row.
+        let distinct = |n: u32| {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&n.to_le_bytes());
+            ant_quic::PeerId(id)
+        };
+        for n in 0..(SESSION_ADDR_LEDGER_MAX_PEERS as u32 + 64) {
+            node.note_session_address(distinct(n), 1, pinned_addr);
+        }
+        assert!(
+            node.session_addr_for(&peer, 1).is_none(),
+            "the detail row was evicted by the global bound"
+        );
+        // The unknown-generation frame is still refused: the implication
+        // survived the eviction.
+        assert!(
+            node.seed_pin_rejects_frame(&link, &peer, 99),
+            "the evicted peer stays implicated until its TTL horizon"
+        );
+
+        node.try_shutdown().await.unwrap();
+    }
+
     /// Round 12 (Codex P2 + Claude: the session ledger grows without a
     /// global bound): writes are no-ops while the pin table is empty
     /// (production pays nothing today), each peer keeps at most 8
@@ -11892,8 +11999,9 @@ mod tests {
     fn issue1112_session_ledger_is_bounded_and_dormant_without_pins() {
         let addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
         let ledger = Arc::new(Mutex::new(SessionAddrLedger::new()));
+        let implications = Arc::new(Mutex::new(std::collections::HashMap::new()));
         // No pin table: writes no-op.
-        note_session_address_in(&ledger, test_ant_peer(1), 1, addr);
+        note_session_address_in(&ledger, &implications, test_ant_peer(1), 1, addr);
         assert!(
             ledger
                 .lock()
@@ -11911,7 +12019,7 @@ mod tests {
         // Per-peer generation cap (checked before the global loop can
         // evict this peer as oldest-touched).
         for generation in 0..20u64 {
-            note_session_address_in(&ledger, test_ant_peer(1), generation, addr);
+            note_session_address_in(&ledger, &implications, test_ant_peer(1), generation, addr);
         }
         assert!(
             ledger
@@ -11928,7 +12036,7 @@ mod tests {
             ant_quic::PeerId(id)
         };
         for n in 0..(SESSION_ADDR_LEDGER_MAX_PEERS as u32 + 64) {
-            note_session_address_in(&ledger, distinct(n), 1, addr);
+            note_session_address_in(&ledger, &implications, distinct(n), 1, addr);
         }
         let ledger = ledger
             .lock()
