@@ -956,6 +956,15 @@ struct PendingApply {
     /// `record` is not owed any more (`OwnerSyncStore::settle_saved`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     saved_in: Vec<SavedNames>,
+    /// `record` is not owed any more, but no write of `APPLY_PENDING_FILE`
+    /// without it has succeeded yet. No pass applies it, and every write
+    /// of the file leaves it out; the first write that succeeds removes
+    /// it from memory (`OwnerSyncStore::persist_and_prune`). Until then a
+    /// profile save must write the file first (`note_profile_save`), or
+    /// the stale file entry can come back at the next start over that
+    /// save.
+    #[serde(skip)]
+    discharged: bool,
 }
 
 /// The contents of `APPLY_PENDING_FILE`.
@@ -1914,23 +1923,35 @@ impl OwnerSyncStore {
                 .or_insert_with(|| PendingApply {
                     record: (*record).clone(),
                     saved_in: Vec::new(),
+                    discharged: false,
                 });
         }
-        self.persist_pending_applies(&next).await?;
+        self.persist_and_prune(&mut next).await?;
         *pending = next;
         Ok(())
     }
 
-    /// Write `pending` durably to `APPLY_PENDING_FILE`. An empty set is
-    /// written too, not unlinked: an unlink without a directory fsync can
-    /// come back after a crash with the obligations it removed.
-    async fn persist_pending_applies(
+    /// Write the owed records of `pending` durably to `APPLY_PENDING_FILE`,
+    /// and then remove the discharged ones from `pending` (see
+    /// `PendingApply::discharged`). An empty set is written too, not
+    /// unlinked: an unlink without a directory fsync can come back after a
+    /// crash with the obligations it removed.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written; `pending` does
+    /// not change.
+    async fn persist_and_prune(
         &self,
-        pending: &BTreeMap<PendingKey, PendingApply>,
+        pending: &mut BTreeMap<PendingKey, PendingApply>,
     ) -> Result<(), SyncError> {
         let path = self.dir.join(APPLY_PENDING_FILE);
         let bytes = serde_json::to_vec(&PersistedPendingApplies {
-            applies: pending.values().cloned().collect(),
+            applies: pending
+                .values()
+                .filter(|p| !p.discharged)
+                .cloned()
+                .collect(),
         })
         .map_err(|e| SyncError::Io(format!("encode pending applies: {e}")))?;
         Self::write_atomically(&path, &bytes, false)
@@ -1939,7 +1960,9 @@ impl OwnerSyncStore {
                 DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
                     SyncError::Io(format!("persist pending applies: {io}"))
                 }
-            })
+            })?;
+        pending.retain(|_, p| !p.discharged);
+        Ok(())
     }
 
     /// #1545: the committed name records that live daemon state may not
@@ -1953,6 +1976,7 @@ impl OwnerSyncStore {
             .lock()
             .await
             .values()
+            .filter(|p| !p.discharged)
             .map(|p| p.record.clone())
             .collect();
         if pending.is_empty() {
@@ -1970,11 +1994,31 @@ impl OwnerSyncStore {
             .collect()
     }
 
+    /// Whether a pending apply is still the winner in `records`, which the
+    /// caller holds (lock order: `records` → `pending_apply`).
+    async fn owes_a_winner(&self, records: &BTreeMap<(SyncKind, String), VersionedRecord>) -> bool {
+        self.pending_apply
+            .lock()
+            .await
+            .values()
+            .filter(|p| !p.discharged)
+            .any(|p| {
+                records
+                    .get(&(p.record.kind, p.record.key.clone()))
+                    .is_some_and(|stored| stored.record_hash() == p.record.record_hash())
+            })
+    }
+
     /// #1545: record that a profile save with `names` starts with
     /// `folded` in it. The caller holds the profile write lock, and saves
     /// only after this returns `Ok`: then a durable profile with `names`
     /// shows that `folded` is not owed any more, even when the discharge
     /// after the save does not reach the disk (`settle_saved`).
+    ///
+    /// It also writes the file when a record is discharged but its removal
+    /// from the file failed: else the file keeps the record with the names
+    /// of an older save only, and the next start applies it over this
+    /// save.
     ///
     /// # Errors
     ///
@@ -1988,10 +2032,10 @@ impl OwnerSyncStore {
         let saved = SavedNames::from(names);
         let mut pending = self.pending_apply.lock().await;
         let mut next = pending.clone();
-        let mut changed = false;
+        let mut changed = next.values().any(|p| p.discharged);
         for record in folded {
             if let Some(entry) = next.get_mut(&pending_key(record)) {
-                if !entry.saved_in.contains(&saved) {
+                if !entry.discharged && !entry.saved_in.contains(&saved) {
                     entry.saved_in.push(saved.clone());
                     changed = true;
                 }
@@ -2000,7 +2044,7 @@ impl OwnerSyncStore {
         if !changed {
             return Ok(());
         }
-        self.persist_pending_applies(&next).await?;
+        self.persist_and_prune(&mut next).await?;
         *pending = next;
         Ok(())
     }
@@ -2009,10 +2053,12 @@ impl OwnerSyncStore {
     /// durably saved the winners among them. A record that a commit added
     /// after `done` was read stays.
     ///
-    /// The records leave memory even when the file write fails, so no
-    /// later pass applies them over a newer local edit. Each save of them
-    /// was noted first (`note_profile_save`), so at the next start
-    /// `settle_saved` removes them from the file.
+    /// When the file write fails, the records stay in memory as
+    /// discharged (`PendingApply::discharged`): no later pass applies them
+    /// over a newer local edit, and the next write of the file, at the
+    /// latest the note of the next profile save, removes them. A crash
+    /// before that keeps the noted names of their save on disk, so
+    /// `settle_saved` removes them at the next start.
     ///
     /// # Errors
     ///
@@ -2022,11 +2068,12 @@ impl OwnerSyncStore {
         done: &[VersionedRecord],
     ) -> Result<(), SyncError> {
         let mut pending = self.pending_apply.lock().await;
-        let before = pending.len();
         for record in done {
-            pending.remove(&pending_key(record));
+            if let Some(entry) = pending.get_mut(&pending_key(record)) {
+                entry.discharged = true;
+            }
         }
-        if pending.len() == before {
+        if !pending.values().any(|p| p.discharged) {
             return Ok(());
         }
         #[cfg(test)]
@@ -2036,7 +2083,7 @@ impl OwnerSyncStore {
         {
             return Err(SyncError::Io("injected discharge failure".into()));
         }
-        self.persist_pending_applies(&pending).await
+        self.persist_and_prune(&mut pending).await
     }
 
     /// #1545: remove the pending applies that a durable profile with
@@ -2048,16 +2095,21 @@ impl OwnerSyncStore {
     /// # Errors
     ///
     /// [`SyncError::Io`] when the file cannot be written; the records
-    /// leave memory all the same.
+    /// stay in memory as discharged, as in `discharge_applies`.
     pub(crate) async fn settle_saved(&self, durable: &SyncProfileNames) -> Result<(), SyncError> {
         let saved = SavedNames::from(durable);
         let mut pending = self.pending_apply.lock().await;
-        let before = pending.len();
-        pending.retain(|_, p| !p.saved_in.contains(&saved));
-        if pending.len() == before {
+        let mut settled = false;
+        for entry in pending.values_mut() {
+            if !entry.discharged && entry.saved_in.contains(&saved) {
+                entry.discharged = true;
+                settled = true;
+            }
+        }
+        if !settled {
             return Ok(());
         }
-        self.persist_pending_applies(&pending).await
+        self.persist_and_prune(&mut pending).await
     }
 
     /// #1542: finish a commit that stopped after its journal intent was
@@ -2173,6 +2225,45 @@ impl OwnerSyncStore {
         owner: &UserKeypair,
         writer_machine: MachineId,
     ) -> Result<(), SyncError> {
+        self.mint_when(kind, key, desired, owner, writer_machine, false)
+            .await
+    }
+
+    /// #1545: [`Self::mint`] for a name read from live daemon state, unless
+    /// a committed name that is still the register's winner is owed to
+    /// that state (`pending_applies`). The check and the mint hold the
+    /// register write lock together. A commit adds its names to the
+    /// pending applies under the same lock, before its register write, so
+    /// a commit after the names were read cannot land between the check
+    /// and the mint: the mint would put the old live name over it at a
+    /// higher version, and the catch-up would then skip it as no longer
+    /// the winner.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::mint`].
+    pub(crate) async fn mint_live_name(
+        &self,
+        kind: SyncKind,
+        key: &str,
+        desired: &SyncValue,
+        owner: &UserKeypair,
+        writer_machine: MachineId,
+    ) -> Result<(), SyncError> {
+        self.mint_when(kind, key, desired, owner, writer_machine, true)
+            .await
+    }
+
+    /// [`Self::mint`]; with `unless_owed`, see [`Self::mint_live_name`].
+    async fn mint_when(
+        &self,
+        kind: SyncKind,
+        key: &str,
+        desired: &SyncValue,
+        owner: &UserKeypair,
+        writer_machine: MachineId,
+        unless_owed: bool,
+    ) -> Result<(), SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
@@ -2194,6 +2285,9 @@ impl OwnerSyncStore {
             None
         };
         let mut records = self.records.write().await;
+        if unless_owed && self.owes_a_winner(&records).await {
+            return Ok(());
+        }
         let stored = records.get(&(kind, key.to_string()));
         if stored.is_some_and(|r| r.value == *desired) {
             return Ok(());
@@ -3630,20 +3724,14 @@ impl OwnerSyncService {
         if let Some(view) = self.view() {
             // The live profile shows every committed name only when they
             // are applied; until then, its names are not local changes. A
-            // session can commit names after `apply_pending`: its commit
-            // adds them to the pending applies before the register, so a
-            // check after the read sees them.
+            // session can commit names after `apply_pending`, so each mint
+            // checks for owed names in one step with its register write
+            // (`mint_live_name`).
             let names = view.profile_names();
-            let owed = self
-                .store
-                .pending_applies()
-                .await
-                .iter()
-                .any(|(_, winner)| *winner);
             #[cfg(test)]
             self.store.pause_before_name_mint().await;
-            if names_applied && !owed {
-                self.mint_or_log(
+            if names_applied {
+                self.mint_live_name_or_log(
                     SyncKind::OwnerProfile,
                     "owner",
                     SyncValue::OwnerProfile {
@@ -3653,7 +3741,7 @@ impl OwnerSyncService {
                     local_machine,
                 )
                 .await;
-                self.mint_or_log(
+                self.mint_live_name_or_log(
                     SyncKind::MachineNames,
                     &local_hex,
                     SyncValue::MachineNames {
@@ -3774,6 +3862,23 @@ impl OwnerSyncService {
         machine: MachineId,
     ) {
         if let Err(e) = self.store.mint(kind, key, &value, owner_kp, machine).await {
+            tracing::warn!(target: "x0x::owner_sync", kind = ?kind, error = %e, "mint failed");
+        }
+    }
+
+    async fn mint_live_name_or_log(
+        &self,
+        kind: SyncKind,
+        key: &str,
+        value: SyncValue,
+        owner_kp: &UserKeypair,
+        machine: MachineId,
+    ) {
+        if let Err(e) = self
+            .store
+            .mint_live_name(kind, key, &value, owner_kp, machine)
+            .await
+        {
             tracing::warn!(target: "x0x::owner_sync", kind = ?kind, error = %e, "mint failed");
         }
     }
