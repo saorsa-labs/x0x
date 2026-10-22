@@ -102,6 +102,12 @@ pub(super) struct WsSession {
     /// Per-topic forwarder tasks for this session (aborted on unsubscribe/cleanup).
     /// The drain owns the `JoinHandle`; this is only the abort handle.
     topic_forwarders: HashMap<String, tokio::task::AbortHandle>,
+    /// This socket's outbound queue.
+    ///
+    /// `POST /gui/show` confirms a slot here before it returns `navigated`.
+    /// Placeholder sessions used by tests that never deliver a frame leave
+    /// this empty.
+    show_outbound: Option<mpsc::Sender<WsOutbound>>,
 }
 
 /// Build a placeholder agent WS session (not a visible GUI tab).
@@ -128,6 +134,7 @@ fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
         visible_mu: Mutex::new(()),
         reveal_inflight: Arc::new(AtomicUsize::new(0)),
         topic_forwarders: HashMap::new(),
+        show_outbound: None,
     }
 }
 
@@ -149,6 +156,96 @@ impl WsSession {
     fn gui_session_token(&self) -> Option<String> {
         self.gui_session_token.clone()
     }
+
+    /// Queue one `gui.show` on this visible tab.
+    ///
+    /// Returns `true` only when the outbound queue accepts the frame.
+    /// A hidden tab, a session with no queue, and a full or closed queue
+    /// return `false`. This does not close the socket: a show that cannot
+    /// be queued is not a navigation, and the caller opens a browser.
+    pub(super) fn try_accept_gui_show(&self, show: &GuiShowFrame) -> bool {
+        if !self.is_visible_gui() {
+            return false;
+        }
+        let Some(tx) = &self.show_outbound else {
+            return false;
+        };
+        tx.try_send(WsOutbound::GuiShow {
+            view: show.view.clone(),
+            banner: show.banner.clone(),
+            agent_id: show.agent_id.clone(),
+            machine_id: show.machine_id.clone(),
+            rider: show.rider,
+            request_id: show.request_id.clone(),
+        })
+        .is_ok()
+    }
+}
+
+/// One `gui.show` frame offered to a live tab's outbound queue.
+pub(super) struct GuiShowFrame {
+    pub(super) view: String,
+    pub(super) banner: String,
+    pub(super) agent_id: String,
+    pub(super) machine_id: String,
+    pub(super) rider: bool,
+    pub(super) request_id: String,
+}
+
+/// Receiver for a test tab's outbound queue.
+#[cfg(test)]
+pub(super) struct GuiShowQueueProbe {
+    rx: Mutex<mpsc::Receiver<WsOutbound>>,
+}
+
+#[cfg(test)]
+impl GuiShowQueueProbe {
+    /// `gui.show` view and banner pairs buffered on this queue.
+    ///
+    /// Other frames, including the filler that saturates the queue, are
+    /// discarded.
+    pub(super) fn gui_shows(&self) -> Vec<(String, String)> {
+        let mut rx = self
+            .rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut shows = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(WsOutbound::GuiShow { view, banner, .. }) => shows.push((view, banner)),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        shows
+    }
+}
+
+/// Insert a visible GUI tab whose outbound queue the route can fill.
+///
+/// `occupied` slots are already taken. `occupied == capacity` is a
+/// saturated live tab: `try_accept_gui_show` must fail.
+#[cfg(test)]
+pub(super) fn insert_visible_gui_with_queue(
+    sessions: &mut HashMap<String, WsSession>,
+    id: &str,
+    capacity: usize,
+    occupied: usize,
+) -> GuiShowQueueProbe {
+    assert!(capacity > 0, "outbound capacity must be positive");
+    assert!(
+        occupied <= capacity,
+        "prefill cannot exceed the outbound capacity"
+    );
+    let (tx, rx) = mpsc::channel(capacity);
+    for _ in 0..occupied {
+        tx.try_send(WsOutbound::Pong)
+            .expect("prefill fits in the outbound queue");
+    }
+    let mut session = test_gui_ws_session(id);
+    session.show_outbound = Some(tx);
+    sessions.insert(id.to_string(), session);
+    GuiShowQueueProbe { rx: Mutex::new(rx) }
 }
 
 /// Shared state for a single gossip topic subscription shared across WS sessions.
@@ -1082,6 +1179,10 @@ fn spawn_navigation_forwarder(
                 "call.incoming" => WsOutbound::CallIncoming { call: event.data },
                 "call.state" => WsOutbound::CallState { call: event.data },
                 "gui.show" => {
+                    // `POST /gui/show` does not use this broadcast. It
+                    // confirms a slot on the session queue first. A full
+                    // queue here still drops the frame and closes the
+                    // socket, and reconnect does not replay the broadcast.
                     if !show_visible.load(Ordering::Acquire) {
                         continue;
                     }
@@ -1252,6 +1353,10 @@ async fn arm_navigation_and_advertise_session(
         Arc::clone(slow_close_counted),
         show_visible,
     )?;
+    // The route confirms this queue before it reports `navigated`. The
+    // sender has to be on the session before insert: that insert is what
+    // makes the tab visible to `POST /gui/show`.
+    session.show_outbound = Some(outbound_tx.clone());
     // Sample immediately before insert. Subscribe and spawn are above this
     // line. Moving the insert above them drops `receivers_at_insert` back to
     // the pre-subscribe count and fails
@@ -1326,6 +1431,7 @@ async fn handle_ws_connection(
         visible_mu: Mutex::new(()),
         reveal_inflight: Arc::new(AtomicUsize::new(0)),
         topic_forwarders: HashMap::new(),
+        show_outbound: None,
     };
     let Some(armed) = arm_navigation_and_advertise_session(
         &state,
@@ -2317,6 +2423,7 @@ pub(super) async fn arm_full_queue_banner_reveal(state: &Arc<AppState>) -> FullQ
             visible_mu: Mutex::new(()),
             reveal_inflight: Arc::new(AtomicUsize::new(0)),
             topic_forwarders: HashMap::new(),
+            show_outbound: None,
         },
     );
     let (tx, rx) = mpsc::channel::<WsOutbound>(1);
@@ -2701,6 +2808,7 @@ mod tests {
                 visible_mu: Mutex::new(()),
                 reveal_inflight: Arc::new(AtomicUsize::new(0)),
                 topic_forwarders: HashMap::new(),
+                show_outbound: None,
             },
         );
     }
@@ -3052,6 +3160,7 @@ mod tests {
             visible_mu: Mutex::new(()),
             reveal_inflight: Arc::new(AtomicUsize::new(0)),
             topic_forwarders: HashMap::new(),
+            show_outbound: None,
         };
         let response = super::super::auth::refresh_session(
             State(Arc::clone(&state)),

@@ -100,7 +100,7 @@ impl Default for GuiShowConfig {
 pub enum GuiShowOutcome {
     /// Platform opener launched a new GUI window.
     Opened,
-    /// An open WS session navigated in place.
+    /// A visible GUI tab accepted the show frame on its outbound queue.
     Navigated,
     /// Sender is blocked or otherwise refused.
     Refused,

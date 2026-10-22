@@ -1,9 +1,10 @@
 //! `POST /gui/show` — ADR 0083 slice 1 (local show).
 //!
 //! Validates the view grammar, applies `[gui_show] local_enabled`, the block
-//! list and the rate limit, then either pushes a `gui.show` WS event
-//! (`navigated`) or opens a fresh session URL (`opened`). The response never
-//! contains a URL or session token.
+//! list and the rate limit, then either queues a `gui.show` frame on a
+//! visible tab (`navigated`) or opens a fresh session URL (`opened`).
+//! `navigated` is returned only after that tab's outbound queue accepts
+//! the frame. The response never contains a URL or session token.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -13,10 +14,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
 
-use super::super::sse::SseEvent;
 use super::super::state::AppState;
+use super::super::ws::GuiShowFrame;
 use crate::gui::{
     new_request_id, origin_banner, short_id_hex, view_route, GuiShowOutcome, GuiShowRequest,
     GuiShowResponse, PendingGuiShow,
@@ -66,24 +66,28 @@ pub(in crate::server) async fn gui_show(
     let banner = origin_banner(&agent_label, &machine_label, false);
     let agent_hex = hex::encode(agent_id.as_bytes());
 
-    let has_gui = state
-        .ws_sessions
-        .read()
-        .await
-        .values()
-        .any(super::super::ws::WsSession::is_visible_gui);
-    if has_gui {
-        let _ = state.broadcast_tx.send(SseEvent {
-            event_type: "gui.show".to_string(),
-            data: json!({
-                "view": route,
-                "banner": banner,
-                "agent_id": agent_hex,
-                "machine_id": machine_id,
-                "rider": false,
-                "request_id": request_id,
-            }),
-        });
+    // Deliver on the tab's own queue. A broadcast would return before the
+    // forwarder runs, and a full queue there drops the frame and closes
+    // the socket. Reconnect does not replay that broadcast.
+    let show = GuiShowFrame {
+        view: route.clone(),
+        banner: banner.clone(),
+        agent_id: agent_hex.clone(),
+        machine_id: machine_id.clone(),
+        rider: false,
+        request_id: request_id.clone(),
+    };
+    let accepted = {
+        let sessions = state.ws_sessions.read().await;
+        let mut accepted = false;
+        for session in sessions.values() {
+            if session.try_accept_gui_show(&show) {
+                accepted = true;
+            }
+        }
+        accepted
+    };
+    if accepted {
         return json_outcome(GuiShowOutcome::Navigated, machine_id, request_id);
     }
 
@@ -196,6 +200,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use axum::routing::post;
+    use serde_json::json;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -320,38 +325,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_ws_session_yields_navigated_and_gui_show_event() -> anyhow::Result<()> {
+    async fn open_ws_session_yields_navigated_when_the_queue_accepts() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let cap = install_capturing_opener(&state);
-        {
+        let probe = {
             let mut sessions = state.ws_sessions.write().await;
-            sessions.insert(
-                "test-session".to_string(),
-                crate::server::ws::test_gui_ws_session("test-session"),
-            );
-        }
-        let mut rx = state.broadcast_tx.subscribe();
+            crate::server::ws::insert_visible_gui_with_queue(&mut sessions, "test-session", 4, 0)
+        };
         let app = router(Arc::clone(&state));
         let (status, body) = post_show(&app, json!({ "view": "network" })).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["outcome"], "navigated", "{body}");
+        assert!(body.get("url").is_none(), "{body}");
+        assert!(body.get("token").is_none(), "{body}");
         assert!(
             cap.urls.lock().unwrap().is_empty(),
             "must not open a window"
         );
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("event")
-            .expect("recv");
-        assert_eq!(event.event_type, "gui.show");
-        assert_eq!(event.data["view"], "network");
+        let shows = probe.gui_shows();
+        assert_eq!(shows.len(), 1, "{shows:?}");
+        assert_eq!(shows[0].0, "network");
         assert!(
-            event.data["banner"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("Opened by "),
+            shows[0].1.starts_with("Opened by "),
             "banner={}",
-            event.data["banner"]
+            shows[0].1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_live_tab_does_not_report_navigated() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let probe = {
+            let mut sessions = state.ws_sessions.write().await;
+            crate::server::ws::insert_visible_gui_with_queue(&mut sessions, "saturated", 1, 1)
+        };
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["outcome"], "opened",
+            "a full live-tab queue is not a navigation: {body}"
+        );
+        assert!(body.get("url").is_none(), "{body}");
+        assert!(body.get("token").is_none(), "{body}");
+        let urls = cap.urls.lock().unwrap();
+        assert_eq!(
+            urls.len(),
+            1,
+            "the browser must open when the frame is not queued"
+        );
+        assert!(urls[0].contains("#/people"), "{}", urls[0]);
+        drop(urls);
+        assert!(
+            probe.gui_shows().is_empty(),
+            "the saturated queue must not contain the show frame"
         );
         Ok(())
     }
