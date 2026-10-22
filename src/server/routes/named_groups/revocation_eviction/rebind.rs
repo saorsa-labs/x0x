@@ -2584,4 +2584,170 @@ pub(super) mod restart_tests {
         state.agent.shutdown().await;
         Ok(())
     }
+
+    /// An `OwnerCertified` group created by `admin`, with each of
+    /// `members` a certified Member. Each certificate expires in ten
+    /// minutes.
+    fn certified_group(
+        owner: &UserKeypair,
+        admin: &AgentKeypair,
+        members: &[&AgentKeypair],
+    ) -> Result<GroupInfo> {
+        let now = now_unix_ms() / 1000;
+        let mut info = GroupInfo::new(
+            "crb".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "c8".repeat(16),
+        );
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        for member in members {
+            info.add_member(
+                hex::encode(member.agent_id().as_bytes()),
+                GroupRole::Member,
+                Some(admin_hex.clone()),
+                None,
+            );
+        }
+        for member in std::iter::once(admin).chain(members.iter().copied()) {
+            let cert = AgentCertificate::issue_with_expiry(owner, member, Some(now + 600))?;
+            cr::install_certificate(&mut info, &hex::encode(member.agent_id().as_bytes()), cert);
+        }
+        info.recompute_state_hash();
+        Ok(info)
+    }
+
+    /// ADR 0110 §4a run (10): the chain the receiver holds when a delayed
+    /// self-rebind races the seat's expiry removal. The admin renews its
+    /// own certificate (`parent`, retained), then seals the removal of
+    /// `seat` on it (`head`). A rebind on `parent` is a sibling of the
+    /// removal.
+    fn removal_race(
+        owner: &UserKeypair,
+        base: &GroupInfo,
+        admin: &AgentKeypair,
+        seat: &AgentKeypair,
+    ) -> Result<(GroupInfo, GroupInfo)> {
+        let now_ms = now_unix_ms();
+        let renewal = AgentCertificate::issue_with_expiry(owner, admin, Some(now_ms / 1000 + 900))?;
+        let (parent, _) = cr::seal(base, *admin.agent_id().as_bytes(), &renewal, admin, now_ms)
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+        let mut head = parent.clone();
+        head.remove_member(
+            &hex::encode(seat.agent_id().as_bytes()),
+            Some(hex::encode(admin.agent_id().as_bytes())),
+        );
+        head.seal_commit_evicting(admin, now_ms + 1)?;
+        Ok((parent, head))
+    }
+
+    /// A rebind of `seat` on `parent`, signed by `signer`, carrying a
+    /// certificate for `seat` issued by `issuer`. Returns the frame and its
+    /// result head.
+    fn sibling_frame(
+        parent: &GroupInfo,
+        issuer: &UserKeypair,
+        seat: &AgentKeypair,
+        signer: &AgentKeypair,
+    ) -> Result<(Vec<u8>, String)> {
+        let now_ms = now_unix_ms();
+        let renewal =
+            AgentCertificate::issue_with_expiry(issuer, seat, Some(now_ms / 1000 + 6000))?;
+        let (next, frame) = cr::seal(
+            parent,
+            *seat.agent_id().as_bytes(),
+            &renewal,
+            signer,
+            now_ms,
+        )
+        .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+        Ok((cr::encode_frame(&frame)?, next.state_hash))
+    }
+
+    async fn quarantine_of(state: &AppState, stable: &str) -> Option<x0x::groups::ForkQuarantine> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(stable)
+            .and_then(|info| info.fork_quarantine.clone())
+    }
+
+    /// #1508 Codex P1 A (ADR 0110 §4a "Receiver checks", ADR 0064 slice
+    /// 4): a rebind that does not chain from this node's head is checked
+    /// against its retained parent before anything is kept as fork
+    /// evidence. An unrevoked ordinary member signs two fabricated
+    /// siblings of the admin's removal: a self-rebind that carries a
+    /// certificate from another user key, and a rebind of the admin's
+    /// seat. Neither quarantines an invite-derived receiver; each is
+    /// refused with its own typed reason. A valid sibling still does.
+    #[tokio::test]
+    async fn an_invalid_rebind_sibling_quarantines_no_receiver() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        let me = receiver.agent.identity().agent_keypair();
+        let base = certified_group(&owner, &admin, &[&member, me])?;
+        let (parent, mut head) = removal_race(&owner, &base, &admin, &member)?;
+        // This receiver joined through an invite.
+        head.invite_lineage = Some(x0x::groups::InviteLineage {
+            base_revision: base.state_revision,
+            base_hash: base.state_hash.clone(),
+            seated_at_revision: Some(base.state_revision),
+            ..Default::default()
+        });
+        let stable = head.stable_group_id().to_string();
+        hold_persisted(&receiver, &head).await?;
+
+        let stranger = UserKeypair::generate()?;
+        let (forged, _) = sibling_frame(&parent, &stranger, &member, &member)?;
+        let outcome = receive(&receiver, member.agent_id(), &forged).await;
+        assert_eq!(
+            quarantine_of(&receiver, &stable).await,
+            None,
+            "a sibling with an invalid certificate is no fork evidence"
+        );
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(cr::CertificateRebindRefusal::CertificateInvalid)
+        );
+
+        let (other_seat, _) = sibling_frame(&parent, &owner, &admin, &member)?;
+        let outcome = receive(&receiver, member.agent_id(), &other_seat).await;
+        assert_eq!(
+            quarantine_of(&receiver, &stable).await,
+            None,
+            "a member's rebind of another seat is no fork evidence"
+        );
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(cr::CertificateRebindRefusal::SignerIneligible)
+        );
+        let lineage = receiver
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .and_then(|info| info.invite_lineage.clone());
+        assert_eq!(lineage.and_then(|lineage| lineage.fork_evidence), None);
+
+        // The control: the member's valid self-rebind on the same parent
+        // is an authenticated sibling.
+        let (valid, sibling_head) = sibling_frame(&parent, &owner, &member, &member)?;
+        let outcome = receive(&receiver, member.agent_id(), &valid).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(cr::CertificateRebindRefusal::SeatNotActive)
+        );
+        let marker = quarantine_of(&receiver, &stable)
+            .await
+            .context("the valid sibling contains the group")?;
+        assert_eq!(marker.state_hash, sibling_head);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
 }
