@@ -2086,6 +2086,17 @@ impl OwnerSyncStore {
             .collect()
     }
 
+    /// #1545: whether any of `records` is still owed: a save of its names
+    /// has not discharged it yet.
+    pub(crate) async fn owes_any(&self, records: &[(VersionedRecord, bool)]) -> bool {
+        let pending = self.pending_apply.lock().await;
+        records.iter().any(|(record, _)| {
+            pending
+                .get(&pending_key(record))
+                .is_some_and(|entry| !entry.discharged)
+        })
+    }
+
     /// #1545: record that a profile save with `names` starts with
     /// `folded` in it. Each entry of `folded` is a record of
     /// [`Self::pending_applies`] with its winner flag at the fold; only a
@@ -3130,10 +3141,12 @@ pub trait SyncDaemonView: Send + Sync + 'static {
 /// #1545: a daemon view whose `apply_names` saves the names in the
 /// background. Crate-internal; see [`OwnerSyncService::attach_daemon_view`].
 pub(crate) trait PersistedNames: Send + Sync + 'static {
-    /// Completes when every earlier `apply_names` call has ended. `true`
-    /// when each one saved its names; `false` when a save failed or did
-    /// not run (shutdown).
-    fn names_persisted(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+    /// Completes when every earlier `apply_names` call has ended, saved
+    /// or not. A save that succeeds discharges the names it holds
+    /// (`OwnerSyncStore::discharge_applies`), so the store, not this
+    /// call, tells whether a name is still owed: a later save, such as
+    /// `PUT /profile`, can discharge a name whose own save failed.
+    fn names_settled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
     /// The names of the live profile, read under its lock (waiting for
     /// a writer), never a cached copy: a copy can be older than a
@@ -3912,10 +3925,18 @@ impl OwnerSyncService {
     }
 
     /// #1545: apply the committed names that live state may not show yet
-    /// (`OwnerSyncStore::pending_applies`), and discharge them once the
-    /// view confirms the save. `true` when none are owed any more; `false`
-    /// when no view is attached or the view did not save them, so the
-    /// next pass applies them again.
+    /// (`OwnerSyncStore::pending_applies`), and discharge them once they
+    /// are saved. `true` when none of them are owed any more; `false` when
+    /// no view is attached or a name is not saved yet, so the next pass
+    /// applies it again.
+    ///
+    /// With a view that saves in the background (`PersistedNames`), each
+    /// save discharges the names it holds. A record that sets a local name
+    /// is then confirmed only by its obligation in the store, after the
+    /// earlier saves have ended: a failed save does not count against a
+    /// name that a later save discharged. The other records set no local
+    /// name (`sets_local_name`), so they need no save, and the pass
+    /// discharges them.
     async fn apply_pending(&self) -> bool {
         let pending = self.store.pending_applies().await;
         if pending.is_empty() {
@@ -3929,16 +3950,26 @@ impl OwnerSyncService {
                 self.apply_record(record);
             }
         }
-        if let Some(persisted) = self.persisted_names() {
-            if !persisted.names_persisted().await {
-                tracing::warn!(target: "x0x::owner_sync", "synced names not saved yet; retry next pass");
-                return false;
+        let Some(persisted) = self.persisted_names() else {
+            // The view applied the winners in place. The store retires a
+            // non-winner only if it is still not the winner
+            // (`discharge_applies`).
+            if let Err(e) = self.store.discharge_applies(&pending).await {
+                tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
             }
-        }
-        // The winners were applied; the store retires a non-winner only if
-        // it is still not the winner (`discharge_applies`).
-        if let Err(e) = self.store.discharge_applies(&pending).await {
+            return true;
+        };
+        persisted.names_settled().await;
+        let local = self.agent.machine_id();
+        let (saved, unsaved): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(record, winner)| *winner && sets_local_name(record, &local));
+        if let Err(e) = self.store.discharge_applies(&unsaved).await {
             tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
+        }
+        if self.store.owes_any(&saved).await {
+            tracing::warn!(target: "x0x::owner_sync", "synced names not saved yet; retry next pass");
+            return false;
         }
         true
     }
@@ -4054,6 +4085,15 @@ impl OwnerSyncService {
             self.sync_all().await;
         }
     }
+}
+
+/// Whether `record` sets a name on the profile of `local_machine`, so that
+/// its apply saves the profile (`SyncDaemonView::apply_names` does nothing
+/// for no names).
+fn sets_local_name(record: &VersionedRecord, local_machine: &MachineId) -> bool {
+    local_names_of(record, local_machine).is_some_and(|names| {
+        names.human_name.is_some() || names.display_name.is_some() || names.machine_name.is_some()
+    })
 }
 
 /// The names that `record` sets on the profile of `local_machine`, with

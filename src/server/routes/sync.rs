@@ -30,9 +30,10 @@ use crate::server::state::AppState;
 /// `profile_names` keeps a last-seen mirror: `apply_names` writes it
 /// synchronously so the very next reconcile pass cannot re-mint a
 /// pre-merge value (LWW flip-back), while the live `AppState` profile and
-/// its persisted file catch up in a spawned task. `names_persisted` waits
-/// for those tasks and reports whether they saved the profile (#1545): the
-/// reconcile pass keeps a synced name owed until then.
+/// its persisted file catch up in a spawned task. `names_settled` waits
+/// for those tasks; a task that saves the profile discharges the synced
+/// names it holds, and the reconcile pass keeps a name owed until a save
+/// discharges it (#1545).
 ///
 /// WHY a `Weak<AppState>`: the view is installed on the sync service the
 /// `AppState` owns (`state.owner_sync`), so an `Arc` here is a cycle
@@ -47,9 +48,8 @@ pub(in crate::server) struct DaemonView {
     state: Weak<AppState>,
     names: std::sync::RwLock<SyncProfileNames>,
     /// One receiver per catch-up task that may still run; each closes
-    /// when its task ends (or is refused at shutdown), and holds `true`
-    /// when the task saved the profile.
-    pending: std::sync::Mutex<Vec<tokio::sync::watch::Receiver<bool>>>,
+    /// when its task ends (or is refused at shutdown).
+    pending: std::sync::Mutex<Vec<tokio::sync::watch::Receiver<()>>>,
 }
 
 impl DaemonView {
@@ -191,7 +191,7 @@ impl SyncDaemonView for DaemonView {
         // in progress instead of leaving it to outlive the daemon with this
         // AppState (and `history.db`) held, and refuses one that has not
         // started, as if the sync had arrived after the stop.
-        let (done, done_rx) = tokio::sync::watch::channel(false);
+        let (done, done_rx) = tokio::sync::watch::channel(());
         {
             let mut pending = self
                 .pending
@@ -204,7 +204,8 @@ impl SyncDaemonView for DaemonView {
         let task_state = Arc::clone(&state);
         state.spawn_shielded(async move {
             // `done` drops when the task ends, which completes
-            // `names_persisted`.
+            // `names_settled`.
+            let _done = done;
             let state = task_state;
             let mut profile = state.profile.write().await;
             // #1545: apply the names still owed, not the values of this
@@ -232,16 +233,13 @@ impl SyncDaemonView for DaemonView {
             // earlier save of them can have failed. Save under the profile
             // lock, so a later local edit cannot save first and then be
             // overwritten by this save (#1545).
-            match save_profile(&state, &profile, owed.map(|(_, folded)| folded)).await {
-                Ok(()) => {
-                    let _ = done.send(true);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "x0x::owner_sync",
-                        "failed to persist synced profile: {e}"
-                    );
-                }
+            // A failed save leaves the names owed in the store, and the
+            // next pass applies them again.
+            if let Err(e) = save_profile(&state, &profile, owed.map(|(_, folded)| folded)).await {
+                tracing::warn!(
+                    target: "x0x::owner_sync",
+                    "failed to persist synced profile: {e}"
+                );
             }
         });
     }
@@ -336,21 +334,18 @@ pub(in crate::server) async fn save_profile(
 }
 
 impl PersistedNames for DaemonView {
-    fn names_persisted(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+    fn names_settled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         let pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         Box::pin(async move {
-            let mut persisted = true;
             for mut task in pending {
                 // `changed` fails once the task drops its sender, at its
-                // end; the last value is its result.
+                // end.
                 while task.changed().await.is_ok() {}
-                persisted &= *task.borrow();
             }
-            persisted
         })
     }
 
@@ -1057,7 +1052,7 @@ mod tests {
         for record in &outcome.accepted {
             service.apply_record(record);
         }
-        assert!(view.names_persisted().await, "the catch-up saves Alice");
+        view.names_settled().await;
         assert_eq!(
             state.profile.read().await.human_name.as_deref(),
             Some("Alice")
@@ -1273,7 +1268,7 @@ mod tests {
         for record in &outcome.accepted {
             service.apply_record(record);
         }
-        assert!(view.names_persisted().await, "the catch-up saves");
+        view.names_settled().await;
 
         service.sync_all().await;
         assert_keeps(&state, "Alice", "after the interleaved commit").await;
@@ -1336,7 +1331,7 @@ mod tests {
         for record in &outcome.accepted {
             service.apply_record(record);
         }
-        assert!(view.names_persisted().await, "the catch-up saves Alice");
+        view.names_settled().await;
         release_tx.send(()).expect("release the reconcile");
         pass.await.expect("the pass ends");
         assert_register_holds(
