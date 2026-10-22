@@ -2827,7 +2827,10 @@ impl NetworkNode {
 
         // Single-cache architecture: the endpoint owns the bootstrap cache;
         // x0x borrows the same instance below instead of opening a second
-        // cache on the same directory.
+        // cache on the same directory. The sim backend (test builds) keeps
+        // its own copy of the config — see the sim claim below.
+        #[cfg(test)]
+        let sim_cache_config = bootstrap_cache_config.clone();
         if let Some(cache_config) = bootstrap_cache_config {
             builder = builder.bootstrap_cache(cache_config);
         }
@@ -2846,14 +2849,27 @@ impl NetworkNode {
 
         // W3-H (#1164): a test-build node whose plane has a registered
         // simulation fabric runs on it instead of binding a QUIC socket.
+        // #1112 (round 22): the sim backend honors the cache config too
+        // (in-memory while `persist` is off), so cached-dial paths are
+        // exercisable end to end on the fabric. The endpoint-owned cache
+        // maintenance loop is absent on this backend; tests do not rely
+        // on it.
         #[cfg(test)]
         if let Some(link) = sim::claim(&config, expected_peer_id) {
+            let cache = match sim_cache_config {
+                Some(cfg) => Some(Arc::new(
+                    ant_quic::BootstrapCache::open(cfg).await.map_err(|e| {
+                        NetworkError::NodeCreation(format!("bootstrap cache open failed: {e}"))
+                    })?,
+                )),
+                None => None,
+            };
             return Ok(Self::assemble(
                 config,
                 LinkNode::Sim(link),
                 expected_peer_id,
                 transport_signing_key,
-                None,
+                cache,
             )
             .await);
         }
@@ -4086,7 +4102,11 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if the peer is not cached or none of its cached
-    /// addresses lead back to the expected peer.
+    /// addresses lead back to the expected peer. #1112 (round 22): cached
+    /// candidates the pin verdict refuses for this identity are never
+    /// socketed — a fully poisoned row fails without a dial — and an answered
+    /// landing on a pinned seed address outside its pin set is refused and
+    /// closed by the peer-authenticated dial underneath (`connect_peer_with_addrs`).
     pub async fn connect_cached_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
         // Issue #292 invariant C: the gate outranks the connected
         // fast-path below — a suppressed peer refuses even while a
@@ -4151,10 +4171,22 @@ impl NetworkNode {
         // cached addresses observed as mapped-v6 wedge sends with
         // "No route to host" on hosts whose mapped-v6 egress is refused
         // (durable fix ant-quic#269).
+        //
+        // #1112 (round 22, Codex P2: a mismatching cached address must
+        // not cost the row its valid siblings): candidates the pin
+        // verdict refuses are skipped BEFORE the dial — the loop falls
+        // through to the row's next address instead of socketing the
+        // rejected pair. Dormant while no pin row exists.
         let candidate_addrs: Vec<SocketAddr> = cached_peer
             .preferred_addresses()
             .into_iter()
             .map(normalize_v4_mapped_addr)
+            .filter(|addr| {
+                !matches!(
+                    seed_pin_gate(*addr, peer_id.0),
+                    SeedPinVerdict::Mismatch { .. }
+                )
+            })
             .collect();
         for addr in &candidate_addrs {
             match self.connect_peer_with_addrs(peer_id, vec![*addr]).await {
@@ -4419,6 +4451,37 @@ impl NetworkNode {
         ))
     }
 
+    /// #1112 (round 22, Codex P2: id dials answered outside the address
+    /// seam): the pin pair verdict for an ANSWERED id dial, run on the
+    /// connection's own remote address. Id dials (`connect_peer`,
+    /// `connect_peer_with_addrs`, and the cached dial's fallback, which
+    /// lets ant-quic enrich the address internally) never pass the
+    /// address-dial seam, so a pinned seed address that answers outside
+    /// its pin set must be refused HERE, before any bookkeeping, event,
+    /// or transport-assistance reuse of the connection: entry recorded,
+    /// answered connection closed, cache row evicted, dial failed.
+    /// Ant-quic-INTERNAL coordinator dials (no x0x hook) stay the
+    /// fenced residual. A MATCH clears this address's rejection,
+    /// pair-scoped, like the seam.
+    async fn enforce_seed_pin_on_answered_id_dial(
+        &self,
+        node: &LinkNode,
+        addr: SocketAddr,
+        answered: &AntPeerId,
+        origin: &'static str,
+    ) -> NetworkResult<()> {
+        match seed_pin_gate(addr, answered.0) {
+            SeedPinVerdict::Mismatch { .. } => Err(self
+                .refuse_seed_pin_mismatch(node, addr, answered, origin)
+                .await),
+            SeedPinVerdict::Match(_) => {
+                self.clear_seed_pin_rejection(addr);
+                Ok(())
+            }
+            SeedPinVerdict::Unpinned => Ok(()),
+        }
+    }
+
     /// Connect to a specific peer by ID.
     ///
     /// # Arguments
@@ -4482,6 +4545,11 @@ impl NetworkNode {
 
         // Record in bootstrap cache so future connections use the cached address
         let rtt_ms = start.elapsed().as_millis() as u32;
+        // #1112 (round 22): this dial has no address hints — ant-quic
+        // picked the address internally, so the pin verdict can only run
+        // on the ANSWERED connection's remote address.
+        self.enforce_seed_pin_on_answered_id_dial(&node, addr, &peer_conn.peer_id, "peer")
+            .await?;
         // #1112 (round 11): leave source-session evidence for the frame
         // guard — id-based dials never pass the address-dial seam.
         self.note_observed_connection(&node, &peer_conn.peer_id, addr);
@@ -4632,6 +4700,20 @@ impl NetworkNode {
 
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         let rtt_ms = dur_ms as u32;
+        // #1112 (round 22, Codex P2: id dials answered outside the
+        // address seam): the identity gate above proved WHO answered;
+        // this proves the pair is allowed where it answered — the
+        // answered connection's own remote address, so an
+        // internally-enriched landing on a pinned seed address is
+        // refused (closed, never reusable as transport assistance)
+        // exactly like an address-seam dial.
+        self.enforce_seed_pin_on_answered_id_dial(
+            &node,
+            addr,
+            &peer_conn.peer_id,
+            "peer_with_addrs",
+        )
+        .await?;
         // #1112 (round 11): leave source-session evidence for the frame
         // guard — id-based dials never pass the address-dial seam.
         self.note_observed_connection(&node, &peer_conn.peer_id, addr);
@@ -11210,6 +11292,35 @@ mod tests {
         (seed, joiner, seed_addr)
     }
 
+    /// Round 22: the sim pair with an in-memory (`persist(false)`)
+    /// bootstrap cache on the JOINER, so the cached id-dial path
+    /// (`connect_cached_peer`) runs end to end over the fabric — the
+    /// production cache-config branch of the sim backend.
+    async fn issue1112_sim_pair_with_joiner_cache(
+        plane: &'static str,
+        fabric_seed: u64,
+    ) -> (NetworkNode, NetworkNode, SocketAddr) {
+        let fabric = sim::SimFabric::new(fabric_seed);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let cache_config = ant_quic::BootstrapCacheConfig::builder()
+            .persist(false)
+            .build();
+        let seed = NetworkNode::new(config(2), None, None).await.unwrap();
+        let joiner = NetworkNode::new(config(1), Some(cache_config), None)
+            .await
+            .unwrap();
+        let seed_addr = SocketAddr::from(([198, 18, 0, 2], 5483));
+        (seed, joiner, seed_addr)
+    }
+
     /// Review round 7 P2 (rejected seeds remain transport coordinators):
     /// the mismatch refusal must close the answered connection. ant-quic's
     /// coordinator selection reuses any live connection to a seed address
@@ -11489,6 +11600,183 @@ mod tests {
         seed.try_shutdown().await.unwrap();
     }
 
+    /// Round 22 (Codex P2: id dials answered outside the address seam):
+    /// `connect_peer_with_addrs` — the peer-authenticated dial the
+    /// cached loop and its no-hint fallback use — takes the seam's pin
+    /// verdict on the ANSWERED connection's own remote address. A
+    /// pinned seed address that answers outside its pin set is refused:
+    /// backoff entry recorded, answered connection closed (no live
+    /// transport-assistance path for ant-quic's coordinator selection),
+    /// cache row evicted, dial failed. Runtime-RED before round 22: the
+    /// dial returned Ok((seed_addr, seed)) and left the connection
+    /// live.
+    #[tokio::test]
+    async fn issue1112_id_dial_landing_on_a_pinned_address_is_refused_and_closed() {
+        const NOT_THE_SEED: [u8; 32] = [0xD1; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r22-iddial";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_141).await;
+        let mut events = joiner.subscribe();
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        let dial = joiner
+            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
+            .await;
+        assert!(
+            matches!(dial, Err(NetworkError::ConnectionFailed(_))),
+            "a pinned address answering outside its pin set is refused on the id-dial path"
+        );
+        assert!(
+            !joiner.is_connected(&seed.peer_id()).await,
+            "the answered connection is closed, not left as transport assistance"
+        );
+        assert!(
+            joiner.seed_pin_addr_rejected(seed_addr),
+            "the refusal records the bounded address backoff"
+        );
+        // No bookkeeping ran: no PeerConnected event for the refused dial.
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    &event,
+                    NetworkEvent::PeerConnected { peer_id, .. } if *peer_id == seed.peer_id().0
+                ),
+                "a refused id dial must not emit PeerConnected"
+            );
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 22 (Codex P2, mixed cache rows): the cached id dial never
+    /// sockets a candidate the pin verdict refuses — a fully poisoned
+    /// row (every address mismatches a pin set that excludes the
+    /// identity) contributes no candidate at all: no socket, no
+    /// answered connection, no PeerConnected, failed dial. Runtime-RED
+    /// before round 22: `connect_cached_peer` dialled the row, returned
+    /// Ok((seed_addr, seed)) and left the connection live.
+    #[tokio::test]
+    async fn issue1112_cached_dial_never_sockets_a_fully_poisoned_row() {
+        const NOT_THE_SEED: [u8; 32] = [0xD2; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r22-poisoned";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair_with_joiner_cache(plane, 11_142).await;
+        let mut events = joiner.subscribe();
+        let _pins = TestPinTableGuard::set(&PINS);
+        // The poisoned row: the seed's own id at a pinned address whose
+        // pin set excludes it (whatever wrote the row).
+        let cache = joiner.bootstrap_cache.clone().expect("joiner cache");
+        cache
+            .add_from_connection(seed.peer_id(), vec![seed_addr], None)
+            .await;
+        assert!(
+            cache.get_peer(&seed.peer_id()).await.is_some(),
+            "the poisoned row exists"
+        );
+
+        let dial = joiner.connect_cached_peer(seed.peer_id()).await;
+        assert!(
+            matches!(dial, Err(NetworkError::ConnectionFailed(_))),
+            "a fully poisoned row is never dialled"
+        );
+        assert!(
+            !joiner.is_connected(&seed.peer_id()).await,
+            "no connection was made to the rejected pair"
+        );
+        assert!(
+            !joiner.seed_pin_addr_rejected(seed_addr),
+            "the skip never sockets the pair, so no backoff entry is written"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    &event,
+                    NetworkEvent::PeerConnected { peer_id, .. } if *peer_id == seed.peer_id().0
+                ),
+                "a skipped row must not emit PeerConnected"
+            );
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 22 companion (Codex P2: "test the complete mixed-row
+    /// connection path"): a row listing a pinned address that excludes
+    /// the identity AND the identity's own valid address reaches the
+    /// VALID sibling through `connect_cached_peer`, and the pinned
+    /// address never keeps a connection. (Also green before round 22 —
+    /// the identity gate already refused the different-id landing; the
+    /// RED halves of the scenario are the refused-landing and
+    /// fully-poisoned tests above.)
+    #[tokio::test]
+    async fn issue1112_mixed_cache_row_id_dial_reaches_the_valid_sibling() {
+        const NOT_THE_SEED: [u8; 32] = [0xD3; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.3:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r22-mixed";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair_with_joiner_cache(plane, 11_143).await;
+        // A third node occupies the pinned address; the pin set there
+        // excludes the seed's identity.
+        let third = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some(SocketAddr::from(([198, 18, 0, 3], 5483))),
+                network_id: Some(plane.to_string()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let pinned_addr: SocketAddr = "198.18.0.3:5483".parse().unwrap();
+        let _pins = TestPinTableGuard::set(&PINS);
+        // The mixed row: the pinned address the pins refuse for this
+        // identity, then the identity's valid listener.
+        let cache = joiner.bootstrap_cache.clone().expect("joiner cache");
+        cache
+            .add_from_connection(seed.peer_id(), vec![pinned_addr, seed_addr], None)
+            .await;
+        assert_eq!(
+            cache
+                .get_peer(&seed.peer_id())
+                .await
+                .expect("the mixed row exists")
+                .preferred_addresses()
+                .len(),
+            2,
+            "the row keeps both addresses"
+        );
+
+        let dial = joiner.connect_cached_peer(seed.peer_id()).await;
+        assert_eq!(
+            dial.expect("the valid sibling is reached"),
+            seed_addr,
+            "the mismatching sibling costs itself, never the valid address"
+        );
+        assert!(joiner.is_connected(&seed.peer_id()).await);
+        assert!(
+            !joiner.is_connected(&third.peer_id()).await,
+            "the pinned address never keeps a connection"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+        third.try_shutdown().await.unwrap();
+    }
+
     /// Round 8 (Codex P2: internal redials bypass rejection): pin
     /// eligibility is enforced against the LIVE connection set,
     /// independent of the backoff. A connection on a pinned address whose
@@ -11593,16 +11881,21 @@ mod tests {
     }
 
     /// Round 11 (Codex P2: queued frames can bypass pin rejection after
-    /// disconnect, id-based-dial variant): an id-based dial records NO
+    /// disconnect, un-refused-session variant; reworked round 22): a
+    /// session the pins mismatch but no dial seam refused records NO
     /// rejection entry, so a frame it queues and drains after its close
-    /// slipped past the recorded-entry clause. The session-address ledger
-    /// (recorded at the id-dial seams, the accept loop and the receive
-    /// pump) maps the frame's source generation to its address, and the
-    /// timeless pair verdict refuses it — no manual rejection inserted.
-    /// Runtime-RED before the ledger clause: the drained frame reached
-    /// the gossip channels.
+    /// slipped past the recorded-entry clause. Round 22 refuses such
+    /// sessions on every OUTBOUND dial, so the mismatched session is
+    /// created the INBOUND way — the pin-mismatched seed dials the
+    /// joiner, whose accept loop ledgered the session (its remote
+    /// address IS the pinned seed address). The session-address ledger
+    /// (accept loop, receive pump, lifecycle watcher) maps the frame's
+    /// source generation to its address, and the timeless pair verdict
+    /// refuses it — no manual rejection inserted. Runtime-RED before
+    /// the ledger clause: the drained frame reached the gossip
+    /// channels.
     #[tokio::test(flavor = "current_thread")]
-    async fn issue1112_id_dial_queued_frame_refused_without_a_recorded_entry() {
+    async fn issue1112_inbound_queued_frame_refused_without_a_recorded_entry() {
         const NOT_THE_SEED: [u8; 32] = [0xAF; 32];
         const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
             addr: "198.18.0.2:5483",
@@ -11610,22 +11903,31 @@ mod tests {
         }];
         let plane = "issue1112-r11-iddial";
         let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_135).await;
-        // Pins are already in force: the LEDGER is active (round 12 gates
-        // ledger writes on a populated table), while the id-based dial
-        // itself still succeeds — the address-dial pin gate does not run
-        // on id-based seams, so the connection exists exactly like an
-        // internal redial's, with no rejection entry.
         let _pins = TestPinTableGuard::set(&PINS);
-        let (_, seed_peer) = joiner
-            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
-            .await
-            .unwrap();
-
-        let joiner_peer = joiner.peer_id();
+        // The mismatched seed dials IN: its own seam check runs on the
+        // JOINER's address (unpinned), so the dial succeeds, and the
+        // joiner's accept loop ledgered the inbound session on the
+        // pinned seed address. No rejection entry is ever recorded — no
+        // x0x dial was refused.
+        let joiner_addr = SocketAddr::from(([198, 18, 0, 1], 5483));
+        let joiner_peer = seed.connect_addr(joiner_addr).await.unwrap();
+        let seed_peer = seed.peer_id();
         let link = joiner.node.read().await.clone().expect("live link");
-        let generation = link
-            .current_connection_generation(&seed_peer)
-            .expect("live generation");
+        // The accept loop ledgers asynchronously — wait for the evidence
+        // (bounded).
+        let generation = tokio::time::timeout(Duration::from_millis(5_000), async {
+            loop {
+                if let Some(generation) = link.current_connection_generation(&seed_peer) {
+                    if joiner.session_addr_for(&seed_peer, generation).is_some() {
+                        return generation;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the accept loop ledgered the inbound session");
+
         // The peer queues a Bulk frame, then the connection closes.
         let seed_link = seed.node.read().await.clone().expect("live link");
         let mut frame = vec![saorsa_gossip_transport::GossipStreamType::Bulk.to_byte()];
@@ -11640,7 +11942,7 @@ mod tests {
         assert_eq!(
             joiner.session_addr_for(&seed_peer, generation),
             Some(seed_addr),
-            "the id-dial seam ledgered the source session"
+            "the accept loop ledgered the inbound session"
         );
         assert!(joiner.seed_pin_rejects_frame(&link, &seed_peer, generation));
 
@@ -11718,17 +12020,28 @@ mod tests {
         let plane = "issue1112-r12-reconnect";
         let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_137).await;
         let _pins = TestPinTableGuard::set(&PINS);
-        // Id-based dials for both generations: the address-dial seam
-        // (rightly) refuses this mismatching address while pins are in
-        // force, and the id-based seams leave the ledger evidence.
-        let (_, seed_peer) = joiner
-            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
-            .await
-            .unwrap();
+        // Round 22: outbound dials at the mismatching address are refused
+        // at every seam, so BOTH generations are INBOUND — the
+        // pin-mismatched seed dials the joiner twice. From the joiner's
+        // ledger view each session's remote address IS the pinned seed
+        // address: a same-address reconnect, the round-12 scenario. The
+        // accept loop leaves the ledger evidence for each generation.
+        let joiner_addr = SocketAddr::from(([198, 18, 0, 1], 5483));
+        let seed_peer = seed.peer_id();
         let link = joiner.node.read().await.clone().expect("live link");
-        let first = link
-            .current_connection_generation(&seed_peer)
-            .expect("live generation");
+        seed.connect_addr(joiner_addr).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(5_000), async {
+            loop {
+                if let Some(generation) = link.current_connection_generation(&seed_peer) {
+                    if joiner.session_addr_for(&seed_peer, generation).is_some() {
+                        return generation;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first inbound session is ledgered");
         // A frame queues on the old generation, then the connection
         // closes and the peer RECONNECTS at the same address.
         let joiner_peer = joiner.peer_id();
@@ -11737,13 +12050,21 @@ mod tests {
         frame.extend_from_slice(b"queued on the old generation");
         seed_link.send(&joiner_peer, &frame).await.unwrap();
         let _ = link.disconnect(&seed_peer).await;
-        joiner
-            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
-            .await
-            .unwrap();
-        let second = link
-            .current_connection_generation(&seed_peer)
-            .expect("replacement generation");
+        seed.connect_addr(joiner_addr).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(5_000), async {
+            loop {
+                if let Some(generation) = link.current_connection_generation(&seed_peer) {
+                    if generation != first
+                        && joiner.session_addr_for(&seed_peer, generation).is_some()
+                    {
+                        return generation;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the replacement session is ledgered");
         assert_ne!(first, second);
 
         // Both generations keep their evidence at the shared address.
