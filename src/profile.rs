@@ -441,6 +441,45 @@ impl IssuedCertRecord {
     }
 }
 
+/// A test model of a host crash. A write is durable only after the file
+/// and its parent directory are fsynced; the durable writers record the
+/// file's bytes here at that point. [`crash_sim::crash`] puts each file
+/// back to its last durable bytes, or removes it, as a host crash can.
+#[cfg(test)]
+pub(crate) mod crash_sim {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn ledger() -> &'static Mutex<HashMap<PathBuf, Vec<u8>>> {
+        static LEDGER: OnceLock<Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
+        LEDGER.get_or_init(Mutex::default)
+    }
+
+    /// Record the bytes now at `path` as durable. The durable writers call
+    /// this after their fsyncs; a test calls it to model the kernel
+    /// flushing a file some time after an unsynced write.
+    pub(crate) fn note_durable(path: &Path) {
+        let bytes = std::fs::read(path).expect("read durable file");
+        ledger().lock().unwrap().insert(path.to_path_buf(), bytes);
+    }
+
+    /// Lose every write to `paths` that was not made durable.
+    pub(crate) fn crash(paths: &[&Path]) {
+        let ledger = ledger().lock().unwrap();
+        for path in paths {
+            match ledger.get(*path) {
+                Some(bytes) => std::fs::write(path, bytes).expect("restore durable bytes"),
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

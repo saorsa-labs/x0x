@@ -1090,6 +1090,8 @@ impl OwnerSyncStore {
         }
         #[cfg(not(unix))]
         let _ = path.parent();
+        #[cfg(test)]
+        crate::profile::crash_sim::note_durable(path);
         Ok(())
     }
 
@@ -6460,6 +6462,53 @@ mod issuance_journal_sync_tests {
         deliver(&local, &owner, r2).await;
 
         // The next reconcile pass.
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (55afdf2), P1: an inbound renewal `d2` commits
+    /// in full, then the host crashes. A crash keeps only the writes made
+    /// durable. The register write is durable, so the journal append that
+    /// came before it must be durable too. If the journal came back as
+    /// `d1` beside a `d2` register, the reconcile would publish `d1` over
+    /// the renewal.
+    #[tokio::test]
+    async fn a_host_crash_after_a_commit_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+        // Some time passes: the kernel has flushed the `d1` journal.
+        crate::profile::crash_sim::note_durable(&journal);
+        deliver(&local, &owner, r2).await;
+        drop(local);
+
+        // The host crash, the restart, then the first reconcile pass.
+        crate::profile::crash_sim::crash(&[&journal, &local_dir.join(SYNC_DIR).join(RECORDS_FILE)]);
+        let (local, journal) = journal_device(&local_dir).await;
         mint_journal_lines(&local, &journal, &owner, machine(1)).await;
         let lines = crate::profile::IssuedCertRecord::load(&journal).await;
         assert_eq!(
