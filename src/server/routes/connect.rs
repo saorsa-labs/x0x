@@ -637,7 +637,7 @@ where
 }
 
 /// Restore due persisted forwards. Returns the next transient retry deadline.
-/// Permanent failures and exhausted retry budgets stay down until owner action.
+/// Transient failures always retain a deadline; permanent failures need owner action.
 /// Never fails: a corrupt store restores nothing (reported by `GET /forwards`),
 /// and a bad record stays down. Shutdown
 /// that has closed admission restores nothing.
@@ -1523,14 +1523,14 @@ mod tests {
         forwarder.shutdown();
     }
 
-    /// WHY: retries must have increasing delays and a finite attempt budget.
+    /// WHY: retries back off, then keep a slow fixed interval indefinitely.
     #[tokio::test]
-    async fn restore_retry_transient_backoff_and_cap() {
+    async fn restore_retry_transient_backoff_then_steady() {
         let (store, forwarder, _spec, _dir) = retry_fixture().await;
         tokio::time::pause();
         let mut attempts = 0;
         let mut at = Vec::new();
-        for second in 0..=1000 {
+        for second in 0..=2200 {
             let before = attempts;
             retry_pass(
                 &store,
@@ -1546,8 +1546,8 @@ mod tests {
         }
         assert_eq!(
             at,
-            vec![0, 10, 30, 70, 150, 310],
-            "initial attempt plus five backed-off retries"
+            vec![0, 10, 30, 70, 150, 310, 910, 1510, 2110],
+            "five backed-off retries, then one retry every ten minutes"
         );
         assert!(forwarder.list_forward_status()[0]
             .error
@@ -1557,17 +1557,16 @@ mod tests {
         forwarder.shutdown();
     }
 
-    /// WHY: bind_failed must use the same budget and return no deadline
-    /// after exhaustion, even if the port later becomes free.
+    /// WHY: a busy port must recover even after the fifth transient retry.
     #[tokio::test]
-    async fn restore_retry_bind_failure_exhausts_deadline() {
+    async fn restore_retry_bind_failure_recovers_after_backoff() {
         let (store, forwarder, spec, _dir) = retry_fixture().await;
         let occupied = tokio::net::TcpListener::bind(spec.spec.local_addr)
             .await
             .unwrap();
         tokio::time::pause();
         let mut attempts = 0;
-        for delay in [Some(10), Some(20), Some(40), Some(80), Some(160), None] {
+        for delay in [10, 20, 40, 80, 160, 600, 600] {
             let now = tokio::time::Instant::now();
             let next = restore_holding(&store, &forwarder, |record| {
                 attempts += 1;
@@ -1580,29 +1579,86 @@ mod tests {
             .await;
             assert_eq!(
                 next.map(|at| at.duration_since(now)),
-                delay.map(std::time::Duration::from_secs)
+                Some(std::time::Duration::from_secs(delay))
             );
-            if let Some(seconds) = delay {
-                tokio::time::advance(std::time::Duration::from_secs(seconds)).await;
-            }
+            tokio::time::advance(std::time::Duration::from_secs(delay)).await;
         }
-        assert_eq!(attempts, 6);
+        assert_eq!(attempts, 7);
         assert!(forwarder.list_forward_status()[0]
             .error
             .as_ref()
             .unwrap()
             .starts_with("bind_failed:"));
         drop(occupied);
-        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
-        assert!(restore_holding(&store, &forwarder, |_| async {
-            panic!("exhausted forward retried")
+        assert!(restore_holding(&store, &forwarder, |record| {
+            let record = record.clone();
+            let forwarder = Arc::clone(&forwarder);
+            let resolved =
+                retry_resolution(spec.spec.peer_agent, spec.binding.pinned_machine.unwrap());
+            async move { install_restored(&forwarder, &record, Some(Ok(resolved))).await }
         })
         .await
         .is_none());
+        assert!(forwarder.list_forward_status()[0].error.is_none());
         forwarder.shutdown();
     }
 
-    /// WHY: discovery within the budget must recover at the next deadline
+    /// WHY: the background caller must keep getting deadlines until a peer
+    /// discovered after twenty minutes can listen on the saved ids.
+    #[tokio::test]
+    async fn restore_retry_peer_appears_after_twenty_minutes() {
+        let (store, forwarder, spec, _dir) = retry_fixture().await;
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let mut attempts = Vec::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = Arc::clone(&forwarder);
+        let task = tokio::spawn(async move {
+            let mut next = start;
+            loop {
+                tokio::time::sleep_until(next).await;
+                let installing = Arc::clone(&worker);
+                let tx = tx.clone();
+                let deadline = restore_in_transaction(
+                    Arc::clone(&worker),
+                    Arc::clone(&store),
+                    move |record| {
+                        let elapsed = start.elapsed().as_secs();
+                        tx.send(elapsed).unwrap();
+                        let resolved = if elapsed >= 1200 {
+                            Ok(retry_resolution(
+                                record.pinned_agent_id,
+                                record.pinned_machine_id,
+                            ))
+                        } else {
+                            Err(x0x::names::NameError::UnknownName("box.me".into()))
+                        };
+                        let record = record.clone();
+                        let installing = Arc::clone(&installing);
+                        async move { install_restored(&installing, &record, Some(resolved)).await }
+                    },
+                )
+                .await;
+                let Some(deadline) = deadline else { break };
+                next = deadline;
+            }
+        });
+        while let Some(second) = rx.recv().await {
+            attempts.push(second);
+        }
+        task.await.unwrap();
+        assert_eq!(attempts, [0, 10, 30, 70, 150, 310, 910, 1510]);
+        let status = forwarder.forward_status_at(spec.spec.local_addr).unwrap();
+        assert!(
+            status.error.is_none(),
+            "late discovery must restore the listener"
+        );
+        assert_eq!(status.spec.peer_agent, spec.spec.peer_agent);
+        assert_eq!(status.binding.pinned_machine, spec.binding.pinned_machine);
+        forwarder.shutdown();
+    }
+
+    /// WHY: discovery during backoff must recover at the next deadline
     /// with both saved ids, never an unpinned or replacement target.
     #[tokio::test]
     async fn restore_retry_recovers_on_pinned_ids() {

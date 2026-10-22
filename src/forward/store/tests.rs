@@ -13,6 +13,33 @@ use crate::names::{
 const NOW: u64 = 1_900_000_000;
 const OWNER: UserId = UserId([0x0a; 32]);
 
+/// A committed owner add must never be visible with its old retry state.
+#[tokio::test]
+async fn owner_add_commits_record_and_retry_reset_together() {
+    let store = ForwardStore::in_memory();
+    let original = machine_spec(true);
+    original.remember(&store).await.unwrap();
+    let mut retries = store.restore_retries.lock().await;
+    let mut retry = RestoreRetry::default();
+    retry.finish(&Err(RestoreFailure::Permanent("name_changed".into())));
+    retries.insert(original.spec.local_addr, retry);
+    let mut replacement = original.clone();
+    replacement.spec.target_port += 1;
+    let add = replacement.remember(&store);
+    tokio::pin!(add);
+    assert!(futures::poll!(&mut add).is_pending());
+    assert_eq!(
+        store.records().await.unwrap(),
+        vec![record(&original)],
+        "the record must not commit while its retry reset is blocked"
+    );
+    drop(retries);
+    assert!(add.await.unwrap());
+    let session = store.begin_restore().await.unwrap();
+    assert_eq!(session.records, vec![record(&replacement)]);
+    assert!(!session.retries.contains_key(&replacement.spec.local_addr));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Parts {
     spec: ForwardSpec,

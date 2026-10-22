@@ -487,6 +487,21 @@ impl ForwardStore {
         guard
     }
 
+    /// Commit an owner mutation and its retry reset under the same lock.
+    /// Restore must not see a new record with the previous retry state.
+    async fn commit(
+        &self,
+        local_addr: SocketAddr,
+        mutate: impl FnOnce(&mut Vec<ForwardRecord>) -> Result<bool, ForwardStoreError>,
+    ) -> Result<bool, ForwardStoreError> {
+        let mut retries = self.restore_retries.lock().await;
+        let result = self.commit_records(mutate).await;
+        if result.is_ok() || result.as_ref().is_err_and(|e| e.durability_unconfirmed()) {
+            retries.remove(&local_addr);
+        }
+        result
+    }
+
     /// Apply `mutate` to a copy, persist it, then commit.
     ///
     /// Success installs the new set. `BeforeRename` keeps the old memory
@@ -496,7 +511,7 @@ impl ForwardStore {
     /// [`ForwardStoreError::Unconfirmed`]. A later no-op mutate retries
     /// the write while durability is pending — it must not report success
     /// until a parent-directory fsync succeeds.
-    async fn commit(
+    async fn commit_records(
         &self,
         mutate: impl FnOnce(&mut Vec<ForwardRecord>) -> Result<bool, ForwardStoreError>,
     ) -> Result<bool, ForwardStoreError> {
@@ -600,26 +615,21 @@ impl ForwardStore {
             return Ok(false);
         };
         validate(&record)?;
-        let result = self
-            .commit(move |records| {
-                if let Some(held) = records.iter_mut().find(|held| held.id == record.id) {
-                    if *held == record {
-                        return Ok(false);
-                    }
-                    *held = record;
-                    return Ok(true);
+        self.commit(spec.local_addr, move |records| {
+            if let Some(held) = records.iter_mut().find(|held| held.id == record.id) {
+                if *held == record {
+                    return Ok(false);
                 }
-                if records.len() >= MAX_FORWARDS {
-                    return Err(ForwardStoreError::Full);
-                }
-                records.push(record);
-                Ok(true)
-            })
-            .await;
-        if result.is_ok() || result.as_ref().is_err_and(|e| e.durability_unconfirmed()) {
-            self.restore_retries.lock().await.remove(&spec.local_addr);
-        }
-        result
+                *held = record;
+                return Ok(true);
+            }
+            if records.len() >= MAX_FORWARDS {
+                return Err(ForwardStoreError::Full);
+            }
+            records.push(record);
+            Ok(true)
+        })
+        .await
     }
 
     /// Delete the record bound to `local_addr`. Returns whether one existed.
@@ -631,17 +641,12 @@ impl ForwardStore {
     /// report success.
     pub async fn forget(&self, local_addr: SocketAddr) -> Result<bool, ForwardStoreError> {
         let id = local_addr.to_string();
-        let result = self
-            .commit(move |records| {
-                let before = records.len();
-                records.retain(|record| record.id != id);
-                Ok(records.len() != before)
-            })
-            .await;
-        if result.is_ok() || result.as_ref().is_err_and(|e| e.durability_unconfirmed()) {
-            self.restore_retries.lock().await.remove(&local_addr);
-        }
-        result
+        self.commit(local_addr, move |records| {
+            let before = records.len();
+            records.retain(|record| record.id != id);
+            Ok(records.len() != before)
+        })
+        .await
     }
 }
 
@@ -666,8 +671,8 @@ impl RestoreFailure {
     }
 }
 
-/// Per-record, per-daemon retry budget. Nothing here is persisted or exposed
-/// in HTTP responses. An owner add/delete resets it after the write applies.
+/// Per-record, per-daemon retry schedule. Nothing here is persisted or exposed
+/// in HTTP responses. An owner add/delete resets it when the write applies.
 #[derive(Debug)]
 pub(crate) struct RestoreRetry {
     failures: u32,
@@ -685,14 +690,17 @@ impl Default for RestoreRetry {
 
 impl RestoreRetry {
     pub(crate) fn finish(&mut self, result: &Result<(), RestoreFailure>) {
-        self.failures += 1;
-        // Initial attempt plus five retries: 10, 20, 40, 80, 160 seconds.
-        // Keep the last reason when the budget ends; do not invent an API code.
+        self.failures = self.failures.saturating_add(1);
+        // Five quick retries, then ten minutes indefinitely. A late peer must
+        // still recover. Only success or a permanent failure ends the schedule.
         self.next = match result {
             Err(RestoreFailure::Transient(_)) if self.failures <= 5 => Some(
                 tokio::time::Instant::now()
                     + std::time::Duration::from_secs(10 << (self.failures - 1)),
             ),
+            Err(RestoreFailure::Transient(_)) => {
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(600))
+            }
             _ => None,
         };
     }
