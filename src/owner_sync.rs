@@ -156,6 +156,9 @@ pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const DEVICES_FILE: &str = "devices.json";
 /// File holding the winning versioned records, inside `<data_dir>/sync/`.
 const RECORDS_FILE: &str = "records.json";
+/// File holding the `IssuanceJournal` records of a commit in progress,
+/// inside `<data_dir>/sync/` (#1542, see `recover_journal_commit`).
+const JOURNAL_INTENT_FILE: &str = "journal-intent.json";
 /// Directory under the instance data dir holding all sync state.
 const SYNC_DIR: &str = "sync";
 
@@ -863,7 +866,10 @@ pub struct OwnerSyncStore {
     /// holds a newer line that the next reconcile publishes. A failure or
     /// a restart between the two writes leaves the journal ahead, never
     /// behind: a register ahead of the journal would make the reconcile
-    /// mint the journal's older line over it. Lock order: `journal_apply` →
+    /// mint the journal's older line over it. The commit also writes a
+    /// journal intent before the journal file, so a restart can finish an
+    /// interrupted commit (`recover_journal_commit`), and the reconcile
+    /// mints only from a durable journal read. Lock order: `journal_apply` →
     /// `canonical_home_gate` → `records`, and `journal_apply` → the
     /// profile journal writer lock.
     journal_apply: tokio::sync::Mutex<()>,
@@ -1547,9 +1553,25 @@ impl OwnerSyncStore {
             .get()
             .filter(|_| batch.iter().any(|r| r.kind == SyncKind::IssuanceJournal));
         let _journal_apply = match journal {
-            Some(_) => Some(self.journal_apply.lock().await),
+            Some(_) => {
+                let guard = self.journal_apply.lock().await;
+                self.recover_journal_commit(owner).await?;
+                Some(guard)
+            }
             None => None,
         };
+        self.commit_locked(batch, owner, journal).await
+    }
+
+    /// [`Self::commit_batch`] after its `journal_apply` step. `journal` is
+    /// the journal file to apply accepted `IssuanceJournal` values to; the
+    /// caller then holds `journal_apply`.
+    async fn commit_locked(
+        &self,
+        batch: Vec<VersionedRecord>,
+        owner: &UserId,
+        journal: Option<&PathBuf>,
+    ) -> Result<CommitOutcome, SyncError> {
         // #449 r3 P2: an inbound batch that can change the canonical Home
         // register waits behind any in-flight seat mint, and blocks the next
         // one until this batch is durable. Batches that touch no HomePointer
@@ -1629,11 +1651,26 @@ impl OwnerSyncStore {
                 // #1542: the journal file first, then the register (see
                 // `journal_apply`). A failed append commits nothing; a
                 // later session delivers the records again.
-                if let Some(path) = journal {
+                let updates = match journal {
+                    Some(_) => Self::journal_updates(&records, &touched),
+                    None => Vec::new(),
+                };
+                if let Some(path) = journal.filter(|_| !updates.is_empty()) {
+                    // The intent first: after a stop between the two
+                    // writes, the journal holds lines that came from these
+                    // records, and the restart must not take them for
+                    // unpublished local issuance (see
+                    // `recover_journal_commit`).
+                    let intent: Vec<VersionedRecord> =
+                        updates.iter().map(|(record, _)| record.clone()).collect();
+                    if let Err(e) = self.persist_journal_intent(intent).await {
+                        Self::rollback(&mut records, &touched);
+                        return Err(e);
+                    }
                     let owner_hex = hex::encode(owner.0);
-                    for (value, published) in Self::journal_updates(&records, &touched) {
+                    for (record, published) in &updates {
                         if let Err(e) = self
-                            .apply_journal_value(path, &owner_hex, &value, published)
+                            .apply_journal_value(path, &owner_hex, &record.value, published.clone())
                             .await
                         {
                             Self::rollback(&mut records, &touched);
@@ -1649,6 +1686,9 @@ impl OwnerSyncStore {
                 }
                 match self.persist_records(&records).await {
                     Ok(()) => {
+                        if !updates.is_empty() {
+                            self.remove_journal_intent().await;
+                        }
                         drop(records);
                         self.kick();
                         Ok(outcome)
@@ -1676,21 +1716,101 @@ impl OwnerSyncStore {
         }
     }
 
-    /// The `IssuanceJournal` values a committed batch changed: each is the
-    /// key's value now, with the value the register held before the batch.
+    /// The `IssuanceJournal` records a committed batch changed: each is the
+    /// key's record now, with the value the register held before the batch.
     fn journal_updates(
         records: &BTreeMap<(SyncKind, String), VersionedRecord>,
         touched: &BTreeMap<(SyncKind, String), Option<VersionedRecord>>,
-    ) -> Vec<(SyncValue, Option<SyncValue>)> {
+    ) -> Vec<(VersionedRecord, Option<SyncValue>)> {
         touched
             .iter()
             .filter(|((kind, _), _)| *kind == SyncKind::IssuanceJournal)
             .filter_map(|(key, previous)| {
-                let now = records.get(key)?.value.clone();
+                let now = records.get(key)?;
                 let previous = previous.as_ref().map(|r| r.value.clone());
-                (previous.as_ref() != Some(&now)).then_some((now, previous))
+                (previous.as_ref() != Some(&now.value)).then(|| (now.clone(), previous))
             })
             .collect()
+    }
+
+    /// Durably record the `IssuanceJournal` records a commit is about to
+    /// write to the journal file and then to the register (#1542).
+    async fn persist_journal_intent(&self, records: Vec<VersionedRecord>) -> Result<(), SyncError> {
+        let bytes = serde_json::to_vec(&PersistedRecords { records })
+            .map_err(|e| SyncError::Io(format!("encode journal intent: {e}")))?;
+        Self::write_atomically(&self.dir.join(JOURNAL_INTENT_FILE), &bytes, false)
+            .await
+            .map_err(|e| match e {
+                DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
+                    SyncError::Io(format!("persist journal intent: {io}"))
+                }
+            })
+    }
+
+    /// Remove the journal intent once its records are in the register. A
+    /// left-over intent is harmless: its recovery finds the records already
+    /// there.
+    async fn remove_journal_intent(&self) {
+        match tokio::fs::remove_file(self.dir.join(JOURNAL_INTENT_FILE)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to remove the journal intent");
+            }
+        }
+    }
+
+    /// #1542: finish a commit that stopped after its journal intent was
+    /// durable but before its register write. The caller holds
+    /// `journal_apply`, and calls this before any other change of the
+    /// `IssuanceJournal` register or any reconcile of the journal.
+    ///
+    /// Without this, the journal can hold a line that came from the
+    /// register (from another device) while the register still holds the
+    /// value before it. That line then looks like a local issuance that no
+    /// reconcile has published: a later same-second record is not
+    /// appended, and the reconcile publishes the older line over it. The
+    /// recovery commits the original signed records again, so the register
+    /// keeps their versions and every device keeps the same order.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] or [`SyncError::Poisoned`] when the recovery
+    /// cannot be written. The intent stays for the next attempt.
+    async fn recover_journal_commit(&self, owner: &UserId) -> Result<(), SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
+        let Some(journal) = self.journal_file.get() else {
+            return Ok(());
+        };
+        let bytes = match tokio::fs::read(self.dir.join(JOURNAL_INTENT_FILE)).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(SyncError::Io(format!("read journal intent: {e}"))),
+        };
+        let batch = match serde_json::from_slice::<PersistedRecords>(&bytes) {
+            Ok(intent) => intent.records,
+            Err(e) => {
+                tracing::warn!(target: "x0x::owner_sync", error = %e, "dropped an undecodable journal intent");
+                self.remove_journal_intent().await;
+                return Ok(());
+            }
+        };
+        match self.commit_locked(batch, owner, Some(journal)).await {
+            Ok(_) => {
+                self.remove_journal_intent().await;
+                Ok(())
+            }
+            Err(e @ (SyncError::Io(_) | SyncError::Poisoned(_))) => Err(e),
+            Err(e) => {
+                // The records no longer verify (for example, after an owner
+                // rotation): no session would deliver them either.
+                tracing::warn!(target: "x0x::owner_sync", error = %e, "dropped an unusable journal intent");
+                self.remove_journal_intent().await;
+                Ok(())
+            }
+        }
     }
 
     /// Restore the in-memory map to its pre-batch state: every touched key
@@ -3292,7 +3412,9 @@ impl OwnerSyncService {
 /// register (kind 4 of the local reconcile). A failed mint is logged and
 /// retried next pass. Holds `OwnerSyncStore::journal_apply` from the
 /// journal read to the last mint, so no inbound commit changes the
-/// register between them (#1542).
+/// register between them (#1542). It first finishes an interrupted commit
+/// (`recover_journal_commit`), and it mints only from a durable read of
+/// the journal.
 async fn mint_journal_lines(
     store: &OwnerSyncStore,
     path: &Path,
@@ -3300,8 +3422,20 @@ async fn mint_journal_lines(
     machine: MachineId,
 ) {
     let _journal_apply = store.journal_apply.lock().await;
+    if let Err(e) = store.recover_journal_commit(&owner_kp.user_id()).await {
+        tracing::warn!(target: "x0x::owner_sync", error = %e, "journal commit recovery failed");
+        return;
+    }
     let owner_hex = hex::encode(owner_kp.user_id().0);
-    let lines = crate::profile::IssuedCertRecord::load(path).await;
+    // A durable read: a line a host crash can take back must not reach the
+    // register first.
+    let lines = match crate::profile::IssuedCertRecord::load_durable(path).await {
+        Ok(lines) => lines,
+        Err(e) => {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "journal is not durable");
+            return;
+        }
+    };
     #[cfg(test)]
     store.pause_after_journal_read().await;
     for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {

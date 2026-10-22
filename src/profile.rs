@@ -17,6 +17,7 @@
 //! Both files are plain JSON with `#[serde(default)]` on every field so
 //! older payloads (and partial PUT bodies) deserialize without error.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -297,10 +298,18 @@ pub fn cert_storage_digest(cert: &crate::identity::AgentCertificate) -> String {
 }
 
 /// Serialises every read-modify-write of the issuance journal in this
-/// process ([`IssuedCertRecord::append`], [`IssuedCertRecord::append_when`]).
-/// An append is a whole-file rewrite, so two writers that interleave lose a
-/// line or put an older line last.
-static JOURNAL_WRITER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// process ([`IssuedCertRecord::append`], [`IssuedCertRecord::append_when`])
+/// and every durable read ([`IssuedCertRecord::load_durable`]). An append
+/// is a whole-file rewrite, so two writers that interleave lose a line or
+/// put an older line last.
+///
+/// The set holds each journal whose visible bytes this process made
+/// durable (#1542). Any other journal may show bytes that a host crash can
+/// take back: an append renamed its new file into place but its directory
+/// fsync failed, or an earlier process wrote it. A durable read or a
+/// decided append makes such a journal durable before it uses its lines.
+static JOURNAL_WRITER: tokio::sync::Mutex<BTreeSet<PathBuf>> =
+    tokio::sync::Mutex::const_new(BTreeSet::new());
 
 impl IssuedCertRecord {
     /// Build the record for a certificate about to be journaled, scoped to
@@ -360,19 +369,42 @@ impl IssuedCertRecord {
     /// the issuance call sites (warn + continue): a missing journal line
     /// degrades the roster to discovery-derived, it never blocks startup.
     pub async fn append(path: &Path, record: &Self) -> std::io::Result<()> {
-        let _writer = JOURNAL_WRITER.lock().await;
-        Self::append_locked(path, record).await
+        let mut durable = JOURNAL_WRITER.lock().await;
+        Self::append_locked(path, record, &mut durable).await
     }
 
     /// [`Self::append`] for a caller that holds `JOURNAL_WRITER`.
-    async fn append_locked(path: &Path, record: &Self) -> std::io::Result<()> {
+    async fn append_locked(
+        path: &Path,
+        record: &Self,
+        durable: &mut BTreeSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        let line = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
+        // Append via read-modify-write under a temp+rename: JSONL appends
+        // through File::open(append) are single-write atomic in practice,
+        // but the temp+rename shape keeps the file NEVER partially written
+        // even on weird filesystems.
+        let mut content = tokio::fs::read(path).await.unwrap_or_default();
+        content.extend_from_slice(line.as_bytes());
+        content.push(b'\n');
+        Self::replace_locked(path, &content, durable).await
+    }
+
+    /// Replace the journal at `path` with `content`, durably. The caller
+    /// holds `JOURNAL_WRITER`. Once the rename is done, the new bytes are
+    /// visible; only once the directory fsync is done are they recorded
+    /// in `durable`.
+    async fn replace_locked(
+        path: &Path,
+        content: &[u8],
+        durable: &mut BTreeSet<PathBuf>,
+    ) -> std::io::Result<()> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
-        let line = serde_json::to_string(record)
-            .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
         let tmp = path.with_file_name(format!(
             ".{}.{}.journal.tmp",
             path.file_name().map_or_else(
@@ -381,14 +413,7 @@ impl IssuedCertRecord {
             ),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        // Append via read-modify-write under a temp+rename: JSONL appends
-        // through File::open(append) are single-write atomic on practice,
-        // but the temp+rename shape keeps the file NEVER partially written
-        // even on weird filesystems.
-        let mut content = tokio::fs::read(path).await.unwrap_or_default();
-        content.extend_from_slice(line.as_bytes());
-        content.push(b'\n');
-        if let Err(e) = Self::write_synced(&tmp, &content).await {
+        if let Err(e) = Self::write_synced(&tmp, content).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
@@ -396,6 +421,7 @@ impl IssuedCertRecord {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
+        durable.remove(path);
         #[cfg(test)]
         journal_faults::after_rename(path).await?;
         // #1542: owner sync persists its register only after this append
@@ -405,9 +431,29 @@ impl IssuedCertRecord {
         if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::File::open(dir).await?.sync_all().await?;
         }
+        durable.insert(path.to_path_buf());
         #[cfg(test)]
         crash_sim::note_durable(path);
         Ok(())
+    }
+
+    /// Make the journal at `path` durable unless this process already did.
+    /// The caller holds `JOURNAL_WRITER`. A new write of the same bytes is
+    /// used, not a second fsync of the old file: after a failed fsync, a
+    /// later fsync can report success for data that was not written.
+    async fn make_durable_locked(
+        path: &Path,
+        durable: &mut BTreeSet<PathBuf>,
+    ) -> std::io::Result<()> {
+        if durable.contains(path) {
+            return Ok(());
+        }
+        match tokio::fs::read(path).await {
+            Ok(content) => Self::replace_locked(path, &content, durable).await,
+            // No journal: no line to publish.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Write `bytes` to a new file at `path` and fsync it.
@@ -433,13 +479,30 @@ impl IssuedCertRecord {
         F: FnOnce(Vec<Self>) -> Fut,
         Fut: std::future::Future<Output = Option<Self>>,
     {
-        let _writer = JOURNAL_WRITER.lock().await;
+        let mut durable = JOURNAL_WRITER.lock().await;
+        // #1542: the decision may skip the append because the line is
+        // already there, and the caller then writes its register. So the
+        // lines it decides from must be durable.
+        Self::make_durable_locked(path, &mut durable).await?;
         let existing = Self::load(path).await;
         let Some(record) = decide(existing).await else {
             return Ok(false);
         };
-        Self::append_locked(path, &record).await?;
+        Self::append_locked(path, &record, &mut durable).await?;
         Ok(true)
+    }
+
+    /// Load the journal for a writer that publishes its lines (owner
+    /// sync's reconcile, #1542). Unlike [`Self::load`], it waits for any
+    /// append in progress, and it makes the journal durable first, so a
+    /// host crash cannot take back a line it returned.
+    ///
+    /// # Errors
+    /// Returns the IO error when the journal cannot be made durable.
+    pub(crate) async fn load_durable(path: &Path) -> std::io::Result<Vec<Self>> {
+        let mut durable = JOURNAL_WRITER.lock().await;
+        Self::make_durable_locked(path, &mut durable).await?;
+        Ok(Self::load(path).await)
     }
 
     /// Load the journal; malformed lines are skipped (the journal is
