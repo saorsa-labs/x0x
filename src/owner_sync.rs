@@ -876,6 +876,14 @@ pub struct OwnerSyncStore {
     /// the journal until the test releases it.
     #[cfg(test)]
     journal_read_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: fail every synced journal append.
+    #[cfg(test)]
+    fail_journal_append: std::sync::atomic::AtomicBool,
+    /// Test injection: stop the next journal-applying commit after the
+    /// first of its two writes (register and journal file), as a crash
+    /// between them would.
+    #[cfg(test)]
+    stop_between_journal_writes: std::sync::atomic::AtomicBool,
     /// ADR-0074 §4: woken when the owner device set changes (an enrollment
     /// or unenrollment).
     device_change_notify: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
@@ -990,6 +998,10 @@ impl OwnerSyncStore {
             journal_check_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             journal_read_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_journal_append: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            stop_between_journal_writes: std::sync::atomic::AtomicBool::new(false),
             device_change_notify: std::sync::Mutex::new(None),
         })
     }
@@ -1160,6 +1172,14 @@ impl OwnerSyncStore {
         self.poisoned_reason().map(SyncError::Poisoned)
     }
 
+    /// Whether the test armed a stop between a commit's two writes;
+    /// disarms it.
+    #[cfg(test)]
+    fn stop_after_first_journal_write(&self) -> bool {
+        self.stop_between_journal_writes
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Hold the next synced journal append after its decision read: it
     /// signals `checked` and then waits for `release`.
     #[cfg(test)]
@@ -1237,6 +1257,14 @@ impl OwnerSyncStore {
         else {
             return;
         };
+        #[cfg(test)]
+        if self
+            .fail_journal_append
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(target: "x0x::owner_sync", "failed to append synced journal line: injected");
+            return;
+        }
         let published_digest = match published {
             Some(SyncValue::IssuanceJournal { cert_digest, .. }) => Some(cert_digest),
             _ => None,
@@ -1600,6 +1628,10 @@ impl OwnerSyncStore {
                     Ok(()) => {
                         let journal_updates = Self::journal_updates(&records, &touched);
                         drop(records);
+                        #[cfg(test)]
+                        if journal.is_some() && self.stop_after_first_journal_write() {
+                            return Err(SyncError::Io("stopped between writes".into()));
+                        }
                         if let Some(path) = journal {
                             let owner_hex = hex::encode(owner.0);
                             for (value, published) in journal_updates {
@@ -6378,6 +6410,101 @@ mod issuance_journal_sync_tests {
             local.stored_value(SyncKind::IssuanceJournal, "bb").await,
             Some(d2),
             "the register must publish the local renewal"
+        );
+    }
+
+    /// Codex review of #1545 (deee2c9), P2: this device holds `d1@100` in
+    /// its register and journal. An inbound renewal `d2@100` commits, but
+    /// its journal append fails. A later session delivers `d2` again. The
+    /// next reconcile must not mint `d1` over the register: if the
+    /// register keeps `d2` while the journal keeps `d1`, the reconcile
+    /// publishes `d1` at a higher version and every device rolls back.
+    #[tokio::test]
+    async fn a_failed_journal_append_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (local, journal) = journal_device(&dir.path().join("local")).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+
+        local
+            .fail_journal_append
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r2.clone()], &owner.user_id()).await;
+        local
+            .fail_journal_append
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // A later session delivers the renewal again.
+        deliver(&local, &owner, r2).await;
+
+        // The next reconcile pass.
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (deee2c9), P2: as above, but the daemon stops
+    /// between the commit's register write and its journal write. After a
+    /// restart, the reconcile must not mint `d1` over the register.
+    #[tokio::test]
+    async fn a_restart_between_the_commit_writes_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r2], &owner.user_id()).await;
+        drop(local);
+
+        // The restart, then the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
         );
     }
 }
