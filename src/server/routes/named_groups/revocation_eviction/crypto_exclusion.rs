@@ -3147,6 +3147,9 @@ mod daemon_tests {
     #[tokio::test]
     async fn a_written_frame_without_survivor_convergence_keeps_the_delivery() -> Result<()> {
         let fx = gss_leave_fixture().await?;
+        // The survivor advertises the bit before the commit: the commit's
+        // own detached delivery round may run first, and it must write.
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
         fx.state
             .named_group_test_recorders
             .catchup_page_force_ok
@@ -3172,7 +3175,6 @@ mod daemon_tests {
         let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
         let survivor = fx.replica.agent.agent_id();
         let survivor_hex = hex::encode(survivor.as_bytes());
-        advertise_crypto_exclusion(&fx.state, survivor);
         let phase = |state: Arc<AppState>| {
             let key = key.clone();
             async move {
@@ -3181,7 +3183,8 @@ mod daemon_tests {
             }
         };
 
-        // The first round writes the frame; the carrier takes it.
+        // The first round (the commit's own, or this one) writes the
+        // frame; the carrier takes it.
         delivery_round(&fx.state, &key, &survivor).await;
         assert_eq!(
             delivery_status(&fx.state, &key, &survivor).await,
