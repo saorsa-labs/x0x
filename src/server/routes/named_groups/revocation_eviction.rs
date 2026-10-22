@@ -468,6 +468,26 @@ fn classify_head_report(info: &GroupInfo, reported: &str) -> HeadReport {
     }
 }
 
+/// The heads a responder that reports `reported` holds (§3 survivor
+/// convergence): the reported head and its ancestors on the local
+/// retained chain. A head off the local chain counts only for itself.
+fn installed_heads(info: &GroupInfo, reported: &str) -> BTreeSet<String> {
+    let mut heads = BTreeSet::from([reported.to_string()]);
+    let mut at = reported;
+    while let Some(prev) = info
+        .commit_log
+        .iter()
+        .find(|retained| retained.commit.state_hash == at)
+        .and_then(|retained| retained.commit.prev_state_hash.as_deref())
+    {
+        if !heads.insert(prev.to_string()) {
+            break;
+        }
+        at = prev;
+    }
+    heads
+}
+
 /// Record one verified, applied, non-truncated catch-up page answer. A
 /// holder at the local head or behind it on the local chain completes the
 /// round: it answered and holds no later head. A holder at a head this
@@ -731,17 +751,18 @@ pub(in crate::server) async fn note_catchup_head(
                     info.stable_group_id().to_string(),
                     info.state_hash.clone(),
                     classify_head_report(info, reported),
+                    installed_heads(info, reported),
                 )
             })
         })
     };
-    let Some((stable, head, report)) = current else {
+    let Some((stable, head, report, installed)) = current else {
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
     // §3: the answer is also the sender's convergence evidence for the
-    // S4 deliveries of this group whose result is the reported head.
-    crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), reported);
+    // S4 deliveries of this group whose result it holds.
+    crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), &installed);
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;

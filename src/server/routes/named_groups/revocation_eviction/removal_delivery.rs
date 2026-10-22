@@ -535,13 +535,13 @@ pub(super) async fn drive(state: &Arc<AppState>) {
 }
 
 /// §3 survivor convergence ([`crypto_exclusion::note_survivor_head`]):
-/// `sender` reported `reported` as its head, so it converged in each
-/// removal delivery of `stable_group_id` whose result is that head.
+/// `sender` holds each head in `installed`, so it converged in each
+/// removal delivery of `stable_group_id` whose result is one of them.
 pub(super) fn note_survivor_head(
     removals: &mut HashMap<EvictionKey, RemovalDelivery>,
     stable_group_id: &str,
     sender: &[u8; 32],
-    reported: &str,
+    installed: &std::collections::BTreeSet<String>,
 ) {
     for (key, delivery) in removals.iter_mut() {
         if key.stable_group_id == stable_group_id {
@@ -549,7 +549,7 @@ pub(super) fn note_survivor_head(
                 &mut delivery.recipients,
                 &delivery.result_head,
                 sender,
-                reported,
+                installed,
             );
         }
     }

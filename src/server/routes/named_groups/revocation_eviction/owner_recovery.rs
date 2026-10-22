@@ -40,8 +40,8 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
 use super::crypto_exclusion::{
-    apply_round, finish_attempt, guarded_admission_for, next_attempt, write_allowed, HeadRule,
-    RecipientDelivery, RoundUpdate,
+    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, next_attempt,
+    note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::rebind::replay_log;
 
@@ -201,8 +201,9 @@ impl OrcState {
     }
 
     /// Install one commit round's planned statuses, if the delivery still
-    /// holds the commit with `result_head`, and drop a delivery that is
-    /// complete. Returns the sends to start, after this.
+    /// holds the commit with `result_head`, and drop a delivery whose
+    /// recipients all converged (ADR 0110 §3: survivor convergence, not a
+    /// write, proves delivery). Returns the sends to start, after this.
     fn install_commit_round(
         &mut self,
         stable: &str,
@@ -217,11 +218,7 @@ impl OrcState {
             return Vec::new();
         };
         let started = apply_round(&mut stored.recipients, updates);
-        if stored
-            .recipients
-            .values()
-            .all(|status| *status == RecipientDelivery::Sent)
-        {
+        if all_converged(&stored.recipients) {
             self.deliveries.remove(stable);
         }
         started
@@ -243,6 +240,25 @@ impl OrcState {
             }
             _ => false,
         }
+    }
+}
+
+/// §3 survivor convergence ([`super::crypto_exclusion::note_survivor_head`]):
+/// `sender` holds each head in `installed`, so it converged in the commit
+/// delivery of `stable_group_id` when its result is one of them.
+pub(super) fn note_survivor_head(
+    orc: &mut OrcState,
+    stable_group_id: &str,
+    sender: &[u8; 32],
+    installed: &BTreeSet<String>,
+) {
+    if let Some(delivery) = orc.deliveries.get_mut(stable_group_id) {
+        note_converged(
+            &mut delivery.recipients,
+            &delivery.result_head,
+            sender,
+            installed,
+        );
     }
 }
 
@@ -1337,6 +1353,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             .collect();
         let mut updates: Vec<RoundUpdate> = Vec::new();
         let mut refreshes: Vec<AgentId> = Vec::new();
+        let mut head_asks: Vec<AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
             let observed = *status;
             if !active.contains(recipient) {
@@ -1349,11 +1366,17 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+                RecipientDelivery::Converged | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
             let agent = AgentId(*recipient);
+            // §3: a written commit is not an installed one. Ask the
+            // survivor for its head and send the commit again, admitted
+            // afresh, until it converges.
+            if *status == RecipientDelivery::Sent {
+                head_asks.push(agent);
+            }
             if !write_allowed(state, &agent).await {
                 continue;
             }
@@ -1382,6 +1405,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             .await
             .orc
             .install_commit_round(&stable, &delivery.result_head, updates);
+        ask_heads(state, &stable, head_asks);
         for (recipient, attempt) in started {
             spawn_commit_send(state, &stable, &delivery, AgentId(recipient), attempt);
         }
@@ -2175,6 +2199,71 @@ mod tests {
         }
     }
 
+    /// ADR 0110 §3 (#1508 review r8 P1): a successful write is `Sent`,
+    /// not delivered. A survivor that took the commit but did not install
+    /// it keeps the delivery: the next round sends it again. Only the
+    /// survivor's head report that holds the result head ends it.
+    #[test]
+    fn a_written_recovery_commit_without_install_keeps_retrying() {
+        let survivor = [7; 32];
+        let mut orc = OrcState::default();
+        orc.deliveries
+            .insert("g".into(), commit_delivery("head-1", survivor));
+        let round = |orc: &mut OrcState, observed| {
+            orc.install_commit_round(
+                "g",
+                "head-1",
+                vec![RoundUpdate {
+                    recipient: survivor,
+                    observed,
+                    next: Some(RecipientDelivery::InFlight(next_attempt())),
+                }],
+            )
+        };
+        let &[(_, attempt)] = round(&mut orc, RecipientDelivery::Due).as_slice() else {
+            panic!("one send starts");
+        };
+        assert!(orc.finish_commit_attempt(
+            "g",
+            "head-1",
+            &survivor,
+            attempt,
+            RecipientDelivery::Sent
+        ));
+        // The receiver crashed before it persisted the commit: no install.
+        // A round that starts nothing keeps the delivery.
+        assert!(orc
+            .install_commit_round("g", "head-1", Vec::new())
+            .is_empty());
+        assert!(
+            orc.deliveries.contains_key("g"),
+            "a write without an install ended the delivery"
+        );
+        let resend = round(&mut orc, RecipientDelivery::Sent);
+        assert_eq!(
+            resend.len(),
+            1,
+            "a write without an install is retried, not complete"
+        );
+        assert!(orc.deliveries.contains_key("g"));
+        // The survivor's verified head report names a later head on the
+        // chain through the result: it converged, and the delivery ends.
+        let installed = BTreeSet::from(["head-1".to_string(), "head-2".to_string()]);
+        let &[(_, resent)] = resend.as_slice() else {
+            panic!("one resend starts");
+        };
+        assert!(orc.finish_commit_attempt(
+            "g",
+            "head-1",
+            &survivor,
+            resent,
+            RecipientDelivery::Sent
+        ));
+        note_survivor_head(&mut orc, "g", &survivor, &installed);
+        orc.install_commit_round("g", "head-1", Vec::new());
+        assert!(!orc.deliveries.contains_key("g"));
+    }
+
     fn mandate_delivery(mandate_id: &str, promoted: [u8; 32]) -> MandateDelivery {
         MandateDelivery {
             bytes: Arc::new(vec![4, 5, 6]),
@@ -2235,9 +2324,7 @@ mod tests {
             }],
         );
         assert!(late.is_empty());
-        // The complete delivery was dropped by that round, so a duplicate
-        // completion of the same attempt writes nothing.
-        assert!(!orc.deliveries.contains_key("g"));
+        // A duplicate completion of the same attempt writes nothing.
         assert!(!orc.finish_commit_attempt(
             "g",
             "head-1",
@@ -2245,6 +2332,8 @@ mod tests {
             attempt,
             RecipientDelivery::Due
         ));
+        // Reset: the replaced-commit case below starts from a fresh delivery.
+        orc.deliveries.remove("g");
 
         // An attempt for a replaced commit (another result head) is ignored.
         orc.deliveries
