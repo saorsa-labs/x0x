@@ -876,6 +876,11 @@ pub struct OwnerSyncStore {
     /// The local issuance journal that accepted `IssuanceJournal` records
     /// are applied to (set by the service; unset in a bare store).
     journal_file: std::sync::OnceLock<PathBuf>,
+    /// #1542: records that `recover_journal_commit` committed and that no
+    /// caller has applied to live daemon state yet. A recovered record is
+    /// not in the accepted list of the commit that runs the recovery, so
+    /// the daemon takes it from here ([`Self::take_recovered`]).
+    recovered: std::sync::Mutex<Vec<VersionedRecord>>,
     /// Test injection: hold a synced journal append after its decision
     /// read until the test releases it.
     #[cfg(test)]
@@ -1002,6 +1007,7 @@ impl OwnerSyncStore {
             canonical_home_gate: tokio::sync::RwLock::new(()),
             journal_apply: tokio::sync::Mutex::new(()),
             journal_file: std::sync::OnceLock::new(),
+            recovered: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             journal_check_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1761,6 +1767,44 @@ impl OwnerSyncStore {
         }
     }
 
+    /// #1542: finish an interrupted commit (`recover_journal_commit`)
+    /// outside of a commit, for the reconcile pass. The daemon calls this
+    /// before it mints any record from live state: a mint before the
+    /// recovery can put an old live value over a recovered record.
+    ///
+    /// # Errors
+    ///
+    /// See `recover_journal_commit`.
+    pub(crate) async fn recover_interrupted_commit(&self, owner: &UserId) -> Result<(), SyncError> {
+        let _journal_apply = self.journal_apply.lock().await;
+        self.recover_journal_commit(owner).await
+    }
+
+    /// Take the records that a recovery committed and that are still the
+    /// register's winners, to apply them to live daemon state. A record
+    /// that a later commit replaced is dropped: that commit applies its
+    /// own record.
+    pub(crate) async fn take_recovered(&self) -> Vec<VersionedRecord> {
+        let taken = std::mem::take(
+            &mut *self
+                .recovered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if taken.is_empty() {
+            return taken;
+        }
+        let records = self.records.read().await;
+        taken
+            .into_iter()
+            .filter(|r| {
+                records
+                    .get(&(r.kind, r.key.clone()))
+                    .is_some_and(|stored| stored.record_hash() == r.record_hash())
+            })
+            .collect()
+    }
+
     /// #1542: finish a commit that stopped after its journal intent was
     /// durable but before its register write. The caller holds
     /// `journal_apply`, and calls this before any other change of the
@@ -1799,8 +1843,12 @@ impl OwnerSyncStore {
             }
         };
         match self.commit_locked(batch, owner, Some(journal)).await {
-            Ok(_) => {
+            Ok(outcome) => {
                 self.remove_journal_intent().await;
+                self.recovered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(outcome.accepted);
                 Ok(())
             }
             Err(e @ (SyncError::Io(_) | SyncError::Poisoned(_))) => Err(e),
@@ -2165,7 +2213,13 @@ where
     .await
     .map_err(|_| SyncError::SessionTimeout)??;
     let owner_id = owner.user_id();
-    let outcome = store.commit_batch(pending.verified, &owner_id).await?;
+    let outcome = store.commit_batch(pending.verified, &owner_id).await;
+    // #1542: a recovery in the commit can commit records of an earlier,
+    // interrupted commit. Apply them even when this commit fails.
+    for record in store.take_recovered().await {
+        on_accept(&record);
+    }
+    let outcome = outcome?;
     let mut summary = pending.summary;
     summary.accepted = outcome.accepted.len();
     summary.superseded = outcome.superseded;
@@ -3253,6 +3307,16 @@ impl OwnerSyncService {
         let local_machine = self.agent.machine_id();
         let local_hex = hex::encode(local_machine.0);
 
+        // #1542: finish an interrupted commit and apply its records before
+        // any mint from live state, or the mint puts the old live value
+        // over a recovered record at a higher version.
+        let recovery = self
+            .store
+            .recover_interrupted_commit(&owner_kp.user_id())
+            .await;
+        self.apply_recovered().await;
+        recovery?;
+
         // Kinds 1 + 2 + 3: profile names and the Home pointer, via the
         // daemon view when attached.
         if let Some(view) = self.view() {
@@ -3284,8 +3348,16 @@ impl OwnerSyncService {
         // Kind 4: issuance journal lines (latest per agent, owner-scoped).
         if let Some(path) = self.journal_path.as_ref() {
             mint_journal_lines(&self.store, path, owner_kp, local_machine).await;
+            self.apply_recovered().await;
         }
         Ok(())
+    }
+
+    /// Apply the records that a recovery committed (#1542).
+    async fn apply_recovered(&self) {
+        for record in self.store.take_recovered().await {
+            self.apply_record(&record);
+        }
     }
 
     /// The owner's CANONICAL Home per the Tier-1 `("home")` register (#449).

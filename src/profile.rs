@@ -311,6 +311,10 @@ pub fn cert_storage_digest(cert: &crate::identity::AgentCertificate) -> String {
 static JOURNAL_WRITER: tokio::sync::Mutex<BTreeSet<PathBuf>> =
     tokio::sync::Mutex::const_new(BTreeSet::new());
 
+/// A held [`JOURNAL_WRITER`]. It is owned, not borrowed, so that a journal
+/// write can move it into the task that does the I/O.
+type JournalWriter = tokio::sync::MutexGuard<'static, BTreeSet<PathBuf>>;
+
 impl IssuedCertRecord {
     /// Build the record for a certificate about to be journaled, scoped to
     /// the issuing owner.
@@ -369,15 +373,14 @@ impl IssuedCertRecord {
     /// the issuance call sites (warn + continue): a missing journal line
     /// degrades the roster to discovery-derived, it never blocks startup.
     pub async fn append(path: &Path, record: &Self) -> std::io::Result<()> {
-        let mut durable = JOURNAL_WRITER.lock().await;
-        Self::append_locked(path, record, &mut durable).await
+        Self::append_locked(path, record, JOURNAL_WRITER.lock().await).await
     }
 
     /// [`Self::append`] for a caller that holds `JOURNAL_WRITER`.
     async fn append_locked(
         path: &Path,
         record: &Self,
-        durable: &mut BTreeSet<PathBuf>,
+        writer: JournalWriter,
     ) -> std::io::Result<()> {
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
@@ -388,14 +391,32 @@ impl IssuedCertRecord {
         let mut content = tokio::fs::read(path).await.unwrap_or_default();
         content.extend_from_slice(line.as_bytes());
         content.push(b'\n');
-        Self::replace_locked(path, &content, durable).await
+        Self::replace_locked(path, content, writer).await.map(drop)
     }
 
-    /// Replace the journal at `path` with `content`, durably. The caller
-    /// holds `JOURNAL_WRITER`. Once the rename is done, the new bytes are
-    /// visible; only once the directory fsync is done are they recorded
-    /// in `durable`. The mark is cleared first.
+    /// Replace the journal at `path` with `content`, durably, and give the
+    /// writer back. The write runs in its own task, which owns `writer`
+    /// until the I/O and the durable mark are done. A cancelled caller
+    /// stops only its wait: no other journal writer can run while a
+    /// blocking write of this one can still land (#1542).
     async fn replace_locked(
+        path: &Path,
+        content: Vec<u8>,
+        mut writer: JournalWriter,
+    ) -> std::io::Result<JournalWriter> {
+        let path = path.to_path_buf();
+        tokio::spawn(async move {
+            Self::replace_durably(&path, &content, &mut writer).await?;
+            Ok(writer)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// The I/O of [`Self::replace_locked`]. Once the rename is done, the
+    /// new bytes are visible; only once the directory fsync is done are
+    /// they recorded in `durable`.
+    async fn replace_durably(
         path: &Path,
         content: &[u8],
         durable: &mut BTreeSet<PathBuf>,
@@ -413,10 +434,8 @@ impl IssuedCertRecord {
             ),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        // Clear the durable mark before the first change, not after the
-        // rename: a cancelled caller can drop this future while the
-        // blocking rename still completes, and a stale mark would then
-        // let a durable read publish the unsynced bytes (#1542).
+        // Clear the durable mark before the first change: a failure after
+        // the rename leaves new bytes that are not durable (#1542).
         durable.remove(path);
         if let Err(e) = Self::write_synced(&tmp, content).await {
             let _ = tokio::fs::remove_file(&tmp).await;
@@ -447,15 +466,15 @@ impl IssuedCertRecord {
     /// later fsync can report success for data that was not written.
     async fn make_durable_locked(
         path: &Path,
-        durable: &mut BTreeSet<PathBuf>,
-    ) -> std::io::Result<()> {
-        if durable.contains(path) {
-            return Ok(());
+        writer: JournalWriter,
+    ) -> std::io::Result<JournalWriter> {
+        if writer.contains(path) {
+            return Ok(writer);
         }
         match tokio::fs::read(path).await {
-            Ok(content) => Self::replace_locked(path, &content, durable).await,
+            Ok(content) => Self::replace_locked(path, content, writer).await,
             // No journal: no line to publish.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(writer),
             Err(e) => Err(e),
         }
     }
@@ -495,16 +514,16 @@ impl IssuedCertRecord {
         F: FnOnce(Vec<Self>) -> Fut,
         Fut: std::future::Future<Output = Option<Self>>,
     {
-        let mut durable = JOURNAL_WRITER.lock().await;
+        let writer = JOURNAL_WRITER.lock().await;
         // #1542: the decision may skip the append because the line is
         // already there, and the caller then writes its register. So the
         // lines it decides from must be durable.
-        Self::make_durable_locked(path, &mut durable).await?;
+        let writer = Self::make_durable_locked(path, writer).await?;
         let existing = Self::load(path).await;
         let Some(record) = decide(existing).await else {
             return Ok(false);
         };
-        Self::append_locked(path, &record, &mut durable).await?;
+        Self::append_locked(path, &record, writer).await?;
         Ok(true)
     }
 
@@ -516,8 +535,9 @@ impl IssuedCertRecord {
     /// # Errors
     /// Returns the IO error when the journal cannot be made durable.
     pub(crate) async fn load_durable(path: &Path) -> std::io::Result<Vec<Self>> {
-        let mut durable = JOURNAL_WRITER.lock().await;
-        Self::make_durable_locked(path, &mut durable).await?;
+        let writer = JOURNAL_WRITER.lock().await;
+        // Hold the writer across the load.
+        let _writer = Self::make_durable_locked(path, writer).await?;
         Ok(Self::load(path).await)
     }
 
