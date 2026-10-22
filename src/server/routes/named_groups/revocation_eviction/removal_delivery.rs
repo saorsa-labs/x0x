@@ -14,8 +14,12 @@
 //!   and moves to `committed_delivery_pending`. The `.evs` is fsynced
 //!   before the first publication.
 //! - **Delivery** ([`drive`]). The row stays `committed_delivery_pending`
-//!   until every eligible survivor took the saved event on the pinned
-//!   direct carrier. Each write is guarded egress (§3 L231): ADR 0107's
+//!   until every eligible survivor converged on the result: its own
+//!   verified catch-up answer names the result head
+//!   ([`crypto_exclusion::note_survivor_head`]). A successful write is not
+//!   delivery (§3 "survivor convergence, not a transport ACK, proves
+//!   delivery"); until the survivor converges, each round asks it for its
+//!   head and sends the event again. Each write is guarded egress (§3 L231): ADR 0107's
 //!   serving check, the D60 machine and binding check and the head rule
 //!   run in the pre-phase and again at the write seam. Resends stop once
 //!   the head moves past the result: old crypto material is never sent
@@ -456,6 +460,7 @@ pub(super) async fn drive(state: &Arc<AppState>) {
         let active: std::collections::BTreeSet<[u8; 32]> =
             survivors(&info, &local, &key.target).into_iter().collect();
         let mut updates: Vec<RoundUpdate> = Vec::new();
+        let mut head_asks: Vec<x0x::identity::AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
             let observed = *status;
             if !active.contains(recipient) {
@@ -468,11 +473,17 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+                RecipientDelivery::Converged | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
             let agent = x0x::identity::AgentId(*recipient);
+            // §3: a written event is not a delivered one. Ask the survivor
+            // for its head and send the event again, admitted afresh,
+            // until it converges.
+            if *status == RecipientDelivery::Sent {
+                head_asks.push(agent);
+            }
             if !crypto_exclusion::write_allowed(state, &agent).await {
                 continue;
             }
@@ -491,16 +502,13 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             };
             let started = crypto_exclusion::apply_round(&mut stored.recipients, updates);
             let reshare_epoch = stored.reshare_epoch.take();
-            if stored
-                .recipients
-                .values()
-                .all(|status| *status == RecipientDelivery::Sent)
-            {
+            if crypto_exclusion::all_converged(&stored.recipients) {
                 inner.removals.remove(&key);
                 inner.dirty = true;
             }
             (started, reshare_epoch)
         };
+        crypto_exclusion::ask_heads(state, &key.stable_group_id, head_asks);
         if let Some(epoch) = reshare_epoch {
             // The head is synced and still the result: the survivors get
             // the saved epoch's secret again, once per resume.
@@ -514,6 +522,27 @@ pub(super) async fn drive(state: &Arc<AppState>) {
                 attempt,
                 delivery.result_head.clone(),
                 Arc::clone(&delivery.event),
+            );
+        }
+    }
+}
+
+/// §3 survivor convergence ([`crypto_exclusion::note_survivor_head`]):
+/// `sender` reported `reported` as its head, so it converged in each
+/// removal delivery of `stable_group_id` whose result is that head.
+pub(super) fn note_survivor_head(
+    removals: &mut HashMap<EvictionKey, RemovalDelivery>,
+    stable_group_id: &str,
+    sender: &[u8; 32],
+    reported: &str,
+) {
+    for (key, delivery) in removals.iter_mut() {
+        if key.stable_group_id == stable_group_id {
+            crypto_exclusion::note_converged(
+                &mut delivery.recipients,
+                &delivery.result_head,
+                sender,
+                reported,
             );
         }
     }

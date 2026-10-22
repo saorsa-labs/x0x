@@ -39,7 +39,12 @@
 //!   Resends stop once the head moves past the result (no old crypto
 //!   material after an epoch change). The `InFlight` status of a recipient
 //!   is installed, with a per-attempt token, before its send task starts,
-//!   and a completion writes only over its own token.
+//!   and a completion writes only over its own token. A successful write
+//!   is `Sent`, not delivered (§3 "survivor convergence, not a transport
+//!   ACK, proves delivery"): the recipient is asked for its head and sent
+//!   the frame again on each round until its verified catch-up answer
+//!   names the result head ([`note_survivor_head`]). Only then is it
+//!   `Converged`, and only a delivery whose recipients all converged ends.
 //! - **Restart** (`resume_crypto_exclusions` in the parent). A saved frame
 //!   is resent only after the group's head is synced
 //!   ([`super::group_head_synced`], not elapsed time alone) and only while
@@ -104,8 +109,16 @@ pub(super) enum RecipientDelivery {
     /// A send is running. The token names the attempt: only that
     /// attempt's completion may replace this status.
     InFlight(u64),
-    /// The carrier accepted the frame.
+    /// The carrier accepted the frame. This is not delivery (§3 "survivor
+    /// convergence, not a transport ACK, proves delivery"): the recipient
+    /// can stop before it installs the frame. Each later round asks the
+    /// recipient for its head and sends the frame again, until
+    /// [`Self::Converged`].
     Sent,
+    /// The recipient reported the frame's result as its own head, on a
+    /// verified, applied catch-up answer ([`note_survivor_head`]). Only
+    /// this status ends the recipient's delivery.
+    Converged,
     /// The recipient's current verified advert lacks the bit: stranded
     /// until it upgrades (§6).
     Lacking,
@@ -373,6 +386,77 @@ pub(super) fn finish_attempt(
             true
         }
         _ => false,
+    }
+}
+
+// ─── Survivor convergence (§3) ─────────────────────────────────────────────
+
+/// §3 "survivor convergence, not a transport ACK, proves delivery": a
+/// delivery is complete only when every remaining recipient converged. A
+/// recipient that left the survivors is dropped from the map by the round.
+pub(super) fn all_converged(recipients: &BTreeMap<[u8; 32], RecipientDelivery>) -> bool {
+    recipients
+        .values()
+        .all(|status| *status == RecipientDelivery::Converged)
+}
+
+/// Record that `sender` reported `reported` as its head. A recipient of a
+/// delivery whose result is `reported` converged: it installed the
+/// exclusion. A running attempt is replaced too, so its late completion
+/// (it writes only over its own `InFlight` token) changes nothing.
+pub(super) fn note_converged(
+    recipients: &mut BTreeMap<[u8; 32], RecipientDelivery>,
+    result_head: &str,
+    sender: &[u8; 32],
+    reported: &str,
+) {
+    if result_head == reported {
+        if let Some(status) = recipients.get_mut(sender) {
+            *status = RecipientDelivery::Converged;
+        }
+    }
+}
+
+/// §3 survivor convergence for the S4 deliveries of one group. The
+/// catch-up response handler reports each verified, applied answer
+/// through [`super::note_catchup_head`]; that answer names the
+/// responder's own head. It is the convergence evidence for the
+/// crypto-only exclusion deliveries and the saved-removal deliveries of
+/// `stable_group_id` whose result is that head.
+pub(super) fn note_survivor_head(
+    inner: &mut super::S4Inner,
+    stable_group_id: &str,
+    sender: &[u8; 32],
+    reported: &str,
+) {
+    for (key, delivery) in &mut inner.ce.deliveries {
+        if key.stable_group_id == stable_group_id {
+            note_converged(
+                &mut delivery.recipients,
+                &delivery.result_head,
+                sender,
+                reported,
+            );
+        }
+    }
+    super::removal_delivery::note_survivor_head(
+        &mut inner.removals,
+        stable_group_id,
+        sender,
+        reported,
+    );
+}
+
+/// Ask each of `peers` for a catch-up page of `group_id`, on the existing
+/// request path, detached (an offline peer must not hold the worker).
+/// The answer reports the peer's head ([`note_survivor_head`]).
+pub(super) fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<AgentId>) {
+    for peer in peers {
+        let task_state = Arc::clone(state);
+        let group_id = group_id.to_string();
+        let _spawned = state.spawn_detached(async move {
+            super::super::request_treekem_catchup_page(&task_state, &group_id, &peer).await;
+        });
     }
 }
 
@@ -1062,6 +1146,7 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             survivors(&info, &local, &key.target).into_iter().collect();
         let mut updates: Vec<RoundUpdate> = Vec::new();
         let mut refreshes: Vec<AgentId> = Vec::new();
+        let mut head_asks: Vec<AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
             let observed = *status;
             if !active.contains(recipient) {
@@ -1074,11 +1159,17 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             }
             if matches!(
                 status,
-                RecipientDelivery::Sent | RecipientDelivery::InFlight(_)
+                RecipientDelivery::Converged | RecipientDelivery::InFlight(_)
             ) {
                 continue;
             }
             let agent = AgentId(*recipient);
+            // §3: a written frame is not a delivered one. Ask the
+            // recipient for its head (its convergence evidence) and send
+            // the frame again, admitted afresh, until it converges.
+            if *status == RecipientDelivery::Sent {
+                head_asks.push(agent);
+            }
             if !write_allowed(state, &agent).await {
                 continue;
             }
@@ -1107,16 +1198,13 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
                 continue;
             };
             let started = apply_round(&mut stored.recipients, updates);
-            if stored
-                .recipients
-                .values()
-                .all(|status| *status == RecipientDelivery::Sent)
-            {
+            if all_converged(&stored.recipients) {
                 inner.ce.deliveries.remove(&key);
                 inner.dirty = true;
             }
             started
         };
+        ask_heads(state, &key.stable_group_id, head_asks);
         for (recipient, attempt) in started {
             spawn_send(
                 state,
