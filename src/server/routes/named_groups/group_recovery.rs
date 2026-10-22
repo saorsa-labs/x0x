@@ -6766,6 +6766,241 @@ mod tests {
         Ok(())
     }
 
+    /// The §2 "Conflict" fixture: a group with the owner, an admin
+    /// `signer`, this node and two other members, durable on disk. `links`
+    /// are two owner role-change commits after `base`, and `events` carry
+    /// them. The signer's ATA for both links arms through the request path
+    /// (`arm_from_response`, durable), then the owner's ATA that diverges
+    /// after the first link is recorded as the conflict through the same
+    /// path. The common prefix is the first link.
+    async fn conflict_fixture(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(
+        String,
+        GroupInfo,
+        Vec<RetainedCommit>,
+        Vec<super::super::NamedGroupMetadataEvent>,
+        x0x::identity::AgentKeypair,
+    )> {
+        let local = local_hex(state);
+        let owner = x0x::identity::AgentKeypair::generate()?;
+        let owner_hex = hex::encode(owner.agent_id().as_bytes());
+        let signer = x0x::identity::AgentKeypair::generate()?;
+        let signer_hex = hex::encode(signer.agent_id().as_bytes());
+        let first_hex = "41".repeat(32);
+        let second_hex = "42".repeat(32);
+        let mut base = GroupInfo::new(
+            "adr0109-conflict-routes".to_string(),
+            String::new(),
+            owner.agent_id(),
+            "7109".repeat(16),
+        );
+        for (member, role) in [
+            (&signer_hex, x0x::groups::GroupRole::Admin),
+            (&local, x0x::groups::GroupRole::Member),
+            (&first_hex, x0x::groups::GroupRole::Member),
+            (&second_hex, x0x::groups::GroupRole::Member),
+        ] {
+            base.add_member(member.clone(), role, Some(owner_hex.clone()), None);
+        }
+        base.seal_commit(&owner, 1_000)?;
+        let key = base.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), base.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let mut ahead = base.clone();
+        ahead.set_member_role(&first_hex, x0x::groups::GroupRole::Admin);
+        ahead.seal_commit(&owner, 2_000)?;
+        ahead.set_member_role(&second_hex, x0x::groups::GroupRole::Admin);
+        ahead.seal_commit(&owner, 3_000)?;
+        let links = links_after(&base, &ahead);
+        assert_eq!(links.len(), 2);
+        let stable = base.stable_group_id().to_string();
+        let events = [(&first_hex, &links[0]), (&second_hex, &links[1])]
+            .into_iter()
+            .map(
+                |(agent, link)| super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
+                    group_id: stable.clone(),
+                    revision: link.commit.revision,
+                    actor: owner_hex.clone(),
+                    agent_id: agent.clone(),
+                    role: x0x::groups::GroupRole::Admin,
+                    commit: Some(link.commit.clone()),
+                },
+            )
+            .collect();
+        let active = sign_ata(&signer, &local, &base, &links)?;
+        arm_from_response(state, &key, &base, active.clone()).await;
+        assert_eq!(
+            sidecar_on_disk(state, &stable).await?.active_ata,
+            Some(active.clone()),
+            "the signer's ATA is armed durably"
+        );
+        let conflicting = AdminTerminalAttestation::sign(
+            AtaFields {
+                group: stable.clone(),
+                subject: local.clone(),
+                attested_by: owner_hex.clone(),
+                signer_public_key: hex::encode(owner.public_key().as_bytes()),
+                from_revision: base.state_revision,
+                from_state_hash: base.state_hash.clone(),
+                sequence: vec![links[0].commit.state_hash.clone(), "x2".to_string()],
+                segment_terminal_revision: base.state_revision + 2,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &owner,
+        )?;
+        arm_from_response(state, &key, &base, conflicting).await;
+        let body = sidecar_on_disk(state, &stable).await?;
+        assert!(
+            body.attestation_conflict.is_some(),
+            "the conflict is durable"
+        );
+        assert_eq!(body.active_ata, Some(active));
+        Ok((key, base, links, events, owner))
+    }
+
+    async fn head_of(state: &AppState, key: &str) -> Option<String> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(key)
+            .map(|info| info.state_hash.clone())
+    }
+
+    /// One catch-up page from `sender` carrying `events`.
+    async fn deliver_page(
+        state: &Arc<AppState>,
+        key: &str,
+        sender: AgentId,
+        events: Vec<super::super::NamedGroupMetadataEvent>,
+    ) {
+        super::super::handle_treekem_catchup_response(
+            state,
+            &sender,
+            true,
+            super::super::TreeKemCatchupResponse {
+                message_type: "treekem_catchup_response".to_string(),
+                group_id: key.to_string(),
+                events,
+                truncated: false,
+                responder_state_hash: None,
+            },
+        )
+        .await;
+    }
+
+    /// Codex P1 (#1533 r5, conflict limit), ADR 0109 §2 "Conflict":
+    /// "Nothing past the common prefix applies" holds for every delivery
+    /// route. The ordinary DM / gossip apply (`apply_named_group_metadata_event`)
+    /// takes the link inside the common prefix and refuses the link past
+    /// it; a catch-up page with the link past it is refused too. Before the
+    /// fix only catch-up pages were bounded, and a valid role-change commit
+    /// by DM or gossip applied past the prefix. Inert.
+    #[tokio::test]
+    async fn a_conflict_bounds_every_delivery_route_at_the_common_prefix() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, base, links, events, owner) = conflict_fixture(&state).await?;
+        let mut events = events.into_iter();
+        let (Some(inside), Some(past)) = (events.next(), events.next()) else {
+            anyhow::bail!("two events");
+        };
+        assert_eq!(head_of(&state, &key).await, Some(base.state_hash.clone()));
+        let applied = super::super::apply_named_group_metadata_event(
+            &state,
+            inside,
+            owner.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            applied.accepted,
+            "the link inside the common prefix applies by DM"
+        );
+        assert_eq!(
+            head_of(&state, &key).await,
+            Some(links[0].commit.state_hash.clone())
+        );
+        let applied = super::super::apply_named_group_metadata_event(
+            &state,
+            past.clone(),
+            owner.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            !applied.accepted,
+            "the link past the common prefix is refused by DM / gossip"
+        );
+        assert_eq!(
+            head_of(&state, &key).await,
+            Some(links[0].commit.state_hash.clone()),
+            "nothing past the common prefix applies (DM / gossip)"
+        );
+        deliver_page(&state, &key, owner.agent_id(), vec![past]).await;
+        assert_eq!(
+            head_of(&state, &key).await,
+            Some(links[0].commit.state_hash.clone()),
+            "nothing past the common prefix applies (catch-up page)"
+        );
+        Ok(())
+    }
+
+    /// Codex P1 (#1533 r5, restart), ADR 0109 §2 "Conflict" and §4: the
+    /// conflict keeps its bound across a restart. Arm durably, record the
+    /// conflict, restart before any link applied (drop the state, load the
+    /// files again and run the worker's boot steps), then a catch-up page
+    /// with both links applies only the common prefix. Before the fix load
+    /// reconciliation dropped the active ATA (its head was still its
+    /// `from`), the gate that needs both ATAs was gone, and the page
+    /// applied past the conflict. Inert.
+    #[tokio::test]
+    async fn a_conflict_keeps_its_bound_across_a_restart() -> anyhow::Result<()> {
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, base, links, events, owner) = conflict_fixture(&state).await?;
+        let stable = base.stable_group_id().to_string();
+        let restarted = super::super::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&state.agent),
+        )
+        .await?;
+        drop(state);
+        load_sidecars(&restarted).await;
+        reconcile_loaded_atas(&restarted).await;
+        resume_journals(&restarted).await;
+        ensure_placeholders(&restarted).await;
+        assert_eq!(
+            head_of(&restarted, &key).await,
+            Some(base.state_hash.clone()),
+            "no link applied before the restart"
+        );
+        deliver_page(&restarted, &key, owner.agent_id(), events).await;
+        assert_eq!(
+            head_of(&restarted, &key).await,
+            Some(links[0].commit.state_hash.clone()),
+            "after the restart nothing past the common prefix applies (base {}, second link {})",
+            base.state_hash,
+            links[1].commit.state_hash
+        );
+        let body = sidecar_on_disk(&restarted, &stable).await?;
+        assert!(body.attestation_conflict.is_some());
+        assert!(
+            body.active_ata.is_some(),
+            "the conflict's ATA stays until a re-seat"
+        );
+        Ok(())
+    }
+
     /// A contained record for G4/G5: `signer` (the owner, an Active
     /// admin) committed a rename after `base`; this node holds a marker on
     /// that commit and a verified ATA whose one-link segment ends at it.
