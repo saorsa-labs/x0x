@@ -666,7 +666,9 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
     };
     if info.stable_group_id() != key.stable_group_id
         || info.fork_quarantine.is_some()
-        || !ce::gss_secret_retained(&info, &target_hex)
+        // Open work rotates unless a rotation already excluded the target:
+        // trimmed history is not that proof (#1508 review, Codex P1).
+        || ce::gss_secret_excluded(&info, &target_hex)
         || ng::self_leave_rekey_batch_held()
         || ng::self_leave_rekey_fence_open(group_key)
         || ng::self_leave_rekey_fence_open(info.stable_group_id())
