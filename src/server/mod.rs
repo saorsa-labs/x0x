@@ -1302,6 +1302,9 @@ pub async fn serve_with_options(
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
+        treekem_catchup_serve_slots: Arc::new(tokio::sync::Semaphore::new(
+            routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
+        )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
