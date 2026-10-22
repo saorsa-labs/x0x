@@ -283,6 +283,14 @@ const HEAD_ROUND_REASK: Duration = Duration::from_secs(2);
 /// (D73). A holder that reports a different head is unresolved head
 /// evidence: the round cannot complete, and it restarts (asks again) after
 /// the wait. A new local head starts a new round.
+///
+/// A retry or a new round never erases unresolved evidence (§2: "no known
+/// higher/conflicting head ... may remain unresolved"). The evidence of a
+/// holder clears only when that holder itself reports a head on the local
+/// chain, or when it is no longer a holder. A new local head does not
+/// clear it either: the round keeps only the holder, not the head it
+/// reported, so the new round asks that holder again and classifies its
+/// new answer against the new local chain.
 #[derive(Debug, Clone)]
 struct HeadRound {
     /// The local head this round confirms.
@@ -292,7 +300,8 @@ struct HeadRound {
     asked: BTreeSet<[u8; 32]>,
     /// A verified holder reported `head` after its page was applied.
     confirmed: bool,
-    /// Verified holders whose last report named a different head.
+    /// Verified holders whose last report named a head this node does not
+    /// have. Carried into each later round until resolved.
     conflicting: BTreeSet<[u8; 32]>,
 }
 
@@ -305,6 +314,17 @@ impl HeadRound {
             confirmed: false,
             conflicting: BTreeSet::new(),
         }
+    }
+
+    /// Start the next round for `head`: ask every holder again (the new
+    /// start resets the [`RoundAsks`]), and keep the unresolved evidence
+    /// of this round.
+    fn restart(&mut self, head: &str, now: Instant) {
+        let conflicting = std::mem::take(&mut self.conflicting);
+        *self = Self {
+            conflicting,
+            ..Self::new(head, now)
+        };
     }
 
     /// The §2 seal condition for this round. `holders` is the number of
@@ -331,7 +351,10 @@ impl HeadRound {
 
 /// Keep the round of one group current and return the peers to ask now.
 /// A new local head starts a new round; a round that met a conflicting
-/// report asks every holder again once the wait has passed.
+/// report asks every holder again once the wait has passed. Both keep the
+/// unresolved evidence ([`HeadRound::restart`]). Evidence of a peer that
+/// is no longer a holder (it left, or it is now an open target) is
+/// dropped: [`HeadRound::synced`] does not count that peer either.
 fn refresh_head_round(
     rounds: &mut HashMap<String, HeadRound>,
     asks: &mut HeadRoundAsks,
@@ -344,29 +367,25 @@ fn refresh_head_round(
     let round = rounds
         .entry(stable_group_id.to_string())
         .or_insert_with(|| HeadRound::new(current_head, now));
+    round.conflicting.retain(|peer| holders.contains(peer));
     if round.head != current_head
         || (!round.conflicting.is_empty() && now.saturating_duration_since(round.started) >= wait)
     {
-        *round = HeadRound::new(current_head, now);
+        round.restart(current_head, now);
     }
-    if round.confirmed {
+    if round.confirmed && round.conflicting.is_empty() {
         return Vec::new();
     }
-    // The last ask per peer belongs to this round only.
-    let (round_start, last_ask) = asks
-        .entry(stable_group_id.to_string())
-        .or_insert_with(|| (round.started, BTreeMap::new()));
-    if *round_start != round.started {
-        *round_start = round.started;
-        last_ask.clear();
-    }
-    // A peer that reported a head is answered; a confirmed round returned
-    // above. A silent peer is asked again after [`HEAD_ROUND_REASK`].
+    let round_asks = round_asks(asks, stable_group_id, round.started);
+    // A peer that reported a head in this round is answered; a confirmed
+    // round with no unresolved evidence returned above. A silent peer is
+    // asked again after [`HEAD_ROUND_REASK`].
     let ask: Vec<[u8; 32]> = holders
         .iter()
         .filter(|peer| {
-            !round.conflicting.contains(*peer)
-                && last_ask
+            !round_asks.answered.contains(*peer)
+                && round_asks
+                    .last_ask
                     .get(*peer)
                     .is_none_or(|at| now.saturating_duration_since(*at) >= HEAD_ROUND_REASK)
         })
@@ -374,13 +393,48 @@ fn refresh_head_round(
         .copied()
         .collect();
     round.asked.extend(ask.iter().copied());
-    last_ask.extend(ask.iter().map(|peer| (*peer, now)));
+    round_asks
+        .last_ask
+        .extend(ask.iter().map(|peer| (*peer, now)));
     ask
 }
 
-/// Per stable group ID: the start of the round the asks belong to, and
-/// the last ask time of each peer in it.
-type HeadRoundAsks = HashMap<String, (Instant, BTreeMap<[u8; 32], Instant>)>;
+/// The ask bookkeeping of one round. It belongs to the round that started
+/// at `started` only: a new round (a retry or a new local head) starts
+/// with none, so it asks every holder again.
+#[derive(Debug)]
+struct RoundAsks {
+    started: Instant,
+    /// The last ask time of each peer in this round.
+    last_ask: BTreeMap<[u8; 32], Instant>,
+    /// Peers that answered this round; they are not asked again in it.
+    /// This is separate from [`HeadRound::conflicting`], which a new
+    /// round keeps.
+    answered: BTreeSet<[u8; 32]>,
+}
+
+/// Per stable group ID: the asks of the group's current round.
+type HeadRoundAsks = HashMap<String, RoundAsks>;
+
+/// The asks of the round of `stable_group_id` that started at `started`.
+fn round_asks<'a>(
+    asks: &'a mut HeadRoundAsks,
+    stable_group_id: &str,
+    started: Instant,
+) -> &'a mut RoundAsks {
+    let fresh = || RoundAsks {
+        started,
+        last_ask: BTreeMap::new(),
+        answered: BTreeSet::new(),
+    };
+    let entry = asks
+        .entry(stable_group_id.to_string())
+        .or_insert_with(fresh);
+    if entry.started != started {
+        *entry = fresh();
+    }
+    entry
+}
 
 /// How a holder's reported head relates to the local verified chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,9 +471,12 @@ fn classify_head_report(info: &GroupInfo, reported: &str) -> HeadReport {
 /// round: it answered and holds no later head. A holder at a head this
 /// node does not have blocks the seal (the stale-replica protection).
 /// Only a report about a later or sibling head is evidence; a survivor
-/// that is behind must not block the delivery that brings it forward.
+/// that is behind must not block the delivery that brings it forward. A
+/// report for a new local head starts the new round first, and keeps the
+/// unresolved evidence ([`HeadRound::restart`]).
 fn note_head_report(
     rounds: &mut HashMap<String, HeadRound>,
+    asks: &mut HeadRoundAsks,
     stable_group_id: &str,
     current_head: &str,
     sender: [u8; 32],
@@ -430,8 +487,11 @@ fn note_head_report(
         .entry(stable_group_id.to_string())
         .or_insert_with(|| HeadRound::new(current_head, now));
     if round.head != current_head {
-        *round = HeadRound::new(current_head, now);
+        round.restart(current_head, now);
     }
+    round_asks(asks, stable_group_id, round.started)
+        .answered
+        .insert(sender);
     match report {
         HeadReport::OnLocalChain => {
             round.confirmed = true;
@@ -679,8 +739,10 @@ pub(in crate::server) async fn note_catchup_head(
     if !inner.head_rounds.contains_key(&stable) {
         return;
     }
+    let state_inner = &mut *inner;
     note_head_report(
-        &mut inner.head_rounds,
+        &mut state_inner.head_rounds,
+        &mut state_inner.head_round_asks,
         &stable,
         &head,
         *sender.as_bytes(),
@@ -878,13 +940,21 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .chain(inner.queued_bans.keys())
         .cloned()
         .collect();
-    // §4b(1): a held owner-recovery mandate is a seal too, so its group
-    // keeps a round even with no open row; its named admins are excluded.
-    let orc_rounds = inner.orc.head_round_groups();
+    // Work that waits for `group_head_synced` with no open row also keeps
+    // its group's round, or nothing would ask for the head and the work
+    // would wait until it expires (#1508 Codex P1). Each plane names its
+    // groups and the peers it excludes from the holders:
+    // - §4b(1): a held owner-recovery mandate (its named admins) and a
+    //   restored owner-recovery delivery;
+    // - §2/§3: a restored rebind delivery and a held §4b(2) self-rebind.
+    let mut extra_rounds = inner.orc.head_round_groups();
+    for (stable, peers) in inner.rebind.head_round_groups() {
+        extra_rounds.entry(stable).or_default().extend(peers);
+    }
     let open_groups: BTreeSet<String> = round_keys
         .iter()
         .map(|key| key.stable_group_id.clone())
-        .chain(orc_rounds.keys().cloned())
+        .chain(extra_rounds.keys().cloned())
         .collect();
     inner
         .head_rounds
@@ -900,7 +970,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .iter()
             .filter(|key| &key.stable_group_id == stable)
             .map(|key| key.target)
-            .chain(orc_rounds.get(stable).into_iter().flatten().copied())
+            .chain(extra_rounds.get(stable).into_iter().flatten().copied())
             .collect();
         let holders = head_holders(info, &local, &excluded);
         let state_inner = &mut *inner;
@@ -3807,7 +3877,15 @@ mod tests {
             "no second ask in the same instant"
         );
         // [9; 32] reports a head this node does not have; [8; 32] is silent.
-        note_head_report(&mut rounds, "g", "h1", [9; 32], HeadReport::Unknown, start);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            [9; 32],
+            HeadReport::Unknown,
+            start,
+        );
         let later = start + Duration::from_secs(3);
         assert_eq!(
             refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, later, wait),
@@ -3829,7 +3907,15 @@ mod tests {
         let (a, b) = ([8; 32], [9; 32]);
         let holders = [a, b];
         refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
-        note_head_report(&mut rounds, "g", "h1", a, HeadReport::Unknown, start);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            a,
+            HeadReport::Unknown,
+            start,
+        );
         let later = start + wait * 10;
         assert!(!rounds
             .get("g")
@@ -3839,7 +3925,15 @@ mod tests {
         let again = refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, later, wait);
         assert_eq!(again, holders.to_vec());
         // B confirms the local head. A's report is still unresolved.
-        note_head_report(&mut rounds, "g", "h1", b, HeadReport::OnLocalChain, later);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            b,
+            HeadReport::OnLocalChain,
+            later,
+        );
         assert!(
             !rounds
                 .get("g")
@@ -3848,7 +3942,15 @@ mod tests {
             "the retry kept A's unknown-head report"
         );
         // A itself now reports a head on the local chain: resolved.
-        note_head_report(&mut rounds, "g", "h1", a, HeadReport::OnLocalChain, later);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            a,
+            HeadReport::OnLocalChain,
+            later,
+        );
         assert!(rounds
             .get("g")
             .expect("round")
@@ -3875,22 +3977,62 @@ mod tests {
         let mut rounds = HashMap::new();
         let mut asks = HeadRoundAsks::new();
         refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
-        note_head_report(&mut rounds, "g", "h1", a, HeadReport::Unknown, start);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            a,
+            HeadReport::Unknown,
+            start,
+        );
         let next = start + Duration::from_millis(1);
         let asked = refresh_head_round(&mut rounds, &mut asks, "g", "h2", &holders, next, wait);
         assert_eq!(asked, holders.to_vec(), "the new round asks A again");
-        note_head_report(&mut rounds, "g", "h2", b, HeadReport::OnLocalChain, next);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h2",
+            b,
+            HeadReport::OnLocalChain,
+            next,
+        );
         let round = rounds.get("g").expect("round");
         assert!(!round.synced("h2", 2, false, true, next, wait));
-        note_head_report(&mut rounds, "g", "h2", a, HeadReport::OnLocalChain, next);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h2",
+            a,
+            HeadReport::OnLocalChain,
+            next,
+        );
         let round = rounds.get("g").expect("round");
         assert!(round.synced("h2", 2, false, true, next, wait));
         // A report arrives first for the new head.
         let mut rounds = HashMap::new();
         let mut asks = HeadRoundAsks::new();
         refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
-        note_head_report(&mut rounds, "g", "h1", a, HeadReport::Unknown, start);
-        note_head_report(&mut rounds, "g", "h2", b, HeadReport::OnLocalChain, start);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            a,
+            HeadReport::Unknown,
+            start,
+        );
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h2",
+            b,
+            HeadReport::OnLocalChain,
+            start,
+        );
         let round = rounds.get("g").expect("round");
         assert!(
             !round.synced("h2", 2, false, true, start, wait),
@@ -3944,7 +4086,7 @@ mod tests {
             let mut asks = HeadRoundAsks::new();
             refresh_head_round(&mut rounds, &mut asks, "g", &head, &[holder], now, wait);
             let report = classify_head_report(&info, reported);
-            note_head_report(&mut rounds, "g", &head, holder, report, now);
+            note_head_report(&mut rounds, &mut asks, "g", &head, holder, report, now);
             rounds
                 .get("g")
                 .is_some_and(|round| round.synced(&head, 1, false, true, now, wait))
@@ -3971,6 +4113,7 @@ mod tests {
             .synced("h1", 1, false, true, now, wait));
         note_head_report(
             &mut rounds,
+            &mut asks,
             "g",
             "h1",
             [8; 32],

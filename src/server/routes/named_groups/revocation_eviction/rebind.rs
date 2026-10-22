@@ -134,6 +134,24 @@ pub(super) struct RebindState {
     held: HashMap<EvictionKey, HeldSelfRebind>,
 }
 
+impl RebindState {
+    /// §2 and §3: the groups whose rebind work waits for
+    /// [`super::group_head_synced`] and that may have no open row: a
+    /// delivery a restart restored (#1508 review F3) and a §4b(2) held
+    /// self-rebind. The worker pass keeps a head round for each, so the
+    /// head sync can complete (#1508 Codex P1). No peer is excluded from
+    /// the holders: the self-rebind target is this node.
+    pub(super) fn head_round_groups(&self) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
+        self.deliveries
+            .iter()
+            .filter(|(_, delivery)| delivery.resumed)
+            .map(|(key, _)| key.0.clone())
+            .chain(self.held.keys().map(|key| key.stable_group_id.clone()))
+            .map(|stable| (stable, BTreeSet::new()))
+            .collect()
+    }
+}
+
 fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP> {
     &mut inner.rebind.log
 }
@@ -2533,8 +2551,13 @@ pub(super) mod restart_tests {
         set_evidence(&state, &group_id, &info, HeadEvidence::Higher, false).await;
         // The survivor answers with a head this node does not have.
         let unknown = "f0".repeat(32);
-        super::super::note_catchup_head(&state, &[group_id.clone()], &survivor_hex, Some(&unknown))
-            .await;
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&unknown),
+        )
+        .await;
         worker_step(&state).await;
         worker_step(&state).await;
         assert!(
@@ -2548,7 +2571,7 @@ pub(super) mod restart_tests {
         // The survivor answers again with the local head: synced.
         super::super::note_catchup_head(
             &state,
-            &[group_id.clone()],
+            std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&info.state_hash),
         )
