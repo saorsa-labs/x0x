@@ -2927,6 +2927,199 @@ mod daemon_tests {
         Ok(())
     }
 
+    /// The author `A` (`fx.state`) commits the GSS exclusion; the survivor
+    /// `C` (`fx.replica`) takes the leave and holds the parent durably.
+    /// Returns the exact frame, its result head and `C`'s parent.
+    async fn authored_frame_and_parent(fx: &GssLeave) -> Result<(Vec<u8>, String, GroupInfo)> {
+        use anyhow::Context as _;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        anyhow::ensure!(applied.accepted, "the leave must apply: {applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let result_head = ce::decode_frame(&frame)
+            .map(|frame| frame.body.commit.state_hash)
+            .map_err(|refused| anyhow::anyhow!("decode: {}", refused.as_str()))?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        anyhow::ensure!(applied.accepted, "{applied:?}");
+        anyhow::ensure!(
+            ng::save_named_groups(&fx.replica).await,
+            "the parent is durable"
+        );
+        let parent = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        Ok((frame, result_head, parent))
+    }
+
+    async fn head_of(state: &AppState, group_id: &str) -> Option<String> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .map(|info| info.state_hash.clone())
+    }
+
+    /// `C` restarts: the runtime state is dropped and the real load path
+    /// runs, then one tick of the worker's crypto-exclusion steps.
+    async fn restart_receiver(fx: &GssLeave) -> Result<Arc<AppState>> {
+        let restarted = ng::tests::secure_endpoint_test_state_at(
+            fx._replica_dir.path(),
+            Arc::clone(&fx.replica.agent),
+        )
+        .await?;
+        super::super::load_persisted_obligations(&restarted).await;
+        drive_deliveries(&restarted).await;
+        retry_stash(&restarted).await;
+        Ok(restarted)
+    }
+
+    /// The frames `C` serves on catch-up above `from_revision`.
+    async fn served(state: &AppState, stable: &str, from_revision: u64) -> Vec<Vec<u8>> {
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .catchup_frames(std::slice::from_ref(&stable.to_string()), from_revision)
+            .into_iter()
+            .map(|(_, _, bytes)| bytes.to_vec())
+            .collect()
+    }
+
+    /// A lagging survivor `B` at `parent` installs `frame`, relayed by `C`.
+    async fn lagging_peer_installs(
+        fx: &GssLeave,
+        parent: &GroupInfo,
+        relay: AgentId,
+        frame: &[u8],
+        result_head: &str,
+    ) -> Result<()> {
+        let (lagging, _lagging_dir) = ng::tests::secure_endpoint_test_state().await?;
+        lagging
+            .named_groups
+            .write()
+            .await
+            .insert(fx.group_id.clone(), parent.clone());
+        assert_eq!(
+            receive(&lagging, relay, frame).await,
+            ReceiveOutcome::Applied,
+            "the lagging survivor installs the served frame"
+        );
+        assert_eq!(
+            head_of(&lagging, &fx.group_id).await.as_deref(),
+            Some(result_head)
+        );
+        Ok(())
+    }
+
+    /// #1508 review (Codex P1): a survivor that installed a received
+    /// exclusion and holds no S4 row for it restarts while the author is
+    /// offline. The restarted survivor serves the exact frame, and a
+    /// lagging survivor installs it from that copy.
+    #[tokio::test]
+    async fn a_restarted_receiver_serves_the_received_exclusion_frame() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        assert!(
+            fx.replica
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_none(),
+            "the receiver holds no obligation row"
+        );
+
+        // `C` stops; the author `A` is offline from here on.
+        fx.state.agent.shutdown().await;
+        let restarted = restart_receiver(&fx).await?;
+        assert_eq!(
+            head_of(&restarted, &fx.group_id).await.as_ref(),
+            Some(&result_head),
+            "the installed exclusion survived the restart"
+        );
+        let frames = served(&restarted, &fx.stable, parent.state_revision).await;
+        assert!(
+            frames == [frame.clone()],
+            "the restarted receiver serves the exact frame at catch-up (served {})",
+            frames.len()
+        );
+        let relay = restarted.agent.agent_id();
+        lagging_peer_installs(&fx, &parent, relay, &frames[0], &result_head).await
+    }
+
+    /// #1508 review (Codex P1): the received frame is durable before the
+    /// state it carries is installed. The install fails (a crash at that
+    /// point); after the restart the node installs its own copy and serves
+    /// it, with the author offline.
+    #[tokio::test]
+    async fn a_crash_before_the_exclusion_install_keeps_the_frame_durable() -> Result<()> {
+        use super::super::rebind::restart_tests::{block_install, unblock_install};
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        let blocked = block_install(&fx.replica).await?;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::LocalFailure,
+            "the install failed"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await.as_ref(),
+            Some(&parent.state_hash),
+            "the exclusion is not installed"
+        );
+
+        // The process dies before the install; the author stays offline.
+        fx.state.agent.shutdown().await;
+        unblock_install(blocked).await?;
+        let restarted = restart_receiver(&fx).await?;
+        assert_eq!(
+            head_of(&restarted, &fx.group_id).await.as_ref(),
+            Some(&result_head),
+            "the restarted node installs its durable copy"
+        );
+        let frames = served(&restarted, &fx.stable, parent.state_revision).await;
+        assert!(
+            frames == [frame.clone()],
+            "exact bytes at catch-up (served {})",
+            frames.len()
+        );
+        let relay = restarted.agent.agent_id();
+        lagging_peer_installs(&fx, &parent, relay, &frames[0], &result_head).await
+    }
+
     /// #1508 review P1: the survivor's receive path refuses a GSS frame
     /// whose next secret epoch skips one, and one whose target is seated.
     #[tokio::test]
