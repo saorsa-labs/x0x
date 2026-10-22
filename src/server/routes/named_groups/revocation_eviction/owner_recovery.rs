@@ -1214,9 +1214,12 @@ async fn finish_commit(
                 Err(error) => ng::self_leave_persist_left_epoch_installed(&error),
             }
         }
+        // #1508 r6: `ReplacedNotDurable` installed the new roster (only
+        // the directory fsync failed), so the commit stands and the frame
+        // and its delivery must stay.
         None => matches!(
             ng::persist_named_group_info(state, group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable)
+            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
         ),
     };
     if !persisted {
@@ -1906,9 +1909,10 @@ async fn receive_commit(
             }
         }
         (None, orc::OwnerRecoveryCryptoV1::TreeKem { .. }) => false,
+        // #1508 r6: `ReplacedNotDurable` installed the roster.
         _ => matches!(
             ng::persist_named_group_info(state, &group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable)
+            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
         ),
     };
     drop(guard);
@@ -3194,6 +3198,106 @@ mod restart_tests {
         let frames = served(&restarted, &stable, info.state_revision).await;
         assert_eq!(frames, vec![(result_head, bytes)]);
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Codex P1 (#1508 r6), author side: the roster write of a
+    /// `SignedPublic` recovery renames the file, and then the directory
+    /// fsync fails (`ReplacedNotDurable`). The new roster is installed, so
+    /// the commit stands: the frame stays held and durable, and its
+    /// delivery is scheduled. Before the fix the author took this as a
+    /// failure, erased the held frame and scheduled no delivery, so the
+    /// survivors could not get the chain link.
+    #[tokio::test]
+    async fn a_recovery_whose_roster_fsync_fails_keeps_its_frame_and_delivery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let author = offline_author(dir.path(), [0x73; 32]).await?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor = x0x::identity::AgentKeypair::generate()?;
+        let info = recovery_parent(
+            owner,
+            &admin,
+            [author.agent.identity().agent_keypair(), &survivor],
+        )?;
+        let stable = info.stable_group_id().to_string();
+        hold_persisted(&author, &info).await?;
+        revoke(&author, &admin).await?;
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let (status, Json(body)) =
+            sign_recovery_mandate(&author, owner, &stable, &author_hex).await;
+        anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
+        super::super::revocation_eviction_pass(&author).await;
+
+        let _fault = super::super::super::set_save_fault(
+            &author,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        try_commit(&author, &stable).await;
+        let committed = author.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            committed.state_revision,
+            info.state_revision + 1,
+            "the new roster is installed"
+        );
+        let delivery = author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .deliveries
+            .get(&stable)
+            .cloned()
+            .context("the installed recovery is scheduled for delivery")?;
+        assert_eq!(delivery.result_head, committed.state_hash);
+        assert!(delivery
+            .recipients
+            .contains_key(survivor.agent_id().as_bytes()));
+        let frames = served(&author, &stable, info.state_revision).await;
+        assert_eq!(
+            frames,
+            vec![(committed.state_hash.clone(), delivery.bytes.to_vec())],
+            "the frame is held for catch-up"
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&author, replay_log::RECOVERY_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 1, "the frame stays durable");
+        assert_eq!(on_disk[0].frame, delivery.bytes.to_vec());
+        author.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Codex P1 (#1508 r6), receiver side: the receiver's roster write
+    /// renames the file and the directory fsync fails. The recovery is
+    /// installed, so the receiver reports it applied and serves the frame.
+    /// Before the fix it reported `Retained` on an installed roster.
+    #[tokio::test]
+    async fn a_received_recovery_whose_roster_fsync_fails_is_applied() -> Result<()> {
+        let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (receiver, info, bytes, result_head, _admin) =
+            received_recovery(author_dir.path(), receiver_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        let _fault = super::super::super::set_save_fault(
+            &receiver,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert_eq!(
+            receive_bytes(&receiver, &bytes).await?,
+            ReceiveOutcome::Applied
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&result_head)
+        );
+        let frames = served(&receiver, &stable, info.state_revision).await;
+        assert_eq!(frames, vec![(result_head, bytes)]);
+        receiver.agent.shutdown().await;
         Ok(())
     }
 

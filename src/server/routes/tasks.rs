@@ -405,32 +405,30 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                     .map_err(|e| {
                         x0x::crdt::CrdtError::Gossip(format!("task author signing: {e}"))
                     })?;
+            // ADR 0110 §4 and §4b(3): a task delta is a member send on
+            // every plane, so the no-eligible-admin refusal applies before
+            // the plane decides how to publish it (#1508 r6: the
+            // `SignedPublic` plane published plaintext with no check). The
+            // TreeKEM arm checks again inside `seal_record`, with its group
+            // guard held.
+            if let Some(hold) =
+                super::named_groups::group_ciphertext_withheld(&state, &self.group_id, None).await
+            {
+                return Err(x0x::crdt::CrdtError::Gossip(format!(
+                    "task seal: {}",
+                    hold.reason()
+                )));
+            }
             match plane {
                 TaskListPlane::Public => Ok(None),
-                TaskListPlane::Gss(info) => {
-                    // The group ciphertext boundary (ADR 0110 §4). The
-                    // TreeKEM arm gets it inside `seal_record`.
-                    if let Some(hold) = super::named_groups::group_ciphertext_withheld(
-                        &state,
-                        info.stable_group_id(),
-                        None,
-                    )
-                    .await
-                    {
-                        return Err(x0x::crdt::CrdtError::Gossip(format!(
-                            "GSS task seal: {}",
-                            hold.reason()
-                        )));
-                    }
-                    x0x::crdt::sealed::seal_gss_task_payload(
-                        &info,
-                        &signing,
-                        kind,
-                        &self.topic,
-                        payload,
-                    )
-                    .map(Some)
-                }
+                TaskListPlane::Gss(info) => x0x::crdt::sealed::seal_gss_task_payload(
+                    &info,
+                    &signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some),
                 TaskListPlane::TreeKem(protector, stable) => {
                     let record_id =
                         x0x::crdt::sealed::group_task_list_record_id(&stable, &self.topic);
@@ -2644,6 +2642,32 @@ mod tests {
                 seal_once(&state, &topic).await,
                 Ok(Some(SealedTaskRecordBody::Gss(_)))
             ));
+            revoke_agent(&state, &admin).await;
+            assert_withheld(seal_once(&state, &topic).await);
+        }
+
+        /// Codex P2 (#1508 r6), ADR 0110 §4b(3): a `SignedPublic` group's
+        /// task delta is a member send too. It is refused while verified
+        /// revocations cover every admin seat, like the encrypted planes.
+        /// Before the fix the public plane returned `Ok(None)` (publish
+        /// plaintext) with no check.
+        #[tokio::test]
+        async fn public_task_write_is_refused_while_every_admin_seat_is_revoked() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b3".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+
+            // No false refusal while the admin seat is unrevoked.
+            assert!(matches!(seal_once(&state, &topic).await, Ok(None)));
             revoke_agent(&state, &admin).await;
             assert_withheld(seal_once(&state, &topic).await);
         }
