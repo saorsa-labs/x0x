@@ -15958,16 +15958,52 @@ impl Agent {
     ///
     /// Returns an error when the record fails signature or issuer-authority
     /// verification.
+    ///
+    /// ADR 0115 §3: the issuer authority comes only from a subject
+    /// certificate with authenticated provenance, as for a gossip receipt.
+    /// A group roster is not such a source: any group owner can seat a
+    /// certificate it issued for another agent's key. `roster_cert` counts
+    /// only when the local user issued it.
     pub async fn ingest_eviction_handoff_revocation(
         &self,
         record: revocation::RevocationRecord,
-        subject_cert: Option<&identity::AgentCertificate>,
+        roster_cert: Option<&identity::AgentCertificate>,
     ) -> error::Result<bool> {
         let hash = record.record_hash();
         if self.revocation_set.read().await.contains_hash(&hash) {
             return Ok(true);
         }
-        self.apply_and_publish_revocation(record, subject_cert)
+        let certs = match record.needs_certificate_authority() {
+            Some(subject) => {
+                let journal = load_journal_certs(self.cert_journal_path.as_deref()).await;
+                let local_user = self.user_id();
+                let mut certs = {
+                    let announced = self.announced_machine_bindings.read().await;
+                    let cache = self.identity_discovery_cache.read().await;
+                    subject_certs_with_provenance(
+                        &ProvenanceSources {
+                            cache: &cache,
+                            announced: &announced,
+                            evidence: Some(self.peer_evidence()),
+                            local_user,
+                            journal: &journal,
+                        },
+                        &subject,
+                    )
+                };
+                if let Some(cert) = roster_cert
+                    .filter(|cert| local_user.is_some() && cert.user_id().ok() == local_user)
+                {
+                    if !certs.contains(cert) {
+                        certs.push(cert.clone());
+                    }
+                }
+                certs
+            }
+            None => Vec::new(),
+        };
+        let subject_cert = pick_subject_cert(Some(&certs), &record).cloned();
+        self.apply_and_publish_revocation(record, subject_cert.as_ref())
             .await?;
         Ok(self.revocation_set.read().await.contains_hash(&hash))
     }
