@@ -423,9 +423,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         connect_policy,
         self_update_enabled,
         daemon_config_path: loaded_config_path.clone(),
-        // Stop merges into this file when it already exists. A missing file
-        // stays missing: the off state goes in the data directory, so a named
-        // instance with no config can still start.
+        // Stop does not write this file. Reload reads the config startup
+        // loaded, or this default path when startup loaded no file.
         gui_show_write_path: Some(loaded_config_path.unwrap_or(default_config_path)),
     };
     let handle = x0x::server::serve_with_options(config, options).await?;

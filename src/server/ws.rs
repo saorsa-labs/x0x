@@ -1152,12 +1152,30 @@ struct ArmedNavigation {
 ///
 /// A spawn failure returns `None` before the insert. The caller must not
 /// abandon a session in that case: nothing was advertised.
+/// Resolve the token the upgrade captured, then queue its banner.
+///
+/// Refresh may already have moved the banner. The returned token is the
+/// one the socket stores. Only a visible tab (`gui=1`) takes the banner
+/// here. That tab is already visible, so a later `gui.visible` true does
+/// not take it again.
+fn open_gui_show_for_upgrade(
+    state: &AppState,
+    outbound_tx: &mpsc::Sender<WsOutbound>,
+    visible: bool,
+    captured: Option<&str>,
+) -> (Option<String>, Option<crate::gui::PendingGuiShow>) {
+    let token = captured.map(|token| state.gui_show.current_gui_session_token(token));
+    let opened = queue_pending_gui_show(state, outbound_tx, visible, token.as_deref());
+    (token, opened)
+}
+
 /// Queue the show this window was opened for, before the session is visible.
 ///
-/// Only a visible GUI tab (`gui=1`) may take it, and only the session token
-/// minted into that window's URL. An agent socket leaves every pending show
-/// queued. The returned value is what was queued, so the caller can put it
-/// back when the session is not admitted.
+/// Only a visible GUI tab (`gui=1`) may take it. `session_token` is the
+/// token the socket will store. A take still follows a refresh that lands
+/// after that resolve. An agent socket leaves every pending show queued.
+/// The returned value is what was queued, so the caller can put it back
+/// when the session is not admitted.
 fn queue_pending_gui_show(
     state: &AppState,
     outbound_tx: &mpsc::Sender<WsOutbound>,
@@ -1284,7 +1302,10 @@ async fn handle_ws_connection(
     // A newer `gui.show` broadcast is delivered after that frame, so it
     // cannot be overwritten by the view this window was opened for.
     // If the forwarder is not admitted, put the pending show back.
-    let opened_show = queue_pending_gui_show(
+    // Resolve the upgrade token first. Refresh may already have moved
+    // the banner, and a `gui=1` tab will not take it on a later
+    // `gui.visible` because it is already visible.
+    let (session_token, opened_show) = open_gui_show_for_upgrade(
         &state,
         &outbound_tx,
         visible_gui.load(Ordering::Acquire),
@@ -3031,6 +3052,127 @@ mod tests {
                 .expect("session")
                 .is_visible_gui(),
             "the tab becomes visible once the banner is queued"
+        );
+        assert!(!state.gui_show.has_pending_session(&fresh));
+        assert!(
+            state.gui_show.has_pending_session("other-tab"),
+            "another tab's banner must stay queued"
+        );
+        armed.forwarder.abort();
+    }
+
+    /// The tab connects with `gui=1`, so it is visible before any
+    /// `gui.visible` frame. Refresh has already moved the banner off the
+    /// token the upgrade captured. The open path must take that banner.
+    /// A later `gui.visible` true does not: the tab is already visible.
+    #[tokio::test]
+    async fn visible_upgrade_keeps_the_banner_when_refresh_runs_first() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let old = state.sessions.issue(std::time::Instant::now());
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "people".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req-visible".to_string(),
+            session_token: old.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by other on other".to_string(),
+            agent_id: "cc".repeat(32),
+            machine_id: "dd".repeat(32),
+            rider: false,
+            request_id: "req-other".to_string(),
+            session_token: "other-tab".to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        let response = super::super::auth::refresh_session(
+            State(Arc::clone(&state)),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/session/refresh")
+                .header("authorization", format!("Bearer {old}"))
+                .body(axum::body::Body::empty())
+                .expect("refresh request"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("refresh body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("refresh json");
+        let fresh = json["session_token"]
+            .as_str()
+            .expect("new session token")
+            .to_string();
+        assert_ne!(fresh, old);
+        assert!(
+            !state.gui_show.has_pending_session(&old),
+            "refresh moves the banner off the token the upgrade captured"
+        );
+        assert!(state.gui_show.has_pending_session(&fresh));
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(4);
+        // Production still holds `old` from the upgrade. `gui=1` is visible.
+        let (token, opened) = open_gui_show_for_upgrade(&state, &tx, true, Some(&old));
+        assert!(
+            opened.is_some(),
+            "a visible upgrade must take the banner after refresh moved it"
+        );
+        assert_eq!(token.as_deref(), Some(fresh.as_str()));
+        match rx.try_recv() {
+            Ok(WsOutbound::GuiShow { view, banner, .. }) => {
+                assert_eq!(view, "people");
+                assert!(
+                    banner.contains("Opened by test on test"),
+                    "the open path must deliver the origin banner: {banner}"
+                );
+            }
+            other => {
+                panic!("gui=1 missed the banner; a later gui.visible would skip it: {other:?}")
+            }
+        }
+        let mut session = test_gui_ws_session("visible-refresh");
+        session.gui_session_token = token;
+        let stats = Arc::new(WsOutboundStats::default());
+        let slow_close = tokio_util::sync::CancellationToken::new();
+        let slow_close_counted = Arc::new(AtomicBool::new(false));
+        let armed = arm_navigation_and_advertise_session(
+            &state,
+            session,
+            &tx,
+            &stats,
+            &slow_close,
+            &slow_close_counted,
+        )
+        .await
+        .expect("the visible upgrade registers after refresh");
+        {
+            let sessions = state.ws_sessions.read().await;
+            let registered = sessions.get("visible-refresh").expect("session");
+            assert!(
+                registered.is_visible_gui(),
+                "gui=1 stays visible, so gui.visible true will not deliver"
+            );
+            assert_eq!(registered.gui_session_token(), Some(fresh.clone()));
+        }
+        handle_ws_command(
+            &state,
+            "visible-refresh",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "gui.visible must not be what delivers the banner on a gui=1 tab"
         );
         assert!(!state.gui_show.has_pending_session(&fresh));
         assert!(

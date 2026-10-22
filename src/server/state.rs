@@ -132,9 +132,10 @@ pub struct ServeOptions {
     /// Path of the daemon TOML that produced `DaemonConfig`, when known.
     /// Used by ADR 0083 to re-read `[gui_show]` on `POST /acl/reload`.
     pub daemon_config_path: Option<std::path::PathBuf>,
-    /// File Stop writes when the human turns local show off. The daemon
-    /// passes the loaded config, or the default config path when startup
-    /// loaded no file.
+    /// Config path `POST /acl/reload` can read.
+    ///
+    /// The daemon passes the loaded config, or the default config path
+    /// when startup loaded no file. Stop does not create or modify it.
     pub gui_show_write_path: Option<std::path::PathBuf>,
 }
 

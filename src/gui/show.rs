@@ -306,9 +306,10 @@ pub struct GuiShowRuntime {
     /// Session token a refresh replaced, for an upgrade that authenticated
     /// with the old token and registers after the refresh.
     ///
-    /// The pending banner moves to the new token in that refresh. A socket
-    /// already in the roster is updated there too. This map is what a later
-    /// registration consults, so `gui.visible` still finds the banner.
+    /// The pending banner moves in the same critical section as this map.
+    /// A take follows the chain, so refresh cannot leave the banner on a
+    /// token the socket no longer searches. A socket already in the roster
+    /// is updated after this map. Registration consults the map too.
     session_successors: Mutex<HashMap<String, (String, Instant)>>,
 }
 
@@ -609,12 +610,21 @@ impl GuiShowRuntime {
 
     /// Remember a show that opened a new window so that window's GUI socket
     /// can deliver the origin banner. Older shows in the freshness window stay.
-    pub fn enqueue_pending(&self, pending: PendingGuiShow) {
-        if let Ok(mut queue) = self.pending.lock() {
-            let now = Instant::now();
-            queue.retain(|item| pending_is_fresh(item, now));
-            queue.push_back(pending);
-        }
+    ///
+    /// A banner put back after a full queue follows the same refresh chain
+    /// as a take. Refresh cannot strand it on the token it left.
+    pub fn enqueue_pending(&self, mut pending: PendingGuiShow) {
+        let Ok(mut map) = self.session_successors.lock() else {
+            return;
+        };
+        let Ok(mut queue) = self.pending.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        expire_session_successors(&mut map, now);
+        pending.session_token = current_token_locked(&map, &pending.session_token);
+        queue.retain(|item| pending_is_fresh(item, now));
+        queue.push_back(pending);
     }
 
     /// Remember that `from_token` was refreshed to `to_token`.
@@ -630,15 +640,7 @@ impl GuiShowRuntime {
         let Ok(mut map) = self.session_successors.lock() else {
             return;
         };
-        let now = Instant::now();
-        map.retain(|_, (_, noted)| now.saturating_duration_since(*noted) <= PENDING_FRESHNESS);
-        for (next, noted) in map.values_mut() {
-            if next == from_token {
-                *next = to_token.to_string();
-                *noted = now;
-            }
-        }
-        map.insert(from_token.to_string(), (to_token.to_string(), now));
+        note_successor_locked(&mut map, from_token, to_token, Instant::now());
     }
 
     /// Token a GUI socket should store after any refreshes of `token`.
@@ -647,19 +649,8 @@ impl GuiShowRuntime {
             return token.to_string();
         };
         let now = Instant::now();
-        map.retain(|_, (_, noted)| now.saturating_duration_since(*noted) <= PENDING_FRESHNESS);
-        let mut current = token.to_string();
-        for _ in 0..8 {
-            let Some((next, _)) = map.get(&current) else {
-                break;
-            };
-            if next == &current {
-                break;
-            }
-            let next = next.clone();
-            current = next;
-        }
-        current
+        expire_session_successors(&mut map, now);
+        current_token_locked(&map, token)
     }
 
     /// Keep a queued origin banner when this GUI session token is refreshed.
@@ -667,13 +658,22 @@ impl GuiShowRuntime {
     /// A hidden tab can refresh before its WebSocket reconnects. The new
     /// connection presents the new token. The banner stays with that tab.
     /// Other sessions stay on their own tokens.
+    ///
+    /// The banner move and the successor record share one critical section.
+    /// A take cannot observe the banner on the old token after the map has
+    /// already moved, or on the new token before the map says so.
     pub fn rebind_pending_session(&self, from_token: &str, to_token: &str) {
         if from_token.is_empty() || to_token.is_empty() || from_token == to_token {
             return;
         }
+        let Ok(mut map) = self.session_successors.lock() else {
+            return;
+        };
         let Ok(mut queue) = self.pending.lock() else {
             return;
         };
+        let now = Instant::now();
+        note_successor_locked(&mut map, from_token, to_token, now);
         for item in queue.iter_mut() {
             if item.session_token == from_token {
                 item.session_token = to_token.to_string();
@@ -683,20 +683,28 @@ impl GuiShowRuntime {
 
     /// Take the fresh pending show minted for this GUI session token.
     ///
-    /// A miss leaves every other pending show in place. Stale entries are
-    /// dropped. An agent socket must not call this.
+    /// The token may be the one the upgrade captured. Refresh may already
+    /// have moved the banner. This follows that chain under the same locks
+    /// the move uses, then takes the banner. A miss leaves every other
+    /// pending show in place. Stale entries are dropped. An agent socket
+    /// must not call this.
     pub fn take_pending_for_session(
         &self,
         session_token: &str,
         now: Instant,
     ) -> Option<PendingGuiShow> {
+        let Ok(mut map) = self.session_successors.lock() else {
+            return None;
+        };
         let Ok(mut queue) = self.pending.lock() else {
             return None;
         };
+        expire_session_successors(&mut map, now);
+        let current = current_token_locked(&map, session_token);
         queue.retain(|item| pending_is_fresh(item, now));
         let idx = queue
             .iter()
-            .position(|item| item.session_token == session_token)?;
+            .position(|item| item.session_token == current)?;
         queue.remove(idx)
     }
 
@@ -716,6 +724,42 @@ impl GuiShowRuntime {
             .map(|queue| queue.iter().any(|item| item.session_token == session_token))
             .unwrap_or(false)
     }
+}
+
+fn expire_session_successors(map: &mut HashMap<String, (String, Instant)>, now: Instant) {
+    map.retain(|_, (_, noted)| now.saturating_duration_since(*noted) <= PENDING_FRESHNESS);
+}
+
+/// Point `from_token`, and any older token that still names it, at `to_token`.
+fn note_successor_locked(
+    map: &mut HashMap<String, (String, Instant)>,
+    from_token: &str,
+    to_token: &str,
+    now: Instant,
+) {
+    expire_session_successors(map, now);
+    for (next, noted) in map.values_mut() {
+        if next == from_token {
+            *next = to_token.to_string();
+            *noted = now;
+        }
+    }
+    map.insert(from_token.to_string(), (to_token.to_string(), now));
+}
+
+/// Newest token reachable from `token`. The caller already holds the map.
+fn current_token_locked(map: &HashMap<String, (String, Instant)>, token: &str) -> String {
+    let mut current = token.to_string();
+    for _ in 0..8 {
+        let Some((next, _)) = map.get(&current) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        current = next.clone();
+    }
+    current
 }
 
 /// Whether `pending` is still inside the session token TTL.
@@ -935,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_merges_into_an_existing_config_without_dropping_network_id() {
+    fn stop_never_writes_config_and_keeps_network_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let original = "network_id = \"x0x.testnet\"\nlog_level = \"info\"\n";
@@ -1478,6 +1522,30 @@ exit 1
         assert_eq!(first.view, "people");
         assert_eq!(second.view, "network");
         assert!(rt.take_pending_for_session("session-a", now).is_none());
+    }
+
+    #[test]
+    fn take_follows_the_token_a_refresh_already_moved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let now = Instant::now();
+        rt.enqueue_pending(pending("old-token", "people", now));
+        rt.enqueue_pending(pending("other-tab", "network", now));
+        rt.rebind_pending_session("old-token", "new-token");
+        assert!(
+            !rt.has_pending_session("old-token"),
+            "refresh moves the banner off the captured token"
+        );
+        assert!(rt.has_pending_session("new-token"));
+        let taken = rt
+            .take_pending_for_session("old-token", now)
+            .expect("the captured token must still find the banner");
+        assert_eq!(taken.view, "people");
+        assert_eq!(taken.session_token, "new-token");
+        assert!(
+            rt.has_pending_session("other-tab"),
+            "another tab's banner must stay queued"
+        );
     }
 
     #[test]
