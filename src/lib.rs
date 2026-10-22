@@ -5618,6 +5618,25 @@ fn select_capability_hints(
         if mid == own_machine_id {
             continue;
         }
+        // Rounds 5-6 + 18: the selector validates the PAIR — when the
+        // observed address (whatever the path: ant-quic reports
+        // hole-punched paths as non-direct while still naming the
+        // peer's remote address, round 18) is a pinned seed address and
+        // the identity is OUTSIDE its pin set, the pair skips BOTH
+        // tiers: the community flags must not rescue it. Inbound
+        // connections and `connect_peer_with_addrs` bypass the dial
+        // seam, so the selector cannot assume the seam already rejected
+        // a mismatched identity.
+        let observed_addr = origin.remote_addr.map(network::normalize_v4_mapped_addr);
+        let pin_mismatch_at_seed = observed_addr.is_some_and(|observed| {
+            matches!(
+                network::seed_pin_gate(observed, origin.peer_id.0),
+                network::SeedPinVerdict::Mismatch { .. }
+            )
+        });
+        if pin_mismatch_at_seed {
+            continue;
+        }
         // Operator tier: the OBSERVED transport address of a DIRECT path
         // IS a seed listener address — the FULL socket address, never the
         // IP alone (round 4: a NATed peer with a relay slot on a seed
@@ -5628,25 +5647,9 @@ fn select_capability_hints(
         // contract does not depend on the caller (review round 3).
         let observed_seed_addr = origin
             .direct
-            .then(|| origin.remote_addr.map(network::normalize_v4_mapped_addr))
+            .then_some(observed_addr)
             .flatten()
             .filter(|observed| seed_addrs.contains(observed));
-        // Rounds 5-6: the selector validates the PAIR — the observed
-        // address is a seed listener AND, when pinned, the identity is
-        // inside that address's pin set. Inbound connections and
-        // `connect_peer_with_addrs` bypass the dial seam, so the selector
-        // cannot assume the seam already rejected a mismatched identity.
-        // A MISMATCH skips BOTH tiers: the community flags must not
-        // rescue an identity the pins rejected at that address.
-        let pin_mismatch_at_seed = observed_seed_addr.is_some_and(|observed| {
-            matches!(
-                network::seed_pin_gate(observed, origin.peer_id.0),
-                network::SeedPinVerdict::Mismatch { .. }
-            )
-        });
-        if pin_mismatch_at_seed {
-            continue;
-        }
         let on_operator_host = observed_seed_addr.is_some();
         let Some(entry) = cache.get(&mid) else {
             // No announcement seen: only the operator tier can qualify,
@@ -41017,6 +41020,51 @@ mod peer_connected_handler_integration_tests {
                 &ant_quic::PeerId(PINNED_KEY),
                 &[pinned_addr]
             ));
+        }
+
+        #[test]
+        fn issue1112_pin_mismatch_skips_both_tiers_on_a_nondirect_path() {
+            // Review round 18 (Codex P2: pin checks bypassed for
+            // hole-punched hint candidates): ant-quic reports hole-punched
+            // paths as non-direct while still naming the peer's remote
+            // address. The pin pair verdict runs on the OBSERVED address
+            // whatever the path, so a mismatched identity at a pinned seed
+            // address cannot enter either tier — not even through its
+            // cached capability flags. Runtime-RED before round 18: the
+            // pair check ran only for direct origins, so this origin
+            // reached both hint lists.
+            const NOT_IT: [u8; 32] = [0xB7; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&NOT_IT],
+            }];
+            let _pins = network::override_dial_pins_for_test(&PINS);
+            let mut cache = std::collections::HashMap::new();
+            let flagged = identity::MachineId([0x33; 32]);
+            cache.insert(
+                flagged,
+                issue1112_machine(
+                    flagged,
+                    &["198.51.100.7:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                // Non-direct (hole-punched shape) at the PINNED address,
+                // with both capability flags asserted.
+                &[issue1112_origin([0x33; 32], "198.51.100.7:5483", false)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a pin-mismatched pair skips both tiers on any path, flags or not"
+            );
         }
 
         #[test]

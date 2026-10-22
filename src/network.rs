@@ -4909,6 +4909,17 @@ impl NetworkNode {
     /// expiry — what catches an ant-quic-internal redial of a rejected
     /// seed after the backoff window lapses.
     fn seed_pin_rejects_current_session(&self, node: &LinkNode, peer: &AntPeerId) -> bool {
+        // Cheapest gate first (round 17): with nothing pinned and nothing
+        // recorded the guard is a no-op before the session lookups.
+        if dial_pin_table().is_empty()
+            && self
+                .seed_pin_rejections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            return false;
+        }
         let session_addr = node
             .session_connection(peer)
             .and_then(|conn| conn.remote_address())
