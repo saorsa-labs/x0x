@@ -1200,4 +1200,67 @@ mod daemon_tests {
         );
         Ok(())
     }
+    /// #1508 r7 F2 (Codex P1), ADR 0110 §3: every physical write of a
+    /// saved removal is admitted immediately before it, under the
+    /// membership lock: "each new exchange re-admits", with no hidden
+    /// transport resend. The real send function goes through the one
+    /// guarded single-exchange egress point. An eligible survivor's write
+    /// is admitted at the write. A write held after it was scheduled, with
+    /// the survivor banned before the bytes leave, is refused at that
+    /// write: an admission taken before route resolution and an ACK'd
+    /// transport with its own retries does not stand for it.
+    #[tokio::test]
+    async fn each_saved_removal_write_is_admitted_at_the_write() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let survivor = AgentId([0x81; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let target = [0x82; 32];
+        let group_id = "d7".repeat(16);
+        let info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let event = removal_event(&group_id, &target);
+
+        let sent = send_removal(&state, &stable, &survivor, &info.state_hash, &event).await;
+        assert!(
+            sent.as_ref()
+                .is_err_and(|reason| reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED)),
+            "an eligible survivor's write is admitted at the guarded single exchange: {sent:?}"
+        );
+
+        // The next write is held after it was scheduled; the survivor is
+        // banned before its bytes leave.
+        let armed = ng::join_egress_test_barrier::arm(&survivor_hex, "s4_removal");
+        let task = {
+            let state = Arc::clone(&state);
+            let stable = stable.clone();
+            let head = info.state_hash.clone();
+            let event = event.clone();
+            tokio::spawn(
+                async move { send_removal(&state, &stable, &survivor, &head, &event).await },
+            )
+        };
+        for _ in 0..200 {
+            if armed.gate.reached() || task.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let held = armed.gate.reached();
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .context("group")?
+            .ban_member(&survivor_hex, None);
+        drop(armed);
+        let sent = task.await?;
+        assert!(held, "the write goes through the guarded egress point");
+        assert_eq!(
+            sent,
+            Err(x0x::dm::PINNED_ADMISSION_REFUSED.to_string()),
+            "the write after the ban is refused at that write"
+        );
+        Ok(())
+    }
 }
