@@ -170,7 +170,16 @@ async fn self_rebind_is_off_while_a_member_capability_is_unknown() {
 
 #[tokio::test]
 async fn self_rebind_before_the_cutoff_changes_only_the_certificate() {
-    let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+    let (mut state, _dir) = secure_endpoint_test_state().await.expect("state");
+    // The restart sync wait has elapsed; only the per-group head sync
+    // (§2) holds the seal.
+    Arc::get_mut(&mut state)
+        .expect("the fresh test state is not shared yet")
+        .revocation_evictions =
+        revocation_eviction::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: std::time::Duration::ZERO,
+            ..x0x::groups::eviction::S4Timing::default()
+        });
     let owner = UserKeypair::generate().expect("owner");
     let group = seed_group(&state, &owner, unix_now() + 86_400, None).await;
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -186,8 +195,15 @@ async fn self_rebind_before_the_cutoff_changes_only_the_certificate() {
         state.agent.identity().agent_keypair(),
         unix_now() + 2 * 86_400,
     );
+    // §2: no head round has run for the group yet, so the route seals
+    // nothing and holds the rebind (#1508 Codex P1 F3).
     let (status, body) = call(&state, &group, &local_hex, Some(renewal.clone())).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "waiting_for_head_sync");
+    // One worker iteration: the pass opens the head round (no other
+    // holder, so it is synced at once) and the rebind step commits.
+    revocation_eviction::revocation_eviction_pass(&state).await;
+    revocation_eviction::rebind::drive(&state).await;
     let after = state
         .named_groups
         .read()
