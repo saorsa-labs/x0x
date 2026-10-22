@@ -3208,4 +3208,74 @@ pub(super) mod restart_tests {
         state.agent.shutdown().await;
         Ok(())
     }
+
+    /// #1533 Codex P1 2 (ADR 0109 §2 "Conflict"): a locally authored
+    /// rebind passes the same conflict gate as a received one. This node
+    /// holds a recorded attestation conflict on its head (no fork marker)
+    /// and a synced head. The self-rebind route must refuse with
+    /// `group_contained` and persist nothing: no head move and no
+    /// planned frame. Before the fix `commit_locked` sealed and persisted
+    /// the rebind past the common prefix. Inert.
+    #[tokio::test]
+    async fn a_recorded_attestation_conflict_refuses_a_local_self_rebind() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let survivor = AgentKeypair::generate()?;
+        let survivor_id = survivor.agent_id();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let me = state.agent.identity().agent_keypair();
+        let info = certified_group(&owner, me, &[&survivor])?;
+        hold_persisted(&state, &info).await?;
+        let stable = info.stable_group_id().to_string();
+        // D129: the survivor's current verified advert sets the bit.
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            survivor_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        set_evidence(&state, &stable, &info, HeadEvidence::Conflicting, false).await;
+        assert!(
+            super::super::group_head_synced(&state, &stable).await,
+            "the head is synced, so only the conflict gate can refuse"
+        );
+        anyhow::ensure!(
+            ng::group_recovery::record_conflict_at_head_for_test(&state, &info).await?,
+            "the conflict is durable"
+        );
+
+        let me = state.agent.identity().agent_keypair();
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, me, Some(now_unix_ms() / 1000 + 1200))?;
+        let (status, body) = self_rebind(&state, &stable, &renewal).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"],
+            cr::CertificateRebindRefusal::GroupContained.as_str()
+        );
+        assert_eq!(
+            head_of(&state, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "nothing past the common prefix applies (local rebind)"
+        );
+        assert!(
+            served(&state, &stable, info.state_revision)
+                .await
+                .is_empty(),
+            "no rebind frame was planned"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
 }
