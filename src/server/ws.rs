@@ -157,14 +157,27 @@ impl WsSession {
         self.gui_session_token.clone()
     }
 
-    /// Queue one `gui.show` on this visible tab.
+    /// Queue one `gui.show` on this visible tab when its GUI session is live.
     ///
-    /// Returns `true` only when the outbound queue accepts the frame.
-    /// A hidden tab, a session with no queue, and a full or closed queue
-    /// return `false`. This does not close the socket: a show that cannot
-    /// be queued is not a navigation, and the caller opens a browser.
-    pub(super) fn try_accept_gui_show(&self, show: &GuiShowFrame) -> bool {
+    /// Returns `true` only when `session_live` accepts this socket's session
+    /// token and the outbound queue accepts the frame. A hidden tab, a tab
+    /// with no token, an expired or revoked token, a session with no queue,
+    /// and a full or closed queue return `false`. The token is checked
+    /// before the frame is queued. This does not close the socket: a show
+    /// that cannot be queued is not a navigation, and the caller opens a
+    /// browser.
+    pub(super) fn try_accept_gui_show(
+        &self,
+        show: &GuiShowFrame,
+        session_live: impl Fn(&str) -> bool,
+    ) -> bool {
         if !self.is_visible_gui() {
+            return false;
+        }
+        let Some(token) = self.gui_session_token.as_deref() else {
+            return false;
+        };
+        if token.is_empty() || !session_live(token) {
             return false;
         }
         let Some(tx) = &self.show_outbound else {
@@ -224,13 +237,16 @@ impl GuiShowQueueProbe {
 /// Insert a visible GUI tab whose outbound queue the route can fill.
 ///
 /// `occupied` slots are already taken. `occupied == capacity` is a
-/// saturated live tab: `try_accept_gui_show` must fail.
+/// saturated live tab: `try_accept_gui_show` must fail. `session_token`
+/// is the GUI session this socket presented. The route accepts a show
+/// only while that token is still live.
 #[cfg(test)]
 pub(super) fn insert_visible_gui_with_queue(
     sessions: &mut HashMap<String, WsSession>,
     id: &str,
     capacity: usize,
     occupied: usize,
+    session_token: &str,
 ) -> GuiShowQueueProbe {
     assert!(capacity > 0, "outbound capacity must be positive");
     assert!(
@@ -243,6 +259,7 @@ pub(super) fn insert_visible_gui_with_queue(
             .expect("prefill fits in the outbound queue");
     }
     let mut session = test_gui_ws_session(id);
+    session.gui_session_token = Some(session_token.to_string());
     session.show_outbound = Some(tx);
     sessions.insert(id.to_string(), session);
     GuiShowQueueProbe { rx: Mutex::new(rx) }

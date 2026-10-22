@@ -21,6 +21,14 @@ use super::rate_limit::GuiShowRateLimit;
 /// revealed later.
 const PENDING_FRESHNESS: Duration = crate::server::SESSION_TOKEN_TTL;
 
+/// Predecessor tokens retained for one refresh chain.
+///
+/// Each record expires from the time it was noted, plus the session-token
+/// TTL. A chain that refreshes again inside that window still adds one
+/// record per refresh. Past this cap the oldest records are dropped, so
+/// the map and the scan that walks it stay bounded.
+const MAX_GUI_SESSION_SUCCESSORS: usize = 8;
+
 /// `error.message` prefix when Stop is off in memory but the marker was not saved.
 ///
 /// `gui.block` has no success frame. This prefix marks the existing error
@@ -703,8 +711,10 @@ impl GuiShowRuntime {
     ///
     /// An upgrade can authenticate with `from_token` and register only after
     /// this refresh. The banner already sits on `to_token`. Registration
-    /// reads the map so the socket does too. Older tokens in the chain point
-    /// at the newest one. Entries older than the session token TTL are dropped.
+    /// reads the map so the socket does too. Older tokens point at the newest
+    /// one and keep the expiry from the refresh that recorded them. A later
+    /// refresh does not extend that time. The oldest records are dropped
+    /// once the map reaches its cap.
     pub(crate) fn note_gui_session_successor(&self, from_token: &str, to_token: &str) {
         if from_token.is_empty() || to_token.is_empty() || from_token == to_token {
             return;
@@ -814,19 +824,39 @@ fn note_successor_locked(
     now: Instant,
 ) {
     expire_session_successors(map, now);
-    for (next, noted) in map.values_mut() {
+    // Point older records at the new token. Leave each record's noted
+    // time alone: that is when this predecessor was recorded, and a later
+    // refresh must not extend it.
+    for (next, _) in map.values_mut() {
         if next == from_token {
             *next = to_token.to_string();
-            *noted = now;
         }
     }
     map.insert(from_token.to_string(), (to_token.to_string(), now));
+    bound_session_successors(map, from_token);
+}
+
+/// Drop the oldest predecessor records once the map is past the cap.
+///
+/// `keep` is the record just inserted. It is the newest and stays.
+fn bound_session_successors(map: &mut HashMap<String, (String, Instant)>, keep: &str) {
+    while map.len() > MAX_GUI_SESSION_SUCCESSORS {
+        let oldest = map
+            .iter()
+            .filter(|(token, _)| token.as_str() != keep)
+            .min_by_key(|(_, (_, noted))| *noted)
+            .map(|(token, _)| token.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        map.remove(&oldest);
+    }
 }
 
 /// Newest token reachable from `token`. The caller already holds the map.
 fn current_token_locked(map: &HashMap<String, (String, Instant)>, token: &str) -> String {
     let mut current = token.to_string();
-    for _ in 0..8 {
+    for _ in 0..MAX_GUI_SESSION_SUCCESSORS {
         let Some((next, _)) = map.get(&current) else {
             break;
         };
@@ -1708,6 +1738,47 @@ exit 1
             rt.take_pending_for_session("later-refreshed", past_session)
                 .is_none(),
             "the banner expires with the refreshed session"
+        );
+    }
+
+    #[test]
+    fn refresh_chain_keeps_predecessor_expiry_and_stays_bounded() {
+        let mut map = std::collections::HashMap::new();
+        let origin = Instant::now();
+        note_successor_locked(&mut map, "t0", "t1", origin);
+        let original = map.get("t0").expect("t0 recorded").1;
+
+        let mut prev = "t1".to_string();
+        for step in 2..=MAX_GUI_SESSION_SUCCESSORS + 8 {
+            let at = origin + Duration::from_secs(u64::try_from(step).expect("step"));
+            let next = format!("t{step}");
+            note_successor_locked(&mut map, &prev, &next, at);
+            prev = next;
+            if let Some((_, noted)) = map.get("t0") {
+                assert_eq!(*noted, original, "refresh at +{step}s extended t0's expiry");
+            }
+        }
+        assert!(
+            map.len() <= MAX_GUI_SESSION_SUCCESSORS,
+            "refresh history grew to {}",
+            map.len()
+        );
+
+        let late = origin + PENDING_FRESHNESS - Duration::from_secs(1);
+        let tail = "t-late".to_string();
+        note_successor_locked(&mut map, &prev, &tail, late);
+        if let Some((_, noted)) = map.get("t0") {
+            assert_eq!(*noted, original, "the late refresh extended t0");
+        }
+        let after = origin + PENDING_FRESHNESS + Duration::from_secs(1);
+        note_successor_locked(&mut map, &tail, "t-end", after);
+        assert!(
+            !map.contains_key("t0"),
+            "t0 outlived the expiry recorded at its own refresh"
+        );
+        assert!(
+            map.contains_key("t-late") || map.values().any(|(next, _)| next == "t-end"),
+            "a mapping noted inside the window must remain"
         );
     }
 

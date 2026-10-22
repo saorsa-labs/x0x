@@ -715,7 +715,11 @@ impl SessionStore {
     /// Validate a candidate token: constant-time compare against every active
     /// session digest, pruning expired entries along the way. Returns `true`
     /// only if an unexpired entry matches.
-    fn is_valid(&self, token: &str, now: Instant) -> bool {
+    ///
+    /// `POST /gui/show` calls this at the navigate decision. A WebSocket
+    /// stays up after the token expires, and visibility alone is not a
+    /// live GUI session.
+    pub(super) fn is_valid(&self, token: &str, now: Instant) -> bool {
         use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
         let Ok(mut guard) = self.sessions.lock() else {
@@ -726,10 +730,28 @@ impl SessionStore {
         guard.iter().any(|s| candidate.ct_eq(&s.token_hash).into())
     }
 
-    /// Whether `token` is a live session. [`Self::is_valid`] stays private.
+    /// Whether `token` is a live session.
     #[cfg(test)]
     pub(super) fn is_live_for_test(&self, token: &str, now: std::time::Instant) -> bool {
         self.is_valid(token, now)
+    }
+
+    /// Mark one session expired. The next [`Self::is_valid`] drops it.
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&self, token: &str) {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let Ok(mut guard) = self.sessions.lock() else {
+            return;
+        };
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        for session in guard.iter_mut() {
+            if bool::from(candidate.ct_eq(&session.token_hash)) {
+                session.expires_at = past;
+            }
+        }
     }
 }
 

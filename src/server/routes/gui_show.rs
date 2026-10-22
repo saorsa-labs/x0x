@@ -3,8 +3,9 @@
 //! Validates the view grammar, applies `[gui_show] local_enabled`, the block
 //! list and the rate limit, then either queues a `gui.show` frame on a
 //! visible tab (`navigated`) or opens a fresh session URL (`opened`).
-//! `navigated` is returned only after that tab's outbound queue accepts
-//! the frame. The response never contains a URL or session token.
+//! `navigated` is returned only when that tab's GUI session is still valid
+//! and its outbound queue accepts the frame. The response never contains a
+//! URL or session token.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -68,7 +69,9 @@ pub(in crate::server) async fn gui_show(
 
     // Deliver on the tab's own queue. A broadcast would return before the
     // forwarder runs, and a full queue there drops the frame and closes
-    // the socket. Reconnect does not replay that broadcast.
+    // the socket. Reconnect does not replay that broadcast. The socket
+    // outlives the session token, so the token is checked here, before
+    // the frame is queued.
     let show = GuiShowFrame {
         view: route.clone(),
         banner: banner.clone(),
@@ -77,11 +80,14 @@ pub(in crate::server) async fn gui_show(
         rider: false,
         request_id: request_id.clone(),
     };
+    let decided_at = Instant::now();
     let accepted = {
         let sessions = state.ws_sessions.read().await;
         let mut accepted = false;
         for session in sessions.values() {
-            if session.try_accept_gui_show(&show) {
+            if session
+                .try_accept_gui_show(&show, |token| state.sessions.is_valid(token, decided_at))
+            {
                 accepted = true;
             }
         }
@@ -328,9 +334,16 @@ mod tests {
     async fn open_ws_session_yields_navigated_when_the_queue_accepts() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let cap = install_capturing_opener(&state);
+        let token = state.sessions.issue(Instant::now());
         let probe = {
             let mut sessions = state.ws_sessions.write().await;
-            crate::server::ws::insert_visible_gui_with_queue(&mut sessions, "test-session", 4, 0)
+            crate::server::ws::insert_visible_gui_with_queue(
+                &mut sessions,
+                "test-session",
+                4,
+                0,
+                &token,
+            )
         };
         let app = router(Arc::clone(&state));
         let (status, body) = post_show(&app, json!({ "view": "network" })).await?;
@@ -357,9 +370,16 @@ mod tests {
     async fn saturated_live_tab_does_not_report_navigated() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let cap = install_capturing_opener(&state);
+        let token = state.sessions.issue(Instant::now());
         let probe = {
             let mut sessions = state.ws_sessions.write().await;
-            crate::server::ws::insert_visible_gui_with_queue(&mut sessions, "saturated", 1, 1)
+            crate::server::ws::insert_visible_gui_with_queue(
+                &mut sessions,
+                "saturated",
+                1,
+                1,
+                &token,
+            )
         };
         let app = router(Arc::clone(&state));
         let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
@@ -382,6 +402,43 @@ mod tests {
             probe.gui_shows().is_empty(),
             "the saturated queue must not contain the show frame"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_visible_tab_does_not_report_navigated() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let token = state.sessions.issue(Instant::now());
+        let probe = {
+            let mut sessions = state.ws_sessions.write().await;
+            crate::server::ws::insert_visible_gui_with_queue(
+                &mut sessions,
+                "expired-tab",
+                4,
+                0,
+                &token,
+            )
+        };
+        state.sessions.expire_for_test(&token);
+        assert!(
+            !state.sessions.is_live_for_test(&token, Instant::now()),
+            "the fixture must be an expired GUI session"
+        );
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(&app, json!({ "view": "people" })).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["outcome"], "opened",
+            "an expired visible tab is not a navigation: {body}"
+        );
+        assert!(
+            probe.gui_shows().is_empty(),
+            "the expired tab must not be told to navigate"
+        );
+        let urls = cap.urls.lock().unwrap();
+        assert_eq!(urls.len(), 1, "the browser must open");
+        assert!(urls[0].contains("#/people"), "{}", urls[0]);
         Ok(())
     }
 
