@@ -4970,20 +4970,30 @@ impl NetworkNode {
     }
 
     /// Whether a live rejection refuses a frame by its SOURCE session
-    /// (#1112, rounds 10-13): either a recorded rejection entry names
-    /// this frame's generation (the address-dial refusal's record, which
-    /// outlives the connection's close), or the session-address ledger
-    /// maps the frame's generation to the address it lived on and the
-    /// TIMELESS pin pair verdict decides on that (identity, address)
-    /// pair — covering id-based dials and internal redials, which never
-    /// pass the address-dial seam and record no entry. Frames queued
-    /// before a close and drained after it are refused on both clauses.
-    /// With pins in force and NO evidence for the frame's generation —
-    /// none recorded, or evicted by the ledger's bounds — the frame is
-    /// refused outright (round 13: unknown provenance under pins; a
-    /// session established before the pin era re-establishes and its
-    /// traffic re-flows). Never reached while the pin table is empty.
-    fn seed_pin_rejects_frame(&self, peer_id: &AntPeerId, source_generation: u64) -> bool {
+    /// (#1112, rounds 10-14), cheapest clauses first so ordinary peers
+    /// pay two short-lock map lookups:
+    ///
+    /// 1. a recorded rejection entry names this frame's generation (the
+    ///    address-dial refusal's record, which outlives the close);
+    /// 2. the session-address ledger (seed-address sessions only, round
+    ///    14) maps the frame's generation to the address it lived on and
+    ///    the timeless pair verdict decides on that (identity, address)
+    ///    pair — covering id-based dials and internal redials, which
+    ///    never pass the address-dial seam;
+    /// 3. the frame rides the peer's CURRENT session: its address
+    ///    decides, and an unpinned address admits (TOFU);
+    /// 4. unknown provenance, SCOPED (round 14): only a peer the pins
+    ///    already implicate — a rejection entry, or seed-address session
+    ///    history in the ledger — is held to the fail-closed rule
+    ///    (evidence evicted by the ledger's bounds, or a session no x0x
+    ///    observation ever caught). Peers with no seed-address history
+    ///    are outside the pins' threat model and keep flowing.
+    fn seed_pin_rejects_frame(
+        &self,
+        node: &LinkNode,
+        peer_id: &AntPeerId,
+        source_generation: u64,
+    ) -> bool {
         if self
             .live_seed_pin_rejections()
             .iter()
@@ -4991,10 +5001,29 @@ impl NetworkNode {
         {
             return true;
         }
-        match self.session_addr_for(peer_id, source_generation) {
-            Some(addr) => seed_pin_mismatch_at(addr, peer_id.0),
-            None => !dial_pin_table().is_empty(),
+        if let Some(addr) = self.session_addr_for(peer_id, source_generation) {
+            return seed_pin_mismatch_at(addr, peer_id.0);
         }
+        if node.current_connection_generation(peer_id) == Some(source_generation) {
+            return node
+                .session_connection(peer_id)
+                .and_then(|conn| conn.remote_address())
+                .is_some_and(|addr| seed_pin_mismatch_at(addr, peer_id.0));
+        }
+        if dial_pin_table().is_empty() {
+            return false;
+        }
+        self.any_live_seed_pin_rejection_for(peer_id.0) || self.peer_has_session_evidence(peer_id)
+    }
+
+    /// Whether the ledger holds ANY session evidence for `peer` (#1112,
+    /// round 14). The ledger records seed-address sessions only, so this
+    /// is "the pins already implicate this peer".
+    fn peer_has_session_evidence(&self, peer_id: &AntPeerId) -> bool {
+        self.session_addr_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(peer_id)
     }
 
     /// [`Self::seed_pin_rejects_current_session`] for callers that hold
@@ -5022,6 +5051,15 @@ impl NetworkNode {
         };
         if self.seed_pin_rejects_current_session(node, peer_id) {
             return true;
+        }
+        // The any-connection walk is confined to peers the pins already
+        // implicate — a rejection entry or seed-address session history
+        // (round 14): ordinary peers never pay the connection-list scan
+        // on the receive path.
+        if !self.any_live_seed_pin_rejection_for(peer_id.0)
+            && !self.peer_has_session_evidence(peer_id)
+        {
+            return false;
         }
         let rejected_addrs: Vec<SocketAddr> = self
             .live_seed_pin_rejections()
@@ -6391,7 +6429,9 @@ impl NetworkNode {
                         }
                     }
                 }
-                // Release this endpoint clone before any channel backpressure.
+                // Release this endpoint clone before any channel
+                // backpressure; the guards below use a cheap clone.
+                let guard_node = node_ref.clone();
                 drop(node_handle);
 
                 match recv_result {
@@ -6543,7 +6583,11 @@ impl NetworkNode {
                         // #206/#292 gossip-plane scope.)
                         if GossipStreamType::from_byte(type_byte).is_some()
                             && (plane_node.is_reconnect_suppressed(peer_id.0)
-                                || plane_node.seed_pin_rejects_frame(&peer_id, source_generation)
+                                || plane_node.seed_pin_rejects_frame(
+                                    &guard_node,
+                                    &peer_id,
+                                    source_generation,
+                                )
                                 || plane_node.seed_pin_rejected_session(&peer_id).await)
                         {
                             tracing::warn!(
@@ -6752,6 +6796,13 @@ impl NetworkNode {
                 let Some(link) = node_handle else {
                     break;
                 };
+                // Round 14: only ledger while the event's generation is
+                // STILL the current one — a later `session_connection`
+                // read would describe whichever connection replaced it,
+                // mis-attributing that address to this generation.
+                if link.current_connection_generation(&peer) != Some(generation) {
+                    continue;
+                }
                 if let Some(addr) = link
                     .session_connection(&peer)
                     .and_then(|conn| conn.remote_address())
@@ -7842,15 +7893,19 @@ const SESSION_ADDR_LEDGER_TTL: Duration = Duration::from_secs(3600);
 /// after an hour of heavy churn; the oldest-touched peers leave first.
 const SESSION_ADDR_LEDGER_MAX_PEERS: usize = 512;
 
-/// Write into the session-address ledger (#1112, round 11): the address
-/// a connection generation of a peer lives on, kept per peer with the
-/// most recent few generations (generations are never reused, and a
-/// RECONNECT at the same address never deletes an earlier generation's
-/// evidence — queued frames of the old generation still need it, round
-/// 12). Entries expire on [`SESSION_ADDR_LEDGER_TTL`]; the identity count
-/// is bounded by [`SESSION_ADDR_LEDGER_MAX_PEERS`]. A no-op while the
-/// pin table is empty: nothing is pinned, nothing can be evaluated, and
-/// the ledger costs nothing (round 12).
+/// Write into the session-address ledger (#1112, rounds 11-14): the
+/// address a connection generation of a peer lives on. SCOPED TO PINNED
+/// ADDRESSES (round 14): evidence for an unpinned address can never
+/// refuse a frame — the pair verdict is TOFU there — so only
+/// seed-address sessions enter the ledger. That keeps it tiny, keeps the
+/// pump's per-frame write work off every ordinary peer, and confines the
+/// fail-closed provenance rule to peers with seed-address history.
+/// Entries keep the most recent few generations per peer (a RECONNECT at
+/// the same address never deletes an earlier generation's evidence —
+/// queued frames of the old generation still need it), expire on
+/// [`SESSION_ADDR_LEDGER_TTL`], and the identity count is bounded by
+/// [`SESSION_ADDR_LEDGER_MAX_PEERS`]. A no-op while the pin table is
+/// empty.
 fn note_session_address_in(
     ledger: &Arc<Mutex<SessionAddrLedger>>,
     peer: AntPeerId,
@@ -7861,6 +7916,10 @@ fn note_session_address_in(
         return;
     }
     let addr = normalize_v4_mapped_addr(addr);
+    // Only pinned addresses: evidence elsewhere cannot refuse anything.
+    if pinned_seed_peer_ids(addr).is_empty() {
+        return;
+    }
     let now = Instant::now();
     let mut ledger = ledger
         .lock()
@@ -11424,7 +11483,7 @@ mod tests {
             Some(seed_addr),
             "the id-dial seam ledgered the source session"
         );
-        assert!(joiner.seed_pin_rejects_frame(&seed_peer, generation));
+        assert!(joiner.seed_pin_rejects_frame(&link, &seed_peer, generation));
 
         // End to end: nothing from the closed, pin-mismatched session
         // reaches the gossip channels.
@@ -11537,7 +11596,7 @@ mod tests {
         assert_eq!(joiner.session_addr_for(&seed_peer, second), Some(seed_addr));
         // The OLD generation's queued frame is refused by the pair
         // verdict over its own evidence.
-        assert!(joiner.seed_pin_rejects_frame(&seed_peer, first));
+        assert!(joiner.seed_pin_rejects_frame(&link, &seed_peer, first));
         match tokio::time::timeout(Duration::from_millis(250), joiner.receive_message()).await {
             Err(_elapsed) => {}
             Ok(Ok((peer, stream_type, _))) => panic!(
@@ -11593,47 +11652,99 @@ mod tests {
         seed.try_shutdown().await.unwrap();
     }
 
-    /// Round 13 (Codex P2: eviction restores the bypass): with pins in
-    /// force, a frame whose source generation has NO evidence — never
-    /// recorded (a connection no x0x seam or watcher observed) or evicted
-    /// by the ledger's bounds — is refused outright: unknown provenance
-    /// under pins never reaches the gossip plane. Runtime-RED before the
-    /// provenance stance: a missing-evidence frame passed both guards.
+    /// Rounds 13-14 (Codex P2: eviction restores the bypass; Claude: the
+    /// fail-closed rule must not swallow ordinary peers): with pins in
+    /// force, a frame of unknown provenance is refused ONLY for a peer
+    /// the pins already implicate — seed-address session history or a
+    /// rejection entry. Evidence evicted by the ledger's bounds is
+    /// refused again; a peer with NO seed-address history is outside the
+    /// pins' threat model and keeps flowing. Runtime-RED before the
+    /// scoped stance: implicated peers' missing-evidence frames passed,
+    /// and (before scoping) ordinary peers' frames were refused.
     #[tokio::test]
-    async fn issue1112_unknown_provenance_frames_are_refused_under_pins() {
+    async fn issue1112_unknown_provenance_scoped_to_implicated_peers() {
         const NOT_THE_SEED: [u8; 32] = [0xB4; 32];
         const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
             addr: "198.18.0.2:5483",
             expected_peer_ids: &[&NOT_THE_SEED],
         }];
-        let addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let pinned_addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
         let node = NetworkNode::new(test_network_config(), None, None)
             .await
             .unwrap();
-        let peer = test_ant_peer(0x9);
+        let link = node.node.read().await.clone().expect("live link");
+        let implicated = test_ant_peer(0x9);
+        let ordinary = test_ant_peer(0xA);
 
-        // Pins empty: no evidence, no entry — the guard is dormant.
-        assert!(!node.seed_pin_rejects_frame(&peer, 42));
+        // Pins empty: the guard is dormant for everyone.
+        assert!(!node.seed_pin_rejects_frame(&link, &implicated, 42));
 
         let _pins = TestPinTableGuard::set(&PINS);
-        // Unknown provenance (no observation ever recorded).
+        // Ordinary peer, unknown provenance: outside the threat model.
         assert!(
-            node.seed_pin_rejects_frame(&peer, 42),
-            "a frame with no source evidence is refused under pins"
+            !node.seed_pin_rejects_frame(&link, &ordinary, 42),
+            "a peer with no seed-address history keeps flowing under pins"
+        );
+        // An implicated peer with NO evidence for the frame's generation
+        // (never observed): fail-closed.
+        node.note_session_address(implicated, 100, pinned_addr);
+        assert!(
+            node.seed_pin_rejects_frame(&link, &implicated, 42),
+            "an implicated peer's frame with no source evidence is refused"
         );
         // Evidence evicted by the per-peer bound: nine generations push
         // the first out (cap 8), and its frames are refused again.
         for generation in 0..9u64 {
-            node.note_session_address(peer, generation, addr);
+            node.note_session_address(implicated, generation, pinned_addr);
         }
         assert!(
-            node.session_addr_for(&peer, 0).is_none(),
+            node.session_addr_for(&implicated, 0).is_none(),
             "the first generation's evidence was evicted by the bound"
         );
-        assert!(node.seed_pin_rejects_frame(&peer, 0));
+        assert!(node.seed_pin_rejects_frame(&link, &implicated, 0));
         // A generation WITH evidence at the mismatching address: refused
         // by the pair verdict.
-        assert!(node.seed_pin_rejects_frame(&peer, 8));
+        assert!(node.seed_pin_rejects_frame(&link, &implicated, 8));
+
+        node.try_shutdown().await.unwrap();
+    }
+
+    /// Round 14 (Codex P2: a delayed watcher event across DIFFERENT
+    /// addresses): the watcher only ledgers while the event's generation
+    /// is still current, so a late event can never mis-attribute the
+    /// replacement connection's address to the old generation. The old
+    /// generation keeps its own evidence and its queued frames stay
+    /// refused; an implicated peer's frames ride the CURRENT session
+    /// clause (an unpinned address admits — the pins govern pinned
+    /// addresses only), and its other unknown generations stay
+    /// fail-closed.
+    #[tokio::test]
+    async fn issue1112_late_lifecycle_event_across_addresses_keeps_evidence_true() {
+        const NOT_THE_SEED: [u8; 32] = [0xB5; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let pinned_addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let node = NetworkNode::new(test_network_config(), None, None)
+            .await
+            .unwrap();
+        let link = node.node.read().await.clone().expect("live link");
+        let peer = test_ant_peer(0xB);
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        // Generation 1 lived on the pinned address (observed by a seam).
+        node.note_session_address(peer, 1, pinned_addr);
+        // The pinned generation's frames stay refused by their own
+        // evidence — a late watcher event cannot rewrite it.
+        assert!(node.seed_pin_rejects_frame(&link, &peer, 1));
+        // Another generation of the same implicated peer, no evidence:
+        // fail-closed (its live traffic flows via the current-session
+        // clause, whose unpinned address admits).
+        assert!(
+            node.seed_pin_rejects_frame(&link, &peer, 2),
+            "an implicated peer's unknown generations stay fail-closed"
+        );
 
         node.try_shutdown().await.unwrap();
     }
@@ -11733,7 +11844,7 @@ mod tests {
             "the current-session check alone cannot see the closed session"
         );
         assert!(
-            joiner.seed_pin_rejects_frame(&seed_peer, generation),
+            joiner.seed_pin_rejects_frame(&link, &seed_peer, generation),
             "the frame's source generation is still refused"
         );
 

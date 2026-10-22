@@ -146,23 +146,27 @@ connection of the identity is checked against the pin rows too. A frame
 is additionally refused by its SOURCE session: a session-address ledger
 (recorded at the dial seams, the accept loop, the receive pump while a
 generation is live, and by an always-on lifecycle watcher on every
-ESTABLISHED generation — so a connection that closes before the pump
-ever sees a frame still leaves evidence) maps the frame's connection
-generation to the address it lived on, so a frame queued before a close
-and drained after it is refused even when the session was never rejected
-at the dial seam (id-based dials, internal redials). A reconnect at the
-same address never erases an earlier generation's entry. The ledger is
-bounded (a few generations per peer, an hour per entry, a global identity
-cap) and is dormant — no writes at all — while the pin table is empty.
-Ordinary gossip sends are bound to the connection generation they
-examined — but only while any address is pinned: with nothing pinned the
-pre-#1112 plain send stands, so the binding (a replacement between check
-and write fails the send instead of riding the unchecked connection)
-costs nothing today. A send with no live session fails with the
-structured PeerNotConnected (the #380 eviction contract), never a plain
-error that would only cool the peer. Frames with unknown provenance —
-no recorded entry and no session evidence, whether never observed or
-evicted by the ledger's bounds — are refused while pins are in force. This is
+ESTABLISHED generation — which only records while the event's generation
+is still current, so a late event can never mis-attribute the
+replacement's address) maps the frame's connection generation to the
+address it lived on, so a frame queued before a close and drained after
+it is refused even when the session was never rejected at the dial seam
+(id-based dials, internal redials). A reconnect at the same address never
+erases an earlier generation's entry. The ledger records SEED-ADDRESS
+sessions only — evidence for an unpinned address can never refuse a
+frame — is bounded (a few generations per peer, an hour per entry, a
+global identity cap), and is dormant while the pin table is empty.
+Frames of unknown provenance (no entry, no evidence — never observed, or
+evicted by the bounds) are refused only for peers the pins already
+implicate (seed-address session history or a rejection entry); ordinary
+peers are outside the pins' threat model and keep flowing. Ordinary
+gossip sends are bound to the connection generation they examined — but
+only while any address is pinned: with nothing pinned the pre-#1112
+plain send stands, so the binding (a replacement between check and write
+fails the send instead of riding the unchecked connection) costs nothing
+today. A send with no live session fails with the structured
+PeerNotConnected (the #380 eviction contract), never a plain error that
+would only cool the peer. This is
 what catches an ant-quic-internal coordinator redial of a rejected seed,
 whose connection never passed x0x's dial seam. The guarded-send policy is recomputed
 inside the post-`open_uni` callback, so a rejection that lands while a
