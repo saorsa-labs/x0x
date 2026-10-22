@@ -50,6 +50,11 @@ Enforces:
   ``docs/adr/transient/T-self-leave-rekey-committer.md``. The sentence
   states the changed ``security_binding`` value and the mixed-version
   break. A status edit, a slot edit, or any other body edit still fails.
+  One exception (David, 21 Oct 2026): pull request 1512 may replace three
+  passages in ``docs/adr/0083-agent-initiated-gui-show.md``. The passages
+  record the local Stop marker ``gui_show_local_disabled``, the
+  ``disabled`` reply, the re-enable banner sentence, ``gui.visible``, and
+  ``gui=1``. A status edit or any other body edit still fails.
   The number is ``GITHUB_PR_NUMBER``, set from
   ``github.event.pull_request.number``. Any other file or number stays frozen.
 """
@@ -722,6 +727,124 @@ def pr1337_in_place_edit_allowed(name: str, snapshot: bytes, head: bytes) -> boo
     return old.replace(_PR1337_CLAIM_BEFORE, _PR1337_CLAIM_AFTER, 1) == new
 
 
+# David, 21 Oct 2026, PR 1512. Three passages, one Accepted ADR, one pull
+# request. The number comes from the Actions event, not from a file in
+# the checkout. The compared bytes are the archive body behind the
+# consolidation link.
+_PR1512_ADR = "docs/adr/0083-agent-initiated-gui-show.md"
+_PR1512_PULL_REQUEST = "1512"
+_PR1512_LIVE_BEFORE = (
+    "2. **If a GUI tab is live and visible** (it has an open WS), it pushes a"
+)
+_PR1512_LIVE_AFTER = (
+    "2. **If a GUI tab is live and visible** (§5), it pushes a"
+)
+_PR1512_STOP_BEFORE = (
+    "- **Origin banner.** Every show, whether navigated in place or opened in a new\n"
+    "  window, displays a non-dismissable-for-3-seconds banner: \"Opened by\n"
+    "  *<agent name or short id>* on *<machine name or short id>*\" (with \"(rider)\"\n"
+    "  when the provenance flag is set). The names are resolved locally, never\n"
+    "  taken from the request. The banner has a \"Stop shows from this agent\"\n"
+    "  control, which adds the sender to a local `gui_show_blocked` list."
+)
+_PR1512_STOP_AFTER = (
+    "- **Origin banner.** Every show displays a banner for 3 seconds. The human\n"
+    "  cannot dismiss it during that time. This applies when the GUI navigates in\n"
+    "  place and when it opens a new window. The first sentence is \"Opened by\n"
+    "  *<agent name or short id>* on *<machine name or short id>*\". The sentence\n"
+    "  includes \"(rider)\" when the provenance flag is set. The daemon resolves\n"
+    "  the names on the target machine. It does not copy them from the request.\n"
+    "  The second sentence is \"Delete gui_show_local_disabled in the data\n"
+    "  directory to turn local show back on.\"\n"
+    "- **Stop.** The banner control reads \"Stop local shows\". Slice 1 has only\n"
+    "  local senders. The control sends `gui.block`.\n"
+    "  - When the sender is this daemon's own agent, Stop writes\n"
+    "    `gui_show_local_disabled` in the data directory. Stop does not add that\n"
+    "    agent to `gui_show_blocked`. A later local show answers `disabled`.\n"
+    "    The human turns local show back on by deleting that file. A config value\n"
+    "    `local_enabled = true`, a process restart, or `POST /acl/reload` does\n"
+    "    not delete the file and does not turn local show back on.\n"
+    "  - When the sender is another agent, Stop adds that agent to the local\n"
+    "    `gui_show_blocked` list. A later show from a blocked sender answers\n"
+    "    `refused`.\n"
+    "- **Live tab.** A GUI tab is live only while the human can use it. The\n"
+    "  WebSocket sends the query flag `gui=1` when it connects in that state.\n"
+    "  The tab sends `gui.visible` when the tab is shown or hidden. A hidden tab\n"
+    "  omits `gui=1` on the next connect. A session that is due for refresh\n"
+    "  (8 minutes after it was issued) stays unavailable until that refresh\n"
+    "  succeeds. The tab does not advertise itself as visible before the refresh\n"
+    "  succeeds. After that refresh succeeds, the same tab sends `gui.visible`\n"
+    "  with visible true. A pending origin banner stays with the tab when the\n"
+    "  session token is refreshed. A hidden tab that refreshes before its\n"
+    "  WebSocket reconnects still receives that banner. David Irvine accepted\n"
+    "  `gui_show_local_disabled`, the `gui.show`, `gui.block` and `gui.visible`\n"
+    "  WebSocket frames, the `gui=1` query flag, and the `[gui_show]` config\n"
+    "  table on 21 Oct 2026 (PR 1512). He ordered this section to match that\n"
+    "  decision."
+)
+_PR1512_CONFIG_BEFORE = (
+    "  When `remote_enabled = false`, the target answers `disabled`, and activity\n"
+    "  queries are answered `disabled` (with no timestamp). The settings are read\n"
+    "  at startup and on `POST /acl/reload`."
+)
+_PR1512_CONFIG_AFTER = (
+    "  When `local_enabled` is false, local show answers `disabled`. The file\n"
+    "  `gui_show_local_disabled` forces that result, including when the config\n"
+    "  still says `local_enabled = true`. When `remote_enabled = false`, the\n"
+    "  target answers `disabled`, and activity queries are answered `disabled`\n"
+    "  (with no timestamp). The daemon reads these settings at startup and on\n"
+    "  `POST /acl/reload`."
+)
+_PR1512_REPLACEMENTS = (
+    (_PR1512_LIVE_BEFORE, _PR1512_LIVE_AFTER),
+    (_PR1512_STOP_BEFORE, _PR1512_STOP_AFTER),
+    (_PR1512_CONFIG_BEFORE, _PR1512_CONFIG_AFTER),
+)
+
+
+def _pr1512_landing_push() -> bool:
+    """Whether this run is the main-branch push that lands PR 1512.
+
+    The push workflow sets ``GITHUB_EVENT_NAME`` and ``GITHUB_BEFORE``.
+    It does not set ``GITHUB_PR_NUMBER``. A zero ``before`` is a new
+    branch, not this landing.
+    """
+    if os.environ.get("GITHUB_EVENT_NAME", "").strip() != "push":
+        return False
+    before = os.environ.get("GITHUB_BEFORE", "").strip()
+    return bool(before) and set(before) != {"0"}
+
+
+def pr1512_section5_edit_allowed(name: str, snapshot: bytes, head: bytes) -> bool:
+    """Whether this Accepted ADR edit is the PR 1512 section 5 update.
+
+    True when *name* is ADR 0083 and the only byte change is the three
+    passages David ordered on 21 Oct 2026. The pull-request workflow
+    allows that for ``GITHUB_PR_NUMBER`` ``1512``. The main push workflow
+    has no pull request number, so the same bytes are also allowed on
+    that landing push. A status edit or any other body edit returns
+    false. Any other path, number, or event stays immutable.
+    """
+    if name != _PR1512_ADR:
+        return False
+    number = os.environ.get("GITHUB_PR_NUMBER", "").strip()
+    if number != _PR1512_PULL_REQUEST and not (number == "" and _pr1512_landing_push()):
+        return False
+    try:
+        old = snapshot.decode("utf-8")
+        new = head.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    expected = old
+    for before, after in _PR1512_REPLACEMENTS:
+        if old.count(before) != 1 or new.count(after) != 1:
+            return False
+        if before in new or after in old:
+            return False
+        expected = expected.replace(before, after, 1)
+    return expected == new
+
+
 def _transient_shape_errors(path: str, text: str) -> list[str]:
     """Check the filename, the one target slot, and the lifecycle."""
     errors: list[str] = []
@@ -1013,6 +1136,10 @@ def main() -> int:
                 if is_template_repair(snapshot_text_str, head_text_str):
                     # Heading-only repair restoring a missing required
                     # section; allowed without superseding.
+                    continue
+                if pr1512_section5_edit_allowed(adr_name, snapshot_text, head_text):
+                    # David, 21 Oct 2026: PR 1512 records the accepted Stop
+                    # marker and live-tab flags in the existing section 5.
                     continue
                 errors.append(
                     f"{adr_name}: Accepted ADRs are immutable. "

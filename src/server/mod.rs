@@ -14,6 +14,7 @@ pub use acl_admin::AclReloadTrigger;
 mod api_watchdog;
 pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
+pub(crate) use auth::SESSION_TOKEN_TTL;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
@@ -500,6 +501,8 @@ pub async fn serve_with_options(
         exec_policy,
         connect_policy,
         self_update_enabled,
+        daemon_config_path,
+        gui_show_write_path,
     } = options;
     // `--skip-update-check` is process-scoped updater suppression. Compute one
     // effective capability before any updater path is considered, then use it
@@ -1340,6 +1343,18 @@ pub async fn serve_with_options(
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         acl_admin: Arc::clone(&acl_admin),
+        gui_show: {
+            let runtime =
+                x0x::gui::GuiShowRuntime::with_defaults(config.gui_show.clone(), &config.data_dir);
+            runtime.set_config_path(daemon_config_path);
+            runtime.set_write_path(gui_show_write_path);
+            // `with_defaults` applies a side-file stop before the config path
+            // is known. Apply again once the path is attached. The marker
+            // still forces show off when the loaded file already says
+            // `local_enabled = true`.
+            runtime.apply_persisted_local_stop();
+            runtime
+        },
         connect_diagnostics,
         forward_service,
         socks_service,
@@ -3031,6 +3046,8 @@ pub async fn serve_with_options(
         // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
+        // ADR 0083 slice 1: local show (no remote target).
+        .route("/gui/show", post(routes::gui_show))
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))
@@ -3305,6 +3322,10 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
+    // Browser launches sit on the blocking pool, which abort does not stop.
+    // Tell them to return before the join below. The launch task does not
+    // hold `AppState`.
+    state.gui_show.stop_opening();
     // #1288 row 2: REST `/subscribe` forwarders. A topic in
     // `[history] record_topics` makes the forwarder clone `HistoryHandle`,
     // which holds `history.db`. Dropping the map would detach that task and
@@ -3336,7 +3357,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // public-message fan-out race, the one-shot predecessor-relay fallback
     // offer, the member-keyed KeyPackage catch-up requests, the KV-store
     // delta direct deliveries, the outgoing file-chunk streams, and since
-    // #1288 the WebSocket session loop and its writer and forwarders, and the
+    // #1288 the WebSocket session loop and its writer and forwarders, the
+    // queued GUI reveal that waits on a full outbound queue, and the
     // startup self-leave catch-up backoff) and the
     // joiner's join-attempt polls and sends hold the Agent or this AppState.
     // Left running, one asleep before a delayed delivery keeps the Agent, and

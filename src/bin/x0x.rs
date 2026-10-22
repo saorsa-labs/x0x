@@ -321,6 +321,14 @@ enum Commands {
         #[arg(long)]
         view: Option<String>,
     },
+    /// Show a GUI view to the human (ADR 0083). Local only in slice 1.
+    Show {
+        /// View route, e.g. `people`, `dm/<agent_id>`, `groups/<id>/board`.
+        view: String,
+        /// Target machine hex id or `active` (remote show; later slice).
+        #[arg(long = "on")]
+        on: Option<String>,
+    },
     /// Print all API routes. [dev]
     #[command(hide = true)]
     Routes {
@@ -2359,6 +2367,7 @@ async fn run(
             }
             Ok(())
         }
+        Commands::Show { view, on } => commands::show::show(&client, &view, on.as_deref()).await,
         Commands::Profile { sub } => match sub {
             None => commands::identity::profile(&client).await,
             Some(ProfileSub::Set {
@@ -3554,6 +3563,7 @@ x0x (v{VERSION})
     |   +-- --apply        Apply through the running daemon
     |   +-- --force        Fetch current manifest with --check
     +-- gui                Open embedded web GUI
+    +-- show <view>        Show a GUI view (ADR 0083; local)
     +-- routes             Print all 130 REST API routes
     +-- tree               This command tree
     +-- ws sessions        List WebSocket sessions

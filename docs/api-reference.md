@@ -79,11 +79,12 @@ Auth-class labels used throughout this reference:
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
   route, (#1386) `POST /forwards` in every case (including plain hex
-  `peer_agent`), `DELETE /forwards/:local_addr` (David, 20 Oct 2026,
-  17:54 BST: a session token or a rider token is refused, the same rule as
-  `POST /forwards`), and every `/names*` route. The join-request list,
-  approve and reject are not on this list. They take one class that
-  depends on the group: see **Join-request admin (#1347)** below.
+  `peer_agent`), (#1392) `POST /gui/show`, `DELETE /forwards/:local_addr`
+  (David, 20 Oct 2026, 17:54 BST: a session token or a rider token is
+  refused, the same rule as `POST /forwards`), and every `/names*` route.
+  The join-request list, approve and reject are not on this list. They
+  take one class that depends on the group: see **Join-request admin
+  (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
@@ -2920,6 +2921,29 @@ does not appear in `x0x routes`. What ships today is **point-to-point
 |---|---|---|---|
 | GET | `/gui` | `x0x gui` | Open the embedded browser UI |
 | GET | `/gui/` | — | Alias for `/gui` |
+| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). **durable-owner**: a GUI session bearer and a rider token receive a typed `403`. Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `navigated` means a visible GUI tab accepted the `gui.show` frame on its outbound queue (`gui=1` only while the tab is visible; the tab then sends `gui.visible`). A full queue does not accept the frame. An agent socket, a hidden tab, a tab whose session has expired, and a visible tab that cannot take the frame do not count, and the daemon opens a browser instead. A blocked sender, including this daemon's agent, is `refused`. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). The daemon re-reads `[gui_show]` from the file startup loaded when it serves `POST /acl/reload`. The reload response has no `gui_show` field. That route answers `422` only when an ACL plane fails. |
+
+#### Example: local show
+
+```bash
+# Open or navigate the local GUI to the People view.
+# $TOKEN is the durable owner API token. A GUI session bearer or a rider
+# token receives a typed 403.
+curl -s -X POST http://127.0.0.1:12700/gui/show \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"view":"people"}'
+# { "outcome": "opened", "machine_id": "<hex>", "request_id": "<hex>" }
+
+x0x show people
+x0x show groups/<group_id>/board
+```
+
+`POST /gui/show` requires the durable owner API token (**durable-owner**). A GUI session bearer receives a typed `403`. A rider token receives a typed `403`. The refusal uses the same gate as `POST /forwards`. David approved this on 22 Oct 2026 at 13:30 BST.
+
+View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
+
+Stop does not rewrite the daemon config file. Stop turns local show off in memory first, then writes `gui_show_local_disabled` in the data directory. If that write fails, shows are already off in this process. The WebSocket error frame reports the failure. To turn local show back on, delete `gui_show_local_disabled`. The next show, and `POST /acl/reload`, see that the marker is gone. A daemon config that already sets `local_enabled = true` does not cancel Stop, because Stop does not change that file. After the marker is gone, that config applies again. A file that sets `local_enabled = false` stays off. A file that omits the key uses the default, which is on. There is no new unblock route. Stop does not write `gui_show_blocked.json`. The opener does not inherit daemon stderr. A failed launch revokes the fresh session. The daemon queues the origin banner before it starts the platform opener. It removes that banner when the opener reports a confirmed failure (`no_display`). A queued origin banner stays until the current session token expires. That token lasts 10 minutes, and a refresh starts those 10 minutes again. That includes a hidden tab revealed later. The daemon delivers the banner when the tab sends `gui.visible` with `visible: true`. An opener that is still running at the 2 second deadline counts as `opened` and is not killed. `gui.block` has no success frame. A GUI tab whose session refresh fails sends `gui.visible` with `visible: false` and stops offering `gui=1`, so a later show opens a browser.
 
 ## Error handling
 

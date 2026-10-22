@@ -45627,6 +45627,10 @@ pub(in crate::server) mod tests {
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
             acl_admin,
+            gui_show: x0x::gui::GuiShowRuntime::with_defaults(
+                x0x::gui::GuiShowConfig::default(),
+                data_dir,
+            ),
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
                 x0x::connect::ConnectPolicy::default().summary(),
             )),
