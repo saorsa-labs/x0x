@@ -611,17 +611,27 @@ pub(crate) mod journal_faults {
     use std::sync::Mutex;
     use tokio::sync::oneshot;
 
-    type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    /// How a paused write ends.
+    pub(crate) enum PauseEnd {
+        /// The write goes on to its directory fsync.
+        Resume,
+        /// The host crashes at the pause: the write stops before its
+        /// directory fsync and returns an error.
+        Crash,
+    }
+
+    type Pause = (oneshot::Sender<()>, oneshot::Receiver<PauseEnd>);
 
     static PAUSES: Mutex<BTreeMap<PathBuf, Pause>> = Mutex::new(BTreeMap::new());
     static FAILURES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
     /// Hold the next write of `path` after its rename: it signals
-    /// `reached` and then waits for `release`.
+    /// `reached` and then waits for `release`. A dropped `release` resumes
+    /// the write.
     pub(crate) fn pause_next(
         path: &Path,
         reached: oneshot::Sender<()>,
-        release: oneshot::Receiver<()>,
+        release: oneshot::Receiver<PauseEnd>,
     ) {
         PAUSES
             .lock()
@@ -664,7 +674,9 @@ pub(crate) mod journal_faults {
         let pause = PAUSES.lock().unwrap().remove(path);
         if let Some((reached, release)) = pause {
             let _ = reached.send(());
-            let _ = release.await;
+            if let Ok(PauseEnd::Crash) = release.await {
+                return Err(std::io::Error::other("simulated host crash"));
+            }
         }
         if FAILURES.lock().unwrap().remove(path) {
             return Err(std::io::Error::other("injected directory fsync failure"));

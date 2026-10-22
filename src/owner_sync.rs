@@ -1820,8 +1820,9 @@ impl OwnerSyncStore {
     ///
     /// # Errors
     ///
-    /// [`SyncError::Io`] or [`SyncError::Poisoned`] when the recovery
-    /// cannot be written. The intent stays for the next attempt.
+    /// [`SyncError::Io`] or [`SyncError::Poisoned`] when the intent cannot
+    /// be read or decoded, or the recovery cannot be written. The intent
+    /// stays for the next attempt.
     async fn recover_journal_commit(&self, owner: &UserId) -> Result<(), SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
@@ -1834,14 +1835,13 @@ impl OwnerSyncStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(SyncError::Io(format!("read journal intent: {e}"))),
         };
-        let batch = match serde_json::from_slice::<PersistedRecords>(&bytes) {
-            Ok(intent) => intent.records,
-            Err(e) => {
-                tracing::warn!(target: "x0x::owner_sync", error = %e, "dropped an undecodable journal intent");
-                self.remove_journal_intent().await;
-                return Ok(());
-            }
-        };
+        // An undecodable intent fails closed and stays in place. Without
+        // it, a journal line of the interrupted commit looks like an
+        // unpublished local issuance, and the reconcile publishes it over
+        // a later same-second record.
+        let batch = serde_json::from_slice::<PersistedRecords>(&bytes)
+            .map_err(|e| SyncError::Io(format!("undecodable journal intent: {e}")))?
+            .records;
         match self.commit_locked(batch, owner, Some(journal)).await {
             Ok(outcome) => {
                 self.remove_journal_intent().await;
@@ -6827,6 +6827,7 @@ mod issuance_journal_sync_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reconcile_does_not_publish_a_journal_line_before_it_is_durable() {
         use super::tests::{machine, owner_kp};
+        use crate::profile::journal_faults::PauseEnd;
 
         let dir = tempfile::tempdir().expect("tmpdir");
         let owner = owner_kp(7);
@@ -6844,7 +6845,7 @@ mod issuance_journal_sync_tests {
         deliver(&local, &owner, r1).await;
 
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         crate::profile::journal_faults::pause_next(&journal, reached_tx, release_rx);
         let issuance = {
             let (journal, line) = (journal.clone(), local_line(&owner_hex, &d2));
@@ -6865,12 +6866,16 @@ mod issuance_journal_sync_tests {
         // Let the reconcile run while the issuance is held (it may block).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // The host crashes before the issuance's directory fsync.
+        // The host crashes before the issuance's directory fsync. Stop and
+        // join the reconcile, then the journal writer itself (the append
+        // awaits the task that owns the write), so no write or durable
+        // mark lands after the crash state is restored.
         reconcile.abort();
-        issuance.abort();
         let _ = reconcile.await;
-        let _ = issuance.await;
-        drop((release_tx, local));
+        let _ = release_tx.send(PauseEnd::Crash);
+        let issued = issuance.await.expect("issuance task");
+        assert!(issued.is_err(), "the writer stops at the simulated crash");
+        drop(local);
         crash_device(&local_dir);
         assert_restart_keeps_the_register(&local_dir, &owner).await;
     }
@@ -7066,6 +7071,7 @@ mod issuance_journal_sync_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_journal_write_does_not_roll_back_a_renewal() {
         use super::tests::{machine, owner_kp};
+        use crate::profile::journal_faults::PauseEnd;
 
         let dir = tempfile::tempdir().expect("tmpdir");
         let owner = owner_kp(7);
@@ -7083,7 +7089,7 @@ mod issuance_journal_sync_tests {
         deliver(&local, &owner, r1).await;
 
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         crate::profile::journal_faults::pause_next(&journal, reached_tx, release_rx);
         let issuance = {
             let (journal, line) = (journal.clone(), local_line(&owner_hex, &d2));
@@ -7098,7 +7104,9 @@ mod issuance_journal_sync_tests {
         // The caller cancels the issuance after the rename.
         issuance.abort();
         let _ = issuance.await;
-        drop(release_tx);
+        // The write goes on without its caller; the reconcile below waits
+        // for it under the journal writer lock.
+        let _ = release_tx.send(PauseEnd::Resume);
         mint_journal_lines(&local, &journal, &owner, machine(1)).await;
 
         drop(local);
