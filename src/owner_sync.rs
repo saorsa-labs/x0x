@@ -3626,7 +3626,7 @@ impl OwnerSyncService {
     /// Apply an accepted record to live daemon state (post-commit only).
     ///
     /// Exhaustive over [`SyncValue`] — Tier-3 kinds cannot reach here.
-    fn apply_record(&self, record: &VersionedRecord) {
+    pub(crate) fn apply_record(&self, record: &VersionedRecord) {
         match &record.value {
             SyncValue::OwnerProfile { human_name } => {
                 if let Some(view) = self.view() {
@@ -7621,6 +7621,64 @@ mod issuance_journal_sync_tests {
             store.stored_value(SyncKind::OwnerProfile, "owner").await,
             Some(alice),
             "the reconcile must not publish the old live name"
+        );
+    }
+    /// Codex review of #1545 (29e2800), P2: a commit writes the apply
+    /// obligation of its name record `B` before its register write. A
+    /// crash between the two leaves the register at the committed `A`.
+    /// The obligation of `A` must stay owed until `B` is committed, or the
+    /// restart has no obligation for the register's winner, and the
+    /// reconcile publishes the old live name over `A`.
+    #[tokio::test]
+    async fn a_crash_before_a_replacing_commit_keeps_the_predecessor_owed() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let mut records = Vec::new();
+        for name in ["A", "B"] {
+            remote
+                .mint(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    &SyncValue::OwnerProfile {
+                        human_name: Some(name.into()),
+                    },
+                    &owner,
+                    machine(2),
+                )
+                .await
+                .expect("remote profile mint");
+            records.extend(remote.records_snapshot().await);
+        }
+        let (a, b) = (records[0].clone(), records[1].clone());
+
+        let local_dir = dir.path().join("local");
+        let local = OwnerSyncStore::load(&local_dir).await.expect("local store");
+        local
+            .commit_batch(vec![a.clone()], &owner.user_id())
+            .await
+            .expect("commit A");
+        // The commit of `B` stops after its obligation is durable and
+        // before its register write.
+        local
+            .add_pending_applies(std::slice::from_ref(&b))
+            .await
+            .expect("obligation of B");
+        drop(local);
+
+        let local = OwnerSyncStore::load(&local_dir).await.expect("restart");
+        assert_eq!(
+            local.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(a.value.clone()),
+            "the register holds A"
+        );
+        assert!(
+            local.pending_applies().await.contains(&(a.clone(), true)),
+            "A must stay owed as the register's winner"
         );
     }
 }

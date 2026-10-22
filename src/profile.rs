@@ -691,6 +691,27 @@ mod tests {
 
     use super::*;
 
+    /// Codex review of #1545 (29e2800), P2: owner sync discharges its
+    /// obligation to apply synced names when the profile save returns. A
+    /// host crash after the save must keep the saved profile, or the
+    /// restart loads the old names with no obligation left to apply them.
+    #[tokio::test]
+    async fn a_saved_profile_survives_a_host_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.json");
+        let profile = SelfProfile {
+            human_name: Some("Alice".into()),
+            ..SelfProfile::default()
+        };
+        profile.save_to(&path).await.unwrap();
+        crash_sim::crash(&[&path]);
+        assert_eq!(
+            SelfProfile::load_from(&path).await.unwrap(),
+            Some(profile),
+            "a host crash must keep a profile that save_to returned"
+        );
+    }
+
     /// Codex review of #1545 (a19203d), P2: an append is cancelled while
     /// its rename is in flight on the blocking pool. A durable read then
     /// runs before the rename lands. The read must not mark the journal

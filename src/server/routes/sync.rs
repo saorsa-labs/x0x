@@ -917,6 +917,70 @@ mod tests {
         );
     }
 
+    /// Codex review of #1545 (29e2800), P2: a session commits and applies
+    /// the profile `Alice`, and its obligation stays until a pass discharges
+    /// it. A local `PUT /profile` then saves `Bob`. The next reconcile must
+    /// publish `Bob`, not apply `Alice` again over the newer local edit.
+    #[tokio::test]
+    async fn a_local_edit_after_a_synced_apply_is_not_overwritten() {
+        use crate::owner_sync::SyncKind;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state = owned_state(dir.path(), [0x89; 32]).await.expect("state");
+        state.profile.write().await.human_name = Some("Old".into());
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        let view = Arc::new(DaemonView::new(Arc::clone(&state)));
+        service.attach_daemon_view(Arc::clone(&view));
+        service.sync_all().await;
+        let owner = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+
+        // The session: commit, then apply the accepted records.
+        let batch = remote_alice_batch(dir.path(), owner).await;
+        let outcome = service
+            .store()
+            .commit_batch(batch, &owner.user_id())
+            .await
+            .expect("commit");
+        for record in &outcome.accepted {
+            service.apply_record(record);
+        }
+        assert!(view.names_persisted().await, "the catch-up saves Alice");
+        assert_eq!(
+            state.profile.read().await.human_name.as_deref(),
+            Some("Alice")
+        );
+
+        let (status, _) = super::super::profile::update_profile(
+            State(Arc::clone(&state)),
+            Json(super::super::profile::UpdateProfileRequest {
+                human_name: Some("Bob".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        service.sync_all().await;
+        assert_eq!(
+            state.profile.read().await.human_name.as_deref(),
+            Some("Bob"),
+            "the daemon must keep the local edit"
+        );
+        assert_eq!(
+            service
+                .store()
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(SyncValue::OwnerProfile {
+                human_name: Some("Bob".into())
+            }),
+            "the reconcile must publish the local edit"
+        );
+    }
+
     /// WHY: the profile mirror must never regress to defaults while the
     /// AppState lock is contended — a default read would mint a record
     /// that fights the remote winner (LWW flip-back).
