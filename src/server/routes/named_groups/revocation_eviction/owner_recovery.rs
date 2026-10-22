@@ -1214,9 +1214,12 @@ async fn finish_commit(
                 Err(error) => ng::self_leave_persist_left_epoch_installed(&error),
             }
         }
+        // #1508 r6: `ReplacedNotDurable` installed the new roster (only
+        // the directory fsync failed), so the commit stands and the frame
+        // and its delivery must stay.
         None => matches!(
             ng::persist_named_group_info(state, group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable)
+            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
         ),
     };
     if !persisted {
@@ -1906,9 +1909,10 @@ async fn receive_commit(
             }
         }
         (None, orc::OwnerRecoveryCryptoV1::TreeKem { .. }) => false,
+        // #1508 r6: `ReplacedNotDurable` installed the roster.
         _ => matches!(
             ng::persist_named_group_info(state, &group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable)
+            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
         ),
     };
     drop(guard);
