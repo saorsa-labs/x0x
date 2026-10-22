@@ -9880,6 +9880,18 @@ async fn recover_member_treekem_key_package(
     recover_member_treekem_key_package_locked(state, group_id, member_agent_id).await
 }
 
+/// W3-H (#1357, test builds only): one read-only line of this node's S4
+/// seal state for `target_hex` in `group_id` (row, evaluation, last attempt,
+/// head round, higher-head evidence). Changes nothing.
+#[cfg(test)]
+pub(in crate::server) async fn s4_seal_probe_for_test(
+    state: &AppState,
+    group_id: &str,
+    target_hex: &str,
+) -> String {
+    revocation_eviction::seal_probe_for_test(state, group_id, target_hex).await
+}
+
 /// W3-H (#1357, test builds only): whether this node can resolve
 /// `member_agent_id`'s TreeKEM KeyPackage for a removal with no network
 /// step, by the lookup [`resolve_member_treekem_kp_for_removal_locked`]
@@ -11299,6 +11311,69 @@ async fn member_keyed_treekem_catchup_response(
     })
 }
 
+/// #1357: most catch-up pages one daemon sends at the same time. A page
+/// send can wait up to the direct-message ACK budget for a slow or
+/// unreachable requester; with every slot busy, a new request is not
+/// served and its requester asks again (the S4 head round re-asks every
+/// 2 s, the other catch-up paths on their own schedules).
+pub(in crate::server) const TREEKEM_CATCHUP_SERVE_SLOTS: usize = 16;
+
+/// The TreeKEM catch-up listener's step for one direct message: a
+/// `treekem_catchup_request` is served, a `treekem_catchup_response` is
+/// applied, anything else is ignored. Returns `false` when the daemon is
+/// shutting down and the listener must stop.
+///
+/// #1357 (ADR 0110 §2): a request is served on its own detached task. The
+/// page send waits for the requester's ACK, so a slow or unreachable
+/// requester (for example a revoked target whose links are closing) must
+/// not hold this listener: the responses behind it include the answers to
+/// this node's own head round, and an available holder's answer must
+/// reach the seal decision. Responses stay in order on the listener.
+pub(in crate::server) async fn dispatch_treekem_catchup_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    payload: &[u8],
+) -> bool {
+    if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(payload) {
+        if request.message_type != "treekem_catchup_request" {
+            return true;
+        }
+        let Ok(slot) = Arc::clone(&state.treekem_catchup_serve_slots).try_acquire_owned() else {
+            tracing::debug!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+                slots = TREEKEM_CATCHUP_SERVE_SLOTS,
+                "TreeKEM catch-up request not served: every page slot is sending; the requester asks again"
+            );
+            return true;
+        };
+        let serve_state = Arc::clone(state);
+        let requester = *sender;
+        let _admitted = state.spawn_detached(async move {
+            handle_treekem_catchup_request(&serve_state, &requester, verified, request).await;
+            drop(slot);
+        });
+        return true;
+    }
+    let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(payload) else {
+        return true;
+    };
+    if response.message_type != "treekem_catchup_response" {
+        return true;
+    }
+    // #1275: the response's events are applied and persisted, so the apply
+    // runs shielded; awaiting it keeps the responses in arrival order.
+    let apply_state = Arc::clone(state);
+    let sender = *sender;
+    state
+        .run_shielded(Box::pin(async move {
+            handle_treekem_catchup_response(&apply_state, &sender, verified, response).await;
+        }))
+        .await
+        .is_some()
+}
+
 pub(in crate::server) async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -11452,6 +11527,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
         recorded.push(payload.clone());
     }
+    #[cfg(test)]
+    detached_send_test_seam::park(&format!("treekem-catchup-serve:{sender_hex}")).await;
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload, direct_message_send_config())
@@ -45689,6 +45766,7 @@ pub(in crate::server) mod tests {
     mod r19_cert_carry;
     mod r2_journal_ratchet_regression;
     mod requester_offer;
+    mod s4_catchup_listener_1357;
     mod s4_key_delivery_1508;
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
@@ -46482,6 +46560,9 @@ pub(in crate::server) mod tests {
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
+            treekem_catchup_serve_slots: Arc::new(tokio::sync::Semaphore::new(
+                TREEKEM_CATCHUP_SERVE_SLOTS,
+            )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),

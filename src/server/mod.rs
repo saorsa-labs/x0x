@@ -78,16 +78,16 @@ use routes::{
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, handle_treekem_catchup_request, handle_treekem_catchup_response, health,
-    history_diagnostics, history_list, history_message, history_policy, history_purge,
-    history_retain, history_scopes, history_search, history_stats, identity_revocations,
-    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
-    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
-    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
-    list_named_groups, list_revocations, list_task_lists, list_tasks, listener_restart_context,
-    load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
-    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    handle_file_message, health, history_diagnostics, history_list, history_message,
+    history_policy, history_purge, history_retain, history_scopes, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, listener_restart_context, load_causal_approval_queue, load_named_groups_merged,
+    load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
+    machine_for_agent_handler, machines_by_user_handler,
+    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
     owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
     owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
@@ -110,13 +110,12 @@ use routes::{
     update_task, upgrade_diagnostics, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage,
     ControlBlobState, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
     PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
-    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, TreeKemCatchupRequest,
-    TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
-    KV_STORE_DELTA_DM_PREFIX,
+    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -1303,6 +1302,9 @@ pub async fn serve_with_options(
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
+        treekem_catchup_serve_slots: Arc::new(tokio::sync::Semaphore::new(
+            routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
+        )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
@@ -2271,42 +2273,15 @@ pub async fn serve_with_options(
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
-                    if request.message_type == "treekem_catchup_request" {
-                        handle_treekem_catchup_request(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            request,
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-                if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
+                if !routes::named_groups::dispatch_treekem_catchup_message(
+                    &catchup_state,
+                    &msg.sender,
+                    msg.verified,
+                    &msg.payload,
+                )
+                .await
                 {
-                    if response.message_type == "treekem_catchup_response" {
-                        // #1275: the response's events are applied and
-                        // persisted, so the apply runs shielded; awaiting it
-                        // keeps the responses in arrival order.
-                        let apply_state = Arc::clone(&catchup_state);
-                        let sender = msg.sender;
-                        let verified = msg.verified;
-                        let applied = catchup_state
-                            .run_shielded(Box::pin(async move {
-                                handle_treekem_catchup_response(
-                                    &apply_state,
-                                    &sender,
-                                    verified,
-                                    response,
-                                )
-                                .await;
-                            }))
-                            .await;
-                        if applied.is_none() {
-                            break;
-                        }
-                    }
+                    break;
                 }
             }
         }));

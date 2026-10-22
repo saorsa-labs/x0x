@@ -1211,6 +1211,11 @@ pub(super) struct AppState {
     /// Anti-spam throttle for outbound catch-up requests. It runs on the
     /// runtime clock, as the catch-up rounds do (#1427).
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, tokio::time::Instant>>,
+    /// #1357 (ADR 0110 §2): the catch-up pages this daemon is sending now.
+    /// Each served request sends its page on its own task, so a slow or
+    /// unreachable requester never holds the catch-up listener (and the
+    /// head-round answers queued behind it). The permits bound those tasks.
+    pub(super) treekem_catchup_serve_slots: Arc<tokio::sync::Semaphore>,
     /// #1427: per group key, the epoch-ahead traffic seen while an
     /// epoch-ahead catch-up task runs for that group. An entry means one
     /// task runs; each later observation updates the entry.
