@@ -407,7 +407,7 @@ impl IssuedCertRecord {
     ///
     /// # Errors
     /// Returns the underlying IO error of the append.
-    pub async fn append_when(
+    pub(crate) async fn append_when(
         path: &Path,
         decide: impl FnOnce(&[Self]) -> Option<Self>,
     ) -> std::io::Result<bool> {

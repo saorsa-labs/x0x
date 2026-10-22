@@ -3122,13 +3122,22 @@ async fn append_synced_journal_line(
 
 /// Whether a synced journal line must be appended to `existing`.
 ///
-/// Not when the line is already local, unless the local line lacks the
-/// expiry the synced value carries (a line written before #1542); the new
-/// line then supplies it (see `latest_journal_values`). Never when this
-/// owner already has another certificate for the agent issued in the same
-/// second or later (`issued_at` has second precision): readers of the
-/// journal (the owner roster) take the last line per agent, so a later
-/// line for an older certificate would roll them back to it.
+/// Owner sync calls this only for a record that won the `IssuanceJournal`
+/// register (`apply_record` runs post-commit). The line is compared with
+/// this owner's CURRENT line for the agent (see `latest_journal_values`;
+/// the owner roster reads the same last line):
+///
+/// - no current line, or a later second: append;
+/// - an earlier second: never append. A later line for an older
+///   certificate would roll the roster back to it (rollback protection);
+///   this device's next pass mints its newer line over the register;
+/// - the same second and the same digest: append only to supply an expiry
+///   the current line lacks (a line written before #1542);
+/// - the same second and a different digest: append. `issued_at` has
+///   second precision, so it cannot order the two certificates. The
+///   register's clock (version, signing time, writer) already did: this
+///   value won it. Every device follows that order, so the devices
+///   converge on one certificate and their mints become no-ops.
 fn synced_line_needed(
     existing: &[crate::profile::IssuedCertRecord],
     owner_hex: &str,
@@ -3137,13 +3146,28 @@ fn synced_line_needed(
     issued_at: u64,
     not_after: Option<u64>,
 ) -> bool {
-    !existing.iter().any(|r| {
-        r.agent_id == agent_hex
-            && ((r.cert_digest == cert_digest && (r.not_after.is_some() || not_after.is_none()))
-                || (r.user_id == owner_hex
-                    && r.cert_digest != cert_digest
-                    && r.issued_at >= issued_at))
-    })
+    let current = latest_journal_values(
+        existing.iter().filter(|r| r.agent_id == agent_hex).cloned(),
+        owner_hex,
+    )
+    .remove(agent_hex);
+    let Some(SyncValue::IssuanceJournal {
+        cert_digest: current_digest,
+        issued_at: current_issued_at,
+        not_after: current_not_after,
+        ..
+    }) = current
+    else {
+        return true;
+    };
+    match issued_at.cmp(&current_issued_at) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal if cert_digest == current_digest => {
+            current_not_after.is_none() && not_after.is_some()
+        }
+        std::cmp::Ordering::Equal => true,
+    }
 }
 
 /// The local journal line for a synced `IssuanceJournal` value. It keeps
@@ -3184,7 +3208,7 @@ fn synced_journal_line(
 /// key in turn: each mint bumps the store generation, which starts the
 /// next sync pass at once, so the pair spins without end.
 fn latest_journal_values(
-    lines: Vec<crate::profile::IssuedCertRecord>,
+    lines: impl IntoIterator<Item = crate::profile::IssuedCertRecord>,
     owner_hex: &str,
 ) -> BTreeMap<String, SyncValue> {
     let mut latest: BTreeMap<String, crate::profile::IssuedCertRecord> = BTreeMap::new();
