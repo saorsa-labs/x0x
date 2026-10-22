@@ -1479,7 +1479,9 @@ fn reconcile_and_retain(
 
 /// Re-derive completion from the verified roster and crypto state (§1,
 /// D128). A row completes only when the target holds no seat and, in a
-/// TreeKEM group, no retained leaf. A withdrawn group terminates its rows
+/// TreeKEM group, no retained leaf, or, in a GSS `MlsEncrypted` group,
+/// the retained commits prove a rotation after its departure
+/// ([`ce::gss_secret_excluded`]). A withdrawn group terminates its rows
 /// (`group_deleted`); a group this node no longer holds ends local
 /// retention. Returns whether the store changed.
 fn reconcile_completion(
@@ -1542,9 +1544,14 @@ fn reconcile_completion(
             // `committed_delivery_pending` while its delivery runs.
             continue;
         }
-        // A GSS group completes only once a rotation excludes the target
-        // (#1508 review P1); its entry is never busy.
-        if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem || ce::is_gss_encrypted(info) {
+        // A GSS group completes only on proof that a rotation excluded the
+        // target (#1508 review P1), never because bounded commit history
+        // lost the commit that seated it.
+        if ce::is_gss_encrypted(info) {
+            if !ce::gss_secret_excluded(info, &target_hex) {
+                continue;
+            }
+        } else if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
             if !leaves.known(stable) {
                 // The tree was busy; decide on a later pass.
                 continue;
@@ -4213,9 +4220,11 @@ mod tests {
 
     #[test]
     fn revocation_of_a_seated_member_creates_work_and_removal_completes_it() {
-        let (admin, member) = ([1; 32], [2; 32]);
+        let admin_kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let (admin, member) = (*admin_kp.agent_id().as_bytes(), [2; 32]);
         let mut info = group_with(admin, member);
         info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.seal_commit(&admin_kp, 1).expect("seat");
         let groups = vec![("k".to_string(), info.clone())];
         let leaves = RetainedLeaves::default();
         let triggers = derive_triggers(&groups, &leaves, &[revocation_of(member, 7)], 0);
@@ -4233,6 +4242,10 @@ mod tests {
             1
         ));
         info.remove_member(&hex::encode(member), Some(hex::encode(admin)));
+        // A GSS admin removal rotates the secret in its own commit: that
+        // rotation is the proof that completes the row (#1508 review).
+        let _ = info.rotate_shared_secret();
+        info.seal_commit(&admin_kp, 2).expect("remove");
         let removed = vec![("k".to_string(), info)];
         // A running crypto-only delivery keeps the row open (§3).
         let delivering: BTreeSet<EvictionKey> = [key.clone()].into_iter().collect();

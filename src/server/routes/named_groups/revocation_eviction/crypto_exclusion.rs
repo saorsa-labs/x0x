@@ -666,7 +666,9 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
     };
     if info.stable_group_id() != key.stable_group_id
         || info.fork_quarantine.is_some()
-        || !ce::gss_secret_retained(&info, &target_hex)
+        // Open work rotates unless a rotation already excluded the target:
+        // trimmed history is not that proof (#1508 review, Codex P1).
+        || ce::gss_secret_excluded(&info, &target_hex)
         || ng::self_leave_rekey_batch_held()
         || ng::self_leave_rekey_fence_open(group_key)
         || ng::self_leave_rekey_fence_open(info.stable_group_id())
@@ -3127,6 +3129,122 @@ mod daemon_tests {
             "no second exclusion"
         );
         assert_eq!(stored_group(&fx).await.secret_epoch, epoch);
+        Ok(())
+    }
+
+    /// Insert a verified advert for `peer` with the capability bits `bits`,
+    /// signed at `created_at_unix_ms` (a later advert replaces it).
+    fn advertise_bits(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                created_at_unix_ms,
+            ),
+            "verified capability advert"
+        );
+    }
+
+    /// #1508 review (Codex P1 on 50b6531): bounded commit history must not
+    /// complete GSS exclusion work. The leaver keeps the current secret
+    /// while a legacy survivor holds the exclusion (D76). More than
+    /// [`x0x::groups::COMMIT_LOG_CAP`] later commits, none of which
+    /// rotates the secret, trim the commit that seated the leaver. The
+    /// real worker pass must keep the row open; once the survivor
+    /// upgrades, the exclusion rotates the secret and only then completes.
+    #[tokio::test]
+    async fn gss_exclusion_held_for_upgrade_survives_commit_log_trimming() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let survivor = fx.replica.agent.agent_id();
+        let all = x0x::dm::CapabilityRegistry::current().bits;
+        let advertised_at = x0x::dm_capability::now_unix_ms();
+        advertise_bits(
+            &fx.state,
+            survivor,
+            all & !x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+            advertised_at,
+        );
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        run_worker(&fx.state).await;
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("S4 self-leave row");
+            assert!(row.phase.is_open(), "{:?}", row.phase);
+            assert_eq!(
+                row.waiting.as_ref().map(|waiting| waiting.cause),
+                Some(x0x::groups::eviction::WaitingCause::WaitingForReceiverUpgrade),
+                "the legacy survivor holds the exclusion"
+            );
+        }
+        assert_eq!(latest_frame_for_test(&fx.state, &fx.stable).await, None);
+
+        // Later commits that do not rotate the secret trim the history.
+        let mut info = stored_group(&fx).await;
+        let leaver_hex = hex::encode(fx.leaver.as_bytes());
+        let admin_kp = fx.state.agent.identity().agent_keypair();
+        for _ in 0..=x0x::groups::COMMIT_LOG_CAP {
+            info.seal_commit(admin_kp, ng::now_millis_u64())?;
+        }
+        assert_eq!(info.commit_log.len(), x0x::groups::COMMIT_LOG_CAP);
+        assert!(
+            info.commit_log.iter().all(|retained| retained
+                .roster
+                .get(&leaver_hex)
+                .is_none_or(|seat| seat.state != x0x::groups::GroupMemberState::Active)),
+            "no retained commit seats the leaver"
+        );
+        assert_eq!(info.secret_epoch, 0, "no rotation");
+        assert!(matches!(
+            ng::persist_named_group_info(&fx.state, &fx.group_id, info).await,
+            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+        ));
+
+        // The leaver still holds the current secret: the row stays open.
+        run_worker(&fx.state).await;
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("S4 self-leave row");
+            assert!(
+                row.phase.is_open(),
+                "trimmed history must not complete the exclusion: {:?}",
+                row.phase
+            );
+        }
+        assert_eq!(stored_group(&fx).await.secret_epoch, 0);
+
+        // The survivor upgrades: the exclusion rotates, then completes.
+        advertise_bits(&fx.state, survivor, all, advertised_at + 1);
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the GSS crypto-only exclusion committed after the upgrade");
+        assert_eq!(
+            ce::decode_frame(&frame).expect("frame").body.crypto,
+            ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: 1
+            }
+        );
+        assert_eq!(stored_group(&fx).await.secret_epoch, 1);
+        fx.state.revocation_evictions.inner.lock().await.ce = CeState::default();
+        super::super::revocation_eviction_pass(&fx.state).await;
+        let inner = fx.state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).map(|row| row.phase),
+            Some(Phase::Complete),
+            "the rotation completes the row"
+        );
         Ok(())
     }
 

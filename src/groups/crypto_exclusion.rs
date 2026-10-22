@@ -474,29 +474,65 @@ pub fn committed_secret_epoch(info: &GroupInfo) -> u64 {
 ///
 /// A member with no retained seated commit is not retained: this node did
 /// not witness its seat, so it cannot prove which secret the member holds.
+/// This rule opens work only on proof. Open work completes only on the
+/// opposite proof ([`gss_secret_excluded`]).
 #[must_use]
 pub fn gss_secret_retained(info: &GroupInfo, target_hex: &str) -> bool {
-    if !is_gss_encrypted(info)
-        || info.withdrawn
-        || !info
-            .members_v2
-            .get(target_hex)
-            .is_some_and(|member| member.state == GroupMemberState::Removed)
-    {
-        return false;
+    gss_secret_hold(info, target_hex) == Some(true)
+}
+
+/// The GSS completion proof (§1, D128): the retained commits show that a
+/// rotation followed the departure of `target_hex`, so it no longer holds
+/// the current secret. Open work completes only on this proof, never on
+/// missing evidence. The commit log is bounded
+/// ([`crate::groups::COMMIT_LOG_CAP`]): while a D76 hold waits, later
+/// commits that do not rotate can trim the commit that seated the target.
+/// That loss is not a rotation, so the work stays open and the exclusion
+/// still runs (#1508 review, Codex P1).
+///
+/// True for a target that is not Removed (Banned rotates in its own
+/// commit), and for a group that is not GSS `MlsEncrypted`.
+#[must_use]
+pub fn gss_secret_excluded(info: &GroupInfo, target_hex: &str) -> bool {
+    gss_secret_hold(info, target_hex) == Some(false)
+}
+
+fn is_removed(info: &GroupInfo, target_hex: &str) -> bool {
+    info.members_v2
+        .get(target_hex)
+        .is_some_and(|member| member.state == GroupMemberState::Removed)
+}
+
+/// Whether the Removed `target_hex` of a GSS `MlsEncrypted` group holds
+/// the current secret: `Some(true)` retained, `Some(false)` a rotation
+/// followed its departure, `None` the retained commits cannot tell.
+///
+/// The newest retained commit that seats the target as Active decides:
+/// its secret epoch is the newest secret the target received. When no
+/// retained commit seats it, a retained commit below the current epoch
+/// still proves a later rotation, because the target was not seated at
+/// that commit. Otherwise the commit that seated it was trimmed or never
+/// witnessed (`None`).
+fn gss_secret_hold(info: &GroupInfo, target_hex: &str) -> Option<bool> {
+    if !is_gss_encrypted(info) || info.withdrawn || !is_removed(info, target_hex) {
+        return Some(false);
     }
     let current = committed_secret_epoch(info);
+    let seated = info.commit_log.iter().rev().find(|retained| {
+        retained
+            .roster
+            .get(target_hex)
+            .is_some_and(|seat| seat.state == GroupMemberState::Active)
+    });
+    if let Some(seated) = seated {
+        return gss_epoch_of(seated.commit.security_binding.as_deref())
+            .map(|seated_epoch| seated_epoch >= current);
+    }
     info.commit_log
         .iter()
-        .rev()
-        .find(|retained| {
-            retained
-                .roster
-                .get(target_hex)
-                .is_some_and(|seat| seat.state == GroupMemberState::Active)
-        })
-        .and_then(|retained| gss_epoch_of(retained.commit.security_binding.as_deref()))
-        .is_some_and(|seated_epoch| seated_epoch >= current)
+        .filter_map(|retained| gss_epoch_of(retained.commit.security_binding.as_deref()))
+        .any(|epoch| epoch < current)
+        .then_some(false)
 }
 
 /// The receiver's L4 checks against its current verified parent state
@@ -939,6 +975,40 @@ mod tests {
         let mut treekem = gss_group(&admin, target);
         treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
         assert!(!gss_secret_retained(&treekem, &target_hex));
+    }
+
+    /// #1508 review (Codex P1 on 50b6531): bounded history is not a
+    /// rotation. Once later commits without a rotation trim the seat of a
+    /// self-leaver, the node can prove neither that it holds the secret
+    /// nor that a rotation excluded it. A rotation after that is proof.
+    #[test]
+    fn gss_trimmed_seat_is_not_proof_of_exclusion() {
+        let admin = keypair();
+        let target = [9u8; 32];
+        let target_hex = hex::encode(target);
+        let mut info = gss_group(&admin, target);
+        info.seal_commit(&admin, 600).expect("leave");
+        assert!(gss_secret_retained(&info, &target_hex));
+        assert!(!gss_secret_excluded(&info, &target_hex));
+        for at in 0..=crate::groups::COMMIT_LOG_CAP as u64 {
+            info.seal_commit(&admin, 700 + at).expect("later commit");
+        }
+        assert_eq!(info.secret_epoch, 0, "no rotation");
+        assert!(!gss_secret_retained(&info, &target_hex));
+        assert!(
+            !gss_secret_excluded(&info, &target_hex),
+            "trimmed history must not prove exclusion"
+        );
+        let _ = info.rotate_shared_secret();
+        info.seal_commit(&admin, 10_000).expect("rotate");
+        assert!(!gss_secret_retained(&info, &target_hex));
+        assert!(gss_secret_excluded(&info, &target_hex));
+        // A seated target is outside this rule: the seat decides first.
+        let mut seated = info.clone();
+        if let Some(member) = seated.members_v2.get_mut(&target_hex) {
+            member.state = GroupMemberState::Active;
+        }
+        assert!(gss_secret_excluded(&seated, &target_hex));
     }
 
     #[test]
