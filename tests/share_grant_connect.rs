@@ -6,7 +6,9 @@
 //! The test is `#[ignore]`. The CI tailnet job runs it with
 //! `X0X_REQUIRE_NETWORK_TESTS=1`. A refused UDP bind fails the test. The
 //! test passes only after both tunnels carry a byte and then end in EOF or
-//! reset. It does not return success when setup does not run.
+//! reset. It does not return success when setup does not run. The
+//! five-second teardown bound starts when the revocation is inserted, not
+//! when `revoke_share_grant` returns from its gossip publish.
 
 #![allow(
     clippy::unwrap_used,
@@ -329,6 +331,180 @@ fn closed_by_teardown_rejects_payload_and_accepts_eof_or_reset() {
     ))));
 }
 
+/// ADR-0074 §4: `closed` is within `bound` of the revocation taking effect.
+///
+/// `effect` is the first moment `is_share_grant_revoked` is true. That is
+/// inside `revoke_share_grant`, before that call publishes.
+fn closed_within_revocation_bound(
+    effect: std::time::Instant,
+    closed: std::time::Instant,
+    bound: Duration,
+) -> bool {
+    closed
+        .checked_duration_since(effect)
+        .is_some_and(|elapsed| elapsed <= bound)
+}
+
+/// Deadline for the teardown read.
+///
+/// A revoked bit seen while `revoke_share_grant` is still running starts
+/// the bound at that instant. A bit seen only after the call returns does
+/// not: the deadline stays at `armed + bound`, which was set before the call.
+fn revocation_teardown_deadline(
+    armed: std::time::Instant,
+    effect: Option<std::time::Instant>,
+    effect_during_revoke: bool,
+    bound: Duration,
+) -> std::time::Instant {
+    match effect {
+        Some(effect) if effect_during_revoke => effect + bound,
+        _ => armed + bound,
+    }
+}
+
+/// WHY (Codex P2): `revoke_share_grant` inserts the revocation and then
+/// awaits gossip. A clock that starts when the call returns accepts a
+/// teardown that already took longer than five seconds. The bound is the
+/// insert.
+#[test]
+fn slow_teardown_past_the_revocation_bound_fails() {
+    let effect = std::time::Instant::now();
+    let bound = Duration::from_secs(5);
+    // Publish returns six seconds after the insert. The sockets close with
+    // that return. The old clock starts here and sees an immediate EOF.
+    let revoke_returned = effect + Duration::from_secs(6);
+    let closed = revoke_returned;
+    assert!(
+        closed.saturating_duration_since(revoke_returned) <= bound,
+        "a clock started at revoke's return hides this teardown"
+    );
+    assert!(
+        !closed_within_revocation_bound(effect, closed, bound),
+        "teardown 6s after the revocation took effect must fail"
+    );
+    assert!(closed_within_revocation_bound(
+        effect,
+        effect + bound,
+        bound
+    ));
+    // The revoked bit is sampled only when revoke returns, six seconds
+    // later. That sample must not move the deadline.
+    let armed = effect;
+    let late_sample = effect + Duration::from_secs(6);
+    let deadline = revocation_teardown_deadline(armed, Some(late_sample), false, bound);
+    assert_eq!(deadline, armed + bound);
+    assert!(
+        late_sample > deadline,
+        "a close that lands when revoke returns is past the armed deadline"
+    );
+    let during =
+        revocation_teardown_deadline(armed, Some(effect + Duration::from_millis(10)), true, bound);
+    assert_eq!(during, effect + Duration::from_millis(10) + bound);
+}
+
+/// Revoke `grant_id` and wait until both sockets close.
+///
+/// The five-second bound starts when the grant first shows as revoked,
+/// which is the insert inside `revoke_share_grant`. Gossip after that
+/// insert is inside the bound. A sample taken only when the call returns
+/// cannot move the deadline later than the instant revoke was armed.
+async fn await_revocation_teardown(
+    bob: &Arc<x0x::Agent>,
+    grant_id: [u8; 32],
+    owner: x0x::identity::UserId,
+    held_forward: &mut TcpStream,
+    held_socks: &mut TcpStream,
+) -> (std::io::Result<usize>, std::io::Result<usize>) {
+    let bound = Duration::from_secs(5);
+    let armed = std::time::Instant::now();
+    let revocation_set = bob.revocation_set();
+    let bob_for_revoke = Arc::clone(bob);
+    let revoke_task = tokio::spawn(async move {
+        bob_for_revoke
+            .revoke_share_grant(grant_id, None)
+            .await
+            .expect("revoke grant")
+    });
+    tokio::pin!(revoke_task);
+
+    let mut forward_buf = [0u8; 1];
+    let mut socks_buf = [0u8; 1];
+    let close_reads = async {
+        let pair = tokio::join!(
+            held_forward.read(&mut forward_buf),
+            held_socks.read(&mut socks_buf),
+        );
+        (std::time::Instant::now(), pair)
+    };
+    tokio::pin!(close_reads);
+
+    let mut effect_at = None;
+    // Set only when the revoked bit is seen before `revoke_share_grant`
+    // returns. A sample taken at return must not push the deadline out.
+    let mut effect_during_revoke = false;
+    let mut closed = None;
+    let mut revoke_done = false;
+
+    loop {
+        if effect_at.is_none()
+            && revocation_set
+                .read()
+                .await
+                .is_share_grant_revoked(&grant_id, &owner)
+        {
+            effect_at = Some(std::time::Instant::now());
+            effect_during_revoke = !revoke_done;
+        }
+        let deadline = revocation_teardown_deadline(armed, effect_at, effect_during_revoke, bound);
+        if revoke_done && effect_at.is_none() {
+            panic!("revoke_share_grant finished without the revocation taking effect");
+        }
+        if closed.is_some() && revoke_done && effect_at.is_some() {
+            break;
+        }
+        if closed.is_none() && std::time::Instant::now() >= deadline {
+            if effect_during_revoke {
+                let effect = effect_at.expect("effect");
+                panic!(
+                    "forward and SOCKS still open {:?} after the revocation took effect",
+                    effect.elapsed()
+                );
+            }
+            panic!(
+                "forward and SOCKS still open {:?} after revoke was armed",
+                armed.elapsed()
+            );
+        }
+
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        let effect_unknown = effect_at.is_none();
+        tokio::select! {
+            biased;
+            sample = &mut close_reads, if closed.is_none() => {
+                closed = Some(sample);
+            }
+            joined = &mut revoke_task, if !revoke_done => {
+                joined.expect("revoke task panicked");
+                revoke_done = true;
+            }
+            // Poll the revoked bit while revoke is still inside publish.
+            _ = tokio::time::sleep(Duration::from_millis(5)), if effect_unknown => {}
+            _ = tokio::time::sleep(wait), if !effect_unknown && closed.is_none() => {}
+        }
+    }
+
+    let effect = effect_at.expect("revocation effect");
+    let (closed_at, (forward_closed, socks_closed)) = closed.expect("socket close");
+    let deadline = revocation_teardown_deadline(armed, Some(effect), effect_during_revoke, bound);
+    let started = if effect_during_revoke { effect } else { armed };
+    assert!(
+        closed_at <= deadline,
+        "teardown {:?} after the bound started missed deadline {deadline:?}",
+        closed_at.saturating_duration_since(started)
+    );
+    (forward_closed, socks_closed)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "two-agent loopback ShareGrant connect; binds UDP. Integration tailnet job."]
 async fn share_grant_connect_reaches_forward_and_socks() {
@@ -485,19 +661,14 @@ async fn share_grant_connect_reaches_forward_and_socks() {
     socks_live_read.expect("SOCKS closed before revoke");
     assert_eq!(forward_live[0], 0x21, "forward must echo before revoke");
     assert_eq!(socks_live[0], 0x21, "SOCKS must echo before revoke");
-    bob.revoke_share_grant(grant.grant_id, None)
-        .await
-        .expect("revoke grant");
-    let mut forward_buf = [0u8; 1];
-    let mut socks_buf = [0u8; 1];
-    let (forward_closed, socks_closed) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(
-            held_forward.read(&mut forward_buf),
-            held_socks.read(&mut socks_buf),
-        )
-    })
-    .await
-    .expect("open forward and SOCKS must EOF or reset within 5s of revoke");
+    let (forward_closed, socks_closed) = await_revocation_teardown(
+        &bob,
+        grant.grant_id,
+        grant.owner,
+        &mut held_forward,
+        &mut held_socks,
+    )
+    .await;
     assert!(
         closed_by_teardown(&forward_closed),
         "forward after revoke must EOF or reset, got {forward_closed:?}"
