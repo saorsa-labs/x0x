@@ -141,7 +141,7 @@ async fn finish_startup_error(
     }
     exec_service.shutdown().await;
     if let Some(forward_service) = forward_service {
-        forward_service.shutdown();
+        forward_service.shutdown_and_release().await;
     }
     agent.begin_shutdown();
     let _ = shutdown_notify.send(true);
@@ -1362,6 +1362,12 @@ pub async fn serve_with_options(
         names: Arc::new(
             x0x::names::NameStore::load(x0x::names::NameStore::path_in(&config.data_dir)).await,
         ),
+        forwards: Arc::new(
+            x0x::forward::store::ForwardStore::load(x0x::forward::store::ForwardStore::path_in(
+                &config.data_dir,
+            ))
+            .await,
+        ),
         startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
         startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
         startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
@@ -1414,6 +1420,36 @@ pub async fn serve_with_options(
     // are owned by the Agent/ExecService and stopped by their own `shutdown()`
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks = startup_tasks;
+
+    // ADR-0074 §2: bring persisted forwards back. Each named forward is
+    // re-resolved through the name store (its pin applies) and comes up
+    // only on exactly its pinned ids; anything else stays down with a
+    // reason in `GET /forwards`. Local work only — it never blocks startup
+    // on the network. Names of peers not yet discovered resolve later, so
+    // forwards still down are retried until they come up or are deleted
+    // (a retry can only ever bring a forward up on its pinned ids).
+    if state.forward_service.is_some() {
+        let restore_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                routes::connect::FORWARD_RESTORE_RETRY_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                if routes::connect::restore_forwards(&restore_state).await == 0 {
+                    return;
+                }
+            }
+        }));
+    }
 
     // Issue #600: keep the peer-table traversal that `/health` used to do
     // inline OFF the request path. The watchdog probes `/health` with a 3 s
@@ -3151,7 +3187,12 @@ pub async fn serve_with_options(
         // 0b. Forwarder listeners + inbound consumer (issue #132): stop
         //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
-            forwarder.shutdown();
+            // Drain add/remove/restore before cancelling listeners. A
+            // transaction still inside bind publishes its accept loop
+            // before it returns; the release below then waits for that
+            // socket to drop. A bind that resumes after this cancel is
+            // refused.
+            forwarder.shutdown_and_release().await;
         }
         if let Some(socks) = &state.socks_service {
             // Join the accept loop so the listen port is free before the

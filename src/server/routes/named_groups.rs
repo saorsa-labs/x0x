@@ -45640,6 +45640,12 @@ pub(in crate::server) mod tests {
             names: Arc::new(
                 x0x::names::NameStore::load(x0x::names::NameStore::path_in(data_dir)).await,
             ),
+            forwards: Arc::new(
+                x0x::forward::store::ForwardStore::load(
+                    x0x::forward::store::ForwardStore::path_in(data_dir),
+                )
+                .await,
+            ),
             startup_catchup_obligations: std::sync::Mutex::new(HashMap::new()),
             startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
             startup_catchup_backoff_owner: AtomicU64::new(0),

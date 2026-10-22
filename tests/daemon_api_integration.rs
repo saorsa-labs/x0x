@@ -2961,14 +2961,17 @@ async fn daemon_api_forwards_list() {
 #[tokio::test]
 #[ignore]
 async fn daemon_api_forwards_remove_disabled() {
-    // connect disabled → DELETE /forwards/:addr returns 409 (no forwarder).
+    // Connect is disabled, so no forwarder is running. DELETE still
+    // reaches the store. An address that was never saved is 404, not 409.
+    // Removing a saved record is
+    // `disabled_connect_restart_still_deletes_saved_forward`.
     let d = daemon().await;
     let r = ca(&d)
         .delete(d.url("/forwards/127.0.0.1:18022"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -546,6 +546,8 @@ mod tests {
             ("/forwards", Method::POST),
             // #1392: show is an owner act. A rider token is refused.
             ("/gui/show", Method::POST),
+            // Deleting a forward removes the owner's persisted record.
+            ("/forwards/127.0.0.1:8022", Method::DELETE),
         ];
         for (path, method) in forbidden {
             assert!(

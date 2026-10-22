@@ -419,7 +419,10 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
             ) || is_two_segment_action(path, "delegate")
                 || is_group_quarantine_clear(path)
         }
-        Method::DELETE => is_sync_device_path(path),
+        // DELETE /forwards/:local_addr removes the owner's persisted
+        // forward. Session and rider tokens must not reach it. GET
+        // /forwards stays readable.
+        Method::DELETE => is_sync_device_path(path) || is_forward_addr_path(path),
         // ADR 0116 §3: the local history policy, with its counters and the
         // fork-quarantine pins, is an owner-only read.
         Method::GET => path == "/history/policy",
@@ -494,6 +497,14 @@ fn is_two_segment_action(path: &str, action: &str) -> bool {
                 && segs.next() == Some(action)
                 && segs.next().is_none()
         }
+        None => false,
+    }
+}
+
+/// `true` for exactly `/forwards/<nonempty-local-addr>` (one path segment).
+fn is_forward_addr_path(path: &str) -> bool {
+    match path.strip_prefix("/forwards/") {
+        Some(addr) => !addr.is_empty() && !addr.contains('/'),
         None => false,
     }
 }
@@ -1560,16 +1571,26 @@ mod tests {
     }
 
     #[test]
-    fn forward_add_requires_durable_owner() {
+    fn forward_add_and_delete_require_durable_owner() {
         // ADR-0074 §1: POST /forwards resolves a peer name and pins it at
-        // first use. Session and rider bearers must not reach it. Card
-        // import stays session-reachable (contacts only; bind is gated in
-        // the handler).
+        // first use. DELETE /forwards/:local_addr removes the owner's
+        // persisted record. Session and rider bearers must not reach
+        // either. GET /forwards stays readable. Card import stays
+        // session-reachable (contacts only; bind is gated in the handler).
         assert!(requires_durable_owner(&Method::POST, "/forwards"));
-        assert!(!requires_durable_owner(&Method::GET, "/forwards"));
-        assert!(!requires_durable_owner(
+        assert!(requires_durable_owner(
             &Method::DELETE,
             "/forwards/127.0.0.1:8022"
+        ));
+        assert!(requires_durable_owner(
+            &Method::DELETE,
+            "/forwards/[::1]:8022"
+        ));
+        assert!(!requires_durable_owner(&Method::GET, "/forwards"));
+        assert!(!requires_durable_owner(&Method::DELETE, "/forwards"));
+        assert!(!requires_durable_owner(
+            &Method::DELETE,
+            "/forwards/127.0.0.1:8022/extra"
         ));
         assert!(!requires_durable_owner(&Method::POST, "/agent/card/import"));
     }
