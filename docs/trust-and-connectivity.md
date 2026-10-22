@@ -155,10 +155,14 @@ same address never erases an earlier generation's entry. The ledger is
 bounded (a few generations per peer, an hour per entry, a global identity
 cap) and is dormant — no writes at all — while the pin table is empty.
 Ordinary gossip sends are bound to the connection generation they
-examined: if the peer's connection is replaced between the policy check
-and the write, the send fails instead of riding the unchecked
-replacement, and a send with no live session fails rather than riding
-whatever connection appears next. This is
+examined — but only while any address is pinned: with nothing pinned the
+pre-#1112 plain send stands, so the binding (a replacement between check
+and write fails the send instead of riding the unchecked connection)
+costs nothing today. A send with no live session fails with the
+structured PeerNotConnected (the #380 eviction contract), never a plain
+error that would only cool the peer. Frames with unknown provenance —
+no recorded entry and no session evidence, whether never observed or
+evicted by the ledger's bounds — are refused while pins are in force. This is
 what catches an ant-quic-internal coordinator redial of a rejected seed,
 whose connection never passed x0x's dial seam. The guarded-send policy is recomputed
 inside the post-`open_uni` callback, so a rejection that lands while a

@@ -4970,14 +4970,19 @@ impl NetworkNode {
     }
 
     /// Whether a live rejection refuses a frame by its SOURCE session
-    /// (#1112, rounds 10-11): either a recorded rejection entry names
+    /// (#1112, rounds 10-13): either a recorded rejection entry names
     /// this frame's generation (the address-dial refusal's record, which
     /// outlives the connection's close), or the session-address ledger
     /// maps the frame's generation to the address it lived on and the
-    /// TIMELESS pin pair verdict refuses that (identity, address) pair —
-    /// covering id-based dials and internal redials, which never pass the
-    /// address-dial seam and record no entry. Frames queued before a
-    /// close and drained after it are refused on both clauses.
+    /// TIMELESS pin pair verdict decides on that (identity, address)
+    /// pair — covering id-based dials and internal redials, which never
+    /// pass the address-dial seam and record no entry. Frames queued
+    /// before a close and drained after it are refused on both clauses.
+    /// With pins in force and NO evidence for the frame's generation —
+    /// none recorded, or evicted by the ledger's bounds — the frame is
+    /// refused outright (round 13: unknown provenance under pins; a
+    /// session established before the pin era re-establishes and its
+    /// traffic re-flows). Never reached while the pin table is empty.
     fn seed_pin_rejects_frame(&self, peer_id: &AntPeerId, source_generation: u64) -> bool {
         if self
             .live_seed_pin_rejections()
@@ -4986,8 +4991,10 @@ impl NetworkNode {
         {
             return true;
         }
-        self.session_addr_for(peer_id, source_generation)
-            .is_some_and(|addr| seed_pin_mismatch_at(addr, peer_id.0))
+        match self.session_addr_for(peer_id, source_generation) {
+            Some(addr) => seed_pin_mismatch_at(addr, peer_id.0),
+            None => !dial_pin_table().is_empty(),
+        }
     }
 
     /// [`Self::seed_pin_rejects_current_session`] for callers that hold
@@ -6726,25 +6733,30 @@ impl NetworkNode {
                 return;
             };
             loop {
-                let Ok((peer, event)) = lifecycle.recv().await else {
-                    break;
+                // The EVENT's generation, not the current one (round 13):
+                // by the time this task runs, a newer connection may have
+                // replaced the established one. A broadcast lag only
+                // narrows the evidence window — keep listening.
+                let event = match lifecycle.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if !matches!(event, ant_quic::PeerLifecycleEvent::Established { .. })
-                    || dial_pin_table().is_empty()
-                {
+                let (peer, ant_quic::PeerLifecycleEvent::Established { generation }) = event else {
+                    continue;
+                };
+                if dial_pin_table().is_empty() {
                     continue;
                 }
                 let node_handle = node.read().await.as_ref().cloned();
                 let Some(link) = node_handle else {
                     break;
                 };
-                if let Some(generation) = link.current_connection_generation(&peer) {
-                    if let Some(addr) = link
-                        .session_connection(&peer)
-                        .and_then(|conn| conn.remote_address())
-                    {
-                        note_session_address_in(&ledger, peer, generation, addr);
-                    }
+                if let Some(addr) = link
+                    .session_connection(&peer)
+                    .and_then(|conn| conn.remote_address())
+                {
+                    note_session_address_in(&ledger, peer, generation, addr);
                 }
             }
         })
@@ -8035,17 +8047,27 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
             // per-peer sends in a small timeout; a multi-second liveness repair on
             // this path turns healthy gossip degradation into a timeout/log storm.
-            let send_result = match checked_generation {
-                Some(generation) => node.send_on_generation(&ant_peer, generation, &buf).await,
-                // No live session at capture time (#1112 round 12): fail
-                // rather than plain-send — a plain send would ride whatever
-                // connection happens to be current at write time, one the
-                // policy above never examined.
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "gossip send refused: no live session for peer {:?}",
-                        peer
-                    ));
+            let send_result = if dial_pin_table().is_empty() {
+                // #1112 (round 13): generation binding is a pin-era
+                // behaviour. With nothing pinned it guards nothing and
+                // would only turn reconnect-race sends into failures, so
+                // the pre-#1112 plain send stands.
+                node.send(&ant_peer, &buf).await
+            } else {
+                match checked_generation {
+                    Some(generation) => node.send_on_generation(&ant_peer, generation, &buf).await,
+                    // No live session at capture time (#1112 round 12):
+                    // the structured PeerNotConnected — the #380 contract
+                    // (saorsa evicts on it), never a plain error that
+                    // would cool instead of evicting.
+                    None => {
+                        return Err(
+                            saorsa_gossip_transport::GossipTransportError::PeerNotConnected {
+                                peer_id: peer,
+                            }
+                            .into(),
+                        );
+                    }
                 }
             };
             send_result.map_err(|e| map_gossip_send_error(e, peer))?;
@@ -11528,14 +11550,19 @@ mod tests {
         seed.try_shutdown().await.unwrap();
     }
 
-    /// Round 12 (Codex P2: the `None`-generation fallback restored the
-    /// unchecked send path): with no live session at capture time, the
-    /// ordinary send FAILS — a plain send would ride whatever connection
-    /// happens to be current at write time, one the policy never
-    /// examined. Runtime-RED before the fix: the fallback called plain
-    /// `send`.
+    /// Round 12-13 (Codex P2 + Claude: the `None`-generation fallback
+    /// restored the unchecked send path, and the failure must keep the
+    /// #380 error contract): with no live session at capture time, the
+    /// ordinary send fails with the STRUCTURED PeerNotConnected —
+    /// saorsa-gossip evicts on it (a plain error would only cool) —
+    /// while the pins-empty path keeps the plain pre-#1112 send.
     #[tokio::test]
     async fn issue1112_ordinary_send_without_a_live_session_fails() {
+        const NOT_THE_SEED: [u8; 32] = [0xB3; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
         let plane = "issue1112-r12-nosession";
         let (seed, joiner, _seed_addr) = issue1112_sim_pair(plane, 11_138).await;
         // A plane-cleared peer with NO live connection: the hold branches
@@ -11544,6 +11571,8 @@ mod tests {
         assert!(!joiner.is_connected(&peer).await);
         joiner.plane_handle_hello(peer, plane).await;
 
+        // Pin era: the structured PeerNotConnected, never a plain error.
+        let _pins = TestPinTableGuard::set(&PINS);
         let result = joiner
             .send_to_peer(
                 ant_to_gossip_peer_id(&peer),
@@ -11551,13 +11580,62 @@ mod tests {
                 bytes::Bytes::from_static(b"membership-frame"),
             )
             .await;
+        let err = result.expect_err("a send with no live session must fail");
+        let transport_error = err
+            .downcast::<saorsa_gossip_transport::GossipTransportError>()
+            .expect("the failure keeps the structured transport error");
         assert!(
-            result.is_err(),
-            "a send with no live session must fail, not ride a later connection unchecked"
+            transport_error.is_peer_not_connected(),
+            "PeerNotConnected carries the #380 eviction contract, got {transport_error:?}"
         );
 
         joiner.try_shutdown().await.unwrap();
         seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 13 (Codex P2: eviction restores the bypass): with pins in
+    /// force, a frame whose source generation has NO evidence — never
+    /// recorded (a connection no x0x seam or watcher observed) or evicted
+    /// by the ledger's bounds — is refused outright: unknown provenance
+    /// under pins never reaches the gossip plane. Runtime-RED before the
+    /// provenance stance: a missing-evidence frame passed both guards.
+    #[tokio::test]
+    async fn issue1112_unknown_provenance_frames_are_refused_under_pins() {
+        const NOT_THE_SEED: [u8; 32] = [0xB4; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let node = NetworkNode::new(test_network_config(), None, None)
+            .await
+            .unwrap();
+        let peer = test_ant_peer(0x9);
+
+        // Pins empty: no evidence, no entry — the guard is dormant.
+        assert!(!node.seed_pin_rejects_frame(&peer, 42));
+
+        let _pins = TestPinTableGuard::set(&PINS);
+        // Unknown provenance (no observation ever recorded).
+        assert!(
+            node.seed_pin_rejects_frame(&peer, 42),
+            "a frame with no source evidence is refused under pins"
+        );
+        // Evidence evicted by the per-peer bound: nine generations push
+        // the first out (cap 8), and its frames are refused again.
+        for generation in 0..9u64 {
+            node.note_session_address(peer, generation, addr);
+        }
+        assert!(
+            node.session_addr_for(&peer, 0).is_none(),
+            "the first generation's evidence was evicted by the bound"
+        );
+        assert!(node.seed_pin_rejects_frame(&peer, 0));
+        // A generation WITH evidence at the mismatching address: refused
+        // by the pair verdict.
+        assert!(node.seed_pin_rejects_frame(&peer, 8));
+
+        node.try_shutdown().await.unwrap();
     }
 
     /// Round 12 (Codex P2 + Claude: the session ledger grows without a
