@@ -1189,7 +1189,7 @@ impl OwnerSyncStore {
             .await
             .map_err(DurableWriteError::BeforeRename)?;
         drop(file);
-        tokio::fs::rename(&tmp, path)
+        crate::profile::rename_file(&tmp, path)
             .await
             .map_err(DurableWriteError::BeforeRename)?;
         // Everything below runs with the NEW state already visible.
@@ -8131,6 +8131,233 @@ mod issuance_journal_sync_tests {
         assert!(
             local.pending_applies().await.contains(&(a.clone(), true)),
             "A must stay owed as the register's winner"
+        );
+    }
+}
+
+/// #1545 round 7: a caller that is cancelled while a durable write of the
+/// store is in flight. The blocking rename of the write still lands after
+/// the cancel; no later writer may run before it, and memory must agree
+/// with the disk after it.
+#[cfg(test)]
+mod cancellation_tests {
+    use super::tests::{machine, owner_kp};
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn names(human: &str) -> SyncProfileNames {
+        SyncProfileNames {
+            human_name: Some(human.into()),
+            display_name: None,
+            machine_name: None,
+        }
+    }
+
+    fn profile(human: &str) -> SyncValue {
+        SyncValue::OwnerProfile {
+            human_name: Some(human.into()),
+        }
+    }
+
+    /// An owner-signed `OwnerProfile` record of another machine.
+    async fn remote_profile(dir: &Path, owner: &UserKeypair, human: &str) -> VersionedRecord {
+        let remote = OwnerSyncStore::load(dir).await.expect("remote store");
+        remote
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile(human),
+                owner,
+                machine(2),
+            )
+            .await
+            .expect("remote mint");
+        remote.records_snapshot().await.remove(0)
+    }
+
+    /// Hold the next rename to `path` on the blocking pool.
+    fn hold_rename(
+        path: &Path,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::profile::journal_faults::pause_next_rename(path, reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
+    /// Start `task`, wait until it holds its rename, and cancel it.
+    async fn cancel_at_rename<T: Send + 'static>(
+        reached: tokio::sync::oneshot::Receiver<()>,
+        task: tokio::task::JoinHandle<T>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the write reaches its rename")
+            .expect("rename hook");
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// Run `next` for up to a second, release the held rename, and finish
+    /// `next`. Then give the released rename time to land.
+    async fn run_then_release<T: Send + 'static>(
+        mut next: tokio::task::JoinHandle<T>,
+        release: std::sync::mpsc::Sender<()>,
+    ) -> T {
+        let early = tokio::time::timeout(Duration::from_secs(1), &mut next).await;
+        release.send(()).expect("release the held rename");
+        let out = match early {
+            Ok(done) => done.expect("next task"),
+            Err(_) => next.await.expect("next task"),
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        out
+    }
+
+    /// Codex review of #1545 (b17cd8bf), P2: `Alice` is owed. `PUT Bob`
+    /// notes its save and is cancelled during the rename of the pending
+    /// file. `PUT Carol` then notes its save and discharges `Alice`. The
+    /// late rename of Bob's note must not bring `Alice` back on disk: a
+    /// restart would then apply `Alice` over the durable `Carol`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_note_cancelled_during_its_rename_cannot_restore_a_discharged_name() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let alice = remote_profile(&dir.path().join("remote"), &owner, "Alice").await;
+        let local_dir = dir.path().join("local");
+        let local = Arc::new(OwnerSyncStore::load(&local_dir).await.expect("store"));
+        local
+            .commit_batch(vec![alice.clone()], &owner.user_id())
+            .await
+            .expect("commit Alice");
+        let folded = vec![(alice.clone(), true)];
+
+        let (reached, release) = hold_rename(&local.pending_applies_path());
+        let bob = {
+            let (local, folded) = (Arc::clone(&local), folded.clone());
+            tokio::spawn(async move { local.note_profile_save(&folded, &names("Bob")).await })
+        };
+        cancel_at_rename(reached, bob).await;
+
+        let carol = {
+            let (local, folded) = (Arc::clone(&local), folded.clone());
+            tokio::spawn(async move {
+                local.note_profile_save(&folded, &names("Carol")).await?;
+                local.discharge_applies(&folded).await
+            })
+        };
+        run_then_release(carol, release)
+            .await
+            .expect("Carol's note and discharge");
+        assert!(
+            local.pending_applies().await.is_empty(),
+            "Alice is discharged"
+        );
+
+        drop(local);
+        let restarted = OwnerSyncStore::load(&local_dir).await.expect("restart");
+        assert!(
+            restarted.pending_applies().await.is_empty(),
+            "a cancelled note must not restore the discharged Alice on disk"
+        );
+    }
+
+    /// A mint is cancelled during the rename of the register file, and a
+    /// later mint completes. The late rename must not put the older
+    /// register on disk over the later one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mint_cancelled_during_its_rename_cannot_roll_the_register_back() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = Arc::new(owner_kp(7));
+        let local = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+
+        let (reached, release) = hold_rename(&local.dir.join(RECORDS_FILE));
+        let first = {
+            let (local, owner) = (Arc::clone(&local), Arc::clone(&owner));
+            tokio::spawn(async move {
+                local
+                    .mint(
+                        SyncKind::OwnerProfile,
+                        "owner",
+                        &profile("A"),
+                        &owner,
+                        machine(1),
+                    )
+                    .await
+            })
+        };
+        cancel_at_rename(reached, first).await;
+
+        let second = {
+            let (local, owner) = (Arc::clone(&local), Arc::clone(&owner));
+            tokio::spawn(async move {
+                local
+                    .mint(
+                        SyncKind::OwnerProfile,
+                        "owner",
+                        &profile("B"),
+                        &owner,
+                        machine(1),
+                    )
+                    .await
+            })
+        };
+        run_then_release(second, release).await.expect("mint B");
+
+        let live = local.records_snapshot().await;
+        drop(local);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert_eq!(
+            restarted
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("B")),
+            "the late rename of a cancelled mint must not roll the register back"
+        );
+        assert_eq!(
+            restarted.records_snapshot().await,
+            live,
+            "memory agrees with disk"
+        );
+    }
+
+    /// A commit of a synced name is cancelled during the write of its
+    /// obligation, before its register write. Memory must then agree with
+    /// the disk: a register in memory that holds the record without its
+    /// obligation lets the reconcile mint the old live name over it, and
+    /// the next register write publishes the record although its commit
+    /// did not complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_commit_cancelled_before_its_register_write_leaves_memory_as_the_disk() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let alice = remote_profile(&dir.path().join("remote"), &owner, "Alice").await;
+        let local_dir = dir.path().join("local");
+        let local = Arc::new(OwnerSyncStore::load(&local_dir).await.expect("store"));
+
+        let (reached, release) = hold_rename(&local.pending_applies_path());
+        let commit = {
+            let (local, owner) = (Arc::clone(&local), owner.user_id());
+            tokio::spawn(async move { local.commit_batch(vec![alice], &owner).await })
+        };
+        cancel_at_rename(reached, commit).await;
+        release.send(()).expect("release the held rename");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let disk = OwnerSyncStore::load(&local_dir).await.expect("reload");
+        assert_eq!(
+            local.records_snapshot().await,
+            disk.records_snapshot().await,
+            "the register in memory must be the register on disk"
+        );
+        assert_eq!(
+            local.pending_applies().await,
+            disk.pending_applies().await,
+            "the obligations in memory must be the obligations on disk"
         );
     }
 }

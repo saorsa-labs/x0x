@@ -196,6 +196,19 @@ impl SelfProfile {
     }
 }
 
+/// Rename `from` to `to` on the blocking pool. A test can hold it before
+/// it lands (`journal_faults::pause_next_rename`).
+pub(crate) async fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from, to) = (from.to_path_buf(), to.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        journal_faults::before_rename(&to);
+        std::fs::rename(&from, &to)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 /// Write `bytes` to `path` via a unique temp file + rename (atomic on both
 /// unix and windows for same-directory renames). The temp name embeds the
 /// pid + a counter so concurrent writers never collide.
@@ -227,7 +240,7 @@ pub(crate) async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Resu
         let mut file = tokio::fs::File::create(&tmp).await?;
         file.write_all(bytes).await?;
         file.sync_all().await?;
-        tokio::fs::rename(&tmp, path).await
+        rename_file(&tmp, path).await
     }
     .await;
     if let Err(e) = written {
@@ -454,7 +467,7 @@ impl IssuedCertRecord {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
-        if let Err(e) = Self::rename(&tmp, path).await {
+        if let Err(e) = rename_file(&tmp, path).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
@@ -490,18 +503,6 @@ impl IssuedCertRecord {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(writer),
             Err(e) => Err(e),
         }
-    }
-
-    /// Rename `from` to `to` on the blocking pool.
-    async fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
-        let (from, to) = (from.to_path_buf(), to.to_path_buf());
-        tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            journal_faults::before_rename(&to);
-            std::fs::rename(&from, &to)
-        })
-        .await
-        .map_err(std::io::Error::other)?
     }
 
     /// Write `bytes` to a new file at `path` and fsync it.
