@@ -210,9 +210,7 @@ impl CeState {
     ) -> Vec<(String, String, Arc<Vec<u8>>)> {
         self.log.catchup_frames(group_ids, from_revision)
     }
-}
 
-impl CeState {
     /// The boot load (`load_persisted_obligations`) replaces the runtime
     /// state with this rebuilt one. A receipt can run before that load
     /// (#1508 review, Codex P1 boot race): it loaded the `.celog` and wrote
