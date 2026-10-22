@@ -62,6 +62,11 @@ pub struct PendingGuiShow {
     pub request_id: String,
     /// Browser session token from the opened `/gui?token=` URL.
     pub session_token: String,
+    /// Start of the current session token's lifetime.
+    ///
+    /// Show sets this to the mint. Refresh moves it to that refresh. The
+    /// banner then lasts one session-token TTL from here, the same window
+    /// the refreshed token stays valid.
     pub created_at: Instant,
 }
 
@@ -656,8 +661,9 @@ impl GuiShowRuntime {
     /// Keep a queued origin banner when this GUI session token is refreshed.
     ///
     /// A hidden tab can refresh before its WebSocket reconnects. The new
-    /// connection presents the new token. The banner stays with that tab.
-    /// Other sessions stay on their own tokens.
+    /// connection presents the new token. The banner stays with that tab
+    /// for the new token's TTL, which starts at this refresh. Other
+    /// sessions stay on their own tokens and their own clocks.
     ///
     /// The banner move and the successor record share one critical section.
     /// A take cannot observe the banner on the old token after the map has
@@ -677,6 +683,9 @@ impl GuiShowRuntime {
         for item in queue.iter_mut() {
             if item.session_token == from_token {
                 item.session_token = to_token.to_string();
+                // `SessionStore::refresh` sets the new token's expiry to
+                // `now + SESSION_TOKEN_TTL`. The banner uses that same start.
+                item.created_at = now;
             }
         }
     }
@@ -762,9 +771,11 @@ fn current_token_locked(map: &HashMap<String, (String, Instant)>, token: &str) -
     current
 }
 
-/// Whether `pending` is still inside the session token TTL.
+/// Whether `pending` is still inside its current session token TTL.
 ///
-/// The banner stays until that TTL, matching a hidden tab revealed later.
+/// The window starts at [`PendingGuiShow::created_at`]. Show sets that to
+/// the mint. Refresh moves it with the new token. A hidden tab revealed
+/// inside that window still receives the banner and its Stop control.
 fn pending_is_fresh(pending: &PendingGuiShow, now: Instant) -> bool {
     now.saturating_duration_since(pending.created_at) <= PENDING_FRESHNESS
 }
@@ -1545,6 +1556,63 @@ exit 1
         assert!(
             rt.has_pending_session("other-tab"),
             "another tab's banner must stay queued"
+        );
+    }
+
+    #[test]
+    fn hidden_refresh_at_minute_nine_keeps_banner_at_minute_eleven() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let refresh_at = Instant::now();
+        let shown_at = refresh_at
+            .checked_sub(Duration::from_secs(9 * 60))
+            .expect("show is nine minutes before the refresh");
+        let notice = origin_banner("agent", "machine", false);
+        let mut shown = pending("shown-token", "people", shown_at);
+        shown.banner = notice.clone();
+        rt.enqueue_pending(shown);
+        rt.enqueue_pending(pending("other-tab", "network", shown_at));
+
+        // Hidden: refresh swaps the token and does not reveal the tab.
+        rt.rebind_pending_session("shown-token", "refreshed-token");
+        let refreshed_at = Instant::now();
+        assert!(
+            rt.has_pending_session("refreshed-token"),
+            "the banner stays queued on the refreshed session while the tab is hidden"
+        );
+        assert!(!rt.has_pending_session("shown-token"));
+
+        let revealed_at = shown_at + Duration::from_secs(11 * 60);
+        assert!(
+            revealed_at.saturating_duration_since(shown_at) > PENDING_FRESHNESS,
+            "minute eleven is past the original show"
+        );
+        assert!(
+            revealed_at.saturating_duration_since(refreshed_at) <= PENDING_FRESHNESS,
+            "minute eleven is inside the refreshed session"
+        );
+        let kept = rt
+            .take_pending_for_session("refreshed-token", revealed_at)
+            .expect("reveal at minute eleven still delivers the origin banner and Stop control");
+        assert_eq!(kept.view, "people");
+        assert_eq!(kept.banner, notice);
+        assert!(
+            !rt.has_pending_session("other-tab"),
+            "a session that was not refreshed still expires ten minutes after its show"
+        );
+
+        // The refreshed banner lasts one session-token TTL from the refresh.
+        let mut again = pending("later-token", "people", shown_at);
+        again.banner = notice;
+        rt.enqueue_pending(again);
+        rt.rebind_pending_session("later-token", "later-refreshed");
+        let later_refresh = Instant::now();
+        let past_session =
+            later_refresh + crate::server::SESSION_TOKEN_TTL + Duration::from_secs(1);
+        assert!(
+            rt.take_pending_for_session("later-refreshed", past_session)
+                .is_none(),
+            "the banner expires with the refreshed session"
         );
     }
 
