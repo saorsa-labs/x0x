@@ -407,6 +407,16 @@ async fn commit_locked(
         })
         .map_err(CommitError::Refused)?;
     }
+    // ADR 0109 §2 "Conflict" (#1533 Codex P1 2): the author's own commit
+    // passes the one conflict gate too, before anything is persisted. A
+    // recorded attestation conflict contains the group until a re-seat.
+    if !ng::group_recovery::conflict_admits_commit(state, info, &frame.body.commit.to_commit())
+        .await
+    {
+        return Err(CommitError::Refused(
+            cr::CertificateRebindRefusal::GroupContained,
+        ));
+    }
     let bytes = cr::encode_frame(&frame)
         .map_err(|_| CommitError::Refused(cr::CertificateRebindRefusal::Malformed))?;
     if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
