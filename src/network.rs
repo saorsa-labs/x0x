@@ -8057,11 +8057,29 @@ fn note_session_address_in(
     let now = Instant::now();
     // Round 19: the peer is implicated for the TTL horizon, decoupled
     // from its detail row — global eviction of the row (the peer bound)
-    // cannot re-admit its queued frames of unknown generations.
-    implications
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(peer, now + SESSION_ADDR_LEDGER_TTL);
+    // cannot re-admit its queued frames of unknown generations. Round
+    // 20: expiry and the cap are enforced AT INSERTION — identity churn
+    // between reads cannot grow the map (prune expired, then drop the
+    // earliest-expiring until inside the cap).
+    {
+        let mut implications = implications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        implications.retain(|_, until| *until > now);
+        implications.insert(peer, now + SESSION_ADDR_LEDGER_TTL);
+        while implications.len() > 2 * SESSION_ADDR_LEDGER_MAX_PEERS {
+            let earliest = implications
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(k, _)| *k);
+            match earliest {
+                Some(id) if id != peer => {
+                    implications.remove(&id);
+                }
+                _ => break,
+            }
+        }
+    }
     let mut ledger = ledger
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -11989,6 +12007,42 @@ mod tests {
         );
 
         node.try_shutdown().await.unwrap();
+    }
+
+    /// Round 20 (Codex P2: `session_implications` was only bounded on
+    /// reads): expiry and the cap are enforced AT INSERTION — identity
+    /// churn at a pinned address between reads cannot grow the map.
+    /// Runtime-RED before the insertion bound: 1_100 inserts with no
+    /// intervening read left 1_100 entries.
+    #[test]
+    fn issue1112_implication_map_is_bounded_at_insertion() {
+        const NOT_IT: [u8; 32] = [0xB9; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &[&NOT_IT],
+        }];
+        let addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
+        let ledger = Arc::new(Mutex::new(SessionAddrLedger::new()));
+        let implications = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let _pins = TestPinTableGuard::set(&PINS);
+        let distinct = |n: u32| {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&n.to_le_bytes());
+            ant_quic::PeerId(id)
+        };
+        // No reads in between: the insertion path alone must hold the
+        // bound.
+        for n in 0..1_100u32 {
+            note_session_address_in(&ledger, &implications, distinct(n), 1, addr);
+        }
+        assert!(
+            implications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                <= 2 * SESSION_ADDR_LEDGER_MAX_PEERS,
+            "the implication map stays inside its cap without reads"
+        );
     }
 
     /// Round 12 (Codex P2 + Claude: the session ledger grows without a
