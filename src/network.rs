@@ -4970,24 +4970,22 @@ impl NetworkNode {
 
     /// Ledger an observed connection (#1112, round 11): the answered
     /// peer's CURRENT generation and the address the observation came
-    /// from — the dial seams and the accept loop, so id-based dials and
-    /// inbound connections (which never pass the address-dial seam) leave
-    /// source-session evidence the frame guard can use after the session
-    /// closes. Round 16: the current session must still sit on the
-    /// observed address — else the dial's connection was replaced before
-    /// this write and the current generation belongs to a different
-    /// connection.
+    /// from — the dial seams, so id-based dials (which never pass the
+    /// address-dial seam) leave source-session evidence the frame guard
+    /// can use after the session closes. Rounds 16-17: the generation is
+    /// read on BOTH sides of the address read and must AGREE — a
+    /// replacement landing in between would record the observed address
+    /// against the replacement's generation.
     fn note_observed_connection(&self, node: &LinkNode, peer: &AntPeerId, addr: SocketAddr) {
         let observed = normalize_v4_mapped_addr(addr);
+        let before = node.current_connection_generation(peer);
         let still_on_observed = node
             .session_connection(peer)
             .and_then(|conn| conn.remote_address())
             .is_some_and(|current| normalize_v4_mapped_addr(current) == observed);
-        if !still_on_observed {
-            return;
-        }
-        if let Some(generation) = node.current_connection_generation(peer) {
-            self.note_session_address(*peer, generation, observed);
+        let after = node.current_connection_generation(peer);
+        if still_on_observed && before.is_some() && before == after {
+            self.note_session_address(*peer, before.unwrap_or_default(), observed);
         }
     }
 
@@ -6802,20 +6800,14 @@ impl NetworkNode {
         })
     }
 
-    /// Spawn a background task that accepts inbound connections.
-    ///
-    /// Without this, only outbound connections (initiated by `connect_addr`)
-    /// are registered in `connected_peers`. Inbound peers would complete the
-    /// QUIC handshake but never have a reader task spawned, so `recv()` would
-    /// never deliver their data.
     /// #1112 (round 12): always-on lifecycle watcher that ledgers every
-    /// ESTABLISHED connection generation with its session address. This
-    /// is the source-session evidence that survives a connection closing
-    /// BEFORE the receive pump ever sees one of its frames — including
-    /// ant-quic-internal connections, which never pass an x0x seam. A
-    /// broadcast lag is fine: the seams, the accept loop and the pump
-    /// ledger as well; a missed event only narrows the evidence window.
-    /// Skips all work while the pin table is empty.
+    /// ESTABLISHED and REPLACED connection generation with its session
+    /// address. This is the source-session evidence that survives a
+    /// connection closing BEFORE the receive pump ever sees one of its
+    /// frames — including ant-quic-internal connections, which never pass
+    /// an x0x seam. A broadcast lag is fine: the seams, the accept loop
+    /// and the pump ledger as well; a missed event only narrows the
+    /// evidence window. Skips all work while the pin table is empty.
     fn spawn_session_ledger_watcher(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let ledger = Arc::clone(&self.session_addr_ledger);
@@ -6884,6 +6876,12 @@ impl NetworkNode {
         })
     }
 
+    /// Spawn a background task that accepts inbound connections.
+    ///
+    /// Without this, only outbound connections (initiated by `connect_addr`)
+    /// are registered in `connected_peers`. Inbound peers would complete the
+    /// QUIC handshake but never have a reader task spawned, so `recv()` would
+    /// never deliver their data.
     fn spawn_accept_loop(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let event_sender = self.event_sender.clone();
@@ -6991,13 +6989,14 @@ impl NetworkNode {
                             ant_quic::TransportAddr::Udp(addr) => Some(addr),
                             _ => None,
                         };
-                        // #1112 (round 11, validated round 16): inbound
-                        // connections never pass the dial seam — leave
-                        // source-session evidence for the frame guard,
-                        // but only while the CURRENT session still sits
-                        // on the accepted address (a replacement between
-                        // accept() and here would mis-attribute).
+                        // #1112 (round 11, validated rounds 16-17):
+                        // inbound connections never pass the dial seam —
+                        // leave source-session evidence for the frame
+                        // guard, but only when the generation read on
+                        // BOTH sides of the address read agrees (a
+                        // replacement in between would mis-attribute).
                         if let Some(addr) = addr {
+                            let before = node_ref.current_connection_generation(&peer_conn.peer_id);
                             let still_on_accepted = node_ref
                                 .session_connection(&peer_conn.peer_id)
                                 .and_then(|conn| conn.remote_address())
@@ -7005,17 +7004,14 @@ impl NetworkNode {
                                     normalize_v4_mapped_addr(current)
                                         == normalize_v4_mapped_addr(addr)
                                 });
-                            if still_on_accepted {
-                                if let Some(generation) =
-                                    node_ref.current_connection_generation(&peer_conn.peer_id)
-                                {
-                                    note_session_address_in(
-                                        &session_addr_ledger,
-                                        peer_conn.peer_id,
-                                        generation,
-                                        addr,
-                                    );
-                                }
+                            let after = node_ref.current_connection_generation(&peer_conn.peer_id);
+                            if still_on_accepted && before.is_some() && before == after {
+                                note_session_address_in(
+                                    &session_addr_ledger,
+                                    peer_conn.peer_id,
+                                    before.unwrap_or_default(),
+                                    addr,
+                                );
                             }
                         }
                         if let (Some(ref cache), Some(addr)) = (&bootstrap_cache, addr) {
