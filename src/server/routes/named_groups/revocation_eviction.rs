@@ -1343,7 +1343,7 @@ fn owner_certified(info: &GroupInfo) -> bool {
 }
 
 /// §1 and §1a: the triggers this pass observes, with the target's current
-/// incarnation (its KeyPackage hash).
+/// incarnation ([`ce::seat_incarnation`]).
 fn derive_triggers(
     groups: &[(String, GroupInfo)],
     leaves: &RetainedLeaves,
@@ -1367,7 +1367,7 @@ fn derive_triggers(
             let target = *agent.as_bytes();
             let retained_leaf = leaves.tracks(stable, &target).unwrap_or(false);
             let seated = is_seated(member.state);
-            let incarnation = member.treekem_key_package_hash.clone();
+            let incarnation = ce::seat_incarnation(info, &member.agent_id);
             // §1: an Agent-subject revocation creates work where the target
             // has a seat or a retained cryptographic leaf.
             if seated || retained_leaf {
@@ -2303,7 +2303,7 @@ fn expiry_handoff_triggers(
     let now_unix = now_unix_ms / 1000;
     let mut out = Vec::new();
     kept.retain(|key, handoff| {
-        let Some(member) = groups
+        let Some((info, member)) = groups
             .iter()
             .map(|(_, info)| info)
             .find(|info| {
@@ -2311,8 +2311,12 @@ fn expiry_handoff_triggers(
                     && !info.withdrawn
                     && owner_certified(info)
             })
-            .and_then(|info| info.members_v2.get(&hex::encode(key.target)))
-            .filter(|member| member.state == GroupMemberState::Active)
+            .and_then(|info| {
+                info.members_v2
+                    .get(&hex::encode(key.target))
+                    .map(|member| (info, member))
+            })
+            .filter(|(_, member)| member.state == GroupMemberState::Active)
         else {
             return false;
         };
@@ -2337,7 +2341,7 @@ fn expiry_handoff_triggers(
                 certificate_digest: digest,
                 not_after,
             },
-            member.treekem_key_package_hash.clone(),
+            ce::seat_incarnation(info, &member.agent_id),
             observed_ms,
         ));
         false

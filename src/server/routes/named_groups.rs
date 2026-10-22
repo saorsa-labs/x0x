@@ -15378,6 +15378,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
+                // ADR 0110 §4b(1), #1508 r5: an owner-recovery share can
+                // arrive before the recovery that makes its sender an admin.
+                if allow_queue {
+                    revocation_eviction::owner_recovery::park_early_share(
+                        state,
+                        &info,
+                        &event_for_log,
+                        sender,
+                        verified,
+                    )
+                    .await;
+                }
                 return ApplyMetadataResult::REJECTED;
             }
             // Ignore stale envelopes. Equal-epoch delivery is still accepted
