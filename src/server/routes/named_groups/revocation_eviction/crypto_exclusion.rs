@@ -1650,6 +1650,16 @@ pub(in crate::server) async fn receive(
         );
         return ReceiveOutcome::Refused(refusal);
     }
+    // ADR 0109 §2 "Conflict" (#1533 r6): the one conflict gate bounds
+    // this commit as it bounds every metadata route.
+    if !ng::group_recovery::conflict_admits_commit(state, &info, &commit).await {
+        tracing::warn!(
+            group_id = %LogHexId::group(&group_key),
+            revision = commit.revision,
+            "ADR 0109 S3: crypto-only exclusion past the attestation conflict's common prefix refused"
+        );
+        return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::GroupContained);
+    }
     // #1508 review (Codex P1): the exact received frame is durable before
     // the roster and crypto state it carries are installed, in a store
     // that needs no S4 row. A restarted receiver then serves it to a

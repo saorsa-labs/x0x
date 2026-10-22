@@ -2357,7 +2357,10 @@ fn attested_link_admitted(
 /// (`apply_named_group_metadata_event_inner_serialized`) calls it for
 /// every commit, under the group's membership lock and on the record it
 /// loaded under that lock, so a catch-up page, a DM and a gossip delivery
-/// have the same bound. A commit that does not advance the head
+/// have the same bound. The ADR 0110 S4 receivers (certificate rebind,
+/// crypto-only exclusion and owner recovery) apply their commits outside
+/// that path, so each calls it under the same lock before it keeps the
+/// frame (#1533 r6). A commit that does not advance the head
 /// (`revision <= current.state_revision`) passes: the apply refuses it or
 /// installs a marker through the existing path ("Conflicting commits still
 /// install a marker"). A commit that advances the head applies only when

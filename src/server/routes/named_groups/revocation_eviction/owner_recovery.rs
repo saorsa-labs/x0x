@@ -1792,6 +1792,17 @@ async fn receive_commit(
             ReceiveOutcome::Refused(refusal)
         };
     }
+    let commit = body.commit.to_commit();
+    // ADR 0109 §2 "Conflict" (#1533 r6): the one conflict gate bounds
+    // this commit as it bounds every metadata route.
+    if !ng::group_recovery::conflict_admits_commit(state, &info, &commit).await {
+        tracing::warn!(
+            group_id = %ng::LogHexId::group(&group_key),
+            revision = commit.revision,
+            "ADR 0109 S3: owner recovery past the attestation conflict's common prefix refused"
+        );
+        return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryGroupQuarantined);
+    }
     // #1508 review F2: the received frame is durable before the roster it
     // carries is installed, in the held log that the author uses. A
     // restarted receiver then serves it to a survivor that missed it while
@@ -1804,7 +1815,6 @@ async fn receive_commit(
     if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
         return ReceiveOutcome::Retained;
     }
-    let commit = body.commit.to_commit();
     let signed_binding = commit.security_binding.clone();
     let roster_revision = body.roster_revision;
     let crypto = body.crypto.clone();

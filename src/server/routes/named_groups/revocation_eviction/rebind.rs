@@ -1630,6 +1630,16 @@ pub(in crate::server) async fn receive(
             return ReceiveOutcome::Refused(refused);
         }
     };
+    // ADR 0109 §2 "Conflict" (#1533 r6): the one conflict gate bounds
+    // this commit as it bounds every metadata route.
+    if !ng::group_recovery::conflict_admits_commit(state, &info, &commit).await {
+        tracing::warn!(
+            group_id = %LogHexId::group(&group_key),
+            revision = commit.revision,
+            "ADR 0109 S3: certificate rebind past the attestation conflict's common prefix refused"
+        );
+        return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::GroupContained);
+    }
     // #1508 review F2: the received frame is durable before the roster it
     // carries is installed, in the held log that the author uses. A
     // restarted receiver then serves it to a survivor that missed it while
