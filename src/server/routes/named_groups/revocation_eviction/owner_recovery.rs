@@ -3114,6 +3114,35 @@ mod restart_tests {
             .collect()
     }
 
+    /// #1533 r6 (Codex P1 1), ADR 0109 §2 "Conflict": "Nothing past the
+    /// common prefix applies" holds for an S4 owner recovery too. The
+    /// receiver records an attestation conflict on the parent (no fork
+    /// marker), then the valid recovery commit on that parent arrives: it
+    /// is refused and the head does not move. Before the fix the recovery
+    /// receiver applied the commit without the conflict gate. Inert.
+    #[tokio::test]
+    async fn a_recorded_attestation_conflict_refuses_a_valid_recovery() -> Result<()> {
+        let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (receiver, info, bytes, _result_head, _admin) =
+            received_recovery(author_dir.path(), receiver_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        anyhow::ensure!(
+            super::super::super::group_recovery::record_conflict_at_head_for_test(&receiver, &info)
+                .await?,
+            "the conflict is durable"
+        );
+        assert_eq!(
+            receive_bytes(&receiver, &bytes).await?,
+            ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryGroupQuarantined)
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "nothing past the common prefix applies (owner recovery)"
+        );
+        Ok(())
+    }
+
     /// F2 (a): a survivor installs a recovery, then restarts while the
     /// author is offline. The restarted survivor serves the exact frame to
     /// another survivor that asks for catch-up from the parent revision.

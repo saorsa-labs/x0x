@@ -3545,6 +3545,33 @@ mod daemon_tests {
         lagging_peer_installs(&fx, &parent, relay, &frames[0], &result_head).await
     }
 
+    /// #1533 r6 (Codex P1 1), ADR 0109 §2 "Conflict": "Nothing past the
+    /// common prefix applies" holds for an S4 crypto-only exclusion too.
+    /// The survivor records an attestation conflict on the parent (no fork
+    /// marker), then the valid GSS exclusion on that parent arrives: it is
+    /// refused and the head does not move. Before the fix the exclusion
+    /// receiver applied the commit without the conflict gate. Inert.
+    #[tokio::test]
+    async fn a_recorded_attestation_conflict_refuses_a_valid_exclusion() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let (frame, _result_head, parent) = authored_frame_and_parent(&fx).await?;
+        anyhow::ensure!(
+            ng::group_recovery::record_conflict_at_head_for_test(&fx.replica, &parent).await?,
+            "the conflict is durable"
+        );
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::GroupContained)
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await.as_ref(),
+            Some(&parent.state_hash),
+            "nothing past the common prefix applies (crypto-only exclusion)"
+        );
+        Ok(())
+    }
+
     /// #1508 review (Codex P1, boot race): a frame received before the S4
     /// load runs stays held after the load. The interleaving is a second
     /// receipt that did its once-per-process `.celog` load before

@@ -5334,6 +5334,45 @@ pub(in crate::server) async fn open_staging_journal_for_test(
     )
 }
 
+/// Test only: record a §2 attestation conflict on `current`'s head, as
+/// [`arm_from_response`] leaves it: an active ATA and a conflicting ATA,
+/// both from the head, that diverge at the first link. The common prefix
+/// is empty, so [`conflict_admits_commit`] admits no commit past the head.
+/// Returns whether the sidecar write is durable.
+#[cfg(test)]
+pub(in crate::server) async fn record_conflict_at_head_for_test(
+    state: &AppState,
+    current: &GroupInfo,
+) -> anyhow::Result<bool> {
+    let signer = x0x::identity::AgentKeypair::generate()?;
+    let ata = |next: &str| {
+        AdminTerminalAttestation::sign(
+            AtaFields {
+                group: current.stable_group_id().to_string(),
+                subject: local_hex(state),
+                attested_by: hex::encode(signer.agent_id().as_bytes()),
+                signer_public_key: hex::encode(signer.public_key().as_bytes()),
+                from_revision: current.state_revision,
+                from_state_hash: current.state_hash.clone(),
+                sequence: vec![next.to_string()],
+                segment_terminal_revision: current.state_revision + 1,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &signer,
+        )
+    };
+    let active = ata("a1")?;
+    let conflict = ata("b1")?;
+    Ok(
+        update_sidecar(state, current.stable_group_id(), move |body| {
+            body.active_ata = Some(active);
+            body.attestation_conflict = Some(conflict);
+        })
+        .await,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

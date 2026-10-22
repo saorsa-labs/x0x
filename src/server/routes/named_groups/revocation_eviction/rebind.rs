@@ -2442,6 +2442,37 @@ pub(super) mod restart_tests {
             .collect()
     }
 
+    /// #1533 r6 (Codex P1 1), ADR 0109 §2 "Conflict": "Nothing past the
+    /// common prefix applies" holds for an S4 rebind too. The receiver
+    /// records an attestation conflict on its head (no fork marker), then
+    /// a valid rebind on that head arrives: it is refused and the head
+    /// does not move. Before the fix the rebind receiver applied the
+    /// commit without the conflict gate. Inert.
+    #[tokio::test]
+    async fn a_recorded_attestation_conflict_refuses_a_valid_rebind() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        anyhow::ensure!(
+            ng::group_recovery::record_conflict_at_head_for_test(&receiver, &fixture.info).await?,
+            "the conflict is durable"
+        );
+        let (bytes, _result_head) = fixture.frame()?;
+        let outcome = receive(&receiver, fixture.admin.agent_id(), &bytes).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(cr::CertificateRebindRefusal::GroupContained)
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&fixture.info.state_hash),
+            "nothing past the common prefix applies (rebind)"
+        );
+        Ok(())
+    }
+
     /// F2 (a): a survivor installs a rebind, then restarts while the author
     /// is offline. The restarted survivor serves the exact frame to another
     /// survivor that asks for catch-up from the parent revision.
