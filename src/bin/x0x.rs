@@ -1113,8 +1113,8 @@ enum ForwardSub {
         /// Local bind address, e.g. `127.0.0.1:8022`.
         #[arg(long)]
         local: String,
-        /// Peer agent: hex agent id or an agent name (`[agent:]<label>.<owner>`,
-        /// ADR-0074). `machine:` names are refused until slice 2.
+        /// Peer agent: hex agent id or a name (`[agent:|machine:]<label>.<owner>`,
+        /// ADR-0074).
         #[arg(long)]
         peer: String,
         /// Loopback target host on the peer (numeric IP). Default `127.0.0.1`.
@@ -1123,6 +1123,9 @@ enum ForwardSub {
         /// Loopback target port on the peer.
         #[arg(long)]
         target_port: u16,
+        /// Keep the forward in memory only (do not persist to forwards.json).
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
     },
     /// List registered forwards.
     List,
@@ -3303,13 +3306,15 @@ async fn run(
                 peer,
                 target,
                 target_port,
+                ephemeral,
             } => {
-                commands::forward::add(
+                commands::forward::add_with_ephemeral(
                     &client,
                     &local,
                     &peer,
                     target.as_deref().unwrap_or("127.0.0.1"),
                     target_port,
+                    ephemeral,
                 )
                 .await
             }
