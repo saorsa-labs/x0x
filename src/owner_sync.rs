@@ -859,10 +859,21 @@ pub struct OwnerSyncStore {
     /// append after the task for its successor. Lock order:
     /// `journal_apply` → `records` (read) → the profile journal writer lock.
     journal_apply: tokio::sync::Mutex<()>,
+    /// Test injection: hold a synced journal append after its register
+    /// winner check until the test releases it.
+    #[cfg(test)]
+    journal_check_pause: std::sync::Mutex<Option<JournalCheckPause>>,
     /// ADR-0074 §4: woken when the owner device set changes (an enrollment
     /// or unenrollment).
     device_change_notify: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
 }
+
+/// The two ends of [`OwnerSyncStore::pause_next_journal_check`].
+#[cfg(test)]
+type JournalCheckPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 /// Per-device sync status surfaced by `GET /sync/devices`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -961,6 +972,8 @@ impl OwnerSyncStore {
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             canonical_home_gate: tokio::sync::RwLock::new(()),
             journal_apply: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            journal_check_pause: std::sync::Mutex::new(None),
             device_change_notify: std::sync::Mutex::new(None),
         })
     }
@@ -1129,6 +1142,33 @@ impl OwnerSyncStore {
     /// underlying fault clears — until an explicit reload.
     fn poison_refusal(&self) -> Option<SyncError> {
         self.poisoned_reason().map(SyncError::Poisoned)
+    }
+
+    /// Hold the next synced journal append after its winner check: it
+    /// signals `checked` and then waits for `release`.
+    #[cfg(test)]
+    fn pause_next_journal_check(
+        &self,
+        checked: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self
+            .journal_check_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((checked, release));
+    }
+
+    #[cfg(test)]
+    async fn pause_after_journal_check(&self) {
+        let pause = self
+            .journal_check_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((checked, release)) = pause {
+            let _ = checked.send(());
+            let _ = release.await;
+        }
     }
 
     fn fail_after_rename_for_testing(&self) -> bool {
@@ -2931,18 +2971,7 @@ impl OwnerSyncService {
 
         // Kind 4: issuance journal lines (latest per agent, owner-scoped).
         if let Some(path) = self.journal_path.as_ref() {
-            let owner_hex = hex::encode(owner_kp.user_id().0);
-            let lines = crate::profile::IssuedCertRecord::load(path).await;
-            for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {
-                self.mint_or_log(
-                    SyncKind::IssuanceJournal,
-                    &agent_hex,
-                    value,
-                    owner_kp,
-                    local_machine,
-                )
-                .await;
-            }
+            mint_journal_lines(&self.store, path, owner_kp, local_machine).await;
         }
         Ok(())
     }
@@ -3098,6 +3127,33 @@ impl OwnerSyncService {
     }
 }
 
+/// Mint each agent's latest journal line into the `IssuanceJournal`
+/// register (kind 4 of the local reconcile). A failed mint is logged and
+/// retried next pass.
+async fn mint_journal_lines(
+    store: &OwnerSyncStore,
+    path: &Path,
+    owner_kp: &UserKeypair,
+    machine: MachineId,
+) {
+    let owner_hex = hex::encode(owner_kp.user_id().0);
+    let lines = crate::profile::IssuedCertRecord::load(path).await;
+    for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {
+        if let Err(e) = store
+            .mint(
+                SyncKind::IssuanceJournal,
+                &agent_hex,
+                &value,
+                owner_kp,
+                machine,
+            )
+            .await
+        {
+            tracing::warn!(target: "x0x::owner_sync", kind = ?SyncKind::IssuanceJournal, error = %e, "mint failed");
+        }
+    }
+}
+
 /// Append the synced journal line to the local journal file when this
 /// device needs it (body of [`OwnerSyncService::apply_journal_line`]).
 ///
@@ -3133,6 +3189,8 @@ async fn append_synced_journal_line(
         // issuance) or the winner's own task appends it.
         return;
     }
+    #[cfg(test)]
+    store.pause_after_journal_check().await;
     let appended = crate::profile::IssuedCertRecord::append_when(&path, |existing| {
         synced_line_needed(
             existing,
@@ -5998,6 +6056,104 @@ mod issuance_journal_sync_tests {
             minted.get("bb"),
             Some(&d2),
             "the journal must end on the register's winner"
+        );
+    }
+
+    /// Codex review of #1545 (a5ee204): a synced repair of `d1@100` passes
+    /// its register winner check and pauses. While it pauses, this device
+    /// renews to `d2@100` and reconciles. The delayed repair must not put
+    /// `d1` after `d2`: the next reconcile would then mint the older
+    /// certificate over the register at a higher version.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_repair_does_not_roll_back_a_local_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let journal = dir.path().join(crate::profile::CERT_JOURNAL_FILE);
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let value = |digest: &str, not_after| SyncValue::IssuanceJournal {
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(not_after),
+        };
+        let (d1, d2) = (value("d1", 5_000), value("d2", 9_000));
+        // Another device's d1 wins the register here.
+        store
+            .mint(SyncKind::IssuanceJournal, "bb", &d1, &owner, machine(2))
+            .await
+            .expect("commit d1");
+
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store.pause_next_journal_check(checked_tx, release_rx);
+        let repair = {
+            let (agent_id, cert_digest, issued_at, not_after) = fields(&d1);
+            tokio::spawn(append_synced_journal_line(
+                Arc::clone(&store),
+                journal.clone(),
+                owner_hex.clone(),
+                agent_id,
+                cert_digest,
+                issued_at,
+                not_after,
+            ))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), checked_rx)
+            .await
+            .expect("the repair reaches its winner check")
+            .expect("checked signal");
+
+        // The local renewal and a reconcile pass, while the repair pauses.
+        let renewal = {
+            let (store, journal, owner, owner_hex) = (
+                Arc::clone(&store),
+                journal.clone(),
+                owner_kp(7),
+                owner_hex.clone(),
+            );
+            tokio::spawn(async move {
+                let renewed = crate::profile::IssuedCertRecord {
+                    user_id: owner_hex,
+                    agent_id: "bb".to_string(),
+                    cert_digest: "d2".to_string(),
+                    issued_at: 100,
+                    not_after: Some(9_000),
+                    mode: crate::profile::CertMode::Acp,
+                    label: None,
+                    cert_b64: None,
+                };
+                crate::profile::IssuedCertRecord::append(&journal, &renewed)
+                    .await
+                    .expect("append d2");
+                mint_journal_lines(&store, &journal, &owner, machine(1)).await;
+            })
+        };
+        // Let the renewal run while the repair is held (it may block).
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            while !renewal.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        release_tx.send(()).expect("release");
+        repair.await.expect("repair task");
+        renewal.await.expect("renewal task");
+
+        // The next reconcile pass.
+        mint_journal_lines(&store, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+        assert_eq!(
+            store.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2),
+            "the register must keep the renewal"
         );
     }
 
