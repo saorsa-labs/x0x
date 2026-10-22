@@ -853,6 +853,12 @@ pub struct OwnerSyncStore {
     /// This is a LOCAL linearization boundary only. It claims nothing about
     /// cross-device election ordering.
     canonical_home_gate: tokio::sync::RwLock<()>,
+    /// #1542: serializes the journal appends of accepted `IssuanceJournal`
+    /// records (see `append_synced_journal_line`). Each append runs in its
+    /// own task, so without it a task for an older register value could
+    /// append after the task for its successor. Lock order:
+    /// `journal_apply` → `records` (read) → the profile journal writer lock.
+    journal_apply: tokio::sync::Mutex<()>,
     /// ADR-0074 §4: woken when the owner device set changes (an enrollment
     /// or unenrollment).
     device_change_notify: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
@@ -954,6 +960,7 @@ impl OwnerSyncStore {
             poisoned: std::sync::Mutex::new(None),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
             canonical_home_gate: tokio::sync::RwLock::new(()),
+            journal_apply: tokio::sync::Mutex::new(()),
             device_change_notify: std::sync::Mutex::new(None),
         })
     }
@@ -3061,6 +3068,7 @@ impl OwnerSyncService {
             return;
         };
         tokio::spawn(append_synced_journal_line(
+            Arc::clone(&self.store),
             path,
             owner_hex,
             agent_hex.to_string(),
@@ -3092,7 +3100,16 @@ impl OwnerSyncService {
 
 /// Append the synced journal line to the local journal file when this
 /// device needs it (body of [`OwnerSyncService::apply_journal_line`]).
+///
+/// The line is appended only while its value is still the register's
+/// winner for the agent. Each accepted record appends in its own task, so
+/// the tasks for `d1` and then `d2` can run as `d2` and then `d1`. Without
+/// this check the journal would end on `d1`, and the next reconcile would
+/// mint the older certificate over the register. The check and the append
+/// hold the store's `journal_apply` lock: a record that wins after the
+/// check appends after this line.
 async fn append_synced_journal_line(
+    store: Arc<OwnerSyncStore>,
     path: PathBuf,
     owner_hex: String,
     agent_hex: String,
@@ -3100,6 +3117,22 @@ async fn append_synced_journal_line(
     issued_at: u64,
     not_after: Option<u64>,
 ) {
+    let _journal_apply = store.journal_apply.lock().await;
+    let applied = SyncValue::IssuanceJournal {
+        agent_id: agent_hex.clone(),
+        cert_digest: cert_digest.clone(),
+        issued_at,
+        not_after,
+    };
+    if store
+        .stored_value(SyncKind::IssuanceJournal, &agent_hex)
+        .await
+        != Some(applied)
+    {
+        // Superseded: the winner's line is already in the journal (a local
+        // issuance) or the winner's own task appends it.
+        return;
+    }
     let appended = crate::profile::IssuedCertRecord::append_when(&path, |existing| {
         synced_line_needed(
             existing,
@@ -3123,7 +3156,8 @@ async fn append_synced_journal_line(
 /// Whether a synced journal line must be appended to `existing`.
 ///
 /// Owner sync calls this only for a record that won the `IssuanceJournal`
-/// register (`apply_record` runs post-commit). The line is compared with
+/// register (`apply_record` runs post-commit) and is still its winner
+/// (`append_synced_journal_line` checks). The line is compared with
 /// this owner's CURRENT line for the agent (see `latest_journal_values`;
 /// the owner roster reads the same last line):
 ///
@@ -4076,7 +4110,7 @@ mod tests {
         install_loopback_socket_boundary();
         let dir = tempfile::tempdir().expect("tmpdir");
         let seed = [0x85; 32];
-        let (agent, _service) = live_owner_device(dir.path(), "alice", seed).await;
+        let (agent, service) = live_owner_device(dir.path(), "alice", seed).await;
         let journal = agent
             .cert_journal_path()
             .expect("journal path")
@@ -4104,8 +4138,27 @@ mod tests {
                 .await
                 .expect("append");
         }
-        // A late sync of d1 that carries its expiry arrives.
+        // A late sync of d1 that carries its expiry arrives and wins the
+        // register here (this device has not minted d2).
+        let owner = UserKeypair::from_seed(&seed).expect("owner");
+        service
+            .store()
+            .mint(
+                SyncKind::IssuanceJournal,
+                &target,
+                &SyncValue::IssuanceJournal {
+                    agent_id: target.clone(),
+                    cert_digest: "d1".to_string(),
+                    issued_at: 100,
+                    not_after: Some(5_000),
+                },
+                &owner,
+                agent.machine_id(),
+            )
+            .await
+            .expect("commit d1");
         append_synced_journal_line(
+            Arc::clone(service.store()),
             journal.clone(),
             owner_hex.clone(),
             target.clone(),
@@ -5770,7 +5823,7 @@ mod issuance_journal_sync_tests {
 
         struct Device {
             journal: PathBuf,
-            store: OwnerSyncStore,
+            store: Arc<OwnerSyncStore>,
             machine: MachineId,
         }
 
@@ -5784,7 +5837,7 @@ mod issuance_journal_sync_tests {
             let data = dir.path().join(name);
             devices.push(Device {
                 journal: data.join(crate::profile::CERT_JOURNAL_FILE),
-                store: OwnerSyncStore::load(&data).await.expect("store"),
+                store: Arc::new(OwnerSyncStore::load(&data).await.expect("store")),
                 machine: machine(id),
             });
         }
@@ -5832,6 +5885,7 @@ mod issuance_journal_sync_tests {
                 } = record.value
                 {
                     append_synced_journal_line(
+                        Arc::clone(&to.store),
                         to.journal.clone(),
                         owner_hex.to_string(),
                         agent_id,
@@ -5902,7 +5956,7 @@ mod issuance_journal_sync_tests {
         let owner = owner_kp(7);
         let owner_hex = hex::encode(owner.user_id().0);
         let journal = dir.path().join(crate::profile::CERT_JOURNAL_FILE);
-        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
         let value = |digest: &str, not_after| SyncValue::IssuanceJournal {
             agent_id: "bb".to_string(),
             cert_digest: digest.to_string(),
@@ -5927,6 +5981,7 @@ mod issuance_journal_sync_tests {
         for applied in [&d2, &d1] {
             let (agent_id, cert_digest, issued_at, not_after) = fields(applied);
             append_synced_journal_line(
+                Arc::clone(&store),
                 journal.clone(),
                 owner_hex.clone(),
                 agent_id,
