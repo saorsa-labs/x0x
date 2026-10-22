@@ -8,7 +8,9 @@
 //! test passes only after both tunnels carry a byte and then end in EOF or
 //! reset. It does not return success when setup does not run. The
 //! five-second teardown bound starts when the revocation is inserted, not
-//! when `revoke_share_grant` returns from its gossip publish.
+//! when `revoke_share_grant` returns from its gossip publish. A sighting
+//! after that return does not move the deadline, including a sighting taken
+//! before the observer consumes the join handle.
 
 #![allow(
     clippy::unwrap_used,
@@ -350,6 +352,9 @@ fn closed_within_revocation_bound(
 /// A revoked bit seen while `revoke_share_grant` is still running starts
 /// the bound at that instant. A bit seen only after the call returns does
 /// not: the deadline stays at `armed + bound`, which was set before the call.
+///
+/// `effect_during_revoke` is [`bound_starts_at_sample`]. An unconsumed join
+/// handle is not "still running".
 fn revocation_teardown_deadline(
     armed: std::time::Instant,
     effect: Option<std::time::Instant>,
@@ -359,6 +364,35 @@ fn revocation_teardown_deadline(
     match effect {
         Some(effect) if effect_during_revoke => effect + bound,
         _ => armed + bound,
+    }
+}
+
+/// What the observer knows when it first sees the revoked bit.
+#[derive(Clone, Copy)]
+struct RevokeSighting {
+    /// `revoke_share_grant` has returned. This is `JoinHandle::is_finished`,
+    /// not whether `select` has consumed the handle.
+    task_finished: bool,
+    /// The observer has consumed the join handle.
+    join_consumed: bool,
+}
+
+/// The sighting starts the five-second bound only while revoke is running.
+///
+/// `join_consumed` stays false until `select` takes the join branch. A
+/// biased `select` takes the socket reads first, so the next sighting can
+/// run with an unconsumed join after the task has already returned. That
+/// sighting must not move the deadline.
+fn bound_starts_at_sample(sighting: RevokeSighting) -> bool {
+    match sighting {
+        RevokeSighting {
+            task_finished: true,
+            join_consumed: _,
+        } => false,
+        RevokeSighting {
+            task_finished: false,
+            join_consumed: _,
+        } => true,
     }
 }
 
@@ -402,12 +436,59 @@ fn slow_teardown_past_the_revocation_bound_fails() {
     assert_eq!(during, effect + Duration::from_millis(10) + bound);
 }
 
+/// WHY (Codex P2): both the socket reads and `revoke_share_grant` can finish
+/// before the observer resumes. Biased `select` takes the reads and leaves
+/// the join handle unconsumed. The next sighting is six seconds late. The
+/// join flag would start the bound at that sighting and accept the teardown.
+#[test]
+fn late_sample_after_finished_revoke_before_join_keeps_armed_deadline() {
+    let armed = std::time::Instant::now();
+    let bound = Duration::from_secs(5);
+    let late_sample = armed + Duration::from_secs(6);
+    let sighting = RevokeSighting {
+        task_finished: true,
+        join_consumed: false,
+    };
+    let starts = bound_starts_at_sample(sighting);
+    let deadline = revocation_teardown_deadline(armed, Some(late_sample), starts, bound);
+    let join_flag_deadline =
+        revocation_teardown_deadline(armed, Some(late_sample), !sighting.join_consumed, bound);
+    assert!(
+        late_sample <= join_flag_deadline,
+        "the unconsumed join flag would accept this six-second teardown"
+    );
+    assert_eq!(deadline, armed + bound);
+    assert!(
+        late_sample > deadline,
+        "teardown at {late_sample:?} must miss {deadline:?}"
+    );
+}
+
+/// A sighting taken while `revoke_share_grant` is still inside publish
+/// starts the bound at that sighting. The armed instant is before the insert.
+#[test]
+fn running_revoke_sighting_starts_the_teardown_bound() {
+    let armed = std::time::Instant::now();
+    let bound = Duration::from_secs(5);
+    let effect = armed + Duration::from_millis(10);
+    let starts = bound_starts_at_sample(RevokeSighting {
+        task_finished: false,
+        join_consumed: false,
+    });
+    assert!(starts);
+    assert_eq!(
+        revocation_teardown_deadline(armed, Some(effect), starts, bound),
+        effect + bound
+    );
+}
+
 /// Revoke `grant_id` and wait until both sockets close.
 ///
 /// The five-second bound starts when the grant first shows as revoked,
 /// which is the insert inside `revoke_share_grant`. Gossip after that
 /// insert is inside the bound. A sample taken only when the call returns
 /// cannot move the deadline later than the instant revoke was armed.
+/// Whether the join handle has been consumed is not that return.
 async fn await_revocation_teardown(
     bob: &Arc<x0x::Agent>,
     grant_id: [u8; 32],
@@ -440,7 +521,8 @@ async fn await_revocation_teardown(
 
     let mut effect_at = None;
     // Set only when the revoked bit is seen before `revoke_share_grant`
-    // returns. A sample taken at return must not push the deadline out.
+    // returns. `revoke_done` is the join handle, which biased `select`
+    // can leave unconsumed after the task has finished.
     let mut effect_during_revoke = false;
     let mut closed = None;
     let mut revoke_done = false;
@@ -452,8 +534,12 @@ async fn await_revocation_teardown(
                 .await
                 .is_share_grant_revoked(&grant_id, &owner)
         {
-            effect_at = Some(std::time::Instant::now());
-            effect_during_revoke = !revoke_done;
+            let seen = std::time::Instant::now();
+            effect_at = Some(seen);
+            effect_during_revoke = bound_starts_at_sample(RevokeSighting {
+                task_finished: revoke_task.is_finished(),
+                join_consumed: revoke_done,
+            });
         }
         let deadline = revocation_teardown_deadline(armed, effect_at, effect_during_revoke, bound);
         if revoke_done && effect_at.is_none() {
