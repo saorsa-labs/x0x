@@ -7174,4 +7174,297 @@ mod tests {
         assert!(merged.get(&key).is_some_and(s3::is_s3_placeholder));
         Ok(())
     }
+
+    // ─── #1533 review (Codex P1, re-seat authority) ────────────────────────
+
+    /// A contained group record on this node (the subject): `admin` created
+    /// it, this node and `member` are Members, and a marker contains it.
+    /// When `promoted` is given, `admin` promotes it to Admin in a signed
+    /// commit that this node applies through the ordinary apply check.
+    /// Durable on disk. Returns the key and the record as written.
+    async fn authority_fixture(
+        state: &Arc<AppState>,
+        admin: &x0x::identity::AgentKeypair,
+        member: &x0x::identity::AgentKeypair,
+        promoted: Option<&x0x::identity::AgentKeypair>,
+    ) -> anyhow::Result<(String, GroupInfo)> {
+        let local = local_hex(state);
+        let mut info = GroupInfo::with_policy(
+            "adr0109-reseat-authority".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "1533".repeat(16),
+            x0x::groups::GroupPolicy {
+                discoverability: x0x::groups::GroupDiscoverability::Hidden,
+                admission: x0x::groups::GroupAdmission::InviteOnly,
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..x0x::groups::GroupPolicy::default()
+            },
+        );
+        for peer in [
+            Some(local.clone()),
+            Some(hex::encode(member.agent_id().as_bytes())),
+        ]
+        .into_iter()
+        .chain(promoted.map(|kp| Some(hex::encode(kp.agent_id().as_bytes()))))
+        .flatten()
+        {
+            info.add_member(peer, x0x::groups::GroupRole::Member, None, None);
+        }
+        info.seal_commit(admin, 1_000)?;
+        if let Some(promoted) = promoted {
+            let promoted_hex = hex::encode(promoted.agent_id().as_bytes());
+            let mut admins_copy = info.clone();
+            admins_copy.set_member_role(&promoted_hex, x0x::groups::GroupRole::Admin);
+            let commit = admins_copy.seal_commit(admin, 2_000)?;
+            info.set_member_role(&promoted_hex, x0x::groups::GroupRole::Admin);
+            info.apply_commit(
+                &commit,
+                x0x::groups::state_commit::ActionKind::AdminOrHigher,
+            )?;
+            assert_eq!(info.state_hash, admins_copy.state_hash);
+        }
+        info.fork_quarantine = Some(original_marker(state, &info));
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        Ok((key, info))
+    }
+
+    /// A re-seat offer signed by `signer`: an InviteV4 addressed to this
+    /// node whose base roster names `signer` Admin (self-asserted), and the
+    /// paired authorisation on `basis`, for a base at `base`.
+    fn reseat_offer(
+        info: &GroupInfo,
+        signer: &x0x::identity::AgentKeypair,
+        local: AgentId,
+        basis: ReseatBasis,
+        base: (u64, &str),
+    ) -> anyhow::Result<(ReseatAuthorisation, String)> {
+        let signer_hex = hex::encode(signer.agent_id().as_bytes());
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            info.mls_group_id.clone(),
+            info.name.clone(),
+            &signer.agent_id(),
+            3600,
+        );
+        crate::server::routes::identity::populate_invite_base_state_v4(
+            &mut invite,
+            info,
+            Some(local),
+        );
+        invite.base_state_revision = Some(base.0);
+        invite.base_state_hash = Some(base.1.to_string());
+        invite.base_roster = Some(BTreeMap::from([(
+            signer_hex.clone(),
+            x0x::groups::state_commit::RosterMemberSnapshot {
+                role: x0x::groups::GroupRole::Admin,
+                state: x0x::groups::GroupMemberState::Active,
+                treekem_key_package_hash: None,
+                certificate_digest: None,
+            },
+        )]));
+        invite.sign_v4(signer, None).map_err(anyhow::Error::msg)?;
+        let link = invite
+            .encode_link()
+            .map_err(|_| anyhow::anyhow!("invite link too large"))?;
+        let authorisation = ReseatAuthorisation::sign(
+            ReseatAuthorisationFields {
+                group: info.stable_group_id().to_string(),
+                subject: hex::encode(local.as_bytes()),
+                basis,
+                invite_secret_hash: s3::invite_secret_hash(&invite.invite_secret),
+                invite_base_revision: base.0,
+                invite_base_state_hash: base.1.to_string(),
+                signer: signer_hex.clone(),
+                signer_public_key: hex::encode(signer.public_key().as_bytes()),
+                reason_hash: s3::reason_hash("r"),
+                expires_at_ms: u64::MAX / 2,
+            },
+            signer,
+        )?;
+        Ok((authorisation, link))
+    }
+
+    /// Deliver the offer through the real receive path (`handle_response`
+    /// with a `Reseat` answer) and return the subject's last refusal.
+    async fn deliver_offer(
+        state: &Arc<AppState>,
+        info: &GroupInfo,
+        signer: &x0x::identity::AgentKeypair,
+        offer: (ReseatAuthorisation, String),
+    ) -> Option<String> {
+        let response = GroupAttestResponseV1 {
+            group: info.stable_group_id().to_string(),
+            subject: *state.agent.agent_id().as_bytes(),
+            for_head_state_hash: info.state_hash.clone(),
+            answer: AttestAnswer::Reseat {
+                authorisation: Box::new(offer.0),
+                invite: offer.1,
+            },
+        };
+        handle_response(state, signer.agent_id(), response).await;
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(info.stable_group_id())
+            .and_then(|subject| subject.last_refusal.clone())
+    }
+
+    /// The live record is the original, with its marker, and no journal is
+    /// open.
+    async fn original_kept(state: &AppState, key: &str, info: &GroupInfo) -> anyhow::Result<()> {
+        let live = state.named_groups.read().await.get(key).cloned();
+        assert_eq!(
+            live.map(|record| serde_json::to_value(&record))
+                .transpose()?,
+            Some(serde_json::to_value(info)?)
+        );
+        assert!(open_journal(state, info.stable_group_id()).await.is_none());
+        Ok(())
+    }
+
+    /// The removal this node never saw: on the canonical chain, past its
+    /// head. The invite base is that commit.
+    fn unseen_removal(info: &GroupInfo) -> (ReseatBasis, u64, String) {
+        let revision = info.state_revision + 1;
+        let hash = "c0".repeat(32);
+        (
+            ReseatBasis::Removal {
+                revision,
+                state_hash: hash.clone(),
+            },
+            revision,
+            hash,
+        )
+    }
+
+    /// #1533 review (Codex P1, re-seat authority): a Member signs an
+    /// authorisation and an invite whose own base roster names it Admin.
+    /// The subject anchors authority in its own verified roster, where the
+    /// signer is a Member, so it refuses before it journals or moves
+    /// anything. Before the fix the subject checked only the invite's
+    /// roster and staged the forger's join. Inert (offline agent).
+    #[tokio::test]
+    async fn a_reseat_signed_by_a_local_non_admin_is_refused() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let forger = x0x::identity::AgentKeypair::generate()?;
+        let (key, info) = authority_fixture(&state, &admin, &forger, None).await?;
+        let (basis, revision, hash) = unseen_removal(&info);
+        let offer = reseat_offer(
+            &info,
+            &forger,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        let refusal = deliver_offer(&state, &info, &forger, offer).await;
+        assert_eq!(
+            refusal.as_deref(),
+            Some("authorisation_refused:signer_not_admin_locally")
+        );
+        original_kept(&state, &key, &info).await
+    }
+
+    /// Control: the same offer signed by the admin of this node's own
+    /// roster passes every authority check and reaches the staged join.
+    /// The join cannot finish offline, so the rollback restores the
+    /// original. Inert (offline agent).
+    #[tokio::test]
+    async fn a_reseat_signed_by_a_local_admin_reaches_the_staged_join() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let member = x0x::identity::AgentKeypair::generate()?;
+        let (key, info) = authority_fixture(&state, &admin, &member, None).await?;
+        let (basis, revision, hash) = unseen_removal(&info);
+        let offer = reseat_offer(
+            &info,
+            &admin,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        let refusal = deliver_offer(&state, &info, &admin, offer).await;
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|why| why.starts_with("join_")),
+            "the staged join ran: {refusal:?}"
+        );
+        original_kept(&state, &key, &info).await
+    }
+
+    /// A Member that this node saw promoted to Admin, in a signed commit it
+    /// applied, signs with the authority of its own verified roster.
+    /// Inert (offline agent).
+    #[tokio::test]
+    async fn a_reseat_signed_by_a_locally_promoted_admin_reaches_the_staged_join(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let member = x0x::identity::AgentKeypair::generate()?;
+        let promoted = x0x::identity::AgentKeypair::generate()?;
+        let (key, info) = authority_fixture(&state, &admin, &member, Some(&promoted)).await?;
+        let (basis, revision, hash) = unseen_removal(&info);
+        let offer = reseat_offer(
+            &info,
+            &promoted,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        let refusal = deliver_offer(&state, &info, &promoted, offer).await;
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|why| why.starts_with("join_")),
+            "the staged join ran: {refusal:?}"
+        );
+        original_kept(&state, &key, &info).await
+    }
+
+    /// A `Removal` basis is checked against this node's own chain: a
+    /// commit it holds that does not remove it, or a removal after the
+    /// invite base, is `basis_unknown`, even from a local admin. Before
+    /// the fix any live `RecoveryRef` let any removal pass. Inert.
+    #[tokio::test]
+    async fn a_removal_basis_is_checked_against_the_local_chain() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let member = x0x::identity::AgentKeypair::generate()?;
+        let (key, info) = authority_fixture(&state, &admin, &member, None).await?;
+        let local = state.agent.agent_id();
+        let (_, revision, hash) = unseen_removal(&info);
+        let held_not_a_removal = ReseatBasis::Removal {
+            revision: info.state_revision,
+            state_hash: info.state_hash.clone(),
+        };
+        let offer = reseat_offer(&info, &admin, local, held_not_a_removal, (revision, &hash))?;
+        assert_eq!(
+            deliver_offer(&state, &info, &admin, offer).await.as_deref(),
+            Some("authorisation_refused:basis_unknown")
+        );
+        original_kept(&state, &key, &info).await?;
+        let after_base = ReseatBasis::Removal {
+            revision: revision + 1,
+            state_hash: "c1".repeat(32),
+        };
+        let offer = reseat_offer(&info, &admin, local, after_base, (revision, &hash))?;
+        assert_eq!(
+            deliver_offer(&state, &info, &admin, offer).await.as_deref(),
+            Some("authorisation_refused:basis_unknown")
+        );
+        original_kept(&state, &key, &info).await
+    }
 }
