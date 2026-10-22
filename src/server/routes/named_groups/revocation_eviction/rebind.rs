@@ -1561,17 +1561,34 @@ pub(in crate::server) async fn receive(
         return ReceiveOutcome::Behind;
     }
     let now_unix = now_unix_ms() / 1000;
+    // Set when the frame is a valid rebind on a sibling branch.
+    let mut sibling = false;
     let validated = {
         // Read the revocation set under the membership lock, immediately
         // before the apply (§3 L231).
         let revocation_set = state.agent.revocation_set();
         let set = revocation_set.read().await;
+        let is_revoked = |id: &[u8; 32]| set.is_agent_revoked(&AgentId(*id));
         if set.is_agent_revoked(&sender) {
             Err(cr::CertificateRebindRefusal::SignerIneligible)
         } else {
-            cr::validate_against_parent(&body, &info, now_unix, |id| {
-                set.is_agent_revoked(&AgentId(*id))
-            })
+            match cr::validate_against_parent(&body, &info, now_unix, is_revoked) {
+                // #1508 Codex P1 A: a frame that does not chain from this
+                // node's head is checked against its retained parent
+                // before it can be fork evidence. A frame that fails
+                // there is refused with that reason and records nothing;
+                // a frame whose parent is not retained stays unvalidated.
+                Err(cr::CertificateRebindRefusal::HeadMismatch) => {
+                    match cr::validate_sibling(&body, &info, now_unix, is_revoked) {
+                        Ok(_) => {
+                            sibling = true;
+                            Err(cr::CertificateRebindRefusal::HeadMismatch)
+                        }
+                        Err(refused) => Err(refused),
+                    }
+                }
+                other => other,
+            }
         }
     };
     let commit = body.commit.to_commit();
@@ -1580,20 +1597,23 @@ pub(in crate::server) async fn receive(
         Err(refused) => {
             match refused {
                 cr::CertificateRebindRefusal::HeadMismatch => {
-                    // A competing child of our head: the shared apply hook
-                    // records the fork evidence it records for any commit.
-                    let _ = ng::apply_stateful_event_with_evidence(
-                        state,
-                        &group_key,
-                        &info,
-                        &commit,
-                        None,
-                        false,
-                        None,
-                        x0x::groups::ActionKind::MemberSelf,
-                        |_| {},
-                    )
-                    .await;
+                    if sibling {
+                        // A valid competing child of a retained parent:
+                        // the shared apply hook records the fork evidence
+                        // it records for any commit.
+                        let _ = ng::apply_stateful_event_with_evidence(
+                            state,
+                            &group_key,
+                            &info,
+                            &commit,
+                            None,
+                            false,
+                            None,
+                            x0x::groups::ActionKind::MemberSelf,
+                            |_| {},
+                        )
+                        .await;
+                    }
                     // §4a "Effect on S4 rows": a rebind that arrives after
                     // the seat's removal is refused with
                     // `rebind_seat_not_active`; the fork evidence above
