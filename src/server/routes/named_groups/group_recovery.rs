@@ -4932,7 +4932,7 @@ async fn lift_staging_marker(state: &AppState, stable: &str, journal: &ReseatJou
     let stable = stable.to_string();
     // The write runs also when no record holds a marker: it is the swap's
     // durable legacy write of the staged record.
-    let outcome = super::persist_named_groups_mutation_durable_only(state, move |groups| {
+    let outcome = super::persist_named_groups_quarantine_clear_durable_only(state, move |groups| {
         for info in groups
             .values_mut()
             .filter(|info| info.stable_group_id() == stable)

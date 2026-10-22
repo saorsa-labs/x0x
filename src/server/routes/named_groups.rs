@@ -6334,7 +6334,8 @@ where
 /// contained, and memory is saved again so that the visible file holds the
 /// marker too. The caller retries later. The manual clear routes keep the
 /// #759 rule (publish on `ReplacedNotDurable`), so they use the other
-/// entry point.
+/// entry point. The S3 marker retirement and the re-seat swap (which
+/// lifts the staged record's marker) both use this one gate.
 pub(in crate::server) async fn persist_named_groups_quarantine_clear_durable_only<F>(
     state: &AppState,
     mutate: F,
@@ -6344,6 +6345,19 @@ where
 {
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let gss_publication_guard = state.gss_publication_gate.write().await;
+    // An earlier `ReplacedNotDurable` left the visible file unconfirmed:
+    // save memory durably first, or change nothing.
+    if state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
+    {
+        match save_named_groups_checked_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) => state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release),
+            outcome => return outcome,
+        }
+    }
     persist_named_groups_quarantine_clear_gated_unlocked(
         state,
         &gss_publication_guard,
@@ -6361,86 +6375,6 @@ where
 enum PublishNotDurable {
     Yes,
     No,
-}
-
-/// ADR 0109 §3 step 3 (#1533 review): a roster write that changes the live
-/// map only when it is `Durable`. The mutation runs on a private candidate.
-/// The live map takes the candidate's changed records only after a durable
-/// write, and only if none of them changed meanwhile. A `ReplacedNotDurable`
-/// write keeps memory as it was and arms the durability confirmation, so
-/// the next write saves memory again before anything else. The re-seat
-/// swap uses it to lift the staged record's marker.
-pub(in crate::server) async fn persist_named_groups_mutation_durable_only<F>(
-    state: &AppState,
-    mutate: F,
-) -> std::io::Result<AtomicWriteOutcome>
-where
-    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
-{
-    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    let _gss_publication_guard = state.gss_publication_gate.write().await;
-    if state
-        .named_groups_requires_durability_confirmation
-        .load(Ordering::Acquire)
-    {
-        match save_named_groups_checked_unlocked(state).await {
-            Ok(AtomicWriteOutcome::Durable) => state
-                .named_groups_requires_durability_confirmation
-                .store(false, Ordering::Release),
-            outcome => return outcome,
-        }
-    }
-    let before = state.named_groups.read().await.clone();
-    let mut candidate = before.clone();
-    if !mutate(&mut candidate) {
-        return Ok(AtomicWriteOutcome::NotReplaced);
-    }
-    state.group_recovery.hold_reseat_markers(&mut candidate);
-    enforce_containment_invariant(&mut candidate, &before);
-    let (legacy_json, home_suite_json) =
-        encode_named_groups_store_excluding_pending_stubs(state, &candidate, None).await?;
-    let outcome = save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await;
-    match &outcome {
-        Ok(AtomicWriteOutcome::Durable) => {
-            let mut groups = state.named_groups.write().await;
-            let mut touched: Vec<&String> = before
-                .keys()
-                .chain(candidate.keys())
-                .filter(|key| before.get(*key) != candidate.get(*key))
-                .collect();
-            touched.sort_unstable();
-            touched.dedup();
-            if touched
-                .iter()
-                .any(|key| groups.get(*key) != before.get(*key))
-            {
-                // A record changed meanwhile: keep memory, and save it again
-                // before the next write.
-                drop(groups);
-                state
-                    .named_groups_requires_durability_confirmation
-                    .store(true, Ordering::Release);
-                return Err(std::io::Error::other(
-                    "named-group record changed during a durable-only write",
-                ));
-            }
-            for key in touched {
-                match candidate.get(key) {
-                    Some(record) => {
-                        groups.insert(key.clone(), record.clone());
-                    }
-                    None => {
-                        groups.remove(key);
-                    }
-                }
-            }
-        }
-        Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
-            .named_groups_requires_durability_confirmation
-            .store(true, Ordering::Release),
-        _ => {}
-    }
-    outcome
 }
 
 /// Caller holds P and G. Record replacements retain the existing TreeKEM
