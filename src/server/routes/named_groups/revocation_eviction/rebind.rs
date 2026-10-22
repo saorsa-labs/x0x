@@ -2750,4 +2750,59 @@ pub(super) mod restart_tests {
         receiver.agent.shutdown().await;
         Ok(())
     }
+
+    /// #1508 Codex P1 B (ADR 0110 §4a run (10), §2 fork containment): the
+    /// creator seals the seat's expiry removal; the seat's delayed valid
+    /// self-rebind on the same parent then arrives. The creator's record
+    /// has no invite lineage, and it is still contained: the fork evidence
+    /// is durable across a restart, and the rebind is refused with
+    /// `rebind_seat_not_active`.
+    #[tokio::test]
+    async fn a_valid_rebind_sibling_contains_the_creator() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let creator = offline_daemon(dir.path(), None).await?;
+        let owner = UserKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        let survivor = AgentKeypair::generate()?;
+        let me = creator.agent.identity().agent_keypair();
+        let base = certified_group(&owner, me, &[&member, &survivor])?;
+        let (parent, head) = removal_race(&owner, &base, me, &member)?;
+        assert!(head.invite_lineage.is_none(), "the creator has no lineage");
+        let stable = head.stable_group_id().to_string();
+        hold_persisted(&creator, &head).await?;
+
+        let (valid, sibling_head) = sibling_frame(&parent, &owner, &member, &member)?;
+        let outcome = receive(&creator, member.agent_id(), &valid).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(cr::CertificateRebindRefusal::SeatNotActive)
+        );
+        let marker = quarantine_of(&creator, &stable)
+            .await
+            .context("the creator is contained")?;
+        assert_eq!(marker.state_hash, sibling_head);
+        assert_eq!(marker.revision, head.state_revision);
+        assert_eq!(
+            marker.snapshot.classification.as_deref(),
+            Some(ng::FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY)
+        );
+        assert_eq!(
+            head_of(&creator, &stable).await.as_ref(),
+            Some(&head.state_hash),
+            "no node applies both siblings"
+        );
+
+        creator.agent.shutdown().await;
+        drop(creator);
+        let restarted = offline_daemon(dir.path(), None).await?;
+        assert_eq!(
+            quarantine_of(&restarted, &stable)
+                .await
+                .map(|marker| marker.state_hash),
+            Some(sibling_head),
+            "the containment survives a restart"
+        );
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
 }
