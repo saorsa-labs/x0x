@@ -268,27 +268,28 @@ fn set_names(profile: &mut SelfProfile, names: SyncProfileNames) -> bool {
 /// `profile`, which the caller holds under the profile write lock. Every
 /// writer of the profile calls this before its own change and then saves,
 /// so a local edit always comes after the synced names committed before
-/// it. Returns whether `profile` changed and the records read; the caller
+/// it. Returns whether `profile` changed and the records read, each with
+/// whether it was applied (it was the register's winner); the caller
 /// saves them with `save_profile`. `None` when the daemon has no owner
 /// sync.
 pub(in crate::server) async fn fold_owed_names(
     state: &AppState,
     profile: &mut SelfProfile,
-) -> Option<(bool, Vec<VersionedRecord>)> {
+) -> Option<(bool, Vec<(VersionedRecord, bool)>)> {
     let sync = state.owner_sync.as_ref()?;
     let local = state.agent.machine_id();
     let mut changed = false;
     let mut folded = Vec::new();
     for (record, winner) in sync.store().pending_applies().await {
-        // A record that is not the register's winner is discharged
-        // without an apply: a later commit replaced it, or its own commit
-        // did not complete.
+        // A record that is not the register's winner is not applied: a
+        // later commit replaced it, or its own commit did not complete.
+        // The discharge retires it only if it is still not the winner.
         if winner {
             if let Some(names) = local_names_of(&record, &local) {
                 changed |= set_names(profile, names);
             }
         }
-        folded.push(record);
+        folded.push((record, winner));
     }
     Some((changed, folded))
 }
@@ -316,7 +317,7 @@ fn names_of(profile: &SelfProfile) -> SyncProfileNames {
 pub(in crate::server) async fn save_profile(
     state: &AppState,
     profile: &SelfProfile,
-    folded: Option<Vec<VersionedRecord>>,
+    folded: Option<Vec<(VersionedRecord, bool)>>,
 ) -> std::io::Result<()> {
     let owed = state.owner_sync.as_ref().zip(folded.as_deref());
     if let Some((sync, folded)) = owed {
@@ -350,6 +351,25 @@ impl PersistedNames for DaemonView {
                 persisted &= *task.borrow();
             }
             persisted
+        })
+    }
+
+    fn live_names(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SyncProfileNames> + Send>> {
+        let state = self.state.upgrade();
+        let mirror = self
+            .names
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Box::pin(async move {
+            // A daemon that is gone has no live profile; its mirror is the
+            // last one seen, as in `profile_names`.
+            match state {
+                Some(state) => names_of(&*state.profile.read().await),
+                None => mirror,
+            }
         })
     }
 }

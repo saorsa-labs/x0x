@@ -889,7 +889,28 @@ pub struct OwnerSyncStore {
     /// one: until the new record's commit is durable, the older one can
     /// still be the register's winner. Lock order: `records` →
     /// `pending_apply`.
+    ///
+    /// Every change of the obligations and every live-name mint is
+    /// checked against the register under `records`, with this lock
+    /// inside it:
+    /// - a commit adds its names under the `records` write lock, before
+    ///   its register write (`add_pending_applies`);
+    /// - a retirement (`discharge_applies`, `settle_saved`) holds the
+    ///   `records` read lock, so no commit can change a winner between
+    ///   its check and its removal;
+    /// - a live-name mint (`mint_live_name`) holds the `records` write
+    ///   lock, and mints only when no winner is owed and `names_epoch` is
+    ///   the one read before the live names were read.
     pending_apply: tokio::sync::Mutex<BTreeMap<PendingKey, PendingApply>>,
+    /// #1545: the generation of `pending_apply`. It changes, while
+    /// `pending_apply` is held, at each commit that adds names and at
+    /// each retirement. A retirement means that the live profile now
+    /// holds a committed name (or that the name is no longer owed), so
+    /// live names read before it can be older than the register. The
+    /// reconcile reads it before it reads the live names
+    /// ([`Self::names_epoch`]), and its mint compares it
+    /// (`mint_live_name`).
+    names_epoch: std::sync::atomic::AtomicU64,
     /// Test injection: hold a synced journal append after its decision
     /// read until the test releases it.
     #[cfg(test)]
@@ -1095,6 +1116,7 @@ impl OwnerSyncStore {
                     .map(|p| (pending_key(&p.record), p))
                     .collect(),
             ),
+            names_epoch: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             journal_check_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1956,16 +1978,49 @@ impl OwnerSyncStore {
         let mut pending = self.pending_apply.lock().await;
         let mut next = pending.clone();
         for record in names {
-            next.entry(pending_key(record))
+            let entry = next
+                .entry(pending_key(record))
                 .or_insert_with(|| PendingApply {
                     record: (*record).clone(),
                     saved_in: Vec::new(),
                     discharged: false,
                 });
+            // A record retired as not the winner (its earlier commit did
+            // not complete), whose removal did not reach the file yet, is
+            // owed again now that a commit accepts it.
+            if entry.discharged {
+                entry.discharged = false;
+                entry.saved_in.clear();
+            }
         }
         self.persist_and_prune(&mut next).await?;
         *pending = next;
+        self.bump_names_epoch();
         Ok(())
+    }
+
+    /// Change `names_epoch`. The caller holds `pending_apply`.
+    fn bump_names_epoch(&self) {
+        self.names_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// #1545: the generation of the pending applies (`names_epoch`). The
+    /// reconcile reads it after its apply step and before it reads the
+    /// live names, and passes it to [`Self::mint_live_name`].
+    pub(crate) async fn names_epoch(&self) -> u64 {
+        let _pending = self.pending_apply.lock().await;
+        self.names_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether `record` is the winner in `records`.
+    fn is_winner(
+        records: &BTreeMap<(SyncKind, String), VersionedRecord>,
+        record: &VersionedRecord,
+    ) -> bool {
+        records
+            .get(&(record.kind, record.key.clone()))
+            .is_some_and(|stored| stored.record_hash() == record.record_hash())
     }
 
     /// Write the owed records of `pending` durably to `APPLY_PENDING_FILE`,
@@ -2031,26 +2086,16 @@ impl OwnerSyncStore {
             .collect()
     }
 
-    /// Whether a pending apply is still the winner in `records`, which the
-    /// caller holds (lock order: `records` → `pending_apply`).
-    async fn owes_a_winner(&self, records: &BTreeMap<(SyncKind, String), VersionedRecord>) -> bool {
-        self.pending_apply
-            .lock()
-            .await
-            .values()
-            .filter(|p| !p.discharged)
-            .any(|p| {
-                records
-                    .get(&(p.record.kind, p.record.key.clone()))
-                    .is_some_and(|stored| stored.record_hash() == p.record.record_hash())
-            })
-    }
-
     /// #1545: record that a profile save with `names` starts with
-    /// `folded` in it. The caller holds the profile write lock, and saves
-    /// only after this returns `Ok`: then a durable profile with `names`
-    /// shows that `folded` is not owed any more, even when the discharge
-    /// after the save does not reach the disk (`settle_saved`).
+    /// `folded` in it. Each entry of `folded` is a record of
+    /// [`Self::pending_applies`] with its winner flag at the fold; only a
+    /// winner was applied to the profile, so only a winner is noted. The
+    /// caller holds the profile write lock, and saves only after this
+    /// returns `Ok`: then a durable profile with `names` shows that the
+    /// applied records are not owed any more, even when the discharge
+    /// after the save does not reach the disk (`settle_saved`). A record
+    /// that was not the winner is not in the profile; a retried commit
+    /// can make it the winner later, so no save may settle it.
     ///
     /// It also writes the file when a record is discharged but its removal
     /// from the file failed: else the file keeps the record with the names
@@ -2063,14 +2108,14 @@ impl OwnerSyncStore {
     /// not save the profile.
     pub(crate) async fn note_profile_save(
         &self,
-        folded: &[VersionedRecord],
+        folded: &[(VersionedRecord, bool)],
         names: &SyncProfileNames,
     ) -> Result<(), SyncError> {
         let saved = SavedNames::from(names);
         let mut pending = self.pending_apply.lock().await;
         let mut next = pending.clone();
         let mut changed = next.values().any(|p| p.discharged);
-        for record in folded {
+        for (record, _) in folded.iter().filter(|(_, applied)| *applied) {
             if let Some(entry) = next.get_mut(&pending_key(record)) {
                 if !entry.discharged && !entry.saved_in.contains(&saved) {
                     entry.saved_in.push(saved.clone());
@@ -2087,8 +2132,16 @@ impl OwnerSyncStore {
     }
 
     /// #1545: remove `done` from the pending applies, after the daemon has
-    /// durably saved the winners among them. A record that a commit added
-    /// after `done` was read stays.
+    /// durably saved the winners among them. Each entry of `done` is a
+    /// record of [`Self::pending_applies`] with its winner flag at the
+    /// read; `true` means the caller applied it. A record that a commit
+    /// added after `done` was read stays.
+    ///
+    /// The check is made again here, under the `records` read lock: a
+    /// record that was not the winner at the read, and so was not
+    /// applied, is retired only if it is still not the winner. A retried
+    /// commit can have made it the winner since; it then stays owed, and
+    /// the next pass applies it.
     ///
     /// When the file write fails, the records stay in memory as
     /// discharged (`PendingApply::discharged`): no later pass applies them
@@ -2102,15 +2155,26 @@ impl OwnerSyncStore {
     /// [`SyncError::Io`] when the file cannot be written.
     pub(crate) async fn discharge_applies(
         &self,
-        done: &[VersionedRecord],
+        done: &[(VersionedRecord, bool)],
     ) -> Result<(), SyncError> {
         #[cfg(test)]
         Self::take_pause(&self.discharge_pause).await;
+        let records = self.records.read().await;
         let mut pending = self.pending_apply.lock().await;
-        for record in done {
-            if let Some(entry) = pending.get_mut(&pending_key(record)) {
-                entry.discharged = true;
+        let mut retired = false;
+        for (record, applied) in done {
+            if !applied && Self::is_winner(&records, record) {
+                continue;
             }
+            if let Some(entry) = pending.get_mut(&pending_key(record)) {
+                if !entry.discharged {
+                    entry.discharged = true;
+                    retired = true;
+                }
+            }
+        }
+        if retired {
+            self.bump_names_epoch();
         }
         if !pending.values().any(|p| p.discharged) {
             return Ok(());
@@ -2137,6 +2201,7 @@ impl OwnerSyncStore {
     /// stay in memory as discharged, as in `discharge_applies`.
     pub(crate) async fn settle_saved(&self, durable: &SyncProfileNames) -> Result<(), SyncError> {
         let saved = SavedNames::from(durable);
+        let _records = self.records.read().await;
         let mut pending = self.pending_apply.lock().await;
         let mut settled = false;
         for entry in pending.values_mut() {
@@ -2148,6 +2213,7 @@ impl OwnerSyncStore {
         if !settled {
             return Ok(());
         }
+        self.bump_names_epoch();
         self.persist_and_prune(&mut pending).await
     }
 
@@ -2264,19 +2330,21 @@ impl OwnerSyncStore {
         owner: &UserKeypair,
         writer_machine: MachineId,
     ) -> Result<(), SyncError> {
-        self.mint_when(kind, key, desired, owner, writer_machine, false)
+        self.mint_when(kind, key, desired, owner, writer_machine, None)
             .await
     }
 
-    /// #1545: [`Self::mint`] for a name read from live daemon state, unless
-    /// a committed name that is still the register's winner is owed to
-    /// that state (`pending_applies`). The check and the mint hold the
-    /// register write lock together. A commit adds its names to the
-    /// pending applies under the same lock, before its register write, so
-    /// a commit after the names were read cannot land between the check
-    /// and the mint: the mint would put the old live name over it at a
-    /// higher version, and the catch-up would then skip it as no longer
-    /// the winner.
+    /// #1545: [`Self::mint`] for a name read from live daemon state.
+    /// `epoch` is [`Self::names_epoch`], read before the live names. The
+    /// mint is skipped when a committed name that is still the register's
+    /// winner is owed to that state (`pending_applies`), or when the
+    /// pending applies changed since `epoch`: a commit or a retirement
+    /// after the read can mean that the names read are older than the
+    /// register, and the mint would put them over a synced name at a
+    /// higher version. The check and the mint hold the register write
+    /// lock together, and every change of the pending applies holds the
+    /// same lock (see `pending_apply`). A mint skipped for a changed
+    /// epoch kicks the next pass, which reads the names again.
     ///
     /// # Errors
     ///
@@ -2288,12 +2356,13 @@ impl OwnerSyncStore {
         desired: &SyncValue,
         owner: &UserKeypair,
         writer_machine: MachineId,
+        epoch: u64,
     ) -> Result<(), SyncError> {
-        self.mint_when(kind, key, desired, owner, writer_machine, true)
+        self.mint_when(kind, key, desired, owner, writer_machine, Some(epoch))
             .await
     }
 
-    /// [`Self::mint`]; with `unless_owed`, see [`Self::mint_live_name`].
+    /// [`Self::mint`]; with `live_epoch`, see [`Self::mint_live_name`].
     async fn mint_when(
         &self,
         kind: SyncKind,
@@ -2301,7 +2370,7 @@ impl OwnerSyncStore {
         desired: &SyncValue,
         owner: &UserKeypair,
         writer_machine: MachineId,
-        unless_owed: bool,
+        live_epoch: Option<u64>,
     ) -> Result<(), SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
@@ -2324,12 +2393,26 @@ impl OwnerSyncStore {
             None
         };
         let mut records = self.records.write().await;
-        if unless_owed && self.owes_a_winner(&records).await {
-            return Ok(());
-        }
         let stored = records.get(&(kind, key.to_string()));
         if stored.is_some_and(|r| r.value == *desired) {
             return Ok(());
+        }
+        if let Some(epoch) = live_epoch {
+            let pending = self.pending_apply.lock().await;
+            let owed = pending
+                .values()
+                .filter(|p| !p.discharged)
+                .any(|p| Self::is_winner(&records, &p.record));
+            if owed {
+                // The next pass applies the owed names first.
+                return Ok(());
+            }
+            if self.names_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+                drop(pending);
+                drop(records);
+                self.kick();
+                return Ok(());
+            }
         }
         let version = stored.map_or(1, |r| r.clock.version.saturating_add(1));
         let clock = RecordClock {
@@ -3051,6 +3134,13 @@ pub(crate) trait PersistedNames: Send + Sync + 'static {
     /// when each one saved its names; `false` when a save failed or did
     /// not run (shutdown).
     fn names_persisted(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+    /// The names of the live profile, read under its lock (waiting for
+    /// a writer), never a cached copy: a copy can be older than a
+    /// retirement of a pending apply (`OwnerSyncStore::names_epoch`).
+    fn live_names(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SyncProfileNames> + Send>>;
 }
 
 /// Current daemon self-profile names, best-effort snapshot.
@@ -3379,6 +3469,15 @@ impl OwnerSyncService {
     /// On-change trigger: wake the periodic pass early.
     pub fn kick(&self) {
         self.store.kick();
+    }
+
+    /// The save confirmation of the daemon view, when installed with
+    /// [`Self::attach_daemon_view`].
+    fn persisted_names(&self) -> Option<Arc<dyn PersistedNames>> {
+        self.persisted_names
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn view(&self) -> Option<Arc<dyn SyncDaemonView>> {
@@ -3763,10 +3862,16 @@ impl OwnerSyncService {
         if let Some(view) = self.view() {
             // The live profile shows every committed name only when they
             // are applied; until then, its names are not local changes. A
-            // session can commit names after `apply_pending`, so each mint
-            // checks for owed names in one step with its register write
-            // (`mint_live_name`).
-            let names = view.profile_names();
+            // session can commit names, and a profile save can retire
+            // them, after `apply_pending`. So the epoch of the pending
+            // applies is read before the names, and each mint checks, in
+            // one step with its register write, that no name is owed and
+            // that the epoch did not change (`mint_live_name`).
+            let epoch = self.store.names_epoch().await;
+            let names = match self.persisted_names() {
+                Some(persisted) => persisted.live_names().await,
+                None => view.profile_names(),
+            };
             #[cfg(test)]
             self.store.pause_before_name_mint().await;
             if names_applied {
@@ -3778,6 +3883,7 @@ impl OwnerSyncService {
                     },
                     owner_kp,
                     local_machine,
+                    epoch,
                 )
                 .await;
                 self.mint_live_name_or_log(
@@ -3789,6 +3895,7 @@ impl OwnerSyncService {
                     },
                     owner_kp,
                     local_machine,
+                    epoch,
                 )
                 .await;
             }
@@ -3822,19 +3929,15 @@ impl OwnerSyncService {
                 self.apply_record(record);
             }
         }
-        let persisted = self
-            .persisted_names
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(persisted) = persisted {
+        if let Some(persisted) = self.persisted_names() {
             if !persisted.names_persisted().await {
                 tracing::warn!(target: "x0x::owner_sync", "synced names not saved yet; retry next pass");
                 return false;
             }
         }
-        let done: Vec<VersionedRecord> = pending.into_iter().map(|(r, _)| r).collect();
-        if let Err(e) = self.store.discharge_applies(&done).await {
+        // The winners were applied; the store retires a non-winner only if
+        // it is still not the winner (`discharge_applies`).
+        if let Err(e) = self.store.discharge_applies(&pending).await {
             tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
         }
         true
@@ -3912,10 +4015,11 @@ impl OwnerSyncService {
         value: SyncValue,
         owner_kp: &UserKeypair,
         machine: MachineId,
+        epoch: u64,
     ) {
         if let Err(e) = self
             .store
-            .mint_live_name(kind, key, &value, owner_kp, machine)
+            .mint_live_name(kind, key, &value, owner_kp, machine, epoch)
             .await
         {
             tracing::warn!(target: "x0x::owner_sync", kind = ?kind, error = %e, "mint failed");
