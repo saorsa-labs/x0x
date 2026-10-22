@@ -5677,21 +5677,38 @@ mod issuance_journal_sync_tests {
         assert_eq!(receiver.get("bb"), Some(sent));
     }
 
-    /// Codex review of #1545 (69fe33e): `issued_at` has second precision,
-    /// so a renewal can share its predecessor's second. Repairing the older
-    /// digest must not append a line after it.
+    /// Codex review of #1545 (42d32a0): `issued_at` has second precision,
+    /// so a renewal can share its predecessor's second. A device that holds
+    /// only `d1@100` must take the synced renewal `d2@100`. If it refuses,
+    /// it mints `d1` again over the register and the issuing device mints
+    /// `d2` again, without end.
     #[test]
-    fn a_same_second_renewal_blocks_the_repair_of_the_older_digest() {
-        let existing = vec![line("d1", 100, None), line("d2", 100, Some(9_000))];
-        assert!(!synced_line_needed(
+    fn a_same_second_renewal_replaces_the_current_certificate() {
+        assert!(synced_line_needed(
+            &[line("d1", 100, Some(5_000))],
+            OWNER,
+            "bb",
+            "d2",
+            100,
+            Some(9_000)
+        ));
+    }
+
+    /// Codex review of #1545 (42d32a0): the expiry repair of the CURRENT
+    /// certificate runs, also when an earlier certificate has the same
+    /// second.
+    #[test]
+    fn the_current_certificate_is_repaired_beside_a_same_second_predecessor() {
+        let existing = vec![line("d1", 100, Some(5_000)), line("d2", 100, None)];
+        assert!(synced_line_needed(
             &existing,
             OWNER,
             "bb",
-            "d1",
+            "d2",
             100,
-            Some(5_000)
+            Some(9_000)
         ));
-        // The repair still runs when the older digest is the newest line.
+        // The repair still runs when the digest is the only line.
         assert!(synced_line_needed(
             &[line("d1", 100, None)],
             OWNER,
@@ -5700,6 +5717,152 @@ mod issuance_journal_sync_tests {
             100,
             Some(5_000)
         ));
+    }
+
+    /// Rollback protection: a synced line for a certificate issued in an
+    /// EARLIER second than the current one is never appended.
+    #[test]
+    fn an_earlier_second_never_replaces_the_current_certificate() {
+        let existing = vec![line("d1", 100, None), line("d2", 200, Some(9_000))];
+        assert!(!synced_line_needed(
+            &existing,
+            OWNER,
+            "bb",
+            "d1",
+            100,
+            Some(5_000)
+        ));
+    }
+
+    /// Codex review of #1545 (42d32a0): two owner devices converge after a
+    /// same-second renewal. Device A issued `d1@100` and then `d2@100`;
+    /// device B holds only `d1@100`. Each pass runs the real reconcile
+    /// (`latest_journal_values` → `OwnerSyncStore::mint`), the real record
+    /// merge and, for an accepted record, the real journal append. The
+    /// register must stop changing, and both devices must hold `d2`.
+    #[tokio::test]
+    async fn two_devices_converge_after_a_same_second_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        struct Device {
+            journal: PathBuf,
+            store: OwnerSyncStore,
+            machine: MachineId,
+        }
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_id = owner.user_id();
+        let owner_hex = hex::encode(owner_id.0);
+        let agent = "bb".to_string();
+        let mut devices = Vec::new();
+        for (name, id) in [("a", 1), ("b", 2)] {
+            let data = dir.path().join(name);
+            devices.push(Device {
+                journal: data.join(crate::profile::CERT_JOURNAL_FILE),
+                store: OwnerSyncStore::load(&data).await.expect("store"),
+                machine: machine(id),
+            });
+        }
+        let issued = |digest: &str, not_after| crate::profile::IssuedCertRecord {
+            user_id: owner_hex.clone(),
+            agent_id: agent.clone(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(not_after),
+            mode: crate::profile::CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        };
+        async fn reconcile(device: &Device, owner: &UserKeypair, owner_hex: &str) {
+            let lines = crate::profile::IssuedCertRecord::load(&device.journal).await;
+            for (key, value) in latest_journal_values(lines, owner_hex) {
+                device
+                    .store
+                    .mint(
+                        SyncKind::IssuanceJournal,
+                        &key,
+                        &value,
+                        owner,
+                        device.machine,
+                    )
+                    .await
+                    .expect("mint");
+            }
+        }
+        async fn deliver(from: &Device, to: &Device, owner_id: &UserId, owner_hex: &str) {
+            for record in from.store.records_snapshot().await {
+                let outcome = to
+                    .store
+                    .merge_record(record.clone(), owner_id)
+                    .await
+                    .expect("merge");
+                if outcome != MergeOutcome::Accepted {
+                    continue;
+                }
+                if let SyncValue::IssuanceJournal {
+                    agent_id,
+                    cert_digest,
+                    issued_at,
+                    not_after,
+                } = record.value
+                {
+                    append_synced_journal_line(
+                        to.journal.clone(),
+                        owner_hex.to_string(),
+                        agent_id,
+                        cert_digest,
+                        issued_at,
+                        not_after,
+                    )
+                    .await;
+                }
+            }
+        }
+        let (a, b) = (&devices[0], &devices[1]);
+
+        // A issues d1; it syncs to B. Then A renews to d2 in the same second.
+        crate::profile::IssuedCertRecord::append(&a.journal, &issued("d1", 5_000))
+            .await
+            .expect("append d1");
+        reconcile(a, &owner, &owner_hex).await;
+        deliver(a, b, &owner_id, &owner_hex).await;
+        crate::profile::IssuedCertRecord::append(&a.journal, &issued("d2", 9_000))
+            .await
+            .expect("append d2");
+
+        let mut stable_passes = 0;
+        for _ in 0..8 {
+            let before = (
+                a.store.records_snapshot().await,
+                b.store.records_snapshot().await,
+            );
+            reconcile(a, &owner, &owner_hex).await;
+            reconcile(b, &owner, &owner_hex).await;
+            deliver(a, b, &owner_id, &owner_hex).await;
+            deliver(b, a, &owner_id, &owner_hex).await;
+            let after = (
+                a.store.records_snapshot().await,
+                b.store.records_snapshot().await,
+            );
+            stable_passes = if before == after {
+                stable_passes + 1
+            } else {
+                0
+            };
+            if stable_passes == 2 {
+                break;
+            }
+        }
+        assert_eq!(stable_passes, 2, "the register never stopped changing");
+        for (device, who) in [(a, "a"), (b, "b")] {
+            let value = device
+                .store
+                .stored_value(SyncKind::IssuanceJournal, &agent)
+                .await
+                .expect("register value");
+            assert_eq!(fields(&value).1, "d2", "device {who} must hold the renewal");
+        }
     }
 
     /// A pre-fix synced line (same digest, no `not_after`) never hides a
