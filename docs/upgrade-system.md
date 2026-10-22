@@ -700,6 +700,30 @@ caveats from #448/#450 still recommend short mixed-fleet windows.
 
 `release.yml` generates `release-manifest.json` and `release-manifest.json.sig` via `x0x-keygen manifest` during the release signing job.
 
+### Signed manifest eligibility (M2 S1a, #1369)
+
+Schema 1 requires a signed `channel` (`stable` or `prerelease`). Verification
+uses the original JSON bytes. Missing, empty, unknown or mismatched channels
+are refused. A stable channel requires a version without a prerelease suffix;
+a prerelease channel requires that suffix. The prerelease ban remains in force
+(D186): neither `include_prereleases` nor an HTTP request can lift it.
+
+Every ingestion and forwarding path uses the same eligibility rules. The
+manifest timestamp must be present and nonzero, no more than 30 days old, and
+no more than five minutes in the future. Excess future skew returns the typed
+`ManifestTimestampInFuture` cause (D182). Recheck eligibility before apply or
+forwarding after a wait. The manifest generator signs `channel: "stable"` and
+refuses prerelease versions.
+
+The compatibility fixture is **test-key-signed**. Its old-format verifier is
+built from released code with a test key as its trusted key. The production-key
+path uses the same parse, signature-verify and eligibility functions; only the
+trusted key differs. This control does not claim acceptance by an unchanged
+production-key executable. David approved the test-key fixture on 22 Oct 2026
+18:31 BST. The transition in ADR 0094 lines 345–348 remains a release-time
+action for David/ops: publish a channel-bearing stable manifest before new
+daemons enforce this requirement. This change does not publish a manifest.
+
 ### Contributor fixtures (ADR 0094)
 
 `upgrade-test-signing` is a test-only feature, off by default. It replaces the
@@ -725,7 +749,8 @@ Both `x0xd` and `x0x` support the inert contributor check
 `--verify-release-manifest MANIFEST SIGNATURE`. It reads the two files and
 verifies their original bytes with the compiled key, before runtime, identity,
 configuration, logging or network initialization. Success exits 0; rejection
-exits nonzero. It neither installs an update nor selects a different key.
+exits nonzero. This signature-only diagnostic does not establish manifest
+eligibility. It neither installs an update nor selects a different key.
 
 Systemd acceptance fixtures require a private loopback-only network namespace,
 non-root identity, empty capability sets and `no_new_privs`. Each child and

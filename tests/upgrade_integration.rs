@@ -35,6 +35,7 @@ fn make_manifest(version: &str) -> ReleaseManifest {
     ReleaseManifest {
         schema_version: SCHEMA_VERSION,
         version: version.to_string(),
+        channel: "stable".into(),
         timestamp: 1700000000,
         assets: vec![
             PlatformAsset {
@@ -348,14 +349,11 @@ fn validate_manifest_timestamp_accepts_fresh() {
 }
 
 #[test]
-fn validate_manifest_timestamp_accepts_zero_legacy() {
+fn validate_manifest_timestamp_rejects_zero_legacy() {
     use x0x::upgrade::monitor::validate_manifest_timestamp;
-    // Legacy manifests with timestamp == 0 must be allowed through for
-    // backward compatibility; otherwise old releases would fail the age
-    // check the moment a new node with the guard joined.
     let mut m = make_manifest("1.0.0");
     m.timestamp = 0;
-    assert!(validate_manifest_timestamp(&m).is_ok());
+    assert!(validate_manifest_timestamp(&m).is_err());
 }
 
 #[test]

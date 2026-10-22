@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! M2 S1a manifest regressions. These cases are inert: JSON decoding and
-//! timestamp validation only, with no daemon, filesystem or network activity.
+//! signature and eligibility validation only, with no daemon or network activity.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,4 +76,83 @@ fn stale_manifest_remains_refused() {
         validate_manifest_timestamp(&manifest(stale)).is_err(),
         "the existing thirty-day replay limit remains in force"
     );
+}
+
+#[test]
+fn required_manifest_fields_and_channel_rules_fail_closed() {
+    let valid = serde_json::to_value(manifest(now_seconds())).unwrap();
+    for field in ["channel", "timestamp"] {
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<ReleaseManifest>(missing).is_err());
+        for bad in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut malformed = valid.clone();
+            malformed[field] = bad;
+            assert!(serde_json::from_value::<ReleaseManifest>(malformed).is_err());
+        }
+    }
+    let mut zero_channel = valid.clone();
+    zero_channel["channel"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<ReleaseManifest>(zero_channel).is_err());
+    for (channel, version) in [
+        ("", "0.48.2"),
+        ("unknown", "0.48.2"),
+        ("Stable", "0.48.2"),
+        ("stable", "0.48.2-rc.1"),
+        ("prerelease", "0.48.2"),
+        ("prerelease", "0.48.2-rc.1"),
+    ] {
+        let mut candidate = valid.clone();
+        candidate["channel"] = channel.into();
+        candidate["version"] = version.into();
+        let candidate = serde_json::from_value(candidate).unwrap();
+        assert!(
+            validate_manifest_timestamp(&candidate).is_err(),
+            "ineligible channel/version pair {channel:?}/{version}"
+        );
+    }
+}
+
+#[test]
+fn test_key_signed_channel_is_accepted_by_pre_channel_schema() {
+    use x0x::upgrade::manifest::PlatformAsset;
+    use x0x::upgrade::signature::{sign_with_context, verify_bytes_signature_with_key};
+
+    // Frozen pre-channel wire fields from released v0.48.1, commit
+    // 8c4ef1744b05e122e49ef5541e2c432a9d9003ee. Unknown fields are ignored.
+    #[derive(serde::Deserialize)]
+    struct PreChannelManifest {
+        schema_version: u32,
+        version: String,
+        timestamp: u64,
+        assets: Vec<PlatformAsset>,
+        skill_url: String,
+        skill_sha256: String,
+    }
+    let current = manifest(now_seconds());
+    let original_bytes = serde_json::to_vec_pretty(&current).unwrap();
+    let (test_public, test_secret) = saorsa_pqc::api::sig::ml_dsa_65()
+        .generate_keypair()
+        .unwrap();
+    let signature = sign_with_context(&test_secret.to_bytes(), &original_bytes).unwrap();
+    verify_bytes_signature_with_key(&original_bytes, &signature, &test_public.to_bytes()).unwrap();
+    let old: PreChannelManifest = serde_json::from_slice(&original_bytes).unwrap();
+    assert_eq!(old.schema_version, current.schema_version);
+    assert_eq!(old.version, current.version);
+    assert_eq!(old.timestamp, current.timestamp);
+    assert_eq!(old.assets.len(), current.assets.len());
+    assert_eq!(old.skill_url, current.skill_url);
+    assert_eq!(hex::decode(old.skill_sha256).unwrap(), current.skill_sha256);
+    validate_manifest_timestamp(&current).unwrap();
+
+    // The ignored field is still signed: changing only channel must fail.
+    let tampered = String::from_utf8(original_bytes)
+        .unwrap()
+        .replace("\"stable\"", "\"prerelease\"");
+    assert!(verify_bytes_signature_with_key(
+        tampered.as_bytes(),
+        &signature,
+        &test_public.to_bytes()
+    )
+    .is_err());
 }

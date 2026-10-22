@@ -19,6 +19,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct ReleaseManifest {
     pub schema_version: u32,
     pub version: String,
+    /// Signed release channel. Missing fields are rejected during decoding.
+    pub channel: String,
     pub timestamp: u64,
     pub assets: Vec<PlatformAsset>,
     pub skill_url: String,
@@ -51,6 +53,21 @@ impl ReleaseManifest {
     pub fn matches_platform(&self, target: &str) -> Option<&PlatformAsset> {
         self.assets.iter().find(|a| a.target == target)
     }
+}
+
+/// Verify original signed bytes, then enforce eligibility before accepting a manifest.
+/// The production and test-key paths differ only in the trusted public key.
+pub(crate) fn verify_eligible_manifest(
+    json: &[u8],
+    signature: &[u8],
+    trusted_key: &[u8],
+) -> Result<ReleaseManifest, UpgradeError> {
+    super::signature::verify_bytes_signature_with_key(json, signature, trusted_key)
+        .map_err(|_| UpgradeError::ManifestSignatureInvalid)?;
+    let manifest = serde_json::from_slice(json)
+        .map_err(|error| UpgradeError::InvalidManifest(error.to_string()))?;
+    super::monitor::validate_manifest_timestamp(&manifest)?;
+    Ok(manifest)
 }
 
 /// Encode manifest JSON + detached signature for gossip transmission.
@@ -164,6 +181,7 @@ mod tests {
         ReleaseManifest {
             schema_version: SCHEMA_VERSION,
             version: "0.5.0".to_string(),
+            channel: "stable".to_owned(),
             timestamp: 1710000000,
             assets: vec![
                 PlatformAsset {
@@ -367,6 +385,7 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "1.0.0".to_string(),
+            channel: "stable".to_owned(),
             timestamp: 1000,
             assets: vec![PlatformAsset {
                 target: "nonexistent-cpu-none".to_string(),
