@@ -853,13 +853,17 @@ pub struct OwnerSyncStore {
     /// This is a LOCAL linearization boundary only. It claims nothing about
     /// cross-device election ordering.
     canonical_home_gate: tokio::sync::RwLock<()>,
-    /// #1542: serializes the journal appends of accepted `IssuanceJournal`
-    /// records (see `append_synced_journal_line`) and the reconcile that
-    /// mints journal lines (`mint_journal_lines`). Each append runs in its
-    /// own task, so without it a task for an older register value could
-    /// append after the task for its successor, and a reconcile could mint
-    /// between a winner check and its append. Lock order: `journal_apply`
-    /// → the profile journal writer lock → `records`.
+    /// #1542: the one serializer of the `IssuanceJournal` register and the
+    /// issuance journal file. Two writers move values between them:
+    /// [`Self::commit_batch`] (register, then the journal file, for an
+    /// accepted inbound record) and the reconcile `mint_journal_lines`
+    /// (journal file, then register). Each holds this lock for its whole
+    /// read-and-write, so neither sees the other half done. Thus, while the
+    /// lock is free, every committed register value is in the journal
+    /// file, or the journal file holds a local issuance that the next
+    /// reconcile publishes. Lock order: `journal_apply` →
+    /// `canonical_home_gate` → `records`, and `journal_apply` → the
+    /// profile journal writer lock.
     journal_apply: tokio::sync::Mutex<()>,
     /// The local issuance journal that accepted `IssuanceJournal` records
     /// are applied to (set by the service; unset in a bare store).
@@ -1211,6 +1215,63 @@ impl OwnerSyncStore {
         }
     }
 
+    /// Append the line for the register value `value` to the journal file
+    /// at `path` when this device needs it ([`synced_line_needed`]).
+    /// `published` is the register's value before the commit that accepted
+    /// `value`. The caller holds `journal_apply`, so the register cannot
+    /// change and no reconcile can read the journal until this returns. A
+    /// failed append is logged; the journal is advisory.
+    async fn apply_journal_value(
+        &self,
+        path: &Path,
+        owner_hex: &str,
+        value: &SyncValue,
+        published: Option<SyncValue>,
+    ) {
+        let SyncValue::IssuanceJournal {
+            agent_id,
+            cert_digest,
+            issued_at,
+            not_after,
+        } = value
+        else {
+            return;
+        };
+        let published_digest = match published {
+            Some(SyncValue::IssuanceJournal { cert_digest, .. }) => Some(cert_digest),
+            _ => None,
+        };
+        let appended = crate::profile::IssuedCertRecord::append_when(path, |existing| async move {
+            #[cfg(test)]
+            self.pause_after_journal_check().await;
+            synced_line_needed(
+                &existing,
+                owner_hex,
+                agent_id,
+                cert_digest,
+                *issued_at,
+                *not_after,
+                published_digest.as_deref(),
+            )
+            .then(|| {
+                synced_journal_line(
+                    owner_hex.to_string(),
+                    agent_id.clone(),
+                    cert_digest.clone(),
+                    *issued_at,
+                    *not_after,
+                )
+            })
+        })
+        .await;
+        if let Err(e) = appended {
+            tracing::warn!(
+                target: "x0x::owner_sync",
+                "failed to append synced journal line: {e}"
+            );
+        }
+    }
+
     /// Apply accepted `IssuanceJournal` records to the issuance journal at
     /// `path` (the service sets it once, at construction).
     pub(crate) fn set_journal_path(&self, path: PathBuf) {
@@ -1449,6 +1510,16 @@ impl OwnerSyncStore {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
+        // #1542: a batch that can change the IssuanceJournal register holds
+        // `journal_apply` until its accepted values are in the journal file.
+        let journal = self
+            .journal_file
+            .get()
+            .filter(|_| batch.iter().any(|r| r.kind == SyncKind::IssuanceJournal));
+        let _journal_apply = match journal {
+            Some(_) => Some(self.journal_apply.lock().await),
+            None => None,
+        };
         // #449 r3 P2: an inbound batch that can change the canonical Home
         // register waits behind any in-flight seat mint, and blocks the next
         // one until this batch is durable. Batches that touch no HomePointer
@@ -1527,7 +1598,15 @@ impl OwnerSyncStore {
                 }
                 match self.persist_records(&records).await {
                     Ok(()) => {
+                        let journal_updates = Self::journal_updates(&records, &touched);
                         drop(records);
+                        if let Some(path) = journal {
+                            let owner_hex = hex::encode(owner.0);
+                            for (value, published) in journal_updates {
+                                self.apply_journal_value(path, &owner_hex, &value, published)
+                                    .await;
+                            }
+                        }
                         self.kick();
                         Ok(outcome)
                     }
@@ -1552,6 +1631,23 @@ impl OwnerSyncStore {
                 Err(e)
             }
         }
+    }
+
+    /// The `IssuanceJournal` values a committed batch changed: each is the
+    /// key's value now, with the value the register held before the batch.
+    fn journal_updates(
+        records: &BTreeMap<(SyncKind, String), VersionedRecord>,
+        touched: &BTreeMap<(SyncKind, String), Option<VersionedRecord>>,
+    ) -> Vec<(SyncValue, Option<SyncValue>)> {
+        touched
+            .iter()
+            .filter(|((kind, _), _)| *kind == SyncKind::IssuanceJournal)
+            .filter_map(|(key, previous)| {
+                let now = records.get(key)?.value.clone();
+                let previous = previous.as_ref().map(|r| r.value.clone());
+                (previous.as_ref() != Some(&now)).then_some((now, previous))
+            })
+            .collect()
     }
 
     /// Restore the in-memory map to its pre-batch state: every touched key
@@ -2482,6 +2578,9 @@ impl OwnerSyncService {
         let store = OwnerSyncStore::load(data_dir)
             .await
             .map_err(|e| crate::error::NetworkError::CacheError(format!("sync store: {e}")))?;
+        if let Some(path) = journal_path.as_ref() {
+            store.set_journal_path(path.clone());
+        }
         let service = Arc::new(Self {
             agent,
             store: Arc::new(store),
@@ -2510,6 +2609,9 @@ impl OwnerSyncService {
         let store = OwnerSyncStore::load(data_dir)
             .await
             .map_err(|e| crate::error::NetworkError::CacheError(format!("sync store: {e}")))?;
+        if let Some(path) = journal_path.as_ref() {
+            store.set_journal_path(path.clone());
+        }
         let service = Arc::new(Self {
             agent,
             store: Arc::new(store),
@@ -3116,41 +3218,11 @@ impl OwnerSyncService {
                 // `GET /home` and adoption all need the CURRENT winner, not
                 // whatever happened to arrive last (#449).
             }
-            SyncValue::IssuanceJournal {
-                agent_id,
-                cert_digest,
-                issued_at,
-                not_after,
-            } => {
-                self.apply_journal_line(agent_id, cert_digest, *issued_at, *not_after);
+            SyncValue::IssuanceJournal { .. } => {
+                // `commit_batch` already wrote the journal file, under the
+                // same `journal_apply` hold as the register change (#1542).
             }
         }
-    }
-
-    /// Append a synced journal line to the local file when missing
-    /// (idempotent; fire-and-forget).
-    fn apply_journal_line(
-        &self,
-        agent_hex: &str,
-        cert_digest: &str,
-        issued_at: u64,
-        not_after: Option<u64>,
-    ) {
-        let Some(path) = self.journal_path.clone() else {
-            return;
-        };
-        let Some(owner_hex) = self.owner_kp().map(|kp| hex::encode(kp.user_id().0)) else {
-            return;
-        };
-        tokio::spawn(append_synced_journal_line(
-            Arc::clone(&self.store),
-            path,
-            owner_hex,
-            agent_hex.to_string(),
-            cert_digest.to_string(),
-            issued_at,
-            not_after,
-        ));
     }
 
     /// Spawn the periodic + on-change pass loop (owned by the daemon's
@@ -3175,7 +3247,9 @@ impl OwnerSyncService {
 
 /// Mint each agent's latest journal line into the `IssuanceJournal`
 /// register (kind 4 of the local reconcile). A failed mint is logged and
-/// retried next pass. Holds `OwnerSyncStore::journal_apply`.
+/// retried next pass. Holds `OwnerSyncStore::journal_apply` from the
+/// journal read to the last mint, so no inbound commit changes the
+/// register between them (#1542).
 async fn mint_journal_lines(
     store: &OwnerSyncStore,
     path: &Path,
@@ -3203,77 +3277,14 @@ async fn mint_journal_lines(
     }
 }
 
-/// Append the synced journal line to the local journal file when this
-/// device needs it (body of [`OwnerSyncService::apply_journal_line`]).
-///
-/// The line is appended only while its value is still the register's
-/// winner for the agent. Each accepted record appends in its own task, so
-/// the tasks for `d1` and then `d2` can run as `d2` and then `d1`. Without
-/// this check the journal would end on `d1`, and the next reconcile would
-/// mint the older certificate over the register.
-///
-/// The winner check and the append are one step. They hold the store's
-/// `journal_apply` lock, which the reconcile (`mint_journal_lines`) also
-/// holds, so the register cannot get a local value between them. They also
-/// hold the journal writer lock, so a local issuance cannot append between
-/// them. A newer winner therefore always appends after this line, or this
-/// line sees it and is not appended.
-async fn append_synced_journal_line(
-    store: Arc<OwnerSyncStore>,
-    path: PathBuf,
-    owner_hex: String,
-    agent_hex: String,
-    cert_digest: String,
-    issued_at: u64,
-    not_after: Option<u64>,
-) {
-    let _journal_apply = store.journal_apply.lock().await;
-    let store = &*store; // borrowed by the `async move` decide closure
-    let applied = SyncValue::IssuanceJournal {
-        agent_id: agent_hex.clone(),
-        cert_digest: cert_digest.clone(),
-        issued_at,
-        not_after,
-    };
-    let appended = crate::profile::IssuedCertRecord::append_when(&path, |existing| async move {
-        if store
-            .stored_value(SyncKind::IssuanceJournal, &agent_hex)
-            .await
-            != Some(applied)
-        {
-            // Superseded: the winner's line is already in the journal
-            // (a local issuance) or the winner's own task appends it.
-            return None;
-        }
-        #[cfg(test)]
-        store.pause_after_journal_check().await;
-        synced_line_needed(
-            &existing,
-            &owner_hex,
-            &agent_hex,
-            &cert_digest,
-            issued_at,
-            not_after,
-        )
-        .then(|| synced_journal_line(owner_hex, agent_hex, cert_digest, issued_at, not_after))
-    })
-    .await;
-    if let Err(e) = appended {
-        tracing::warn!(
-            target: "x0x::owner_sync",
-            "failed to append synced journal line: {e}"
-        );
-    }
-}
-
 /// Whether a synced journal line must be appended to `existing`.
 ///
-/// Owner sync calls this only for a record that won the `IssuanceJournal`
-/// register (`apply_record` runs post-commit) and is still its winner
-/// (`append_synced_journal_line` checks, under the journal writer lock).
-/// The line is compared with this owner's CURRENT line for the agent
-/// (see `latest_journal_values`; the owner roster reads the same last
-/// line):
+/// Owner sync calls this only for a value that `commit_batch` has just
+/// made the `IssuanceJournal` register's winner, under `journal_apply`.
+/// `published_digest` is the certificate the register held before that
+/// commit. The line is compared with this owner's CURRENT line for the
+/// agent (see `latest_journal_values`; the owner roster reads the same
+/// last line):
 ///
 /// - no current line, or a later second: append;
 /// - an earlier second: never append. A later line for an older
@@ -3281,11 +3292,13 @@ async fn append_synced_journal_line(
 ///   this device's next pass mints its newer line over the register;
 /// - the same second and the same digest: append only to supply an expiry
 ///   the current line lacks (a line written before #1542);
-/// - the same second and a different digest: append. `issued_at` has
-///   second precision, so it cannot order the two certificates. The
-///   register's clock (version, signing time, writer) already did: this
-///   value won it. Every device follows that order, so the devices
-///   converge on one certificate and their mints become no-ops.
+/// - the same second and a different digest: `issued_at` has second
+///   precision, so it cannot order the two certificates. If the current
+///   line is the published one, append: the register's clock (version,
+///   signing time, writer) ordered them, and every device follows that
+///   order. Otherwise the current line is a local issuance that no
+///   reconcile has published yet: keep it, and the next reconcile
+///   publishes it over the register at a higher version.
 fn synced_line_needed(
     existing: &[crate::profile::IssuedCertRecord],
     owner_hex: &str,
@@ -3293,6 +3306,7 @@ fn synced_line_needed(
     cert_digest: &str,
     issued_at: u64,
     not_after: Option<u64>,
+    published_digest: Option<&str>,
 ) -> bool {
     let current = latest_journal_values(
         existing.iter().filter(|r| r.agent_id == agent_hex).cloned(),
@@ -3314,7 +3328,7 @@ fn synced_line_needed(
         std::cmp::Ordering::Equal if cert_digest == current_digest => {
             current_not_after.is_none() && not_after.is_some()
         }
-        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Equal => published_digest == Some(current_digest.as_str()),
     }
 }
 
@@ -4271,16 +4285,20 @@ mod tests {
             )
             .await
             .expect("commit d1");
-        append_synced_journal_line(
-            Arc::clone(service.store()),
-            journal.clone(),
-            owner_hex.clone(),
-            target.clone(),
-            "d1".to_string(),
-            100,
-            Some(5_000),
-        )
-        .await;
+        service
+            .store()
+            .apply_journal_value(
+                &journal,
+                &owner_hex,
+                &SyncValue::IssuanceJournal {
+                    agent_id: target.clone(),
+                    cert_digest: "d1".to_string(),
+                    issued_at: 100,
+                    not_after: Some(5_000),
+                },
+                None,
+            )
+            .await;
         let roster = agent.owner_issued_certificates().await;
         let entry = roster
             .iter()
@@ -5881,8 +5899,28 @@ mod issuance_journal_sync_tests {
             "bb",
             "d2",
             100,
-            Some(9_000)
+            Some(9_000),
+            Some("d1")
         ));
+    }
+
+    /// Codex review of #1545 (5306e5d): the same-second line is not
+    /// appended over a local issuance that the register has not published
+    /// yet. The next reconcile publishes the local issuance instead.
+    #[test]
+    fn a_same_second_line_keeps_an_unpublished_local_issuance() {
+        let existing = vec![line("d0", 50, Some(1_000)), line("d2", 100, Some(9_000))];
+        for published in [Some("d0"), None] {
+            assert!(!synced_line_needed(
+                &existing,
+                OWNER,
+                "bb",
+                "d1",
+                100,
+                Some(5_000),
+                published
+            ));
+        }
     }
 
     /// Codex review of #1545 (42d32a0): the expiry repair of the CURRENT
@@ -5897,7 +5935,8 @@ mod issuance_journal_sync_tests {
             "bb",
             "d2",
             100,
-            Some(9_000)
+            Some(9_000),
+            Some("d2")
         ));
         // The repair still runs when the digest is the only line.
         assert!(synced_line_needed(
@@ -5906,7 +5945,8 @@ mod issuance_journal_sync_tests {
             "bb",
             "d1",
             100,
-            Some(5_000)
+            Some(5_000),
+            Some("d1")
         ));
     }
 
@@ -5921,16 +5961,17 @@ mod issuance_journal_sync_tests {
             "bb",
             "d1",
             100,
-            Some(5_000)
+            Some(5_000),
+            Some("d2")
         ));
     }
 
     /// Codex review of #1545 (42d32a0): two owner devices converge after a
     /// same-second renewal. Device A issued `d1@100` and then `d2@100`;
     /// device B holds only `d1@100`. Each pass runs the real reconcile
-    /// (`latest_journal_values` → `OwnerSyncStore::mint`), the real record
-    /// merge and, for an accepted record, the real journal append. The
-    /// register must stop changing, and both devices must hold `d2`.
+    /// (`mint_journal_lines`) and the real record merge, which applies an
+    /// accepted record to the journal. The register must stop changing,
+    /// and both devices must hold `d2`.
     #[tokio::test]
     async fn two_devices_converge_after_a_same_second_renewal() {
         use super::tests::{machine, owner_kp};
@@ -5948,10 +5989,10 @@ mod issuance_journal_sync_tests {
         let agent = "bb".to_string();
         let mut devices = Vec::new();
         for (name, id) in [("a", 1), ("b", 2)] {
-            let data = dir.path().join(name);
+            let (store, journal) = journal_device(&dir.path().join(name)).await;
             devices.push(Device {
-                journal: data.join(crate::profile::CERT_JOURNAL_FILE),
-                store: Arc::new(OwnerSyncStore::load(&data).await.expect("store")),
+                journal,
+                store,
                 machine: machine(id),
             });
         }
@@ -5965,50 +6006,15 @@ mod issuance_journal_sync_tests {
             label: None,
             cert_b64: None,
         };
-        async fn reconcile(device: &Device, owner: &UserKeypair, owner_hex: &str) {
-            let lines = crate::profile::IssuedCertRecord::load(&device.journal).await;
-            for (key, value) in latest_journal_values(lines, owner_hex) {
-                device
-                    .store
-                    .mint(
-                        SyncKind::IssuanceJournal,
-                        &key,
-                        &value,
-                        owner,
-                        device.machine,
-                    )
-                    .await
-                    .expect("mint");
-            }
+        async fn reconcile(device: &Device, owner: &UserKeypair) {
+            mint_journal_lines(&device.store, &device.journal, owner, device.machine).await;
         }
-        async fn deliver(from: &Device, to: &Device, owner_id: &UserId, owner_hex: &str) {
+        async fn deliver(from: &Device, to: &Device, owner_id: &UserId) {
             for record in from.store.records_snapshot().await {
-                let outcome = to
-                    .store
-                    .merge_record(record.clone(), owner_id)
+                to.store
+                    .merge_record(record, owner_id)
                     .await
                     .expect("merge");
-                if outcome != MergeOutcome::Accepted {
-                    continue;
-                }
-                if let SyncValue::IssuanceJournal {
-                    agent_id,
-                    cert_digest,
-                    issued_at,
-                    not_after,
-                } = record.value
-                {
-                    append_synced_journal_line(
-                        Arc::clone(&to.store),
-                        to.journal.clone(),
-                        owner_hex.to_string(),
-                        agent_id,
-                        cert_digest,
-                        issued_at,
-                        not_after,
-                    )
-                    .await;
-                }
             }
         }
         let (a, b) = (&devices[0], &devices[1]);
@@ -6017,8 +6023,8 @@ mod issuance_journal_sync_tests {
         crate::profile::IssuedCertRecord::append(&a.journal, &issued("d1", 5_000))
             .await
             .expect("append d1");
-        reconcile(a, &owner, &owner_hex).await;
-        deliver(a, b, &owner_id, &owner_hex).await;
+        reconcile(a, &owner).await;
+        deliver(a, b, &owner_id).await;
         crate::profile::IssuedCertRecord::append(&a.journal, &issued("d2", 9_000))
             .await
             .expect("append d2");
@@ -6029,10 +6035,10 @@ mod issuance_journal_sync_tests {
                 a.store.records_snapshot().await,
                 b.store.records_snapshot().await,
             );
-            reconcile(a, &owner, &owner_hex).await;
-            reconcile(b, &owner, &owner_hex).await;
-            deliver(a, b, &owner_id, &owner_hex).await;
-            deliver(b, a, &owner_id, &owner_hex).await;
+            reconcile(a, &owner).await;
+            reconcile(b, &owner).await;
+            deliver(a, b, &owner_id).await;
+            deliver(b, a, &owner_id).await;
             let after = (
                 a.store.records_snapshot().await,
                 b.store.records_snapshot().await,
@@ -6058,68 +6064,43 @@ mod issuance_journal_sync_tests {
     }
 
     /// Codex review of #1545 (3b18ea7): the register accepts `d1@100` and
-    /// then `d2@100`, but each accepted record's journal append is its own
-    /// task, so the appends can run in the other order. The journal must
-    /// still end on the register's winner `d2`. If it ends on `d1`, the
-    /// next reconcile mints the older certificate over the register.
+    /// then `d2@100`. The journal must end on the register's winner `d2`.
+    /// If it ends on `d1`, the next reconcile mints the older certificate
+    /// over the register. One batch carries both, so the commit applies
+    /// only the batch's final value for the key.
     #[tokio::test]
-    async fn reordered_appends_keep_the_register_winner() {
-        use super::tests::{machine, owner_kp};
-
+    async fn a_batch_applies_only_the_register_winner() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let owner = owner_kp(7);
+        let owner = super::tests::owner_kp(7);
         let owner_hex = hex::encode(owner.user_id().0);
-        let journal = dir.path().join(crate::profile::CERT_JOURNAL_FILE);
-        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
-        let value = |digest: &str, not_after| SyncValue::IssuanceJournal {
-            agent_id: "bb".to_string(),
-            cert_digest: digest.to_string(),
-            issued_at: 100,
-            not_after: Some(not_after),
-        };
-        let (d1, d2) = (value("d1", 5_000), value("d2", 9_000));
-        for accepted in [&d1, &d2] {
-            store
-                .mint(
-                    SyncKind::IssuanceJournal,
-                    "bb",
-                    accepted,
-                    &owner,
-                    machine(2),
-                )
-                .await
-                .expect("commit");
-        }
-
-        // The tasks for d2 and then d1 run: the reverse of commit order.
-        for applied in [&d2, &d1] {
-            let (agent_id, cert_digest, issued_at, not_after) = fields(applied);
-            append_synced_journal_line(
-                Arc::clone(&store),
-                journal.clone(),
-                owner_hex.clone(),
-                agent_id,
-                cert_digest,
-                issued_at,
-                not_after,
-            )
-            .await;
-        }
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (local, journal) = journal_device(&dir.path().join("local")).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        local
+            .commit_batch(vec![r1, r2], &owner.user_id())
+            .await
+            .expect("commit");
 
         let lines = crate::profile::IssuedCertRecord::load(&journal).await;
-        let minted = latest_journal_values(lines, &owner_hex);
         assert_eq!(
-            minted.get("bb"),
+            latest_journal_values(lines, &owner_hex).get("bb"),
             Some(&d2),
             "the journal must end on the register's winner"
         );
     }
 
-    /// Codex review of #1545 (a5ee204): a synced repair of `d1@100` passes
-    /// its register winner check and pauses. While it pauses, this device
-    /// renews to `d2@100` and reconciles. The delayed repair must not put
-    /// `d1` after `d2`: the next reconcile would then mint the older
-    /// certificate over the register at a higher version.
+    /// Codex review of #1545 (a5ee204): an inbound `d1@100` commits and
+    /// its journal append pauses after it reads the journal. While it
+    /// pauses, this device renews to `d2@100` and reconciles. The renewal
+    /// must land after `d1`, and the reconcile must publish it: the
+    /// delayed append must not put `d1` after `d2`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_delayed_repair_does_not_roll_back_a_local_renewal() {
         use super::tests::{machine, owner_kp};
@@ -6127,39 +6108,26 @@ mod issuance_journal_sync_tests {
         let dir = tempfile::tempdir().expect("tmpdir");
         let owner = owner_kp(7);
         let owner_hex = hex::encode(owner.user_id().0);
-        let journal = dir.path().join(crate::profile::CERT_JOURNAL_FILE);
-        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
-        let value = |digest: &str, not_after| SyncValue::IssuanceJournal {
-            agent_id: "bb".to_string(),
-            cert_digest: digest.to_string(),
-            issued_at: 100,
-            not_after: Some(not_after),
-        };
-        let (d1, d2) = (value("d1", 5_000), value("d2", 9_000));
-        // Another device's d1 wins the register here.
-        store
-            .mint(SyncKind::IssuanceJournal, "bb", &d1, &owner, machine(2))
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
             .await
-            .expect("commit d1");
+            .expect("remote store");
+        let (store, journal) = journal_device(&dir.path().join("local")).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
 
         let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         store.pause_next_journal_check(checked_tx, release_rx);
         let repair = {
-            let (agent_id, cert_digest, issued_at, not_after) = fields(&d1);
-            tokio::spawn(append_synced_journal_line(
-                Arc::clone(&store),
-                journal.clone(),
-                owner_hex.clone(),
-                agent_id,
-                cert_digest,
-                issued_at,
-                not_after,
-            ))
+            let (store, owner) = (Arc::clone(&store), owner_kp(7));
+            tokio::spawn(async move { deliver(&store, &owner, r1).await })
         };
         tokio::time::timeout(std::time::Duration::from_secs(10), checked_rx)
             .await
-            .expect("the repair reaches its winner check")
+            .expect("the repair reaches its journal read")
             .expect("checked signal");
 
         // The local renewal and a reconcile pass, while the repair pauses.
@@ -6187,13 +6155,8 @@ mod issuance_journal_sync_tests {
                 mint_journal_lines(&store, &journal, &owner, machine(1)).await;
             })
         };
-        // Let the renewal run while the repair is held (it may block).
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-            while !renewal.is_finished() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await;
+        // Let the renewal run while the repair is held (it blocks).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         release_tx.send(()).expect("release");
         repair.await.expect("repair task");
         renewal.await.expect("renewal task");
@@ -6277,38 +6240,13 @@ mod issuance_journal_sync_tests {
             .expect("remote record")
     }
 
-    /// Commit one inbound record the way a sync session does, journal
-    /// application included.
-    async fn deliver(
-        store: &Arc<OwnerSyncStore>,
-        journal: &Path,
-        owner: &UserKeypair,
-        record: VersionedRecord,
-    ) {
-        let outcome = store
+    /// Commit one inbound record the way a sync session does; the commit
+    /// applies an accepted record to the store's journal.
+    async fn deliver(store: &OwnerSyncStore, owner: &UserKeypair, record: VersionedRecord) {
+        store
             .commit_batch(vec![record], &owner.user_id())
             .await
             .expect("commit");
-        for accepted in outcome.accepted {
-            if let SyncValue::IssuanceJournal {
-                agent_id,
-                cert_digest,
-                issued_at,
-                not_after,
-            } = accepted.value
-            {
-                append_synced_journal_line(
-                    Arc::clone(store),
-                    journal.to_path_buf(),
-                    hex::encode(owner.user_id().0),
-                    agent_id,
-                    cert_digest,
-                    issued_at,
-                    not_after,
-                )
-                .await;
-            }
-        }
     }
 
     fn journal_value(digest: &str, issued_at: u64, not_after: u64) -> SyncValue {
@@ -6342,7 +6280,7 @@ mod issuance_journal_sync_tests {
         );
         let r1 = remote_record(&remote, &owner, &d1).await;
         let r2 = remote_record(&remote, &owner, &d2).await;
-        deliver(&local, &journal, &owner, r1).await;
+        deliver(&local, &owner, r1).await;
 
         let (read_tx, read_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -6358,8 +6296,8 @@ mod issuance_journal_sync_tests {
             .expect("the reconcile reads the journal")
             .expect("read signal");
         let inbound = {
-            let (local, journal, owner) = (Arc::clone(&local), journal.clone(), owner_kp(7));
-            tokio::spawn(async move { deliver(&local, &journal, &owner, r2).await })
+            let (local, owner) = (Arc::clone(&local), owner_kp(7));
+            tokio::spawn(async move { deliver(&local, &owner, r2).await })
         };
         // Let the inbound commit run while the reconcile is held (it may block).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -6407,7 +6345,7 @@ mod issuance_journal_sync_tests {
         );
         let r0 = remote_record(&remote, &owner, &d0).await;
         let r1 = remote_record(&remote, &owner, &d1).await;
-        deliver(&local, &journal, &owner, r0).await;
+        deliver(&local, &owner, r0).await;
 
         // The local renewal completes before the inbound line arrives.
         let (_, digest, issued_at, not_after) = fields(&d2);
@@ -6426,7 +6364,7 @@ mod issuance_journal_sync_tests {
         )
         .await
         .expect("append d2");
-        deliver(&local, &journal, &owner, r1).await;
+        deliver(&local, &owner, r1).await;
 
         // The next reconcile pass.
         mint_journal_lines(&local, &journal, &owner, machine(1)).await;

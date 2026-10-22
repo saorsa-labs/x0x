@@ -38391,8 +38391,9 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         None,
     )
     .expect("Rider issuance");
-    // OwnerSyncService::apply_journal_line materializes exactly this Tier-1
-    // subset: hosting mode/certificate bytes do not travel and default to ACP.
+    // OwnerSyncStore::commit_batch (apply_journal_value) materializes exactly
+    // this Tier-1 subset: hosting mode/certificate bytes do not travel and
+    // default to ACP.
     // This fixture covers the resulting local hint, not the sync protocol.
     let synced: profile::IssuedCertRecord = serde_json::from_value(serde_json::json!({
         "user_id": rider.user_id,
