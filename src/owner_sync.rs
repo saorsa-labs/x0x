@@ -898,6 +898,10 @@ pub struct OwnerSyncStore {
     /// the journal until the test releases it.
     #[cfg(test)]
     journal_read_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: hold the reconcile's name mint after it reads the
+    /// live names until the test releases it.
+    #[cfg(test)]
+    name_mint_pause: std::sync::Mutex<Option<JournalCheckPause>>,
     /// Test injection: fail every synced journal append.
     #[cfg(test)]
     fail_journal_append: std::sync::atomic::AtomicBool,
@@ -1079,6 +1083,8 @@ impl OwnerSyncStore {
             journal_check_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             journal_read_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            name_mint_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_journal_append: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1295,6 +1301,22 @@ impl OwnerSyncStore {
     #[cfg(test)]
     async fn pause_after_journal_read(&self) {
         Self::take_pause(&self.journal_read_pause).await;
+    }
+
+    /// Hold the next reconcile name mint after it reads the live names:
+    /// it signals `read` and then waits for `release`.
+    #[cfg(test)]
+    pub(crate) fn pause_next_name_mint(
+        &self,
+        read: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        Self::arm_pause(&self.name_mint_pause, read, release);
+    }
+
+    #[cfg(test)]
+    async fn pause_before_name_mint(&self) {
+        Self::take_pause(&self.name_mint_pause).await;
     }
 
     #[cfg(test)]
@@ -3618,6 +3640,8 @@ impl OwnerSyncService {
                 .await
                 .iter()
                 .any(|(_, winner)| *winner);
+            #[cfg(test)]
+            self.store.pause_before_name_mint().await;
             if names_applied && !owed {
                 self.mint_or_log(
                     SyncKind::OwnerProfile,

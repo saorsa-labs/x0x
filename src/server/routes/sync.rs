@@ -1096,12 +1096,12 @@ mod tests {
         state
     }
 
-    /// `PUT /profile` with the human name `Bob`.
-    async fn put_bob(state: &Arc<AppState>) -> StatusCode {
+    /// `PUT /profile` with the human name `name`.
+    async fn put_name(state: &Arc<AppState>, name: &str) -> StatusCode {
         let (status, _) = super::super::profile::update_profile(
             State(Arc::clone(state)),
             Json(super::super::profile::UpdateProfileRequest {
-                human_name: Some("Bob".into()),
+                human_name: Some(name.into()),
                 ..Default::default()
             }),
         )
@@ -1109,14 +1109,14 @@ mod tests {
         status
     }
 
-    /// The daemon shows and publishes the profile `Bob`.
-    async fn assert_keeps_bob(state: &AppState, why: &str) {
+    /// The daemon shows and publishes the profile `name`.
+    async fn assert_keeps(state: &AppState, name: &str, why: &str) {
         use crate::owner_sync::SyncKind;
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
         assert_eq!(
             state.profile.read().await.human_name.as_deref(),
-            Some("Bob"),
-            "{why}: the daemon must keep the local edit"
+            Some(name),
+            "{why}: the daemon must keep the profile"
         );
         assert_eq!(
             service
@@ -1124,9 +1124,9 @@ mod tests {
                 .stored_value(SyncKind::OwnerProfile, "owner")
                 .await,
             Some(SyncValue::OwnerProfile {
-                human_name: Some("Bob".into())
+                human_name: Some(name.into())
             }),
-            "{why}: the reconcile must publish the local edit"
+            "{why}: the reconcile must publish the profile"
         );
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
         let seed = [0x8A; 32];
         let (pending_path, profile_path) = {
             let state = state_owing_alice(dir.path(), seed).await;
-            assert_eq!(put_bob(&state).await, StatusCode::OK);
+            assert_eq!(put_name(&state, "Bob").await, StatusCode::OK);
             let service = state.owner_sync.as_ref().expect("owned state wires sync");
             (
                 service.store().pending_applies_path(),
@@ -1157,7 +1157,7 @@ mod tests {
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
         DaemonView::attach(service, &state).await;
         service.sync_all().await;
-        assert_keeps_bob(&state, "after the crash").await;
+        assert_keeps(&state, "Bob", "after the crash").await;
     }
 
     /// Codex review of #1545 (f16c484), P2: `PUT /profile` folds the owed
@@ -1172,9 +1172,9 @@ mod tests {
             let state = state_owing_alice(dir.path(), seed).await;
             let service = state.owner_sync.as_ref().expect("owned state wires sync");
             service.store().fail_next_discharge();
-            assert_eq!(put_bob(&state).await, StatusCode::OK);
+            assert_eq!(put_name(&state, "Bob").await, StatusCode::OK);
             service.sync_all().await;
-            assert_keeps_bob(&state, "after the failed discharge").await;
+            assert_keeps(&state, "Bob", "after the failed discharge").await;
         }
 
         let state = owned_state(dir.path(), seed)
@@ -1183,7 +1183,80 @@ mod tests {
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
         DaemonView::attach(service, &state).await;
         service.sync_all().await;
-        assert_keeps_bob(&state, "after a restart").await;
+        assert_keeps(&state, "Bob", "after a restart").await;
+    }
+
+    /// Codex review of #1545 (0f55c78), P2: with `Alice` owed, `PUT
+    /// /profile` saves `Bob` and its discharge fails; a second `PUT
+    /// /profile` then saves `Carol`. A restart before any pass must keep
+    /// `Carol`, not apply `Alice` again over it.
+    #[tokio::test]
+    async fn a_second_local_edit_after_a_failed_discharge_keeps_the_edit() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x8E; 32];
+        {
+            let state = state_owing_alice(dir.path(), seed).await;
+            let service = state.owner_sync.as_ref().expect("owned state wires sync");
+            service.store().fail_next_discharge();
+            assert_eq!(put_name(&state, "Bob").await, StatusCode::OK);
+            assert_eq!(put_name(&state, "Carol").await, StatusCode::OK);
+        }
+
+        let state = owned_state(dir.path(), seed)
+            .await
+            .expect("restarted state");
+        let service = state.owner_sync.as_ref().expect("owned state wires sync");
+        DaemonView::attach(service, &state).await;
+        service.sync_all().await;
+        assert_keeps(&state, "Carol", "after a restart").await;
+    }
+
+    /// Codex review of #1545 (0f55c78), P2: the reconcile reads the live
+    /// name `Old` and finds no owed names; a session then commits `Alice`
+    /// before the reconcile mints. The mint must not put `Old` over
+    /// `Alice` at a higher version, or the catch-up skips `Alice` as no
+    /// longer the winner and the synced name is lost.
+    #[tokio::test]
+    async fn a_commit_during_the_reconcile_name_mint_keeps_the_synced_name() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let state = owned_state(dir.path(), [0x8F; 32]).await.expect("state");
+        state.profile.write().await.human_name = Some("Old".into());
+        let service = Arc::clone(state.owner_sync.as_ref().expect("owned state wires sync"));
+        let view = Arc::new(DaemonView::new(Arc::clone(&state)));
+        service.attach_daemon_view(Arc::clone(&view));
+        service.sync_all().await;
+        let owner = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        service.store().pause_next_name_mint(read_tx, release_rx);
+        let pass = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.sync_all().await }
+        });
+        read_rx.await.expect("the reconcile reads the live names");
+
+        // The session commits `Alice` while the reconcile holds `Old`.
+        let batch = remote_alice_batch(dir.path(), owner).await;
+        let outcome = service
+            .store()
+            .commit_batch(batch, &owner.user_id())
+            .await
+            .expect("commit");
+        release_tx.send(()).expect("release the reconcile");
+        pass.await.expect("the pass ends");
+        // The session applies what it committed.
+        for record in &outcome.accepted {
+            service.apply_record(record);
+        }
+        assert!(view.names_persisted().await, "the catch-up saves");
+
+        service.sync_all().await;
+        assert_keeps(&state, "Alice", "after the interleaved commit").await;
     }
 
     /// WHY: the profile mirror must never regress to defaults while the
