@@ -394,7 +394,7 @@ impl IssuedCertRecord {
     /// Replace the journal at `path` with `content`, durably. The caller
     /// holds `JOURNAL_WRITER`. Once the rename is done, the new bytes are
     /// visible; only once the directory fsync is done are they recorded
-    /// in `durable`.
+    /// in `durable`. The mark is cleared first.
     async fn replace_locked(
         path: &Path,
         content: &[u8],
@@ -413,6 +413,11 @@ impl IssuedCertRecord {
             ),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        // Clear the durable mark before the first change, not after the
+        // rename: a cancelled caller can drop this future while the
+        // blocking rename still completes, and a stale mark would then
+        // let a durable read publish the unsynced bytes (#1542).
+        durable.remove(path);
         if let Err(e) = Self::write_synced(&tmp, content).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
@@ -423,7 +428,6 @@ impl IssuedCertRecord {
         }
         #[cfg(test)]
         journal_faults::after_rename(path).await?;
-        durable.remove(path);
         // #1542: owner sync persists its register only after this append
         // returns, so the new line must survive a host crash. fsync the
         // parent directory to make the rename durable.

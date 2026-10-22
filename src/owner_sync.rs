@@ -1660,10 +1660,10 @@ impl OwnerSyncStore {
                     // writes, the journal holds lines that came from these
                     // records, and the restart must not take them for
                     // unpublished local issuance (see
-                    // `recover_journal_commit`).
-                    let intent: Vec<VersionedRecord> =
-                        updates.iter().map(|(record, _)| record.clone()).collect();
-                    if let Err(e) = self.persist_journal_intent(intent).await {
+                    // `recover_journal_commit`). The intent holds every
+                    // accepted record of the batch, not only the journal
+                    // ones, so the recovery commits all of it or none.
+                    if let Err(e) = self.persist_journal_intent(outcome.accepted.clone()).await {
                         Self::rollback(&mut records, &touched);
                         return Err(e);
                     }
@@ -1733,8 +1733,9 @@ impl OwnerSyncStore {
             .collect()
     }
 
-    /// Durably record the `IssuanceJournal` records a commit is about to
-    /// write to the journal file and then to the register (#1542).
+    /// Durably record the accepted records of a commit that is about to
+    /// write `IssuanceJournal` values to the journal file and then the
+    /// whole batch to the register (#1542).
     async fn persist_journal_intent(&self, records: Vec<VersionedRecord>) -> Result<(), SyncError> {
         let bytes = serde_json::to_vec(&PersistedRecords { records })
             .map_err(|e| SyncError::Io(format!("encode journal intent: {e}")))?;
