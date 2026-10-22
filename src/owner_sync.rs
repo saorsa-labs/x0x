@@ -73,7 +73,7 @@
 //! is not one of the four fails to decode, and a record whose kind does not
 //! match its value variant is rejected whole.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -805,14 +805,23 @@ pub struct SessionSummary {
 
 type VerifiedEnrollmentOwners = BTreeMap<[u8; 32], (UserId, OwnerEnrollment)>;
 
+/// The register: the winning record of each `(kind, key)`.
+type RecordMap = BTreeMap<(SyncKind, String), VersionedRecord>;
+
+/// An owned hold of `OwnerSyncStore::journal_apply`.
+type JournalGuard = tokio::sync::OwnedMutexGuard<()>;
+
 pub struct OwnerSyncStore {
     dir: PathBuf,
-    records: tokio::sync::RwLock<BTreeMap<(SyncKind, String), VersionedRecord>>,
+    /// Every change of the register runs its durable write in a task that
+    /// owns this lock until the write and the memory update are done
+    /// (`replace_records`, #1545).
+    records: Arc<tokio::sync::RwLock<RecordMap>>,
     devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
     // Verified once on load/enroll, consulted under the devices read lock.
     evidence_owners: std::sync::RwLock<VerifiedEnrollmentOwners>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
-    generation_tx: tokio::sync::watch::Sender<u64>,
+    generation_tx: Arc<tokio::sync::watch::Sender<u64>>,
     /// #824: count of successful sessions with an owner device, inbound or
     /// outbound. Home provisioning waits for one before minting, because a
     /// completed session means that device's records, including any
@@ -822,7 +831,7 @@ pub struct OwnerSyncStore {
     /// synced: memory/disk agreement is no longer reconstructable by
     /// rollback, so every further mutation and session fails until the
     /// process reloads from disk (review R5 finding 2).
-    poisoned: std::sync::Mutex<Option<String>>,
+    poisoned: Arc<std::sync::Mutex<Option<String>>>,
     /// Test injection: make the next durable writes fail AFTER the rename
     /// (simulates a post-rename fsync failure). Never set in production.
     fail_after_rename: std::sync::atomic::AtomicBool,
@@ -858,7 +867,7 @@ pub struct OwnerSyncStore {
     ///
     /// This is a LOCAL linearization boundary only. It claims nothing about
     /// cross-device election ordering.
-    canonical_home_gate: tokio::sync::RwLock<()>,
+    canonical_home_gate: Arc<tokio::sync::RwLock<()>>,
     /// #1542: the one serializer of the `IssuanceJournal` register and the
     /// issuance journal file. Two writers move values between them:
     /// [`Self::commit_batch`] (for an accepted inbound record) and the
@@ -875,7 +884,12 @@ pub struct OwnerSyncStore {
     /// mints only from a durable journal read. Lock order: `journal_apply` →
     /// `canonical_home_gate` → `records`, and `journal_apply` → the
     /// profile journal writer lock.
-    journal_apply: tokio::sync::Mutex<()>,
+    ///
+    /// #1545: each write of the journal intent and each register write
+    /// of a commit runs in a task that owns this lock until the write is
+    /// done (`run_to_completion`). A cancelled caller cannot release it
+    /// while one of its writes can still land.
+    journal_apply: Arc<tokio::sync::Mutex<()>>,
     /// The local issuance journal that accepted `IssuanceJournal` records
     /// are applied to (set by the service; unset in a bare store).
     journal_file: std::sync::OnceLock<PathBuf>,
@@ -899,18 +913,14 @@ pub struct OwnerSyncStore {
     ///   `records` read lock, so no commit can change a winner between
     ///   its check and its removal;
     /// - a live-name mint (`mint_live_name`) holds the `records` write
-    ///   lock, and mints only when no winner is owed and `names_epoch` is
-    ///   the one read before the live names were read.
-    pending_apply: tokio::sync::Mutex<BTreeMap<PendingKey, PendingApply>>,
-    /// #1545: the generation of `pending_apply`. It changes, while
-    /// `pending_apply` is held, at each commit that adds names and at
-    /// each retirement. A retirement means that the live profile now
-    /// holds a committed name (or that the name is no longer owed), so
-    /// live names read before it can be older than the register. The
-    /// reconcile reads it before it reads the live names
-    /// ([`Self::names_epoch`]), and its mint compares it
-    /// (`mint_live_name`).
-    names_epoch: std::sync::atomic::AtomicU64,
+    ///   lock, and mints only when no winner is owed and the epoch
+    ///   (`PendingApplies::epoch`) is the one read before the live names
+    ///   were read.
+    ///
+    /// Each write of `APPLY_PENDING_FILE` runs in a task that owns this
+    /// lock until the write and the memory update are done
+    /// (`replace_pending`).
+    pending_apply: Arc<tokio::sync::Mutex<PendingApplies>>,
     /// Test injection: hold a synced journal append after its decision
     /// read until the test releases it.
     #[cfg(test)]
@@ -993,6 +1003,20 @@ struct PendingApply {
     /// save.
     #[serde(skip)]
     discharged: bool,
+}
+
+/// #1545: the pending applies (`OwnerSyncStore::pending_apply`).
+#[derive(Debug, Clone, Default)]
+struct PendingApplies {
+    applies: BTreeMap<PendingKey, PendingApply>,
+    /// The generation of `applies`. It changes at each commit that adds
+    /// names and at each retirement. A retirement means that the live
+    /// profile now holds a committed name (or that the name is no longer
+    /// owed), so live names read before it can be older than the
+    /// register. The reconcile reads it before it reads the live names
+    /// ([`OwnerSyncStore::names_epoch`]), and its mint compares it
+    /// (`OwnerSyncStore::mint_live_name`).
+    epoch: u64,
 }
 
 /// The contents of `APPLY_PENDING_FILE`.
@@ -1098,25 +1122,25 @@ impl OwnerSyncStore {
         let (generation_tx, _) = tokio::sync::watch::channel(0);
         Ok(Self {
             dir,
-            records: tokio::sync::RwLock::new(records),
+            records: Arc::new(tokio::sync::RwLock::new(records)),
             devices: tokio::sync::RwLock::new(devices),
             evidence_owners: std::sync::RwLock::new(evidence_owners),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
-            generation_tx,
+            generation_tx: Arc::new(generation_tx),
             sessions_ok_tx: tokio::sync::watch::channel(0).0,
-            poisoned: std::sync::Mutex::new(None),
+            poisoned: Arc::new(std::sync::Mutex::new(None)),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
-            canonical_home_gate: tokio::sync::RwLock::new(()),
-            journal_apply: tokio::sync::Mutex::new(()),
+            canonical_home_gate: Arc::new(tokio::sync::RwLock::new(())),
+            journal_apply: Arc::new(tokio::sync::Mutex::new(())),
             journal_file: std::sync::OnceLock::new(),
-            pending_apply: tokio::sync::Mutex::new(
-                pending_apply
+            pending_apply: Arc::new(tokio::sync::Mutex::new(PendingApplies {
+                applies: pending_apply
                     .applies
                     .into_iter()
                     .map(|p| (pending_key(&p.record), p))
                     .collect(),
-            ),
-            names_epoch: std::sync::atomic::AtomicU64::new(0),
+                epoch: 0,
+            })),
             #[cfg(test)]
             journal_check_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1224,20 +1248,50 @@ impl OwnerSyncStore {
         Ok(())
     }
 
-    /// Persist the winning records. `Poisoned` tells the caller the write
-    /// crossed the rename but could not be made durable — memory must NOT
-    /// be rolled back (disk already advanced); the store must be poisoned.
-    /// Errors PROPAGATE — callers never report success on a swallowed
-    /// write (review R2 finding 2).
-    async fn persist_records(
+    /// #1545: run `work` to its end in its own task, and wait for its
+    /// output. A cancelled caller stops only its wait. Each durable write
+    /// of the register, of the pending applies and of the journal intent
+    /// runs in this way, with the owned guards of the state that it writes
+    /// moved into `work`. Those guards stay held until the write and the
+    /// memory update after it are done: no later writer can start before
+    /// the write lands, and memory ends as the disk holds it.
+    ///
+    /// # Errors
+    ///
+    /// The error of `work`, or [`SyncError::Io`] when its task fails.
+    async fn run_to_completion<T: Send + 'static>(
+        work: impl std::future::Future<Output = Result<T, SyncError>> + Send + 'static,
+    ) -> Result<T, SyncError> {
+        tokio::spawn(work)
+            .await
+            .map_err(|e| SyncError::Io(format!("durable write task failed: {e}")))?
+    }
+
+    /// Write `next` durably as the register, and then make it the register
+    /// in memory. The two run to their end in one task
+    /// (`run_to_completion`), which owns `records` and `held` until then;
+    /// `held` comes back on success. A caller builds `next` from a copy of
+    /// the register, so a caller cancelled before this call leaves the
+    /// register as it was.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the write fails before its rename: the
+    /// register does not change. [`SyncError::Poisoned`] when it fails
+    /// after its rename: the disk holds `next`, so memory takes it too and
+    /// the store is poisoned (review R5 finding 2). Errors PROPAGATE —
+    /// callers never report success on a swallowed write (review R2
+    /// finding 2).
+    async fn replace_records<H: Send + 'static>(
         &self,
-        records: &BTreeMap<(SyncKind, String), VersionedRecord>,
-    ) -> Result<(), SyncError> {
-        let persisted = PersistedRecords {
-            records: records.values().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&persisted)
-            .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
+        mut records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
+        next: RecordMap,
+        held: H,
+    ) -> Result<H, SyncError> {
+        let bytes = serde_json::to_vec(&PersistedRecords {
+            records: next.values().cloned().collect(),
+        })
+        .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
         #[cfg(test)]
         if self
             .fail_next_register_write
@@ -1245,21 +1299,37 @@ impl OwnerSyncStore {
         {
             return Err(SyncError::Io("injected register write failure".into()));
         }
-        Self::write_atomically(
-            &self.dir.join(RECORDS_FILE),
-            &bytes,
-            self.fail_after_rename_for_testing(),
-        )
-        .await
-        .map_err(|e| match e {
-            DurableWriteError::BeforeRename(io) => SyncError::Io(format!("persist records: {io}")),
-            DurableWriteError::AfterRename(io) => {
-                SyncError::Poisoned(format!("records replaced but not durable: {io}"))
+        let path = self.dir.join(RECORDS_FILE);
+        let fail_after_rename = self.fail_after_rename_for_testing();
+        let poisoned = Arc::clone(&self.poisoned);
+        let generation = Arc::clone(&self.generation_tx);
+        Self::run_to_completion(async move {
+            match Self::write_atomically(&path, &bytes, fail_after_rename).await {
+                Ok(()) => {
+                    *records = next;
+                    drop(records);
+                    Self::kick_generation(&generation);
+                    Ok(held)
+                }
+                Err(DurableWriteError::BeforeRename(io)) => {
+                    Err(SyncError::Io(format!("persist records: {io}")))
+                }
+                Err(DurableWriteError::AfterRename(io)) => {
+                    // Disk already holds `next`: memory takes it, and the
+                    // store is poisoned; never roll memory back below an
+                    // advanced disk.
+                    *records = next;
+                    drop(records);
+                    let e = SyncError::Poisoned(format!("records replaced but not durable: {io}"));
+                    Self::poison_slot(&poisoned, e.to_string());
+                    Err(e)
+                }
             }
         })
+        .await
     }
 
-    /// Persist the device set; errors propagate (see [`Self::persist_records`]).
+    /// Persist the device set; errors propagate (see [`Self::replace_records`]).
     async fn persist_devices(
         &self,
         devices: &BTreeMap<[u8; 32], OwnerEnrollment>,
@@ -1288,8 +1358,12 @@ impl OwnerSyncStore {
     /// further mutations and sessions fail until a fresh `load` (review R5
     /// finding 2).
     fn poison(&self, reason: String) {
-        *self
-            .poisoned
+        Self::poison_slot(&self.poisoned, reason);
+    }
+
+    /// [`Self::poison`] for a task that owns no `&self`.
+    fn poison_slot(slot: &std::sync::Mutex<Option<String>>, reason: String) {
+        *slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
     }
@@ -1674,7 +1748,12 @@ impl OwnerSyncStore {
 
     /// On-change trigger: bump the generation the periodic task waits on.
     pub fn kick(&self) {
-        self.generation_tx.send_modify(|g| *g = g.wrapping_add(1));
+        Self::kick_generation(&self.generation_tx);
+    }
+
+    /// [`Self::kick`] for a task that owns no `&self`.
+    fn kick_generation(generation: &tokio::sync::watch::Sender<u64>) {
+        generation.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// Subscribe to generation changes.
@@ -1706,19 +1785,17 @@ impl OwnerSyncStore {
     }
 
     /// Commit a verified batch atomically (review R2 finding 4): all
-    /// classification decisions are made against the live map, all accepted
-    /// records inserted, and ONE file write persists the result. On any
-    /// failure the in-memory map is rolled back to its **pre-batch** state
-    /// — each key's pre-batch value is captured ONCE, on its first touch
-    /// in the batch, so a key replaced twice in a failing batch restores
-    /// the original, not an intermediate replacement (review R3 finding 4)
-    /// — and the error propagates. A partial batch is never committed or
-    /// advertised.
+    /// classification decisions are made against a copy of the register,
+    /// all accepted records inserted into it, and ONE file write persists
+    /// the result. The copy becomes the register only once that write is
+    /// done (`replace_records`). On any failure the register keeps its
+    /// **pre-batch** state, and the error propagates. A partial batch is
+    /// never committed or advertised.
     ///
     /// Records must have been verified (`verify_owner`) by the caller.
-    /// Callers must NOT hold this future inside a cancellable timeout: the
-    /// rollback paths assume the await completes (the session wrapper
-    /// commits outside its time budget for exactly that reason).
+    /// #1545: a caller that is cancelled leaves the register as before
+    /// the batch, or, once the register write has started, as that write
+    /// leaves it; memory always ends as the disk holds it.
     ///
     /// # Errors
     ///
@@ -1738,188 +1815,146 @@ impl OwnerSyncStore {
             .journal_file
             .get()
             .filter(|_| batch.iter().any(|r| r.kind == SyncKind::IssuanceJournal));
-        let _journal_apply = match journal {
+        let held = match journal {
             Some(_) => {
-                let guard = self.journal_apply.lock().await;
-                self.recover_journal_commit(owner).await?;
-                Some(guard)
+                let guard = Arc::clone(&self.journal_apply).lock_owned().await;
+                Some(self.recover_journal_commit(guard, owner).await?)
             }
             None => None,
         };
-        self.commit_locked(batch, owner, journal).await
+        self.commit_locked(batch, owner, journal, held)
+            .await
+            .map(|(outcome, _)| outcome)
     }
 
     /// [`Self::commit_batch`] after its `journal_apply` step. `journal` is
-    /// the journal file to apply accepted `IssuanceJournal` values to; the
-    /// caller then holds `journal_apply`.
-    async fn commit_locked(
+    /// the journal file to apply accepted `IssuanceJournal` values to;
+    /// `held` then holds `journal_apply`. `held` moves into each write of
+    /// the journal intent and of the register (`run_to_completion`), and
+    /// comes back on success.
+    async fn commit_locked<H: Send + 'static>(
         &self,
         batch: Vec<VersionedRecord>,
         owner: &UserId,
         journal: Option<&PathBuf>,
-    ) -> Result<CommitOutcome, SyncError> {
+        mut held: H,
+    ) -> Result<(CommitOutcome, H), SyncError> {
         // #449 r3 P2: an inbound batch that can change the canonical Home
         // register waits behind any in-flight seat mint, and blocks the next
         // one until this batch is durable. Batches that touch no HomePointer
         // record skip the gate entirely (lock order: gate → records).
-        let _canonical_gate = if batch.iter().any(|r| r.kind == SyncKind::HomePointer) {
-            Some(self.canonical_home_gate.write().await)
+        let canonical_gate = if batch.iter().any(|r| r.kind == SyncKind::HomePointer) {
+            Some(Arc::clone(&self.canonical_home_gate).write_owned().await)
         } else {
             None
         };
-        let mut records = self.records.write().await;
-        // (kind, key) → the value held BEFORE this batch first touched it.
-        let mut touched: BTreeMap<(SyncKind, String), Option<VersionedRecord>> = BTreeMap::new();
+        let records = Arc::clone(&self.records).write_owned().await;
+        let mut next = records.clone();
+        // The keys this batch changes; `records` keeps their values before
+        // the batch until `replace_records`.
+        let mut touched: BTreeSet<(SyncKind, String)> = BTreeSet::new();
         let mut outcome = CommitOutcome::default();
-        let result = (|| -> Result<(), SyncError> {
-            for record in batch {
-                // Re-verify inside the lock: the caller's verification and
-                // the commit must not be separated by a store mutation.
-                record.verify_owner(owner)?;
-                if records.len() >= MAX_STORED_RECORDS
-                    && !records.contains_key(&(record.kind, record.key.clone()))
+        for record in batch {
+            // Re-verify inside the lock: the caller's verification and
+            // the commit must not be separated by a store mutation.
+            record.verify_owner(owner)?;
+            if next.len() >= MAX_STORED_RECORDS
+                && !next.contains_key(&(record.kind, record.key.clone()))
+            {
+                return Err(SyncError::StoreLimit(format!(
+                    "store at capacity ({MAX_STORED_RECORDS} records)"
+                )));
+            }
+            let key = (record.kind, record.key.clone());
+            let stored = next.get(&key);
+            // Equal clock with ANY differing signed bytes (different
+            // value, or the same value double-signed) is an
+            // equivocation whichever side wins the hash tie-break —
+            // surfaced, never silently merged (review R2 finding 3,
+            // extended in R5 to signature-only differences).
+            if let Some(existing) = stored {
+                if existing.clock == record.clock && existing.record_hash() != record.record_hash()
                 {
-                    return Err(SyncError::StoreLimit(format!(
-                        "store at capacity ({MAX_STORED_RECORDS} records)"
-                    )));
-                }
-                let key = (record.kind, record.key.clone());
-                let stored = records.get(&key);
-                // Equal clock with ANY differing signed bytes (different
-                // value, or the same value double-signed) is an
-                // equivocation whichever side wins the hash tie-break —
-                // surfaced, never silently merged (review R2 finding 3,
-                // extended in R5 to signature-only differences).
-                if let Some(existing) = stored {
-                    if existing.clock == record.clock
-                        && existing.record_hash() != record.record_hash()
-                    {
-                        outcome.equivocations += 1;
-                        let values_differ = existing.value != record.value;
-                        tracing::warn!(
-                            target: "x0x::owner_sync",
-                            kind = ?existing.kind,
-                            key = %existing.key,
-                            values_differ,
-                            "equal-clock equivocation resolved deterministically by record hash"
-                        );
-                    }
-                }
-                let decision = stored.map(|existing| Self::classify(&record, existing));
-                match decision {
-                    None => {
-                        // First touch of a fresh key: pre-batch value None.
-                        touched.entry(key.clone()).or_insert(None);
-                        records.insert(key, record.clone());
-                        outcome.accepted.push(record);
-                    }
-                    Some(MergeOutcome::Accepted) => {
-                        // Capture the pre-batch value ONCE (entry.or_insert
-                        // keeps the first capture even on repeat touches).
-                        touched
-                            .entry(key.clone())
-                            .or_insert_with(|| stored.cloned());
-                        records.insert(key, record.clone());
-                        outcome.accepted.push(record);
-                    }
-                    Some(MergeOutcome::Superseded) => {
-                        outcome.superseded += 1;
-                    }
+                    outcome.equivocations += 1;
+                    let values_differ = existing.value != record.value;
+                    tracing::warn!(
+                        target: "x0x::owner_sync",
+                        kind = ?existing.kind,
+                        key = %existing.key,
+                        values_differ,
+                        "equal-clock equivocation resolved deterministically by record hash"
+                    );
                 }
             }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                if outcome.accepted.is_empty() {
-                    return Ok(outcome); // nothing new — no write needed
+            match stored.map(|existing| Self::classify(&record, existing)) {
+                None | Some(MergeOutcome::Accepted) => {
+                    touched.insert(key.clone());
+                    next.insert(key, record.clone());
+                    outcome.accepted.push(record);
                 }
-                // #1542: the journal file first, then the register (see
-                // `journal_apply`). A failed append commits nothing; a
-                // later session delivers the records again.
-                let updates = match journal {
-                    Some(_) => Self::journal_updates(&records, &touched),
-                    None => Vec::new(),
-                };
-                if let Some(path) = journal.filter(|_| !updates.is_empty()) {
-                    // The intent first: after a stop between the two
-                    // writes, the journal holds lines that came from these
-                    // records, and the restart must not take them for
-                    // unpublished local issuance (see
-                    // `recover_journal_commit`). The intent holds every
-                    // accepted record of the batch, not only the journal
-                    // ones, so the recovery commits all of it or none.
-                    if let Err(e) = self.persist_journal_intent(outcome.accepted.clone()).await {
-                        Self::rollback(&mut records, &touched);
-                        return Err(e);
-                    }
-                    let owner_hex = hex::encode(owner.0);
-                    for (record, published) in &updates {
-                        if let Err(e) = self
-                            .apply_journal_value(path, &owner_hex, &record.value, published.clone())
-                            .await
-                        {
-                            Self::rollback(&mut records, &touched);
-                            return Err(SyncError::Io(format!(
-                                "failed to append synced journal line: {e}"
-                            )));
-                        }
-                    }
-                    #[cfg(test)]
-                    if self.stop_after_first_journal_write() {
-                        return Err(SyncError::Io("stopped between writes".into()));
-                    }
+                Some(MergeOutcome::Superseded) => {
+                    outcome.superseded += 1;
                 }
-                // #1545: the obligation to apply the names before the
-                // register holds them (see `pending_apply`).
-                if let Err(e) = self.add_pending_applies(&outcome.accepted).await {
-                    Self::rollback(&mut records, &touched);
-                    return Err(e);
-                }
-                match self.persist_records(&records).await {
-                    Ok(()) => {
-                        if !updates.is_empty() {
-                            self.remove_journal_intent().await;
-                        }
-                        drop(records);
-                        self.kick();
-                        Ok(outcome)
-                    }
-                    Err(e) if matches!(e, SyncError::Poisoned(_)) => {
-                        // The batch crossed the rename but was not durable:
-                        // disk already holds it — KEEP the mutations (memory
-                        // matches the advanced disk) and poison the store;
-                        // never roll memory back below an advanced disk
-                        // (review R5 finding 2).
-                        drop(records);
-                        self.poison(e.to_string());
-                        Err(e)
-                    }
-                    Err(e) => {
-                        Self::rollback(&mut records, &touched);
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => {
-                Self::rollback(&mut records, &touched);
-                Err(e)
             }
         }
+        if outcome.accepted.is_empty() {
+            return Ok((outcome, held)); // nothing new — no write needed
+        }
+        // #1542: the journal file first, then the register (see
+        // `journal_apply`). A failed append commits nothing; a later
+        // session delivers the records again.
+        let updates = match journal {
+            Some(_) => Self::journal_updates(&records, &next, &touched),
+            None => Vec::new(),
+        };
+        if let Some(path) = journal.filter(|_| !updates.is_empty()) {
+            // The intent first: after a stop between the two writes, the
+            // journal holds lines that came from these records, and the
+            // restart must not take them for unpublished local issuance
+            // (see `recover_journal_commit`). The intent holds every
+            // accepted record of the batch, not only the journal ones, so
+            // the recovery commits all of it or none.
+            held = self
+                .persist_journal_intent(held, outcome.accepted.clone())
+                .await?;
+            let owner_hex = hex::encode(owner.0);
+            for (record, published) in &updates {
+                self.apply_journal_value(path, &owner_hex, &record.value, published.clone())
+                    .await
+                    .map_err(|e| {
+                        SyncError::Io(format!("failed to append synced journal line: {e}"))
+                    })?;
+            }
+            #[cfg(test)]
+            if self.stop_after_first_journal_write() {
+                return Err(SyncError::Io("stopped between writes".into()));
+            }
+        }
+        // #1545: the obligation to apply the names before the register
+        // holds them (see `pending_apply`).
+        self.add_pending_applies(&outcome.accepted).await?;
+        let (_, mut held) = self
+            .replace_records(records, next, (canonical_gate, held))
+            .await?;
+        if !updates.is_empty() {
+            held = self.remove_journal_intent(held).await?;
+        }
+        Ok((outcome, held))
     }
 
     /// The `IssuanceJournal` records a committed batch changed: each is the
     /// key's record now, with the value the register held before the batch.
     fn journal_updates(
-        records: &BTreeMap<(SyncKind, String), VersionedRecord>,
-        touched: &BTreeMap<(SyncKind, String), Option<VersionedRecord>>,
+        before: &RecordMap,
+        after: &RecordMap,
+        touched: &BTreeSet<(SyncKind, String)>,
     ) -> Vec<(VersionedRecord, Option<SyncValue>)> {
         touched
             .iter()
-            .filter(|((kind, _), _)| *kind == SyncKind::IssuanceJournal)
-            .filter_map(|(key, previous)| {
-                let now = records.get(key)?;
-                let previous = previous.as_ref().map(|r| r.value.clone());
+            .filter(|(kind, _)| *kind == SyncKind::IssuanceJournal)
+            .filter_map(|key| {
+                let now = after.get(key)?;
+                let previous = before.get(key).map(|r| r.value.clone());
                 (previous.as_ref() != Some(&now.value)).then(|| (now.clone(), previous))
             })
             .collect()
@@ -1927,30 +1962,47 @@ impl OwnerSyncStore {
 
     /// Durably record the accepted records of a commit that is about to
     /// write `IssuanceJournal` values to the journal file and then the
-    /// whole batch to the register (#1542).
-    async fn persist_journal_intent(&self, records: Vec<VersionedRecord>) -> Result<(), SyncError> {
+    /// whole batch to the register (#1542). `held` holds `journal_apply`
+    /// until the write is done (`run_to_completion`), and comes back.
+    async fn persist_journal_intent<H: Send + 'static>(
+        &self,
+        held: H,
+        records: Vec<VersionedRecord>,
+    ) -> Result<H, SyncError> {
         let bytes = serde_json::to_vec(&PersistedRecords { records })
             .map_err(|e| SyncError::Io(format!("encode journal intent: {e}")))?;
-        Self::write_atomically(&self.dir.join(JOURNAL_INTENT_FILE), &bytes, false)
-            .await
-            .map_err(|e| match e {
-                DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
-                    SyncError::Io(format!("persist journal intent: {io}"))
-                }
-            })
+        let path = self.dir.join(JOURNAL_INTENT_FILE);
+        Self::run_to_completion(async move {
+            Self::write_atomically(&path, &bytes, false)
+                .await
+                .map_err(|e| match e {
+                    DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
+                        SyncError::Io(format!("persist journal intent: {io}"))
+                    }
+                })?;
+            Ok(held)
+        })
+        .await
     }
 
     /// Remove the journal intent once its records are in the register. A
     /// left-over intent is harmless: its recovery finds the records already
-    /// there.
-    async fn remove_journal_intent(&self) {
-        match tokio::fs::remove_file(self.dir.join(JOURNAL_INTENT_FILE)).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to remove the journal intent");
+    /// there. `held` holds `journal_apply` until the removal is done, so a
+    /// late removal cannot take the intent of a later commit; it comes
+    /// back.
+    async fn remove_journal_intent<H: Send + 'static>(&self, held: H) -> Result<H, SyncError> {
+        let path = self.dir.join(JOURNAL_INTENT_FILE);
+        Self::run_to_completion(async move {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to remove the journal intent");
+                }
             }
-        }
+            Ok(held)
+        })
+        .await
     }
 
     /// #1542: finish an interrupted commit (`recover_journal_commit`)
@@ -1962,8 +2014,8 @@ impl OwnerSyncStore {
     ///
     /// See `recover_journal_commit`.
     pub(crate) async fn recover_interrupted_commit(&self, owner: &UserId) -> Result<(), SyncError> {
-        let _journal_apply = self.journal_apply.lock().await;
-        self.recover_journal_commit(owner).await
+        let guard = Arc::clone(&self.journal_apply).lock_owned().await;
+        self.recover_journal_commit(guard, owner).await.map(drop)
     }
 
     /// Add the name records of a commit to `pending_apply` and its file.
@@ -1975,10 +2027,11 @@ impl OwnerSyncStore {
         if names.is_empty() {
             return Ok(());
         }
-        let mut pending = self.pending_apply.lock().await;
+        let pending = Arc::clone(&self.pending_apply).lock_owned().await;
         let mut next = pending.clone();
         for record in names {
             let entry = next
+                .applies
                 .entry(pending_key(record))
                 .or_insert_with(|| PendingApply {
                     record: (*record).clone(),
@@ -1993,24 +2046,16 @@ impl OwnerSyncStore {
                 entry.saved_in.clear();
             }
         }
-        self.persist_and_prune(&mut next).await?;
-        *pending = next;
-        self.bump_names_epoch();
-        Ok(())
+        next.epoch = next.epoch.wrapping_add(1);
+        self.replace_pending(pending, next).await
     }
 
-    /// Change `names_epoch`. The caller holds `pending_apply`.
-    fn bump_names_epoch(&self) {
-        self.names_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// #1545: the generation of the pending applies (`names_epoch`). The
-    /// reconcile reads it after its apply step and before it reads the
-    /// live names, and passes it to [`Self::mint_live_name`].
+    /// #1545: the generation of the pending applies
+    /// (`PendingApplies::epoch`). The reconcile reads it after its apply
+    /// step and before it reads the live names, and passes it to
+    /// [`Self::mint_live_name`].
     pub(crate) async fn names_epoch(&self) -> u64 {
-        let _pending = self.pending_apply.lock().await;
-        self.names_epoch.load(std::sync::atomic::Ordering::Acquire)
+        self.pending_apply.lock().await.epoch
     }
 
     /// Whether `record` is the winner in `records`.
@@ -2023,38 +2068,50 @@ impl OwnerSyncStore {
             .is_some_and(|stored| stored.record_hash() == record.record_hash())
     }
 
-    /// Write the owed records of `pending` durably to `APPLY_PENDING_FILE`,
-    /// and then remove the discharged ones from `pending` (see
-    /// `PendingApply::discharged`). An empty set is written too, not
-    /// unlinked: an unlink without a directory fsync can come back after a
-    /// crash with the obligations it removed.
+    /// Write the owed records of `next` durably to `APPLY_PENDING_FILE`,
+    /// and then make `next`, without its discharged records, the pending
+    /// applies (see `PendingApply::discharged`). An empty set is written
+    /// too, not unlinked: an unlink without a directory fsync can come
+    /// back after a crash with the obligations it removed.
+    ///
+    /// The write and the update run to their end in one task
+    /// (`run_to_completion`), which owns `pending` until then. A caller
+    /// cancelled during the write stops only its wait: no later change of
+    /// the pending applies can start before the write lands, and memory
+    /// ends as the disk holds it (Codex review of #1545, b17cd8bf).
     ///
     /// # Errors
     ///
     /// [`SyncError::Io`] when the file cannot be written; `pending` does
     /// not change.
-    async fn persist_and_prune(
+    async fn replace_pending(
         &self,
-        pending: &mut BTreeMap<PendingKey, PendingApply>,
+        mut pending: tokio::sync::OwnedMutexGuard<PendingApplies>,
+        mut next: PendingApplies,
     ) -> Result<(), SyncError> {
         let path = self.dir.join(APPLY_PENDING_FILE);
         let bytes = serde_json::to_vec(&PersistedPendingApplies {
-            applies: pending
+            applies: next
+                .applies
                 .values()
                 .filter(|p| !p.discharged)
                 .cloned()
                 .collect(),
         })
         .map_err(|e| SyncError::Io(format!("encode pending applies: {e}")))?;
-        Self::write_atomically(&path, &bytes, false)
-            .await
-            .map_err(|e| match e {
-                DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
-                    SyncError::Io(format!("persist pending applies: {io}"))
-                }
-            })?;
-        pending.retain(|_, p| !p.discharged);
-        Ok(())
+        Self::run_to_completion(async move {
+            Self::write_atomically(&path, &bytes, false)
+                .await
+                .map_err(|e| match e {
+                    DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
+                        SyncError::Io(format!("persist pending applies: {io}"))
+                    }
+                })?;
+            next.applies.retain(|_, p| !p.discharged);
+            *pending = next;
+            Ok(())
+        })
+        .await
     }
 
     /// #1545: the committed name records that live daemon state may not
@@ -2067,6 +2124,7 @@ impl OwnerSyncStore {
             .pending_apply
             .lock()
             .await
+            .applies
             .values()
             .filter(|p| !p.discharged)
             .map(|p| p.record.clone())
@@ -2092,6 +2150,7 @@ impl OwnerSyncStore {
         let pending = self.pending_apply.lock().await;
         records.iter().any(|(record, _)| {
             pending
+                .applies
                 .get(&pending_key(record))
                 .is_some_and(|entry| !entry.discharged)
         })
@@ -2123,11 +2182,11 @@ impl OwnerSyncStore {
         names: &SyncProfileNames,
     ) -> Result<(), SyncError> {
         let saved = SavedNames::from(names);
-        let mut pending = self.pending_apply.lock().await;
+        let pending = Arc::clone(&self.pending_apply).lock_owned().await;
         let mut next = pending.clone();
-        let mut changed = next.values().any(|p| p.discharged);
+        let mut changed = next.applies.values().any(|p| p.discharged);
         for (record, _) in folded.iter().filter(|(_, applied)| *applied) {
-            if let Some(entry) = next.get_mut(&pending_key(record)) {
+            if let Some(entry) = next.applies.get_mut(&pending_key(record)) {
                 if !entry.discharged && !entry.saved_in.contains(&saved) {
                     entry.saved_in.push(saved.clone());
                     changed = true;
@@ -2137,9 +2196,7 @@ impl OwnerSyncStore {
         if !changed {
             return Ok(());
         }
-        self.persist_and_prune(&mut next).await?;
-        *pending = next;
-        Ok(())
+        self.replace_pending(pending, next).await
     }
 
     /// #1545: remove `done` from the pending applies, after the daemon has
@@ -2171,13 +2228,13 @@ impl OwnerSyncStore {
         #[cfg(test)]
         Self::take_pause(&self.discharge_pause).await;
         let records = self.records.read().await;
-        let mut pending = self.pending_apply.lock().await;
+        let mut pending = Arc::clone(&self.pending_apply).lock_owned().await;
         let mut retired = false;
         for (record, applied) in done {
             if !applied && Self::is_winner(&records, record) {
                 continue;
             }
-            if let Some(entry) = pending.get_mut(&pending_key(record)) {
+            if let Some(entry) = pending.applies.get_mut(&pending_key(record)) {
                 if !entry.discharged {
                     entry.discharged = true;
                     retired = true;
@@ -2185,9 +2242,9 @@ impl OwnerSyncStore {
             }
         }
         if retired {
-            self.bump_names_epoch();
+            pending.epoch = pending.epoch.wrapping_add(1);
         }
-        if !pending.values().any(|p| p.discharged) {
+        if !pending.applies.values().any(|p| p.discharged) {
             return Ok(());
         }
         #[cfg(test)]
@@ -2197,7 +2254,8 @@ impl OwnerSyncStore {
         {
             return Err(SyncError::Io("injected discharge failure".into()));
         }
-        self.persist_and_prune(&mut pending).await
+        let next = pending.clone();
+        self.replace_pending(pending, next).await
     }
 
     /// #1545: remove the pending applies that a durable profile with
@@ -2213,9 +2271,9 @@ impl OwnerSyncStore {
     pub(crate) async fn settle_saved(&self, durable: &SyncProfileNames) -> Result<(), SyncError> {
         let saved = SavedNames::from(durable);
         let _records = self.records.read().await;
-        let mut pending = self.pending_apply.lock().await;
+        let mut pending = Arc::clone(&self.pending_apply).lock_owned().await;
         let mut settled = false;
-        for entry in pending.values_mut() {
+        for entry in pending.applies.values_mut() {
             if !entry.discharged && entry.saved_in.contains(&saved) {
                 entry.discharged = true;
                 settled = true;
@@ -2224,14 +2282,16 @@ impl OwnerSyncStore {
         if !settled {
             return Ok(());
         }
-        self.bump_names_epoch();
-        self.persist_and_prune(&mut pending).await
+        pending.epoch = pending.epoch.wrapping_add(1);
+        let next = pending.clone();
+        self.replace_pending(pending, next).await
     }
 
     /// #1542: finish a commit that stopped after its journal intent was
-    /// durable but before its register write. The caller holds
-    /// `journal_apply`, and calls this before any other change of the
-    /// `IssuanceJournal` register or any reconcile of the journal.
+    /// durable but before its register write. `guard` holds
+    /// `journal_apply`, and comes back on success. The caller calls this
+    /// before any other change of the `IssuanceJournal` register or any
+    /// reconcile of the journal.
     ///
     /// Without this, the journal can hold a line that came from the
     /// register (from another device) while the register still holds the
@@ -2248,16 +2308,20 @@ impl OwnerSyncStore {
     /// the commit when the intent's records do not verify or do not fit.
     /// The intent stays for the next attempt. Only an intent whose records
     /// verify under another owner is dropped.
-    async fn recover_journal_commit(&self, owner: &UserId) -> Result<(), SyncError> {
+    async fn recover_journal_commit(
+        &self,
+        guard: JournalGuard,
+        owner: &UserId,
+    ) -> Result<JournalGuard, SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
         let Some(journal) = self.journal_file.get() else {
-            return Ok(());
+            return Ok(guard);
         };
         let bytes = match tokio::fs::read(self.dir.join(JOURNAL_INTENT_FILE)).await {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(guard),
             Err(e) => return Err(SyncError::Io(format!("read journal intent: {e}"))),
         };
         // An undecodable intent fails closed and stays in place. Without
@@ -2267,44 +2331,30 @@ impl OwnerSyncStore {
         let batch = serde_json::from_slice::<PersistedRecords>(&bytes)
             .map_err(|e| SyncError::Io(format!("undecodable journal intent: {e}")))?
             .records;
-        match self.commit_locked(batch, owner, Some(journal)).await {
-            Ok(_) => {
-                // The commit added the recovered names to `pending_apply`.
-                self.remove_journal_intent().await;
-                Ok(())
-            }
-            Err(SyncError::OwnerMismatch) => {
+        // The commit verifies each record in order and stops at the first
+        // failure; the same check here decides the intent's fate first,
+        // while `guard` is still held for its removal.
+        match batch.iter().find_map(|r| r.verify_owner(owner).err()) {
+            None => {}
+            Some(SyncError::OwnerMismatch) => {
                 // The records verify, but under another owner (after an
                 // owner rotation): no session would deliver them either.
                 // `verify_owner` checks the signature first, so a changed
                 // record cannot get here.
                 tracing::warn!(target: "x0x::owner_sync", "dropped a journal intent of a previous owner");
-                self.remove_journal_intent().await;
-                Ok(())
+                return self.remove_journal_intent(guard).await;
             }
-            // Any other failure (a bad signature, a kind mismatch, a full
-            // store, I/O) fails closed and keeps the intent, as for an
-            // undecodable intent.
-            Err(e) => Err(e),
+            // Any other failure (a bad signature, a kind mismatch) fails
+            // closed and keeps the intent, as for an undecodable intent.
+            Some(e) => return Err(e),
         }
-    }
-
-    /// Restore the in-memory map to its pre-batch state: every touched key
-    /// returns to the value captured on its FIRST touch in the batch.
-    fn rollback(
-        records: &mut BTreeMap<(SyncKind, String), VersionedRecord>,
-        touched: &BTreeMap<(SyncKind, String), Option<VersionedRecord>>,
-    ) {
-        for ((kind, key), previous) in touched {
-            match previous {
-                Some(prev) => {
-                    records.insert((*kind, key.clone()), prev.clone());
-                }
-                None => {
-                    records.remove(&(*kind, key.clone()));
-                }
-            }
-        }
+        // A failure here (a full store, I/O) fails closed and keeps the
+        // intent too. The commit adds the recovered names to
+        // `pending_apply`.
+        let (_, guard) = self
+            .commit_locked(batch, owner, Some(journal), guard)
+            .await?;
+        self.remove_journal_intent(guard).await
     }
 
     /// Merge one verified inbound record — a single-record batch commit.
@@ -2398,12 +2448,12 @@ impl OwnerSyncStore {
         // #449 r3 P2: the LOCAL publisher of a canonical Home pointer is
         // fenced on the same gate as inbound commits (lock order: gate →
         // records). Other kinds are unaffected.
-        let _canonical_gate = if kind == SyncKind::HomePointer {
-            Some(self.canonical_home_gate.write().await)
+        let canonical_gate = if kind == SyncKind::HomePointer {
+            Some(Arc::clone(&self.canonical_home_gate).write_owned().await)
         } else {
             None
         };
-        let mut records = self.records.write().await;
+        let records = Arc::clone(&self.records).write_owned().await;
         let stored = records.get(&(kind, key.to_string()));
         if stored.is_some_and(|r| r.value == *desired) {
             return Ok(());
@@ -2411,6 +2461,7 @@ impl OwnerSyncStore {
         if let Some(epoch) = live_epoch {
             let pending = self.pending_apply.lock().await;
             let owed = pending
+                .applies
                 .values()
                 .filter(|p| !p.discharged)
                 .any(|p| Self::is_winner(&records, &p.record));
@@ -2418,7 +2469,7 @@ impl OwnerSyncStore {
                 // The next pass applies the owed names first.
                 return Ok(());
             }
-            if self.names_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+            if pending.epoch != epoch {
                 drop(pending);
                 drop(records);
                 self.kick();
@@ -2433,33 +2484,11 @@ impl OwnerSyncStore {
         };
         let record = VersionedRecord::sign(kind, key, desired, clock, owner)
             .map_err(|e| SyncError::BadSignature(format!("mint: {e}")))?;
-        let previous = records.insert((kind, key.to_string()), record);
-        match self.persist_records(&records).await {
-            Ok(()) => {
-                drop(records);
-                self.kick();
-                Ok(())
-            }
-            Err(e) if matches!(e, SyncError::Poisoned(_)) => {
-                // Disk already holds the minted record: keep it and poison.
-                drop(records);
-                self.poison(e.to_string());
-                Err(e)
-            }
-            Err(e) => {
-                // Pre-rename failure: roll back so memory matches the
-                // unchanged disk.
-                match previous {
-                    Some(prev) => {
-                        records.insert((kind, key.to_string()), prev);
-                    }
-                    None => {
-                        records.remove(&(kind, key.to_string()));
-                    }
-                }
-                Err(e)
-            }
-        }
+        let mut next = records.clone();
+        next.insert((kind, key.to_string()), record);
+        self.replace_records(records, next, canonical_gate)
+            .await
+            .map(drop)
     }
 
     /// Hold the canonical-Home admission gate for reading (#449 r3 P2).
@@ -2592,14 +2621,15 @@ impl OwnerSyncStore {
         // #449 r3 P2: the unverified test writer participates in the gate
         // too, so a test cannot accidentally prove a fence that production
         // writers honour but this back door bypasses.
-        let _canonical_gate = if record.kind == SyncKind::HomePointer {
-            Some(self.canonical_home_gate.write().await)
+        let canonical_gate = if record.kind == SyncKind::HomePointer {
+            Some(Arc::clone(&self.canonical_home_gate).write_owned().await)
         } else {
             None
         };
-        let mut records = self.records.write().await;
-        records.insert((record.kind, record.key.clone()), record);
-        let _ = self.persist_records(&records).await;
+        let records = Arc::clone(&self.records).write_owned().await;
+        let mut next = records.clone();
+        next.insert((record.kind, record.key.clone()), record);
+        let _ = self.replace_records(records, next, canonical_gate).await;
     }
 }
 
@@ -4143,11 +4173,17 @@ async fn mint_journal_lines(
     owner_kp: &UserKeypair,
     machine: MachineId,
 ) {
-    let _journal_apply = store.journal_apply.lock().await;
-    if let Err(e) = store.recover_journal_commit(&owner_kp.user_id()).await {
-        tracing::warn!(target: "x0x::owner_sync", error = %e, "journal commit recovery failed");
-        return;
-    }
+    let guard = Arc::clone(&store.journal_apply).lock_owned().await;
+    let _journal_apply = match store
+        .recover_journal_commit(guard, &owner_kp.user_id())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "journal commit recovery failed");
+            return;
+        }
+    };
     let owner_hex = hex::encode(owner_kp.user_id().0);
     // A durable read: a line a host crash can take back must not reach the
     // register first.
