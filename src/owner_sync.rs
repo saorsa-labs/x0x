@@ -4377,7 +4377,7 @@ mod tests {
     /// enrollment store installed. The owner-connect re-announcement is
     /// left off, and `join_network` is not called, so the discovery cache
     /// stays empty and the IPv6 route probe does not run.
-    async fn live_owner_device(
+    pub(in crate::owner_sync) async fn live_owner_device(
         dir: &Path,
         name: &str,
         owner_seed: [u8; 32],
@@ -4872,7 +4872,7 @@ mod tests {
         );
     }
 
-    fn install_loopback_socket_boundary() {
+    pub(in crate::owner_sync) fn install_loopback_socket_boundary() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         socket_boundary::install();
     }
@@ -7036,6 +7036,196 @@ mod issuance_journal_sync_tests {
             local.stored_value(SyncKind::OwnerProfile, "owner").await,
             Some(profile),
             "the recovery must commit the rest of the batch"
+        );
+    }
+
+    /// A daemon view with a live owner profile name, for the recovery
+    /// tests: `profile_names` reads it, `apply_names` replaces it.
+    struct ProfileView(std::sync::Mutex<Option<String>>);
+
+    impl ProfileView {
+        fn human_name(&self) -> Option<String> {
+            self.0.lock().expect("view").clone()
+        }
+    }
+
+    impl SyncDaemonView for ProfileView {
+        fn profile_names(&self) -> SyncProfileNames {
+            SyncProfileNames {
+                human_name: self.human_name(),
+                ..SyncProfileNames::default()
+            }
+        }
+        fn home_pointer(&self) -> Option<SyncValue> {
+            None
+        }
+        fn home_pointer_definitive(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<SyncValue>, ()>> + Send>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn apply_names(
+            &self,
+            human_name: Option<String>,
+            _display_name: Option<String>,
+            _machine_name: Option<String>,
+        ) {
+            if human_name.is_some() {
+                *self.0.lock().expect("view") = human_name;
+            }
+        }
+        fn canonical_pointer_is_retired(&self, _group_id: &str) -> bool {
+            false
+        }
+    }
+
+    /// A remote store's signed records for the mixed batch of the recovery
+    /// tests: a journal renewal and the owner profile `name` at version 2.
+    async fn remote_mixed_batch(
+        remote: &OwnerSyncStore,
+        owner: &UserKeypair,
+        name: &str,
+    ) -> (VersionedRecord, VersionedRecord) {
+        use super::tests::machine;
+        let journal = remote_record(remote, owner, &journal_value("d2", 100, 9_000)).await;
+        for human_name in ["first", name] {
+            remote
+                .mint(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    &SyncValue::OwnerProfile {
+                        human_name: Some(human_name.into()),
+                    },
+                    owner,
+                    machine(2),
+                )
+                .await
+                .expect("remote profile mint");
+        }
+        let profile = remote
+            .records_snapshot()
+            .await
+            .into_iter()
+            .find(|r| r.kind == SyncKind::OwnerProfile)
+            .expect("remote profile record");
+        (journal, profile)
+    }
+
+    /// Codex review of #1545 (a19203d), P2: a mixed journal and profile
+    /// commit fails after its journal intent is durable. The same records
+    /// then arrive again in a session. The recovery in that commit commits them, so
+    /// the session's own batch is superseded. The session must still apply
+    /// the recovered profile to the daemon.
+    #[tokio::test]
+    async fn a_session_applies_the_records_its_recovery_commits() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = Arc::new(
+            OwnerSyncStore::load(&dir.path().join("remote"))
+                .await
+                .expect("remote store"),
+        );
+        let (local, _) = journal_device(&dir.path().join("local")).await;
+        super::tests::cross_enroll_for_tests(&local, &remote, &owner).await;
+        let (rj, rp) = remote_mixed_batch(&remote, &owner, "Alice").await;
+        local
+            .fail_journal_append
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed = local.commit_batch(vec![rj, rp], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
+        local
+            .fail_journal_append
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (mut c_recv, mut c_send) = tokio::io::split(server);
+        let (mut r_recv, mut r_send) = tokio::io::split(client);
+        let responder = {
+            let (remote, owner) = (Arc::clone(&remote), owner_kp(7));
+            tokio::spawn(async move {
+                run_sync_session(
+                    &mut r_send,
+                    &mut r_recv,
+                    &remote,
+                    &owner,
+                    &machine(2),
+                    &machine(1),
+                    |_| {},
+                )
+                .await
+                .expect("responder")
+            })
+        };
+        let mut applied = Vec::new();
+        run_sync_session(
+            &mut c_send,
+            &mut c_recv,
+            &local,
+            &owner,
+            &machine(1),
+            &machine(2),
+            |record| applied.push(record.value.clone()),
+        )
+        .await
+        .expect("initiator");
+        responder.await.expect("responder task");
+        assert!(
+            applied.contains(&SyncValue::OwnerProfile {
+                human_name: Some("Alice".into())
+            }),
+            "the session must apply the recovered profile: {applied:?}"
+        );
+    }
+
+    /// Codex review of #1545 (a19203d), P2: after a mixed journal and
+    /// profile commit fails after its journal intent is durable, the
+    /// reconcile pass recovers it. The live profile must then show the recovered name,
+    /// and the next pass must not publish the old live name over it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcile_applies_a_recovered_profile_to_the_daemon() {
+        super::tests::install_loopback_socket_boundary();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = 0x86;
+        let owner = super::tests::owner_kp(seed);
+        let (_agent, service) =
+            super::tests::live_owner_device(dir.path(), "alice", [seed; 32]).await;
+        let view = Arc::new(ProfileView(std::sync::Mutex::new(Some("Old".into()))));
+        service.attach_view(Arc::clone(&view) as Arc<dyn SyncDaemonView>);
+        service.reconcile_local_state().await.expect("first pass");
+
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (rj, rp) = remote_mixed_batch(&remote, &owner, "Alice").await;
+        let store = service.store();
+        store
+            .fail_journal_append
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed = store.commit_batch(vec![rj, rp], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
+        store
+            .fail_journal_append
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        for _ in 0..2 {
+            service.reconcile_local_state().await.expect("pass");
+        }
+        let alice = SyncValue::OwnerProfile {
+            human_name: Some("Alice".into()),
+        };
+        assert_eq!(
+            view.human_name().as_deref(),
+            Some("Alice"),
+            "the daemon must show the recovered profile"
+        );
+        assert_eq!(
+            store.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(alice),
+            "the reconcile must not publish the old live name"
         );
     }
 }

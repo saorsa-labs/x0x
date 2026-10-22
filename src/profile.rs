@@ -422,7 +422,7 @@ impl IssuedCertRecord {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
-        if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        if let Err(e) = Self::rename(&tmp, path).await {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(e);
         }
@@ -458,6 +458,18 @@ impl IssuedCertRecord {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Rename `from` to `to` on the blocking pool.
+    async fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+        let (from, to) = (from.to_path_buf(), to.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            journal_faults::before_rename(&to);
+            std::fs::rename(&from, &to)
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     /// Write `bytes` to a new file at `path` and fsync it.
@@ -602,6 +614,32 @@ pub(crate) mod journal_faults {
         FAILURES.lock().unwrap().insert(path.to_path_buf());
     }
 
+    type BlockingPause = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+    static RENAME_PAUSES: Mutex<BTreeMap<PathBuf, BlockingPause>> = Mutex::new(BTreeMap::new());
+
+    /// Hold the next rename to `path` on the blocking pool, before it
+    /// lands: it signals `reached` and then waits for `release`. A caller
+    /// that is cancelled meanwhile does not stop the rename.
+    pub(crate) fn pause_next_rename(
+        path: &Path,
+        reached: oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        RENAME_PAUSES
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (reached, release));
+    }
+
+    pub(super) fn before_rename(path: &Path) {
+        let pause = RENAME_PAUSES.lock().unwrap().remove(path);
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+    }
+
     pub(super) async fn after_rename(path: &Path) -> std::io::Result<()> {
         let pause = PAUSES.lock().unwrap().remove(path);
         if let Some((reached, release)) = pause {
@@ -620,6 +658,69 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Codex review of #1545 (a19203d), P2: an append is cancelled while
+    /// its rename is in flight on the blocking pool. A durable read then
+    /// runs before the rename lands. The read must not mark the journal
+    /// durable while the cancelled rename can still put unsynced bytes in
+    /// place: every line a durable read returns must survive a host crash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_append_cannot_land_unsynced_bytes_under_a_durable_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CERT_JOURNAL_FILE);
+        let line = |digest: &str| IssuedCertRecord {
+            user_id: "aa".to_string(),
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(5_000),
+            mode: CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        };
+        IssuedCertRecord::append(&path, &line("d1")).await.unwrap();
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        journal_faults::pause_next_rename(&path, reached_tx, release_rx);
+        let issuance = {
+            let (path, d2) = (path.clone(), line("d2"));
+            tokio::spawn(async move { IssuedCertRecord::append(&path, &d2).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the append reaches its rename")
+            .unwrap();
+        // The caller cancels the append; its rename is still in flight.
+        issuance.abort();
+        let _ = issuance.await;
+
+        // A durable read: before the rename lands if nothing holds it off.
+        let mut read = {
+            let path = path.clone();
+            tokio::spawn(async move { IssuedCertRecord::load_durable(&path).await })
+        };
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), &mut read).await;
+        release_tx.send(()).unwrap();
+        match first {
+            Ok(done) => {
+                done.unwrap().unwrap();
+            }
+            Err(_) => {
+                read.await.unwrap().unwrap();
+            }
+        }
+        // Let the cancelled rename land.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let published = IssuedCertRecord::load_durable(&path).await.unwrap();
+        crash_sim::crash(&[&path]);
+        let after = IssuedCertRecord::load(&path).await;
+        assert_eq!(
+            after, published,
+            "a host crash must keep every line a durable read returned"
+        );
+    }
 
     /// Codex review of #1545 (69fe33e): a writer that decides from the
     /// journal (`append_when`) and an issuance append must not interleave.
