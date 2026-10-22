@@ -2882,4 +2882,159 @@ pub(super) mod restart_tests {
         restarted.agent.shutdown().await;
         Ok(())
     }
+
+    /// The self-rebind route (§4a) with this node's own renewal.
+    async fn self_rebind(
+        state: &Arc<AppState>,
+        stable: &str,
+        renewal: &AgentCertificate,
+    ) -> Result<(StatusCode, serde_json::Value)> {
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let request = RebindCertificateRequest {
+            certificate: Some(BASE64.encode(renewal.to_storage_bytes()?)),
+        };
+        let (status, Json(body)) = rebind_member_certificate(
+            State(Arc::clone(state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((stable.to_string(), local_hex)),
+            Some(Json(request)),
+        )
+        .await;
+        Ok((status, body))
+    }
+
+    /// #1508 Codex P1 F3 (ADR 0110 §2, §4a): the immediate self-rebind
+    /// passes the same head-sync gate as the background rebinds. A
+    /// restart restored a rebind delivery, so the worker keeps a head
+    /// round for the group; the survivor then reports a head this node
+    /// does not have (the catch-up response handler's call). This replica
+    /// is stale: the route must not seal. It holds the rebind with
+    /// `waiting_for_head_sync`, and the worker commits it once the
+    /// survivor reports the local head.
+    #[tokio::test]
+    async fn a_self_rebind_waits_for_the_head_sync() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let survivor = AgentKeypair::generate()?;
+        let survivor_id = survivor.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let frame = Arc::new(b"X0XCRB1\0restored frame".to_vec());
+        let info = {
+            let author = offline_daemon(dir.path(), None).await?;
+            let me = author.agent.identity().agent_keypair();
+            let info = certified_group(&owner, me, &[&survivor])?;
+            hold_persisted(&author, &info).await?;
+            let at = (info.state_revision, info.state_hash.as_str());
+            let ext = replay_log::REBIND_EXTENSION;
+            let stable = info.stable_group_id();
+            assert!(replay_log::write_planned(&author, ext, held, stable, at, &frame).await);
+            author.agent.shutdown().await;
+            info
+        };
+        let stable = info.stable_group_id().to_string();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the restarted state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // D129: the survivor's current verified advert sets the bit.
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            survivor_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        let worker_step = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            async move {
+                super::super::revocation_eviction_pass(&state).await;
+                drive(&state).await;
+            }
+        };
+        // The first step restores the delivery; the next pass opens the
+        // group's head round and asks the survivor.
+        worker_step(&state).await;
+        worker_step(&state).await;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .head_rounds
+                .get(&stable)
+                .is_some_and(|round| round.asked.contains(survivor_id.as_bytes())),
+            "the worker pass opened a head round and asked the survivor"
+        );
+        // The survivor answers the catch-up with a head this node lacks.
+        let unknown = "f0".repeat(32);
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&stable),
+            &survivor_hex,
+            Some(&unknown),
+        )
+        .await;
+        assert!(
+            !super::super::group_head_synced(&state, &stable).await,
+            "the replica holds unresolved higher-head evidence"
+        );
+
+        let me = state.agent.identity().agent_keypair();
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, me, Some(now_unix_ms() / 1000 + 1200))?;
+        let (status, body) = self_rebind(&state, &stable, &renewal).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], WaitingCause::WaitingForHeadSync.as_str());
+        assert_eq!(
+            head_of(&state, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "a stale replica seals nothing"
+        );
+        worker_step(&state).await;
+        assert_eq!(
+            head_of(&state, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the held self-rebind waits while the evidence is unresolved"
+        );
+
+        // The survivor reports the local head: synced, the rebind commits.
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&stable),
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        worker_step(&state).await;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let after = state
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .cloned()
+            .context("the group")?;
+        assert_eq!(after.state_revision, info.state_revision + 1);
+        assert_eq!(
+            after.members_v2[&local_hex].certificate_digest.as_deref(),
+            Some(x0x::groups::owner_cert::certificate_digest_hex(&renewal).as_str()),
+            "the held self-rebind committed after the head sync"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
 }
