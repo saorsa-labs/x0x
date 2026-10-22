@@ -961,7 +961,11 @@ open the sync gate; non-enrolled machines are refused at stream accept.
 omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
 lifetime; omitted = until deleted). Response: `machine_id`, `enrolled_at_ms`,
 `expires_at_ms` (null = no expiry), `device_count`. A persistence failure is a
-`500` — success is never reported on a swallowed write.
+`500` — success is never reported on a swallowed write. A `409
+enrollment_tombstoned` means the machine has an unenroll tombstone at or after
+this enrollment's `enrolled_at_ms` (it was deleted after being enrolled, or
+the enrollment is a restore/replay): re-enroll with a freshly issued
+enrollment whose `enrolled_at_ms` is strictly later than the delete time.
 
 **GET /owner/machines (#1383, M1 census)** — the owner's machine census over
 owner-sync. One row per enrolled device with its last-sync status; the local
@@ -1017,10 +1021,18 @@ synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
 boundary), so a synced roster row is not itself mint-capable for riders.
 
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
-machine is refused; existing streams are not torn down mid-flight. `404` when
-the machine is not enrolled; `400` for a malformed id — but the owner gate runs
-FIRST: on a daemon with no owner identity the DELETE answers `409 no owner
-identity configured` regardless of the id's shape.
+machine is refused, and a live session from it stops at its next admission
+re-check (phase or page boundary, or before its commit — #1055). The DELETE
+also writes a durable unenroll tombstone (persisted in
+`<data_dir>/sync/unenroll_tombstones.json`, a versioned envelope) — including
+on the `404` (not enrolled) path — that refuses any later enroll, restore or
+replay whose `enrolled_at_ms` is at or before the delete time; re-enrolling
+requires a freshly issued enrollment with a strictly later `enrolled_at_ms`.
+A corrupt tombstone file or an unknown envelope version fails the daemon
+load closed — never a silent fallback to an empty tombstone store. `404` when
+the machine is not enrolled; `400` for a malformed id — but the owner gate
+runs FIRST: on a daemon with no owner identity the DELETE answers `409 no
+owner identity configured` regardless of the id's shape.
 
 ## Placement and agent key-move (ADR-0043)
 
