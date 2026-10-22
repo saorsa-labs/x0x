@@ -633,11 +633,27 @@ pub(in crate::server) async fn list_kv_keys(
 }
 
 /// PUT /stores/:id/:key
+/// ADR 0110 §4 and §4b(3): a put or delete on a group's store (topic
+/// `x0x/group/<gid>/kv/<id>`) is a member send on every plane. While
+/// verified revocations cover every admin seat of that group, the route
+/// refuses it with the typed state, before the store's plane decides how
+/// to publish it (#1508 r6: a `SignedPublic` store took the write).
+async fn group_store_write_refusal(
+    state: &AppState,
+    topic: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let (group_id, _) = topic.strip_prefix("x0x/group/")?.split_once("/kv/")?;
+    super::named_groups::s4_no_eligible_admin_refusal(state, group_id).await
+}
+
 pub(in crate::server) async fn put_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<PutValueRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = group_store_write_refusal(&state, &id).await {
+        return refusal;
+    }
     let handle = {
         let stores = state.kv_stores.read().await;
         let Some(handle) = stores.get(&id) else {
@@ -779,6 +795,9 @@ pub(in crate::server) async fn delete_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = group_store_write_refusal(&state, &id).await {
+        return refusal;
+    }
     let handle = {
         let stores = state.kv_stores.read().await;
         let Some(handle) = stores.get(&id) else {
