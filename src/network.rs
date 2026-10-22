@@ -4947,17 +4947,25 @@ impl NetworkNode {
     }
 
     /// The address `generation` of `peer` was observed on, if any
-    /// (#1112, round 11).
+    /// (#1112, round 11; read-time expiry, round 16: an entry past
+    /// [`SESSION_ADDR_LEDGER_TTL`] reads as absent even when no later
+    /// write pruned it).
     fn session_addr_for(&self, peer: &AntPeerId, generation: u64) -> Option<SocketAddr> {
-        let ledger = self
+        let now = Instant::now();
+        let mut ledger = self
             .session_addr_ledger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        ledger
-            .get(peer)?
+        let entries = ledger.get_mut(peer)?;
+        entries.retain(|(_, _, at)| now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL);
+        let addr = entries
             .iter()
             .find(|(gen, _, _)| *gen == generation)
-            .map(|(_, addr, _)| *addr)
+            .map(|(_, addr, _)| *addr);
+        if entries.is_empty() {
+            ledger.remove(peer);
+        }
+        addr
     }
 
     /// Ledger an observed connection (#1112, round 11): the answered
@@ -4965,10 +4973,21 @@ impl NetworkNode {
     /// from — the dial seams and the accept loop, so id-based dials and
     /// inbound connections (which never pass the address-dial seam) leave
     /// source-session evidence the frame guard can use after the session
-    /// closes.
+    /// closes. Round 16: the current session must still sit on the
+    /// observed address — else the dial's connection was replaced before
+    /// this write and the current generation belongs to a different
+    /// connection.
     fn note_observed_connection(&self, node: &LinkNode, peer: &AntPeerId, addr: SocketAddr) {
+        let observed = normalize_v4_mapped_addr(addr);
+        let still_on_observed = node
+            .session_connection(peer)
+            .and_then(|conn| conn.remote_address())
+            .is_some_and(|current| normalize_v4_mapped_addr(current) == observed);
+        if !still_on_observed {
+            return;
+        }
         if let Some(generation) = node.current_connection_generation(peer) {
-            self.note_session_address(*peer, generation, addr);
+            self.note_session_address(*peer, generation, observed);
         }
     }
 
@@ -5027,14 +5046,26 @@ impl NetworkNode {
         self.any_live_seed_pin_rejection_for(peer_id.0) || self.peer_has_session_evidence(peer_id)
     }
 
-    /// Whether the ledger holds ANY session evidence for `peer` (#1112,
-    /// round 14). The ledger records seed-address sessions only, so this
-    /// is "the pins already implicate this peer".
+    /// Whether the ledger holds any UNEXPIRED session evidence for
+    /// `peer` (#1112, rounds 14-16). The ledger records seed-address
+    /// sessions only, so this is "the pins already implicate this peer";
+    /// an idle peer's evidence lapses on [`SESSION_ADDR_LEDGER_TTL`] at
+    /// read time, so implication cannot outlive the bound.
     fn peer_has_session_evidence(&self, peer_id: &AntPeerId) -> bool {
-        self.session_addr_ledger
+        let now = Instant::now();
+        let mut ledger = self
+            .session_addr_ledger
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(peer_id)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entries) = ledger.get_mut(peer_id) else {
+            return false;
+        };
+        entries.retain(|(_, _, at)| now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL);
+        let implicated = !entries.is_empty();
+        if !implicated {
+            ledger.remove(peer_id);
+        }
+        implicated
     }
 
     /// [`Self::seed_pin_rejects_current_session`] for callers that hold
@@ -6436,7 +6467,14 @@ impl NetworkNode {
                             .session_connection(peer_id)
                             .and_then(|conn| conn.remote_address())
                         {
-                            plane_node.note_session_address(*peer_id, *source_generation, addr);
+                            // Round 16: re-verify after the address read —
+                            // a replacement between the two reads would
+                            // describe a different connection.
+                            if node_ref.current_connection_generation(peer_id)
+                                == Some(*source_generation)
+                            {
+                                plane_node.note_session_address(*peer_id, *source_generation, addr);
+                            }
                         }
                     }
                 }
@@ -6799,8 +6837,20 @@ impl NetworkNode {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let (peer, ant_quic::PeerLifecycleEvent::Established { generation }) = event else {
-                    continue;
+                // Round 16: a connection's FIRST registration emits
+                // `Established`; subsequent registrations (promoted or
+                // re-dialled connections) emit `Replaced` with the NEW
+                // generation — ledger both, or a replacement can lose its
+                // source-address evidence even when the watcher processes
+                // every event.
+                let (peer, generation) = match event {
+                    (peer, ant_quic::PeerLifecycleEvent::Established { generation }) => {
+                        (peer, generation)
+                    }
+                    (peer, ant_quic::PeerLifecycleEvent::Replaced { new_generation, .. }) => {
+                        (peer, new_generation)
+                    }
+                    _ => continue,
                 };
                 if dial_pin_table().is_empty() {
                     continue;
@@ -6941,19 +6991,31 @@ impl NetworkNode {
                             ant_quic::TransportAddr::Udp(addr) => Some(addr),
                             _ => None,
                         };
-                        // #1112 (round 11): inbound connections never pass
-                        // the dial seam — leave source-session evidence
-                        // for the frame guard.
+                        // #1112 (round 11, validated round 16): inbound
+                        // connections never pass the dial seam — leave
+                        // source-session evidence for the frame guard,
+                        // but only while the CURRENT session still sits
+                        // on the accepted address (a replacement between
+                        // accept() and here would mis-attribute).
                         if let Some(addr) = addr {
-                            if let Some(generation) =
-                                node_ref.current_connection_generation(&peer_conn.peer_id)
-                            {
-                                note_session_address_in(
-                                    &session_addr_ledger,
-                                    peer_conn.peer_id,
-                                    generation,
-                                    addr,
-                                );
+                            let still_on_accepted = node_ref
+                                .session_connection(&peer_conn.peer_id)
+                                .and_then(|conn| conn.remote_address())
+                                .is_some_and(|current| {
+                                    normalize_v4_mapped_addr(current)
+                                        == normalize_v4_mapped_addr(addr)
+                                });
+                            if still_on_accepted {
+                                if let Some(generation) =
+                                    node_ref.current_connection_generation(&peer_conn.peer_id)
+                                {
+                                    note_session_address_in(
+                                        &session_addr_ledger,
+                                        peer_conn.peer_id,
+                                        generation,
+                                        addr,
+                                    );
+                                }
                             }
                         }
                         if let (Some(ref cache), Some(addr)) = (&bootstrap_cache, addr) {
@@ -11726,6 +11788,51 @@ mod tests {
         // A generation WITH evidence at the mismatching address: refused
         // by the pair verdict.
         assert!(node.seed_pin_rejects_frame(&link, &implicated, 8));
+
+        node.try_shutdown().await.unwrap();
+    }
+
+    /// Round 16 (Codex P2: ledger expiry was not enforced on reads): a
+    /// peer that moves off seed addresses stops being implicated once
+    /// its evidence passes [`SESSION_ADDR_LEDGER_TTL`] — the reads
+    /// enforce the bound even when no later write pruned the entries.
+    #[tokio::test]
+    async fn issue1112_idle_peer_evidence_expires_on_read() {
+        const NOT_THE_SEED: [u8; 32] = [0xB6; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let pinned_addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let node = NetworkNode::new(test_network_config(), None, None)
+            .await
+            .unwrap();
+        let link = node.node.read().await.clone().expect("live link");
+        let peer = test_ant_peer(0xC);
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        // Fresh evidence implicates the peer.
+        node.note_session_address(peer, 1, pinned_addr);
+        assert!(node.peer_has_session_evidence(&peer));
+        assert!(node.seed_pin_rejects_frame(&link, &peer, 99));
+
+        // Age every entry past the TTL (as an idle period would).
+        {
+            let mut ledger = node
+                .session_addr_ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for entries in ledger.values_mut() {
+                for (_, _, at) in entries.iter_mut() {
+                    *at = Instant::now() - SESSION_ADDR_LEDGER_TTL - Duration::from_secs(1);
+                }
+            }
+        }
+        // The reads enforce the bound: no evidence, no implication, and
+        // the idle peer's unknown-provenance frames flow again.
+        assert!(node.session_addr_for(&peer, 1).is_none());
+        assert!(!node.peer_has_session_evidence(&peer));
+        assert!(!node.seed_pin_rejects_frame(&link, &peer, 99));
 
         node.try_shutdown().await.unwrap();
     }
