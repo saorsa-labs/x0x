@@ -388,14 +388,32 @@ impl IssuedCertRecord {
         let mut content = tokio::fs::read(path).await.unwrap_or_default();
         content.extend_from_slice(line.as_bytes());
         content.push(b'\n');
-        tokio::fs::write(&tmp, &content).await?;
-        match tokio::fs::rename(&tmp, path).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Err(e)
-            }
+        if let Err(e) = Self::write_synced(&tmp, &content).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
         }
+        if let Err(e) = tokio::fs::rename(&tmp, path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        // #1542: owner sync persists its register only after this append
+        // returns, so the new line must survive a host crash. fsync the
+        // parent directory to make the rename durable.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::File::open(dir).await?.sync_all().await?;
+        }
+        #[cfg(test)]
+        crash_sim::note_durable(path);
+        Ok(())
+    }
+
+    /// Write `bytes` to a new file at `path` and fsync it.
+    async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::File::create(path).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await
     }
 
     /// Append the record `decide` returns for the journal's current lines,
