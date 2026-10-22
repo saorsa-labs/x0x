@@ -113,8 +113,12 @@ refuses a mismatched answer instead of admitting it:
   - records a bounded, expiring backoff entry for the address (10
     minutes) with the answered identity and the connection generation it
     arrived on. The entry refuses re-dials of that address pre-socket
-    until it expires or a dial matches the pin set again — never a
-    process-lifetime tombstone;
+    until it expires — a bounded window, never a process-lifetime
+    tombstone. (A pair-scoped clear on a later MATCH exists defensively,
+    but in production it cannot end a live backoff: the pre-socket gate
+    refuses the address while the entry lives, so no matching dial can
+    run; a correctly re-keyed seed is dialable again once the window
+    lapses.);
   - closes the answered connection with a plain transport disconnect
     (#292 invariant-F style). ant-quic's NAT-traversal coordinator
     selection reuses any live connection to a seed address and never

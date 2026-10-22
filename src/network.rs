@@ -4881,7 +4881,10 @@ impl NetworkNode {
     /// Whether a live rejection refuses further dials of `addr`: the
     /// bounded backoff at the shared address-dial boundary (#1112). A
     /// pinned address that answered outside its pin set is not re-socketed
-    /// until the window expires or a dial matches its pin set again.
+    /// until the window expires. The pair-scoped clear on a MATCH cannot
+    /// end a live backoff in production — the pre-socket gate refuses the
+    /// address while the entry lives, so no matching dial can run; the
+    /// clear is defensive for paths that bypass the gate.
     fn seed_pin_addr_rejected(&self, addr: SocketAddr) -> bool {
         let addr = normalize_v4_mapped_addr(addr);
         self.live_seed_pin_rejections()
@@ -4994,6 +4997,17 @@ impl NetworkNode {
         peer_id: &AntPeerId,
         source_generation: u64,
     ) -> bool {
+        // Cheapest gate first (round 15): with nothing pinned and no
+        // recorded entries the guard is a no-op before any lock.
+        if dial_pin_table().is_empty()
+            && self
+                .seed_pin_rejections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            return false;
+        }
         if self
             .live_seed_pin_rejections()
             .iter()
@@ -5009,9 +5023,6 @@ impl NetworkNode {
                 .session_connection(peer_id)
                 .and_then(|conn| conn.remote_address())
                 .is_some_and(|addr| seed_pin_mismatch_at(addr, peer_id.0));
-        }
-        if dial_pin_table().is_empty() {
-            return false;
         }
         self.any_live_seed_pin_rejection_for(peer_id.0) || self.peer_has_session_evidence(peer_id)
     }
@@ -6429,8 +6440,10 @@ impl NetworkNode {
                         }
                     }
                 }
-                // Release this endpoint clone before any channel
-                // backpressure; the guards below use a cheap clone.
+                // A cheap clone for the frame guard below; the read guard
+                // itself is released before any channel backpressure
+                // (shutdown aborts this task, so the clone cannot outlive
+                // the endpoint).
                 let guard_node = node_ref.clone();
                 drop(node_handle);
 
@@ -6796,19 +6809,27 @@ impl NetworkNode {
                 let Some(link) = node_handle else {
                     break;
                 };
-                // Round 14: only ledger while the event's generation is
-                // STILL the current one — a later `session_connection`
-                // read would describe whichever connection replaced it,
-                // mis-attributing that address to this generation.
+                // Round 14-15: only ledger while the event's generation is
+                // the current one, and RE-CHECK after the address read —
+                // a replacement landing between the two reads would
+                // describe a different connection than the event's. The
+                // nanosecond-scale residue of this check-sequence is a
+                // transport limitation: ant-quic exposes no atomic
+                // (generation, address) snapshot (see the PR's
+                // FOR-ENGINEER fenced-dependency note).
                 if link.current_connection_generation(&peer) != Some(generation) {
                     continue;
                 }
-                if let Some(addr) = link
+                let Some(addr) = link
                     .session_connection(&peer)
                     .and_then(|conn| conn.remote_address())
-                {
-                    note_session_address_in(&ledger, peer, generation, addr);
+                else {
+                    continue;
+                };
+                if link.current_connection_generation(&peer) != Some(generation) {
+                    continue;
                 }
+                note_session_address_in(&ledger, peer, generation, addr);
             }
         })
     }
