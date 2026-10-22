@@ -8952,6 +8952,88 @@ mod cancellation_tests {
             "the obligations in memory must be the obligations on disk"
         );
     }
+
+    /// Codex review of #1545 (1e46704b), P2: an enroll of machine 1 is
+    /// cancelled during the rename of the device file, and an enroll of
+    /// machine 2 then completes. The late rename of the first write must
+    /// not put a device set without machine 2 on disk over the
+    /// acknowledged second enroll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_enroll_cancelled_during_its_rename_cannot_lose_a_later_enroll() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let local = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let enrollment =
+            |id: u8| OwnerEnrollment::sign(machine(id), &owner, 1_000, None).expect("sign");
+
+        let (reached, release) = hold_rename(&local.dir.join(DEVICES_FILE));
+        let first = {
+            let (local, enrollment) = (Arc::clone(&local), enrollment(1));
+            tokio::spawn(async move { local.enroll(enrollment).await })
+        };
+        cancel_at_rename(reached, first).await;
+
+        let second = {
+            let (local, enrollment) = (Arc::clone(&local), enrollment(2));
+            tokio::spawn(async move { local.enroll(enrollment).await })
+        };
+        run_then_release(second, release)
+            .await
+            .expect("enroll machine 2");
+
+        let live = local.enrolled_devices().await;
+        drop(local);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert!(
+            restarted.is_enrolled(&machine(2), &owner.user_id()).await,
+            "the late rename of a cancelled enroll must not lose a later enroll"
+        );
+        assert_eq!(
+            restarted.enrolled_devices().await,
+            live,
+            "the device set in memory is the device set on disk"
+        );
+    }
+
+    /// Codex review of #1545 (1e46704b), P2: an unenroll of machine 1 is
+    /// cancelled during the rename of the tombstone file, and an unenroll
+    /// of machine 2 then completes. The late rename of the first write
+    /// must not lose the tombstone of machine 2: after a restart, a replay
+    /// of the deleted enrollment of machine 2 must still be refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unenroll_cancelled_during_its_rename_cannot_lose_a_later_tombstone() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let local = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let enrollment =
+            |id: u8| OwnerEnrollment::sign(machine(id), &owner, 1_000, None).expect("sign");
+        for id in [1, 2] {
+            local.enroll(enrollment(id)).await.expect("enroll");
+        }
+
+        let (reached, release) = hold_rename(&local.dir.join(TOMBSTONES_FILE));
+        let first = {
+            let local = Arc::clone(&local);
+            tokio::spawn(async move { local.unenroll(&machine(1)).await })
+        };
+        cancel_at_rename(reached, first).await;
+
+        let second = {
+            let local = Arc::clone(&local);
+            tokio::spawn(async move { local.unenroll(&machine(2)).await })
+        };
+        run_then_release(second, release)
+            .await
+            .expect("unenroll machine 2");
+
+        drop(local);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        let replay = restarted.enroll(enrollment(2)).await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { .. })),
+            "the late rename of a cancelled unenroll must not lose a later tombstone: {replay:?}"
+        );
+    }
 }
 
 /// #1055 (ADR 0084 findings 3–4): unenroll must leave a durable tombstone

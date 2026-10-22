@@ -2178,6 +2178,82 @@ mod tests {
         );
     }
 
+    /// Codex review of #1545 (1e46704b), P2: a commit of a synced issuance
+    /// line is held at the rename of its journal write, and shutdown aborts
+    /// its caller. The shutdown drain must wait for the journal write
+    /// before the daemon gives up the data directory: else a replacement
+    /// process can write a newer journal that the late rename replaces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_drains_a_held_journal_write() {
+        use crate::identity::MachineId;
+        use crate::owner_sync::{OwnerSyncStore, SyncKind, SyncValue};
+        let seed = [0x90; 32];
+        let owner = crate::identity::UserKeypair::from_seed(&seed).expect("owner key");
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let agent_hex = hex::encode([0x42; 32]);
+        remote
+            .mint(
+                SyncKind::IssuanceJournal,
+                &agent_hex,
+                &SyncValue::IssuanceJournal {
+                    agent_id: agent_hex.clone(),
+                    cert_digest: "held".into(),
+                    issued_at: 100,
+                    not_after: None,
+                },
+                &owner,
+                MachineId([2; 32]),
+            )
+            .await
+            .expect("remote mint");
+        let synced = remote.records_snapshot().await;
+
+        let state = owned_state(&dir.path().join("local"), seed)
+            .await
+            .expect("state");
+        let journal = state
+            .agent
+            .cert_journal_path()
+            .expect("journal path")
+            .to_path_buf();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::profile::journal_faults::pause_next_rename(&journal, reached_tx, release_rx);
+        let commit = {
+            let store = Arc::clone(state.owner_sync.as_ref().expect("sync").store());
+            let owner = owner.user_id();
+            tokio::spawn(async move {
+                let _ = store.commit_batch(synced, &owner).await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the journal write reaches its rename")
+            .expect("rename hook");
+
+        // Shutdown aborts the caller; the held rename ends one second from
+        // now, whatever the drain does.
+        commit.abort();
+        let _ = commit.await;
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let _ = release_tx.send(());
+        });
+        crate::server::drain_server_tasks(&state, Vec::new()).await;
+        let landed = crate::profile::IssuedCertRecord::load(&journal)
+            .await
+            .iter()
+            .any(|line| line.cert_digest == "held");
+        releaser.join().expect("releaser");
+        assert!(
+            landed,
+            "shutdown must wait for a journal write before it gives up the data directory"
+        );
+    }
+
     /// WHY (#1055 RC2, review of RC1): a tombstoned enroll is a REFUSAL the
     /// caller can correct, not a storage failure — the route must answer
     /// `409 enrollment_tombstoned`, never `500 failed to persist`. The
