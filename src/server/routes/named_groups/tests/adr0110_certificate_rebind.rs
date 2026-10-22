@@ -170,7 +170,16 @@ async fn self_rebind_is_off_while_a_member_capability_is_unknown() {
 
 #[tokio::test]
 async fn self_rebind_before_the_cutoff_changes_only_the_certificate() {
-    let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+    let (mut state, _dir) = secure_endpoint_test_state().await.expect("state");
+    // The restart sync wait has elapsed; only the per-group head sync
+    // (§2) holds the seal.
+    Arc::get_mut(&mut state)
+        .expect("the fresh test state is not shared yet")
+        .revocation_evictions =
+        revocation_eviction::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: std::time::Duration::ZERO,
+            ..x0x::groups::eviction::S4Timing::default()
+        });
     let owner = UserKeypair::generate().expect("owner");
     let group = seed_group(&state, &owner, unix_now() + 86_400, None).await;
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -186,8 +195,15 @@ async fn self_rebind_before_the_cutoff_changes_only_the_certificate() {
         state.agent.identity().agent_keypair(),
         unix_now() + 2 * 86_400,
     );
+    // §2: no head round has run for the group yet, so the route seals
+    // nothing and holds the rebind (#1508 Codex P1 F3).
     let (status, body) = call(&state, &group, &local_hex, Some(renewal.clone())).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "waiting_for_head_sync");
+    // One worker iteration: the pass opens the head round (no other
+    // holder, so it is synced at once) and the rebind step commits.
+    revocation_eviction::revocation_eviction_pass(&state).await;
+    revocation_eviction::rebind::drive(&state).await;
     let after = state
         .named_groups
         .read()
@@ -208,4 +224,69 @@ async fn self_rebind_before_the_cutoff_changes_only_the_certificate() {
     let (status, body) = call(&state, &group, &local_hex, Some(renewal)).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"], "rebind_not_later");
+}
+
+/// #1533 Codex P2 (ADR 0110 §1a, §4b(2)): the every-admin-expired
+/// exception needs every admin, this one too, actually expired on this
+/// node's clock (`not_after + τ`). A sole admin whose certificate expires
+/// in 60 s is past its cutoff but still eligible: it hands the renewal to
+/// the admins (there is none) and never gets the relaxed D76 rule, which
+/// would strand a member whose capability is unknown.
+#[tokio::test]
+async fn an_unexpired_sole_admin_gets_no_every_admin_expired_exception() {
+    let (mut state, _dir) = secure_endpoint_test_state().await.expect("state");
+    Arc::get_mut(&mut state)
+        .expect("the fresh test state is not shared yet")
+        .revocation_evictions =
+        revocation_eviction::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: std::time::Duration::ZERO,
+            ..x0x::groups::eviction::S4Timing::default()
+        });
+    let owner = UserKeypair::generate().expect("owner");
+    // Past the cutoff `not_after − τ`, before `not_after` itself.
+    let group = seed_group(&state, &owner, unix_now() + 60, None).await;
+    // An ordinary member whose capability is unknown (no advert).
+    let member = AgentKeypair::generate().expect("member");
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group).expect("group");
+        let member_hex = hex::encode(member.agent_id().as_bytes());
+        info.members_v2.insert(
+            member_hex.clone(),
+            x0x::groups::GroupMember::new_member(
+                member_hex.clone(),
+                None,
+                Some(local_hex.clone()),
+                1,
+            ),
+        );
+        cr::install_certificate(
+            info,
+            &member_hex,
+            AgentCertificate::issue_with_expiry(&owner, &member, Some(unix_now() + 86_400))
+                .expect("member cert"),
+        );
+        info.recompute_state_hash();
+    }
+    let renewal = renewal_b64(
+        &owner,
+        state.agent.identity().agent_keypair(),
+        unix_now() + 86_400,
+    );
+    let (status, body) = call(&state, &group, &local_hex, Some(renewal)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], REBIND_WINDOW_CLOSED, "{body}");
+    assert_eq!(body["state"], WAITING_FOR_ADMIN_REBIND);
+    // One worker iteration commits nothing: no rebind is held.
+    revocation_eviction::revocation_eviction_pass(&state).await;
+    revocation_eviction::rebind::drive(&state).await;
+    let info = state
+        .named_groups
+        .read()
+        .await
+        .get(&group)
+        .cloned()
+        .expect("group");
+    assert_eq!(info.state_revision, 0, "the unknown member is not stranded");
 }
