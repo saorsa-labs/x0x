@@ -2185,17 +2185,27 @@ async fn handle_ws_command(
                                 state.gui_show.enqueue_pending(pending);
                                 return;
                             }
-                            let state = Arc::clone(state);
-                            let tx = tx.clone();
-                            let session_id = session_id.to_string();
-                            tokio::spawn(async move {
-                                let frame = outbound_gui_show(pending.clone());
-                                let sent = tx.send(frame).await.is_ok();
-                                finish_queued_reveal(&state, &session_id, sent).await;
+                            // The worker holds this AppState until a slot
+                            // accepts the frame. The shutdown drain must own
+                            // that task. A closed admission does not start it:
+                            // the banner goes back and the waiting reveal ends.
+                            let worker_state = Arc::clone(state);
+                            let worker_tx = tx.clone();
+                            let worker_session = session_id.to_string();
+                            let queued = pending.clone();
+                            if spawn_ws_task(state, async move {
+                                let frame = outbound_gui_show(queued.clone());
+                                let sent = worker_tx.send(frame).await.is_ok();
+                                finish_queued_reveal(&worker_state, &worker_session, sent).await;
                                 if !sent {
-                                    state.gui_show.enqueue_pending(pending);
+                                    worker_state.gui_show.enqueue_pending(queued);
                                 }
-                            });
+                            })
+                            .is_none()
+                            {
+                                finish_queued_reveal(state, session_id, false).await;
+                                state.gui_show.enqueue_pending(pending);
+                            }
                         }
                     }
                 } else {
@@ -2264,6 +2274,79 @@ async fn finish_queued_reveal(state: &AppState, session_id: &str, sent: bool) {
         && session.requested_visible.load(Ordering::Acquire)
     {
         session.set_visible_gui(true);
+    }
+}
+
+/// A full outbound queue with one pending origin banner. The receiver stays
+/// in this value so the reveal worker remains blocked on `send` until the
+/// caller drops it or the shutdown drain aborts the worker.
+#[cfg(test)]
+pub(super) struct FullQueueBannerHold {
+    _tx: mpsc::Sender<WsOutbound>,
+    _rx: mpsc::Receiver<WsOutbound>,
+    pub(super) reveal_inflight: usize,
+    pub(super) visible: bool,
+    pub(super) pending: bool,
+}
+
+/// Drive the real full-queue `gui.visible` path. The returned hold keeps the
+/// only queue slot occupied, so the banner worker stays parked on send.
+#[cfg(test)]
+pub(super) async fn arm_full_queue_banner_reveal(state: &Arc<AppState>) -> FullQueueBannerHold {
+    let token = "full-queue-shutdown";
+    let session_id = "full-queue-shutdown";
+    state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+        view: "network".to_string(),
+        banner: "Opened by test on test".to_string(),
+        agent_id: "aa".repeat(32),
+        machine_id: "bb".repeat(32),
+        rider: false,
+        request_id: "req".to_string(),
+        session_token: token.to_string(),
+        created_at: std::time::Instant::now(),
+    });
+    state.ws_sessions.write().await.insert(
+        session_id.to_string(),
+        WsSession {
+            id: session_id.to_string(),
+            subscribed_topics: HashSet::new(),
+            receives_direct: false,
+            visible_gui: visible_gui_flag(false),
+            gui_session_token: Some(token.to_string()),
+            requested_visible: AtomicBool::new(false),
+            visible_mu: Mutex::new(()),
+            reveal_inflight: Arc::new(AtomicUsize::new(0)),
+            topic_forwarders: HashMap::new(),
+        },
+    );
+    let (tx, rx) = mpsc::channel::<WsOutbound>(1);
+    let stats = WsOutboundStats::default();
+    tx.try_send(WsOutbound::Pong)
+        .expect("fill the only outbound slot");
+    handle_ws_command(
+        state,
+        session_id,
+        r#"{"type":"gui.visible","visible":true}"#,
+        &tx,
+        &stats,
+        false,
+    )
+    .await;
+    tokio::task::yield_now().await;
+    let (reveal_inflight, visible) = {
+        let sessions = state.ws_sessions.read().await;
+        let session = sessions.get(session_id).expect("session");
+        (
+            session.reveal_inflight.load(Ordering::Acquire),
+            session.is_visible_gui(),
+        )
+    };
+    FullQueueBannerHold {
+        _tx: tx,
+        _rx: rx,
+        reveal_inflight,
+        visible,
+        pending: state.gui_show.has_pending_session(token),
     }
 }
 
@@ -3389,6 +3472,82 @@ mod tests {
         .expect("the drained queue restores the latest show");
         assert!(visible);
         assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// WHY: shutdown closes detached-task admission before this handler
+    /// runs. The worker must not start. The banner returns to the queue and
+    /// the tab stays hidden, with no task left holding `AppState`.
+    #[tokio::test]
+    async fn full_queue_banner_is_refused_when_admission_is_closed() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        {
+            let mut admission = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let running = admission.take().expect("admission starts open");
+            assert!(
+                running.is_empty(),
+                "closing admission must not detach a task the test state already owns"
+            );
+        }
+        let token = "admission-closed";
+        state.gui_show.enqueue_pending(crate::gui::PendingGuiShow {
+            view: "network".to_string(),
+            banner: "Opened by test on test".to_string(),
+            agent_id: "aa".repeat(32),
+            machine_id: "bb".repeat(32),
+            rider: false,
+            request_id: "req".to_string(),
+            session_token: token.to_string(),
+            created_at: std::time::Instant::now(),
+        });
+        register_test_session(&state, "admission-closed").await;
+        state
+            .ws_sessions
+            .write()
+            .await
+            .get_mut("admission-closed")
+            .expect("session")
+            .gui_session_token = Some(token.to_string());
+        let (tx, rx) = mpsc::channel::<WsOutbound>(1);
+        let stats = WsOutboundStats::default();
+        tx.try_send(WsOutbound::Pong).expect("fill the only slot");
+        handle_ws_command(
+            &state,
+            "admission-closed",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        tokio::task::yield_now().await;
+        {
+            let sessions = state.ws_sessions.read().await;
+            let session = sessions.get("admission-closed").expect("session");
+            assert_eq!(session.reveal_inflight.load(Ordering::Acquire), 0);
+            assert!(
+                !session.is_visible_gui(),
+                "a refused reveal must leave the tab hidden"
+            );
+        }
+        assert!(
+            state.gui_show.has_pending_session(token),
+            "a refused reveal must put the banner back"
+        );
+        let state_weak = Arc::downgrade(&state);
+        drop(state);
+        assert_eq!(
+            state_weak.strong_count(),
+            0,
+            "a refused reveal must not leave a task holding AppState"
+        );
+        drop(rx);
+        drop(tx);
     }
 
     #[tokio::test]

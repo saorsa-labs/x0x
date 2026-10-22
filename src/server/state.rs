@@ -996,8 +996,9 @@ pub(super) struct AppState {
     /// catch-up requests, the KV-store delta direct deliveries and the
     /// outgoing file-chunk streams, and since #1288 the WebSocket session
     /// loop and its child tasks (the writer, the direct-message, call, and
-    /// keepalive forwarders, and the shared and per-session topic
-    /// forwarders). None of them owns a write that an abort
+    /// keepalive forwarders, the shared and per-session topic forwarders,
+    /// and the queued GUI reveal that waits on a full outbound queue). None
+    /// of them owns a write that an abort
     /// could cut: the most a send leaves behind is the outbound DM history
     /// row that `Agent::send_direct_with_history` enqueues synchronously
     /// after a successful send, and the history writer owns that

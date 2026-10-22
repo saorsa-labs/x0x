@@ -3312,7 +3312,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // public-message fan-out race, the one-shot predecessor-relay fallback
     // offer, the member-keyed KeyPackage catch-up requests, the KV-store
     // delta direct deliveries, the outgoing file-chunk streams, and since
-    // #1288 the WebSocket session loop and its writer and forwarders, and the
+    // #1288 the WebSocket session loop and its writer and forwarders, the
+    // queued GUI reveal that waits on a full outbound queue, and the
     // startup self-leave catch-up backoff) and the
     // joiner's join-attempt polls and sends hold the Agent or this AppState.
     // Left running, one asleep before a delayed delivery keeps the Agent, and
