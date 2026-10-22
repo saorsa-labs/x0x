@@ -515,7 +515,15 @@ fn self_rebind_rule(
         return SelfRebindRule::Ordinary;
     }
     let admins = admins_with_expiry(info);
+    // #1533 Codex P2: past the cutoff is not expired. The exception needs
+    // this admin's own certificate expired on this node's clock too (own
+    // trigger, `not_after + τ`); before that it is still eligible and
+    // hands the renewal off.
+    let own_expired = old_not_after.is_some_and(|not_after| {
+        x0x::groups::eviction::own_expiry_trigger_due(not_after, now_unix)
+    });
     let every_admin_expired = seat.role.at_least(GroupRole::Admin)
+        && own_expired
         && (admins.iter().all(|(id, _)| id == local)
             || cr::admins_needing_renewal(&admins, local, now_unix).is_some());
     if every_admin_expired {
