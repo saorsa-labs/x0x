@@ -681,6 +681,77 @@ pub fn validate_against_parent(
     Ok(())
 }
 
+/// ADR 0110 §2 fork containment: whether `body`, which
+/// [`validate_against_parent`] refused with `recovery_head_mismatch` on
+/// `current`, is an authenticated sibling of a commit on `current`'s
+/// retained chain. That is: the policy owner U signed its mandate for the
+/// commit's own parent; the promoted member is the actor; the commit
+/// chains exactly from that parent; and `current` retains a different
+/// commit at the same revision on the same parent. When `current` retains
+/// the parent itself, the promoted member must hold an Active seat there,
+/// with the mandate's certificate digest when the snapshot records one.
+///
+/// The caller has already run [`verify_commit_signatures`], so the actor
+/// signed the frame and the embedded commit.
+///
+/// # Errors
+///
+/// Returns the first failed check; `recovery_head_mismatch` when the
+/// commit is no sibling of the retained chain.
+pub fn validate_sibling(
+    body: &OwnerRecoveryBodyV1,
+    current: &GroupInfo,
+) -> Result<(), OwnerRecoveryRefusal> {
+    let Some(owner) = current.policy.admission.owner_certified_user_id() else {
+        return Err(OwnerRecoveryRefusal::RecoverySignerNotOwner);
+    };
+    verify_mandate_signature(&body.mandate, owner)?;
+    let mandate = &body.mandate.body;
+    let stable = current.stable_group_id();
+    if body.stable_group_id != stable
+        || body.commit.group_id != stable
+        || mandate.stable_group_id != stable
+        || mandate.parent_head != body.prior_head
+        || mandate.parent_revision != body.prior_revision
+        || body.commit.prev_state_hash.as_deref() != Some(body.prior_head.as_str())
+        || body.next_revision != body.prior_revision.saturating_add(1)
+        || body.commit.revision != body.next_revision
+    {
+        return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
+    }
+    if body.actor != mandate.promoted {
+        return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible);
+    }
+    let sibling = current.commit_log.iter().any(|retained| {
+        retained.commit.prev_state_hash.as_deref() == Some(body.prior_head.as_str())
+            && retained.commit.revision == body.next_revision
+            && retained.commit.state_hash != body.commit.state_hash
+    });
+    if !sibling {
+        return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
+    }
+    if let Some(parent) = current
+        .commit_log
+        .iter()
+        .find(|retained| retained.commit.state_hash == body.prior_head)
+    {
+        let seated = parent
+            .roster
+            .get(&hex::encode(mandate.promoted))
+            .is_some_and(|seat| {
+                seat.state == GroupMemberState::Active
+                    && seat
+                        .certificate_digest
+                        .as_deref()
+                        .is_none_or(|digest| digest == mandate.promoted_certificate_digest)
+            });
+        if !seated {
+            return Err(OwnerRecoveryRefusal::RecoveryMemberIneligible);
+        }
+    }
+    Ok(())
+}
+
 /// The D76 hold rule (§4b(1) "Mixed versions"): the Active members whose
 /// current verified advert lacks `owner_recovery_v1` (`Some(false)`).
 /// Unknown, expired or offline members do not hold the commit; they are
@@ -1048,6 +1119,58 @@ mod tests {
         assert_eq!(
             validate_against_parent(&actor, &f.info, 2, &f.revocations, NOW),
             Err(OwnerRecoveryRefusal::RecoveryMemberIneligible)
+        );
+    }
+
+    /// ADR 0110 §2 (#1508 r5): only an owner-mandated commit that chains
+    /// from the parent of a retained commit at the same revision is a
+    /// sibling (fork evidence); a forged mandate, a wrong actor or a
+    /// commit with no retained sibling is not.
+    #[test]
+    fn only_an_owner_mandated_child_of_a_retained_parent_is_a_sibling() {
+        let f = fixture(
+            GroupConfidentiality::SignedPublic,
+            crate::mls::SecureGroupPlane::default(),
+        );
+        let theirs = commit_for(&f, mandate_for(&f), 0);
+        // This node committed its own recovery on the same parent: it
+        // also promoted another member.
+        let mut ours = f.info.clone();
+        apply_roster_change(&mut ours, &theirs);
+        ours.members_v2
+            .get_mut(&hex::encode(f.other.agent_id().as_bytes()))
+            .expect("other seat")
+            .role = GroupRole::Admin;
+        let own = ours.seal_commit_evicting(&f.promoted, 2_000).expect("seal");
+        assert_ne!(own.state_hash, theirs.commit.state_hash);
+        assert_eq!(validate_sibling(&theirs, &ours), Ok(()));
+
+        // No retained child of the parent: not a sibling.
+        assert_eq!(
+            validate_sibling(&theirs, &f.info),
+            Err(OwnerRecoveryRefusal::RecoveryHeadMismatch)
+        );
+        // A mandate that U did not sign.
+        let mut forged = theirs.clone();
+        let stranger = UserKeypair::generate().expect("user");
+        forged.mandate = sign_mandate(forged.mandate.body, &stranger).expect("sign");
+        assert_eq!(
+            validate_sibling(&forged, &ours),
+            Err(OwnerRecoveryRefusal::RecoverySignerNotOwner)
+        );
+        // The actor is not the promoted member.
+        let mut wrong_actor = theirs.clone();
+        wrong_actor.actor = *f.other.agent_id().as_bytes();
+        assert_eq!(
+            validate_sibling(&wrong_actor, &ours),
+            Err(OwnerRecoveryRefusal::RecoveryMemberIneligible)
+        );
+        // A commit that does not chain from the mandate's parent.
+        let mut unchained = theirs;
+        unchained.prior_head = "other".to_string();
+        assert_eq!(
+            validate_sibling(&unchained, &ours),
+            Err(OwnerRecoveryRefusal::RecoveryHeadMismatch)
         );
     }
 
