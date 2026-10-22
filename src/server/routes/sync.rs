@@ -1350,6 +1350,91 @@ mod tests {
         assert_keeps(&state, "Alice", "after the interleaved discharge").await;
     }
 
+    /// Codex review of #1545 (e3089a4), P2: the catch-up of `Alice` fails
+    /// to save the profile. `PUT /profile` then saves `Bob` and discharges
+    /// `Alice`. A remote machine's names arrive next; they set no local
+    /// name, so no catch-up runs for them. The failed save of `Alice` is
+    /// for an obligation that the save of `Bob` retired, so it must not
+    /// keep the reconcile from publishing `Bob`.
+    #[tokio::test]
+    async fn a_failed_catch_up_then_a_local_edit_keeps_the_names_published() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x93; 32];
+        let owner = crate::identity::UserKeypair::from_seed(&seed).expect("owner key");
+        let state = owned_state(dir.path(), seed).await.expect("state");
+        {
+            let mut profile = state.profile.write().await;
+            profile.human_name = Some("Old".into());
+            profile
+                .save_to(&state.profile_path)
+                .await
+                .expect("save the old profile");
+        }
+        let service = Arc::clone(state.owner_sync.as_ref().expect("owned state wires sync"));
+        DaemonView::attach(&service, &state).await;
+        service.sync_all().await;
+        assert_register_holds(&state, "Old", "the first pass publishes Old").await;
+
+        // A directory in place of the profile file fails every save.
+        tokio::fs::remove_file(&state.profile_path)
+            .await
+            .expect("remove the profile");
+        tokio::fs::create_dir(&state.profile_path)
+            .await
+            .expect("block the profile save");
+        let batch = remote_alice_profile(dir.path(), &owner).await;
+        service
+            .store()
+            .commit_batch(batch, &owner.user_id())
+            .await
+            .expect("commit Alice");
+        service.sync_all().await;
+        assert!(
+            !service.store().pending_applies().await.is_empty(),
+            "the failed catch-up keeps Alice owed"
+        );
+
+        tokio::fs::remove_dir(&state.profile_path)
+            .await
+            .expect("unblock the profile save");
+        assert_eq!(put_name(&state, "Bob").await, StatusCode::OK);
+        assert!(
+            service.store().pending_applies().await.is_empty(),
+            "the save of Bob discharges Alice"
+        );
+
+        // Another machine's names arrive; they set no local name.
+        let remote = crate::owner_sync::OwnerSyncStore::load(&dir.path().join("remote-names"))
+            .await
+            .expect("remote store");
+        let remote_machine = crate::identity::MachineId([3; 32]);
+        remote
+            .mint(
+                crate::owner_sync::SyncKind::MachineNames,
+                &hex::encode(remote_machine.0),
+                &SyncValue::MachineNames {
+                    display_name: Some("remote-agent".into()),
+                    machine_name: Some("remote-mac".into()),
+                },
+                &owner,
+                remote_machine,
+            )
+            .await
+            .expect("remote names mint");
+        service
+            .store()
+            .commit_batch(remote.records_snapshot().await, &owner.user_id())
+            .await
+            .expect("commit the remote names");
+
+        service.sync_all().await;
+        assert_keeps(&state, "Bob", "after a failed catch-up and a local edit").await;
+        assert!(
+            service.store().pending_applies().await.is_empty(),
+            "the remote names are discharged"
+        );
+    }
+
     /// A remote device's owner profile `Alice` (version 2) only.
     async fn remote_alice_profile(
         dir: &std::path::Path,
