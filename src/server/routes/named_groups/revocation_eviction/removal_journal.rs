@@ -19,6 +19,10 @@
 //! - **Abandon** ([`RemovalBarrier::abandon`]). The legacy transaction
 //!   failed after the prepare: the saved event is cleared, so a restart
 //!   never delivers an event that did not commit.
+//! - **Not durable** ([`RemovalBarrier::not_durable`]). The roster write
+//!   was not directory-durable. If the new roster is live anyway, the
+//!   removal committed: the event is kept and delivered with the rotated
+//!   secret. If it is not live, this is an abandon.
 //! - **Committed** ([`RemovalBarrier::committed`]). The transaction is
 //!   durable: the row moves to `committed_delivery_pending` and its
 //!   delivery starts, before the first publication.
@@ -123,10 +127,62 @@ impl RemovalBarrier {
             ));
         }
         if self.s4 {
-            super::record_committed_removal(state, info, target_hex, event).await;
+            super::record_committed_removal(state, info, target_hex, event, false).await;
         }
         Ok(())
     }
+
+    /// The transaction did not reach directory durability. When its sealed
+    /// after-image `info` is nevertheless the live head (a
+    /// `ReplacedNotDurable` roster write, or an installed TreeKEM epoch),
+    /// the removal has committed: the saved event is kept and S4 delivers
+    /// it and, for GSS, the rotated secret, because the route stops before
+    /// its own publication (#1508 review P1). Otherwise the saved event is
+    /// cleared as in [`Self::abandon`]. Returns whether the removal is live.
+    pub(in crate::server) async fn not_durable(
+        self,
+        state: &AppState,
+        info: &GroupInfo,
+        target_hex: &str,
+        event: &NamedGroupMetadataEvent,
+    ) -> bool {
+        let live = live_head_is(state, info).await;
+        if self.s4 {
+            if live {
+                super::record_committed_removal(state, info, target_hex, event, true).await;
+            } else {
+                abandon_prepared_removal(state, info, target_hex).await;
+            }
+        }
+        live
+    }
+
+    /// A TreeKEM persist failed. When the error says the epoch is
+    /// installed, this is [`Self::not_durable`]; otherwise it is
+    /// [`Self::abandon`]. Returns whether the removal is live, in which case
+    /// the caller must not roll the tree back.
+    pub(in crate::server) async fn persist_failed(
+        self,
+        state: &AppState,
+        info: &GroupInfo,
+        target_hex: &str,
+        event: &NamedGroupMetadataEvent,
+        epoch_installed: bool,
+    ) -> bool {
+        if epoch_installed {
+            self.not_durable(state, info, target_hex, event).await
+        } else {
+            self.abandon(state, info, target_hex).await;
+            false
+        }
+    }
+}
+
+/// Whether the live roster of `info`'s group is `info`'s sealed head.
+async fn live_head_is(state: &AppState, info: &GroupInfo) -> bool {
+    state.named_groups.read().await.values().any(|group| {
+        group.stable_group_id() == info.stable_group_id() && group.state_hash == info.state_hash
+    })
 }
 
 /// The result of [`prepare_committed_removal`].
@@ -1066,6 +1122,92 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// #1508 review P1: the roster write of S4's GSS removal or ban
+    /// renames the file but the directory fsync fails
+    /// (`ReplacedNotDurable`). The new roster is live, so the removal has
+    /// committed: the row keeps the exact event, moves to
+    /// `committed_delivery_pending`, and its first delivery round also
+    /// sends the rotated secret, because the route stops before its own
+    /// publication. Before the fix the barrier abandoned the event and the
+    /// worker retired the journal, so nothing reached the survivors.
+    async fn assert_not_durable_roster_keeps_the_event(
+        group_id: &str,
+        kind: super::super::ManualRequestKind,
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = state_past_restart_wait().await?;
+        let (target_hex, _survivor_hex) = gss_target_group(
+            &state,
+            group_id,
+            x0x::groups::GroupPolicyPreset::PrivateSecure,
+        )
+        .await?;
+        let key = s4_prepare(&state, group_id, &target_hex, prepared_store).await?;
+        let scope = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            super::super::eviction_seal_scope(&inner.store, &key)
+        };
+        let (status, body) = {
+            let _fault = super::super::super::set_save_fault(
+                &state,
+                super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+            );
+            super::super::run_member_route(&state, group_id, &target_hex, kind, scope).await
+        };
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{kind:?}: {body:?}"
+        );
+        let (head, epoch) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(group_id).expect("group");
+            assert!(
+                !info.has_active_member(&target_hex),
+                "{kind:?}: the new roster is live"
+            );
+            (info.state_hash.clone(), info.secret_epoch)
+        };
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner.store.get(&key).expect("row");
+        assert_eq!(row.phase, Phase::CommittedDeliveryPending, "{kind:?}");
+        assert_eq!(row.result_head.as_deref(), Some(head.as_str()), "{kind:?}");
+        assert!(
+            row.outgoing_event
+                .as_deref()
+                .and_then(decode_saved_removal)
+                .is_some(),
+            "{kind:?}: the exact event is kept"
+        );
+        let delivery = inner
+            .removals
+            .get(&key)
+            .expect("the delivery to the survivors runs");
+        assert_eq!(
+            delivery.reshare_epoch_for_test(),
+            Some(epoch),
+            "{kind:?}: the survivors get the rotated secret"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_not_durable_gss_removal_keeps_and_delivers_its_event() -> anyhow::Result<()> {
+        assert_not_durable_roster_keeps_the_event(
+            &"b5".repeat(16),
+            super::super::ManualRequestKind::Remove,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_not_durable_gss_ban_keeps_and_delivers_its_event() -> anyhow::Result<()> {
+        assert_not_durable_roster_keeps_the_event(
+            &"b6".repeat(16),
+            super::super::ManualRequestKind::Ban,
+        )
+        .await
     }
 
     #[tokio::test]

@@ -1902,11 +1902,33 @@ async fn receive_commit(
             let processed = commits
                 .iter()
                 .all(|treekem_commit| guard.process_commit(treekem_commit).is_ok());
-            // The cryptographic removal proof: every revoked leaf is gone.
-            if !processed
-                || guard.epoch() != *next_epoch
-                || removed.iter().any(|agent| guard.tracks_member(agent))
-            {
+            // The cryptographic removal proof: the tree holds no revoked
+            // seat's committed leaf. The local leaf map alone is not proof;
+            // a seat with no evidence keeps the frame pending (#1508
+            // review P1).
+            let leaves: Vec<Option<bool>> = removed
+                .iter()
+                .map(|agent| {
+                    info.members_v2
+                        .get(&hex::encode(agent.as_bytes()))
+                        .and_then(|member| ng::member_treekem_leaf_present(guard, member))
+                })
+                .collect();
+            // An undecided seat keeps the frame pending even when another
+            // seat's leaf is still present: the proof is retried whole.
+            let installed = processed && guard.epoch() == *next_epoch;
+            if installed && leaves.contains(&None) {
+                ng::rollback_treekem_group_after_failed_install(
+                    state,
+                    &group_key,
+                    &next,
+                    &rollback_snapshot,
+                    guard,
+                    "owner_recovery_leaf_unproven",
+                );
+                return ReceiveOutcome::Retained;
+            }
+            if !installed || leaves.contains(&Some(true)) {
                 ng::rollback_treekem_group_after_failed_install(
                     state,
                     &group_key,

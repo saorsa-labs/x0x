@@ -76,6 +76,14 @@ pub(super) struct RemovalDelivery {
     reshare_epoch: Option<u64>,
 }
 
+#[cfg(test)]
+impl RemovalDelivery {
+    /// The rotated secret epoch whose shares the first round sends again.
+    pub(super) fn reshare_epoch_for_test(&self) -> Option<u64> {
+        self.reshare_epoch
+    }
+}
+
 /// The parts of a saved removal event that the restart needs.
 #[derive(Debug, Clone)]
 pub(super) struct SavedRemoval {
@@ -229,11 +237,17 @@ fn redeliver_secret_shares(
 /// removal changes; any other removal returns at once. The `.evs` is
 /// fsynced before this returns (§5: "persist ... exact outgoing event
 /// before publication").
+///
+/// `reshare` is set when the route stopped before its own publication (the
+/// roster is live but not directory-durable): the first delivery round then
+/// also seals a GSS removal's rotated secret to each survivor, as after a
+/// restart (#1508 review P1).
 pub(in crate::server) async fn record_committed_removal(
     state: &AppState,
     info: &GroupInfo,
     target_hex: &str,
     event: &NamedGroupMetadataEvent,
+    reshare: bool,
 ) {
     let Some(target) = agent_bytes(target_hex) else {
         return;
@@ -259,16 +273,17 @@ pub(in crate::server) async fn record_committed_removal(
         row.result_epoch = saved.result_epoch;
         row.outgoing_event = Some(bytes);
         row.waiting = None;
-        inner.removals.insert(
-            key,
-            new_delivery(
-                saved.event,
-                saved.result_head,
-                survivors(info, &local, &target),
-                false,
-                Instant::now() + REMOVAL_FIRST_SEND_DELAY,
-            ),
+        let mut delivery = new_delivery(
+            saved.event,
+            saved.result_head,
+            survivors(info, &local, &target),
+            false,
+            Instant::now() + REMOVAL_FIRST_SEND_DELAY,
         );
+        if reshare {
+            delivery.reshare_epoch = gss_secret_epoch(&delivery.event);
+        }
+        inner.removals.insert(key, delivery);
         inner.dirty = true;
     }
     if !super::persist_obligations(state).await {
