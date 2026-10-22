@@ -53,6 +53,13 @@ use super::crypto_exclusion::{self, HeadRule, RecipientDelivery, RoundUpdate, Sa
 const REMOVAL_FIRST_SEND_DELAY: Duration = Duration::from_secs(5);
 /// A delivery round runs no more often than this per row.
 const REMOVAL_RESEND_INTERVAL: Duration = Duration::from_secs(5);
+/// The bound of one saved-removal exchange (the guarded egress point caps
+/// it further).
+const REMOVAL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The kind of a saved-removal event write at the guarded egress point.
+const REMOVAL_EVENT_EGRESS: &str = "s4_removal";
+/// The kind of the bounded reference write of an oversized saved removal.
+const REMOVAL_REFERENCE_EGRESS: &str = "s4_removal_reference";
 
 /// The retained delivery of one committed seated-target removal.
 #[derive(Debug, Clone)]
@@ -548,17 +555,11 @@ pub(super) fn note_survivor_head(
     }
 }
 
-/// The guarded-egress admission of one saved-removal write to `recipient`
-/// (§3 L231): [`crypto_exclusion::guarded_removal_admission`] with
+/// The guarded admission of one serve to `recipient` (§3 L231):
+/// [`crypto_exclusion::guarded_removal_admission`] with
 /// [`HeadRule::Current`]. The pre-phase runs under the group's membership
 /// lock (ADR 0107 serving check, D60, head rule, no capability gate), and
-/// the synchronous seam check runs at once after it, immediately before the
-/// caller hands the bytes to the ACK'd send.
-///
-/// Residual (FOR ENGINEER): ant-quic exposes no receive-ACK send with a
-/// stream-seam admission, so the seam check runs before the ACK'd send's
-/// own resolution and stream open, not inside it, and that send's internal
-/// duplicate-safe retry writes again without a fresh check.
+/// the synchronous seam check runs at once after it.
 async fn removal_write_admitted(
     state: &Arc<AppState>,
     stable_group_id: &str,
@@ -591,18 +592,28 @@ pub(in crate::server) async fn removal_blob_serve_admitted(
     removal_write_admitted(state, &guard.stable_group_id, recipient, &guard.result_head).await
 }
 
-/// Send the saved removal event to `recipient`, guarded (§3 L231) and
-/// acknowledged.
+/// Send the saved removal event to `recipient` in one guarded exchange
+/// (§3 L231, #1508 r7 F2).
 ///
-/// [`removal_write_admitted`] runs first; a refusal is a withhold and
-/// sends nothing. The send is then the legacy removal send, unchanged:
-/// the same bytes and the same ACK'd direct delivery
-/// (`named_group_direct_delivery_config`, with the #1217 cold wait for an
-/// owner's removal notice), so `Ok` still means the survivor's daemon
-/// acknowledged receipt, and a legacy survivor decodes the event. An event
-/// above `MAX_PAYLOAD_BYTES` goes by control-blob reference as before; the
-/// blob is staged with a [`ServeGuard`](super::super::control_blob::ServeGuard),
-/// so each chunk serve passes the same admission.
+/// Every physical write goes through the one guarded egress point
+/// ([`super::super::send_join_artifact`]): x0x's pinned single-exchange
+/// send. Its pre-phase runs [`crypto_exclusion::guarded_removal_admission`]
+/// under the group's membership lock after route resolution, and its seam
+/// check runs again immediately before `write_all`. It never uses the
+/// gossip inbox, never waits for an ACK-v2 receipt (whose internal retry
+/// writes again without a fresh check) and never retries: "each new
+/// exchange re-admits". The S4 round owns every resend, and a write is
+/// not delivery; the survivor's convergence is
+/// ([`crypto_exclusion::note_survivor_head`]). The bounded resolution of
+/// that send waits for a cold survivor's verified binding, as the #1217
+/// cold wait did.
+///
+/// The bytes are the legacy removal event, unchanged, on the direct
+/// carrier that every member decodes. An event above `MAX_PAYLOAD_BYTES`
+/// goes by control-blob reference: the blob is staged with a
+/// [`ServeGuard`](super::super::control_blob::ServeGuard), so each chunk
+/// serve passes the same admission, and the reference is one guarded
+/// exchange too.
 async fn send_removal(
     state: &Arc<AppState>,
     stable_group_id: &str,
@@ -612,46 +623,70 @@ async fn send_removal(
 ) -> Result<(), String> {
     use super::super::control_blob;
     let payload = serde_json::to_vec(event).map_err(|e| e.to_string())?;
-    removal_write_admitted(state, stable_group_id, recipient, result_head).await?;
-    // The #1217 opt-in, exactly as the legacy send decides it.
-    let cold_removal = matches!(event,
-        NamedGroupMetadataEvent::MemberRemoved { actor, agent_id, .. }
-            if actor == &hex::encode(state.agent.agent_id().as_bytes()) && actor != agent_id);
-    if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-        return control_blob::send_reference_guarded(
-            &state.control_blobs,
-            &state.agent,
+    let admission = crypto_exclusion::guarded_removal_admission(
+        state,
+        stable_group_id,
+        recipient,
+        HeadRule::Current(result_head.to_string()),
+    );
+    let deadline = std::time::Instant::now() + REMOVAL_EXCHANGE_TIMEOUT;
+    if payload.len() <= x0x::dm::MAX_PAYLOAD_BYTES {
+        let sent = super::super::send_join_artifact(
+            state,
             recipient,
-            control_blob::ControlBlobKind::NamedGroupEvent,
-            super::super::named_group_metadata_event_group_id(event),
-            None,
-            payload,
-            cold_removal,
-            Some(control_blob::ServeGuard {
-                stable_group_id: stable_group_id.to_string(),
-                result_head: result_head.to_string(),
-            }),
+            &payload,
+            stable_group_id,
+            REMOVAL_EVENT_EGRESS,
+            admission,
+            deadline,
         )
         .await;
+        return plain_refusal(sent);
     }
-    let config = super::super::named_group_direct_delivery_config();
-    let sent = if cold_removal {
-        state
-            .agent
-            .send_direct_with_config_cold_wait(
-                recipient,
-                payload,
-                config,
-                x0x::dm::PINNED_RESOLUTION_WAIT,
-            )
-            .await
-    } else {
-        state
-            .agent
-            .send_direct_with_config(recipient, payload, config)
-            .await
-    };
-    sent.map(|_| ()).map_err(|e| e.to_string())
+    // Stage nothing for a recipient that is not eligible now.
+    removal_write_admitted(state, stable_group_id, recipient, result_head).await?;
+    let reference = control_blob::stage_reference_entry(
+        &state.control_blobs,
+        &state.agent,
+        recipient,
+        control_blob::ControlBlobKind::NamedGroupEvent,
+        super::super::named_group_metadata_event_group_id(event),
+        None,
+        payload,
+        None,
+        Some(control_blob::ServeGuard {
+            stable_group_id: stable_group_id.to_string(),
+            result_head: result_head.to_string(),
+        }),
+    )
+    .map_err(str::to_string)?;
+    let message =
+        control_blob::encode_message(&control_blob::ControlBlobMessage::Reference { reference })?;
+    let sent = super::super::send_join_artifact(
+        state,
+        recipient,
+        &message,
+        stable_group_id,
+        REMOVAL_REFERENCE_EGRESS,
+        admission,
+        deadline,
+    )
+    .await;
+    plain_refusal(sent)
+}
+
+/// An admission refusal at either phase of the guarded exchange is
+/// reported as [`x0x::dm::PINNED_ADMISSION_REFUSED`] itself, as
+/// [`removal_write_admitted`] reports it: a withhold, not a transport
+/// failure.
+fn plain_refusal(sent: Result<(), String>) -> Result<(), String> {
+    sent.map_err(|error| {
+        if error.contains(x0x::dm::PINNED_ADMISSION_REFUSED) {
+            x0x::dm::PINNED_ADMISSION_REFUSED.to_string()
+        } else {
+            error
+        }
+    })
 }
 
 fn spawn_send(
@@ -675,6 +710,12 @@ fn spawn_send(
         .await;
         let status = match sent {
             Ok(()) => RecipientDelivery::Sent,
+            // The in-process stand-in reports an admitted exchange with its
+            // marker error (test builds only), as for the class-K shares.
+            #[cfg(test)]
+            Err(error) if error.contains(x0x::dm::PINNED_STANDIN_ADMITTED) => {
+                RecipientDelivery::Sent
+            }
             Err(error) => {
                 // An admission refusal is a withhold: the next round
                 // re-evaluates the recipient from the current state.
@@ -1152,7 +1193,7 @@ mod daemon_tests {
         Ok(())
     }
 
-    /// #1357 review: the ACK'd saved-removal send and the serve of a chunk
+    /// #1357 review: the saved-removal send and the serve of a chunk
     /// of its blob both pass the guarded admission first. For a banned
     /// survivor both are refused before anything is sent.
     #[tokio::test]
