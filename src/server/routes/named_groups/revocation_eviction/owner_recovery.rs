@@ -2326,7 +2326,7 @@ mod tests {
         ));
     }
 
-    fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
+    pub(super) fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
         let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
         capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
         assert!(
@@ -3280,6 +3280,236 @@ mod restart_tests {
             !held_back(&state).await,
             "the synced group's restored delivery ran"
         );
+        Ok(())
+    }
+
+    /// An offline promoted member that holds the owner key `seed`, with a
+    /// zero restart sync wait.
+    async fn offline_author(dir: &std::path::Path, seed: [u8; 32]) -> Result<Arc<AppState>> {
+        zero_restart_wait(
+            offline_daemon(dir, Some(x0x::identity::UserKeypair::from_seed(&seed)?)).await?,
+        )
+    }
+
+    /// `author` signs a mandate for its own agent and commits the recovery
+    /// through the real worker pass and commit attempt. Returns the
+    /// committed state and the exact frame.
+    async fn commit_own_recovery(
+        author: &Arc<AppState>,
+        stable: &str,
+        parent: &GroupInfo,
+    ) -> Result<(GroupInfo, Vec<u8>)> {
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(author, owner, stable, &author_hex).await;
+        anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
+        super::super::revocation_eviction_pass(author).await;
+        try_commit(author, stable).await;
+        let committed = author.named_groups.read().await[stable].clone();
+        anyhow::ensure!(
+            committed.state_revision == parent.state_revision + 1,
+            "the author committed the recovery"
+        );
+        let bytes = author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .deliveries
+            .get(stable)
+            .map(|delivery| delivery.bytes.to_vec())
+            .context("the committed frame is held for delivery")?;
+        Ok((committed, bytes))
+    }
+
+    /// Codex P1 (#1508 r5, A): the GSS recovery share and the recovery
+    /// frame travel on different carriers, so a survivor can get the share
+    /// first. The share goes through the real direct metadata apply, and
+    /// then the frame through the real receive path. The survivor must
+    /// end at the new epoch WITH its secret. Before the fix the share was
+    /// refused (its sender was still a Member on the survivor's roster)
+    /// and dropped, and the frame then moved the survivor to the new epoch
+    /// with no secret and no later share.
+    #[tokio::test]
+    async fn a_gss_share_before_the_recovery_frame_still_installs_the_new_secret() -> Result<()> {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let author = offline_author(author_dir.path(), [0x71; 32]).await?;
+        let survivor = offline_daemon(survivor_dir.path(), None).await?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor_id = survivor.agent.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                survivor.agent.identity().agent_keypair(),
+            ],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        {
+            use base64::Engine as _;
+            let member = info
+                .members_v2
+                .get_mut(&survivor_hex)
+                .context("survivor seat")?;
+            member.kem_public_key_b64 = Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&survivor.agent_kem_keypair.public_bytes),
+            );
+        }
+        info.recompute_state_hash();
+        assert_eq!(orc::crypto_kind(&info), orc::RecoveryCryptoKind::Gss);
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &survivor] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        // The survivor's current verified advert sets `owner_recovery_v1`.
+        super::tests::advertise(
+            &author,
+            survivor_id,
+            x0x::dm::CapabilityRegistry::current().bits,
+            x0x::dm_capability::now_unix_ms(),
+        );
+        let (committed, frame) = commit_own_recovery(&author, &stable, &info).await?;
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+
+        // The real worker ticks deliver the recovery and its share.
+        let mut share = None;
+        for _ in 0..100 {
+            worker_tick(&author).await;
+            share = scheduled_shares(&author)
+                .into_iter()
+                .find(|(recipient, _)| *recipient == survivor_hex)
+                .map(|(_, share)| share);
+            if share.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let share = share.context("the author seals the new secret to the survivor")?;
+
+        // The share lands first, through the direct metadata apply.
+        let early = super::super::super::apply_named_group_metadata_event(
+            &survivor,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            !early.accepted,
+            "the promoted member is not an admin on the survivor's roster yet"
+        );
+        // Then the recovery frame.
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Applied
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, committed.state_hash, "the recovery head");
+        assert_eq!(held.secret_epoch, committed.secret_epoch, "the new epoch");
+        assert_eq!(
+            held.shared_secret.as_deref(),
+            Some(new_secret.as_slice()),
+            "the survivor holds the new epoch's secret"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Codex P1 (#1508 r5, B), ADR 0110 §2: the owner signs two valid
+    /// mandates on one parent, for two members. Each member commits its
+    /// own recovery, so two sibling recoveries promote different members.
+    /// Each replica then receives the other's sibling. It must keep the
+    /// authenticated conflict as fork evidence and contain the group (the
+    /// existing fork-quarantine marker; ADR 0064's owner anchor resolves
+    /// it), across a restart, and stop sealing and delivering on its own
+    /// branch. Before the fix the sibling was refused with
+    /// `recovery_head_mismatch` and dropped: each side went on alone.
+    #[tokio::test]
+    async fn sibling_owner_recoveries_contain_the_group_on_each_replica() -> Result<()> {
+        let seed = [0x72; 32];
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let a = offline_author(dir_a.path(), seed).await?;
+        let b = offline_author(dir_b.path(), seed).await?;
+        let owner = a.agent.identity().user_keypair().context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let info = recovery_parent(
+            owner,
+            &admin,
+            [
+                a.agent.identity().agent_keypair(),
+                b.agent.identity().agent_keypair(),
+            ],
+        )?;
+        let stable = info.stable_group_id().to_string();
+        for state in [&a, &b] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        let (head_a, frame_a) = commit_own_recovery(&a, &stable, &info).await?;
+        let (head_b, frame_b) = commit_own_recovery(&b, &stable, &info).await?;
+        assert_ne!(head_a.state_hash, head_b.state_hash, "two siblings");
+
+        for (replica, own, sibling) in [(&a, &head_a, &frame_b), (&b, &head_b, &frame_a)] {
+            let sibling_head = match orc::decode_frame(sibling) {
+                Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) => frame.body.commit.state_hash,
+                _ => anyhow::bail!("an X0XORC1 commit frame"),
+            };
+            assert_ne!(
+                receive_bytes(replica, sibling).await?,
+                ReceiveOutcome::Applied,
+                "no node applies both siblings"
+            );
+            let held = replica.named_groups.read().await[&stable].clone();
+            assert_eq!(held.state_hash, own.state_hash, "the own branch is kept");
+            let marker = held
+                .fork_quarantine
+                .as_ref()
+                .context("the sibling recovery is kept as fork evidence")?;
+            assert_eq!(marker.state_hash, sibling_head, "the sibling's head");
+            assert_eq!(marker.revision, own.state_revision);
+            assert!(!marker.no_anchor, "the owner anchor resolves it");
+            // Containment: the delivery of the own branch stops.
+            drive_deliveries(replica).await;
+            assert!(
+                !replica
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .orc
+                    .deliveries
+                    .contains_key(&stable),
+                "a contained group delivers no recovery"
+            );
+        }
+
+        // The evidence survives a restart.
+        a.agent.shutdown().await;
+        drop(a);
+        let restarted = offline_daemon(dir_a.path(), None).await?;
+        let held = restarted.named_groups.read().await[&stable].clone();
+        assert!(
+            held.fork_quarantine.is_some(),
+            "the fork evidence survives the restart"
+        );
+        restarted.agent.shutdown().await;
+        b.agent.shutdown().await;
         Ok(())
     }
 }
