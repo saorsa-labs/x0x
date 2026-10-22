@@ -9775,6 +9775,18 @@ async fn recover_member_treekem_key_package(
     recover_member_treekem_key_package_locked(state, group_id, member_agent_id).await
 }
 
+/// W3-H (#1357, test builds only): one read-only line of this node's S4
+/// seal state for `target_hex` in `group_id` (row, evaluation, last attempt,
+/// head round, higher-head evidence). Changes nothing.
+#[cfg(test)]
+pub(in crate::server) async fn s4_seal_probe_for_test(
+    state: &AppState,
+    group_id: &str,
+    target_hex: &str,
+) -> String {
+    revocation_eviction::seal_probe_for_test(state, group_id, target_hex).await
+}
+
 /// W3-H (#1357, test builds only): whether this node can resolve
 /// `member_agent_id`'s TreeKEM KeyPackage for a removal with no network
 /// step, by the lookup [`resolve_member_treekem_kp_for_removal_locked`]

@@ -199,6 +199,18 @@ const EARLY_READ: Duration = Duration::from_secs(5);
 /// After H, the case waits this long and re-reads, so a duplicate rekey
 /// (a second epoch step) is seen.
 const SETTLE: Duration = Duration::from_secs(30);
+/// The late arm: after the poll that first sees A's row, the case reads A's
+/// seal state at these points (a healthy A seals in about 1.1 s; the ranked
+/// fallback can seal about 8 s later). Receipt evidence only.
+const LATE_PROBE_MARKS: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_millis(500),
+    Duration::from_millis(1500),
+    Duration::from_secs(4),
+    Duration::from_secs(7),
+];
+/// Most captured WARN logs a RED late-arm receipt lists.
+const LATE_RED_LOG_LINES: usize = 60;
 /// Budget for each setup readiness wait.
 const SETUP: Duration = Duration::from_secs(180);
 /// Budget for the revocation record to reach the holders.
@@ -1574,6 +1586,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // The late arm: the first poll (virtual time after t = 0) at which A's
     // `.evs` row for B exists. A file read only, so the trace is the same.
     let mut a_row_seen: Option<Duration> = None;
+    // The late arm (#1533 flake evidence): A's in-process seal state at
+    // fixed points after the poll that first saw A's row. An in-memory
+    // read only (no API call, no frame), so the trace is the same.
+    let mut a_probes: Vec<String> = Vec::new();
     let waited = sim
         .until("the survivors reach H", bound, async |s: &Sim| {
             if late_hold.is_some()
@@ -1581,6 +1597,28 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                 && persisted_t_obs(s, "A", b.as_bytes()).is_ok_and(|t_obs| t_obs.is_some())
             {
                 a_row_seen = Some(s.fabric().now().saturating_sub(started));
+            }
+            if let Some(row_seen) = a_row_seen {
+                let since = s
+                    .fabric()
+                    .now()
+                    .saturating_sub(started)
+                    .saturating_sub(row_seen);
+                while LATE_PROBE_MARKS
+                    .get(a_probes.len())
+                    .is_some_and(|mark| since >= *mark)
+                {
+                    let probe = match s.state("A") {
+                        Ok(state) => {
+                            crate::server::routes::named_groups::s4_seal_probe_for_test(
+                                &state, &group, &b_hex,
+                            )
+                            .await
+                        }
+                        Err(error) => format!("{error:#}"),
+                    };
+                    a_probes.push(format!("row seen +{} ms: {probe}", since.as_millis()));
+                }
             }
             let Some(now) = seen.observe(views_now(s, survivors, &group, &b)).await else {
                 return true;
@@ -1727,6 +1765,35 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             h && data_plane && stays_removed && committed_by && in_bound
         }
     };
+    if late_hold.is_some() {
+        receipt.note(format!(
+            "late arm: A's seal state after its row: {}",
+            if a_probes.is_empty() {
+                "no probe".to_string()
+            } else {
+                a_probes.join(" | ")
+            }
+        ));
+        if !passed {
+            // The WARN-or-worse logs of every daemon after t = 0 (the
+            // capture has no node label), so a RED names its refusal.
+            let logs: Vec<String> = sim
+                .logs_containing(&[])
+                .into_iter()
+                .filter(|log| log.at >= started)
+                .take(LATE_RED_LOG_LINES)
+                .map(|log| {
+                    let text: String = log.text.chars().take(400).collect();
+                    format!("{} us {text}", log.at.as_micros())
+                })
+                .collect();
+            receipt.note(format!(
+                "late arm RED: WARN logs after t=0 ({} shown, at most {LATE_RED_LOG_LINES}): {}",
+                logs.len(),
+                logs.join(" | ")
+            ));
+        }
+    }
     receipt.note(format!(
         "S4 status at the end: {}",
         statuses(sim, labels, &group).await?

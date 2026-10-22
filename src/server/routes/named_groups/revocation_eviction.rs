@@ -558,6 +558,91 @@ pub(super) async fn group_head_synced(state: &AppState, group_key: &str) -> bool
         })
 }
 
+/// Test-only: one line of the S4 seal state of `target_hex` in
+/// `group_key`, for a W3-H receipt (#1533 late-observation flake). It reads
+/// every input of the seal decision: the row, the last evaluation, the
+/// last attempt (wait and next time), the head round and each part of the
+/// higher-head evidence. It changes nothing.
+#[cfg(test)]
+pub(in crate::server) async fn seal_probe_for_test(
+    state: &AppState,
+    group_key: &str,
+    target_hex: &str,
+) -> String {
+    let Some((key_name, info)) = ({
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, group_key)
+            .map(|(key, info)| (key.to_string(), info.clone()))
+    }) else {
+        return "group not found".to_string();
+    };
+    let Ok(target) = super::parse_agent_id_hex(target_hex) else {
+        return "bad target".to_string();
+    };
+    let stable = info.stable_group_id().to_string();
+    let ids = [key_name.clone(), stable.clone(), info.mls_group_id.clone()];
+    let local_epoch = local_epoch_of(state, &key_name, &info).await;
+    let queued: usize = {
+        let pending = state.treekem_pending_events.read().await;
+        ids.iter()
+            .map(|id| pending.get(id).map_or(0, std::collections::VecDeque::len))
+            .sum()
+    };
+    let ahead: Option<u64> = {
+        let targets = state.treekem_epoch_ahead_targets.lock().await;
+        ids.iter()
+            .filter_map(|id| targets.get(id).map(|target| target.epoch))
+            .max()
+    };
+    let fence = super::self_leave_rekey_fence_any_open(&ids);
+    let synced = group_head_synced(state, &key_name).await;
+    let key_package =
+        super::holds_member_key_package_for_removal(state, &key_name, target_hex).await;
+    let key = EvictionKey::new(stable, *target.as_bytes());
+    let now = Instant::now();
+    let inner = state.revocation_evictions.inner.lock().await;
+    let row = inner.store.get(&key).map(|row| {
+        format!(
+            "phase={} waiting={:?}",
+            row.phase.as_str(),
+            row.waiting.as_ref().map(|waiting| waiting.cause.as_str())
+        )
+    });
+    let evaluation = inner
+        .evaluations
+        .get(&key)
+        .map(|evaluation| format!("{:?} {:?}", evaluation.action, evaluation.permission));
+    let attempt_wait = inner
+        .attempt_wait
+        .get(&key)
+        .map(|waiting| waiting.cause.as_str());
+    let next_attempt_ms = inner
+        .next_attempt
+        .get(&key)
+        .map(|at| s4::duration_ms(at.saturating_duration_since(now)));
+    let elapsed_ms = inner
+        .budgets
+        .get(&key)
+        .map(|budget| s4::duration_ms(budget.elapsed(now)));
+    let round = inner.head_rounds.get(info.stable_group_id()).map(|round| {
+        format!(
+            "current_head={} confirmed={} asked={} conflicting={} age_ms={}",
+            round.head == info.state_hash,
+            round.confirmed,
+            round.asked.len(),
+            round.conflicting.len(),
+            s4::duration_ms(now.saturating_duration_since(round.started))
+        )
+    });
+    format!(
+        "row={row:?} evaluation={evaluation:?} attempt_wait={attempt_wait:?} \
+         next_attempt_in_ms={next_attempt_ms:?} elapsed_ms={elapsed_ms:?} \
+         head_synced={synced} round={round:?} pending_events={queued} \
+         epoch_ahead={ahead:?} local_epoch={local_epoch} fence_open={fence} \
+         key_package={key_package}"
+    )
+}
+
 /// §2: the catch-up response handler calls this for each verified,
 /// applied, non-truncated page that carries the responder's saved head
 /// (`responder_state_hash`). The sender is an active, unrevoked member;
