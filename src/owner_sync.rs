@@ -855,13 +855,15 @@ pub struct OwnerSyncStore {
     canonical_home_gate: tokio::sync::RwLock<()>,
     /// #1542: the one serializer of the `IssuanceJournal` register and the
     /// issuance journal file. Two writers move values between them:
-    /// [`Self::commit_batch`] (register, then the journal file, for an
-    /// accepted inbound record) and the reconcile `mint_journal_lines`
-    /// (journal file, then register). Each holds this lock for its whole
-    /// read-and-write, so neither sees the other half done. Thus, while the
-    /// lock is free, every committed register value is in the journal
-    /// file, or the journal file holds a local issuance that the next
-    /// reconcile publishes. Lock order: `journal_apply` →
+    /// [`Self::commit_batch`] (for an accepted inbound record) and the
+    /// reconcile `mint_journal_lines`. Both write the journal file first
+    /// and the register second, and each holds this lock for its whole
+    /// read-and-write, so neither sees the other half done. Thus every
+    /// durable register value is in the journal file, or the journal file
+    /// holds a newer line that the next reconcile publishes. A failure or
+    /// a restart between the two writes leaves the journal ahead, never
+    /// behind: a register ahead of the journal would make the reconcile
+    /// mint the journal's older line over it. Lock order: `journal_apply` →
     /// `canonical_home_gate` → `records`, and `journal_apply` → the
     /// profile journal writer lock.
     journal_apply: tokio::sync::Mutex<()>,
@@ -1239,15 +1241,19 @@ impl OwnerSyncStore {
     /// at `path` when this device needs it ([`synced_line_needed`]).
     /// `published` is the register's value before the commit that accepted
     /// `value`. The caller holds `journal_apply`, so the register cannot
-    /// change and no reconcile can read the journal until this returns. A
-    /// failed append is logged; the journal is advisory.
+    /// change and no reconcile can read the journal until this returns.
+    ///
+    /// # Errors
+    ///
+    /// The IO error of a failed append. The caller must not then persist
+    /// `value` to the register (see `journal_apply`).
     async fn apply_journal_value(
         &self,
         path: &Path,
         owner_hex: &str,
         value: &SyncValue,
         published: Option<SyncValue>,
-    ) {
+    ) -> std::io::Result<()> {
         let SyncValue::IssuanceJournal {
             agent_id,
             cert_digest,
@@ -1255,21 +1261,20 @@ impl OwnerSyncStore {
             not_after,
         } = value
         else {
-            return;
+            return Ok(());
         };
         #[cfg(test)]
         if self
             .fail_journal_append
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            tracing::warn!(target: "x0x::owner_sync", "failed to append synced journal line: injected");
-            return;
+            return Err(std::io::Error::other("injected append failure"));
         }
         let published_digest = match published {
             Some(SyncValue::IssuanceJournal { cert_digest, .. }) => Some(cert_digest),
             _ => None,
         };
-        let appended = crate::profile::IssuedCertRecord::append_when(path, |existing| async move {
+        crate::profile::IssuedCertRecord::append_when(path, |existing| async move {
             #[cfg(test)]
             self.pause_after_journal_check().await;
             synced_line_needed(
@@ -1291,13 +1296,8 @@ impl OwnerSyncStore {
                 )
             })
         })
-        .await;
-        if let Err(e) = appended {
-            tracing::warn!(
-                target: "x0x::owner_sync",
-                "failed to append synced journal line: {e}"
-            );
-        }
+        .await?;
+        Ok(())
     }
 
     /// Apply accepted `IssuanceJournal` records to the issuance journal at
@@ -1624,21 +1624,30 @@ impl OwnerSyncStore {
                 if outcome.accepted.is_empty() {
                     return Ok(outcome); // nothing new — no write needed
                 }
+                // #1542: the journal file first, then the register (see
+                // `journal_apply`). A failed append commits nothing; a
+                // later session delivers the records again.
+                if let Some(path) = journal {
+                    let owner_hex = hex::encode(owner.0);
+                    for (value, published) in Self::journal_updates(&records, &touched) {
+                        if let Err(e) = self
+                            .apply_journal_value(path, &owner_hex, &value, published)
+                            .await
+                        {
+                            Self::rollback(&mut records, &touched);
+                            return Err(SyncError::Io(format!(
+                                "failed to append synced journal line: {e}"
+                            )));
+                        }
+                    }
+                    #[cfg(test)]
+                    if self.stop_after_first_journal_write() {
+                        return Err(SyncError::Io("stopped between writes".into()));
+                    }
+                }
                 match self.persist_records(&records).await {
                     Ok(()) => {
-                        let journal_updates = Self::journal_updates(&records, &touched);
                         drop(records);
-                        #[cfg(test)]
-                        if journal.is_some() && self.stop_after_first_journal_write() {
-                            return Err(SyncError::Io("stopped between writes".into()));
-                        }
-                        if let Some(path) = journal {
-                            let owner_hex = hex::encode(owner.0);
-                            for (value, published) in journal_updates {
-                                self.apply_journal_value(path, &owner_hex, &value, published)
-                                    .await;
-                            }
-                        }
                         self.kick();
                         Ok(outcome)
                     }
@@ -4330,7 +4339,8 @@ mod tests {
                 },
                 None,
             )
-            .await;
+            .await
+            .expect("apply d1");
         let roster = agent.owner_issued_certificates().await;
         let entry = roster
             .iter()
@@ -6441,7 +6451,8 @@ mod issuance_journal_sync_tests {
         local
             .fail_journal_append
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = local.commit_batch(vec![r2.clone()], &owner.user_id()).await;
+        let failed = local.commit_batch(vec![r2.clone()], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
         local
             .fail_journal_append
             .store(false, std::sync::atomic::Ordering::Relaxed);
