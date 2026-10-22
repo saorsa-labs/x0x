@@ -744,8 +744,9 @@ impl Drop for FailDurableBeforeRenameGuard {
 }
 
 /// Test-only pause at the durable rename, so a caller can be cancelled
-/// while the publish is still in progress. Path-scoped: other files in
-/// the same process rename normally.
+/// while the publish is still in progress. Path-scoped, like the
+/// parent-directory fsync seam: threaded `cargo test` runs the suite in
+/// one process, and one armed path must not release or skip another.
 #[cfg(test)]
 struct DurableRenamePause {
     path: std::path::PathBuf,
@@ -753,8 +754,8 @@ struct DurableRenamePause {
 }
 
 #[cfg(test)]
-static DURABLE_RENAME_PAUSE_FOR_TESTING: std::sync::Mutex<Option<DurableRenamePause>> =
-    std::sync::Mutex::new(None);
+static DURABLE_RENAME_PAUSE_FOR_TESTING: std::sync::Mutex<Vec<DurableRenamePause>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Arm the pause. Drop releases it, including after a panic.
 #[cfg(test)]
@@ -764,12 +765,13 @@ pub(crate) struct DurableRenamePauseGuard {
 
 #[cfg(test)]
 pub(crate) fn arm_durable_rename_pause_for_testing(path: &Path) -> DurableRenamePauseGuard {
-    *DURABLE_RENAME_PAUSE_FOR_TESTING
+    DURABLE_RENAME_PAUSE_FOR_TESTING
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DurableRenamePause {
-        path: path.to_path_buf(),
-        entered: false,
-    });
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(DurableRenamePause {
+            path: path.to_path_buf(),
+            entered: false,
+        });
     DurableRenamePauseGuard {
         path: path.to_path_buf(),
     }
@@ -780,18 +782,16 @@ pub(crate) fn durable_rename_pause_entered_for_testing(path: &Path) -> bool {
     DURABLE_RENAME_PAUSE_FOR_TESTING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .is_some_and(|pause| pause.path == path && pause.entered)
+        .iter()
+        .any(|pause| pause.path == path && pause.entered)
 }
 
 #[cfg(test)]
 fn release_durable_rename_pause(path: &Path) {
-    let mut slot = DURABLE_RENAME_PAUSE_FOR_TESTING
+    DURABLE_RENAME_PAUSE_FOR_TESTING
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if slot.as_ref().is_some_and(|pause| pause.path == path) {
-        *slot = None;
-    }
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|pause| pause.path != path);
 }
 
 #[cfg(test)]
@@ -810,12 +810,9 @@ async fn pause_durable_rename_for_testing(path: &Path) {
         let mut slot = DURABLE_RENAME_PAUSE_FOR_TESTING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(pause) = slot.as_mut() else {
+        let Some(pause) = slot.iter_mut().find(|pause| pause.path == path) else {
             return;
         };
-        if pause.path != path {
-            return;
-        }
         pause.entered = true;
     }
     loop {
@@ -823,10 +820,7 @@ async fn pause_durable_rename_for_testing(path: &Path) {
         let slot = DURABLE_RENAME_PAUSE_FOR_TESTING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(pause) = slot.as_ref() else {
-            return;
-        };
-        if pause.path != path {
+        if !slot.iter().any(|pause| pause.path == path) {
             return;
         }
     }

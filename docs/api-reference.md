@@ -79,7 +79,9 @@ Auth-class labels used throughout this reference:
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
   route, (#1386) `POST /forwards` in every case (including plain hex
-  `peer_agent`), and every `/names*` route. The join-request list,
+  `peer_agent`), `DELETE /forwards/:local_addr` (David, 20 Oct 2026,
+  17:54 BST: a session token or a rider token is refused, the same rule as
+  `POST /forwards`), and every `/names*` route. The join-request list,
   approve and reject are not on this list. They take one class that
   depends on the group: see **Join-request admin (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
@@ -3162,10 +3164,10 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service (**durable-owner** in every case) |
-| GET | `/forwards` | `x0x forward list` | List registered forwards |
-| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address |
-| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `socks_denied`, and the connect-ACL snapshot |
+| POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`; **durable-owner** in every case) |
+| GET | `/forwards` | `x0x forward list` | List registered forwards, including persisted forwards that are down |
+| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address and delete its persisted record (**durable-owner**) |
+| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `machine_mismatch`, `socks_denied`, and the connect-ACL snapshot |
 
 `socks_denied` counts SOCKS CONNECT replies of `0x02` (the peer connect gate denied the target). The field is `0` when the SOCKS listener is off.
 
@@ -3193,17 +3195,46 @@ In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact addres
 ```json
 {
   "local_addr": "127.0.0.1:8022",
-  "peer_agent": "<peer agent id hex>",
+  "peer_agent": "<peer agent id hex, or a name>",
   "target_host": "127.0.0.1",
-  "target_port": 22
+  "target_port": 22,
+  "ephemeral": false
 }
 ```
 
-`POST /forwards` requires the durable owner API token (**durable-owner**) in every case. Session and rider tokens receive a typed `403`, including a plain hex `peer_agent` that writes no name or pin. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward.
+`POST /forwards` and `DELETE /forwards/:local_addr` require the durable owner API token (**durable-owner**). David ruled this for `DELETE /forwards/:local_addr` on 20 Oct 2026 at 17:54 BST: a session token or a rider token receives a typed `403`, the same rule as `POST /forwards`. That includes a plain hex `peer_agent` that writes no name or pin, and a delete of an ephemeral forward. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward and could delete any forward.
 
-`local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
+`local_addr` must be loopback. `target_host` must be a numeric loopback IP (no DNS). `POST /forwards` returns `409` when connect is disabled (no ACL loaded). `DELETE /forwards/:local_addr` still removes a saved record in that state and returns `404` when the address is not saved. No running forwarder is required. The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
 
-`peer_agent` also accepts an agent name (`studio.me`, `agent:studio.bob`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. The response then carries the canonical `name`. A `machine:` name, or a bare label that resolves to a machine, is refused with `400` `machine_target_unsupported`. This lasts until forwards check that the stream reaches the pinned `MachineId` (ADR-0074 slice 2). Name errors use the codes listed under Names.
+`peer_agent` also accepts a name (`studio.me`, `agent:studio.bob`, `machine:box.me`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. A machine name opens streams to the one agent that machine's daemon announces. The response carries the canonical `name`, its `kind`, `pinned_machine_id` and `persistent`. Name errors use the codes listed under Names.
+
+**Machine binding (ADR-0074 §1).** A forward with a pinned machine (every machine-name forward and every persistent forward) checks, on every stream, that the stream reached that `MachineId` before any forward-header byte is sent. On a mismatch (the agent moved, or discovery changed) the stream is reset with zero header bytes, the local TCP connection closes, and `GET /streams` `machine_mismatch` counts it.
+
+**Persistence (ADR-0074 §2).** Forwards persist by default in `<data_dir>/forwards.json` (versioned JSON, unknown fields rejected, mode `0600`, written durably). `"ephemeral": true` (`x0x forward add --ephemeral`) keeps a forward in memory only. A persistent forward records `{id, local_addr, name?, kind, pinned_agent_id, pinned_machine_id, target_host, target_port}`, where `id` is the bound `local_addr`. For an agent or hex target, the pinned machine is the machine the agent is bound to when the forward is added; if that is not known yet, a persistent add returns `409` `machine_unknown` (retry once the peer is discovered, or add it as ephemeral). A persistent add returns `503` `forward_store` when `forwards.json` is unreadable or cannot be written, and `409` `forward_store_full` at 1024 forwards. An unreadable file does not block an ephemeral add, and it does not block deletion of a live ephemeral forward. Deleting a persistent forward still returns `503` `forward_store` until the file can be updated. The corrupt file is never overwritten.
+
+At daemon start each persisted forward is re-bound. A named forward is first re-resolved through the name store, where its pin applies, and comes up only if the name still denotes exactly its pinned agent (and, for a machine name, its pinned machine). Otherwise it stays down and is never retargeted: `GET /forwards` lists it with `enabled: false` and an `error` starting with a code — `name_changed` (the name now resolves to another key; delete and re-add the forward to re-pin), a name error code such as `unknown_name`, or `bind_failed` (the port is busy). Forwards that are down are retried every 10 s, so a peer that is discovered after startup comes back without user action; startup never waits for them. An unreadable `forwards.json` restores nothing, is never overwritten, and is reported as `store_error` in `GET /forwards`. When connect is disabled (no ACL loaded) the file is kept and nothing is restored. `GET /forwards` still lists each saved record, with `enabled` false and `error` `connect_disabled: connect forwarding is disabled (no connect ACL loaded)`. `DELETE /forwards/:local_addr` still removes the saved record. No forwarder is required. A persistent add whose record would not load back (for example a non-loopback `target_host`) is refused with `400` `invalid_forward` before the port is bound.
+
+`GET /forwards` returns:
+
+```json
+{
+  "forwards": [
+    {
+      "local_addr": "127.0.0.1:8022",
+      "peer_agent": "<hex>",
+      "target_host": "::1",
+      "target_port": 22,
+      "name": "machine:box.me",
+      "kind": "machine",
+      "pinned_machine_id": "<hex>",
+      "persistent": true,
+      "enabled": true,
+      "error": null
+    }
+  ],
+  "store_error": null
+}
+```
 
 ## Names (ADR-0074)
 
@@ -3252,8 +3283,8 @@ Refusals are `{"ok": false, "error", "code"}`:
 |---|---|---|
 | `invalid_name` | 400 | Outside the grammar |
 | `reserved_label` | 400 | `me`/`agent`/`machine` used as a label |
-| `machine_target_unsupported` | 400 | A machine name where only agents are accepted (`POST /forwards`) |
-| `unknown_name` | 404 | Unbound owner label, or nothing carries the name |
+| `machine_target_unsupported` | 400 | A machine name where the caller asked for an agent only |
+| `unknown_name` | 404 | Unbound owner label, or nothing carries the name (for a forward to a machine name: no single agent is announced on that machine) |
 | `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
 | `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
 | `ambiguous_kind` | 409 | A bare label names both an agent and a machine, even when a pin exists. Retry with `agent:` or `machine:` |

@@ -3,9 +3,13 @@
 use crate::cli::{print_value, DaemonClient};
 use anyhow::Result;
 
-/// `x0x forward add --local 127.0.0.1:PORT --peer <hex> --target 127.0.0.1 --target-port N`
+/// `x0x forward add --local 127.0.0.1:PORT --peer <hex|name> --target 127.0.0.1 --target-port N`
 ///
 /// Registers a local loopback listener that tunnels to a peer's loopback
+/// service. The forward persists across daemon restarts.
+///
+/// Existing callers keep this signature. [`add_with_ephemeral`] opts a
+/// forward out of persistence.
 pub async fn add(
     client: &DaemonClient,
     local_addr: &str,
@@ -13,16 +17,39 @@ pub async fn add(
     target_host: &str,
     target_port: u16,
 ) -> Result<()> {
+    add_with_ephemeral(client, local_addr, peer, target_host, target_port, false).await
+}
+
+/// `x0x forward add --ephemeral` — same as [`add`], kept in memory only.
+pub async fn add_with_ephemeral(
+    client: &DaemonClient,
+    local_addr: &str,
+    peer: &str,
+    target_host: &str,
+    target_port: u16,
+    ephemeral: bool,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({
+    let body = add_body(local_addr, peer, target_host, target_port, ephemeral);
+    let resp = client.post("/forwards", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+fn add_body(
+    local_addr: &str,
+    peer: &str,
+    target_host: &str,
+    target_port: u16,
+    ephemeral: bool,
+) -> serde_json::Value {
+    serde_json::json!({
         "local_addr": local_addr,
         "peer_agent": peer,
         "target_host": target_host,
         "target_port": target_port,
-    });
-    let resp = client.post("/forwards", &body).await?;
-    print_value(client.format(), &resp);
-    Ok(())
+        "ephemeral": ephemeral,
+    })
 }
 
 /// `x0x forward list` — list registered forwards.
@@ -51,19 +78,18 @@ pub async fn streams(client: &DaemonClient) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use super::add_body;
 
     #[test]
     fn add_body_shape_is_stable() {
         // The REST body the CLI sends — pinned so a daemon handler change
         // can't silently drift from what the CLI emits.
-        let body = json!({
-            "local_addr": "127.0.0.1:8022",
-            "peer_agent": "deadbeef",
-            "target_host": "127.0.0.1",
-            "target_port": 22,
-        });
+        let body = add_body("127.0.0.1:8022", "deadbeef", "127.0.0.1", 22, false);
         assert_eq!(body["target_port"], 22);
         assert_eq!(body["local_addr"], "127.0.0.1:8022");
+        // `--ephemeral` opts a forward out, and it must reach the wire.
+        assert_eq!(body["ephemeral"], false);
+        let body = add_body("127.0.0.1:8022", "deadbeef", "127.0.0.1", 22, true);
+        assert_eq!(body["ephemeral"], true);
     }
 }

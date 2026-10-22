@@ -544,6 +544,8 @@ mod tests {
             ("/history", Method::DELETE),
             ("/files/send", Method::POST),
             ("/forwards", Method::POST),
+            // Deleting a forward removes the owner's persisted record.
+            ("/forwards/127.0.0.1:8022", Method::DELETE),
         ];
         for (path, method) in forbidden {
             assert!(
