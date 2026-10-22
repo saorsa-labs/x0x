@@ -399,14 +399,16 @@ impl IssuedCertRecord {
     /// the issuance call sites (warn + continue): a missing journal line
     /// degrades the roster to discovery-derived, it never blocks startup.
     pub async fn append(path: &Path, record: &Self) -> std::io::Result<()> {
-        Self::append_locked(path, record, JOURNAL_WRITER.lock().await).await
+        Self::append_locked(path, record, JOURNAL_WRITER.lock().await, ()).await
     }
 
-    /// [`Self::append`] for a caller that holds `JOURNAL_WRITER`.
-    async fn append_locked(
+    /// [`Self::append`] for a caller that holds `JOURNAL_WRITER`. `held`
+    /// moves into the write task (see [`Self::replace_locked`]).
+    async fn append_locked<H: Send + 'static>(
         path: &Path,
         record: &Self,
         writer: JournalWriter,
+        held: H,
     ) -> std::io::Result<()> {
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
@@ -417,26 +419,39 @@ impl IssuedCertRecord {
         let mut content = tokio::fs::read(path).await.unwrap_or_default();
         content.extend_from_slice(line.as_bytes());
         content.push(b'\n');
-        Self::replace_locked(path, content, writer).await.map(drop)
+        Self::replace_locked(path, content, writer, held)
+            .await
+            .map(drop)
     }
 
     /// Replace the journal at `path` with `content`, durably, and give the
-    /// writer back. The write runs in its own task, which owns `writer`
+    /// writer and `held` back. This is the one write path of the journal.
+    /// The write runs in its own task, which owns `writer` and `held`
     /// until the I/O and the durable mark are done. A cancelled caller
     /// stops only its wait: no other journal writer can run while a
-    /// blocking write of this one can still land (#1542).
-    async fn replace_locked(
+    /// blocking write of this one can still land (#1542). A writer that
+    /// must not outlive a custody (owner sync's write custody, #1545)
+    /// passes its hold as `held`, so the custody waits for the write.
+    async fn replace_locked<H: Send + 'static>(
         path: &Path,
         content: Vec<u8>,
         mut writer: JournalWriter,
-    ) -> std::io::Result<JournalWriter> {
+        held: H,
+    ) -> std::io::Result<(JournalWriter, H)> {
         let path = path.to_path_buf();
         tokio::spawn(async move {
             Self::replace_durably(&path, &content, &mut writer).await?;
-            Ok(writer)
+            Ok((writer, held))
         })
         .await
         .map_err(std::io::Error::other)?
+    }
+
+    /// #1545: wait for the journal write in flight, if any. Shutdown calls
+    /// this before the daemon releases its data directory, so a write
+    /// whose caller was aborted cannot land after it.
+    pub(crate) async fn wait_for_writes() {
+        drop(JOURNAL_WRITER.lock().await);
     }
 
     /// The I/O of [`Self::replace_locked`]. Once the rename is done, the
@@ -490,17 +505,18 @@ impl IssuedCertRecord {
     /// The caller holds `JOURNAL_WRITER`. A new write of the same bytes is
     /// used, not a second fsync of the old file: after a failed fsync, a
     /// later fsync can report success for data that was not written.
-    async fn make_durable_locked(
+    async fn make_durable_locked<H: Send + 'static>(
         path: &Path,
         writer: JournalWriter,
-    ) -> std::io::Result<JournalWriter> {
+        held: H,
+    ) -> std::io::Result<(JournalWriter, H)> {
         if writer.contains(path) {
-            return Ok(writer);
+            return Ok((writer, held));
         }
         match tokio::fs::read(path).await {
-            Ok(content) => Self::replace_locked(path, content, writer).await,
+            Ok(content) => Self::replace_locked(path, content, writer, held).await,
             // No journal: no line to publish.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(writer),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((writer, held)),
             Err(e) => Err(e),
         }
     }
@@ -520,24 +536,30 @@ impl IssuedCertRecord {
     /// decision and the append are one step: every journal writer in this
     /// process holds the journal writer lock for its read-modify-write.
     /// `decide` runs under that lock, so it must not append to the journal.
+    /// `held` moves into each write (see [`Self::replace_locked`]).
     ///
     /// # Errors
     /// Returns the underlying IO error of the append.
-    pub(crate) async fn append_when<F, Fut>(path: &Path, decide: F) -> std::io::Result<bool>
+    pub(crate) async fn append_when<F, Fut, H>(
+        path: &Path,
+        held: H,
+        decide: F,
+    ) -> std::io::Result<bool>
     where
         F: FnOnce(Vec<Self>) -> Fut,
         Fut: std::future::Future<Output = Option<Self>>,
+        H: Send + 'static,
     {
         let writer = JOURNAL_WRITER.lock().await;
         // #1542: the decision may skip the append because the line is
         // already there, and the caller then writes its register. So the
         // lines it decides from must be durable.
-        let writer = Self::make_durable_locked(path, writer).await?;
+        let (writer, held) = Self::make_durable_locked(path, writer, held).await?;
         let existing = Self::load(path).await;
         let Some(record) = decide(existing).await else {
             return Ok(false);
         };
-        Self::append_locked(path, &record, writer).await?;
+        Self::append_locked(path, &record, writer, held).await?;
         Ok(true)
     }
 
@@ -548,10 +570,13 @@ impl IssuedCertRecord {
     ///
     /// # Errors
     /// Returns the IO error when the journal cannot be made durable.
-    pub(crate) async fn load_durable(path: &Path) -> std::io::Result<Vec<Self>> {
+    pub(crate) async fn load_durable<H: Send + 'static>(
+        path: &Path,
+        held: H,
+    ) -> std::io::Result<Vec<Self>> {
         let writer = JOURNAL_WRITER.lock().await;
-        // Hold the writer across the load.
-        let _writer = Self::make_durable_locked(path, writer).await?;
+        // Hold the writer (and `held`) across the load.
+        let _writer_and_held = Self::make_durable_locked(path, writer, held).await?;
         Ok(Self::load(path).await)
     }
 
@@ -765,7 +790,7 @@ mod tests {
         // A durable read: before the rename lands if nothing holds it off.
         let mut read = {
             let path = path.clone();
-            tokio::spawn(async move { IssuedCertRecord::load_durable(&path).await })
+            tokio::spawn(async move { IssuedCertRecord::load_durable(&path, ()).await })
         };
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), &mut read).await;
         release_tx.send(()).unwrap();
@@ -780,7 +805,7 @@ mod tests {
         // Let the cancelled rename land.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let published = IssuedCertRecord::load_durable(&path).await.unwrap();
+        let published = IssuedCertRecord::load_durable(&path, ()).await.unwrap();
         crash_sim::crash(&[&path]);
         let after = IssuedCertRecord::load(&path).await;
         assert_eq!(
@@ -815,7 +840,7 @@ mod tests {
             let path = path.clone();
             let repair = line("d1");
             tokio::spawn(async move {
-                IssuedCertRecord::append_when(&path, move |existing| {
+                IssuedCertRecord::append_when(&path, (), move |existing| {
                     let saw_d2 = existing.iter().any(|r| r.cert_digest == "d2");
                     deciding_tx.send(()).unwrap();
                     release_rx

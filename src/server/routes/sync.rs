@@ -311,7 +311,7 @@ fn names_of(profile: &SelfProfile) -> SyncProfileNames {
 /// # Errors
 ///
 /// The IO error of the note or of the save. The profile is not saved when
-/// the note fails, and `folded` stays owed.
+/// the note fails, or after shutdown, and `folded` stays owed.
 pub(in crate::server) async fn save_profile(
     state: &AppState,
     profile: &SelfProfile,
@@ -324,7 +324,24 @@ pub(in crate::server) async fn save_profile(
             .await
             .map_err(|e| std::io::Error::other(format!("note the profile save: {e}")))?;
     }
-    profile.save_to(&state.profile_path).await?;
+    match state.owner_sync.as_ref() {
+        // #1545: the save holds the store's write custody until it lands,
+        // as the store's own writes do, so shutdown waits for it and a
+        // save after shutdown is refused.
+        Some(sync) => {
+            let (profile, path) = (profile.clone(), state.profile_path.clone());
+            sync.store()
+                .run_to_completion(async move {
+                    profile
+                        .save_to(&path)
+                        .await
+                        .map_err(|e| crate::owner_sync::SyncError::Io(e.to_string()))
+                })
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        None => profile.save_to(&state.profile_path).await?,
+    }
     if let Some((sync, folded)) = owed {
         if let Err(e) = sync.store().discharge_applies(folded).await {
             tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");

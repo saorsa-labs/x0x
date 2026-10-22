@@ -842,13 +842,22 @@ type RecordMap = BTreeMap<(SyncKind, String), VersionedRecord>;
 /// An owned hold of `OwnerSyncStore::journal_apply`.
 type JournalGuard = tokio::sync::OwnedMutexGuard<()>;
 
+/// #1545: a hold of the store's write custody
+/// (`OwnerSyncStore::write_custody`). The task of a durable write owns
+/// one until the write ends; shutdown waits for every hold.
+pub(crate) struct WriteCustody {
+    _custody: tokio::sync::OwnedRwLockReadGuard<bool>,
+}
+
 pub struct OwnerSyncStore {
     dir: PathBuf,
     /// Every change of the register runs its durable write in a task that
     /// owns this lock until the write and the memory update are done
     /// (`replace_records`, #1545).
     records: Arc<tokio::sync::RwLock<RecordMap>>,
-    devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
+    /// Each change runs its durable write as the register does
+    /// (`replace_state`, #1545).
+    devices: Arc<tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>>,
     /// #1055: machine → deletion time (Unix ms). Written BEFORE the device
     /// row is removed, so a crash between the two writes leaves the machine
     /// blocked (fail closed), never re-admittable from a stale enrollment.
@@ -857,9 +866,9 @@ pub struct OwnerSyncStore {
     /// and `unenroll` holds the WRITE across both of its mutations, so
     /// enrollment and deletion serialize on this lock (RC1: no delete can
     /// land between `enroll`'s check and its insert).
-    unenroll_tombstones: tokio::sync::RwLock<BTreeMap<[u8; 32], u64>>,
+    unenroll_tombstones: Arc<tokio::sync::RwLock<BTreeMap<[u8; 32], u64>>>,
     // Verified once on load/enroll, consulted under the devices read lock.
-    evidence_owners: std::sync::RwLock<VerifiedEnrollmentOwners>,
+    evidence_owners: Arc<std::sync::RwLock<VerifiedEnrollmentOwners>>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
     generation_tx: Arc<tokio::sync::watch::Sender<u64>>,
     /// #824: count of successful sessions with an owner device, inbound or
@@ -1156,14 +1165,18 @@ impl OwnerSyncStore {
     }
 
     fn notify_device_change(&self) {
-        if let Some(notify) = self
-            .device_change_notify
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(notify) = self.device_change_notifier() {
             notify.notify_one();
         }
+    }
+
+    /// The listener that `notify_device_change` wakes, for a task that
+    /// owns no `&self`.
+    fn device_change_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.device_change_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Load (or start empty under) `<data_dir>/sync`, creating the
@@ -1225,9 +1238,9 @@ impl OwnerSyncStore {
         Ok(Self {
             dir,
             records: Arc::new(tokio::sync::RwLock::new(records)),
-            devices: tokio::sync::RwLock::new(devices),
-            unenroll_tombstones: tokio::sync::RwLock::new(unenroll_tombstones),
-            evidence_owners: std::sync::RwLock::new(evidence_owners),
+            devices: Arc::new(tokio::sync::RwLock::new(devices)),
+            unenroll_tombstones: Arc::new(tokio::sync::RwLock::new(unenroll_tombstones)),
+            evidence_owners: Arc::new(std::sync::RwLock::new(evidence_owners)),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
             generation_tx: Arc::new(generation_tx),
             sessions_ok_tx: tokio::sync::watch::channel(0).0,
@@ -1352,32 +1365,47 @@ impl OwnerSyncStore {
         Ok(())
     }
 
-    /// #1545: run `work` to its end in its own task, and wait for its
-    /// output. A cancelled caller stops only its wait. Each durable write
-    /// of the register, of the pending applies and of the journal intent
-    /// runs in this way, with the owned guards of the state that it writes
-    /// moved into `work`. Those guards stay held until the write and the
-    /// memory update after it are done: no later writer can start before
-    /// the write lands, and memory ends as the disk holds it.
-    ///
-    /// The task also holds the store's write custody (`write_custody`)
-    /// until `work` ends, so shutdown waits for it
-    /// (`release_write_custody`). After shutdown, `work` does not run.
+    /// #1545: take a hold of the store's write custody for one durable
+    /// write. Shutdown waits for every hold (`release_write_custody`), so
+    /// the write that owns it ends before the daemon releases its data
+    /// directory.
     ///
     /// # Errors
     ///
-    /// The error of `work`; [`SyncError::Io`] when its task fails, or when
-    /// the store has released its files.
-    async fn run_to_completion<T: Send + 'static>(
-        &self,
-        work: impl std::future::Future<Output = Result<T, SyncError>> + Send + 'static,
-    ) -> Result<T, SyncError> {
+    /// [`SyncError::Io`] when the store has released its files.
+    pub(crate) async fn write_custody(&self) -> Result<WriteCustody, SyncError> {
         let custody = Arc::clone(&self.write_custody).read_owned().await;
         if *custody {
             return Err(SyncError::Io(
                 "owner sync store has released its files: write refused".into(),
             ));
         }
+        Ok(WriteCustody { _custody: custody })
+    }
+
+    /// #1545: run `work` to its end in its own task, and wait for its
+    /// output. A cancelled caller stops only its wait. Every durable write
+    /// of the store runs in this way: the register, the device set and
+    /// the tombstones through `replace_state`, the pending applies and the
+    /// journal intent directly, and the profile save through the server.
+    /// The owned guards of the state that a write changes move into
+    /// `work`, and stay held until the write and the memory update after
+    /// it are done: no later writer can start before the write lands, and
+    /// memory ends as the disk holds it.
+    ///
+    /// The task also holds a hold of the write custody
+    /// (`write_custody`) until `work` ends, so shutdown waits for it.
+    /// After shutdown, `work` does not run.
+    ///
+    /// # Errors
+    ///
+    /// The error of `work`; [`SyncError::Io`] when its task fails, or when
+    /// the store has released its files.
+    pub(crate) async fn run_to_completion<T: Send + 'static>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, SyncError>> + Send + 'static,
+    ) -> Result<T, SyncError> {
+        let custody = self.write_custody().await?;
         tokio::spawn(async move {
             let out = work.await;
             drop(custody);
@@ -1390,31 +1418,75 @@ impl OwnerSyncStore {
     /// #1545: give up the store's files before the daemon releases its
     /// data directory. Waits for every durable write in flight, including
     /// one whose caller shutdown aborted, and refuses every later write
-    /// (`run_to_completion`). The wait has no bound: a write cannot be
-    /// stopped once it has started, and only the end of the process (which
-    /// also ends the write) may come first.
+    /// (`write_custody`). The wait has no bound: a write cannot be stopped
+    /// once it has started, and only the end of the process (which also
+    /// ends the write) may come first.
     pub(crate) async fn release_write_custody(&self) {
         *self.write_custody.write().await = true;
     }
 
-    /// Write `next` durably as the register, and then make it the register
-    /// in memory. The two run to their end in one task
-    /// (`run_to_completion`), which owns `records` and `held` until then;
-    /// `held` comes back on success. A caller builds `next` from a copy of
-    /// the register, so a caller cancelled before this call leaves the
-    /// register as it was.
+    /// #1545: the one write path of a state file. Write `bytes` (the
+    /// encoding of `next`) durably to `file`, then make `next` the state in
+    /// memory and call `landed`. All of this runs to its end in
+    /// one task (`run_to_completion`), which owns `state` and `held` until
+    /// then. A caller builds `next` from a copy of the state, so a caller
+    /// cancelled before this call leaves the state as it was. `state` and
+    /// `held` come back on success, so a caller can keep them across a
+    /// second write.
     ///
     /// # Errors
     ///
-    /// [`SyncError::Io`] when the write fails before its rename: the
-    /// register does not change. [`SyncError::Poisoned`] when it fails
-    /// after its rename: the disk holds `next`, so memory takes it too and
-    /// the store is poisoned (review R5 finding 2). Errors PROPAGATE —
-    /// callers never report success on a swallowed write (review R2
-    /// finding 2).
+    /// [`SyncError::Io`] when the write fails before its rename: the state
+    /// does not change. [`SyncError::Poisoned`] when it fails after its
+    /// rename: the disk holds `next`, so memory takes it too (and `landed`
+    /// runs), and the store is poisoned (review R5 finding 2). Errors
+    /// PROPAGATE — callers never report success on a swallowed write
+    /// (review R2 finding 2).
+    async fn replace_state<T, H>(
+        &self,
+        mut state: tokio::sync::OwnedRwLockWriteGuard<T>,
+        next: T,
+        file: &'static str,
+        bytes: Vec<u8>,
+        held: H,
+        landed: impl FnOnce() + Send + 'static,
+    ) -> Result<(tokio::sync::OwnedRwLockWriteGuard<T>, H), SyncError>
+    where
+        T: Send + Sync + 'static,
+        H: Send + 'static,
+    {
+        let path = self.dir.join(file);
+        let fail_after_rename = self.fail_after_rename_for_testing();
+        let poisoned = Arc::clone(&self.poisoned);
+        self.run_to_completion(async move {
+            let written = Self::write_atomically(&path, &bytes, fail_after_rename).await;
+            if let Err(DurableWriteError::BeforeRename(io)) = written {
+                return Err(SyncError::Io(format!("persist {file}: {io}")));
+            }
+            // The disk holds `next`: memory takes it, even when the write
+            // is not durable. Never roll memory back below an advanced
+            // disk.
+            *state = next;
+            landed();
+            if let Err(DurableWriteError::AfterRename(io)) = written {
+                let e = SyncError::Poisoned(format!("{file} replaced but not durable: {io}"));
+                Self::poison_slot(&poisoned, e.to_string());
+                return Err(e);
+            }
+            Ok((state, held))
+        })
+        .await
+    }
+
+    /// Write `next` durably as the register, and then make it the register
+    /// in memory (`replace_state`). `held` comes back on success.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::replace_state`].
     async fn replace_records<H: Send + 'static>(
         &self,
-        mut records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
+        records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
         next: RecordMap,
         held: H,
     ) -> Result<H, SyncError> {
@@ -1429,72 +1501,91 @@ impl OwnerSyncStore {
         {
             return Err(SyncError::Io("injected register write failure".into()));
         }
-        let path = self.dir.join(RECORDS_FILE);
-        let fail_after_rename = self.fail_after_rename_for_testing();
-        let poisoned = Arc::clone(&self.poisoned);
         let generation = Arc::clone(&self.generation_tx);
-        self.run_to_completion(async move {
-            match Self::write_atomically(&path, &bytes, fail_after_rename).await {
-                Ok(()) => {
-                    *records = next;
-                    drop(records);
-                    Self::kick_generation(&generation);
-                    Ok(held)
-                }
-                Err(DurableWriteError::BeforeRename(io)) => {
-                    Err(SyncError::Io(format!("persist records: {io}")))
-                }
-                Err(DurableWriteError::AfterRename(io)) => {
-                    // Disk already holds `next`: memory takes it, and the
-                    // store is poisoned; never roll memory back below an
-                    // advanced disk.
-                    *records = next;
-                    drop(records);
-                    let e = SyncError::Poisoned(format!("records replaced but not durable: {io}"));
-                    Self::poison_slot(&poisoned, e.to_string());
-                    Err(e)
+        let landed = move || Self::kick_generation(&generation);
+        self.replace_state(records, next, RECORDS_FILE, bytes, held, landed)
+            .await
+            .map(|(_, held)| held)
+    }
+
+    /// Write `next` durably as the device set, and then make it the device
+    /// set in memory (`replace_state`). The memory update after the write
+    /// sets the verified owner of `machine` to `verified`
+    /// ([`Self::devices_landed`]).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::replace_state`].
+    async fn replace_devices<H: Send + 'static>(
+        &self,
+        devices: tokio::sync::OwnedRwLockWriteGuard<BTreeMap<[u8; 32], OwnerEnrollment>>,
+        next: BTreeMap<[u8; 32], OwnerEnrollment>,
+        held: H,
+        machine: [u8; 32],
+        verified: Option<(UserId, OwnerEnrollment)>,
+    ) -> Result<H, SyncError> {
+        let landed = self.devices_landed(machine, verified);
+        let bytes = serde_json::to_vec(&PersistedDevices {
+            devices: next.values().cloned().collect(),
+        })
+        .map_err(|e| SyncError::Io(format!("encode devices: {e}")))?;
+        self.replace_state(devices, next, DEVICES_FILE, bytes, held, landed)
+            .await
+            .map(|(_, held)| held)
+    }
+
+    /// The memory update after a device set write: set the verified owner
+    /// of `machine` to `verified` (or remove it), kick a sync pass and wake
+    /// the device-change listener. It runs in the write task, so a
+    /// cancelled caller cannot skip it.
+    fn devices_landed(
+        &self,
+        machine: [u8; 32],
+        verified: Option<(UserId, OwnerEnrollment)>,
+    ) -> impl FnOnce() + Send + 'static {
+        let evidence = Arc::clone(&self.evidence_owners);
+        let generation = Arc::clone(&self.generation_tx);
+        let notify = self.device_change_notifier();
+        move || {
+            if let Ok(mut owners) = evidence.write() {
+                match verified {
+                    Some(entry) => {
+                        owners.insert(machine, entry);
+                    }
+                    None => {
+                        owners.remove(&machine);
+                    }
                 }
             }
-        })
-        .await
+            Self::kick_generation(&generation);
+            if let Some(notify) = notify {
+                notify.notify_one();
+            }
+        }
     }
 
-    /// Persist the device set; errors propagate (see [`Self::replace_records`]).
-    async fn persist_devices(
+    /// Write `next` durably as the unenroll tombstones, and then make them
+    /// the tombstones in memory (`replace_state`). The tombstone guard and
+    /// `held` come back on success.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::replace_state`].
+    async fn replace_tombstones<H: Send + 'static>(
         &self,
-        devices: &BTreeMap<[u8; 32], OwnerEnrollment>,
-    ) -> Result<(), SyncError> {
-        let persisted = PersistedDevices {
-            devices: devices.values().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&persisted)
-            .map_err(|e| SyncError::Io(format!("encode devices: {e}")))?;
-        let path = self.dir.join(DEVICES_FILE);
-        let fail_after_rename = self.fail_after_rename_for_testing();
-        self.run_to_completion(async move {
-            Self::write_atomically(&path, &bytes, fail_after_rename)
-                .await
-                .map_err(|e| match e {
-                    DurableWriteError::BeforeRename(io) => {
-                        SyncError::Io(format!("persist devices: {io}"))
-                    }
-                    DurableWriteError::AfterRename(io) => {
-                        SyncError::Poisoned(format!("devices replaced but not durable: {io}"))
-                    }
-                })
-        })
-        .await
-    }
-
-    /// Persist the unenroll tombstones; errors propagate (see
-    /// [`Self::persist_devices`]).
-    async fn persist_tombstones(
-        &self,
-        tombstones: &BTreeMap<[u8; 32], u64>,
-    ) -> Result<(), SyncError> {
+        tombstones: tokio::sync::OwnedRwLockWriteGuard<BTreeMap<[u8; 32], u64>>,
+        next: BTreeMap<[u8; 32], u64>,
+        held: H,
+    ) -> Result<
+        (
+            tokio::sync::OwnedRwLockWriteGuard<BTreeMap<[u8; 32], u64>>,
+            H,
+        ),
+        SyncError,
+    > {
         let persisted = PersistedTombstones {
             version: TOMBSTONES_FORMAT_VERSION,
-            tombstones: tombstones
+            tombstones: next
                 .iter()
                 .map(|(machine_id, deleted_at_ms)| UnenrollTombstone {
                     machine_id: *machine_id,
@@ -1504,32 +1595,15 @@ impl OwnerSyncStore {
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|e| SyncError::Io(format!("encode tombstones: {e}")))?;
-        let path = self.dir.join(TOMBSTONES_FILE);
-        let fail_after_rename = self.fail_after_rename_for_testing();
-        self.run_to_completion(async move {
-            Self::write_atomically(&path, &bytes, fail_after_rename)
-                .await
-                .map_err(|e| match e {
-                    DurableWriteError::BeforeRename(io) => {
-                        SyncError::Io(format!("persist tombstones: {io}"))
-                    }
-                    DurableWriteError::AfterRename(io) => {
-                        SyncError::Poisoned(format!("tombstones replaced but not durable: {io}"))
-                    }
-                })
-        })
-        .await
+        self.replace_state(tombstones, next, TOMBSTONES_FILE, bytes, held, || {})
+            .await
     }
 
     /// Poison the store: a durable write crossed the rename but could not
     /// be synced, so memory/disk agreement is not reconstructable — all
     /// further mutations and sessions fail until a fresh `load` (review R5
-    /// finding 2).
-    fn poison(&self, reason: String) {
-        Self::poison_slot(&self.poisoned, reason);
-    }
-
-    /// [`Self::poison`] for a task that owns no `&self`.
+    /// finding 2). The write task calls it (`replace_state`), so it takes
+    /// the slot, not `&self`.
     fn poison_slot(slot: &std::sync::Mutex<Option<String>>, reason: String) {
         *slot
             .lock()
@@ -1689,7 +1763,14 @@ impl OwnerSyncStore {
             Some(SyncValue::IssuanceJournal { cert_digest, .. }) => Some(cert_digest),
             _ => None,
         };
-        crate::profile::IssuedCertRecord::append_when(path, |existing| async move {
+        // #1545: the journal write holds the store's write custody until it
+        // lands, so shutdown waits for it even when this caller is
+        // aborted, and a write after shutdown is refused.
+        let custody = self
+            .write_custody()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        crate::profile::IssuedCertRecord::append_when(path, custody, |existing| async move {
             #[cfg(test)]
             self.pause_after_journal_check().await;
             synced_line_needed(
@@ -1847,7 +1928,7 @@ impl OwnerSyncStore {
     ///
     /// [`SyncError::EnrollmentTombstoned`] when the enrollment predates
     /// the machine's tombstone; [`SyncError::Io`] when persistence failed
-    /// BEFORE the rename (the in-memory set is rolled back);
+    /// BEFORE the rename (the in-memory set does not change);
     /// [`SyncError::Poisoned`] when the write crossed the rename but was
     /// not durable — the mutation STAYS (disk already advanced) and the
     /// store refuses further sync until reload (review R5 finding 2).
@@ -1860,7 +1941,7 @@ impl OwnerSyncStore {
         // between this check and the device insert — enrollment and
         // deletion are serialized by `unenroll_tombstones` (RC1; lock
         // order: tombstones → devices).
-        let tombstones = self.unenroll_tombstones.read().await;
+        let tombstones = Arc::clone(&self.unenroll_tombstones).read_owned().await;
         if tombstones
             .get(&enrollment.machine_id)
             .is_some_and(|deleted_at| enrollment.enrolled_at_ms <= *deleted_at)
@@ -1875,46 +1956,27 @@ impl OwnerSyncStore {
             .ok()
             .map(|key| UserId(derive_peer_id_from_public_key(&key).0))
             .filter(|owner| enrollment.verify_owner(owner).is_ok());
-        let mut devices = self.devices.write().await;
-        let previous = devices.get(&enrollment.machine_id).cloned();
-        let keep = previous
-            .as_ref()
+        let devices = Arc::clone(&self.devices).write_owned().await;
+        let keep = devices
+            .get(&enrollment.machine_id)
             .is_none_or(|old| enrollment.enrolled_at_ms >= old.enrolled_at_ms);
-        if keep {
-            devices.insert(enrollment.machine_id, enrollment.clone());
-            if let Err(e) = self.persist_devices(&devices).await {
-                if matches!(e, SyncError::Poisoned(_)) {
-                    // Disk already holds the new device set: keep the
-                    // mutation (memory matches disk) and poison.
-                    drop(devices);
-                    self.poison(e.to_string());
-                    self.notify_device_change();
-                    return Err(e);
-                }
-                // Pre-rename failure: roll back so memory matches the
-                // unchanged disk (review R2 finding 2).
-                match previous {
-                    Some(old) => {
-                        devices.insert(old.machine_id, old);
-                    }
-                    None => {
-                        devices.remove(&enrollment.machine_id);
-                    }
-                }
-                return Err(e);
-            }
-            if let Ok(mut verified) = self.evidence_owners.write() {
-                if let Some(owner) = verified_owner {
-                    verified.insert(enrollment.machine_id, (owner, enrollment.clone()));
-                } else {
-                    verified.remove(&enrollment.machine_id);
-                }
-            }
+        if !keep {
+            drop(devices);
+            self.kick();
+            self.notify_device_change();
+            return Ok(());
         }
-        drop(devices);
-        self.kick();
-        self.notify_device_change();
-        Ok(())
+        // #1545: the write and its memory update run to their end in one
+        // task that owns the device lock and the tombstone read
+        // (`replace_state`), so a cancelled enroll cannot land after a
+        // later device change. A write that fails before its rename leaves
+        // memory and disk as they were (review R2 finding 2).
+        let mut next = devices.clone();
+        next.insert(enrollment.machine_id, enrollment.clone());
+        let verified = verified_owner.map(|owner| (owner, enrollment.clone()));
+        self.replace_devices(devices, next, tombstones, enrollment.machine_id, verified)
+            .await
+            .map(drop)
     }
 
     /// Remove a machine from the owner device set (the DELETE
@@ -1940,7 +2002,7 @@ impl OwnerSyncStore {
         // and a commit that waits takes the gate only after this removal,
         // so its re-validation sees the tombstone
         // (see `commit_session_batch`).
-        let _removal_gate = self.canonical_home_gate.write().await;
+        let removal_gate = Arc::clone(&self.canonical_home_gate).write_owned().await;
         // Tombstone FIRST (#1055): a crash between the two writes leaves
         // the machine blocked (fail closed) instead of re-admittable from
         // a stale enrollment. RC2: the tombstone write lock is held through
@@ -1951,7 +2013,7 @@ impl OwnerSyncStore {
         // restore admission. Holding the lock here serializes `enroll`
         // (which holds the read lock across its insert) for the whole
         // removal — see `unenroll_tombstones`.
-        let mut tombstones = self.unenroll_tombstones.write().await;
+        let tombstones = Arc::clone(&self.unenroll_tombstones).write_owned().await;
         let enrollment_at = self
             .devices
             .read()
@@ -1959,50 +2021,30 @@ impl OwnerSyncStore {
             .get(&machine.0)
             .map_or(0, |enrollment| enrollment.enrolled_at_ms);
         let deleted_at = now_unix_ms().max(enrollment_at);
-        let previous = tombstones.get(&machine.0).copied();
-        if previous.is_none_or(|old| old < deleted_at) {
-            tombstones.insert(machine.0, deleted_at);
-            if let Err(e) = self.persist_tombstones(&tombstones).await {
-                if matches!(e, SyncError::Poisoned(_)) {
-                    // Disk already holds the tombstone: keep it and poison.
-                    self.poison(e.to_string());
-                    return Err(e);
-                }
-                // Pre-rename failure: roll back to the unchanged disk.
-                match previous {
-                    Some(old) => {
-                        tombstones.insert(machine.0, old);
-                    }
-                    None => {
-                        tombstones.remove(&machine.0);
-                    }
-                }
-                return Err(e);
-            }
-        }
-        let mut devices = self.devices.write().await;
-        if let Some(previous) = devices.remove(&machine.0) {
-            if let Err(e) = self.persist_devices(&devices).await {
-                if matches!(e, SyncError::Poisoned(_)) {
-                    // Disk already holds the removal: keep it and poison.
-                    drop(devices);
-                    self.poison(e.to_string());
-                    self.notify_device_change();
-                    return Err(e);
-                }
-                devices.insert(previous.machine_id, previous);
-                return Err(e);
-            }
+        // #1545: each write and its memory update run to their end in a
+        // task that owns the lock of the state it writes
+        // (`replace_state`), so a cancelled unenroll cannot land after a
+        // later one. The tombstone lock and the gate come back from the
+        // tombstone write and move into the device write: RC2 holds.
+        let (tombstones, removal_gate) = if tombstones
+            .get(&machine.0)
+            .is_none_or(|old| *old < deleted_at)
+        {
+            let mut next = tombstones.clone();
+            next.insert(machine.0, deleted_at);
+            self.replace_tombstones(tombstones, next, removal_gate)
+                .await?
         } else {
+            (tombstones, removal_gate)
+        };
+        let devices = Arc::clone(&self.devices).write_owned().await;
+        if !devices.contains_key(&machine.0) {
             return Ok(false);
         }
-        if let Ok(mut verified) = self.evidence_owners.write() {
-            verified.remove(&machine.0);
-        }
-        drop(devices);
-        drop(tombstones);
-        self.kick();
-        self.notify_device_change();
+        let mut next = devices.clone();
+        next.remove(&machine.0);
+        self.replace_devices(devices, next, (removal_gate, tombstones), machine.0, None)
+            .await?;
         Ok(true)
     }
 
@@ -4683,7 +4725,16 @@ async fn mint_journal_lines(
     let owner_hex = hex::encode(owner_kp.user_id().0);
     // A durable read: a line a host crash can take back must not reach the
     // register first.
-    let lines = match crate::profile::IssuedCertRecord::load_durable(path).await {
+    // #1545: a durable read can rewrite the journal; the rewrite holds the
+    // store's write custody until it lands (see `apply_journal_value`).
+    let custody = match store.write_custody().await {
+        Ok(custody) => custody,
+        Err(e) => {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "journal read refused");
+            return;
+        }
+    };
+    let lines = match crate::profile::IssuedCertRecord::load_durable(path, custody).await {
         Ok(lines) => lines,
         Err(e) => {
             tracing::warn!(target: "x0x::owner_sync", error = %e, "journal is not durable");
