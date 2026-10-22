@@ -96,6 +96,12 @@ struct CommitDelivery {
     /// A restart restored this delivery from the held log: each round
     /// waits for the group's §2 head sync first (#1508 review F3).
     resumed: bool,
+    /// The removed seats of the recovery: they are not head holders.
+    removed: BTreeSet<[u8; 32]>,
+    /// A restored GSS recovery: the epoch whose secret the first synced
+    /// round seals to the survivors again. The sealed shares were not
+    /// durable; the secret is, in the persisted group (#1508 review).
+    reshare_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,25 +125,30 @@ pub(super) struct OrcState {
 }
 
 impl OrcState {
-    /// §2: the groups whose held mandate needs a head catch-up round
-    /// before its seal, each with the named (revoked) admins, which are
-    /// not head holders.
+    /// §2: the groups that need a head catch-up round, each with the
+    /// agents that are not head holders. A held mandate needs one before
+    /// its seal (its named, revoked admins are excluded). A delivery that
+    /// a restart restored needs one before any resend of its frame or its
+    /// GSS shares (its removed seats are excluded).
     pub(super) fn head_round_groups(&self) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
-        self.pending
-            .iter()
-            .map(|(stable, pending)| {
-                (
-                    stable.clone(),
-                    pending
-                        .mandate
-                        .body
-                        .revoked_admins
-                        .iter()
-                        .map(|admin| admin.agent)
-                        .collect(),
-                )
-            })
-            .collect()
+        let mut groups: BTreeMap<String, BTreeSet<[u8; 32]>> = BTreeMap::new();
+        for (stable, pending) in &self.pending {
+            groups.entry(stable.clone()).or_default().extend(
+                pending
+                    .mandate
+                    .body
+                    .revoked_admins
+                    .iter()
+                    .map(|admin| admin.agent),
+            );
+        }
+        for (stable, delivery) in self.deliveries.iter().filter(|(_, d)| d.resumed) {
+            groups
+                .entry(stable.clone())
+                .or_default()
+                .extend(delivery.removed.iter().copied());
+        }
+        groups
     }
 
     /// Install one planned mandate status, if the delivery still holds
@@ -249,6 +260,18 @@ async fn ensure_restored(state: &AppState) {
     for resume in restored.resumes {
         let recipients = survivors(&resume.info, &local, &BTreeSet::new());
         let stable = resume.stable_group_id;
+        let body = match orc::decode_frame(&resume.bytes) {
+            Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) => Some(frame.body),
+            _ => None,
+        };
+        let removed = body
+            .iter()
+            .flat_map(|body| body.removed.iter().map(|seat| seat.agent))
+            .collect();
+        let reshare_epoch = body.and_then(|body| match body.crypto {
+            orc::OwnerRecoveryCryptoV1::Gss { next_secret_epoch } => Some(next_secret_epoch),
+            _ => None,
+        });
         inner
             .orc
             .deliveries
@@ -263,6 +286,8 @@ async fn ensure_restored(state: &AppState) {
                     .collect(),
                 next_at: Instant::now(),
                 resumed: true,
+                removed,
+                reshare_epoch,
             });
     }
 }
@@ -1207,6 +1232,8 @@ async fn finish_commit(
                     .collect(),
                 next_at: Instant::now(),
                 resumed: false,
+                removed: removed_ids,
+                reshare_epoch: None,
             },
         );
     }
@@ -1283,6 +1310,21 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         let active: BTreeSet<[u8; 32]> = survivors(&info, &local, &BTreeSet::new())
             .into_iter()
             .collect();
+        // #1508 review: a restored GSS recovery moves each survivor to the
+        // new epoch; the head is synced and still the result, so the
+        // survivors get that epoch's secret again, once per restore.
+        let reshare_epoch = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .orc
+                .deliveries
+                .get_mut(&stable)
+                .filter(|stored| stored.result_head == delivery.result_head)
+                .and_then(|stored| stored.reshare_epoch.take())
+        };
+        if let Some(epoch) = reshare_epoch {
+            seal_gss_shares(state, &info, active.iter(), epoch);
+        }
         let mut updates: Vec<RoundUpdate> = Vec::new();
         let mut refreshes: Vec<AgentId> = Vec::new();
         for (recipient, status) in &delivery.recipients {
@@ -1348,6 +1390,54 @@ async fn drive_deliveries(state: &Arc<AppState>) {
     }
 }
 
+/// Seal `info`'s current GSS secret to each of `recipients` with the
+/// envelope the commit built ([`super::super::build_secure_share_event`]),
+/// each a D60 class-K delivery with a fresh epoch-bound admission per
+/// write. Nothing is sealed when the group's secret epoch is not `epoch`:
+/// old key material is never sent after an epoch change. A survivor
+/// without a roster KEM key cannot get a share; it is logged and skipped.
+fn seal_gss_shares<'a>(
+    state: &Arc<AppState>,
+    info: &GroupInfo,
+    recipients: impl IntoIterator<Item = &'a [u8; 32]>,
+    epoch: u64,
+) {
+    use super::super as ng;
+    if info.secret_epoch != epoch {
+        return;
+    }
+    let Some(secret) = info
+        .shared_secret
+        .as_deref()
+        .and_then(|secret| <[u8; 32]>::try_from(secret).ok())
+    else {
+        return;
+    };
+    let stable = info.stable_group_id();
+    let actor = hex::encode(state.agent.agent_id().as_bytes());
+    for recipient in recipients {
+        let recipient_hex = hex::encode(recipient);
+        let Some(kem) = info
+            .members_v2
+            .get(&recipient_hex)
+            .and_then(|member| member.kem_public_key_b64.as_deref())
+        else {
+            tracing::warn!(group_id = %ng::LogHexId::group(stable), recipient = %ng::LogHexId::agent(&recipient_hex), "ADR 0110 S4: no KEM key on record for a survivor; cannot seal the recovery secret");
+            continue;
+        };
+        match ng::build_secure_share_event(stable, &recipient_hex, kem, &actor, &secret, epoch) {
+            Ok(event) => {
+                ng::spawn_secure_share_delivery(state, &event);
+            }
+            Err(_) => tracing::warn!(
+                group_id = %ng::LogHexId::group(stable),
+                recipient = %ng::LogHexId::agent(&recipient_hex),
+                "ADR 0110 S4: cannot seal the recovery secret to a survivor"
+            ),
+        }
+    }
+}
+
 fn spawn_commit_send(
     state: &Arc<AppState>,
     stable: &str,
@@ -1380,7 +1470,10 @@ fn spawn_commit_send(
 /// catch-up page (§4b(1) "Mixed versions"). Each write uses the guarded
 /// admission with [`HeadRule::OnChain`] and the `owner_recovery_v1` gate.
 ///
-/// The author's frames survive a restart ([`replay_log`]).
+/// The author's frames survive a restart ([`replay_log`]). A GSS frame
+/// moves the requester's epoch without the secret, so an admin also seals
+/// its current secret to the requester (#1508 review), as the
+/// crypto-exclusion catch-up does.
 pub(in crate::server) async fn serve_catchup(
     state: &Arc<AppState>,
     requester: &AgentId,
@@ -1396,7 +1489,15 @@ pub(in crate::server) async fn serve_catchup(
         .orc
         .log
         .catchup_frames(group_ids, from_revision);
+    let mut gss_groups = BTreeSet::new();
     for (group_id, result_head, bytes) in frames {
+        if matches!(
+            orc::decode_frame(&bytes),
+            Ok(orc::OwnerRecoveryFrameV1::Commit(frame))
+                if matches!(frame.body.crypto, orc::OwnerRecoveryCryptoV1::Gss { .. })
+        ) {
+            gss_groups.insert(group_id.clone());
+        }
         let status = send_guarded(
             state,
             &group_id,
@@ -1407,6 +1508,23 @@ pub(in crate::server) async fn serve_catchup(
         .await;
         if status != RecipientDelivery::Sent {
             return;
+        }
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    for group_id in gss_groups {
+        let info = group_by_stable(state, &group_id)
+            .await
+            .map(|(_, info)| info);
+        if let Some(info) = info.filter(|info| {
+            info.caller_role(&local_hex)
+                .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+        }) {
+            seal_gss_shares(
+                state,
+                &info,
+                std::iter::once(requester.as_bytes()),
+                info.secret_epoch,
+            );
         }
     }
 }
@@ -1891,6 +2009,8 @@ mod tests {
             recipients: BTreeMap::from([(recipient, RecipientDelivery::Due)]),
             next_at: Instant::now(),
             resumed: false,
+            removed: BTreeSet::new(),
+            reshare_epoch: None,
         }
     }
 
@@ -2923,11 +3043,190 @@ mod restart_tests {
         Ok(())
     }
 
+    /// `state` with a zero restart sync wait: only the per-group head
+    /// round holds a seal or a restored resend.
+    fn zero_restart_wait(mut state: Arc<AppState>) -> Result<Arc<AppState>> {
+        Arc::get_mut(&mut state)
+            .context("the fresh state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        Ok(state)
+    }
+
+    /// One S4 worker tick for owner recovery: the pass (it keeps the §2
+    /// head rounds) and the owner-recovery drive.
+    async fn worker_tick(state: &Arc<AppState>) {
+        super::super::revocation_eviction_pass(state).await;
+        drive(state).await;
+    }
+
+    /// The `SecureShareDelivered` envelopes `state` scheduled, by recipient.
+    fn scheduled_shares(
+        state: &AppState,
+    ) -> Vec<(String, super::super::super::NamedGroupMetadataEvent)> {
+        state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map(|scheduled| scheduled.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, recipient, payload)| {
+                serde_json::from_slice(&payload)
+                    .ok()
+                    .map(|event| (recipient, event))
+            })
+            .collect()
+    }
+
+    /// Open a `SecureShareDelivered` envelope with the recipient's KEM key.
+    fn open_share(
+        event: &super::super::super::NamedGroupMetadataEvent,
+        kem: &x0x::groups::kem_envelope::AgentKemKeypair,
+    ) -> Result<(u64, [u8; 32])> {
+        use base64::Engine as _;
+        let super::super::super::NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id,
+            recipient,
+            secret_epoch,
+            kem_ciphertext_b64,
+            aead_nonce_b64,
+            aead_ciphertext_b64,
+            ..
+        } = event
+        else {
+            anyhow::bail!("not a secure share");
+        };
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let nonce: [u8; 12] = b64
+            .decode(aead_nonce_b64)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("nonce length"))?;
+        let secret = x0x::groups::kem_envelope::open_group_secret(
+            kem,
+            &x0x::groups::aad::secure_share_aad(group_id, recipient, *secret_epoch),
+            &b64.decode(kem_ciphertext_b64)?,
+            &nonce,
+            &b64.decode(aead_ciphertext_b64)?,
+        )?;
+        Ok((*secret_epoch, secret))
+    }
+
+    /// Codex P1 (#1508): a GSS owner recovery commits, and the process
+    /// crashes before the survivors' key envelopes leave. After the real
+    /// restart (the group and the frame load from disk) and the real
+    /// worker ticks, the survivor gets an envelope that opens to the new
+    /// epoch's secret, once the group's head is synced. Before the fix the
+    /// restored delivery resent only the frame: the survivor moved to the
+    /// new epoch without its secret.
+    #[tokio::test]
+    async fn a_restart_before_the_gss_key_delivery_reseals_the_new_secret() -> Result<()> {
+        let author_dir = tempfile::tempdir()?;
+        let seed = [0x6F; 32];
+        let author = zero_restart_wait(
+            offline_daemon(
+                author_dir.path(),
+                Some(x0x::identity::UserKeypair::from_seed(&seed)?),
+            )
+            .await?,
+        )?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor = x0x::identity::AgentKeypair::generate()?;
+        let survivor_kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        let survivor_hex = hex::encode(survivor.agent_id().as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [author.agent.identity().agent_keypair(), &survivor],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        {
+            use base64::Engine as _;
+            let member = info
+                .members_v2
+                .get_mut(&survivor_hex)
+                .context("survivor seat")?;
+            member.kem_public_key_b64 =
+                Some(base64::engine::general_purpose::STANDARD.encode(&survivor_kem.public_bytes));
+        }
+        info.recompute_state_hash();
+        assert_eq!(orc::crypto_kind(&info), orc::RecoveryCryptoKind::Gss);
+        let stable = info.stable_group_id().to_string();
+        hold_persisted(&author, &info).await?;
+        revoke(&author, &admin).await?;
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let (status, Json(body)) =
+            sign_recovery_mandate(&author, owner, &stable, &author_hex).await;
+        anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
+        // The real pass opens the held mandate's head round; the commit
+        // attempt runs now (the route's own attempt deferred the next).
+        super::super::revocation_eviction_pass(&author).await;
+        try_commit(&author, &stable).await;
+        let committed = author.named_groups.read().await[&stable].clone();
+        assert_eq!(committed.state_revision, info.state_revision + 1);
+        assert_eq!(committed.secret_epoch, info.secret_epoch + 1);
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+        assert!(
+            scheduled_shares(&author)
+                .iter()
+                .any(|(recipient, _)| *recipient == survivor_hex),
+            "the commit sealed the new secret to the survivor"
+        );
+
+        // Crash before the envelope delivery: every runtime task, recorder
+        // and in-memory delivery is gone.
+        author.agent.shutdown().await;
+        drop(author);
+        let restarted = zero_restart_wait(
+            offline_daemon(
+                author_dir.path(),
+                Some(x0x::identity::UserKeypair::from_seed(&seed)?),
+            )
+            .await?,
+        )?;
+        assert_eq!(
+            head_of(&restarted, &stable).await.as_ref(),
+            Some(&committed.state_hash),
+            "the committed recovery survived the restart"
+        );
+        assert!(scheduled_shares(&restarted).is_empty());
+        for _ in 0..3 {
+            worker_tick(&restarted).await;
+        }
+        let shares: Vec<_> = scheduled_shares(&restarted)
+            .into_iter()
+            .filter(|(recipient, _)| *recipient == survivor_hex)
+            .collect();
+        let (_, share) = shares
+            .first()
+            .context("the restored delivery seals the new secret to the survivor again")?;
+        let (epoch, secret) = open_share(share, &survivor_kem)?;
+        assert_eq!(epoch, committed.secret_epoch, "the new epoch");
+        assert_eq!(secret.as_slice(), new_secret.as_slice(), "the new secret");
+        assert!(
+            scheduled_shares(&restarted)
+                .iter()
+                .all(|(recipient, _)| *recipient == survivor_hex),
+            "no share for the removed admin or the author"
+        );
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
     /// F3 (c): a recovery delivery restored after a restart is not resent
     /// while the group has higher-head or conflicting-head evidence, even
     /// though the restart wait has elapsed. It uses the same §2 gate as
-    /// the removal and crypto-exclusion deliveries. Once the evidence
-    /// resolves, the same round delivers it.
+    /// the removal and crypto-exclusion deliveries, and the real worker
+    /// pass opens the group's head round for it (no open row and no held
+    /// mandate keep one). Once the evidence resolves, the same round
+    /// delivers it.
     #[tokio::test]
     async fn a_restored_recovery_delivery_waits_for_the_head_sync() -> Result<()> {
         let (state, _dir) = state_past_restart_wait().await?;
@@ -2940,18 +3239,19 @@ mod restart_tests {
         let ext = replay_log::RECOVERY_EXTENSION;
         assert!(replay_log::write_planned(&state, ext, held, &stable, at, &frame).await);
         ensure_restored(&state).await;
+        super::super::revocation_eviction_pass(&state).await;
         let scheduled = {
-            let mut inner = state.revocation_evictions.inner.lock().await;
-            let scheduled = inner
+            let inner = state.revocation_evictions.inner.lock().await;
+            anyhow::ensure!(
+                inner.head_rounds.contains_key(&stable),
+                "the worker pass opens a head round for the restored delivery"
+            );
+            inner
                 .orc
                 .deliveries
                 .get(&stable)
                 .context("restored")?
-                .next_at;
-            inner
-                .head_rounds
-                .insert(stable.clone(), HeadRound::new(&info.state_hash, scheduled));
-            scheduled
+                .next_at
         };
         let held_back = |state: &Arc<AppState>| {
             let state = Arc::clone(state);

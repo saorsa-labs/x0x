@@ -50,17 +50,24 @@
 //!   installs it atomically. **Catch-up** ([`serve_catchup`]) sends held
 //!   frames to a capable requester on this same carrier, only while the
 //!   frame's result is on this node's verified chain.
-//! - **Replay evidence** (§4 catch-up across restart). The frame stays in
-//!   its `.evs` row after completion (the existing `outgoing_event` field;
-//!   no new file or layout), for the newest
+//! - **Replay evidence** (§4 catch-up across restart). An authored frame
+//!   stays in its `.evs` row after completion (the existing
+//!   `outgoing_event` field), for the newest
 //!   [`x0x::groups::eviction::MAX_REPLAY_FRAMES_PER_GROUP`] completed rows
-//!   of a group. A survivor that installed a received frame attaches it to
-//!   its own completed row. A restart rebuilds the catch-up log from those
-//!   rows ([`rebuild_catchup_log`]), so a survivor that missed the
-//!   transition still catches up after the head moves and this node
-//!   restarts.
+//!   of a group. A restart rebuilds the catch-up log from those rows
+//!   ([`rebuild_catchup_log`]), so a survivor that missed the transition
+//!   still catches up after the head moves and this node restarts.
+//! - **Received frames** (#1508 review, Codex P1). A receiver often holds
+//!   no `.evs` row for the exclusion, so a row cannot keep its frame. The
+//!   receiver writes the exact received frame durably before it installs
+//!   the state that the frame carries. It uses the held log of the rebind
+//!   and owner-recovery planes ([`super::rebind::replay_log`]), in its own
+//!   `<stem>.celog` file. A restart loads that file, so a restarted
+//!   survivor serves the frame to a lagging survivor while the author is
+//!   offline. A frame above the loaded head (a crash between the write and
+//!   the install) goes through the full receive checks again.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,6 +82,7 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
 use super::super::{LogHexId, SelfLeaveRekeyStep};
+use super::rebind::replay_log;
 
 /// A delivery round runs no more often than this per row.
 const CE_RESEND_INTERVAL: Duration = Duration::from_secs(5);
@@ -122,16 +130,6 @@ pub(super) struct CeDelivery {
     next_at: Instant,
 }
 
-/// A frame held for catch-up serving.
-#[derive(Debug, Clone)]
-struct CeLogEntry {
-    next_revision: u64,
-    /// The frame's result head: it is served only while this head is on
-    /// the verified chain.
-    result_head: String,
-    bytes: Arc<Vec<u8>>,
-}
-
 /// A verified-shape frame that arrived before this node reached its parent.
 #[derive(Debug, Clone)]
 struct StashedFrame {
@@ -144,11 +142,11 @@ struct StashedFrame {
 #[derive(Debug, Default)]
 pub(super) struct CeState {
     deliveries: HashMap<EvictionKey, CeDelivery>,
-    log: HashMap<String, VecDeque<CeLogEntry>>,
+    /// Frames held for catch-up serving. The received frames are durable
+    /// in the `.celog` ([`replay_log`]); the authored frames are durable in
+    /// their `.evs` rows.
+    log: replay_log::HeldLog<CE_LOG_PER_GROUP>,
     stash: Vec<StashedFrame>,
-    /// Installed received frames waiting for their row to complete, so the
-    /// frame is kept there as durable replay evidence.
-    replay_pending: HashMap<EvictionKey, Arc<Vec<u8>>>,
     /// Rows whose saved frame meets a competing branch (§3).
     pub(super) fork: BTreeSet<EvictionKey>,
     /// Rows held by the D76 rule, with the holding survivors.
@@ -189,32 +187,18 @@ impl CeState {
         serde_json::Value::Array(entries)
     }
 
+    /// Hold a frame for catch-up serving (memory only; the caller made it
+    /// durable).
     fn remember(
         &mut self,
         stable_group_id: &str,
         next_revision: u64,
         result_head: &str,
         bytes: Arc<Vec<u8>>,
+        authored: bool,
     ) {
-        let log = self.log.entry(stable_group_id.to_string()).or_default();
-        if log.iter().any(|entry| entry.next_revision == next_revision) {
-            return;
-        }
-        let at = log
-            .iter()
-            .position(|entry| entry.next_revision > next_revision)
-            .unwrap_or(log.len());
-        log.insert(
-            at,
-            CeLogEntry {
-                next_revision,
-                result_head: result_head.to_string(),
-                bytes,
-            },
-        );
-        while log.len() > CE_LOG_PER_GROUP {
-            log.pop_front();
-        }
+        self.log
+            .remember(stable_group_id, next_revision, result_head, bytes, authored);
     }
 
     /// The frames held for any of `group_ids` above `from_revision`, oldest
@@ -224,57 +208,50 @@ impl CeState {
         group_ids: &[String],
         from_revision: u64,
     ) -> Vec<(String, String, Arc<Vec<u8>>)> {
-        group_ids
-            .iter()
-            .find_map(|id| self.log.get(id).map(|log| (id, log)))
-            .map(|(id, log)| {
-                log.iter()
-                    .filter(|entry| entry.next_revision > from_revision)
-                    .map(|entry| {
-                        (
-                            id.clone(),
-                            entry.result_head.clone(),
-                            Arc::clone(&entry.bytes),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.log.catchup_frames(group_ids, from_revision)
     }
 
-    /// Keep an installed received frame until its row completes (bounded).
-    fn note_replay_pending(&mut self, key: EvictionKey, bytes: Arc<Vec<u8>>) {
-        if self.replay_pending.len() >= CE_STASH_CAP && !self.replay_pending.contains_key(&key) {
-            return;
-        }
-        self.replay_pending.insert(key, bytes);
+    /// The boot load (`load_persisted_obligations`) replaces the runtime
+    /// state with this rebuilt one. A receipt can run before that load
+    /// (#1508 review, Codex P1 boot race): it loaded the `.celog` and wrote
+    /// its frame. Keep that live held log, and its load state, and add the
+    /// frames rebuilt from the `.evs` rows to it. Otherwise a later frame
+    /// write would rewrite the `.celog` without the earlier frames.
+    pub(super) fn keep_live_held_log(&mut self, live: &mut CeState) {
+        let rebuilt = std::mem::replace(&mut self.log, std::mem::take(&mut live.log));
+        self.log.absorb(rebuilt);
     }
 }
 
-/// Attach each installed received frame to its row once the row is
-/// complete, as durable replay evidence for catch-up after a restart.
-/// A row that is gone drops the frame; an open row keeps it waiting (an
-/// open row's `outgoing_event` is a frame this node must deliver, which a
-/// receiver never does). Returns whether the store changed.
-pub(super) fn attach_replay_evidence(ce_state: &mut CeState, store: &mut ObligationStore) -> bool {
-    let mut changed = false;
-    ce_state.replay_pending.retain(|key, bytes| {
-        let Some(row) = store.get_mut(key) else {
-            return false;
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CE_LOG_PER_GROUP> {
+    &mut inner.ce.log
+}
+
+/// Load the durable received frames once (#1508 review, Codex P1), before
+/// this node serves catch-up, receives or retries a frame. A received
+/// frame that a crash stopped before its install goes to the stash: the
+/// next pass receives it again, with every receiver check. An authored
+/// frame's delivery resumes from its `.evs` row, not from this file.
+async fn ensure_restored(state: &AppState) {
+    let restored = replay_log::ensure_restored(state, replay_log::CE_EXTENSION, held).await;
+    if restored.received.is_empty() {
+        return;
+    }
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    for bytes in restored.received {
+        // The frame is self-authenticating; its actor is the sender.
+        let Ok(frame) = ce::decode_frame(&bytes) else {
+            continue;
         };
-        match row.phase {
-            Phase::Complete => {
-                if row.outgoing_event.is_none() {
-                    row.outgoing_event = Some(bytes.to_vec());
-                    changed = true;
-                }
-                false
-            }
-            Phase::Terminated => false,
-            Phase::Pending | Phase::Prepared | Phase::CommittedDeliveryPending => true,
+        if inner.ce.stash.len() >= CE_STASH_CAP {
+            inner.ce.stash.remove(0);
         }
-    });
-    changed
+        inner.ce.stash.push(StashedFrame {
+            sender: AgentId(frame.body.actor),
+            bytes: bytes.to_vec(),
+            at: Instant::now(),
+        });
+    }
 }
 
 /// §4 catch-up across restart: rebuild the catch-up log from the frames
@@ -328,6 +305,7 @@ pub(super) fn rebuild_catchup_log(
             next_revision,
             &result_head,
             Arc::new(bytes),
+            true,
         );
     }
 }
@@ -882,6 +860,7 @@ pub(super) fn new_delivery(
         next_revision,
         result_head,
         Arc::clone(&bytes),
+        true,
     );
     let gss_shares_pending = resumed
         && ce::decode_frame(&bytes).is_ok_and(|frame| {
@@ -1016,11 +995,7 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
     let candidates: Vec<(EvictionKey, bool)> = {
-        let mut guard = runtime.inner.lock().await;
-        let inner = &mut *guard;
-        if attach_replay_evidence(&mut inner.ce, &mut inner.store) {
-            inner.dirty = true;
-        }
+        let inner = runtime.inner.lock().await;
         inner
             .ce
             .deliveries
@@ -1293,6 +1268,7 @@ pub(in crate::server) async fn serve_catchup(
     group_ids: &[String],
     from_revision: u64,
 ) {
+    ensure_restored(state).await;
     let frames = state
         .revocation_evictions
         .inner
@@ -1523,6 +1499,7 @@ pub(in crate::server) fn spawn_receipt(
 /// Retry every stashed frame; keep the ones still ahead of this node or
 /// stopped by a local fault.
 pub(super) async fn retry_stash(state: &Arc<AppState>) {
+    ensure_restored(state).await;
     let stash = std::mem::take(&mut state.revocation_evictions.inner.lock().await.ce.stash);
     let now = Instant::now();
     let mut keep = Vec::new();
@@ -1594,6 +1571,9 @@ pub(in crate::server) async fn receive(
     if info.state_hash != body.prior_head && info.state_revision < body.prior_revision {
         return ReceiveOutcome::Behind;
     }
+    // The load runs first, so the frame write below keeps the frames that
+    // a restart restored.
+    ensure_restored(state).await;
     // #1508 review P1: the GSS form has no tree; its epoch is the secret
     // epoch the parent head commits to.
     let gss = match body.crypto {
@@ -1660,21 +1640,35 @@ pub(in crate::server) async fn receive(
         );
         return ReceiveOutcome::Refused(refusal);
     }
+    // #1508 review (Codex P1): the exact received frame is durable before
+    // the roster and crypto state it carries are installed, in a store
+    // that needs no S4 row. A restarted receiver then serves it to a
+    // survivor that missed it while the author is offline.
+    let frame_bytes = Arc::new(payload.to_vec());
+    let stable = body.stable_group_id.as_str();
+    let at = (body.next_revision, body.commit.state_hash.as_str());
+    let ext = replay_log::CE_EXTENSION;
+    if !replay_log::write_received(state, ext, held, stable, at, &frame_bytes).await {
+        return ReceiveOutcome::LocalFailure;
+    }
     let Some(mut guard) = guard else {
         // There is no tree only for the GSS form.
-        let Some(next_secret_epoch) = gss else {
-            return ReceiveOutcome::NotApplicable;
+        let outcome = match gss {
+            Some(next_secret_epoch) => {
+                install_gss(
+                    state,
+                    &group_key,
+                    &info,
+                    &body,
+                    &commit,
+                    next_secret_epoch,
+                    frame_bytes,
+                )
+                .await
+            }
+            None => ReceiveOutcome::NotApplicable,
         };
-        return install_gss(
-            state,
-            &group_key,
-            &info,
-            &body,
-            &commit,
-            next_secret_epoch,
-            payload,
-        )
-        .await;
+        return unhold_unless_kept(state, stable, outcome).await;
     };
     let ce::CryptoExclusionCryptoV1::TreeKem {
         commit: treekem_commit,
@@ -1682,7 +1676,8 @@ pub(in crate::server) async fn receive(
         ..
     } = &body.crypto
     else {
-        return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::CryptoPlaneUnsupported);
+        let refused = ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::CryptoPlaneUnsupported);
+        return unhold_unless_kept(state, stable, refused).await;
     };
     let next_epoch = *next_epoch;
     let signed_binding = commit.security_binding.clone();
@@ -1707,12 +1702,13 @@ pub(in crate::server) async fn receive(
         Ok(next) => next,
         Err(error) => {
             tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0110 S4: crypto-only exclusion commit refused: {error}");
-            return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::BadSignature);
+            let refused = ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::BadSignature);
+            return unhold_unless_kept(state, stable, refused).await;
         }
     };
     let target = AgentId(body.target);
     let Ok(rollback_snapshot) = guard.to_snapshot_bytes() else {
-        return ReceiveOutcome::NotApplicable;
+        return unhold_unless_kept(state, stable, ReceiveOutcome::NotApplicable).await;
     };
     let refuse = |guard: &mut x0x::mls::TreeKemMlsGroup, reason: &str| {
         ng::rollback_treekem_group_after_failed_install(
@@ -1726,12 +1722,14 @@ pub(in crate::server) async fn receive(
     };
     if guard.process_commit(treekem_commit).is_err() || guard.epoch() != next_epoch {
         refuse(&mut guard, "crypto_exclusion_process_failed");
-        return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::EpochMismatch);
+        let refused = ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::EpochMismatch);
+        return unhold_unless_kept(state, stable, refused).await;
     }
     // The cryptographic removal proof: the target's leaf is gone.
     if guard.tracks_member(&target) {
         refuse(&mut guard, "crypto_exclusion_leaf_retained");
-        return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::LeafMismatch);
+        let refused = ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::LeafMismatch);
+        return unhold_unless_kept(state, stable, refused).await;
     }
     if let Err(error) = ng::persist_treekem_and_named_groups_atomic_with_info(
         state,
@@ -1745,7 +1743,7 @@ pub(in crate::server) async fn receive(
             refuse(&mut guard, "crypto_exclusion_persist_failed");
             tracing::warn!(group_id = %LogHexId::group(&group_key), "ADR 0110 S4: crypto-only exclusion not installed: {error}");
             // A local storage fault, not a sender defect: keep the frame
-            // and try again.
+            // (durable and in the stash) and try again.
             return ReceiveOutcome::LocalFailure;
         }
     }
@@ -1758,9 +1756,7 @@ pub(in crate::server) async fn receive(
         "crypto_exclusion",
     )
     .await;
-    // Durable replay evidence: kept in this node's own row once it
-    // completes, so catch-up still has the frame after a restart.
-    remember_installed(state, &body, payload).await;
+    remember_installed(state, &body, frame_bytes).await;
     drop(membership_guard);
     tracing::info!(
         group_id = %LogHexId::group(&group_key),
@@ -1785,7 +1781,7 @@ async fn install_gss(
     body: &ce::CryptoExclusionBodyV1,
     commit: &x0x::groups::GroupStateCommit,
     next_secret_epoch: u64,
-    payload: &[u8],
+    frame_bytes: Arc<Vec<u8>>,
 ) -> ReceiveOutcome {
     use super::super as ng;
     let roster_revision = body.roster_revision;
@@ -1825,7 +1821,7 @@ async fn install_gss(
     remove_legacy_mls_member(state, group_key, AgentId(body.target)).await;
     ng::refresh_group_card_cache_from_info(state, group_key, &next).await;
     ng::purge_join_artifacts_if_ineligible(state, group_key, &hex::encode(body.target)).await;
-    remember_installed(state, body, payload).await;
+    remember_installed(state, body, frame_bytes).await;
     tracing::info!(
         group_id = %LogHexId::group(group_key),
         secret_epoch = next_secret_epoch,
@@ -1835,21 +1831,35 @@ async fn install_gss(
     ReceiveOutcome::Applied
 }
 
-/// Keep an installed frame for catch-up serving, and as durable replay
-/// evidence in this node's own row once that row completes.
-async fn remember_installed(state: &AppState, body: &ce::CryptoExclusionBodyV1, payload: &[u8]) {
-    let frame_bytes = Arc::new(payload.to_vec());
-    let mut inner = state.revocation_evictions.inner.lock().await;
-    inner.ce.remember(
+/// Keep an installed frame for catch-up serving. The `.celog` already
+/// holds it (written before the install).
+async fn remember_installed(
+    state: &AppState,
+    body: &ce::CryptoExclusionBodyV1,
+    frame_bytes: Arc<Vec<u8>>,
+) {
+    state.revocation_evictions.inner.lock().await.ce.remember(
         &body.stable_group_id,
         body.next_revision,
         &body.commit.state_hash,
-        Arc::clone(&frame_bytes),
-    );
-    inner.ce.note_replay_pending(
-        EvictionKey::new(body.stable_group_id.clone(), body.target),
         frame_bytes,
+        false,
     );
+}
+
+/// After the frame write: a frame that this node refused or cannot
+/// install leaves the `.celog` again (written as memory holds the log).
+/// A local fault keeps it, so the stash or the restart installs it later.
+async fn unhold_unless_kept(
+    state: &AppState,
+    stable_group_id: &str,
+    outcome: ReceiveOutcome,
+) -> ReceiveOutcome {
+    if !outcome.is_retained() {
+        replay_log::rewrite_from_memory(state, replay_log::CE_EXTENSION, held, stable_group_id)
+            .await;
+    }
+    outcome
 }
 
 /// The GSS plane's legacy local MLS view: the excluded agent is no longer
@@ -1877,10 +1887,9 @@ pub(in crate::server) async fn latest_frame_for_test(
     let inner = state.revocation_evictions.inner.lock().await;
     inner
         .ce
-        .log
-        .get(stable_group_id)
-        .and_then(|log| log.back())
-        .map(|entry| entry.bytes.to_vec())
+        .catchup_frames(&[stable_group_id.to_string()], 0)
+        .pop()
+        .map(|(_, _, bytes)| bytes.to_vec())
 }
 
 #[cfg(test)]
@@ -1979,10 +1988,10 @@ mod tests {
     fn catchup_log_is_bounded_and_deduplicated() {
         let mut ce_state = CeState::default();
         for revision in 0..(CE_LOG_PER_GROUP as u64 + 4) {
-            ce_state.remember("g", revision, "r", Arc::new(vec![1]));
-            ce_state.remember("g", revision, "r", Arc::new(vec![2]));
+            ce_state.remember("g", revision, "r", Arc::new(vec![1]), false);
+            ce_state.remember("g", revision, "r", Arc::new(vec![2]), false);
         }
-        let log = ce_state.log.get("g").map(VecDeque::len);
+        let log = ce_state.log.len("g");
         assert_eq!(log, Some(CE_LOG_PER_GROUP));
     }
 
@@ -2287,40 +2296,12 @@ mod tests {
             .is_empty());
     }
 
-    /// A survivor keeps an installed frame in its own row once that row
-    /// completes, never in an open row (which would make it deliver).
-    #[test]
-    fn received_frame_is_attached_to_the_completed_row_only() {
-        let key = EvictionKey::new("g", [9; 32]);
-        let mut store = ObligationStore::new();
-        store.intake(
-            &key,
-            x0x::groups::eviction::EvictionTrigger::SelfLeave {
-                commit_hash: "p".to_string(),
-            },
-            None,
-            0,
-            [0; 16],
-        );
-        let mut ce_state = CeState::default();
-        ce_state.note_replay_pending(key.clone(), Arc::new(vec![7]));
-        assert!(!attach_replay_evidence(&mut ce_state, &mut store));
-        assert!(store.get(&key).expect("row").outgoing_event.is_none());
-        assert!(store.complete(&key, Some("r".into()), Some(2), 1));
-        assert!(attach_replay_evidence(&mut ce_state, &mut store));
-        assert_eq!(
-            store.get(&key).expect("row").outgoing_event.as_deref(),
-            Some(&[7u8][..])
-        );
-        assert!(ce_state.replay_pending.is_empty());
-    }
-
     #[test]
     fn catchup_frames_are_served_oldest_first() {
         let mut ce_state = CeState::default();
-        ce_state.remember("g", 7, "r7", Arc::new(vec![7]));
-        ce_state.remember("g", 5, "r5", Arc::new(vec![5]));
-        ce_state.remember("g", 6, "r6", Arc::new(vec![6]));
+        ce_state.remember("g", 7, "r7", Arc::new(vec![7]), false);
+        ce_state.remember("g", 5, "r5", Arc::new(vec![5]), false);
+        ce_state.remember("g", 6, "r6", Arc::new(vec![6]), false);
         let heads: Vec<String> = ce_state
             .catchup_frames(&["g".to_string()], 5)
             .into_iter()
@@ -2925,6 +2906,266 @@ mod daemon_tests {
             "the saved frame's delivery resumes"
         );
         Ok(())
+    }
+
+    /// The author `A` (`fx.state`) commits the GSS exclusion; the survivor
+    /// `C` (`fx.replica`) takes the leave and holds the parent durably.
+    /// Returns the exact frame, its result head and `C`'s parent.
+    async fn authored_frame_and_parent(fx: &GssLeave) -> Result<(Vec<u8>, String, GroupInfo)> {
+        use anyhow::Context as _;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        anyhow::ensure!(applied.accepted, "the leave must apply: {applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let result_head = ce::decode_frame(&frame)
+            .map(|frame| frame.body.commit.state_hash)
+            .map_err(|refused| anyhow::anyhow!("decode: {}", refused.as_str()))?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        anyhow::ensure!(applied.accepted, "{applied:?}");
+        anyhow::ensure!(
+            ng::save_named_groups(&fx.replica).await,
+            "the parent is durable"
+        );
+        let parent = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        Ok((frame, result_head, parent))
+    }
+
+    async fn head_of(state: &AppState, group_id: &str) -> Option<String> {
+        state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .map(|info| info.state_hash.clone())
+    }
+
+    /// `C` restarts: the runtime state is dropped and the real load path
+    /// runs, then one tick of the worker's crypto-exclusion steps.
+    async fn restart_receiver(fx: &GssLeave) -> Result<Arc<AppState>> {
+        let restarted = ng::tests::secure_endpoint_test_state_at(
+            fx._replica_dir.path(),
+            Arc::clone(&fx.replica.agent),
+        )
+        .await?;
+        super::super::load_persisted_obligations(&restarted).await;
+        drive_deliveries(&restarted).await;
+        retry_stash(&restarted).await;
+        Ok(restarted)
+    }
+
+    /// The frames `C` serves on catch-up above `from_revision`.
+    async fn served(state: &AppState, stable: &str, from_revision: u64) -> Vec<Vec<u8>> {
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .catchup_frames(std::slice::from_ref(&stable.to_string()), from_revision)
+            .into_iter()
+            .map(|(_, _, bytes)| bytes.to_vec())
+            .collect()
+    }
+
+    /// A lagging survivor `B` at `parent` installs `frame`, relayed by `C`.
+    async fn lagging_peer_installs(
+        fx: &GssLeave,
+        parent: &GroupInfo,
+        relay: AgentId,
+        frame: &[u8],
+        result_head: &str,
+    ) -> Result<()> {
+        let (lagging, _lagging_dir) = ng::tests::secure_endpoint_test_state().await?;
+        lagging
+            .named_groups
+            .write()
+            .await
+            .insert(fx.group_id.clone(), parent.clone());
+        assert_eq!(
+            receive(&lagging, relay, frame).await,
+            ReceiveOutcome::Applied,
+            "the lagging survivor installs the served frame"
+        );
+        assert_eq!(
+            head_of(&lagging, &fx.group_id).await.as_deref(),
+            Some(result_head)
+        );
+        Ok(())
+    }
+
+    /// #1508 review (Codex P1): a survivor that installed a received
+    /// exclusion and holds no S4 row for it restarts while the author is
+    /// offline. The restarted survivor serves the exact frame, and a
+    /// lagging survivor installs it from that copy.
+    #[tokio::test]
+    async fn a_restarted_receiver_serves_the_received_exclusion_frame() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        assert!(
+            fx.replica
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_none(),
+            "the receiver holds no obligation row"
+        );
+
+        // `C` stops; the author `A` is offline from here on.
+        fx.state.agent.shutdown().await;
+        let restarted = restart_receiver(&fx).await?;
+        assert_eq!(
+            head_of(&restarted, &fx.group_id).await.as_ref(),
+            Some(&result_head),
+            "the installed exclusion survived the restart"
+        );
+        let frames = served(&restarted, &fx.stable, parent.state_revision).await;
+        assert!(
+            frames == [frame.clone()],
+            "the restarted receiver serves the exact frame at catch-up (served {})",
+            frames.len()
+        );
+        let relay = restarted.agent.agent_id();
+        lagging_peer_installs(&fx, &parent, relay, &frames[0], &result_head).await
+    }
+
+    /// #1508 review (Codex P1, boot race): a frame received before the S4
+    /// load runs stays held after the load. The interleaving is a second
+    /// receipt that did its once-per-process `.celog` load before
+    /// `load_persisted_obligations` replaced the runtime, and writes its
+    /// frame after it. That write must keep the first frame in the file.
+    #[tokio::test]
+    async fn a_frame_received_before_the_s4_load_stays_held_after_it() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+
+        // The worker's boot load runs after the receipt.
+        super::super::load_persisted_obligations(&fx.replica).await;
+        let held_now = fx
+            .replica
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .catchup_frames(std::slice::from_ref(&fx.stable), parent.state_revision);
+        assert!(
+            held_now.len() == 1 && held_now[0].2.as_slice() == frame.as_slice(),
+            "the live held frame survives the load (held {})",
+            held_now.len()
+        );
+
+        // The second receipt's frame write lands after the load.
+        let ext = super::super::rebind::replay_log::CE_EXTENSION;
+        let later = Arc::new(b"X0XCE1\0later frame".to_vec());
+        let at = (parent.state_revision.saturating_add(2), "later-head");
+        assert!(
+            super::super::rebind::replay_log::write_received(
+                &fx.replica,
+                ext,
+                held,
+                &fx.stable,
+                at,
+                &later
+            )
+            .await
+        );
+        let on_disk =
+            super::super::rebind::replay_log::tests::frames_on_disk(&fx.replica, ext, &fx.stable)
+                .await;
+        assert!(
+            on_disk
+                .iter()
+                .any(|held| held.frame == frame && held.result_head == result_head),
+            "the first frame is still durable ({} frames on disk)",
+            on_disk.len()
+        );
+        Ok(())
+    }
+
+    /// #1508 review (Codex P1): the received frame is durable before the
+    /// state it carries is installed. The install fails (a crash at that
+    /// point); after the restart the node installs its own copy and serves
+    /// it, with the author offline.
+    #[tokio::test]
+    async fn a_crash_before_the_exclusion_install_keeps_the_frame_durable() -> Result<()> {
+        use super::super::rebind::restart_tests::{block_install, unblock_install};
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        let blocked = block_install(&fx.replica).await?;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::LocalFailure,
+            "the install failed"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await.as_ref(),
+            Some(&parent.state_hash),
+            "the exclusion is not installed"
+        );
+        let ext = super::super::rebind::replay_log::CE_EXTENSION;
+        let on_disk =
+            super::super::rebind::replay_log::tests::frames_on_disk(&fx.replica, ext, &fx.stable)
+                .await;
+        assert_eq!(on_disk.len(), 1, "the received frame is durable");
+        assert!(on_disk[0].frame == frame, "exact bytes on disk");
+        assert_eq!(on_disk[0].result_head, result_head);
+        assert!(!on_disk[0].authored);
+
+        // The process dies before the install; the author stays offline.
+        fx.state.agent.shutdown().await;
+        unblock_install(blocked).await?;
+        let restarted = restart_receiver(&fx).await?;
+        assert_eq!(
+            head_of(&restarted, &fx.group_id).await.as_ref(),
+            Some(&result_head),
+            "the restarted node installs its durable copy"
+        );
+        let frames = served(&restarted, &fx.stable, parent.state_revision).await;
+        assert!(
+            frames == [frame.clone()],
+            "exact bytes at catch-up (served {})",
+            frames.len()
+        );
+        let relay = restarted.agent.agent_id();
+        lagging_peer_installs(&fx, &parent, relay, &frames[0], &result_head).await
     }
 
     /// #1508 review P1: the survivor's receive path refuses a GSS frame
