@@ -159,6 +159,9 @@ const RECORDS_FILE: &str = "records.json";
 /// File holding the `IssuanceJournal` records of a commit in progress,
 /// inside `<data_dir>/sync/` (#1542, see `recover_journal_commit`).
 const JOURNAL_INTENT_FILE: &str = "journal-intent.json";
+/// File holding the committed name records that live daemon state may not
+/// show yet, inside `<data_dir>/sync/` (#1545, see `pending_applies`).
+const APPLY_PENDING_FILE: &str = "apply-pending.json";
 /// Directory under the instance data dir holding all sync state.
 const SYNC_DIR: &str = "sync";
 
@@ -876,11 +879,14 @@ pub struct OwnerSyncStore {
     /// The local issuance journal that accepted `IssuanceJournal` records
     /// are applied to (set by the service; unset in a bare store).
     journal_file: std::sync::OnceLock<PathBuf>,
-    /// #1542: records that `recover_journal_commit` committed and that no
-    /// caller has applied to live daemon state yet. A recovered record is
-    /// not in the accepted list of the commit that runs the recovery, so
-    /// the daemon takes it from here ([`Self::take_recovered`]).
-    recovered: std::sync::Mutex<Vec<VersionedRecord>>,
+    /// #1545: the committed name records that live daemon state may not
+    /// show yet, one per key; a mirror of `APPLY_PENDING_FILE`. A commit
+    /// adds its name records here and to the file before its register
+    /// write, and only the reconcile pass removes them, after the daemon
+    /// has saved them (see [`Self::pending_applies`]). A restart before
+    /// that applies them again, so the reconcile never mints the old live
+    /// names over them. Lock order: `records` → `pending_apply`.
+    pending_apply: tokio::sync::Mutex<BTreeMap<(SyncKind, String), VersionedRecord>>,
     /// Test injection: hold a synced journal append after its decision
     /// read until the test releases it.
     #[cfg(test)]
@@ -974,6 +980,8 @@ impl OwnerSyncStore {
         })?;
         let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
         let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
+        let pending_apply: PersistedRecords =
+            Self::load_json(&dir.join(APPLY_PENDING_FILE)).await?;
         let records = persisted_records
             .records
             .into_iter()
@@ -1007,7 +1015,13 @@ impl OwnerSyncStore {
             canonical_home_gate: tokio::sync::RwLock::new(()),
             journal_apply: tokio::sync::Mutex::new(()),
             journal_file: std::sync::OnceLock::new(),
-            recovered: std::sync::Mutex::new(Vec::new()),
+            pending_apply: tokio::sync::Mutex::new(
+                pending_apply
+                    .records
+                    .into_iter()
+                    .map(|r| ((r.kind, r.key.clone()), r))
+                    .collect(),
+            ),
             #[cfg(test)]
             journal_check_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1697,6 +1711,12 @@ impl OwnerSyncStore {
                         return Err(SyncError::Io("stopped between writes".into()));
                     }
                 }
+                // #1545: the obligation to apply the names before the
+                // register holds them (see `pending_apply`).
+                if let Err(e) = self.add_pending_applies(&outcome.accepted).await {
+                    Self::rollback(&mut records, &touched);
+                    return Err(e);
+                }
                 match self.persist_records(&records).await {
                     Ok(()) => {
                         if !updates.is_empty() {
@@ -1787,29 +1807,104 @@ impl OwnerSyncStore {
         self.recover_journal_commit(owner).await
     }
 
-    /// Take the records that a recovery committed and that are still the
-    /// register's winners, to apply them to live daemon state. A record
-    /// that a later commit replaced is dropped: that commit applies its
-    /// own record.
-    pub(crate) async fn take_recovered(&self) -> Vec<VersionedRecord> {
-        let taken = std::mem::take(
-            &mut *self
-                .recovered
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        if taken.is_empty() {
-            return taken;
+    /// Add the name records of a commit to `pending_apply` and its file.
+    async fn add_pending_applies(&self, accepted: &[VersionedRecord]) -> Result<(), SyncError> {
+        let names: Vec<&VersionedRecord> = accepted
+            .iter()
+            .filter(|r| matches!(r.kind, SyncKind::OwnerProfile | SyncKind::MachineNames))
+            .collect();
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut pending = self.pending_apply.lock().await;
+        let mut next = pending.clone();
+        for record in names {
+            next.insert((record.kind, record.key.clone()), (*record).clone());
+        }
+        self.persist_pending_applies(&next).await?;
+        *pending = next;
+        Ok(())
+    }
+
+    /// Write `pending` to `APPLY_PENDING_FILE`, or remove the file when
+    /// `pending` is empty.
+    async fn persist_pending_applies(
+        &self,
+        pending: &BTreeMap<(SyncKind, String), VersionedRecord>,
+    ) -> Result<(), SyncError> {
+        let path = self.dir.join(APPLY_PENDING_FILE);
+        if pending.is_empty() {
+            return match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(SyncError::Io(format!("remove pending applies: {e}"))),
+            };
+        }
+        let bytes = serde_json::to_vec(&PersistedRecords {
+            records: pending.values().cloned().collect(),
+        })
+        .map_err(|e| SyncError::Io(format!("encode pending applies: {e}")))?;
+        Self::write_atomically(&path, &bytes, false)
+            .await
+            .map_err(|e| match e {
+                DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
+                    SyncError::Io(format!("persist pending applies: {io}"))
+                }
+            })
+    }
+
+    /// #1545: the committed name records that live daemon state may not
+    /// show yet (see `pending_apply`). The flag is `true` for a record that
+    /// is still the register's winner; the caller applies only those. A
+    /// record that a later commit replaced, or whose commit failed after
+    /// the obligation was written, is `false`.
+    pub(crate) async fn pending_applies(&self) -> Vec<(VersionedRecord, bool)> {
+        let pending: Vec<VersionedRecord> =
+            self.pending_apply.lock().await.values().cloned().collect();
+        if pending.is_empty() {
+            return Vec::new();
         }
         let records = self.records.read().await;
-        taken
+        pending
             .into_iter()
-            .filter(|r| {
-                records
+            .map(|r| {
+                let winner = records
                     .get(&(r.kind, r.key.clone()))
-                    .is_some_and(|stored| stored.record_hash() == r.record_hash())
+                    .is_some_and(|stored| stored.record_hash() == r.record_hash());
+                (r, winner)
             })
             .collect()
+    }
+
+    /// #1545: remove `done` from the pending applies, after the daemon has
+    /// saved the winners among them. A record that a commit put in place of
+    /// one of them stays.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written; the records stay,
+    /// and the next pass applies them again.
+    pub(crate) async fn discharge_applies(
+        &self,
+        done: &[VersionedRecord],
+    ) -> Result<(), SyncError> {
+        let mut pending = self.pending_apply.lock().await;
+        let mut next = pending.clone();
+        for record in done {
+            let key = (record.kind, record.key.clone());
+            if next
+                .get(&key)
+                .is_some_and(|r| r.record_hash() == record.record_hash())
+            {
+                next.remove(&key);
+            }
+        }
+        if next.len() == pending.len() {
+            return Ok(());
+        }
+        self.persist_pending_applies(&next).await?;
+        *pending = next;
+        Ok(())
     }
 
     /// #1542: finish a commit that stopped after its journal intent was
@@ -1852,12 +1947,9 @@ impl OwnerSyncStore {
             .map_err(|e| SyncError::Io(format!("undecodable journal intent: {e}")))?
             .records;
         match self.commit_locked(batch, owner, Some(journal)).await {
-            Ok(outcome) => {
+            Ok(_) => {
+                // The commit added the recovered names to `pending_apply`.
                 self.remove_journal_intent().await;
-                self.recovered
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend(outcome.accepted);
                 Ok(())
             }
             Err(SyncError::OwnerMismatch) => {
@@ -2229,9 +2321,21 @@ where
     let owner_id = owner.user_id();
     let outcome = store.commit_batch(pending.verified, &owner_id).await;
     // #1542: a recovery in the commit can commit records of an earlier,
-    // interrupted commit. Apply them even when this commit fails.
-    for record in store.take_recovered().await {
-        on_accept(&record);
+    // interrupted commit. Apply the names still owed to live state (the
+    // reconcile pass confirms them), even when this commit fails.
+    let accepted: Vec<[u8; 32]> = outcome
+        .as_ref()
+        .map(|o| {
+            o.accepted
+                .iter()
+                .map(VersionedRecord::record_hash)
+                .collect()
+        })
+        .unwrap_or_default();
+    for (record, winner) in store.pending_applies().await {
+        if winner && !accepted.contains(&record.record_hash()) {
+            on_accept(&record);
+        }
     }
     let outcome = outcome?;
     let mut summary = pending.summary;
@@ -2644,17 +2748,6 @@ pub trait SyncDaemonView: Send + Sync + 'static {
         display_name: Option<String>,
         machine_name: Option<String>,
     );
-    /// Completes when every earlier [`Self::apply_names`] call shows in
-    /// [`Self::profile_names`].
-    ///
-    /// An implementation may finish `apply_names` in the background. The
-    /// reconcile pass awaits this before it reads the profile: a read of
-    /// the old live names would mint them over the applied winner at a
-    /// higher version (#1545 review). The default suits an implementation
-    /// whose `apply_names` is synchronous.
-    fn names_applied(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(std::future::ready(()))
-    }
     /// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
     ///
     /// Proof is local: the group is in our roster and carries the terminal
@@ -2663,6 +2756,15 @@ pub trait SyncDaemonView: Send + Sync + 'static {
     /// would let a partitioned device mint over the owner's real Home.
     /// Implementations MUST be non-blocking and answer `false` when unsure.
     fn canonical_pointer_is_retired(&self, group_id: &str) -> bool;
+}
+
+/// #1545: a daemon view whose `apply_names` saves the names in the
+/// background. Crate-internal; see [`OwnerSyncService::attach_daemon_view`].
+pub(crate) trait PersistedNames: Send + Sync + 'static {
+    /// Completes when every earlier `apply_names` call has ended. `true`
+    /// when each one saved its names; `false` when a save failed or did
+    /// not run (shutdown).
+    fn names_persisted(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
 }
 
 /// Current daemon self-profile names, best-effort snapshot.
@@ -2798,6 +2900,9 @@ pub struct OwnerSyncService {
     store: Arc<OwnerSyncStore>,
     journal_path: Option<PathBuf>,
     view: std::sync::RwLock<Option<Arc<dyn SyncDaemonView>>>,
+    /// The attached view's save confirmation, when it saves in the
+    /// background (#1545, see [`Self::attach_daemon_view`]).
+    persisted_names: std::sync::RwLock<Option<Arc<dyn PersistedNames>>>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     session_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -2829,6 +2934,7 @@ impl OwnerSyncService {
             store: Arc::new(store),
             journal_path,
             view: std::sync::RwLock::new(None),
+            persisted_names: std::sync::RwLock::new(None),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
         });
@@ -2860,6 +2966,7 @@ impl OwnerSyncService {
             store: Arc::new(store),
             journal_path,
             view: std::sync::RwLock::new(None),
+            persisted_names: std::sync::RwLock::new(None),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
         });
@@ -2947,7 +3054,30 @@ impl OwnerSyncService {
 
     /// Install the live daemon view (idempotent; called by the daemon right
     /// after `AppState` construction).
+    ///
+    /// The reconcile pass takes a name record as applied once the view's
+    /// `apply_names` returns.
     pub fn attach_view(&self, view: Arc<dyn SyncDaemonView>) {
+        self.install_view(view, None);
+    }
+
+    /// #1545: [`Self::attach_view`] for a view that saves its names in the
+    /// background. The reconcile pass takes a name record as applied only
+    /// when the view confirms the save.
+    pub(crate) fn attach_daemon_view<V: SyncDaemonView + PersistedNames>(&self, view: Arc<V>) {
+        let persisted: Arc<dyn PersistedNames> = view.clone();
+        self.install_view(view, Some(persisted));
+    }
+
+    fn install_view(
+        &self,
+        view: Arc<dyn SyncDaemonView>,
+        persisted: Option<Arc<dyn PersistedNames>>,
+    ) {
+        *self
+            .persisted_names
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = persisted;
         *self
             .view
             .write()
@@ -3339,53 +3469,93 @@ impl OwnerSyncService {
             .store
             .recover_interrupted_commit(&owner_kp.user_id())
             .await;
-        self.apply_recovered().await;
+        let names_applied = self.apply_pending().await;
         recovery?;
 
         // Kinds 1 + 2 + 3: profile names and the Home pointer, via the
         // daemon view when attached.
         if let Some(view) = self.view() {
-            // The recovery and any session may have applied names that the
-            // live profile does not show yet.
-            view.names_applied().await;
+            // The live profile shows every committed name only when they
+            // are applied; until then, its names are not local changes. A
+            // session can commit names after `apply_pending`: its commit
+            // adds them to the pending applies before the register, so a
+            // check after the read sees them.
             let names = view.profile_names();
-            self.mint_or_log(
-                SyncKind::OwnerProfile,
-                "owner",
-                SyncValue::OwnerProfile {
-                    human_name: names.human_name,
-                },
-                owner_kp,
-                local_machine,
-            )
-            .await;
-            self.mint_or_log(
-                SyncKind::MachineNames,
-                &local_hex,
-                SyncValue::MachineNames {
-                    display_name: names.display_name,
-                    machine_name: names.machine_name,
-                },
-                owner_kp,
-                local_machine,
-            )
-            .await;
+            let owed = self
+                .store
+                .pending_applies()
+                .await
+                .iter()
+                .any(|(_, winner)| *winner);
+            if names_applied && !owed {
+                self.mint_or_log(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    SyncValue::OwnerProfile {
+                        human_name: names.human_name,
+                    },
+                    owner_kp,
+                    local_machine,
+                )
+                .await;
+                self.mint_or_log(
+                    SyncKind::MachineNames,
+                    &local_hex,
+                    SyncValue::MachineNames {
+                        display_name: names.display_name,
+                        machine_name: names.machine_name,
+                    },
+                    owner_kp,
+                    local_machine,
+                )
+                .await;
+            }
             self.materialize_local_home_pointer().await;
         }
 
         // Kind 4: issuance journal lines (latest per agent, owner-scoped).
         if let Some(path) = self.journal_path.as_ref() {
             mint_journal_lines(&self.store, path, owner_kp, local_machine).await;
-            self.apply_recovered().await;
+            // Its recovery can commit names too.
+            self.apply_pending().await;
         }
         Ok(())
     }
 
-    /// Apply the records that a recovery committed (#1542).
-    async fn apply_recovered(&self) {
-        for record in self.store.take_recovered().await {
-            self.apply_record(&record);
+    /// #1545: apply the committed names that live state may not show yet
+    /// (`OwnerSyncStore::pending_applies`), and discharge them once the
+    /// view confirms the save. `true` when none are owed any more; `false`
+    /// when no view is attached or the view did not save them, so the
+    /// next pass applies them again.
+    async fn apply_pending(&self) -> bool {
+        let pending = self.store.pending_applies().await;
+        if pending.is_empty() {
+            return true;
         }
+        if self.view().is_none() {
+            return false;
+        }
+        for (record, winner) in &pending {
+            if *winner {
+                self.apply_record(record);
+            }
+        }
+        let persisted = self
+            .persisted_names
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(persisted) = persisted {
+            if !persisted.names_persisted().await {
+                tracing::warn!(target: "x0x::owner_sync", "synced names not saved yet; retry next pass");
+                return false;
+            }
+        }
+        let done: Vec<VersionedRecord> = pending.into_iter().map(|(r, _)| r).collect();
+        if let Err(e) = self.store.discharge_applies(&done).await {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
+        }
+        true
     }
 
     /// The owner's CANONICAL Home per the Tier-1 `("home")` register (#449).

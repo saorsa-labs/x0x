@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use super::status::ApiResponse;
 use crate::owner_sync::{
-    OwnerEnrollment, OwnerSyncService, SyncDaemonView, SyncProfileNames, SyncValue,
+    OwnerEnrollment, OwnerSyncService, PersistedNames, SyncDaemonView, SyncProfileNames, SyncValue,
 };
 use crate::server::state::AppState;
 
@@ -28,8 +28,9 @@ use crate::server::state::AppState;
 /// `profile_names` keeps a last-seen mirror: `apply_names` writes it
 /// synchronously so the very next reconcile pass cannot re-mint a
 /// pre-merge value (LWW flip-back), while the live `AppState` profile and
-/// its persisted file catch up in a spawned task. `names_applied` waits
-/// for those tasks, because `profile_names` reads the live profile first.
+/// its persisted file catch up in a spawned task. `names_persisted` waits
+/// for those tasks and reports whether they saved the profile (#1545): the
+/// reconcile pass keeps a synced name owed until then.
 ///
 /// WHY a `Weak<AppState>`: the view is installed on the sync service the
 /// `AppState` owns (`state.owner_sync`), so an `Arc` here is a cycle
@@ -44,8 +45,9 @@ pub(in crate::server) struct DaemonView {
     state: Weak<AppState>,
     names: std::sync::RwLock<SyncProfileNames>,
     /// One receiver per catch-up task that may still run; each closes
-    /// when its task ends (or is refused at shutdown).
-    pending: std::sync::Mutex<Vec<tokio::sync::watch::Receiver<()>>>,
+    /// when its task ends (or is refused at shutdown), and holds `true`
+    /// when the task saved the profile.
+    pending: std::sync::Mutex<Vec<tokio::sync::watch::Receiver<bool>>>,
 }
 
 impl DaemonView {
@@ -67,7 +69,7 @@ impl DaemonView {
 
     /// Install a view over `state` on `service`, as the daemon does.
     pub(in crate::server) fn attach(service: &OwnerSyncService, state: &Arc<AppState>) {
-        service.attach_view(Arc::new(Self::new(Arc::clone(state))));
+        service.attach_daemon_view(Arc::new(Self::new(Arc::clone(state))));
     }
 }
 
@@ -183,7 +185,7 @@ impl SyncDaemonView for DaemonView {
         // in progress instead of leaving it to outlive the daemon with this
         // AppState (and `history.db`) held, and refuses one that has not
         // started, as if the sync had arrived after the stop.
-        let (done, done_rx) = tokio::sync::watch::channel(());
+        let (done, done_rx) = tokio::sync::watch::channel(false);
         {
             let mut pending = self
                 .pending
@@ -195,8 +197,8 @@ impl SyncDaemonView for DaemonView {
         }
         let task_state = Arc::clone(&state);
         state.spawn_shielded(async move {
-            // Dropped when the task ends, which completes `names_applied`.
-            let _done = done;
+            // `done` drops when the task ends, which completes
+            // `names_persisted`.
             let state = task_state;
             let mut profile = state.profile.write().await;
             let mut changed = false;
@@ -218,36 +220,47 @@ impl SyncDaemonView for DaemonView {
                     changed = true;
                 }
             }
-            if !changed {
-                return;
-            }
             let snapshot = profile.clone();
             let path = state.profile_path.clone();
             drop(profile);
             // The announce self-name follows the merged display name
             // (mirrors PUT /profile).
-            state.agent.set_self_name(snapshot.display_name.clone());
-            if let Err(e) = snapshot.save_to(&path).await {
-                tracing::warn!(
-                    target: "x0x::owner_sync",
-                    "failed to persist synced profile: {e}"
-                );
+            if changed {
+                state.agent.set_self_name(snapshot.display_name.clone());
+            }
+            // Save even when the live profile already holds the names: an
+            // earlier save of them can have failed (#1545).
+            match snapshot.save_to(&path).await {
+                Ok(()) => {
+                    let _ = done.send(true);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "x0x::owner_sync",
+                        "failed to persist synced profile: {e}"
+                    );
+                }
             }
         });
     }
+}
 
-    fn names_applied(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+impl PersistedNames for DaemonView {
+    fn names_persisted(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
         let pending = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         Box::pin(async move {
+            let mut persisted = true;
             for mut task in pending {
-                // The task never sends: `changed` returns when it drops
-                // its sender, at its end.
+                // `changed` fails once the task drops its sender, at its
+                // end; the last value is its result.
                 while task.changed().await.is_ok() {}
+                persisted &= *task.borrow();
             }
+            persisted
         })
     }
 }
