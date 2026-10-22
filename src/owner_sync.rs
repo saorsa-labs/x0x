@@ -854,10 +854,12 @@ pub struct OwnerSyncStore {
     /// cross-device election ordering.
     canonical_home_gate: tokio::sync::RwLock<()>,
     /// #1542: serializes the journal appends of accepted `IssuanceJournal`
-    /// records (see `append_synced_journal_line`). Each append runs in its
+    /// records (see `append_synced_journal_line`) and the reconcile that
+    /// mints journal lines (`mint_journal_lines`). Each append runs in its
     /// own task, so without it a task for an older register value could
-    /// append after the task for its successor. Lock order:
-    /// `journal_apply` → `records` (read) → the profile journal writer lock.
+    /// append after the task for its successor, and a reconcile could mint
+    /// between a winner check and its append. Lock order: `journal_apply`
+    /// → the profile journal writer lock → `records`.
     journal_apply: tokio::sync::Mutex<()>,
     /// Test injection: hold a synced journal append after its register
     /// winner check until the test releases it.
@@ -3129,13 +3131,14 @@ impl OwnerSyncService {
 
 /// Mint each agent's latest journal line into the `IssuanceJournal`
 /// register (kind 4 of the local reconcile). A failed mint is logged and
-/// retried next pass.
+/// retried next pass. Holds `OwnerSyncStore::journal_apply`.
 async fn mint_journal_lines(
     store: &OwnerSyncStore,
     path: &Path,
     owner_kp: &UserKeypair,
     machine: MachineId,
 ) {
+    let _journal_apply = store.journal_apply.lock().await;
     let owner_hex = hex::encode(owner_kp.user_id().0);
     let lines = crate::profile::IssuedCertRecord::load(path).await;
     for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {
@@ -3161,9 +3164,14 @@ async fn mint_journal_lines(
 /// winner for the agent. Each accepted record appends in its own task, so
 /// the tasks for `d1` and then `d2` can run as `d2` and then `d1`. Without
 /// this check the journal would end on `d1`, and the next reconcile would
-/// mint the older certificate over the register. The check and the append
-/// hold the store's `journal_apply` lock: a record that wins after the
-/// check appends after this line.
+/// mint the older certificate over the register.
+///
+/// The winner check and the append are one step. They hold the store's
+/// `journal_apply` lock, which the reconcile (`mint_journal_lines`) also
+/// holds, so the register cannot get a local value between them. They also
+/// hold the journal writer lock, so a local issuance cannot append between
+/// them. A newer winner therefore always appends after this line, or this
+/// line sees it and is not appended.
 async fn append_synced_journal_line(
     store: Arc<OwnerSyncStore>,
     path: PathBuf,
@@ -3174,26 +3182,27 @@ async fn append_synced_journal_line(
     not_after: Option<u64>,
 ) {
     let _journal_apply = store.journal_apply.lock().await;
+    let store = &*store; // borrowed by the `async move` decide closure
     let applied = SyncValue::IssuanceJournal {
         agent_id: agent_hex.clone(),
         cert_digest: cert_digest.clone(),
         issued_at,
         not_after,
     };
-    if store
-        .stored_value(SyncKind::IssuanceJournal, &agent_hex)
-        .await
-        != Some(applied)
-    {
-        // Superseded: the winner's line is already in the journal (a local
-        // issuance) or the winner's own task appends it.
-        return;
-    }
-    #[cfg(test)]
-    store.pause_after_journal_check().await;
-    let appended = crate::profile::IssuedCertRecord::append_when(&path, |existing| {
+    let appended = crate::profile::IssuedCertRecord::append_when(&path, |existing| async move {
+        if store
+            .stored_value(SyncKind::IssuanceJournal, &agent_hex)
+            .await
+            != Some(applied)
+        {
+            // Superseded: the winner's line is already in the journal
+            // (a local issuance) or the winner's own task appends it.
+            return None;
+        }
+        #[cfg(test)]
+        store.pause_after_journal_check().await;
         synced_line_needed(
-            existing,
+            &existing,
             &owner_hex,
             &agent_hex,
             &cert_digest,
@@ -3215,9 +3224,10 @@ async fn append_synced_journal_line(
 ///
 /// Owner sync calls this only for a record that won the `IssuanceJournal`
 /// register (`apply_record` runs post-commit) and is still its winner
-/// (`append_synced_journal_line` checks). The line is compared with
-/// this owner's CURRENT line for the agent (see `latest_journal_values`;
-/// the owner roster reads the same last line):
+/// (`append_synced_journal_line` checks, under the journal writer lock).
+/// The line is compared with this owner's CURRENT line for the agent
+/// (see `latest_journal_values`; the owner roster reads the same last
+/// line):
 ///
 /// - no current line, or a later second: append;
 /// - an earlier second: never append. A later line for an older

@@ -404,16 +404,18 @@ impl IssuedCertRecord {
     /// (owner sync's repair of a synced line) uses this, so the read, the
     /// decision and the append are one step: every journal writer in this
     /// process holds the journal writer lock for its read-modify-write.
+    /// `decide` runs under that lock, so it must not append to the journal.
     ///
     /// # Errors
     /// Returns the underlying IO error of the append.
-    pub(crate) async fn append_when(
-        path: &Path,
-        decide: impl FnOnce(&[Self]) -> Option<Self>,
-    ) -> std::io::Result<bool> {
+    pub(crate) async fn append_when<F, Fut>(path: &Path, decide: F) -> std::io::Result<bool>
+    where
+        F: FnOnce(Vec<Self>) -> Fut,
+        Fut: std::future::Future<Output = Option<Self>>,
+    {
         let _writer = JOURNAL_WRITER.lock().await;
         let existing = Self::load(path).await;
-        let Some(record) = decide(&existing) else {
+        let Some(record) = decide(existing).await else {
             return Ok(false);
         };
         Self::append_locked(path, &record).await?;
@@ -477,7 +479,7 @@ mod tests {
                     release_rx
                         .recv_timeout(std::time::Duration::from_secs(10))
                         .unwrap();
-                    (!saw_d2).then_some(repair)
+                    std::future::ready((!saw_d2).then_some(repair))
                 })
                 .await
                 .unwrap()
