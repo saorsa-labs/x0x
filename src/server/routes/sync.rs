@@ -70,7 +70,15 @@ impl DaemonView {
     }
 
     /// Install a view over `state` on `service`, as the daemon does.
-    pub(in crate::server) fn attach(service: &OwnerSyncService, state: &Arc<AppState>) {
+    ///
+    /// #1545: first remove the pending applies that the loaded profile
+    /// already holds (`OwnerSyncStore::settle_saved`), so that no pass
+    /// applies them over a local edit saved before the start.
+    pub(in crate::server) async fn attach(service: &OwnerSyncService, state: &Arc<AppState>) {
+        let durable = names_of(&*state.profile.read().await);
+        if let Err(e) = service.store().settle_saved(&durable).await {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to settle saved names");
+        }
         service.attach_daemon_view(Arc::new(Self::new(Arc::clone(state))));
     }
 }
@@ -79,11 +87,7 @@ impl SyncDaemonView for DaemonView {
     fn profile_names(&self) -> SyncProfileNames {
         if let Some(state) = self.state.upgrade() {
             if let Ok(profile) = state.profile.try_read() {
-                let fresh = SyncProfileNames {
-                    human_name: profile.human_name.clone(),
-                    display_name: profile.display_name.clone(),
-                    machine_name: profile.machine_name.clone(),
-                };
+                let fresh = names_of(&profile);
                 *self
                     .names
                     .write()
@@ -228,11 +232,8 @@ impl SyncDaemonView for DaemonView {
             // earlier save of them can have failed. Save under the profile
             // lock, so a later local edit cannot save first and then be
             // overwritten by this save (#1545).
-            match profile.save_to(&state.profile_path).await {
+            match save_profile(&state, &profile, owed.map(|(_, folded)| folded)).await {
                 Ok(()) => {
-                    if let Some((_, folded)) = owed {
-                        discharge_folded(&state, &folded).await;
-                    }
                     let _ = done.send(true);
                 }
                 Err(e) => {
@@ -268,8 +269,8 @@ fn set_names(profile: &mut SelfProfile, names: SyncProfileNames) -> bool {
 /// writer of the profile calls this before its own change and then saves,
 /// so a local edit always comes after the synced names committed before
 /// it. Returns whether `profile` changed and the records read; the caller
-/// discharges them (`discharge_folded`) after a successful save. `None`
-/// when the daemon has no owner sync.
+/// saves them with `save_profile`. `None` when the daemon has no owner
+/// sync.
 pub(in crate::server) async fn fold_owed_names(
     state: &AppState,
     profile: &mut SelfProfile,
@@ -292,16 +293,45 @@ pub(in crate::server) async fn fold_owed_names(
     Some((changed, folded))
 }
 
-/// #1545: discharge the records of `fold_owed_names` after the profile
-/// that holds them is durably saved. A failure keeps them owed, and the
-/// next pass applies them again.
-pub(in crate::server) async fn discharge_folded(state: &AppState, folded: &[VersionedRecord]) {
-    let Some(sync) = state.owner_sync.as_ref() else {
-        return;
-    };
-    if let Err(e) = sync.store().discharge_applies(folded).await {
-        tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
+/// The sync names of `profile`.
+fn names_of(profile: &SelfProfile) -> SyncProfileNames {
+    SyncProfileNames {
+        human_name: profile.human_name.clone(),
+        display_name: profile.display_name.clone(),
+        machine_name: profile.machine_name.clone(),
     }
+}
+
+/// #1545: durably save `profile`, which the caller holds under the profile
+/// write lock, with the records `folded` of `fold_owed_names` in it. The
+/// store first notes the save (`OwnerSyncStore::note_profile_save`), and
+/// after the save it discharges `folded`. Thus a discharge that does not
+/// reach the disk cannot bring the records back over this save, or over a
+/// local edit in it.
+///
+/// # Errors
+///
+/// The IO error of the note or of the save. The profile is not saved when
+/// the note fails, and `folded` stays owed.
+pub(in crate::server) async fn save_profile(
+    state: &AppState,
+    profile: &SelfProfile,
+    folded: Option<Vec<VersionedRecord>>,
+) -> std::io::Result<()> {
+    let owed = state.owner_sync.as_ref().zip(folded.as_deref());
+    if let Some((sync, folded)) = owed {
+        sync.store()
+            .note_profile_save(folded, &names_of(profile))
+            .await
+            .map_err(|e| std::io::Error::other(format!("note the profile save: {e}")))?;
+    }
+    profile.save_to(&state.profile_path).await?;
+    if let Some((sync, folded)) = owed {
+        if let Err(e) = sync.store().discharge_applies(folded).await {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
+        }
+    }
+    Ok(())
 }
 
 impl PersistedNames for DaemonView {
@@ -668,7 +698,8 @@ mod tests {
             DaemonView::attach(
                 state.owner_sync.as_ref().expect("owned state wires sync"),
                 state,
-            );
+            )
+            .await;
         }
         let sync_a = a.owner_sync.as_ref().expect("sync a");
         let sync_b = b.owner_sync.as_ref().expect("sync b");
@@ -833,7 +864,7 @@ mod tests {
         let state = owned_state(dir.path(), [0x87; 32]).await.expect("state");
         state.profile.write().await.human_name = Some("Old".into());
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
-        DaemonView::attach(service, &state);
+        DaemonView::attach(service, &state).await;
         service.sync_all().await;
         let owner = state
             .agent
@@ -931,7 +962,7 @@ mod tests {
                     .expect("save the old profile");
             }
             let service = state.owner_sync.as_ref().expect("owned state wires sync");
-            DaemonView::attach(service, &state);
+            DaemonView::attach(service, &state).await;
             service.sync_all().await;
 
             let batch = remote_alice_batch(dir.path(), &owner).await;
@@ -957,7 +988,7 @@ mod tests {
             "the restart loads the old profile"
         );
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
-        DaemonView::attach(service, &state);
+        DaemonView::attach(service, &state).await;
         service.sync_all().await;
         assert_eq!(
             service
@@ -1054,7 +1085,7 @@ mod tests {
                 .expect("save the old profile");
         }
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
-        DaemonView::attach(service, &state);
+        DaemonView::attach(service, &state).await;
         service.sync_all().await;
         let batch = remote_alice_batch(dir, &owner).await;
         service
@@ -1124,7 +1155,7 @@ mod tests {
             .await
             .expect("restarted state");
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
-        DaemonView::attach(service, &state);
+        DaemonView::attach(service, &state).await;
         service.sync_all().await;
         assert_keeps_bob(&state, "after the crash").await;
     }
@@ -1150,7 +1181,7 @@ mod tests {
             .await
             .expect("restarted state");
         let service = state.owner_sync.as_ref().expect("owned state wires sync");
-        DaemonView::attach(service, &state);
+        DaemonView::attach(service, &state).await;
         service.sync_all().await;
         assert_keeps_bob(&state, "after a restart").await;
     }

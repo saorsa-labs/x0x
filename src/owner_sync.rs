@@ -889,7 +889,7 @@ pub struct OwnerSyncStore {
     /// one: until the new record's commit is durable, the older one can
     /// still be the register's winner. Lock order: `records` →
     /// `pending_apply`.
-    pending_apply: tokio::sync::Mutex<BTreeMap<PendingKey, VersionedRecord>>,
+    pending_apply: tokio::sync::Mutex<BTreeMap<PendingKey, PendingApply>>,
     /// Test injection: hold a synced journal append after its decision
     /// read until the test releases it.
     #[cfg(test)]
@@ -920,6 +920,45 @@ type PendingKey = (SyncKind, String, [u8; 32]);
 
 fn pending_key(record: &VersionedRecord) -> PendingKey {
     (record.kind, record.key.clone(), record.record_hash())
+}
+
+/// The names of a profile save (`OwnerSyncStore::note_profile_save`). A
+/// private copy of [`SyncProfileNames`], so the public type gets no serde
+/// impls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SavedNames {
+    human_name: Option<String>,
+    display_name: Option<String>,
+    machine_name: Option<String>,
+}
+
+impl From<&SyncProfileNames> for SavedNames {
+    fn from(names: &SyncProfileNames) -> Self {
+        Self {
+            human_name: names.human_name.clone(),
+            display_name: names.display_name.clone(),
+            machine_name: names.machine_name.clone(),
+        }
+    }
+}
+
+/// #1545: a pending apply (`OwnerSyncStore::pending_apply`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingApply {
+    record: VersionedRecord,
+    /// The names of each profile save that started with `record` folded
+    /// in, written durably before the save. A durable profile with one of
+    /// these names holds `record` or a later local edit over it, so
+    /// `record` is not owed any more (`OwnerSyncStore::settle_saved`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    saved_in: Vec<SavedNames>,
+}
+
+/// The contents of `APPLY_PENDING_FILE`.
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct PersistedPendingApplies {
+    #[serde(default)]
+    applies: Vec<PendingApply>,
 }
 
 /// The two ends of [`OwnerSyncStore::pause_next_journal_check`].
@@ -994,7 +1033,7 @@ impl OwnerSyncStore {
         })?;
         let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
         let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
-        let pending_apply: PersistedRecords =
+        let pending_apply: PersistedPendingApplies =
             Self::load_json(&dir.join(APPLY_PENDING_FILE)).await?;
         let records = persisted_records
             .records
@@ -1031,9 +1070,9 @@ impl OwnerSyncStore {
             journal_file: std::sync::OnceLock::new(),
             pending_apply: tokio::sync::Mutex::new(
                 pending_apply
-                    .records
+                    .applies
                     .into_iter()
-                    .map(|r| (pending_key(&r), r))
+                    .map(|p| (pending_key(&p.record), p))
                     .collect(),
             ),
             #[cfg(test)]
@@ -1849,29 +1888,27 @@ impl OwnerSyncStore {
         let mut pending = self.pending_apply.lock().await;
         let mut next = pending.clone();
         for record in names {
-            next.insert(pending_key(record), (*record).clone());
+            next.entry(pending_key(record))
+                .or_insert_with(|| PendingApply {
+                    record: (*record).clone(),
+                    saved_in: Vec::new(),
+                });
         }
         self.persist_pending_applies(&next).await?;
         *pending = next;
         Ok(())
     }
 
-    /// Write `pending` to `APPLY_PENDING_FILE`, or remove the file when
-    /// `pending` is empty.
+    /// Write `pending` durably to `APPLY_PENDING_FILE`. An empty set is
+    /// written too, not unlinked: an unlink without a directory fsync can
+    /// come back after a crash with the obligations it removed.
     async fn persist_pending_applies(
         &self,
-        pending: &BTreeMap<PendingKey, VersionedRecord>,
+        pending: &BTreeMap<PendingKey, PendingApply>,
     ) -> Result<(), SyncError> {
         let path = self.dir.join(APPLY_PENDING_FILE);
-        if pending.is_empty() {
-            return match tokio::fs::remove_file(&path).await {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(SyncError::Io(format!("remove pending applies: {e}"))),
-            };
-        }
-        let bytes = serde_json::to_vec(&PersistedRecords {
-            records: pending.values().cloned().collect(),
+        let bytes = serde_json::to_vec(&PersistedPendingApplies {
+            applies: pending.values().cloned().collect(),
         })
         .map_err(|e| SyncError::Io(format!("encode pending applies: {e}")))?;
         Self::write_atomically(&path, &bytes, false)
@@ -1889,8 +1926,13 @@ impl OwnerSyncStore {
     /// record that a later commit replaced, or whose commit failed after
     /// the obligation was written, is `false`.
     pub(crate) async fn pending_applies(&self) -> Vec<(VersionedRecord, bool)> {
-        let pending: Vec<VersionedRecord> =
-            self.pending_apply.lock().await.values().cloned().collect();
+        let pending: Vec<VersionedRecord> = self
+            .pending_apply
+            .lock()
+            .await
+            .values()
+            .map(|p| p.record.clone())
+            .collect();
         if pending.is_empty() {
             return Vec::new();
         }
@@ -1906,24 +1948,63 @@ impl OwnerSyncStore {
             .collect()
     }
 
+    /// #1545: record that a profile save with `names` starts with
+    /// `folded` in it. The caller holds the profile write lock, and saves
+    /// only after this returns `Ok`: then a durable profile with `names`
+    /// shows that `folded` is not owed any more, even when the discharge
+    /// after the save does not reach the disk (`settle_saved`).
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written; the caller must
+    /// not save the profile.
+    pub(crate) async fn note_profile_save(
+        &self,
+        folded: &[VersionedRecord],
+        names: &SyncProfileNames,
+    ) -> Result<(), SyncError> {
+        let saved = SavedNames::from(names);
+        let mut pending = self.pending_apply.lock().await;
+        let mut next = pending.clone();
+        let mut changed = false;
+        for record in folded {
+            if let Some(entry) = next.get_mut(&pending_key(record)) {
+                if !entry.saved_in.contains(&saved) {
+                    entry.saved_in.push(saved.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        self.persist_pending_applies(&next).await?;
+        *pending = next;
+        Ok(())
+    }
+
     /// #1545: remove `done` from the pending applies, after the daemon has
     /// durably saved the winners among them. A record that a commit added
     /// after `done` was read stays.
     ///
+    /// The records leave memory even when the file write fails, so no
+    /// later pass applies them over a newer local edit. Each save of them
+    /// was noted first (`note_profile_save`), so at the next start
+    /// `settle_saved` removes them from the file.
+    ///
     /// # Errors
     ///
-    /// [`SyncError::Io`] when the file cannot be written; the records stay,
-    /// and the next pass applies them again.
+    /// [`SyncError::Io`] when the file cannot be written.
     pub(crate) async fn discharge_applies(
         &self,
         done: &[VersionedRecord],
     ) -> Result<(), SyncError> {
         let mut pending = self.pending_apply.lock().await;
-        let mut next = pending.clone();
+        let before = pending.len();
         for record in done {
-            next.remove(&pending_key(record));
+            pending.remove(&pending_key(record));
         }
-        if next.len() == pending.len() {
+        if pending.len() == before {
             return Ok(());
         }
         #[cfg(test)]
@@ -1933,9 +2014,28 @@ impl OwnerSyncStore {
         {
             return Err(SyncError::Io("injected discharge failure".into()));
         }
-        self.persist_pending_applies(&next).await?;
-        *pending = next;
-        Ok(())
+        self.persist_pending_applies(&pending).await
+    }
+
+    /// #1545: remove the pending applies that a durable profile with
+    /// `durable` holds (see `PendingApply::saved_in`). The daemon calls
+    /// this at start, with the profile it loaded, before any pass applies
+    /// them: a discharge before the restart can have failed to reach the
+    /// disk.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written; the records
+    /// leave memory all the same.
+    pub(crate) async fn settle_saved(&self, durable: &SyncProfileNames) -> Result<(), SyncError> {
+        let saved = SavedNames::from(durable);
+        let mut pending = self.pending_apply.lock().await;
+        let before = pending.len();
+        pending.retain(|_, p| !p.saved_in.contains(&saved));
+        if pending.len() == before {
+            return Ok(());
+        }
+        self.persist_pending_applies(&pending).await
     }
 
     /// #1542: finish a commit that stopped after its journal intent was

@@ -101,12 +101,9 @@ pub(in crate::server) async fn update_profile(
         // so a later replay of them cannot put them over this edit.
         let owed = super::sync::fold_owed_names(&state, &mut profile).await;
         let _changed = profile.merge(&update);
-        let persist_err = profile.save_to(&state.profile_path).await.err();
-        if persist_err.is_none() {
-            if let Some((_, folded)) = owed {
-                super::sync::discharge_folded(&state, &folded).await;
-            }
-        }
+        let persist_err = super::sync::save_profile(&state, &profile, owed.map(|(_, f)| f))
+            .await
+            .err();
         // The announce name follows the stored profile even if persistence
         // fails — the daemon's live view stays coherent; the error is
         // reported so the operator can fix the disk.
