@@ -19,8 +19,10 @@ use serde::Serialize;
 
 use super::status::ApiResponse;
 use crate::owner_sync::{
-    OwnerEnrollment, OwnerSyncService, PersistedNames, SyncDaemonView, SyncProfileNames, SyncValue,
+    local_names_of, OwnerEnrollment, OwnerSyncService, PersistedNames, SyncDaemonView,
+    SyncProfileNames, SyncValue, VersionedRecord,
 };
+use crate::profile::SelfProfile;
 use crate::server::state::AppState;
 
 /// Adapter over live daemon state for the sync service.
@@ -201,37 +203,36 @@ impl SyncDaemonView for DaemonView {
             // `names_persisted`.
             let state = task_state;
             let mut profile = state.profile.write().await;
-            let mut changed = false;
-            if let Some(human) = human_name {
-                if profile.human_name != Some(human.clone()) {
-                    profile.human_name = Some(human);
-                    changed = true;
-                }
-            }
-            if let Some(display) = display_name {
-                if profile.display_name != Some(display.clone()) {
-                    profile.display_name = Some(display.clone());
-                    changed = true;
-                }
-            }
-            if let Some(machine) = machine_name {
-                if profile.machine_name != Some(machine.clone()) {
-                    profile.machine_name = Some(machine);
-                    changed = true;
-                }
-            }
-            let snapshot = profile.clone();
-            let path = state.profile_path.clone();
-            drop(profile);
+            // #1545: apply the names still owed, not the values of this
+            // call. A local edit (`PUT /profile`) that ran after this call
+            // already folded them in and discharged them; applying the
+            // values of this call again would put them over that edit.
+            let owed = fold_owed_names(&state, &mut profile).await;
+            let changed = match &owed {
+                Some((changed, _)) => *changed,
+                None => set_names(
+                    &mut profile,
+                    SyncProfileNames {
+                        human_name,
+                        display_name,
+                        machine_name,
+                    },
+                ),
+            };
             // The announce self-name follows the merged display name
             // (mirrors PUT /profile).
             if changed {
-                state.agent.set_self_name(snapshot.display_name.clone());
+                state.agent.set_self_name(profile.display_name.clone());
             }
             // Save even when the live profile already holds the names: an
-            // earlier save of them can have failed (#1545).
-            match snapshot.save_to(&path).await {
+            // earlier save of them can have failed. Save under the profile
+            // lock, so a later local edit cannot save first and then be
+            // overwritten by this save (#1545).
+            match profile.save_to(&state.profile_path).await {
                 Ok(()) => {
+                    if let Some((_, folded)) = owed {
+                        discharge_folded(&state, &folded).await;
+                    }
                     let _ = done.send(true);
                 }
                 Err(e) => {
@@ -242,6 +243,64 @@ impl SyncDaemonView for DaemonView {
                 }
             }
         });
+    }
+}
+
+/// Set each name of `names` that is `Some` on `profile`. Returns whether
+/// anything changed.
+fn set_names(profile: &mut SelfProfile, names: SyncProfileNames) -> bool {
+    let mut changed = false;
+    for (slot, name) in [
+        (&mut profile.human_name, names.human_name),
+        (&mut profile.display_name, names.display_name),
+        (&mut profile.machine_name, names.machine_name),
+    ] {
+        if name.is_some() && *slot != name {
+            *slot = name;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// #1545: put the synced names that are still owed to this machine into
+/// `profile`, which the caller holds under the profile write lock. Every
+/// writer of the profile calls this before its own change and then saves,
+/// so a local edit always comes after the synced names committed before
+/// it. Returns whether `profile` changed and the records read; the caller
+/// discharges them (`discharge_folded`) after a successful save. `None`
+/// when the daemon has no owner sync.
+pub(in crate::server) async fn fold_owed_names(
+    state: &AppState,
+    profile: &mut SelfProfile,
+) -> Option<(bool, Vec<VersionedRecord>)> {
+    let sync = state.owner_sync.as_ref()?;
+    let local = state.agent.machine_id();
+    let mut changed = false;
+    let mut folded = Vec::new();
+    for (record, winner) in sync.store().pending_applies().await {
+        // A record that is not the register's winner is discharged
+        // without an apply: a later commit replaced it, or its own commit
+        // did not complete.
+        if winner {
+            if let Some(names) = local_names_of(&record, &local) {
+                changed |= set_names(profile, names);
+            }
+        }
+        folded.push(record);
+    }
+    Some((changed, folded))
+}
+
+/// #1545: discharge the records of `fold_owed_names` after the profile
+/// that holds them is durably saved. A failure keeps them owed, and the
+/// next pass applies them again.
+pub(in crate::server) async fn discharge_folded(state: &AppState, folded: &[VersionedRecord]) {
+    let Some(sync) = state.owner_sync.as_ref() else {
+        return;
+    };
+    if let Err(e) = sync.store().discharge_applies(folded).await {
+        tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
     }
 }
 

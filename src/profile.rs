@@ -218,14 +218,27 @@ pub(crate) async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Resu
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    tokio::fs::write(&tmp, bytes).await?;
-    match tokio::fs::rename(&tmp, path).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(e)
-        }
+    // #1545: a successful save is durable. Owner sync discharges its
+    // obligation to apply synced names once the profile save returns, so
+    // a host crash must not bring back the old profile after that. fsync
+    // the temp file before the rename, and the directory after it.
+    let written = async {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&tmp, path).await
     }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    #[cfg(unix)]
+    tokio::fs::File::open(dir).await?.sync_all().await?;
+    #[cfg(test)]
+    crash_sim::note_durable(path);
+    Ok(())
 }
 
 /// One line of the append-only owner certificate journal (ADR-0036,

@@ -880,13 +880,16 @@ pub struct OwnerSyncStore {
     /// are applied to (set by the service; unset in a bare store).
     journal_file: std::sync::OnceLock<PathBuf>,
     /// #1545: the committed name records that live daemon state may not
-    /// show yet, one per key; a mirror of `APPLY_PENDING_FILE`. A commit
-    /// adds its name records here and to the file before its register
-    /// write, and only the reconcile pass removes them, after the daemon
-    /// has saved them (see [`Self::pending_applies`]). A restart before
+    /// show yet, keyed by kind, key and record hash; a mirror of `APPLY_PENDING_FILE`.
+    /// A commit adds its name records here and to the file before its
+    /// register write, and only a durable save of the daemon profile
+    /// removes them (see [`Self::pending_applies`]). A restart before
     /// that applies them again, so the reconcile never mints the old live
-    /// names over them. Lock order: `records` → `pending_apply`.
-    pending_apply: tokio::sync::Mutex<BTreeMap<(SyncKind, String), VersionedRecord>>,
+    /// names over them. A new record of a key does not replace an older
+    /// one: until the new record's commit is durable, the older one can
+    /// still be the register's winner. Lock order: `records` →
+    /// `pending_apply`.
+    pending_apply: tokio::sync::Mutex<BTreeMap<PendingKey, VersionedRecord>>,
     /// Test injection: hold a synced journal append after its decision
     /// read until the test releases it.
     #[cfg(test)]
@@ -906,6 +909,13 @@ pub struct OwnerSyncStore {
     /// ADR-0074 §4: woken when the owner device set changes (an enrollment
     /// or unenrollment).
     device_change_notify: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
+}
+
+/// The key of a pending apply (`OwnerSyncStore::pending_apply`).
+type PendingKey = (SyncKind, String, [u8; 32]);
+
+fn pending_key(record: &VersionedRecord) -> PendingKey {
+    (record.kind, record.key.clone(), record.record_hash())
 }
 
 /// The two ends of [`OwnerSyncStore::pause_next_journal_check`].
@@ -1019,7 +1029,7 @@ impl OwnerSyncStore {
                 pending_apply
                     .records
                     .into_iter()
-                    .map(|r| ((r.kind, r.key.clone()), r))
+                    .map(|r| (pending_key(&r), r))
                     .collect(),
             ),
             #[cfg(test)]
@@ -1819,7 +1829,7 @@ impl OwnerSyncStore {
         let mut pending = self.pending_apply.lock().await;
         let mut next = pending.clone();
         for record in names {
-            next.insert((record.kind, record.key.clone()), (*record).clone());
+            next.insert(pending_key(record), (*record).clone());
         }
         self.persist_pending_applies(&next).await?;
         *pending = next;
@@ -1830,7 +1840,7 @@ impl OwnerSyncStore {
     /// `pending` is empty.
     async fn persist_pending_applies(
         &self,
-        pending: &BTreeMap<(SyncKind, String), VersionedRecord>,
+        pending: &BTreeMap<PendingKey, VersionedRecord>,
     ) -> Result<(), SyncError> {
         let path = self.dir.join(APPLY_PENDING_FILE);
         if pending.is_empty() {
@@ -1877,8 +1887,8 @@ impl OwnerSyncStore {
     }
 
     /// #1545: remove `done` from the pending applies, after the daemon has
-    /// saved the winners among them. A record that a commit put in place of
-    /// one of them stays.
+    /// durably saved the winners among them. A record that a commit added
+    /// after `done` was read stays.
     ///
     /// # Errors
     ///
@@ -1891,13 +1901,7 @@ impl OwnerSyncStore {
         let mut pending = self.pending_apply.lock().await;
         let mut next = pending.clone();
         for record in done {
-            let key = (record.kind, record.key.clone());
-            if next
-                .get(&key)
-                .is_some_and(|r| r.record_hash() == record.record_hash())
-            {
-                next.remove(&key);
-            }
+            next.remove(&pending_key(record));
         }
         if next.len() == pending.len() {
             return Ok(());
@@ -3624,37 +3628,11 @@ impl OwnerSyncService {
     }
 
     /// Apply an accepted record to live daemon state (post-commit only).
-    ///
-    /// Exhaustive over [`SyncValue`] — Tier-3 kinds cannot reach here.
+    /// See [`local_names_of`] for what each kind applies.
     pub(crate) fn apply_record(&self, record: &VersionedRecord) {
-        match &record.value {
-            SyncValue::OwnerProfile { human_name } => {
-                if let Some(view) = self.view() {
-                    view.apply_names(human_name.clone(), None, None);
-                }
-            }
-            SyncValue::MachineNames {
-                display_name,
-                machine_name,
-            } => {
-                let local_hex = hex::encode(self.agent.machine_id().0);
-                if record.key == local_hex {
-                    if let Some(view) = self.view() {
-                        view.apply_names(None, display_name.clone(), machine_name.clone());
-                    }
-                }
-                // Remote machines' names stay in the record store for
-                // future surfacing (ADR-0041 Tier-1 scope).
-            }
-            SyncValue::HomePointer { .. } => {
-                // The register is read on demand (`canonical_home`) by the
-                // Home resolution path rather than pushed here: provisioning,
-                // `GET /home` and adoption all need the CURRENT winner, not
-                // whatever happened to arrive last (#449).
-            }
-            SyncValue::IssuanceJournal { .. } => {
-                // `commit_batch` already wrote the journal file, under the
-                // same `journal_apply` hold as the register change (#1542).
+        if let Some(names) = local_names_of(record, &self.agent.machine_id()) {
+            if let Some(view) = self.view() {
+                view.apply_names(names.human_name, names.display_name, names.machine_name);
             }
         }
     }
@@ -3676,6 +3654,40 @@ impl OwnerSyncService {
             }
             self.sync_all().await;
         }
+    }
+}
+
+/// The names that `record` sets on the profile of `local_machine`, with
+/// `None` for a name it leaves unchanged; `None` when it sets no local
+/// name. The names of a remote machine stay in the record store for future
+/// surfacing (ADR-0041 Tier-1 scope).
+pub(crate) fn local_names_of(
+    record: &VersionedRecord,
+    local_machine: &MachineId,
+) -> Option<SyncProfileNames> {
+    match &record.value {
+        SyncValue::OwnerProfile { human_name } => Some(SyncProfileNames {
+            human_name: human_name.clone(),
+            display_name: None,
+            machine_name: None,
+        }),
+        SyncValue::MachineNames {
+            display_name,
+            machine_name,
+        } if record.key == hex::encode(local_machine.0) => Some(SyncProfileNames {
+            human_name: None,
+            display_name: display_name.clone(),
+            machine_name: machine_name.clone(),
+        }),
+        SyncValue::MachineNames { .. } => None,
+        // The register is read on demand (`canonical_home`) by the Home
+        // resolution path rather than pushed here: provisioning,
+        // `GET /home` and adoption all need the CURRENT winner, not
+        // whatever happened to arrive last (#449).
+        SyncValue::HomePointer { .. } => None,
+        // `commit_batch` already wrote the journal file, under the same
+        // `journal_apply` hold as the register change (#1542).
+        SyncValue::IssuanceJournal { .. } => None,
     }
 }
 
@@ -7623,6 +7635,7 @@ mod issuance_journal_sync_tests {
             "the reconcile must not publish the old live name"
         );
     }
+
     /// Codex review of #1545 (29e2800), P2: a commit writes the apply
     /// obligation of its name record `B` before its register write. A
     /// crash between the two leaves the register at the committed `A`.
