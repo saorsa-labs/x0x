@@ -4748,4 +4748,135 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A `GSS` group of a remote admin with `target` seated as a Member,
+    /// or not yet seated, held by `state` under `group_id`.
+    async fn hold_remote_admin_group(
+        state: &AppState,
+        group_id: &str,
+        target: &x0x::identity::AgentId,
+        seated: bool,
+    ) -> anyhow::Result<GroupInfo> {
+        let admin = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let mut info = GroupInfo::new("s4-r7".into(), String::new(), admin, group_id.to_string());
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        if seated {
+            info.add_member(
+                hex::encode(target.as_bytes()),
+                GroupRole::Member,
+                Some(hex::encode(admin.as_bytes())),
+                None,
+            );
+        }
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        Ok(info)
+    }
+
+    /// A verified Agent-subject revocation of `target` in `state`'s set.
+    async fn revoke_agent(
+        state: &AppState,
+        target: &x0x::identity::AgentKeypair,
+    ) -> anyhow::Result<()> {
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(target.agent_id()),
+            target.public_key(),
+            target.secret_key(),
+            1,
+            None,
+        )?;
+        let inserted = state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)?;
+        anyhow::ensure!(inserted, "the revocation is held");
+        Ok(())
+    }
+
+    /// #1508 r7 (Codex P1 4, ADR 0110 §1): a revocation that this node
+    /// consumed before a delayed `MemberAdded` seats its target still
+    /// opens the work once the roster catch-up lands. The revocation
+    /// generation does not change and nothing requests a reconcile.
+    #[tokio::test]
+    async fn a_revocation_before_its_target_is_seated_opens_work_on_catch_up() -> anyhow::Result<()>
+    {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "a6".repeat(16);
+        let info = hold_remote_admin_group(&state, &group_id, &target.agent_id(), false).await?;
+        let key = EvictionKey::new(info.stable_group_id(), *target.agent_id().as_bytes());
+        revoke_agent(&state, &target).await?;
+        revocation_eviction_pass(&state).await;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_none(),
+            "no seat yet: no work"
+        );
+        revocation_eviction_pass(&state).await;
+
+        // The roster catch-up seats the revoked member.
+        hold_remote_admin_group(&state, &group_id, &target.agent_id(), true).await?;
+        revocation_eviction_pass(&state).await;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_some(),
+            "the seated revoked member gets eviction work"
+        );
+        Ok(())
+    }
+
+    /// #1508 r7 (Codex P2 6, ADR 0110 §2 L175/L194): the fallback budget
+    /// that a waiting row consumes is written to the `.evs`, so a restart
+    /// resumes it and cannot extend the window.
+    #[tokio::test]
+    async fn a_consumed_budget_survives_a_restart() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "a7".repeat(16);
+        let info = hold_remote_admin_group(&state, &group_id, &target.agent_id(), true).await?;
+        let key = EvictionKey::new(info.stable_group_id(), *target.agent_id().as_bytes());
+        revoke_agent(&state, &target).await?;
+        revocation_eviction_pass(&state).await;
+        assert!(persist_obligations(&state).await, "the intake is durable");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        revocation_eviction_pass(&state).await;
+        assert!(persist_obligations(&state).await);
+
+        // Restart: the S4 state is reloaded from disk.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        revocation_eviction_pass(&state).await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner
+            .store
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("the row survives"))?;
+        assert!(row.phase.is_open(), "the row still waits");
+        assert!(
+            row.elapsed_budget_ms >= 1_200,
+            "the consumed budget is resumed, not restarted: {} ms",
+            row.elapsed_budget_ms
+        );
+        Ok(())
+    }
 }
