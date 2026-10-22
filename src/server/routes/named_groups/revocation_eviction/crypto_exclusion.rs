@@ -2648,6 +2648,7 @@ mod daemon_tests {
         group_id: String,
         stable: String,
         leaver: AgentId,
+        leaver_kp: x0x::identity::AgentKeypair,
         leave: ng::NamedGroupMetadataEvent,
         old_secret: Vec<u8>,
     }
@@ -2725,6 +2726,7 @@ mod daemon_tests {
             group_id,
             stable,
             leaver,
+            leaver_kp,
             leave,
             old_secret,
         })
@@ -2905,6 +2907,225 @@ mod daemon_tests {
             inner.ce.delivering().contains(&key),
             "the saved frame's delivery resumes"
         );
+        Ok(())
+    }
+
+    /// Apply the fixture's leave, run the real worker until the GSS
+    /// exclusion commits, end delivery and run one more pass, so the row
+    /// completes from the chain. Returns the group as it was after the
+    /// leave and before the exclusion (a stale snapshot of the departure),
+    /// and the exclusion frame.
+    async fn exclude_first_leave(fx: &GssLeave) -> Result<(GroupInfo, Vec<u8>)> {
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        let departed = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the first exclusion frame");
+        fx.state.revocation_evictions.inner.lock().await.ce = CeState::default();
+        super::super::revocation_eviction_pass(&fx.state).await;
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let inner = fx.state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).map(|row| row.phase),
+            Some(Phase::Complete),
+            "the first exclusion completed"
+        );
+        Ok((departed, frame))
+    }
+
+    async fn stored_group(fx: &GssLeave) -> GroupInfo {
+        fx.state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group")
+    }
+
+    /// #1508 review (Codex P1 on a00455a): a later departure of a new
+    /// membership incarnation reopens completed exclusion work. The leaver
+    /// is excluded (row `Complete`), the admin adds it again through the
+    /// real add-member route, and it leaves again. The second departure
+    /// keeps the current secret, so the real worker pass must reopen the
+    /// row and the GSS exclusion must run again: a new epoch, and no share
+    /// for the departed member.
+    #[tokio::test]
+    async fn gss_second_departure_after_rejoin_reopens_and_rotates_again() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let (_, first_frame) = exclude_first_leave(&fx).await?;
+        let leaver_hex = hex::encode(fx.leaver.as_bytes());
+
+        // The rejoin: the admin seats the leaver again.
+        let added = ng::add_named_group_member(
+            axum::extract::State(Arc::clone(&fx.state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            axum::extract::Path(fx.group_id.clone()),
+            axum::Json(ng::AddNamedGroupMemberRequest {
+                agent_id: leaver_hex.clone(),
+                display_name: None,
+                treekem_key_package_b64: None,
+            }),
+        )
+        .await;
+        let added = axum::response::IntoResponse::into_response(added);
+        assert_eq!(added.status(), axum::http::StatusCode::OK, "the rejoin");
+        let rejoined = stored_group(&fx).await;
+        assert_eq!(
+            rejoined
+                .members_v2
+                .get(&leaver_hex)
+                .map(|member| member.state),
+            Some(x0x::groups::GroupMemberState::Active)
+        );
+
+        // The second departure: a new signed self-leave of the new seat.
+        let mut leaving = rejoined.clone();
+        leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+        let revision = leaving.roster_revision;
+        leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let leave_commit = leaving.seal_commit(&fx.leaver_kp, ng::now_millis_u64())?;
+        let second_leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: fx.group_id.clone(),
+            revision,
+            actor: leaver_hex.clone(),
+            agent_id: leaver_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(leave_commit),
+        };
+        let applied =
+            ng::apply_named_group_metadata_event(&fx.state, second_leave, fx.leaver, true, None)
+                .await;
+        assert!(applied.accepted, "the second leave must apply: {applied:?}");
+        let departed = stored_group(&fx).await;
+        assert!(
+            ce::gss_secret_retained(&departed, &leaver_hex),
+            "the second leaver still holds the current secret"
+        );
+        let departed_epoch = ce::committed_secret_epoch(&departed);
+        if let Ok(mut scheduled) = fx
+            .state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+        {
+            scheduled.clear();
+        }
+
+        run_worker(&fx.state).await;
+
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("row");
+            assert_eq!(
+                row.phase,
+                Phase::CommittedDeliveryPending,
+                "the second departure reopened the row and the exclusion committed"
+            );
+        }
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("a second exclusion frame");
+        assert_ne!(frame, first_frame, "a new exclusion ran");
+        let decoded = ce::decode_frame(&frame).expect("frame");
+        assert_eq!(
+            decoded.body.crypto,
+            ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: departed_epoch + 1
+            }
+        );
+        let committed = stored_group(&fx).await;
+        assert_eq!(committed.secret_epoch, departed_epoch + 1, "a new epoch");
+        assert!(!ce::gss_secret_retained(&committed, &leaver_hex));
+        let shares = fx
+            .state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map(|scheduled| scheduled.clone())
+            .unwrap_or_default();
+        assert!(!shares.is_empty(), "the survivor gets the new secret");
+        assert!(
+            shares
+                .iter()
+                .all(|(_, recipient, _)| *recipient != leaver_hex),
+            "no share for the departed member"
+        );
+        Ok(())
+    }
+
+    /// The negative of the test above: a replay of the old departure does
+    /// not reopen completed work. Neither the old leave event applied again
+    /// nor a stale snapshot of the departed group (the old incarnation,
+    /// read before the exclusion) reopens the `Complete` row or commits a
+    /// second exclusion.
+    #[tokio::test]
+    async fn gss_replayed_old_departure_does_not_reopen_completed_work() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let (departed, _) = exclude_first_leave(&fx).await?;
+        let epoch = stored_group(&fx).await.secret_epoch;
+
+        let _ = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        run_worker(&fx.state).await;
+
+        let stale = vec![(fx.group_id.clone(), departed)];
+        let leaves = super::super::snapshot_retained_leaves(&fx.state, &stale).await;
+        let triggers = super::super::derive_triggers(&stale, &leaves, &[], 0);
+        assert!(!triggers.is_empty(), "the stale snapshot shows the leave");
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        {
+            let runtime = &fx.state.revocation_evictions;
+            let mut inner = runtime.inner.lock().await;
+            for (trigger_key, trigger, incarnation) in triggers {
+                let outcome = inner.store.intake(
+                    &trigger_key,
+                    trigger,
+                    incarnation.as_deref(),
+                    1,
+                    runtime.boot_id,
+                );
+                assert_ne!(outcome, x0x::groups::eviction::IntakeOutcome::Reopened);
+            }
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::Complete),
+                "the replayed departure does not reopen the row"
+            );
+        }
+        assert_eq!(
+            latest_frame_for_test(&fx.state, &fx.stable).await,
+            None,
+            "no second exclusion"
+        );
+        assert_eq!(stored_group(&fx).await.secret_epoch, epoch);
         Ok(())
     }
 

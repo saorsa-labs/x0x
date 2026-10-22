@@ -1787,26 +1787,50 @@ mod tests {
         assert_eq!(store.get(&k).expect("row").phase, Phase::Complete);
     }
 
+    /// #1508 review (Codex P1 on a00455a): every trigger kind of a new
+    /// membership incarnation reopens completed work, and a trigger of the
+    /// old incarnation (a replay of the old departure) does not.
     #[test]
-    fn revocation_reopens_for_a_new_incarnation_but_self_leave_does_not() {
-        let mut store = ObligationStore::new();
-        let k = key(9);
-        store.intake(&k, revocation(1), Some("leaf-a"), 1, [0; 16]);
-        store.complete(&k, None, None, 2);
-        let leave = EvictionTrigger::SelfLeave {
-            commit_hash: "h".into(),
+    fn every_trigger_of_a_new_incarnation_reopens_completed_work() {
+        let leave = |hash: &str| EvictionTrigger::SelfLeave {
+            commit_hash: hash.into(),
         };
-        assert_ne!(
-            store.intake(&k, leave, Some("leaf-b"), 3, [0; 16]),
-            IntakeOutcome::Reopened
-        );
-        assert_eq!(
-            store.intake(&k, revocation(1), Some("leaf-b"), 4, [0; 16]),
-            IntakeOutcome::Reopened
-        );
-        let row = store.get(&k).expect("row");
-        assert_eq!(row.phase, Phase::Pending);
-        assert_eq!(row.incarnation.as_deref(), Some("leaf-b"));
+        let expiry = |digest: &str| EvictionTrigger::CertificateExpiry {
+            certificate_digest: digest.into(),
+            not_after: 10,
+        };
+        let cases: [(EvictionTrigger, EvictionTrigger, EvictionTrigger); 3] = [
+            (revocation(1), revocation(1), revocation(1)),
+            (leave("h1"), leave("h1-later-head"), leave("h2")),
+            (expiry("d1"), expiry("d1"), expiry("d2")),
+        ];
+        for (first, replay, second) in cases {
+            let mut store = ObligationStore::new();
+            let k = key(9);
+            store.intake(&k, first, Some("seat-a"), 1, [0; 16]);
+            assert!(store.complete(&k, None, None, 2));
+            assert_ne!(
+                store.intake(&k, replay, Some("seat-a"), 3, [0; 16]),
+                IntakeOutcome::Reopened,
+                "a replay of the old incarnation"
+            );
+            assert_eq!(store.get(&k).expect("row").phase, Phase::Complete);
+            assert_eq!(
+                store.intake(&k, second.clone(), Some("seat-b"), 4, [0; 16]),
+                IntakeOutcome::Reopened,
+                "{second:?} of a new incarnation"
+            );
+            let row = store.get(&k).expect("row");
+            assert_eq!(row.phase, Phase::Pending);
+            assert_eq!(row.incarnation.as_deref(), Some("seat-b"));
+            assert_eq!(row.observed_at_unix_ms, 4, "T_obs restarts");
+            if let EvictionTrigger::SelfLeave { commit_hash } = &second {
+                assert!(
+                    row.self_leave_commits.contains(commit_hash),
+                    "the new departure is the row's leave evidence"
+                );
+            }
+        }
     }
 
     #[test]
