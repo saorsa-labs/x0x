@@ -16,7 +16,8 @@
 //! block list, the rate limit, the origin banner, and the outgoing
 //! `agent_id`. The daemon's own agent stays the sender for a durable owner
 //! token. Stop then blocks that rider, or turns local show off only when
-//! the sender is this daemon.
+//! the sender is this daemon. A rider banner names `gui_show_blocked.json`
+//! and a daemon restart. A local banner names `gui_show_local_disabled`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -600,6 +601,26 @@ mod tests {
         assert!(pending_a.banner.contains("(rider)"));
         assert!(pending_a.banner.contains(&short_id_hex(&rider_a)));
         assert!(!pending_a.banner.contains(&short_id_hex(&daemon_hex)));
+        assert!(
+            pending_a.banner.contains(crate::gui::RIDER_SHOW_REENABLE),
+            "rider recovery must name the block file: {}",
+            pending_a.banner
+        );
+        assert!(
+            pending_a.banner.contains("gui_show_blocked.json"),
+            "rider recovery must name the block file: {}",
+            pending_a.banner
+        );
+        assert!(
+            pending_a.banner.contains("restart the daemon"),
+            "the block list loads at daemon start: {}",
+            pending_a.banner
+        );
+        assert!(
+            !pending_a.banner.contains("gui_show_local_disabled"),
+            "deleting the local marker does not unblock this rider: {}",
+            pending_a.banner
+        );
 
         // The GUI Stop control sends `gui.block` with this frame's agent id.
         // That id is not the daemon, so production Stop adds it to the block
@@ -625,6 +646,16 @@ mod tests {
         assert_eq!(pending_owner.agent_id, daemon_hex);
         assert!(!pending_owner.rider);
         assert!(!pending_owner.banner.contains("(rider)"));
+        assert!(
+            pending_owner.banner.contains("gui_show_local_disabled"),
+            "owner Stop still names the local marker: {}",
+            pending_owner.banner
+        );
+        assert!(
+            !pending_owner.banner.contains("gui_show_blocked.json"),
+            "owner Stop must not send the human to the block file: {}",
+            pending_owner.banner
+        );
         Ok(())
     }
 

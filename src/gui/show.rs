@@ -42,6 +42,14 @@ pub const LOCAL_SHOW_DISABLE_FAILED: &str = "local show is off, but the stop mar
 pub const LOCAL_SHOW_REENABLE: &str =
     "Delete gui_show_local_disabled in the data directory to turn local show back on.";
 
+/// Sentence a rider banner uses to name the recovery path.
+///
+/// Stop for a rider writes that agent into `gui_show_blocked.json`.
+/// Deleting `gui_show_local_disabled` does not remove the entry. The
+/// block list is loaded when the daemon starts, so the daemon must be
+/// restarted after the id is removed.
+pub const RIDER_SHOW_REENABLE: &str = "Remove this agent's id from gui_show_blocked.json in the data directory and restart the daemon to allow shows from this rider again.";
+
 /// Data-directory marker Stop writes for this daemon.
 ///
 /// A named instance with no config file is a normal start (`x0xd --name`,
@@ -951,15 +959,22 @@ pub fn new_request_id() -> String {
 
 /// Build the origin banner text from locally resolved names (ADR 0083 §5).
 ///
-/// The second sentence tells the human how to turn a local show back on
-/// after Stop: delete `gui_show_local_disabled` in the data directory.
+/// The second sentence follows the sender. A local show names
+/// `gui_show_local_disabled`. A rider names `gui_show_blocked.json` and
+/// a daemon restart, because Stop writes that file and the process reads
+/// it at start.
 pub fn origin_banner(agent_label: &str, machine_label: &str, rider: bool) -> String {
     let opened = if rider {
         format!("Opened by {agent_label} (rider) on {machine_label}")
     } else {
         format!("Opened by {agent_label} on {machine_label}")
     };
-    format!("{opened}. {LOCAL_SHOW_REENABLE}")
+    let recovery = if rider {
+        RIDER_SHOW_REENABLE
+    } else {
+        LOCAL_SHOW_REENABLE
+    };
+    format!("{opened}. {recovery}")
 }
 
 /// `[gui_show]` from a daemon TOML document.
@@ -1968,6 +1983,52 @@ exit 1
         assert!(
             html.contains("function guiTabVisible"),
             "the GUI socket must advertise gui=1 only while the tab is visible"
+        );
+    }
+
+    /// Rider Stop writes `gui_show_blocked.json`. The banner and the button
+    /// must say that, and must not tell the human to delete the local marker.
+    #[test]
+    fn rider_stop_names_the_block_file_and_its_own_control() {
+        let rider = origin_banner("Ada", "desk", true);
+        assert!(
+            rider.contains(RIDER_SHOW_REENABLE),
+            "rider Stop persists gui_show_blocked.json: {rider}"
+        );
+        assert!(
+            rider.contains("gui_show_blocked.json"),
+            "rider Stop persists gui_show_blocked.json: {rider}"
+        );
+        assert!(
+            rider.contains("restart the daemon"),
+            "the block list loads when the daemon starts: {rider}"
+        );
+        assert!(
+            !rider.contains("gui_show_local_disabled"),
+            "deleting the local marker does not unblock a rider: {rider}"
+        );
+        assert!(rider.starts_with("Opened by Ada (rider) on desk"));
+
+        let local = origin_banner("Ada", "desk", false);
+        assert!(
+            local.contains(LOCAL_SHOW_REENABLE),
+            "a local show still names the marker: {local}"
+        );
+        assert!(
+            !local.contains("gui_show_blocked.json"),
+            "local Stop does not use the block file: {local}"
+        );
+
+        let html = include_str!("x0x-gui.html");
+        let on_show = fn_source(html, "function onGuiShow(m){", "function hideGuiShowBanner");
+        assert!(
+            on_show.contains("!!m.rider"),
+            "the show frame must pass the rider flag into the control: {on_show}"
+        );
+        let src = fn_source(html, "function showGuiShowBanner", "function navigate");
+        assert!(
+            src.contains("block.textContent=rider?'Stop shows from this rider':'Stop local shows'"),
+            "a rider Stop control must not say Stop local shows: {src}"
         );
     }
 
