@@ -11206,6 +11206,40 @@ async fn member_keyed_treekem_catchup_response(
     })
 }
 
+/// The TreeKEM catch-up listener's step for one direct message: a
+/// `treekem_catchup_request` is served, a `treekem_catchup_response` is
+/// applied, anything else is ignored. Returns `false` when the daemon is
+/// shutting down and the listener must stop.
+pub(in crate::server) async fn dispatch_treekem_catchup_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    payload: &[u8],
+) -> bool {
+    if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(payload) {
+        if request.message_type == "treekem_catchup_request" {
+            handle_treekem_catchup_request(state, sender, verified, request).await;
+        }
+        return true;
+    }
+    let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(payload) else {
+        return true;
+    };
+    if response.message_type != "treekem_catchup_response" {
+        return true;
+    }
+    // #1275: the response's events are applied and persisted, so the apply
+    // runs shielded; awaiting it keeps the responses in arrival order.
+    let apply_state = Arc::clone(state);
+    let sender = *sender;
+    state
+        .run_shielded(Box::pin(async move {
+            handle_treekem_catchup_response(&apply_state, &sender, verified, response).await;
+        }))
+        .await
+        .is_some()
+}
+
 pub(in crate::server) async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -11359,6 +11393,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
         recorded.push(payload.clone());
     }
+    #[cfg(test)]
+    detached_send_test_seam::park(&format!("treekem-catchup-serve:{sender_hex}")).await;
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload, direct_message_send_config())
@@ -45304,6 +45340,7 @@ pub(in crate::server) mod tests {
     mod r19_cert_carry;
     mod r2_journal_ratchet_regression;
     mod requester_offer;
+    mod s4_catchup_listener_1357;
     mod s4_key_delivery_1508;
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
