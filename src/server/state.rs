@@ -356,7 +356,7 @@ pub struct DaemonConfig {
 
     /// Update configuration.
     #[serde(default)]
-    pub(super) update: DaemonUpdateConfig,
+    pub update: DaemonUpdateConfig,
 
     /// ADR-0023 durable local history (TOML `[history]`). Default-on in the
     /// daemon; `history.enabled = false` is the escape hatch. The database
@@ -611,7 +611,7 @@ fn default_log_format() -> String {
 
 /// Update configuration for x0xd daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct DaemonUpdateConfig {
+pub struct DaemonUpdateConfig {
     /// Enable listening for release manifests via gossip and the GitHub fallback poll.
     #[serde(default = "default_true")]
     pub(super) enabled: bool,
@@ -651,6 +651,13 @@ pub(super) struct DaemonUpdateConfig {
     /// Set to false to only use the GitHub fallback poll.
     #[serde(default = "default_true")]
     pub(super) gossip_updates: bool,
+
+    /// Acknowledged shutdown-flush budget in seconds for supervised
+    /// self-update (ADR 0094 §4 transient ruling, 23 Oct 2026).
+    /// Default: 30. A failed or overrunning flush restores the previous
+    /// binary and exits EX_TEMPFAIL (75). Bounds: 1..=3600.
+    #[serde(default = "default_shutdown_flush_timeout_secs")]
+    pub(super) shutdown_flush_timeout_secs: u64,
 }
 
 impl Default for DaemonUpdateConfig {
@@ -663,7 +670,21 @@ impl Default for DaemonUpdateConfig {
             repo: default_update_repo(),
             include_prereleases: false,
             gossip_updates: true,
+            shutdown_flush_timeout_secs: default_shutdown_flush_timeout_secs(),
         }
+    }
+}
+
+impl DaemonUpdateConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=3600).contains(&self.shutdown_flush_timeout_secs) {
+            return Err(
+                "config key `shutdown_flush_timeout_secs` under `[update]` must be \
+                 between 1 and 3600 seconds (default 30)"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -681,6 +702,10 @@ fn default_fallback_check_interval_minutes() -> u64 {
 
 fn default_update_repo() -> String {
     "saorsa-labs/x0x".to_string()
+}
+
+fn default_shutdown_flush_timeout_secs() -> u64 {
+    crate::upgrade::shutdown_flush::LIMIT.as_secs()
 }
 
 /// Named-group enforcement configuration (TOML `[groups]`).
@@ -1681,6 +1706,31 @@ mod tests {
         assert!(!effective_self_update_enabled(true, true));
         assert!(!effective_self_update_enabled(false, false));
         assert!(!effective_self_update_enabled(false, true));
+    }
+
+    #[test]
+    fn update_flush_budget_defaults_to_30s_and_rejects_out_of_range_values() {
+        // ADR 0094 §4 transient ruling (23 Oct 2026): 30 s default, 1..=3600.
+        let default = DaemonUpdateConfig::default();
+        assert_eq!(default.shutdown_flush_timeout_secs, 30);
+        assert!(default.validate().is_ok());
+
+        let daemon: DaemonConfig = toml::from_str("").expect("empty config");
+        assert_eq!(daemon.update.shutdown_flush_timeout_secs, 30);
+
+        for rejected in [0, 3601] {
+            let config: DaemonUpdateConfig =
+                toml::from_str(&format!("shutdown_flush_timeout_secs = {rejected}\n"))
+                    .expect("parses");
+            let err = config.validate().expect_err("out-of-range budget");
+            assert!(err.contains("shutdown_flush_timeout_secs"), "{err}");
+        }
+        for accepted in [1, 120, 3600] {
+            let config: DaemonUpdateConfig =
+                toml::from_str(&format!("shutdown_flush_timeout_secs = {accepted}\n"))
+                    .expect("parses");
+            assert!(config.validate().is_ok());
+        }
     }
 
     #[test]

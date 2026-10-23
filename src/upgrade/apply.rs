@@ -1442,8 +1442,10 @@ impl AutoApplyUpgrader {
                         installed_bytes = true,
                         restart = "not_started",
                         readiness_observed = false,
-                        "Restart did not obtain authorization: {e}; \
-                         process retained for manual recovery"
+                        recovery = "exited_tempfail",
+                        "Restart did not obtain a flush receipt: {e}; the previous \
+                         binary is restored and the process exits EX_TEMPFAIL for a \
+                         supervisor restart"
                     );
                 }
             }))
@@ -1569,10 +1571,46 @@ impl AutoApplyUpgrader {
                         binding.clone(),
                         prepare,
                     ),
-                }
-                .map_err(|error| {
-                    UpgradeError::Other(format!("supervised shutdown flush failed: {error}"))
-                })?;
+                };
+                let receipt = match receipt {
+                    Ok(receipt) => receipt,
+                    Err(failure) if failure.started => {
+                        // Engineer ruling 23 Oct 2026: a flush that started
+                        // and failed or overran left this daemon stopped
+                        // behind the hook (no API, no network). Restore the
+                        // previous binary, leave the failed-upgrade rollback
+                        // record in place, log the cause, and exit
+                        // EX_TEMPFAIL so the service manager restarts the
+                        // daemon on the old version.
+                        error!(
+                            error = %failure,
+                            installed_bytes = false,
+                            restart = "not_started",
+                            "supervised shutdown flush failed; the previous binary is restored \
+                             and the process exits EX_TEMPFAIL for a supervisor restart"
+                        );
+                        let backup = plan.executable.with_extension("backup");
+                        if let Err(restore_error) =
+                            super::restore_backup_binary(&plan.executable, &backup)
+                        {
+                            error!(
+                                error = %restore_error,
+                                target = %plan.executable.display(),
+                                "cannot restore the previous binary; manual recovery applies"
+                            );
+                        }
+                        exit(restart::flush_failure_exit_code());
+                        #[allow(unreachable_code)]
+                        return Err(UpgradeError::Other(format!(
+                            "supervised shutdown flush failed: {failure}"
+                        )));
+                    }
+                    Err(failure) => {
+                        return Err(UpgradeError::Other(format!(
+                            "supervised shutdown flush failed: {failure}"
+                        )));
+                    }
+                };
                 receipt
                     .authorize(&binding)
                     .map_err(|error| UpgradeError::Other(error.to_string()))?;

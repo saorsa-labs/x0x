@@ -245,7 +245,10 @@ Use this procedure to investigate and resolve the condition:
 ### Dormant pair transaction (M2 S2e)
 
 The private pair engine is implemented and tested, but no live apply path calls
-it yet. Activation requires the S2c host inventory and S3a acknowledged flush.
+it yet. Activation requires the S2c host inventory and the S3a acknowledged
+flush, whose daemon-side owner and arm-and-flush control listener now exist
+(see [Acknowledged shutdown flush](#acknowledged-shutdown-flush-supervised-exit)
+below); launcher-coordinated host transactions remain the missing piece.
 The current apply path still uses its existing single-binary replacement flow.
 Do not infer pair rollback or launcher protection from this dormant module.
 
@@ -529,6 +532,65 @@ only after fixing whatever step 1 identified (a broken release will fail
 the same way again; a refused apply means the loaded policy still does not
 guarantee a respawn).
 
+
+### Acknowledged shutdown flush (supervised exit)
+
+Before a supervised exit requests its restart, the daemon waits for an
+acknowledged flush of its durable state: the flush owner stops the API and
+the Agent, joins every server producer, walks and fsyncs the data and
+identity roots, flushes the captured logs, and only then publishes a receipt
+(`upgrade-flush.json` with a `receipt_id`). A fired shutdown hook,
+cancellation or a port release is never proof of flush (ADR 0094 §4).
+
+The flush budget is 30 seconds by default and configurable per daemon with
+`[update] shutdown_flush_timeout_secs` (bounds 1..=3600; ADR 0094 §4
+transient ruling, 23 Oct 2026).
+
+Failure behaviour (engineer ruling, 23 Oct 2026): a flush that started and
+then failed or overran its budget must not leave the daemon running with no
+API and no network. The daemon restores the previous binary from the
+transaction's backup, leaves the rollback record
+(`upgrade-flush-rollback.json`) in place as the failed-upgrade mark, logs the
+cause, and exits `EX_TEMPFAIL` (75). The service manager then restarts the
+daemon on the old version. A refusal that happens before any flush starts
+(a missing flush owner, an unresolved predecessor, a mismatched arm request)
+never stops the daemon and returns an ordinary error instead.
+
+The local control listener is a Unix socket, `upgrade-flush.sock` in the
+data directory, mode `0600`. It accepts one JSON request line carrying the
+API token, the transaction ID, generation, instance ID and frozen plan, and
+answers `{"receipt": …}` or `{"error": …}`. The daemon-side listener exists
+and is authenticated; the client that drives it belongs to later stack
+work, and the socket's API and framing are held for David's ruling — do not
+change or extend them. A very long data-directory path can exceed the Unix
+socket path limit (104 bytes on macOS); the bind then fails and supervised
+apply is disabled with a WARN in the log.
+
+#### Stale flush records
+
+If the daemon is killed mid-flush (for example SIGTERM during the flush
+window trips the 5 s exit watchdog), `upgrade-flush.json` may survive
+without a receipt, and `upgrade-flush-rollback.json` may survive from the
+failed attempt. At the next startup — after the new process holds the
+instance data-root lock, which proves the flush's owning process is gone —
+the daemon clears this debris, logs the recorded cause, and treats that
+upgrade as failed; a later apply is not refused by these records. A record
+that carries a receipt proves a completed flush and is preserved.
+
+Manual fallback, if the debris somehow survives or the record cannot be
+parsed: stop the daemon, keep an evidence copy, then delete
+`<data_dir>/upgrade-flush.json` (only if it has no `receipt_id`) and
+`<data_dir>/upgrade-flush-rollback.json`, and start the daemon again. There
+is no CLI or API for this.
+
+#### Windows
+
+Supervised self-update needs the acknowledged flush, and the flush owner
+exists only on Unix (it needs the suspend-inclusive boot clock and the Unix
+control socket). On Windows, a supervised apply (`X0X_SUPERVISED=1`) is
+refused with "acknowledged shutdown owner unavailable" before any byte is
+replaced — it fails safe. This is accepted until a later slice covers
+Windows; a follow-up issue tracks the Windows flush owner.
 
 ### Migrating an existing launchd job
 

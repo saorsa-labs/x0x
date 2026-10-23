@@ -22,6 +22,43 @@ pub(super) struct FlushOwner {
     complete: mpsc::SyncSender<io::Result<()>>,
     control: tokio::task::JoinHandle<()>,
     socket: PathBuf,
+    /// Process exit used after a started flush failed. A seam so tests can
+    /// observe the EX_TEMPFAIL code instead of ending the test process.
+    exit: Arc<dyn Fn(i32) + Send + Sync>,
+    /// Set (with a stored permit) by the control loop after a started flush
+    /// failed and its recovery finished; `finish` exits EX_TEMPFAIL on it.
+    flush_failed: Arc<tokio::sync::Notify>,
+}
+
+/// Result of an arm-and-flush request. `FlushFailed` means the
+/// acknowledged flush started in this process and then failed or overran:
+/// the daemon is stopped behind the hook, the previous binary has been
+/// restored, and the process must exit EX_TEMPFAIL (engineer ruling
+/// 23 Oct 2026) so the service manager restarts the old version.
+#[derive(Debug)]
+enum ArmFailure {
+    /// Refused before any flush started; the daemon keeps serving.
+    Refused(io::Error),
+    /// The started flush failed; recovery ran inside `arm`.
+    FlushFailed(shutdown_flush::FlushFailure),
+}
+impl ArmFailure {
+    #[cfg(test)]
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            ArmFailure::Refused(error) => error.kind(),
+            ArmFailure::FlushFailed(failure) => failure.kind(),
+        }
+    }
+}
+
+impl std::fmt::Display for ArmFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArmFailure::Refused(error) => error.fmt(formatter),
+            ArmFailure::FlushFailed(failure) => failure.fmt(formatter),
+        }
+    }
 }
 
 impl Drop for FlushOwner {
@@ -36,6 +73,8 @@ impl FlushOwner {
         state: &Arc<AppState>,
         data_root: &Path,
         identity_root: &Path,
+        limit: Duration,
+        exit: Arc<dyn Fn(i32) + Send + Sync>,
     ) -> io::Result<Self> {
         use std::os::unix::fs::{FileTypeExt, PermissionsExt};
         let root = data_root.canonicalize()?;
@@ -54,7 +93,7 @@ impl FlushOwner {
         let stop = super::routes::daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let (complete, receive) = mpsc::sync_channel(1);
         let receive = Mutex::new(receive);
-        let registration = shutdown_flush::register(
+        let registration = shutdown_flush::register_with_limit(
             root.clone(),
             Arc::new(move |deadline| {
                 deadline.check()?;
@@ -70,12 +109,15 @@ impl FlushOwner {
                 deadline.check()?;
                 log_flush::flush_captured(&logs, deadline.instant)
             }),
+            limit,
         )?;
         let state = Arc::new(ControlContext {
             api_token: state.api_token.clone(),
             api_address: state.api_address,
             identity_root,
         });
+        let flush_failed = Arc::new(tokio::sync::Notify::new());
+        let failure_signal = Arc::clone(&flush_failed);
         let control = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut bytes = Vec::new();
@@ -91,13 +133,14 @@ impl FlushOwner {
                     let root = root.clone();
                     tokio::task::spawn_blocking(move || arm(&state, &root, &bytes))
                         .await
-                        .map_err(io::Error::other)
+                        .map_err(|error| ArmFailure::Refused(io::Error::other(error)))
                         .and_then(|result| result)
                 } else {
-                    Err(io::Error::other(
+                    Err(ArmFailure::Refused(io::Error::other(
                         "invalid or incomplete arm-and-flush request",
-                    ))
+                    )))
                 };
+                let started_flush_failed = matches!(response, Err(ArmFailure::FlushFailed(_)));
                 let value = match response {
                     Ok(receipt) => serde_json::json!({"receipt": receipt}),
                     Err(error) => serde_json::json!({"error": error.to_string()}),
@@ -107,6 +150,13 @@ impl FlushOwner {
                     let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&bytes))
                         .await;
                 }
+                // Only after the reply is written does the failed flush end
+                // this process: the recovery inside `arm` has already
+                // restored the previous binary, and `finish` exits
+                // EX_TEMPFAIL for a service-manager restart on it.
+                if started_flush_failed {
+                    failure_signal.notify_one();
+                }
             }
         });
         Ok(Self {
@@ -114,6 +164,8 @@ impl FlushOwner {
             complete,
             control,
             socket,
+            exit,
+            flush_failed,
         })
     }
 
@@ -142,6 +194,20 @@ impl FlushOwner {
             tokio::select! {
                 _ = cancel.cancelled() => {},
                 _ = self._registration.wait_for_unused_release() => {},
+                _ = self.flush_failed.notified() => {
+                    // Engineer ruling 23 Oct 2026: a started flush that
+                    // failed or overran must not leave this daemon running
+                    // with no API and no network. Recovery already restored
+                    // the previous binary and marked the upgrade failed;
+                    // exit EX_TEMPFAIL so the service manager restarts the
+                    // daemon on the old version.
+                    tracing::error!(
+                        exit_code = crate::upgrade::restart::flush_failure_exit_code(),
+                        "acknowledged shutdown flush failed; exiting EX_TEMPFAIL \
+                         for a service-manager restart on the previous binary"
+                    );
+                    (self.exit)(crate::upgrade::restart::flush_failure_exit_code());
+                },
             }
         }
     }
@@ -163,7 +229,14 @@ struct Request {
     plan: journal::FrozenPlan,
 }
 
-fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<shutdown_flush::Receipt> {
+/// An authenticated arm request that matched the frozen transaction.
+struct AdmittedArm {
+    plan: journal::FrozenPlan,
+    binding: shutdown_flush::Binding,
+    handoff: journal::M2HandoffRecord,
+}
+
+fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<AdmittedArm> {
     let request: Request = serde_json::from_slice(bytes)?;
     if !bool::from(
         Sha256::digest(request.token.as_bytes()).ct_eq(&Sha256::digest(state.api_token.as_bytes())),
@@ -213,11 +286,15 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<shutdown
             "launcher-child handoff ownership is not implemented",
         ));
     }
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
     let legacy = serde_json::json!({
         "from_version": request.plan.previous_version, "to_version": request.plan.candidate_version,
         "target_path": request.plan.daemon.target_path, "backup_path": request.plan.daemon.backup_path,
         "argv": participant.argv, "cwd": participant.cwd, "env": participant.env,
-        "old_pid": participant.old_pid, "api_addr": state.api_address.to_string(), "started_at": 0,
+        "old_pid": participant.old_pid, "api_addr": state.api_address.to_string(), "started_at": started_at,
         "mode": participant.restart.mode, "launchd_verified": participant.restart.launchd_verified,
         "systemd_verified": participant.restart.systemd_verified,
     });
@@ -229,15 +306,61 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<shutdown
         instance_id: request.instance_id.clone(),
         legacy: serde_json::from_value(legacy)?,
     };
+    let plan = request.plan.clone();
     let binding = shutdown_flush::Binding::new(
         request.transaction_id,
         request.generation,
         &(request.instance_id, request.plan),
     )?;
-    let handoff_path = root.join(journal::HANDOFF_FILE_NAME);
-    shutdown_flush::acknowledge(root, binding, move || {
-        journal::write_record(&handoff_path, &handoff)
+    Ok(AdmittedArm {
+        plan,
+        binding,
+        handoff,
     })
+}
+
+fn arm(
+    state: &ControlContext,
+    root: &Path,
+    bytes: &[u8],
+) -> Result<shutdown_flush::Receipt, ArmFailure> {
+    let admitted = match admit(state, root, bytes) {
+        Ok(admitted) => admitted,
+        Err(error) => return Err(ArmFailure::Refused(error)),
+    };
+    let AdmittedArm {
+        plan,
+        binding,
+        handoff,
+    } = admitted;
+    let handoff_path = root.join(journal::HANDOFF_FILE_NAME);
+    let flush = shutdown_flush::acknowledge(root, binding, move || {
+        journal::write_record(&handoff_path, &handoff)
+    });
+    match flush {
+        Ok(receipt) => Ok(receipt),
+        Err(failure) if failure.started => {
+            // The flush started and failed or overran: this daemon is
+            // stopped behind the hook. Keep the old binary (engineer
+            // ruling 23 Oct 2026) so the EX_TEMPFAIL restart lands on it.
+            tracing::error!(
+                error = %failure,
+                target = %plan.daemon.target_path.display(),
+                "acknowledged shutdown flush failed; restoring the previous daemon binary"
+            );
+            if let Err(error) = crate::upgrade::restore_backup_binary(
+                &plan.daemon.target_path,
+                &plan.daemon.backup_path,
+            ) {
+                tracing::error!(
+                    %error,
+                    "cannot restore the previous daemon binary; manual recovery applies"
+                );
+            }
+            Err(ArmFailure::FlushFailed(failure))
+        }
+        Err(failure) => Err(ArmFailure::Refused(failure.error)),
+    }
 }
 
 // All producers are drained before this barrier. A symlink is not a verified
@@ -304,6 +427,8 @@ fn process_start() -> io::Result<u64> {
         // SAFETY: libproc writes exactly the owned, sized output buffer.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&info) as i32;
+        // SAFETY: proc_pidinfo writes at most `size` bytes into the owned,
+        // sized `info` buffer and reads only the pid and arguments passed.
         let received = unsafe {
             libc::proc_pidinfo(
                 std::process::id() as i32,
@@ -358,7 +483,12 @@ mod arm_flush_regressions_unused_reservation {
     fn owner(
         root: &Path,
         fail: bool,
-    ) -> (FlushOwner, mpsc::Receiver<io::Result<()>>, Arc<AtomicBool>) {
+    ) -> (
+        FlushOwner,
+        mpsc::Receiver<io::Result<()>>,
+        Arc<AtomicBool>,
+        Arc<std::sync::atomic::AtomicI32>,
+    ) {
         let called = Arc::new(AtomicBool::new(false));
         let observed = called.clone();
         let registration = shutdown_flush::register(
@@ -374,6 +504,8 @@ mod arm_flush_regressions_unused_reservation {
         )
         .unwrap();
         let (complete, receive) = mpsc::sync_channel(1);
+        let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let observed_exit = Arc::clone(&exit_code);
         (
             FlushOwner {
                 _registration: registration,
@@ -381,9 +513,14 @@ mod arm_flush_regressions_unused_reservation {
                 control: tokio::spawn(std::future::pending()),
                 // This fixture creates no socket and no Agent or network runtime.
                 socket: root.join("never-bound.sock"),
+                exit: Arc::new(move |code| {
+                    observed_exit.store(code, Ordering::SeqCst);
+                }),
+                flush_failed: Arc::new(tokio::sync::Notify::new()),
             },
             receive,
             called,
+            exit_code,
         )
     }
 
@@ -398,7 +535,7 @@ mod arm_flush_regressions_unused_reservation {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_wakes_when_unused_reservation_is_released() {
         let (_dir, root) = fixture();
-        let (owner, receive, _called) = owner(&root, false);
+        let (owner, receive, _called, _exit_code) = owner(&root, false);
         let reservation = shutdown_flush::reserve(&root).unwrap();
         reservation.activate().unwrap();
         let cancel = CancellationToken::new();
@@ -427,7 +564,7 @@ mod arm_flush_regressions_unused_reservation {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_keeps_started_acknowledgment_custody_until_cancelled() {
         let (_dir, root) = fixture();
-        let (owner, receive, called) = owner(&root, true);
+        let (owner, receive, called, _exit_code) = owner(&root, true);
         let reservation = shutdown_flush::reserve(&root).unwrap();
         reservation.activate().unwrap();
         let binding =
@@ -455,5 +592,40 @@ mod arm_flush_regressions_unused_reservation {
             retained_custody,
             "started acknowledgment must retain recovery custody"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_finish_exits_tempfail_after_a_failed_started_flush() {
+        let (_dir, root) = fixture();
+        let (owner, receive, _called, exit_code) = owner(&root, true);
+        let reservation = shutdown_flush::reserve(&root).unwrap();
+        reservation.activate().unwrap();
+        let binding =
+            shutdown_flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+        assert!(
+            shutdown_flush::acknowledge_reserved(&root, binding, || Ok(()), &reservation).is_err()
+        );
+        owner._registration.join_workers();
+        drop(reservation);
+        let failed_signal = Arc::clone(&owner.flush_failed);
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let mut finish = tokio::spawn(async move {
+            owner.finish(&Ok(()), true, &worker_cancel).await;
+        });
+        finish_observed_armed(receive).await;
+        // Engineer ruling 23 Oct 2026: the failed started flush must not
+        // park this daemon with no API and no network. The failure signal
+        // alone ends the wait with EX_TEMPFAIL, without cancellation.
+        failed_signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), &mut finish)
+            .await
+            .expect("finish must end on the failure signal")
+            .unwrap();
+        assert_eq!(
+            exit_code.load(Ordering::SeqCst),
+            crate::upgrade::restart::flush_failure_exit_code()
+        );
+        assert!(!cancel.is_cancelled());
     }
 }

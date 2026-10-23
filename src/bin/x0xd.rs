@@ -725,6 +725,12 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
         .socks
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid [socks] configuration: {e}"))?;
+    // ADR 0094 §4 transient ruling (23 Oct 2026): the shutdown-flush budget
+    // must stay inside its compiled bounds (default 30 s).
+    config
+        .update
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid [update] configuration: {e}"))?;
     Ok((config, findings.warning_lines()))
 }
 

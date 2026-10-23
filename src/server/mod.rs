@@ -1435,6 +1435,15 @@ pub async fn serve_with_options(
         .await);
     }
 
+    // Startup recovery (engineer ruling 23 Oct 2026): a receipt-less
+    // upgrade-flush.json or an upgrade-flush-rollback.json whose owning
+    // process is gone is debris from a failed or interrupted flush. The
+    // instance lock taken above proves that owner exited (it held the lock
+    // for its whole flush); clear the debris, log the cause and leave that
+    // upgrade failed so a later apply is not refused forever.
+    #[cfg(unix)]
+    crate::upgrade::shutdown_flush::clear_stale_records(&config.data_dir);
+
     // The control listener survives the HTTP drain, so a peer can receive
     // its durable receipt after every normal request and producer has stopped.
     #[cfg(unix)]
@@ -1444,7 +1453,10 @@ pub async fn serve_with_options(
                 Some(root) => root,
                 None => crate::storage::x0x_dir().await?,
             };
-            upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root)
+            let limit = Duration::from_secs(config.update.shutdown_flush_timeout_secs.max(1));
+            let exit: std::sync::Arc<dyn Fn(i32) + Send + Sync> =
+                std::sync::Arc::new(|code| std::process::exit(code));
+            upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root, limit, exit)
                 .map_err(anyhow::Error::from)
         }
         .await;
@@ -3473,7 +3485,12 @@ async fn drain_server_tasks(
                 handle.abort();
             }
             let results: Vec<Result<(), tokio::task::JoinError>> = join.await;
-            complete &= results.iter().all(|r| r.as_ref().err().is_none_or(|e| e.is_cancelled()));
+            // ADR 0094 §4: an abort cancels a task's next await; it does not
+            // stop blocking work the task already started. A straggler that
+            // missed the grace window is therefore never a finished producer,
+            // whatever its cancelled JoinError says. Only a task that returned
+            // on its own counts as finished here.
+            complete &= results.iter().all(Result::is_ok);
         }
     }
     // #1288: history backfills outlive the session that started them. The
