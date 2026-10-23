@@ -2674,7 +2674,8 @@ pub async fn serve_with_options(
     }
 
     // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
-    // the body is decoded.
+    // the body is decoded. Reply sends are detached there, so one slow
+    // refusal does not hold the next result or activity message.
     {
         let gui_show_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {

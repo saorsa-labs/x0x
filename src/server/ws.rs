@@ -122,6 +122,14 @@ pub(super) fn test_gui_ws_session(id: &str) -> WsSession {
     test_ws_session_kind(id, true)
 }
 
+/// Visible GUI socket whose session token the store can accept.
+#[cfg(test)]
+pub(super) fn test_live_gui_ws_session(id: &str, token: &str) -> WsSession {
+    let mut session = test_gui_ws_session(id);
+    session.gui_session_token = Some(token.to_string());
+    session
+}
+
 #[cfg(test)]
 fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
     WsSession {
@@ -146,6 +154,18 @@ impl WsSession {
     /// Live visible GUI tab. A hidden tab and an agent socket are not.
     pub(super) fn is_visible_gui(&self) -> bool {
         self.visible_gui.load(Ordering::Acquire)
+    }
+
+    /// Visible tab whose session token `session_live` still accepts.
+    ///
+    /// A visible flag with no token, or with an expired token, is not a
+    /// live GUI. Activity selection uses this.
+    pub(super) fn visible_with_live_session(&self, session_live: impl Fn(&str) -> bool) -> bool {
+        self.is_visible_gui()
+            && matches!(
+                self.gui_session_token.as_deref(),
+                Some(token) if !token.is_empty() && session_live(token)
+            )
     }
 
     /// The GUI tab reports `document.visibilityState`.
@@ -3074,6 +3094,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state.gui_show.last_gui_visible_at().is_none(),
+            "a session refresh is not a visible GUI tab"
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .expect("refresh body");

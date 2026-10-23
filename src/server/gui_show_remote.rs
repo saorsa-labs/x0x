@@ -1,7 +1,9 @@
 //! Receive path for remote GUI show typed DMs (ADR 0083 slice 3).
 //!
 //! Owner trust runs before any body decode. Result and activity replies
-//! are one attempt, with no retry.
+//! are one attempt, with no retry. The handler starts each reply send and
+//! returns, so one slow send does not hold the next message. A sender that
+//! is not owner-trusted gets at most one refusal per minute.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -50,7 +52,7 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
     let remote_enabled = state.gui_show.config().remote_enabled;
     let control = show_control(state, &typed.sender, &ingress);
     let blocked = match &control {
-        Some(agent) => state.gui_show.is_blocked(agent),
+        Some(agent) => state.gui_show.is_blocked(agent) || subject_barred(state, agent).await,
         None => false,
     };
     let mut preview = receive_action(&ingress, remote_enabled, blocked, false);
@@ -81,7 +83,18 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
                 request_id,
                 outcome,
             };
-            send_show_result(state, typed.sender, result).await;
+            let untrusted = matches!(ingress, ShowIngress::Untrusted { .. });
+            if untrusted && !state.gui_show.allow_untrusted_refusal(Instant::now()) {
+                finish(typed, DmTypedPayloadCompletion::Inserted);
+                return;
+            }
+            detach_reply(
+                state,
+                ReplyJob::Result {
+                    to: typed.sender,
+                    result,
+                },
+            );
             finish(typed, DmTypedPayloadCompletion::Inserted);
         }
         ReceiveAction::Display { route, via_rider } => {
@@ -107,7 +120,13 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
                 request_id,
                 outcome,
             };
-            send_show_result(state, typed.sender, result).await;
+            detach_reply(
+                state,
+                ReplyJob::Result {
+                    to: typed.sender,
+                    result,
+                },
+            );
             finish(typed, DmTypedPayloadCompletion::Inserted);
         }
     }
@@ -144,7 +163,13 @@ async fn handle_activity(state: &Arc<AppState>, typed: DmTypedPayload) {
             let remote_enabled = state.gui_show.config().remote_enabled;
             let visible = crate::server::routes::gui_show::fresh_gui_visible_at(state).await;
             let body = activity_reply(request_id, remote_enabled, visible);
-            send_activity(state, typed.sender, body).await;
+            detach_reply(
+                state,
+                ReplyJob::Activity {
+                    to: typed.sender,
+                    body,
+                },
+            );
             finish(typed, DmTypedPayloadCompletion::Inserted);
         }
         ActivityIngress::Reply(body) => {
@@ -193,6 +218,22 @@ fn show_control(state: &AppState, envelope: &AgentId, ingress: &ShowIngress) -> 
     Some(AgentId(bytes))
 }
 
+/// Contact block and revocation for the agent the target attributes.
+///
+/// The envelope signer is already owner-trusted. A rider subject is a
+/// different agent. A Blocked contact or a revoked agent does not display.
+async fn subject_barred(state: &AppState, agent: &AgentId) -> bool {
+    if state.agent.contacts().read().await.is_blocked(agent) {
+        return true;
+    }
+    state
+        .agent
+        .revocation_set()
+        .read()
+        .await
+        .is_agent_revoked(agent)
+}
+
 fn request_id_of(ingress: &ShowIngress) -> Option<[u8; 16]> {
     match ingress {
         ShowIngress::Trusted(show) => Some(show.request.request_id),
@@ -205,6 +246,10 @@ fn request_id_of(ingress: &ShowIngress) -> Option<[u8; 16]> {
 /// `evaluate_pair` runs `OwnerTrust::is_owner_trusted` and forces
 /// `owner_trusted` false for a `Blocked` contact (ADR 0083 §2).
 async fn owner_trusted(state: &AppState, typed: &DmTypedPayload) -> bool {
+    #[cfg(test)]
+    if state.gui_show.sender_trusted_for_test(&typed.sender) {
+        return true;
+    }
     let cache = state.agent.identity_discovery_cache();
     let revoked = state.agent.revocation_set();
     state
@@ -221,7 +266,40 @@ async fn owner_trusted(state: &AppState, typed: &DmTypedPayload) -> bool {
         .owner_trusted
 }
 
+enum ReplyJob {
+    Result {
+        to: AgentId,
+        result: GuiShowDmResult,
+    },
+    Activity {
+        to: AgentId,
+        body: GuiActivityBody,
+    },
+}
+
+/// Start one reply send and return.
+///
+/// The receive loop can take the next message while this send waits.
+/// A full permit set skips the send. The caller does not wait for a slot.
+fn detach_reply(state: &Arc<AppState>, job: ReplyJob) {
+    let Some(permit) = state.gui_show.try_reply_permit() else {
+        tracing::debug!("gui show reply skipped: send slots are full");
+        return;
+    };
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let _permit = permit;
+        match job {
+            ReplyJob::Result { to, result } => send_show_result(&state, to, result).await,
+            ReplyJob::Activity { to, body } => send_activity(&state, to, body).await,
+        }
+    });
+}
+
 async fn send_show_result(state: &AppState, to: AgentId, result: GuiShowDmResult) {
+    if delayed_test_reply(state).await {
+        return;
+    }
     let Some(payload) = result.to_dm_payload() else {
         return;
     };
@@ -241,6 +319,9 @@ async fn send_show_result(state: &AppState, to: AgentId, result: GuiShowDmResult
 }
 
 async fn send_activity(state: &AppState, to: AgentId, body: GuiActivityBody) {
+    if delayed_test_reply(state).await {
+        return;
+    }
     let request_id = match &body {
         GuiActivityBody::Query { request_id } | GuiActivityBody::Reply { request_id, .. } => {
             *request_id
@@ -268,6 +349,27 @@ fn finish(mut typed: DmTypedPayload, completion: DmTypedPayloadCompletion) {
     if let Some(done) = typed.completion.take() {
         let _ = done.send(Ok(completion));
     }
+}
+
+/// Test replies wait here and skip the network.
+///
+/// A zero delay keeps the real send. The receive handler starts this
+/// wait on a detached task.
+async fn delayed_test_reply(state: &AppState) -> bool {
+    #[cfg(test)]
+    {
+        let delay_ms = state.gui_show.reply_delay_ms_for_test();
+        if delay_ms > 0 {
+            state.gui_show.count_reply_send_for_test();
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            return true;
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = state;
+    }
+    false
 }
 
 fn unix_now_secs() -> u64 {
@@ -624,5 +726,155 @@ mod adr_remote {
         assert!(!state.gui_show.is_blocked(&owner));
         assert!(!state.gui_show.is_blocked(&state.agent.agent_id()));
         assert_ne!(rider_a_control, state.agent.agent_id());
+    }
+
+    fn show_typed(
+        sender: AgentId,
+        machine: MachineId,
+        request_id: [u8; 16],
+        subject: AgentId,
+        via_rider: bool,
+    ) -> DmTypedPayload {
+        let now = unix_now_secs();
+        let payload = GuiShowDmRequest {
+            request_id,
+            view: "people".into(),
+            issued_at: now,
+            via_rider,
+            subject: *subject.as_bytes(),
+        }
+        .to_dm_payload()
+        .expect("encode");
+        DmTypedPayload {
+            sender,
+            machine_id: machine,
+            payload,
+            verified: true,
+            trust_decision: None,
+            received_at_unix_ms: now.saturating_mul(1000),
+            request_id,
+            completion: None,
+        }
+    }
+
+    /// A flood of signed strangers must not hold the owner's result.
+    ///
+    /// Each refusal is a full attempt when the handler awaits the send.
+    /// Twelve delays of 250 ms pass one second. The owner result has to
+    /// land inside that second, and at most one refusal may be sent.
+    #[tokio::test]
+    async fn untrusted_flood_then_owner_result_completes() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let owner = AgentId([0xA1; 32]);
+        let owner_machine = MachineId([0xB2; 32]);
+        state.gui_show.trust_sender_for_test(&owner);
+        let request_id = [0xC3; 16];
+        let wait = state
+            .gui_show
+            .remote_hub()
+            .begin_show(request_id, owner, owner_machine)
+            .expect("waiter");
+        state.gui_show.arm_reply_delay_for_test(250);
+        let started = std::time::Instant::now();
+        for n in 0..12u8 {
+            let stranger = AgentId([n.saturating_add(1); 32]);
+            let mut id = [0xD0; 16];
+            id[0] = n;
+            handle_gui_show_typed(
+                &state,
+                show_typed(stranger, MachineId([0xE0; 32]), id, stranger, false),
+            )
+            .await;
+        }
+        let payload = crate::gui::remote::GuiShowDmResult {
+            request_id,
+            outcome: GuiShowOutcome::Opened,
+        }
+        .to_dm_payload()
+        .expect("result");
+        let now = unix_now_secs();
+        handle_gui_show_typed(
+            &state,
+            DmTypedPayload {
+                sender: owner,
+                machine_id: owner_machine,
+                payload,
+                verified: true,
+                trust_decision: None,
+                received_at_unix_ms: now.saturating_mul(1000),
+                request_id,
+                completion: None,
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let result = wait.recv().await.expect("owner result");
+        assert_eq!(result.outcome, GuiShowOutcome::Opened);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "owner result waited behind untrusted refusals: {elapsed:?}"
+        );
+        tokio::task::yield_now().await;
+        let sends = state.gui_show.reply_sends_for_test();
+        assert!(
+            sends <= 1,
+            "a stranger flood sent {sends} refusals; the cap is one per minute"
+        );
+        state.gui_show.arm_reply_delay_for_test(0);
+    }
+
+    #[tokio::test]
+    async fn blocked_or_revoked_rider_does_not_display() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let cap = CapturingOpener::new();
+        state
+            .gui_show
+            .replace_opener_for_test(Arc::new(cap.clone()));
+        let daemon = AgentId([0x11; 32]);
+        let machine = MachineId([0x44; 32]);
+        state.gui_show.trust_sender_for_test(&daemon);
+        let blocked = AgentId([0x22; 32]);
+        let allowed = AgentId([0x55; 32]);
+        state
+            .agent
+            .contacts()
+            .write()
+            .await
+            .set_trust(&blocked, crate::contacts::TrustLevel::Blocked);
+        let rider_kp = crate::identity::AgentKeypair::generate().expect("rider key");
+        let revoked = rider_kp.agent_id();
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(revoked),
+            rider_kp.public_key(),
+            rider_kp.secret_key(),
+            unix_now_secs(),
+            None,
+        )
+        .expect("sign revocation");
+        state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("insert revocation");
+
+        handle_gui_show_typed(&state, show_typed(daemon, machine, [1; 16], blocked, true)).await;
+        handle_gui_show_typed(&state, show_typed(daemon, machine, [2; 16], revoked, true)).await;
+        assert!(
+            cap.urls.lock().expect("urls").is_empty(),
+            "a blocked or revoked rider must not open a window"
+        );
+        handle_gui_show_typed(&state, show_typed(daemon, machine, [3; 16], allowed, true)).await;
+        assert!(
+            !cap.urls.lock().expect("urls").is_empty(),
+            "another rider on the same daemon still displays"
+        );
     }
 }

@@ -15,6 +15,22 @@ use crate::identity::AgentId;
 
 use super::rate_limit::GuiShowRateLimit;
 
+/// Reply sends that may be in flight together.
+const REPLY_SEND_SLOTS: usize = 4;
+
+/// Refusals to a sender that is not owner-trusted, inside one minute.
+const UNTRUSTED_REFUSAL_LIMIT: u32 = 1;
+
+/// Window for [`UNTRUSTED_REFUSAL_LIMIT`].
+const UNTRUSTED_REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+
+/// Refusals already sent to untrusted show senders.
+#[derive(Debug, Default)]
+struct UntrustedRefusalWindow {
+    start: Option<Instant>,
+    sent: u32,
+}
+
 /// How long a pending banner waits for its GUI window to connect.
 ///
 /// The banner stays until the session token TTL, matching a hidden tab
@@ -390,6 +406,25 @@ pub struct GuiShowRuntime {
     last_gui_visible_at: Mutex<Option<u64>>,
     /// Show request ids already seen, for the ADR 0050 replay window.
     replay: Mutex<crate::gui::remote::ReplayCache>,
+    /// In-flight result and activity reply sends.
+    reply_permits: Arc<tokio::sync::Semaphore>,
+    /// Refusals sent to senders that are not owner-trusted.
+    untrusted_refusals: Mutex<UntrustedRefusalWindow>,
+    /// Test seam: milliseconds `send_show_result` waits before it returns.
+    ///
+    /// Zero uses the real send. The receive tests arm this so one slow
+    /// reply is visible without a network attempt.
+    #[cfg(test)]
+    reply_delay_ms: std::sync::atomic::AtomicU64,
+    /// How many test reply sends ran while `reply_delay_ms` was set.
+    #[cfg(test)]
+    reply_sends: std::sync::atomic::AtomicU32,
+    /// Test seam: senders the receive handler treats as owner-trusted.
+    ///
+    /// The AppState test agent has no user key. Installing one starts
+    /// owner sync, and that constructor dials. Empty unless a test opts in.
+    #[cfg(test)]
+    trusted_senders: Mutex<HashSet<AgentId>>,
 }
 
 impl std::fmt::Debug for GuiShowRuntime {
@@ -429,6 +464,14 @@ impl GuiShowRuntime {
             remote_hub: crate::gui::remote::RemoteHub::new(),
             last_gui_visible_at: Mutex::new(None),
             replay: Mutex::new(crate::gui::remote::ReplayCache::new()),
+            reply_permits: Arc::new(tokio::sync::Semaphore::new(REPLY_SEND_SLOTS)),
+            untrusted_refusals: Mutex::new(UntrustedRefusalWindow::default()),
+            #[cfg(test)]
+            reply_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            reply_sends: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            trusted_senders: Mutex::new(HashSet::new()),
         };
         // Honour a stop recorded before this process. The marker wins over
         // a config that already says `local_enabled = true`, because Stop
@@ -458,6 +501,79 @@ impl GuiShowRuntime {
     /// Hub the requester waits on and the receive handler completes.
     pub fn remote_hub(&self) -> &crate::gui::remote::RemoteHub {
         &self.remote_hub
+    }
+
+    /// Arm a per-state reply delay and clear the send counter.
+    #[cfg(test)]
+    pub fn arm_reply_delay_for_test(&self, delay_ms: u64) {
+        self.reply_sends
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reply_delay_ms
+            .store(delay_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reply sends observed while the test delay is armed.
+    #[cfg(test)]
+    pub fn reply_sends_for_test(&self) -> u32 {
+        self.reply_sends.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Milliseconds the test reply path waits. Zero means use the real send.
+    #[cfg(test)]
+    pub(crate) fn reply_delay_ms_for_test(&self) -> u64 {
+        self.reply_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one delayed test reply.
+    #[cfg(test)]
+    pub(crate) fn count_reply_send_for_test(&self) {
+        self.reply_sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Treat `agent` as owner-trusted on the receive path.
+    #[cfg(test)]
+    pub fn trust_sender_for_test(&self, agent: &AgentId) {
+        if let Ok(mut guard) = self.trusted_senders.lock() {
+            guard.insert(*agent);
+        }
+    }
+
+    /// Whether a test opted this sender in as owner-trusted.
+    #[cfg(test)]
+    pub(crate) fn sender_trusted_for_test(&self, agent: &AgentId) -> bool {
+        self.trusted_senders
+            .lock()
+            .map(|guard| guard.contains(agent))
+            .unwrap_or(false)
+    }
+
+    /// One slot for a detached reply send. `None` when every slot is in use.
+    pub(crate) fn try_reply_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.reply_permits.clone().try_acquire_owned().ok()
+    }
+
+    /// Whether this process may send one more refusal to an untrusted sender.
+    ///
+    /// The window is one minute. A full window skips the send. The caller
+    /// does not wait.
+    pub(crate) fn allow_untrusted_refusal(&self, now: Instant) -> bool {
+        let Ok(mut window) = self.untrusted_refusals.lock() else {
+            return false;
+        };
+        match window.start {
+            Some(start) if now.saturating_duration_since(start) < UNTRUSTED_REFUSAL_WINDOW => {}
+            _ => {
+                window.start = Some(now);
+                window.sent = 0;
+            }
+        }
+        if window.sent >= UNTRUSTED_REFUSAL_LIMIT {
+            return false;
+        }
+        window.sent = window.sent.saturating_add(1);
+        true
     }
 
     /// Record that a GUI window was visible at `unix_secs`.

@@ -681,17 +681,22 @@ async fn enrolled_remote_machines(state: &AppState, local: &MachineId) -> Vec<Ma
     machines
 }
 
+/// Agents whose authenticated binding names `machine`.
+///
+/// The discovery cache is announce-only. A machine can announce that it
+/// hosts an owner agent and move that cache entry. This lookup does not
+/// read it. The limit covers the agents one enrolled machine runs.
 async fn agents_on_machine(state: &AppState, machine: &MachineId) -> Vec<AgentId> {
-    let cache = state.agent.identity_discovery_cache();
-    let cache = cache.read().await;
-    cache
-        .iter()
-        .filter(|(_, found)| found.machine_id == *machine)
-        .map(|(id, _)| *id)
-        .collect()
+    const LIMIT: usize = 32;
+    state
+        .agent
+        .authenticated_machine_bindings()
+        .read()
+        .await
+        .agents_on_machine(*machine, LIMIT)
 }
 
-/// Enrolled machine in the identity cache that advertises `gui_show_v1`.
+/// Enrolled machine with an authenticated binding that advertises `gui_show_v1`.
 ///
 /// A direct QUIC connection is not required. ADR 0050 delivers the query
 /// over gossip. A missing bit leaves the machine in the candidate list
@@ -841,14 +846,13 @@ fn show_dm_request(
 ///
 /// A tab that is visible now counts as now, including when the stored
 /// stamp is older than [`crate::gui::ACTIVE_WINDOW_SECS`]. Hiding the tab
-/// leaves the stored stamp. The session refresh tick also writes it.
+/// leaves the stored stamp. The socket must hold a live session token.
+/// A session refresh does not write this stamp.
 pub(crate) async fn fresh_gui_visible_at(state: &AppState) -> Option<u64> {
-    let live = state
-        .ws_sessions
-        .read()
-        .await
-        .values()
-        .any(|session| session.is_visible_gui());
+    let now_instant = Instant::now();
+    let live = state.ws_sessions.read().await.values().any(|session| {
+        session.visible_with_live_session(|token| state.sessions.is_valid(token, now_instant))
+    });
     if live {
         let now = unix_secs();
         state.gui_show.note_gui_visible(now);
@@ -2144,6 +2148,22 @@ mod tests {
         )
         .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["outcome"], "no_active_machine",
+            "a visible flag with no live session is not active: {body}"
+        );
+
+        let token = state.sessions.issue(std::time::Instant::now());
+        state.ws_sessions.write().await.insert(
+            "visible".to_string(),
+            crate::server::ws::test_live_gui_ws_session("visible", &token),
+        );
+        let (status, body) = post_show(
+            &app,
+            json!({ "view": "people", "target_machine": "active" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
         let outcome = body["outcome"].as_str().unwrap_or("");
         assert!(
             outcome == "opened" || outcome == "navigated",
@@ -2273,10 +2293,71 @@ mod tests {
             !state.agent.is_agent_connected(&agent).await,
             "this test has no QUIC connection"
         );
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, machine, now)
+            .await;
         assert_eq!(
             activity_peer(&state, &machine).await,
             Some(agent),
-            "a gossip-cached enrolled machine is queried without a direct connection"
+            "an authenticated binding is queried without a direct connection"
+        );
+        Ok(())
+    }
+
+    /// An announce that names a different machine does not move an owner agent.
+    #[tokio::test]
+    async fn announce_only_identity_does_not_move_an_owner_agent() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0xAB; 32]);
+        let real = MachineId([0x11; 32]);
+        let announced = MachineId([0x22; 32]);
+        let mut caps = crate::dm::DmCapabilities::pending();
+        caps.application_registry = crate::dm::CapabilityRegistry {
+            version: 1,
+            bits: crate::dm::CapabilityRegistry::GUI_SHOW_V1,
+        };
+        let now = unix_secs();
+        assert!(state
+            .agent
+            .capability_store()
+            .insert(agent, real, caps, now.saturating_mul(1000)));
+        state
+            .agent
+            .insert_discovered_agent_for_testing(crate::DiscoveredAgent {
+                agent_id: agent,
+                machine_id: announced,
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: now,
+                last_seen: now,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+                self_name: None,
+            })
+            .await;
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, real, now.saturating_add(1))
+            .await;
+        assert_eq!(
+            activity_peer(&state, &real).await,
+            Some(agent),
+            "the authenticated machine stays the show target"
+        );
+        assert_eq!(
+            show_peer(&state, &announced).await,
+            None,
+            "an announce-only machine is not a show target"
         );
         Ok(())
     }
