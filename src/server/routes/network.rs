@@ -826,6 +826,8 @@ mod participation_diagnostics_tests {
         assert_eq!(
             keys,
             [
+                "digest_beacon_divergences",
+                "digest_beacons_sent",
                 "incoming_record_merges",
                 "incomplete_retained_images_pruned",
                 "rejected_authorization_version",
