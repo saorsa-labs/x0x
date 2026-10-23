@@ -11271,7 +11271,7 @@ impl Agent {
                     // executor or its timers. Load and Lookup share the
                     // resolver's deadline; only the source re-read below
                     // can establish a binding.
-                    let _ = evidence.lookup_before(*to, deadline).await;
+                    let _ = evidence.lookup_before(*to, None, deadline).await;
                 }
             };
             tokio::pin!(lookup);
