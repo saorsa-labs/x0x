@@ -78,15 +78,113 @@ macro_rules! log_flush_regression_tests {
             }
 
             #[test]
-            fn shutdown_log_flush_keeps_write_and_flush_failures_sticky() {
+            fn shutdown_log_flush_limits_write_and_flush_failures_to_one_transaction() {
                 for failure in [false, true] {
                     let mut fixture = Fixture::new(Some(failure), false, 8);
                     fixture.writer.write_all(b"first").unwrap();
                     assert!(fixture.writer.flush().is_err());
                     fixture.writer.write_all(b"healthy tail").unwrap();
-                    assert!(fixture.writer.flush_until(Instant::now() + BOUND).is_err());
+                    fixture.writer.flush().unwrap();
                     assert!(fixture.bytes.lock().unwrap().ends_with(b"healthy tail"));
                 }
+            }
+
+            fn captured(fixture: &Fixture) -> FlushCallback {
+                use tracing_subscriber::layer::SubscriberExt;
+                let dispatch = tracing::Dispatch::new(
+                    tracing_subscriber::registry()
+                        .with(FlushLayer::new(vec![fixture.writer.clone()]).unwrap()),
+                );
+                capture(&dispatch).unwrap()
+            }
+
+            #[test]
+            fn shutdown_log_flush_barrier_keeps_admission_open_for_rollback() {
+                let mut fixture = Fixture::new(None, true, 1);
+                let callback = captured(&fixture);
+                fixture.block();
+                fixture.writer.write_all(b"second").unwrap();
+                let deadline = Instant::now() + BOUND;
+                // Upgrade barriers need their own slot even when writes fill the queue.
+                let mut receivers = callback(deadline);
+                let receiver = receivers.pop().unwrap();
+                assert!(matches!(
+                    receiver.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                fixture.release.send(()).unwrap();
+                wait_ack(&receiver, deadline).unwrap();
+                fixture.writer.write_all(b"after rollback").unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstsecondafter rollback");
+            }
+
+            #[test]
+            fn shutdown_log_flush_dropped_line_fails_only_the_current_transaction() {
+                let mut fixture = Fixture::new(None, true, 1);
+                let callback = captured(&fixture);
+                fixture.block();
+                fixture.writer.write_all(b"accepted").unwrap();
+                assert_eq!(
+                    fixture.writer.write_all(b"dropped").unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                let deadline = Instant::now() + BOUND;
+                let mut receivers = callback(deadline);
+                fixture.release.send(()).unwrap();
+                assert_eq!(
+                    wait_ack(&receivers.pop().unwrap(), deadline)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                fixture.writer.write_all(b"healthy tail").unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstacceptedhealthy tail");
+            }
+
+            #[test]
+            fn shutdown_log_flush_loss_after_a_queued_barrier_belongs_to_the_next_window() {
+                let mut fixture = Fixture::new(None, true, 1);
+                let callback = captured(&fixture);
+                fixture.block();
+                fixture.writer.write_all(b"accepted").unwrap();
+                let deadline = Instant::now() + BOUND;
+                let mut receivers = callback(deadline);
+                assert_eq!(
+                    fixture.writer.write_all(b"later drop").unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                fixture.release.send(()).unwrap();
+                wait_ack(&receivers.pop().unwrap(), deadline).unwrap();
+                assert_eq!(
+                    flush_captured(&callback, Instant::now() + BOUND)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                fixture.writer.write_all(b"healthy tail").unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstacceptedhealthy tail");
+            }
+
+            #[test]
+            fn shutdown_log_flush_hook_timeout_allows_later_writes_and_barriers() {
+                let mut fixture = Fixture::new(None, true, 8);
+                let callback = captured(&fixture);
+                fixture.block();
+                assert_eq!(
+                    flush_captured(&callback, Instant::now() + Duration::from_millis(50))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::TimedOut
+                );
+                // Admission must resume while the timed-out worker is still blocked.
+                let admitted = fixture.writer.write_all(b"after timeout");
+                fixture.release.send(()).unwrap();
+                admitted.unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstafter timeout");
             }
 
             #[test]
@@ -138,6 +236,110 @@ macro_rules! log_flush_regression_tests {
                         .unwrap_err()
                         .kind(),
                     io::ErrorKind::Other
+                );
+            }
+
+            #[cfg(unix)]
+            fn directory_fixture() -> tempfile::TempDir {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("target/upgrade-log-directory-tests");
+                std::fs::create_dir_all(&root).unwrap();
+                tempfile::tempdir_in(root).unwrap()
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn shutdown_log_directory_existing_folders_are_not_synced() {
+                let root = directory_fixture();
+                let existing = root.path().join("existing");
+                std::fs::create_dir(&existing).unwrap();
+                let mut synced = Vec::new();
+                prepare_log_dir(
+                    &existing,
+                    |path| {
+                        synced.push(path.to_path_buf());
+                        Ok(())
+                    },
+                    |_, error| panic!("unexpected directory warning: {error}"),
+                )
+                .unwrap();
+                assert!(synced.is_empty());
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn shutdown_log_directory_syncs_only_folders_it_created() {
+                let root = directory_fixture();
+                let nested = root.path().join("new/deep");
+                let mut synced = Vec::new();
+                prepare_log_dir(
+                    &nested,
+                    |path| {
+                        synced.push(path.to_path_buf());
+                        File::open(path)?.sync_all()
+                    },
+                    |_, error| panic!("unexpected directory warning: {error}"),
+                )
+                .unwrap();
+                assert_eq!(synced, vec![nested.clone(), root.path().join("new")]);
+                assert!(nested.is_dir());
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn shutdown_log_directory_unreadable_folder_only_warns() {
+                let root = directory_fixture();
+                let nested = root.path().join("new/deep");
+                let mut warnings = Vec::new();
+                prepare_log_dir(
+                    &nested,
+                    |_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "unreadable folder",
+                        ))
+                    },
+                    |path, error| warnings.push((path.to_path_buf(), error.kind())),
+                )
+                .unwrap();
+                assert_eq!(
+                    warnings,
+                    vec![
+                        (nested.clone(), io::ErrorKind::PermissionDenied),
+                        (root.path().join("new"), io::ErrorKind::PermissionDenied),
+                    ]
+                );
+                let path = nested.join("daemon.log");
+                let file = File::create(&path).unwrap();
+                // Directory access was unavailable; the file remains writable and flushable.
+                let (mut writer, _guard) = acknowledged_file(file, None).unwrap();
+                writer
+                    .write_all(b"file logging survives directory warning")
+                    .unwrap();
+                writer.flush().unwrap();
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    b"file logging survives directory warning"
+                );
+            }
+
+            #[test]
+            fn shutdown_log_flush_retains_an_unrecovered_sink_setup_failure() {
+                let mut fixture = Fixture::new(None, false, 8);
+                fixture.writer.record_setup_error(&io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "configured sink did not open",
+                ));
+                for _ in 0..2 {
+                    fixture.writer.write_all(b"stdout still works").unwrap();
+                    assert_eq!(
+                        fixture.writer.flush().unwrap_err().kind(),
+                        io::ErrorKind::PermissionDenied
+                    );
+                }
+                assert_eq!(
+                    *fixture.bytes.lock().unwrap(),
+                    b"stdout still worksstdout still works"
                 );
             }
 
