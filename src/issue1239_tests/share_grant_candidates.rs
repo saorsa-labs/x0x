@@ -45,8 +45,8 @@ async fn hold_grant_store(
 async fn grant_fixture() -> (
     Arc<share_grant::ShareGrantStore>,
     dm_inbox::AuthenticatedMachineBindings,
-    tokio::sync::RwLock<HashMap<identity::AgentId, DiscoveredAgent>>,
-    tokio::sync::RwLock<crate::revocation::RevocationSet>,
+    Arc<tokio::sync::RwLock<HashMap<identity::AgentId, DiscoveredAgent>>>,
+    Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
     identity::AgentId,
     identity::MachineId,
     u64,
@@ -78,8 +78,10 @@ async fn grant_fixture() -> (
     (
         grants,
         bindings,
-        tokio::sync::RwLock::new(HashMap::new()),
-        tokio::sync::RwLock::new(crate::revocation::RevocationSet::new()),
+        Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        )),
         requester,
         machine,
         now_unix,
@@ -214,5 +216,70 @@ async fn briefly_held_grant_store_still_evaluates() {
     assert!(
         elapsed < EVIDENCE_READ_BUDGET,
         "brief contention outlived the read budget: {elapsed:?}"
+    );
+}
+
+/// Review on #1598: admission is bounded too. A writer held past the
+/// budget pins every reader permit (a running read keeps its permit until
+/// the lock frees), so evaluations beyond the permit cap must still fail
+/// closed at the budget while queued for admission — not wait unbounded.
+#[tokio::test(flavor = "current_thread")]
+async fn evaluations_past_the_reader_cap_still_fail_closed_at_the_budget() {
+    let (grants, bindings, discovery, revocations, requester, machine, now) = grant_fixture().await;
+    let (release, writer, held_now) =
+        hold_grant_store(Arc::clone(&grants), Duration::from_secs(15)).await;
+
+    let mut evaluations = tokio::task::JoinSet::new();
+    for _ in 0..=share_grant::SHARE_GRANT_READ_PERMITS {
+        let grants = Arc::clone(&grants);
+        let bindings = Arc::clone(&bindings);
+        let discovery = Arc::clone(&discovery);
+        let revocations = Arc::clone(&revocations);
+        evaluations.spawn(async move {
+            let started = std::time::Instant::now();
+            let outcome = evaluate(
+                &grants,
+                &bindings,
+                &discovery,
+                &revocations,
+                &requester,
+                &machine,
+                now,
+            )
+            .await;
+            (started.elapsed(), outcome)
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = evaluations.join_next().await {
+        results.push(joined.expect("evaluation task must not panic"));
+    }
+    let all_returned_while_held = held_now.load(Ordering::SeqCst);
+    let _ = release.send(());
+    writer.join().unwrap();
+
+    assert_eq!(
+        results.len(),
+        share_grant::SHARE_GRANT_READ_PERMITS + 1,
+        "every evaluation must return"
+    );
+    assert!(
+        all_returned_while_held,
+        "all evaluations must return before the writer releases the store"
+    );
+    for (index, (elapsed, outcome)) in results.into_iter().enumerate() {
+        assert!(
+            matches!(outcome, Err(())),
+            "evaluation {index} past the reader cap must fail closed, not block: \
+             {outcome:?} after {elapsed:?}"
+        );
+        assert!(
+            elapsed < EVIDENCE_READ_BUDGET + Duration::from_secs(2),
+            "evaluation {index} past the reader cap outlived the budget: {elapsed:?}"
+        );
+    }
+    assert!(
+        drained(&grants, Duration::from_secs(2)).await,
+        "the pinned reads never finished after release"
     );
 }

@@ -534,7 +534,7 @@ impl StoreState {
 /// keeps readers queued behind a held store writer from growing the
 /// blocking pool without bound; it matches the evidence runtime's reader
 /// cap.
-const SHARE_GRANT_READ_PERMITS: usize = 16;
+pub(crate) const SHARE_GRANT_READ_PERMITS: usize = 16;
 
 /// Persistent store of issued and received share grants.
 ///
@@ -804,9 +804,13 @@ impl ShareGrantStore {
         if tokio::time::Instant::now() >= deadline {
             return Err(());
         }
-        let permit = Arc::clone(&self.reads)
-            .acquire_owned()
+        // Admission waits inside the same deadline: a writer held past the
+        // budget pins every permit (a running read keeps its until the lock
+        // frees), so an evaluation queued for admission must still fail
+        // closed at the budget, not wait unbounded.
+        let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.reads).acquire_owned())
             .await
+            .map_err(|_| ())?
             .map_err(|_| ())?;
         if tokio::time::Instant::now() >= deadline {
             return Err(());
