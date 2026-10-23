@@ -92,6 +92,40 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Job 120231656380 died with 54 MB free. Record the raw runner before
+      # this job deletes disposable toolchains.
+      - name: Record disk at Test Suite start
+        run: |
+          echo "=== disk at Test Suite start ==="
+          df -h
+
+      # Preinstalled SDKs are not Test Suite inputs. Removing them is the
+      # same headroom the Coverage Gate uses. It is not enough on its own:
+      # the default-feature M2 compile below still needs the all-features
+      # target removed first (#1584).
+      - name: Free preinstalled runner disk
+        run: |
+          echo "=== disk before freeing preinstalled tools ==="
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/share/vcpkg \
+            /opt/az \
+            /usr/local/.ghcup \
+            /usr/share/miniconda \
+            /usr/local/graalvm \
+            /usr/local/share/boost \
+            || true
+          sudo apt-get clean || true
+          echo "=== disk after freeing preinstalled tools ==="
+          df -h
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
@@ -123,7 +157,8 @@ jobs:
             cargo generate-lockfile
           fi
 
-      # Restore here; save at the end of the job, after the prune step (#1543).
+      # Restore here. Save after the all-features lane, before that target
+      # is removed for the default-feature M2 controls (#1584).
       - name: Restore target directory
         id: restore_target
         uses: actions/cache/restore@v5
@@ -146,6 +181,12 @@ jobs:
       - name: Prepare bounded convergence custody
         id: prepare_convergence
         run: python3 scripts/ci/issue442-convergence-custody.py prepare
+
+      - name: Record disk before Run tests
+        run: |
+          echo "=== disk before Run tests ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
 
       - name: Run tests
         id: tests
@@ -190,23 +231,16 @@ jobs:
           X0X_ISOLATION_ROLE: m2-cli-now-controls
         run: bash scripts/ci/nextest-isolated.sh --locked --workspace --all-features --bin x0x -- -E 'test(upgrade_now_cli_regressions)' --no-tests=fail
 
-      # The workspace all-features lane exercises the debug seam. Also run the
-      # committed H controls with the default production trust root in isolation.
-      - name: M2 default-key and debug-signing controls
-        env:
-          X0X_ISOLATION_ROLE: m2-signing-controls
-        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
+      # Run while the all-features target is still on disk, and after the
+      # workspace artifact upload, so this invocation cannot replace those
+      # results. A voice failure must not skip the default-feature M2 controls.
+      - name: Record disk before Voice pipeline acceptance
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        run: |
+          echo "=== disk before Voice pipeline acceptance ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
 
-      # Library fleet guards must also use the production key, not the
-      # all-features debug rehearsal key that permits zero-minute windows.
-      - name: M2 production fleet staging controls
-        env:
-          X0X_ISOLATION_ROLE: m2-fleet-controls
-        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --lib -- -E 'test(fleet_)' --no-tests=fail
-
-
-      # Run after the workspace artifact is uploaded so this nextest invocation
-      # cannot replace the full-suite results kept above.
       - name: Voice pipeline acceptance
         if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
         env:
@@ -237,11 +271,12 @@ jobs:
 
       # The full target holds ~115 workspace test binaries that change on every
       # PR; archiving them filled the runner disk (#1543). Cache only the
-      # third-party build output, on the same terms as the old post-job save.
+      # third-party build output from this all-features lane.
       - name: Prune target directory for the cache
         if: steps.restore_target.outputs.cache-hit != 'true'
         run: |
-          df -h .
+          echo "=== disk before pruning the all-features target cache ==="
+          df -h
           du -sh target || true
           python3 -B scripts/ci/prune-target-cache.py target
           du -sh target || true
@@ -252,6 +287,57 @@ jobs:
         with:
           path: target
           key: ${{ steps.restore_target.outputs.cache-primary-key }}
+
+      # The steps above use --all-features. The M2 controls below compile the
+      # default feature set, which is a second graph in the same target.
+      # Job 120231656380 kept both and rustc died at 54 MB free. Remove the
+      # all-features output after the cache save. always() keeps this step
+      # when Voice failed; the outcome checks still require the tests and the
+      # all-features CLI control.
+      - name: Free intermediate target output
+        id: free_intermediate
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success'
+        run: |
+          echo "=== disk before freeing intermediate target output ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+          rm -rf target
+          echo "=== disk after freeing intermediate target output ==="
+          df -h
+
+      # The workspace all-features lane exercises the debug seam. Also run the
+      # committed H controls with the default production trust root in isolation.
+      - name: M2 default-key and debug-signing controls
+        id: m2_signing
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.free_intermediate.outcome == 'success'
+        env:
+          X0X_ISOLATION_ROLE: m2-signing-controls
+        run: |
+          echo "=== disk before M2 default-key and debug-signing controls ==="
+          df -h
+          bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
+
+      # Library fleet guards must also use the production key, not the
+      # all-features debug rehearsal key that permits zero-minute windows.
+      - name: Record disk before M2 production fleet staging controls
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.m2_signing.outcome == 'success'
+        run: |
+          echo "=== disk before M2 production fleet staging controls ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+
+      - name: M2 production fleet staging controls
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.m2_signing.outcome == 'success'
+        env:
+          X0X_ISOLATION_ROLE: m2-fleet-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --lib -- -E 'test(fleet_)' --no-tests=fail
+
+      - name: Record disk at Test Suite end
+        if: always()
+        run: |
+          echo "=== disk at Test Suite end ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
 
   signing-path-100k:
     name: Signing path 100k acceptance
