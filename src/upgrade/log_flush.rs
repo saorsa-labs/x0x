@@ -1,4 +1,5 @@
-//! Owned, nonblocking log sinks with acknowledged transaction barriers.
+//! Owned log sinks with acknowledged transaction barriers.
+//! Files apply back-pressure; bounded stdout reports dropped lines.
 //! The transaction checks its suspend-inclusive deadline around this local wait.
 //! Transaction barriers leave admission open for rollback. Only guard teardown
 //! closes admission and terminates the worker.
@@ -34,8 +35,10 @@ enum Message {
 }
 
 struct State {
-    queue: VecDeque<Message>,
+    // Each entry carries the losses that precede it, including flush markers.
+    queue: VecDeque<(Message, usize)>,
     bytes: usize,
+    dropped_lines: usize,
     failure: Option<(io::ErrorKind, &'static str)>,
     setup_failure: Option<(io::ErrorKind, &'static str)>,
     deadline: Option<Instant>,
@@ -46,7 +49,9 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     ready: Condvar,
+    space: Condvar,
     capacity: usize,
+    lossless: bool,
 }
 
 #[derive(Clone)]
@@ -62,7 +67,7 @@ pub(crate) struct LogGuard {
 pub(crate) fn acknowledged<W: Write + Send + 'static>(
     sink: W,
 ) -> io::Result<(LogWriter, LogGuard)> {
-    start(sink, Write::flush, MAX_MESSAGES)
+    start(sink, Write::flush, MAX_MESSAGES, false)
 }
 
 #[cfg(test)]
@@ -70,10 +75,15 @@ pub(crate) fn acknowledged_with_capacity<W: Write + Send + 'static>(
     sink: W,
     capacity: usize,
 ) -> io::Result<(LogWriter, LogGuard)> {
-    start(sink, Write::flush, capacity)
+    start(sink, Write::flush, capacity, false)
 }
 
-fn start<W, F>(sink: W, barrier: F, capacity: usize) -> io::Result<(LogWriter, LogGuard)>
+fn start<W, F>(
+    sink: W,
+    barrier: F,
+    capacity: usize,
+    lossless: bool,
+) -> io::Result<(LogWriter, LogGuard)>
 where
     W: Write + Send + 'static,
     F: FnMut(&mut W) -> io::Result<()> + Send + 'static,
@@ -88,6 +98,7 @@ where
         state: Mutex::new(State {
             queue: VecDeque::new(),
             bytes: 0,
+            dropped_lines: 0,
             failure: None,
             setup_failure: None,
             deadline: None,
@@ -95,7 +106,9 @@ where
             alive: true,
         }),
         ready: Condvar::new(),
+        space: Condvar::new(),
         capacity,
+        lossless,
     });
     let worker_state = Arc::clone(&shared);
     let worker = thread::Builder::new()
@@ -154,12 +167,19 @@ impl LogWriter {
             // Errors after this marker belong to the next transaction. Sink
             // errors are ordered by the worker's own position in the queue.
             let admission_failure = state.setup_failure.or(state.failure.take());
-            state.queue.push_back(Message::Flush {
-                deadline,
-                ack: ack.clone(),
-                terminal,
-                admission_failure,
-            });
+            let dropped_lines = std::mem::take(&mut state.dropped_lines);
+            state.queue.push_back((
+                Message::Flush {
+                    deadline,
+                    ack: ack.clone(),
+                    terminal,
+                    admission_failure,
+                },
+                dropped_lines,
+            ));
+            if terminal {
+                self.shared.space.notify_all();
+            }
             self.shared.ready.notify_one();
             Ok(())
         })();
@@ -189,23 +209,42 @@ impl Write for LogWriter {
             return Ok(0);
         }
         let mut state = self.shared.state.lock().map_err(|_| poisoned())?;
-        if !state.alive || state.closed {
-            return Err(unavailable());
-        }
-        if bytes.len() > MAX_MESSAGE_BYTES
-            || state.queue.len() >= self.shared.capacity
-            || bytes.len() > MAX_BYTES.saturating_sub(state.bytes)
-        {
+        loop {
+            if !state.alive || state.closed {
+                return Err(unavailable());
+            }
+            // Keep each file event intact. One event larger than the byte
+            // budget may enter an otherwise byte-empty queue; subsequent
+            // writes wait for space. Stdout retains its per-event cap.
+            if (self.shared.lossless || bytes.len() <= MAX_MESSAGE_BYTES)
+                && state.queue.len() < self.shared.capacity
+                && (bytes.len() <= MAX_BYTES.saturating_sub(state.bytes)
+                    || (self.shared.lossless && state.bytes == 0))
+            {
+                break;
+            }
+            if self.shared.lossless {
+                state = self.shared.space.wait(state).map_err(|_| poisoned())?;
+                continue;
+            }
+            // tracing submits a formatted event in one write_all. Count its
+            // lines, including a final line without a newline.
+            state.dropped_lines += bytes.iter().filter(|&&byte| byte == b'\n').count()
+                + usize::from(!bytes.ends_with(b"\n"));
             state
                 .failure
                 .get_or_insert((io::ErrorKind::WouldBlock, "logging queue lost a write"));
+            self.shared.ready.notify_one();
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "logging queue capacity exceeded",
             ));
         }
         state.bytes += bytes.len();
-        state.queue.push_back(Message::Write(bytes.to_vec()));
+        let dropped_lines = std::mem::take(&mut state.dropped_lines);
+        state
+            .queue
+            .push_back((Message::Write(bytes.to_vec()), dropped_lines));
         self.shared.ready.notify_one();
         Ok(bytes.len())
     }
@@ -258,30 +297,41 @@ impl Drop for WorkerExit {
         state.alive = false;
         state.closed = true;
         state.queue.clear(); // Pending receivers disconnect, never acknowledge.
+        self.0.space.notify_all();
     }
 }
 
 fn run<W: Write, F: FnMut(&mut W) -> io::Result<()>>(mut sink: W, mut barrier: F, shared: &Shared) {
     let mut sink_failure = None;
     loop {
-        let message = {
+        let (message, dropped_lines) = {
             let Ok(mut state) = shared.state.lock() else {
                 return;
             };
-            while state.queue.is_empty() {
+            while state.queue.is_empty() && state.dropped_lines == 0 {
                 let Ok(next) = shared.ready.wait(state) else {
                     return;
                 };
                 state = next;
             }
-            let Some(message) = state.queue.pop_front() else {
-                return;
-            };
+            // Report overflow even if no further writes or barriers arrive.
+            let (message, dropped_lines) = state.queue.pop_front().unwrap_or_else(|| {
+                (
+                    Message::Write(Vec::new()),
+                    std::mem::take(&mut state.dropped_lines),
+                )
+            });
             if let Message::Write(bytes) = &message {
                 state.bytes = state.bytes.saturating_sub(bytes.len());
             }
-            message
+            shared.space.notify_all();
+            (message, dropped_lines)
         };
+        if dropped_lines != 0 {
+            if let Err(error) = writeln!(sink, "{dropped_lines} log lines dropped") {
+                sink_failure.get_or_insert((error.kind(), "log loss marker write failed"));
+            }
+        }
         match message {
             Message::Write(bytes) => {
                 if let Err(error) = sink.write_all(&bytes) {
@@ -387,6 +437,7 @@ pub(crate) fn acknowledged_file(
             sink.parent.as_ref().map_or(Ok(()), File::sync_all)
         },
         MAX_MESSAGES,
+        true,
     )
 }
 

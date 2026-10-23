@@ -816,7 +816,7 @@ fn init_logging(level: &str, format: &str) -> Result<Vec<log_flush::LogGuard>> {
                 log_flush::acknowledged_file(file, parent)?
             };
             #[cfg(not(unix))]
-            let (writer, guard) = log_flush::acknowledged(file)?;
+            let (writer, guard) = log_flush::acknowledged_file(file, None)?;
             Ok((path, writer, guard))
         };
         match open() {

@@ -42,6 +42,14 @@ macro_rules! log_flush_regression_tests {
             }
             impl Fixture {
                 fn new(failure: Option<bool>, block: bool, capacity: usize) -> Self {
+                    Self::with_policy(failure, block, capacity, false)
+                }
+                fn with_policy(
+                    failure: Option<bool>,
+                    block: bool,
+                    capacity: usize,
+                    lossless: bool,
+                ) -> Self {
                     let bytes = Arc::new(Mutex::new(Vec::new()));
                     let (release, released) = mpsc::channel();
                     let (entered, entered_rx) = mpsc::channel();
@@ -50,7 +58,12 @@ macro_rules! log_flush_regression_tests {
                         failure,
                         blocked: block.then_some((entered, released)),
                     };
-                    let (writer, guard) = acknowledged_with_capacity(sink, capacity).unwrap();
+                    let (writer, guard) = if lossless {
+                        start(sink, Write::flush, capacity, true)
+                    } else {
+                        acknowledged_with_capacity(sink, capacity)
+                    }
+                    .unwrap();
                     Self {
                         writer,
                         guard: Some(guard),
@@ -75,6 +88,145 @@ macro_rules! log_flush_regression_tests {
                         }
                     }
                 }
+            }
+
+            #[test]
+            fn shutdown_log_file_backpressure_preserves_flood_past_both_queue_limits() {
+                // Hold the worker in its first write so each bound is reached
+                // deterministically, independent of filesystem or CPU speed.
+                for line_bytes in [8, MAX_MESSAGE_BYTES] {
+                    let mut fixture = Fixture::with_policy(None, true, MAX_MESSAGES, true);
+                    fixture.block();
+                    let mut line = vec![b'x'; line_bytes];
+                    *line.last_mut().unwrap() = b'\n';
+                    let capacity = MAX_MESSAGES.min(MAX_BYTES / line_bytes);
+                    for _ in 0..capacity {
+                        fixture.writer.write_all(&line).unwrap();
+                    }
+                    let (started, starting) = mpsc::channel();
+                    let (done, completed) = mpsc::channel();
+                    let mut writer = fixture.writer.clone();
+                    let extra = line.clone();
+                    let producer = thread::spawn(move || {
+                        started.send(()).unwrap();
+                        let result = writer.write_all(&extra);
+                        done.send(result).unwrap();
+                    });
+                    starting.recv_timeout(BOUND).unwrap();
+                    let blocked = completed.recv_timeout(Duration::from_millis(50));
+                    fixture.release.send(()).unwrap();
+                    producer.join().unwrap();
+                    assert!(matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)));
+                    completed.recv_timeout(BOUND).unwrap().unwrap();
+                    fixture.writer.flush().unwrap();
+                    let mut expected = b"first".to_vec();
+                    expected.extend(line.repeat(capacity + 1));
+                    assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+                }
+            }
+
+            #[test]
+            fn shutdown_log_file_terminal_barrier_wakes_a_blocked_producer() {
+                let mut fixture = Fixture::with_policy(None, true, 1, true);
+                fixture.block();
+                fixture.writer.write_all(b"accepted").unwrap();
+                let (done, completed) = mpsc::channel();
+                let mut writer = fixture.writer.clone();
+                let producer = thread::spawn(move || {
+                    done.send(writer.write_all(b"not admitted")).unwrap();
+                });
+                assert!(matches!(
+                    completed.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                let ack = fixture.writer.request(Instant::now() + BOUND, true);
+                assert_eq!(
+                    completed.recv_timeout(BOUND).unwrap().unwrap_err().kind(),
+                    io::ErrorKind::BrokenPipe
+                );
+                fixture.release.send(()).unwrap();
+                producer.join().unwrap();
+                wait_ack(&ack, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstaccepted");
+            }
+
+            #[test]
+            fn shutdown_log_stdout_flood_reports_exact_line_counts_without_a_barrier() {
+                for line_bytes in [8, MAX_MESSAGE_BYTES] {
+                    let mut fixture = Fixture::new(None, true, MAX_MESSAGES);
+                    fixture.block();
+                    let mut line = vec![b'x'; line_bytes];
+                    *line.last_mut().unwrap() = b'\n';
+                    let capacity = MAX_MESSAGES.min(MAX_BYTES / line_bytes);
+                    for _ in 0..capacity {
+                        fixture.writer.write_all(&line).unwrap();
+                    }
+                    for _ in 0..37 {
+                        assert_eq!(
+                            fixture
+                                .writer
+                                .write_all(b"lost one\nlost two\n")
+                                .unwrap_err()
+                                .kind(),
+                            io::ErrorKind::WouldBlock
+                        );
+                    }
+                    // The per-event limit also counts all lines in the event.
+                    let oversized = vec![b'\n'; MAX_MESSAGE_BYTES + 1];
+                    assert_eq!(
+                        fixture.writer.write_all(&oversized).unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                    let marker = format!("{} log lines dropped\n", 74 + oversized.len());
+                    fixture.release.send(()).unwrap();
+                    let deadline = Instant::now() + BOUND;
+                    while !fixture.bytes.lock().unwrap().ends_with(marker.as_bytes()) {
+                        assert!(
+                            Instant::now() < deadline,
+                            "loss marker was not written while idle"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    let mut expected = b"first".to_vec();
+                    expected.extend(line.repeat(capacity));
+                    expected.extend(marker.as_bytes());
+                    assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+                    assert_eq!(
+                        fixture.writer.flush().unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                    fixture.writer.flush().unwrap();
+                    assert_eq!(
+                        *fixture.bytes.lock().unwrap(),
+                        expected,
+                        "marker must appear exactly once"
+                    );
+                }
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn shutdown_log_file_receives_every_line_beyond_the_old_limits() {
+                let root = directory_fixture();
+                let path = root.path().join("flood.log");
+                let (mut writer, _guard) = acknowledged_file(
+                    File::create(&path).unwrap(),
+                    Some(File::open(root.path()).unwrap()),
+                )
+                .unwrap();
+                let mut expected = Vec::<u8>::new();
+                for index in 0..4096 {
+                    let line = format!("line {index:04}: {}\n", "x".repeat(1200));
+                    writer.write_all(line.as_bytes()).unwrap();
+                    expected.extend(line.as_bytes());
+                }
+                // A single large event is admitted intact, never split between
+                // concurrent producers or rejected by the stdout size cap.
+                let large = format!("{}\n", "y".repeat(MAX_BYTES + 1));
+                writer.write_all(large.as_bytes()).unwrap();
+                expected.extend(large.as_bytes());
+                writer.flush().unwrap();
+                assert_eq!(std::fs::read(path).unwrap(), expected);
             }
 
             #[test]
@@ -140,7 +292,10 @@ macro_rules! log_flush_regression_tests {
                 );
                 fixture.writer.write_all(b"healthy tail").unwrap();
                 flush_captured(&callback, Instant::now() + BOUND).unwrap();
-                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstacceptedhealthy tail");
+                assert_eq!(
+                    *fixture.bytes.lock().unwrap(),
+                    b"firstaccepted1 log lines dropped\nhealthy tail"
+                );
             }
 
             #[test]
@@ -165,7 +320,10 @@ macro_rules! log_flush_regression_tests {
                 );
                 fixture.writer.write_all(b"healthy tail").unwrap();
                 flush_captured(&callback, Instant::now() + BOUND).unwrap();
-                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstacceptedhealthy tail");
+                assert_eq!(
+                    *fixture.bytes.lock().unwrap(),
+                    b"firstaccepted1 log lines dropped\nhealthy tail"
+                );
             }
 
             #[test]
@@ -227,6 +385,7 @@ macro_rules! log_flush_regression_tests {
                     std::io::sink(),
                     |_| Err(io::Error::other("injected durability barrier failure")),
                     8,
+                    false,
                 )
                 .unwrap();
                 writer.write_all(b"accepted bytes").unwrap();
