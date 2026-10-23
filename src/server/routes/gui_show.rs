@@ -7,9 +7,17 @@
 //! and its outbound queue accepts the frame. The response never contains a
 //! URL or session token.
 //!
-//! The route requires the durable owner API token. `auth_middleware` refuses
-//! a GUI session bearer and a rider token before this handler runs. The
-//! handler repeats that check.
+//! An owner token must be the durable API token. A GUI session bearer is
+//! refused. A rider bearer is admitted only when the token carries
+//! `gui:show`. `auth_middleware` applies that check. The handler repeats
+//! it for tests that call the handler without middleware.
+//!
+//! After admission, a rider show uses that token's `sub_agent_id` for the
+//! block list, the rate limit, the origin banner, and the outgoing
+//! `agent_id`. The daemon's own agent stays the sender for a durable owner
+//! token. Stop then blocks that rider, or turns local show off only when
+//! the sender is this daemon. A rider banner names `gui_show_blocked.json`
+//! and a daemon restart. A local banner names `gui_show_local_disabled`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -20,13 +28,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use super::super::rider_auth::ActorContext;
+use super::super::rider_auth::{admit_gui_show, ActorContext, AdmitGuiShow};
 use super::super::state::AppState;
 use super::super::ws::GuiShowFrame;
 use crate::gui::{
     new_request_id, origin_banner, short_id_hex, view_route, GuiShowOutcome, GuiShowRequest,
     GuiShowResponse, PendingGuiShow,
 };
+use crate::identity::AgentId;
 
 /// POST /gui/show
 pub(in crate::server) async fn gui_show(
@@ -34,18 +43,15 @@ pub(in crate::server) async fn gui_show(
     Extension(actor): Extension<ActorContext>,
     Json(req): Json<GuiShowRequest>,
 ) -> Response {
-    // David approved 22 Oct 2026 13:30 BST (#1392). Same refusal as
-    // `POST /forwards`: the middleware returns 403 before extractors, and
-    // this check refuses a non-durable actor when that layer is absent.
-    if !actor.is_durable_owner() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "/gui/show requires the durable API token (not a session token)"
-            })),
-        )
-            .into_response();
-    }
+    // David approved 22 Oct 2026 13:30 BST (#1392) for owner tokens: a GUI
+    // session bearer stays a durable-token 403. A rider is admitted only
+    // with `gui:show`. This is the same check as the middleware.
+    let rider = match admit_gui_show(&actor) {
+        AdmitGuiShow::Allow { rider } => rider,
+        AdmitGuiShow::Forbidden(body) => {
+            return (StatusCode::FORBIDDEN, Json(body)).into_response();
+        }
+    };
 
     let machine_id = hex::encode(state.agent.machine_id().as_bytes());
     let request_id = new_request_id();
@@ -70,21 +76,25 @@ pub(in crate::server) async fn gui_show(
     };
     let route = parsed.as_route();
 
-    let agent_id = state.agent.agent_id();
-    // ADR 0083 §5: a blocked sender is refused. Slice 1's requester is this
-    // daemon's agent, and that agent is not exempt.
-    if state.gui_show.is_blocked(&agent_id) {
+    // ADR 0083 §5 keys the block list, the rate limit, the banner, and Stop
+    // on the requesting agent. A rider's requesting agent is the
+    // authenticated `sub_agent_id`, not this daemon. A bad id is refused
+    // here so it cannot fall back onto the daemon's identity.
+    let Some(sender) = show_sender(&state, &actor) else {
+        return json_outcome(GuiShowOutcome::Refused, machine_id, request_id);
+    };
+    if state.gui_show.is_blocked(&sender) {
         return json_outcome(GuiShowOutcome::Refused, machine_id, request_id);
     }
 
     let now = Instant::now();
-    if !state.gui_show.try_rate_limit(&agent_id, now) {
+    if !state.gui_show.try_rate_limit(&sender, now) {
         return json_outcome(GuiShowOutcome::RateLimited, machine_id, request_id);
     }
 
-    let (agent_label, machine_label) = resolve_banner_labels(&state).await;
-    let banner = origin_banner(&agent_label, &machine_label, false);
-    let agent_hex = hex::encode(agent_id.as_bytes());
+    let agent_hex = hex::encode(sender.as_bytes());
+    let (agent_label, machine_label) = resolve_banner_labels(&state, &agent_hex, rider).await;
+    let banner = origin_banner(&agent_label, &machine_label, rider);
 
     // Deliver on the tab's own queue. A broadcast would return before the
     // forwarder runs, and a full queue there drops the frame and closes
@@ -96,7 +106,7 @@ pub(in crate::server) async fn gui_show(
         banner: banner.clone(),
         agent_id: agent_hex.clone(),
         machine_id: machine_id.clone(),
-        rider: false,
+        rider,
         request_id: request_id.clone(),
     };
     let decided_at = Instant::now();
@@ -127,7 +137,7 @@ pub(in crate::server) async fn gui_show(
         banner,
         agent_id: agent_hex,
         machine_id: machine_id.clone(),
-        rider: false,
+        rider,
         request_id: request_id.clone(),
         session_token: session.clone(),
         created_at: Instant::now(),
@@ -199,16 +209,38 @@ fn show_loopback_url(api: SocketAddr, session: &str, route: &str) -> String {
     format!("http://{addr}/gui?token={session}#/{route}")
 }
 
-async fn resolve_banner_labels(state: &AppState) -> (String, String) {
+/// Requesting agent for one admitted show.
+///
+/// A durable owner acts as this daemon. A rider acts as the token's
+/// `sub_agent_id`. `None` means that id is not a 32-byte agent id.
+fn show_sender(state: &AppState, actor: &ActorContext) -> Option<AgentId> {
+    match actor {
+        ActorContext::Owner { .. } => Some(state.agent.agent_id()),
+        ActorContext::Rider { sub_agent_id, .. } => {
+            super::super::parse_agent_id_hex(sub_agent_id).ok()
+        }
+    }
+}
+
+async fn resolve_banner_labels(
+    state: &AppState,
+    sender_hex: &str,
+    rider: bool,
+) -> (String, String) {
     let profile = state.profile.read().await;
-    let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let machine_hex = hex::encode(state.agent.machine_id().as_bytes());
-    let agent_label = profile
-        .display_name
-        .clone()
-        .filter(|s| !s.is_empty())
-        .or_else(|| profile.human_name.clone().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| short_id_hex(&agent_hex));
+    // The profile names this daemon. A rider has no entry there, so the
+    // banner uses the sender's short id (ADR 0083 §5).
+    let agent_label = if rider {
+        short_id_hex(sender_hex)
+    } else {
+        profile
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| profile.human_name.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| short_id_hex(sender_hex))
+    };
     let machine_label = profile
         .machine_name
         .clone()
@@ -313,7 +345,8 @@ mod tests {
     }
 
     /// David approved 22 Oct 2026 13:30 BST (#1392). A GUI session bearer
-    /// and a rider token are refused. The durable owner token is accepted.
+    /// is refused with the durable-token 403. A scopeless rider is
+    /// `missing_scope`. The durable owner token is accepted.
     #[tokio::test]
     async fn gui_show_refuses_session_and_rider_accepts_durable_owner() -> anyhow::Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
@@ -353,6 +386,7 @@ mod tests {
                     None,
                     None,
                     crate::server::rider_auth::unix_now_secs(),
+                    Vec::new(),
                 )
                 .await?;
             token
@@ -361,18 +395,18 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
-            "rider token must be refused: {body}"
+            "scopeless rider token must be refused: {body}"
         );
+        assert_eq!(body["reason"], "missing_scope", "{body}");
         assert!(
             body["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("denied"),
-            "rider 403 must be the route denial: {body}"
+                .contains("gui:show"),
+            "scopeless rider 403 must name gui:show: {body}"
         );
 
-        // The handler refuses a non-durable actor even when middleware is
-        // absent. This fails if the handler check is removed.
+        // The handler repeats the same check when middleware is absent.
         for actor in [
             ActorContext::Owner { durable: false },
             ActorContext::Rider {
@@ -380,25 +414,27 @@ mod tests {
                 token_id: 1,
                 token_hash: "hash".to_string(),
                 groups: Vec::new(),
+                scopes: Vec::new(),
             },
         ] {
+            let session_bearer = matches!(actor, ActorContext::Owner { .. });
             let bare = axum::Router::new()
                 .route("/gui/show", post(gui_show))
                 .layer(Extension(actor))
                 .with_state(Arc::clone(&state));
             let (status, body) = post_show_as(&bare, "not-a-token").await?;
-            assert_eq!(
-                status,
-                StatusCode::FORBIDDEN,
-                "handler must refuse a non-durable actor: {body}"
-            );
-            assert!(
-                body["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("durable API token"),
-                "handler 403 must name the durable requirement: {body}"
-            );
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            if session_bearer {
+                assert!(
+                    body["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("durable API token"),
+                    "handler 403 must name the durable requirement: {body}"
+                );
+            } else {
+                assert_eq!(body["reason"], "missing_scope", "{body}");
+            }
         }
 
         assert!(
@@ -416,6 +452,261 @@ mod tests {
         assert!(
             outcome == "opened" || outcome == "navigated",
             "durable owner token must reach the handler: {body}"
+        );
+        Ok(())
+    }
+
+    /// A rider whose token carries `gui:show` gets a token-free show response.
+    #[tokio::test]
+    async fn gui_show_scope_rider_response_has_no_token_or_url() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let tab = state.sessions.issue(Instant::now());
+        let probe = {
+            let mut sessions = state.ws_sessions.write().await;
+            crate::server::ws::insert_visible_gui_with_queue(&mut sessions, "rider-tab", 4, 0, &tab)
+        };
+        let app = axum::Router::new()
+            .route("/gui/show", post(gui_show))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let rider = {
+            let mut store = state.rider_tokens.lock().await;
+            let (token, _) = store
+                .issue(
+                    "aa".repeat(32),
+                    Vec::new(),
+                    None,
+                    60,
+                    String::new(),
+                    None,
+                    None,
+                    crate::server::rider_auth::unix_now_secs(),
+                    vec!["gui:show".to_string()],
+                )
+                .await?;
+            token
+        };
+        let (status, body) = post_show_as(&app, &rider).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "navigated", "{body}");
+        let keys = body.as_object().expect("object");
+        assert_eq!(keys.len(), 3, "{body}");
+        assert!(keys.contains_key("outcome") && keys.contains_key("machine_id"));
+        assert!(
+            keys.contains_key("request_id"),
+            "show response must not carry a token or url: {body}"
+        );
+        let raw = body.to_string();
+        assert!(!raw.contains(&rider), "{raw}");
+        assert!(
+            !raw.contains("session_token") && !raw.contains("http"),
+            "{raw}"
+        );
+        let shows = probe.gui_shows();
+        let rider_short = short_id_hex(&"aa".repeat(32));
+        let daemon_short = short_id_hex(&hex::encode(state.agent.agent_id().as_bytes()));
+        assert!(
+            shows.len() == 1 && shows[0].1.contains("(rider)") && shows[0].1.contains(&rider_short),
+            "origin banner must name this rider: {shows:?}"
+        );
+        assert!(
+            !shows[0].1.contains(&daemon_short),
+            "origin banner must not name the daemon: {shows:?}"
+        );
+        assert!(cap.urls.lock().expect("opener lock").is_empty());
+        Ok(())
+    }
+
+    fn auth_router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route("/gui/show", post(gui_show))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn issue_gui_show_rider(state: &AppState, sub_agent_id: &str) -> anyhow::Result<String> {
+        let mut store = state.rider_tokens.lock().await;
+        let (token, _) = store
+            .issue(
+                sub_agent_id.to_string(),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+                vec!["gui:show".to_string()],
+            )
+            .await?;
+        Ok(token)
+    }
+
+    fn session_token_from_show_url(url: &str) -> String {
+        url.split("token=")
+            .nth(1)
+            .unwrap_or("")
+            .split(['&', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    async fn opened_pending(
+        app: &axum::Router,
+        state: &AppState,
+        cap: &CapturingOpener,
+        bearer: &str,
+    ) -> anyhow::Result<crate::gui::PendingGuiShow> {
+        let before = cap.urls.lock().expect("urls").len();
+        let (status, body) = post_show_as(app, bearer).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "opened", "{body}");
+        let urls = cap.urls.lock().expect("urls");
+        assert_eq!(urls.len(), before + 1, "the show must open one browser");
+        let token = session_token_from_show_url(&urls[before]);
+        drop(urls);
+        Ok(state
+            .gui_show
+            .take_pending_for_session(&token, Instant::now())
+            .expect("the opened show queues its banner before the browser connects"))
+    }
+
+    /// Two riders keep separate sender ids. Stop on one rider blocks that
+    /// rider. It does not turn local show off, and the other rider and the
+    /// durable owner can still show.
+    #[tokio::test]
+    async fn separate_riders_are_blocked_and_attributed_apart_from_the_daemon() -> anyhow::Result<()>
+    {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let app = auth_router(Arc::clone(&state));
+        let rider_a = "aa".repeat(32);
+        let rider_b = "bb".repeat(32);
+        let token_a = issue_gui_show_rider(&state, &rider_a).await?;
+        let token_b = issue_gui_show_rider(&state, &rider_b).await?;
+        let daemon_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        let pending_a = opened_pending(&app, &state, &cap, &token_a).await?;
+        assert_eq!(pending_a.agent_id, rider_a);
+        assert_ne!(pending_a.agent_id, daemon_hex);
+        assert!(pending_a.rider);
+        assert!(pending_a.banner.contains("(rider)"));
+        assert!(pending_a.banner.contains(&short_id_hex(&rider_a)));
+        assert!(!pending_a.banner.contains(&short_id_hex(&daemon_hex)));
+        assert!(
+            pending_a.banner.contains(crate::gui::RIDER_SHOW_REENABLE),
+            "rider recovery must name the block file: {}",
+            pending_a.banner
+        );
+        assert!(
+            pending_a.banner.contains("gui_show_blocked.json"),
+            "rider recovery must name the block file: {}",
+            pending_a.banner
+        );
+        assert!(
+            pending_a.banner.contains("restart the daemon"),
+            "the block list loads at daemon start: {}",
+            pending_a.banner
+        );
+        assert!(
+            !pending_a.banner.contains("gui_show_local_disabled"),
+            "deleting the local marker does not unblock this rider: {}",
+            pending_a.banner
+        );
+
+        // The GUI Stop control sends `gui.block` with this frame's agent id.
+        // That id is not the daemon, so production Stop adds it to the block
+        // list and leaves local show on (`ws` `GuiBlock`).
+        let blocked =
+            super::super::super::parse_agent_id_hex(&pending_a.agent_id).expect("rider agent id");
+        state.gui_show.block_agent(&blocked);
+        assert!(state.gui_show.config().local_enabled);
+        assert!(!state.gui_show.is_blocked(&state.agent.agent_id()));
+
+        let urls_after_stop = cap.urls.lock().expect("urls").len();
+        let (status, body) = post_show_as(&app, &token_a).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "refused", "{body}");
+        assert_eq!(cap.urls.lock().expect("urls").len(), urls_after_stop);
+
+        let pending_b = opened_pending(&app, &state, &cap, &token_b).await?;
+        assert_eq!(pending_b.agent_id, rider_b);
+        assert!(pending_b.banner.contains(&short_id_hex(&rider_b)));
+        assert!(!pending_b.banner.contains(&short_id_hex(&rider_a)));
+
+        let pending_owner = opened_pending(&app, &state, &cap, "test-token").await?;
+        assert_eq!(pending_owner.agent_id, daemon_hex);
+        assert!(!pending_owner.rider);
+        assert!(!pending_owner.banner.contains("(rider)"));
+        assert!(
+            pending_owner.banner.contains("gui_show_local_disabled"),
+            "owner Stop still names the local marker: {}",
+            pending_owner.banner
+        );
+        assert!(
+            !pending_owner.banner.contains("gui_show_blocked.json"),
+            "owner Stop must not send the human to the block file: {}",
+            pending_owner.banner
+        );
+        Ok(())
+    }
+
+    /// Each rider spends its own burst. The daemon's quota stays available.
+    #[tokio::test]
+    async fn rider_burst_does_not_spend_the_daemon_or_another_rider() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let app = auth_router(Arc::clone(&state));
+        let token_a = issue_gui_show_rider(&state, &"aa".repeat(32)).await?;
+        let token_b = issue_gui_show_rider(&state, &"cc".repeat(32)).await?;
+
+        for i in 0..3 {
+            let pending = opened_pending(&app, &state, &cap, &token_a).await?;
+            assert_eq!(pending.agent_id, "aa".repeat(32), "show {i}");
+        }
+        let urls = cap.urls.lock().expect("urls").len();
+        let (status, body) = post_show_as(&app, &token_a).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "rate_limited", "{body}");
+        assert_eq!(cap.urls.lock().expect("urls").len(), urls);
+
+        let owner = opened_pending(&app, &state, &cap, "test-token").await?;
+        assert_eq!(
+            owner.agent_id,
+            hex::encode(state.agent.agent_id().as_bytes())
+        );
+        let other = opened_pending(&app, &state, &cap, &token_b).await?;
+        assert_eq!(other.agent_id, "cc".repeat(32));
+
+        let (status, body) = post_show_as(&app, &token_a).await?;
+        assert_eq!(body["outcome"], "rate_limited", "{status} {body}");
+        Ok(())
+    }
+
+    /// A `gui:show` token whose `sub_agent_id` is not an agent id is refused.
+    /// It must not open a browser as the daemon.
+    #[tokio::test]
+    async fn rider_with_a_bad_sub_agent_id_is_refused() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let app = auth_router(Arc::clone(&state));
+        let token = issue_gui_show_rider(&state, "not-an-agent-id").await?;
+        let (status, body) = post_show_as(&app, &token).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "refused", "{body}");
+        assert!(cap.urls.lock().expect("urls").is_empty());
+        let owner = opened_pending(&app, &state, &cap, "test-token").await?;
+        assert_eq!(
+            owner.agent_id,
+            hex::encode(state.agent.agent_id().as_bytes())
         );
         Ok(())
     }

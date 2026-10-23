@@ -196,7 +196,14 @@ pub(super) async fn auth_middleware(
                 )
                     .into_response();
             }
-            if !super::rider_auth::rider_route_allowed(&method, &path) {
+            if !super::rider_auth::rider_route_allowed(&method, &path, &rider.scopes) {
+                if method == axum::http::Method::POST && path == "/gui/show" {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(super::rider_auth::missing_gui_show_scope_body()),
+                    )
+                        .into_response();
+                }
                 return (
                     StatusCode::FORBIDDEN,
                     Json(serde_json::json!({
@@ -210,6 +217,7 @@ pub(super) async fn auth_middleware(
                 token_id: rider.token_id,
                 token_hash: rider.token_hash,
                 groups: rider.groups,
+                scopes: rider.scopes,
             };
             let mut req = req;
             req.extensions_mut().insert(actor);
@@ -412,9 +420,10 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/history/retain"
                     // ADR-0074 §1: named forwards resolve (and pin) a name.
                     | "/forwards"
-                    // #1392: David approved 22 Oct 2026 13:30 BST. Show is
-                    // an owner act. A GUI session bearer and a rider token
-                    // are refused, the same as POST /forwards.
+                    // #1392: David approved 22 Oct 2026 13:30 BST. An owner
+                    // token must be the durable API token. A GUI session
+                    // bearer is refused here. A rider is not an owner
+                    // token; `gui:show` admission is the rider scope check.
                     | "/gui/show"
             ) || is_two_segment_action(path, "delegate")
                 || is_group_quarantine_clear(path)

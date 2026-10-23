@@ -12,6 +12,6 @@ pub use show::{
     new_request_id, origin_banner, parse_gui_ws_query, short_id_hex, startup_config_path,
     CapturingOpener, GuiShowConfig, GuiShowOutcome, GuiShowRequest, GuiShowResponse,
     GuiShowRuntime, PendingGuiShow, PlatformOpener, ShowOpener, LOCAL_SHOW_DISABLE_FAILED,
-    LOCAL_SHOW_REENABLE,
+    LOCAL_SHOW_REENABLE, RIDER_SHOW_REENABLE,
 };
 pub use view_route::{parse, ParsedView, HASH_SPACE_APPS, HASH_VIEWS};

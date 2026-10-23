@@ -963,19 +963,20 @@ function onGuiShow(m){
     location.hash='#/'+route;
     if(location.hash===prev)applyHashRoute();
   }
-  showGuiShowBanner(m.banner||'Opened by an agent', m.agent_id||'');
+  showGuiShowBanner(m.banner||'Opened by an agent', m.agent_id||'', !!m.rider);
 }
 function hideGuiShowBanner(){
   const bar=document.getElementById('gui-show-banner');
   if(bar)bar.classList.remove('visible');
 }
-function showGuiShowBanner(text, agentId){
+function showGuiShowBanner(text, agentId, rider){
   const bar=document.getElementById('gui-show-banner');
   const label=document.getElementById('gui-show-banner-text');
   const block=document.getElementById('gui-show-banner-block');
   const hide=document.getElementById('gui-show-banner-dismiss');
   if(!bar||!label||!block||!hide)return;
   label.textContent=text;
+  block.textContent=rider?'Stop shows from this rider':'Stop local shows';
   bar.classList.add('visible');
   block.hidden=false;
   block.disabled=true;

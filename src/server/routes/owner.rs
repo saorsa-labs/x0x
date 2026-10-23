@@ -19,7 +19,7 @@
 //! `/owner/*` route before any handler runs.
 
 use super::super::state::AppState;
-use super::super::{api_error, parse_agent_id_hex};
+use super::super::{api_error, api_error_with_reason, parse_agent_id_hex};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -348,6 +348,10 @@ pub(in crate::server) struct IssueRiderRequest {
     /// Token lifetime in seconds (default 7 days, max 90 days).
     #[serde(default)]
     ttl_secs: Option<u64>,
+    /// Rider-token scopes. Empty is the default. The only defined value
+    /// is `gui:show`. This is not the group `delegation` scope list.
+    #[serde(default)]
+    scopes: Vec<String>,
     /// The sub-agent-signed delegation capability (review r3, option B)
     /// — REQUIRED: without it the daemon could assert any sub-agent and
     /// receivers would have no proof.
@@ -447,6 +451,17 @@ pub(in crate::server) async fn owner_riders_issue(
             "owner-admin endpoints require the durable API token (not a session token)",
         );
     }
+    // Reject an unknown scope before any certificate lookup or disk write.
+    let scopes = match crate::server::rider_auth::parse_rider_scopes(&req.scopes) {
+        Ok(scopes) => scopes,
+        Err(scope) => {
+            return api_error_with_reason(
+                StatusCode::BAD_REQUEST,
+                format!("unknown rider scope: {scope}"),
+                "unknown_scope",
+            );
+        }
+    };
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         return owner_missing();
     };
@@ -605,14 +620,22 @@ pub(in crate::server) async fn owner_riders_issue(
             cert_not_after,
             Some(delegation),
             now,
+            scopes,
         )
         .await;
     let (token, record) = match issued {
         Ok(issued) => issued,
-        Err(e) => {
+        Err(crate::server::rider_auth::IssueRiderError::UnknownScope(scope)) => {
+            return api_error_with_reason(
+                StatusCode::BAD_REQUEST,
+                format!("unknown rider scope: {scope}"),
+                "unknown_scope",
+            );
+        }
+        Err(crate::server::rider_auth::IssueRiderError::Persist(error)) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to persist rider token: {e}"),
+                format!("failed to persist rider token: {error}"),
             );
         }
     };
@@ -626,6 +649,7 @@ pub(in crate::server) async fn owner_riders_issue(
             "token_id": record.token_id,
             "sub_agent_id": target_hex,
             "groups": groups,
+            "scopes": record.scopes,
             "label": req.label,
             "issued_at_unix": record.issued_at,
             "expires_at_unix": record.expires_at,
@@ -671,6 +695,7 @@ pub(in crate::server) async fn owner_riders_list(
                 "token_id": record.token_id,
                 "sub_agent_id": record.sub_agent_id,
                 "groups": record.groups,
+                "scopes": record.scopes,
                 "label": record.label,
                 "issued_at_unix": record.issued_at,
                 "expires_at_unix": record.expires_at,
@@ -836,6 +861,7 @@ mod revocation_persistence_tests {
                 None,
                 None,
                 now,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -1232,5 +1258,54 @@ mod owner_recovery_mandate_tests {
         );
         assert_eq!(body["parent_head"], info.state_hash);
         state.agent.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod rider_scope_mint_tests {
+    use super::*;
+    use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn unknown_rider_scope_is_400_and_not_persisted() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let app = axum::Router::new()
+            .route("/owner/riders", post(owner_riders_issue))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/owner/riders")
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "sub_agent_id": "aa".repeat(32),
+                    "scopes": ["not-a-scope"],
+                    "delegation": {"payload_b64": "YQ==", "signature": "00"}
+                })
+                .to_string(),
+            ))?;
+        let resp = app.oneshot(req).await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(body["reason"], "unknown_scope");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not-a-scope"),
+            "{body}"
+        );
+        assert!(state.rider_tokens.lock().await.list().is_empty());
+        Ok(())
     }
 }

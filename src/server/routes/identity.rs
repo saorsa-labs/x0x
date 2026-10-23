@@ -1770,6 +1770,7 @@ mod owner_act_tests {
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await
             .expect("rider token issues");
@@ -2522,6 +2523,7 @@ mod owner_act_tests {
             token_id: 1,
             token_hash: String::new(),
             groups: Vec::new(),
+            scopes: Vec::new(),
         }
         .is_durable_owner());
     }

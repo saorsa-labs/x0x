@@ -17976,6 +17976,7 @@ pub(in crate::server) async fn send_group_public_message(
                 token_id,
                 token_hash,
                 groups,
+                ..
             } => {
                 let granted = groups.iter().any(|g| g.as_str() == info.stable_group_id());
                 if !granted {
@@ -56105,6 +56106,7 @@ pub(in crate::server) mod tests {
                 None,
                 None,
                 now,
+                Vec::new(),
             )
             .await?;
         let (status, body) = secure_group_encrypt(
@@ -56115,6 +56117,7 @@ pub(in crate::server) mod tests {
                 token_id: undel.1.token_id,
                 token_hash: undel.1.token_hash.clone(),
                 groups: vec![stable_group_id.to_string()],
+                scopes: Vec::new(),
             }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"no delegation"),
@@ -56138,6 +56141,7 @@ pub(in crate::server) mod tests {
                 None,
                 Some(delegation),
                 now,
+                Vec::new(),
             )
             .await?;
         let (status, body) = secure_group_encrypt(
@@ -56148,6 +56152,7 @@ pub(in crate::server) mod tests {
                 token_id: del.1.token_id,
                 token_hash: del.1.token_hash.clone(),
                 groups: vec![stable_group_id.to_string()],
+                scopes: Vec::new(),
             }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"delegated rider plaintext"),
@@ -56231,6 +56236,7 @@ pub(in crate::server) mod tests {
                     signature: del.1.delegation.clone().expect("delegation").signature,
                 }),
                 now,
+                Vec::new(),
             )
             .await?;
         let (status, body) = secure_group_encrypt(
@@ -56241,6 +56247,7 @@ pub(in crate::server) mod tests {
                 token_id: del2.1.token_id,
                 token_hash: del2.1.token_hash.clone(),
                 groups: vec![stable_group_id.to_string()],
+                scopes: Vec::new(),
             }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"not a member"),
