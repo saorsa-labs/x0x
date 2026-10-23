@@ -360,7 +360,7 @@ The instance data directory retains three private diagnostic records:
 A flush timeout, receipt-write failure or binding failure does not authorize
 the supervised exit. A flush that started — the daemon actually stopped
 behind the hook — and then failed or overran restores every binary the
-transaction swapped (daemon and `x0x` CLI together, or neither) and exits
+transaction swapped and exits
 `EX_TEMPFAIL` (75) for a service-manager restart on the old version; a
 refusal before the daemon stops is an ordinary error, nothing is restored,
 and the daemon keeps serving. Both cases are described under
