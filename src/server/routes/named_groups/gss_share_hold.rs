@@ -55,6 +55,9 @@ pub(in crate::server) struct GssShareHolds {
     /// `true` while the hold directory, or a file in it, cannot be read:
     /// every GSS group is held until a load succeeds.
     unreadable: std::sync::atomic::AtomicBool,
+    /// The groups whose last write failed. A later park or hold of the
+    /// group, a resend included, writes again ([`retry_unsaved`]).
+    unsaved: StdMutex<HashSet<String>>,
 }
 
 /// A verified GSS crypto-only exclusion that waits for its share.
@@ -109,8 +112,9 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
 }
 
 /// Whether a parked removal or ban, or a held crypto-only exclusion, still
-/// holds new ciphertext for `group_key`. There is no time limit: only the
-/// share or a moved head ends a hold. Call [`ensure_loaded`] first.
+/// holds new ciphertext for `group_key`. There is no time limit: only a
+/// secret of the held epoch, or a later one, ends a hold. Call
+/// [`ensure_loaded`] first.
 pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) -> bool {
     if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
         && (state
@@ -157,6 +161,11 @@ pub(super) async fn ensure_loaded(state: &AppState) {
     let mut entries = match tokio::fs::read_dir(&dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No holds saved: a load that succeeds.
+            state
+                .gss_share_holds
+                .unreadable
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             *loaded = true;
             return;
         }
@@ -339,13 +348,94 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
     super::sync_parent_dir_for_path(&path)
 }
 
-/// Log a failed write. Memory still holds the transition, so this process
-/// keeps withholding; only a restart before the next good write loses it.
+/// Write the group's holds, and log a failed write. Memory still holds the
+/// transition, so this process keeps withholding. The group is marked
+/// unsaved, so the next park or hold of it, a resend included, writes again
+/// ([`retry_unsaved`]); only a restart before a good write loses it.
 pub(super) async fn persist_logged(state: &AppState, group_key: &str) {
-    if let Err(error) = persist(state, group_key).await {
-        tracing::error!(
-            group_id = %LogHexId::group(group_key),
-            "#1573 GSS share hold not saved; sends stay withheld in this process: {error}"
+    let result = persist(state, group_key).await;
+    let mut unsaved = state
+        .gss_share_holds
+        .unsaved
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match result {
+        Ok(()) => {
+            unsaved.remove(group_key);
+        }
+        Err(error) => {
+            unsaved.insert(group_key.to_string());
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "#1573 GSS share hold not saved; sends stay withheld in this process: {error}"
+            );
+        }
+    }
+}
+
+/// Write the group's holds again if its last write failed. A resend of a
+/// held transition is not held twice, but it does retry the write.
+pub(super) async fn retry_unsaved(state: &AppState, group_key: &str) {
+    let unsaved = state
+        .gss_share_holds
+        .unsaved
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(group_key);
+    if unsaved {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// Add `hold` to the group's exclusion holds. At the cap the hold of the
+/// lowest epoch goes: a hold of a later epoch withholds whenever a hold of
+/// an earlier one does ([`holds`]), so the group stays held as before.
+fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> bool {
+    let mut lot = state
+        .gss_share_holds
+        .exclusions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = lot.entry(group_key.to_string()).or_default();
+    if list.contains(&hold) {
+        return false;
+    }
+    list.push(hold);
+    while list.len() > super::PARKED_ROLE_UPDATE_CAP {
+        let lowest = list
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, kept)| kept.secret_epoch)
+            .map(|(at, _)| at);
+        match lowest {
+            Some(at) => {
+                list.remove(at);
+            }
+            None => break,
+        }
+    }
+    true
+}
+
+/// A parked removal or ban left the full parked list: keep its hold as an
+/// exclusion hold of its epoch, so the cap never ends a hold. Its replay is
+/// lost; the containment is not. The caller writes the file.
+pub(super) fn keep_evicted_removal(
+    state: &AppState,
+    group_key: &str,
+    event: &NamedGroupMetadataEvent,
+) {
+    let parent = named_group_metadata_event_commit(event)
+        .and_then(|commit| commit.prev_state_hash.clone())
+        .unwrap_or_default();
+    if let Some(secret_epoch) = removal_epoch(event) {
+        push_exclusion(
+            state,
+            group_key,
+            ExclusionHold {
+                parent_state_hash: parent,
+                secret_epoch,
+            },
         );
     }
 }
@@ -359,29 +449,35 @@ pub(super) async fn hold_exclusion(
     secret_epoch: u64,
 ) {
     ensure_loaded(state).await;
-    let added = {
-        let mut lot = state
-            .gss_share_holds
-            .exclusions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let list = lot.entry(group_key.to_string()).or_default();
-        let hold = ExclusionHold {
+    let added = push_exclusion(
+        state,
+        group_key,
+        ExclusionHold {
             parent_state_hash: parent_state_hash.to_string(),
             secret_epoch,
-        };
-        if list.contains(&hold) {
-            false
-        } else {
-            while list.len() >= super::PARKED_ROLE_UPDATE_CAP {
-                list.remove(0);
-            }
-            list.push(hold);
-            true
-        }
-    };
+        },
+    );
     if added {
         persist_logged(state, group_key).await;
+    } else {
+        retry_unsaved(state, group_key).await;
+    }
+}
+
+/// Drop the group's exclusion holds that no longer hold `info` (a secret of
+/// their epoch or a later one is installed), such as an evicted removal's
+/// hold after its key installed. The caller writes the file.
+pub(super) fn prune_exclusions(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) {
+    let mut lot = state
+        .gss_share_holds
+        .exclusions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(list) = lot.get_mut(group_key) {
+        list.retain(|hold| holds(info, Some(hold.secret_epoch)));
+        if list.is_empty() {
+            lot.remove(group_key);
+        }
     }
 }
 
@@ -466,6 +562,12 @@ pub(in crate::server) mod test_seam {
         state
             .gss_share_holds
             .undecodable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        state
+            .gss_share_holds
+            .unsaved
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();

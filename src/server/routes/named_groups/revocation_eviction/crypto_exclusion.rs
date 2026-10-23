@@ -2032,17 +2032,29 @@ async fn install_gss(
 ) -> ReceiveOutcome {
     use super::super as ng;
     let waiting = info.secret_epoch < next_secret_epoch || info.shared_secret.is_none();
-    let promoted = if waiting {
-        super::owner_recovery::promoted_admin_secret(
-            state,
-            &body.stable_group_id,
-            &body.actor,
-            &body.commit.state_hash,
-            next_secret_epoch,
+    let roster_revision = body.roster_revision;
+    // The frame's verified result without its key: the roster that a later
+    // admin's promotion chains on.
+    let keyless = || {
+        ng::apply_stateful_event_to_group(
+            info,
+            commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.roster_revision =
+                    ng::adopt_roster_revision(next.roster_revision, roster_revision);
+                next.secret_epoch = next_secret_epoch;
+                next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+            },
         )
-        .await
-    } else {
-        None
+        .ok()
+    };
+    let result = if waiting { keyless() } else { None };
+    let promoted = match result {
+        Some(result) => {
+            super::owner_recovery::promoted_admin_secret(state, &result, next_secret_epoch).await
+        }
+        None => None,
     };
     if waiting && promoted.is_none() {
         tracing::info!(
@@ -2058,7 +2070,6 @@ async fn install_gss(
             .await;
         return ReceiveOutcome::WaitingForShare;
     }
-    let roster_revision = body.roster_revision;
     let next = match ng::apply_stateful_event_with_evidence(
         state,
         group_key,

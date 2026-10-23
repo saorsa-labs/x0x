@@ -1570,6 +1570,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// #1573: install a GSS removal head before its share, as a released
     /// receiver does (`legacy_gss_removal_receiver`).
     pub(super) legacy_gss_removal_receiver: std::sync::atomic::AtomicBool,
+    /// #1508 rc14: whether the group's sends were held at each step of a
+    /// parked GSS removal replay (`gss_replay_probe`).
+    pub(super) gss_replay_holds: StdMutex<Vec<bool>>,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }

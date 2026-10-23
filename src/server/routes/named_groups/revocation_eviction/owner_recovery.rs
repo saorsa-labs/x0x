@@ -1769,63 +1769,180 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
     Some((*secret_epoch, secret))
 }
 
-/// #1508 rc13 (Codex P1): the secret of `epoch` for a GSS removal, ban or
-/// crypto-only exclusion of `stable_group_id` by `actor` with result
-/// `result_state_hash`, from a later admin. The transition's actor can
-/// promote an admin and go offline; a lagging survivor then catches up
-/// from that admin. Its share is refused while it is a Member here, and
-/// the promotion chains on the transition, which waits for a share.
+/// #1508 rc13/rc14 (Codex P1): the secret of `epoch` for a GSS removal,
+/// ban or crypto-only exclusion whose verified, keyless result is
+/// `result`, from a later admin. The transition's actor can promote an
+/// admin and go offline, also after other commits (a rename); a lagging
+/// survivor then catches up from that admin. Its share is refused while it
+/// is a Member here, and the later commits chain on the transition, which
+/// waits for a share.
 ///
-/// The share is used only with authenticated chain evidence: a held,
-/// verified `MemberRoleUpdated` that `actor` signed directly on the
-/// transition's result and that makes the share's sender an admin
-/// ([`hold_unchained_event`]). The transition then installs with this
-/// secret, so its head still means that the key is installed: a keyless
-/// head could end a key delivery that later same-epoch commits keep open.
-/// The ordinary apply checks the promotion again when it replays.
+/// The share is used only when the held commits after `result` make its
+/// sender an active admin. Each step is checked as the ordinary apply
+/// checks it, on the roster the step before produced
+/// ([`next_held_state`]): the revocation gate, the commit's signature and
+/// signer authority, the event's own authority rules, and the result state
+/// hash, which binds the
+/// signed roster root to the event's fields. So a held event whose fields
+/// do not match its commit (a forged promotion around a genuine commit)
+/// promotes nobody. The transition then installs with this secret, so its
+/// head still means that the key is installed: a keyless head could end a
+/// key delivery that later same-epoch commits keep open. The ordinary
+/// apply checks the held commits again when they replay.
 pub(in crate::server) async fn promoted_admin_secret(
     state: &AppState,
-    stable_group_id: &str,
-    actor: &[u8; 32],
-    result_state_hash: &str,
+    result: &GroupInfo,
     epoch: u64,
 ) -> Option<[u8; 32]> {
+    let stable_group_id = result.stable_group_id().to_string();
     let now = Instant::now();
-    let (held, parked) = {
+    let (held, parked): (Vec<HeldEvent>, Vec<ParkedShare>) = {
         let inner = state.revocation_evictions.inner.lock().await;
         (
-            inner.orc.held_events.clone(),
-            inner.orc.early_shares.clone(),
+            inner
+                .orc
+                .held_events
+                .iter()
+                .filter(|held| {
+                    held.stable_group_id == stable_group_id
+                        && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
+                })
+                .cloned()
+                .collect(),
+            inner
+                .orc
+                .early_shares
+                .iter()
+                .filter(|share| {
+                    share.stable_group_id == stable_group_id
+                        && now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL
+                })
+                .cloned()
+                .collect(),
         )
     };
-    let promoted = |sender: &AgentId| {
-        let sender_hex = hex::encode(sender.as_bytes());
-        held.iter().any(|held| {
-            held.stable_group_id == stable_group_id
-                && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
-                && held.author.as_bytes() == actor
-                && held.prev_state_hash.as_deref() == Some(result_state_hash)
-                && matches!(
-                    &held.event,
-                    super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
-                        agent_id,
-                        role,
-                        ..
-                    } if *agent_id == sender_hex && role.at_least(x0x::groups::GroupRole::Admin)
-                )
-        })
+    if parked.is_empty() {
+        return None;
+    }
+    // A revoked agent signs no step and sends no trusted share, as in the
+    // ordinary apply's revocation gate.
+    let (held, parked) = {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        (
+            held.into_iter()
+                .filter(|held| !revoked.is_agent_revoked(&held.author))
+                .collect::<Vec<_>>(),
+            parked
+                .into_iter()
+                .filter(|share| !revoked.is_agent_revoked(&share.sender))
+                .collect::<Vec<_>>(),
+        )
     };
-    parked
-        .iter()
-        .filter(|share| {
-            share.stable_group_id == stable_group_id
-                && now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL
-                && promoted(&share.sender)
-        })
-        .find_map(|share| match open_parked_share(state, share) {
-            Some((at, secret)) if at == epoch => Some(secret),
-            _ => None,
-        })
+    let admin_share = |roster: &GroupInfo| {
+        parked
+            .iter()
+            .filter(|share| {
+                roster
+                    .caller_role(&hex::encode(share.sender.as_bytes()))
+                    .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+            })
+            .find_map(|share| match open_parked_share(state, share) {
+                Some((at, secret)) if at == epoch => Some(secret),
+                _ => None,
+            })
+    };
+    let mut cursor = result.clone();
+    // Each step moves the revision up, so the walk ends; the bound keeps it
+    // to the held set.
+    for _ in 0..=held.len() {
+        if let Some(secret) = admin_share(&cursor) {
+            return Some(secret);
+        }
+        match held.iter().find_map(|held| next_held_state(&cursor, held)) {
+            Some(next) => cursor = next,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// The state after the held commit `held` on `cursor`, checked as the
+/// ordinary apply checks it, or `None`. Only same-epoch roster and
+/// metadata steps are walked (a role update or a rename); any other event,
+/// or one that fails a check, ends the walk, and the transition keeps
+/// waiting for its share.
+fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
+    use super::super::NamedGroupMetadataEvent as Event;
+    let commit = super::super::named_group_metadata_event_commit(&held.event)?;
+    if commit.prev_state_hash.as_deref() != Some(cursor.state_hash.as_str()) {
+        return None;
+    }
+    let author = hex::encode(held.author.as_bytes());
+    let admin = |actor: &str| {
+        *actor == author
+            && cursor
+                .caller_role(actor)
+                .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+    };
+    let next = match &held.event {
+        Event::MemberRoleUpdated {
+            revision,
+            actor,
+            agent_id,
+            role,
+            ..
+        } => {
+            let target = cursor.members_v2.get(agent_id)?;
+            if !admin(actor)
+                || target.is_removed()
+                || target.is_banned()
+                || *role == x0x::groups::GroupRole::Owner
+            {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision =
+                        super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    next.set_member_role(agent_id, *role);
+                },
+            )
+        }
+        Event::GroupMetadataUpdated {
+            revision,
+            actor,
+            name,
+            description,
+            ..
+        } => {
+            if !admin(actor) {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision =
+                        super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    if let Some(name) = name.clone() {
+                        next.name = name;
+                    }
+                    if let Some(description) = description.clone() {
+                        next.description = description;
+                    }
+                    next.updated_at = commit.committed_at;
+                },
+            )
+        }
+        _ => return None,
+    }
+    .ok()?;
+    (next.secret_epoch == cursor.secret_epoch).then_some(next)
 }
 
 /// #1508 rc12 (Codex P1): hold a verified commit of a GSS group that does
@@ -1864,10 +1981,15 @@ pub(in crate::server) async fn hold_unchained_event(
     let now = Instant::now();
     {
         let inner = state.revocation_evictions.inner.lock().await;
-        if inner.orc.held_events.iter().any(|held| {
-            super::super::named_group_metadata_event_commit(&held.event)
-                .is_some_and(|kept| kept.state_hash == commit.state_hash)
-        }) {
+        // The whole event, not only its commit: a forged event around a
+        // genuine commit must not crowd the genuine one out
+        // ([`promoted_admin_secret`] checks each event's fields).
+        if inner
+            .orc
+            .held_events
+            .iter()
+            .any(|held| held.event == *event)
+        {
             return;
         }
     }
