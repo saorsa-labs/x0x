@@ -91,13 +91,183 @@ The coordination path uses explicit peer-ID-based NAT traversal via `connect_pee
 
 Successful connections enrich the bootstrap cache via `add_from_connection()`.
 
+## Seed identity pinning (issue #1112)
+
+`SEED_PEER_ID_PINS` (`src/network.rs`) carries one `SeedPeerPin` row per
+pinned seed address, separate from the `DEFAULT_BOOTSTRAP_PEERS` address
+list (whose public type is unchanged). The per-address pin is enforced at
+the SHARED address-dial boundary — `NetworkNode::connect_addr_with_origin`,
+next to the #292 answered-id gate and BEFORE the bootstrap-cache write,
+the success record, and the `PeerConnected` event — so every address dial
+(manual connects, join dials in every phase, HyParView bootstrap dials)
+refuses a mismatched answer instead of admitting it:
+
+- **No pin row**: trust-on-first-use, exactly as before #1112. No
+  production address is pinned today.
+- **Answer inside the pin set**: the dial proceeds, and a match at this
+  address clears any live rejection recorded for THIS address.
+- **Answer outside the pin set**: the dial returns an error — the hint is
+  dropped, never a trust anchor and never a hard join failure. The
+  refusal is SCOPED to the mismatching address/session and does three
+  things:
+  - records a bounded, expiring backoff entry for the address (10
+    minutes) with the answered identity and the connection generation it
+    arrived on. The entry refuses re-dials of that address pre-socket
+    until it expires — a bounded window, never a process-lifetime
+    tombstone. (A pair-scoped clear on a later MATCH exists defensively,
+    but in production it cannot end a live backoff: the pre-socket gate
+    refuses the address while the entry lives, so no matching dial can
+    run; a correctly re-keyed seed is dialable again once the window
+    lapses.);
+  - closes the answered connection with a plain transport disconnect
+    (#292 invariant-F style). ant-quic's NAT-traversal coordinator
+    selection reuses any live connection to a seed address and never
+    consults x0x's rejection set, so a live leftover kept the rejected
+    seed usable as coordinator/relay assistance. The close is
+    identity-scoped (the only close API); if the same identity holds a
+    valid connection at another address, the redial paths re-establish
+    it and it is admitted again at once, because no guard suppresses the
+    identity as a whole;
+  - evicts the answered identity's row from the shared bootstrap cache,
+    so cache-reading coordinator selection cannot surface it while the
+    backoff lives.
+
+The guards (`peer_admission`, the receive pump's frame drop, both
+guarded-send policy checks) refuse only the mismatching session: a live
+rejection entry must name the CURRENT connection's generation, or its
+address, so a valid connection of the same identity elsewhere — a
+different generation and address — stays admitted whatever the dial
+completion order. An entry with no generation evidence (the mismatching
+connection closed before capture) stays address-scoped: it refuses a
+session on its own address only, never the identity's sessions elsewhere.
+Independent of every recorded entry, the guards also apply the timeless
+pair verdict to the current session whenever any pin row exists — with
+no entry and after an entry expires: the session lookup reads the winner
+map the transport reader actually uses, which does not depend on the
+`connected_peers()` metadata a freshly materialized internal connection
+may not have registered yet. The walk over EVERY current connection of
+the identity fires only for an identity with a live rejection entry
+(Engineer ruling, 23 Oct 2026): entry-less identities — including every
+pin-matching seed, whatever its ledger history — never pay the
+connection-list scan on the receive path. A frame
+is additionally refused by its SOURCE session: a session-address ledger
+(recorded at the dial seams, the accept loop, the receive pump while a
+generation is live, and by an always-on lifecycle watcher on every
+ESTABLISHED generation — which only records while the event's generation
+is still current, so a late event can never mis-attribute the
+replacement's address) maps the frame's connection generation to the
+address it lived on, so a frame queued before a close and drained after
+it is refused even when the session was never rejected at the dial seam
+(id-based dials, internal redials). A reconnect at the same address never
+erases an earlier generation's entry. The ledger records SEED-ADDRESS
+sessions only — evidence for an unpinned address can never refuse a
+frame — is bounded (a few generations per peer, an hour per entry, a
+global identity cap), and is dormant while the pin table is empty.
+Frames of unknown provenance (never observed, or evicted by the bounds)
+are refused only for peers with a LIVE rejection entry — never on
+seed-address session history alone, so a pin-matching seed's frames of
+an unobserved generation keep flowing (Engineer ruling, 23 Oct 2026).
+Known provenance always decides by the pair verdict: the session ledger
+maps a frame's own generation to the address it lived on. Ordinary
+gossip sends are bound to the connection generation they examined — but
+only while any address is pinned: with nothing pinned the pre-#1112
+plain send stands, so the binding (a replacement between check and write
+fails the send instead of riding the unchecked connection) costs nothing
+today. A send with no live session fails with the structured
+PeerNotConnected (the #380 eviction contract), never a plain error that
+would only cool the peer. This is
+what catches an ant-quic-internal coordinator redial of a rejected seed,
+whose connection never passed x0x's dial seam. The guarded-send policy is recomputed
+inside the post-`open_uni` callback, so a rejection that lands while a
+stream waits for credit refuses the bytes there. The capability-hint
+selector additionally validates the observed (seed address, identity)
+pair itself, because inbound connections and id-based dials never pass
+the address-dial seam; that exclusion is pair-scoped, not identity-wide.
+
+The pin set is per address, never per host: the UDP/443 and UDP/5483
+listeners on one seed host are separate `x0xd` instances with separate
+machine keys (`.deployment/deploy-443.sh`), so each address needs its own
+pin. Pin lookups normalize v4-mapped forms on both sides.
+
+Why no production address is pinned yet: the repo holds PeerId captures
+for the six `:5483` seed listeners only (git history,
+`proofs/v0.19.0-validation-*` sustained-watch diagnostics of 2026-04-23,
+cross-confirmed by the May 2026 soak captures), and they are six months
+old. A pin that no longer matches a live seed key would refuse that seed
+for every client. Pinning is a deliberate operator change, made when the
+live fleet keys are verified. The pin table and its helpers are
+crate-private (`pub(crate)`): pinning is an operator-compiled behaviour,
+not a public API. Rejection entries expire on their own TTL, so the set
+cannot grow unbounded with dial rate against pinned addresses.
+
+### Capability hints: one observed operator tier (#1112)
+
+The coordinator/relay hint lists on outgoing machine announcements
+(`select_capability_hints`, `src/lib.rs`) admit exactly one tier:
+
+- **Operator tier:** a peer connected over a DIRECT path whose OBSERVED
+  remote address (v4-mapped forms normalized) IS a compiled-in seed
+  listener address — the full socket address, never the IP alone, so a
+  NATed peer with a relay slot on a seed (which advertises the seed IP on
+  an allocated port) does not qualify — and, when that address is pinned,
+  whose identity is inside its pin set, is a coordinator and relay hint
+  with no capability flag consulted at all. A completed QUIC handshake
+  with that source is deployment-derived evidence no announcement can
+  forge: listing a seed address in an announcement buys nothing.
+
+**Decided (David, 20 Oct 2026; confirmed 22 Oct 2026).** David's #1112
+ruling to ignore self-asserted relay/coordinator flags REPLACES ADR
+0071's community flag tiers. The announcement's `is_relay`/
+`is_coordinator` fields stay in the wire structs as informational data,
+but no hint, join or selection path reads them: a peer that only
+self-asserts the flags gets no hint. The same applies to the transport
+helper hints (`seed_transport_peer_hints_for_target`, `src/lib.rs`):
+gossip-advert roles and machine-cache flags contribute address hints
+only, never coordinator/relay capability marks — and so do the rows
+ant-quic's own `select_coordinators` / `select_relay_peers` return, which
+deliberately include unverified fallback peers ("measure, don't trust").
+A capability mark is fed to ant-quic only when the row carries its own
+fresh Global-scope direct observation — evidence this node's outbound
+dial created and no announcement can forge. ant-quic persists a
+higher-layer mark as a sticky `hinted_supports_*` bit that a false hint
+cannot clear, so at load x0x clears every persisted mark the row's
+current direct evidence does not support (addresses, direct observations
+and statistics are kept); marks older heads wrote by self-assertion or
+fallback promotion disappear at the next start.
+
+A pin-mismatched (observed address, identity) PAIR is excluded from the
+tier — pair-scoped, never identity-wide, so a mismatch at one seed
+address does not cost the same identity its valid, pinned origin at
+another. A relayed connection's observed address names the relay, not the
+peer, so it is never operator-tier evidence.
+
+### Seed key rotation policy
+
+A seed rotates its machine key as follows:
+
+1. **Prepare**: the operator generates the new key on the seed host. The
+   listener still runs under the OLD key.
+2. **Overlap first**: the next release pins BOTH the old and the new
+   PeerId on that address row (the pin is a set). Clients must hold the
+   overlap release — accepting either identity — BEFORE the listener
+   switches: switching first would make every pinned client reject the
+   old-key address it still expects.
+3. **Switch**: after the overlap release has spread (the slowest supported
+   client release cycle, minimum one minor release), the seed's listener
+   moves to the new key. Overlap-release clients accept it.
+4. **Expire**: a later release removes the old PeerId from the pin set.
+   An old identity answering after expiry is a failed hint — dropped like
+   any other mismatch.
+5. **Unpinned seeds** remain trust-on-first-use hints throughout; rotation
+   of an unpinned seed needs no release at all.
+
 ## Enhanced Announcements (`lib.rs`, `network.rs`)
 
 `IdentityAnnouncement` and `DiscoveredAgent` carry four optional NAT fields:
 - `nat_type: Option<String>` — e.g. "FullCone", "Symmetric", "None"
 - `can_receive_direct: Option<bool>` — whether inbound connections are accepted
-- `is_relay: Option<bool>` — whether the node is relaying for others
-- `is_coordinator: Option<bool>` — whether the node is coordinating NAT punch timing
+- `is_relay: Option<bool>` — whether the node claims it is relaying for others (informational: no hint, join or selection path reads it — David's 20 Oct 2026 #1112 ruling)
+- `is_coordinator: Option<bool>` — whether the node claims it is coordinating NAT punch timing (informational, same ruling)
 
 The sync `build_announcement()` leaves these as `None` (no network access). The async heartbeat queries `NetworkNode::node_status()` to populate them.
 
