@@ -25,6 +25,7 @@ fn rider() -> crate::server::rider_auth::ActorContext {
         token_id: 1,
         token_hash: "hash".to_string(),
         groups: Vec::new(),
+        scopes: Vec::new(),
     }
 }
 
@@ -730,6 +731,7 @@ async fn issue1228_open_envelope_middleware_refuses_scoped_tokens_before_body() 
             None,
             None,
             crate::server::rider_auth::unix_now_secs(),
+            Vec::new(),
         )
         .await?;
     let app = axum::Router::new()

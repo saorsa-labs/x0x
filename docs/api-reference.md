@@ -79,9 +79,11 @@ Auth-class labels used throughout this reference:
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
   route, (#1386) `POST /forwards` in every case (including plain hex
-  `peer_agent`), (#1392) `POST /gui/show`, `DELETE /forwards/:local_addr`
-  (David, 20 Oct 2026, 17:54 BST: a session token or a rider token is
-  refused, the same rule as `POST /forwards`), and every `/names*` route.
+  `peer_agent`), (#1392) `POST /gui/show` (a GUI session bearer is still
+  refused; a rider token is admitted only with `gui:show`),
+  `DELETE /forwards/:local_addr` (David, 20 Oct 2026, 17:54 BST: a session
+  token or a rider token is refused, the same rule as `POST /forwards`),
+  and every `/names*` route.
   The join-request list, approve and reject are not on this list. They
   take one class that depends on the group: see **Join-request admin
   (#1347)** below.
@@ -89,9 +91,9 @@ Auth-class labels used throughout this reference:
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
-- **rider-allowed** — the three surfaces a rider token may reach (see the
-  harness-boundary section below). Rider tokens authenticate in the
-  `Authorization` header only.
+- **rider-allowed** — the surfaces a rider token may reach (see the
+  harness-boundary section below). `POST /gui/show` needs `gui:show`.
+  Rider tokens authenticate in the `Authorization` header only.
 
 **#446 resolution notes:** `POST /announce` without
 `include_user_identity` and `PATCH /groups/:id` on ordinary
@@ -621,8 +623,9 @@ authority evidence), and the response returns the certificate
 (`certificate.storage_b64`) for ACP-attached harness instances.
 
 **Rider tokens** (`{ "sub_agent_id": <hex>, "groups": [gid…], "label"?:
-string, "ttl_secs"?: ≤ 90 days, default 7, "delegation": {
-"payload_b64", "signature" } }`) are stored hashed at rest (SHA-256),
+string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show"],
+"delegation": { "payload_b64", "signature" } }`) are stored hashed at
+rest (SHA-256),
 expire, and are revocable per-token or by revoking their sub-agent.
 The `delegation` capability is REQUIRED — a request without it answers
 `400 delegation is required…`. The CLI `x0x owner riders issue` mints
@@ -645,6 +648,7 @@ authenticates as a distinct principal that may reach exactly:
   must be listed explicitly like any other group (`rider_allows_group`
   checks the explicit list only)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
+- `POST /gui/show` — only when the token's `scopes` contain `gui:show`
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
 `/shutdown`, and the rest of the `/history` family (`/history/search`,
@@ -663,18 +667,42 @@ per-message envelope carries the certificate (~10 KB overhead) so
 verification is self-contained. `/agent/sign` stays owner-only. Rider
 Home encrypts record the sub-agent id as the history row's author.
 
-**Verified rider lifecycle** (run against a live daemon this campaign):
+`scopes` on `POST /owner/riders` is optional. It is the rider-token
+permission list. It is not the group list inside the delegation
+capability. Omit the field, or send `[]`, and the rider has no scopes.
+The only allowed value is the exact string `gui:show`. A repeated
+`gui:show` is stored once. Any other string, including a different case
+or added whitespace, is rejected before a certificate lookup or a disk
+write. The mint response is HTTP 400 and nothing is stored:
 
 ```json
-// POST /owner/riders -> 200 (token secret returned exactly once)
-{"ok":true,"sub_agent_id":"df4eca…","token_id":1,"label":"…",
- "groups":["home"],"issued_at_unix":1788091312,"expires_at_unix":1788092212,
- "token":"bfc14e49…"}
+{"error":"unknown rider scope: <value>","ok":false,"reason":"unknown_scope"}
 ```
 
-- `GET /owner/riders` lists records with **no secrets** — `token_id`,
-  `sub_agent_id`, `cert_digest`, `groups`, `issued_at_unix`,
-  `expires_at_unix`, `revoked_at_unix`. Durable-owner only.
+The issue response returns the secret once. `scopes` is the stored list.
+`label` is JSON `null` when the request omits it. This build serializes
+object keys in alphabetical order. The body from `owner_riders_issue` is:
+
+```json
+{"expires_at_unix":1788696112,"groups":["home"],"issued_at_unix":1788091312,
+ "label":null,"ok":true,"scopes":["gui:show"],"sub_agent_id":"<64 hex>",
+ "token":"<secret>","token_id":1}
+```
+
+`GET /owner/riders` is durable-owner only. It returns the same records
+with no secret. Each item from `owner_riders_list` is:
+
+```json
+{"ok":true,"riders":[{"cert_digest":"<hex>","expires_at_unix":1788696112,
+ "groups":["home"],"issued_at_unix":1788091312,"label":null,
+ "revoked_at_unix":null,"scopes":["gui:show"],"sub_agent_id":"<64 hex>",
+ "token_id":1}]}
+```
+
+A token minted with no `scopes` lists `"scopes": []`.
+
+**Rider lifecycle:**
+
 - With the rider token: `GET /history?scope=group:home` → `200`;
   `GET /owner/agents` → `403`; `POST /agent/sign` → `403`.
 - `DELETE /owner/riders/:id` → the very next rider request answers `401`
@@ -2933,14 +2961,15 @@ does not appear in `x0x routes`. What ships today is **point-to-point
 |---|---|---|---|
 | GET | `/gui` | `x0x gui` | Open the embedded browser UI |
 | GET | `/gui/` | — | Alias for `/gui` |
-| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). **durable-owner**: a GUI session bearer and a rider token receive a typed `403`. Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `navigated` means a visible GUI tab accepted the `gui.show` frame on its outbound queue (`gui=1` only while the tab is visible; the tab then sends `gui.visible`). A full queue does not accept the frame. An agent socket, a hidden tab, a tab whose session has expired, and a visible tab that cannot take the frame do not count, and the daemon opens a browser instead. A blocked sender, including this daemon's agent, is `refused`. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). The daemon re-reads `[gui_show]` from the file startup loaded when it serves `POST /acl/reload`. The reload response has no `gui_show` field. That route answers `422` only when an ACL plane fails. |
+| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). An owner token must be the durable API token. A GUI session bearer receives a typed `403`. A rider token with `gui:show` is admitted. A rider without that scope receives HTTP 403 `reason: missing_scope`. Absent/`null` `target_machine` means this machine (slice 1). The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `navigated` means a visible GUI tab accepted the `gui.show` frame on its outbound queue (`gui=1` only while the tab is visible; the tab then sends `gui.visible`). A full queue does not accept the frame. An agent socket, a hidden tab, a tab whose session has expired, and a visible tab that cannot take the frame do not count, and the daemon opens a browser instead. A blocked sender, including this daemon's agent, is `refused`. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, and `refused`. Config: `[gui_show] local_enabled` (default on). The daemon re-reads `[gui_show]` from the file startup loaded when it serves `POST /acl/reload`. The reload response has no `gui_show` field. That route answers `422` only when an ACL plane fails. |
 
 #### Example: local show
 
 ```bash
 # Open or navigate the local GUI to the People view.
-# $TOKEN is the durable owner API token. A GUI session bearer or a rider
-# token receives a typed 403.
+# $TOKEN is the durable owner API token, or a rider token with gui:show.
+# A GUI session bearer receives a typed 403. A rider without gui:show
+# receives HTTP 403 reason missing_scope.
 curl -s -X POST http://127.0.0.1:12700/gui/show \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -2951,11 +2980,27 @@ x0x show people
 x0x show groups/<group_id>/board
 ```
 
-`POST /gui/show` requires the durable owner API token (**durable-owner**). A GUI session bearer receives a typed `403`. A rider token receives a typed `403`. The refusal uses the same gate as `POST /forwards`. David approved this on 22 Oct 2026 at 13:30 BST.
+David approved rider `scopes` on 22 Oct 2026 at 22:22 BST. That ruling narrows the 22 Oct 2026 13:30 BST rule (`POST /gui/show` needs the durable owner token) for one case only. Admission is:
+
+- A durable owner API token is admitted.
+- A rider token whose stored `scopes` contain `gui:show` is admitted. `x0x show` posts this route. The response is still `{ "outcome", "machine_id", "request_id" }`. It never carries a URL or a session token.
+- A rider token without `gui:show` is HTTP 403. The body has no `ok` field:
+
+```json
+{"error":"rider token is missing scope gui:show","reason":"missing_scope"}
+```
+
+- A GUI session bearer is HTTP 403. The body has no `reason` field:
+
+```json
+{"error":"/gui/show requires the durable API token (not a session token)"}
+```
+
+A rider show is attributed to that token's `sub_agent_id`. The origin banner, the block check, the rate limit, and the `gui.show` `agent_id` use that id. Stop on a rider id adds that agent to the block list. It does not write `gui_show_local_disabled`. The rider banner tells the human to remove that agent's id from `gui_show_blocked.json` and restart the daemon. The button reads "Stop shows from this rider". Other riders and the daemon's own shows continue. Stop on the daemon's own agent still turns local show off. The local banner still names `gui_show_local_disabled`.
 
 View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
 
-Stop does not rewrite the daemon config file. Stop turns local show off in memory first, then writes `gui_show_local_disabled` in the data directory. If that write fails, shows are already off in this process. The WebSocket error frame reports the failure. To turn local show back on, delete `gui_show_local_disabled`. The next show, and `POST /acl/reload`, see that the marker is gone. A daemon config that already sets `local_enabled = true` does not cancel Stop, because Stop does not change that file. After the marker is gone, that config applies again. A file that sets `local_enabled = false` stays off. A file that omits the key uses the default, which is on. There is no new unblock route. Stop does not write `gui_show_blocked.json`. The opener does not inherit daemon stderr. A failed launch revokes the fresh session. The daemon queues the origin banner before it starts the platform opener. It removes that banner when the opener reports a confirmed failure (`no_display`). A queued origin banner stays until the current session token expires. That token lasts 10 minutes, and a refresh starts those 10 minutes again. That includes a hidden tab revealed later. The daemon delivers the banner when the tab sends `gui.visible` with `visible: true`. An opener that is still running at the 2 second deadline counts as `opened` and is not killed. `gui.block` has no success frame. A GUI tab whose session refresh fails sends `gui.visible` with `visible: false` and stops offering `gui=1`, so a later show opens a browser.
+Stop does not rewrite the daemon config file. Stop turns local show off in memory first, then writes `gui_show_local_disabled` in the data directory. If that write fails, shows are already off in this process. The WebSocket error frame reports the failure. To turn local show back on, delete `gui_show_local_disabled`. The next show, and `POST /acl/reload`, see that the marker is gone. A daemon config that already sets `local_enabled = true` does not cancel Stop, because Stop does not change that file. After the marker is gone, that config applies again. A file that sets `local_enabled = false` stays off. A file that omits the key uses the default, which is on. There is no new unblock route. Stop on this daemon's own agent does not write `gui_show_blocked.json`. A rider Stop does write that file, as the previous paragraph says. The opener does not inherit daemon stderr. A failed launch revokes the fresh session. The daemon queues the origin banner before it starts the platform opener. It removes that banner when the opener reports a confirmed failure (`no_display`). A queued origin banner stays until the current session token expires. That token lasts 10 minutes, and a refresh starts those 10 minutes again. That includes a hidden tab revealed later. The daemon delivers the banner when the tab sends `gui.visible` with `visible: true`. An opener that is still running at the 2 second deadline counts as `opened` and is not killed. `gui.block` has no success frame. A GUI tab whose session refresh fails sends `gui.visible` with `visible: false` and stops offering `gui=1`, so a later show opens a browser.
 
 ## Error handling
 

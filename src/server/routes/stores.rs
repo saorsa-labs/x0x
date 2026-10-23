@@ -4212,6 +4212,7 @@ mod tests {
             token_id: 1,
             token_hash: "hash".to_string(),
             groups: vec![group_id.clone()],
+            scopes: Vec::new(),
         };
         let (code, _) = list_legacy_page_imports(
             State(Arc::clone(&state)),

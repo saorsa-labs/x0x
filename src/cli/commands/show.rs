@@ -7,7 +7,8 @@ use serde_json::json;
 /// `x0x show <view> [--on <machine|active>]` — POST /gui/show.
 ///
 /// Slice 1 is local only: omit `--on`. A remote target is refused by the
-/// daemon until slice 3 (#1394).
+/// daemon until slice 3 (#1394). A rider bearer that carries `gui:show`
+/// is admitted by the daemon on this same body.
 pub async fn show(client: &DaemonClient, view: &str, on: Option<&str>) -> Result<()> {
     client.ensure_running().await?;
     let mut body = json!({ "view": view });

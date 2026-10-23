@@ -511,9 +511,9 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/owner/riders",
         cli_name: "owner riders issue",
-        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
+        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty, only gui:show is defined; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
         category: "identity",
-        request: RequestSpec::Fields(&[RequestField::body_as("sub_agent_id", true, "AGENT_ID"), RequestField::body_as("groups", false, "--group"), RequestField::body("label", false), RequestField::body("ttl_secs", false), RequestField::body_as("delegation", true, "--delegation-payload-b64")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("sub_agent_id", true, "AGENT_ID"), RequestField::body_as("groups", false, "--group"), RequestField::body_as("scopes", false, "--scope"), RequestField::body("label", false), RequestField::body("ttl_secs", false), RequestField::body_as("delegation", true, "--delegation-payload-b64")]),
     },
     EndpointDef {
         method: Method::Get,
