@@ -33,7 +33,10 @@ macro_rules! shutdown_flush_regression_tests {
                 std::fs::write(&executable, b"owned candidate fixture").unwrap();
                 let plan = restart::RestartPlan {
                     mode: restart::RestartMode::SupervisedExit,
-                    supervised_exit_code: Some(75),
+                    // Distinct from EX_TEMPFAIL (75) so the tests prove which
+                    // exit path fired: success exits the plan's code, a failed
+                    // started flush exits flush_failure_exit_code().
+                    supervised_exit_code: Some(7),
                     supervision_signal: Some("fixture-manager".into()),
                     executable: executable.clone(),
                     argv: vec![executable.to_str().unwrap().into()],
@@ -69,7 +72,7 @@ macro_rules! shutdown_flush_regression_tests {
                 let mut exited = false;
                 AutoApplyUpgrader::new("x0xd")
                     .trigger_restart_with_exit(&plan, "2.0.0", |code| {
-                        assert_eq!(code, 75);
+                        assert_eq!(code, 7);
                         assert!(flushed.load(Ordering::SeqCst));
                         let saved = record(&plan);
                         assert!(saved["receipt_id"].as_str().is_some());
@@ -92,6 +95,7 @@ macro_rules! shutdown_flush_regression_tests {
             fn supervised_exit_refuses_failed_flush_or_failed_receipt_write() {
                 for receipt_write_failure in [false, true] {
                     let (_dir, plan) = fixture();
+                    let original = std::fs::read(&plan.executable).unwrap();
                     let path = plan.data_root.join(flush::RECORD);
                     let owner = flush::register(
                         plan.data_root.clone(),
@@ -106,16 +110,51 @@ macro_rules! shutdown_flush_regression_tests {
                         }),
                     )
                     .unwrap();
-                    let mut exited = false;
-                    assert!(AutoApplyUpgrader::new("x0xd")
-                        .trigger_restart_with_exit(&plan, "2.0.0", |_| exited = true)
-                        .is_err());
+                    let mut exit_code = None;
+                    let result = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
+                        &plan,
+                        "2.0.0",
+                        |code| exit_code = Some(code),
+                    );
                     owner.join_workers();
-                    assert!(!exited);
+                    assert!(result.is_err());
+                    // Engineer ruling 23 Oct 2026: the started flush failed, so
+                    // the process exits EX_TEMPFAIL instead of staying up with
+                    // no API and no network. No backup exists in this fixture;
+                    // the installed bytes stay untouched by the recovery.
+                    assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
+                    assert_eq!(std::fs::read(&plan.executable).unwrap(), original);
                     if !receipt_write_failure {
                         assert!(record(&plan)["receipt_id"].is_null());
                     }
+                    assert!(plan.data_root.join(flush::ROLLBACK_RECORD).is_file());
                 }
+            }
+
+            #[test]
+            fn supervised_exit_after_failed_flush_restores_the_previous_binary() {
+                let (_dir, plan) = fixture();
+                let backup = plan.executable.with_extension("backup");
+                std::fs::write(&plan.executable, b"swapped candidate").unwrap();
+                std::fs::write(&backup, b"previous binary").unwrap();
+                let owner = flush::register(
+                    plan.data_root.clone(),
+                    Arc::new(|_| Err(io::Error::other("injected started flush failure"))),
+                )
+                .unwrap();
+                let mut exit_code = None;
+                let result = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
+                    &plan,
+                    "2.0.0",
+                    |code| exit_code = Some(code),
+                );
+                owner.join_workers();
+                assert!(result.is_err());
+                // Keep the old binary: the EX_TEMPFAIL restart lands on it.
+                assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
+                assert_eq!(std::fs::read(&plan.executable).unwrap(), b"previous binary");
+                assert!(!backup.exists());
+                assert!(plan.data_root.join(flush::ROLLBACK_RECORD).is_file());
             }
 
             #[test]
@@ -221,16 +260,16 @@ macro_rules! shutdown_flush_regression_tests {
                     Duration::from_millis(500),
                 )
                 .unwrap();
-                let exited = Arc::new(AtomicBool::new(false));
-                let exit_called = Arc::clone(&exited);
+                let exited = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+                let exit_code = Arc::clone(&exited);
                 let worker_plan = plan.clone();
                 let (returned, result) = std::sync::mpsc::channel();
                 let caller = std::thread::spawn(move || {
                     let outcome = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
                         &worker_plan,
                         "2.0.0",
-                        |_| {
-                            exit_called.store(true, Ordering::SeqCst);
+                        |code| {
+                            exit_code.store(code, Ordering::SeqCst);
                         },
                     );
                     let _ = returned.send(outcome);
@@ -242,7 +281,12 @@ macro_rules! shutdown_flush_regression_tests {
                 owner.join_workers();
                 did_enter.unwrap();
                 assert!(outcome.unwrap().is_err());
-                assert!(!exited.load(Ordering::SeqCst));
+                // An overrunning flush is a started failure: EX_TEMPFAIL,
+                // never a late success receipt.
+                assert_eq!(
+                    exited.load(Ordering::SeqCst),
+                    restart::flush_failure_exit_code()
+                );
                 assert!(record(&plan)["receipt_id"].is_null());
                 assert!(plan.data_root.join("upgrade-flush-rollback.json").is_file());
             }

@@ -443,6 +443,22 @@ fn sideline_path_for(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
+/// Put the pre-upgrade binary back at `target` from `backup` (engineer
+/// ruling 23 Oct 2026: a failed or overrunning acknowledged shutdown flush
+/// keeps the old binary so the service manager's restart lands on the old
+/// version). A missing backup means no swap happened or the backup was
+/// already consumed; the error names that state so the caller can log it
+/// and still exit `EX_TEMPFAIL`.
+pub fn restore_backup_binary(target: &Path, backup: &Path) -> std::io::Result<()> {
+    if !backup.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no backup binary at {} to restore", backup.display()),
+        ));
+    }
+    std::fs::rename(backup, target)
+}
+
 /// Reclaim leftover upgrade artifacts from interrupted or failed attempts.
 ///
 /// Two kinds of debris accumulate in the binary's directory:

@@ -176,6 +176,37 @@ macro_rules! arm_flush_regression_tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 1, "no new sync after expiry");
             }
 
+            #[test]
+            fn arm_flush_failure_reports_the_started_failure_and_marks_the_upgrade() {
+                let (dir, journal, request, state) = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                // The frozen plan's daemon target is pinned to the running
+                // executable by the journal's participant/install consistency
+                // rule, so byte restoration is proven at the trigger level
+                // (supervised_exit_after_failed_flush_restores_the_previous_binary);
+                // here the plan's backup does not exist and the recovery must
+                // stay non-destructive.
+                let target: PathBuf =
+                    serde_json::from_value(journal["plan"]["daemon"]["target_path"].clone())
+                        .unwrap();
+                let before = std::fs::read(&target).unwrap();
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|_| {
+                    Err(io::Error::other("injected started flush failure"))
+                }))
+                .unwrap();
+                let failure = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                owner.join_workers();
+                // Engineer ruling 23 Oct 2026: a started flush that failed is
+                // a FlushFailed (the process exits EX_TEMPFAIL for a restart
+                // on the old version), never a plain refusal.
+                assert!(matches!(failure, ArmFailure::FlushFailed(_)));
+                assert_eq!(std::fs::read(&target).unwrap(), before);
+                assert!(root.join(shutdown_flush::ROLLBACK_RECORD).is_file());
+                let saved: Value = serde_json::from_slice(
+                    &std::fs::read(root.join(shutdown_flush::RECORD)).unwrap()).unwrap();
+                assert!(saved["receipt_id"].is_null());
+            }
+
             // Socket execution belongs to the isolated Linux CI runner.
             #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
             #[tokio::test]
@@ -211,8 +242,12 @@ macro_rules! arm_flush_regression_tests {
                     writer.write_all(b"accepted shutdown log").unwrap();
                     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry()
                         .with(log_flush::FlushLayer::new(vec![writer]).unwrap()));
+                    let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+                    let observed_exit = Arc::clone(&exit_code);
                     let mut owner = tracing::dispatcher::with_default(&dispatch,
-                        || FlushOwner::start(&state, &root, &root)).unwrap();
+                        || FlushOwner::start(&state, &root, &root, shutdown_flush::LIMIT,
+                            Arc::new(move |code| observed_exit.store(code, std::sync::atomic::Ordering::SeqCst))))
+                        .unwrap();
                     let mut stream = tokio::net::UnixStream::connect(root.join(SOCKET)).await.unwrap();
                     let mut encoded = serde_json::to_vec(&request).unwrap(); encoded.push(b'\n');
                     stream.write_all(&encoded).await.unwrap();
@@ -240,6 +275,13 @@ macro_rules! arm_flush_regression_tests {
                     if fail {
                         assert!(response.get("receipt").is_none()); assert!(response["error"].is_string());
                         assert!(saved["receipt_id"].is_null());
+                        // Engineer ruling 23 Oct 2026: a started flush that failed
+                        // ends the process with EX_TEMPFAIL instead of parking the
+                        // daemon with no API and no network.
+                        assert_eq!(
+                            exit_code.load(std::sync::atomic::Ordering::SeqCst),
+                            crate::upgrade::restart::flush_failure_exit_code()
+                        );
                     } else {
                         assert_eq!(response["receipt"]["receipt_id"], saved["receipt_id"]);
                         assert!(saved["receipt_id"].is_string());
@@ -287,6 +329,32 @@ macro_rules! arm_flush_regression_tests {
                     assert_eq!(complete, !blocked);
                     if blocked { assert!(start.elapsed() >= Duration::from_secs(10)); }
                 }
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn shutdown_flush_counts_an_aborted_grace_straggler_as_unfinished() {
+                let (dir, _, _, _) = fixture();
+                let agent = Arc::new(crate::Agent::builder()
+                    .with_identity_dir(dir.path())
+                    .with_user_key_path(dir.path().join("user.key"))
+                    .with_machine_key(dir.path().join("machine.key"))
+                    .with_agent_key_path(dir.path().join("agent.key"))
+                    .with_agent_cert_path(dir.path().join("agent.cert"))
+                    .with_contact_store_path(dir.path().join("contacts.json"))
+                    .with_peer_cache_disabled().build().await.unwrap());
+                assert!(agent.network().is_none());
+                let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+                    dir.path(), Arc::clone(&agent)).await.unwrap();
+                state.exec_service.shutdown().await;
+                let straggler = tokio::spawn(std::future::pending::<()>());
+                let abort = straggler.abort_handle();
+                let complete = crate::server::drain_server_tasks(&state, vec![straggler]).await;
+                assert!(abort.is_finished(), "the straggler must be aborted and joined");
+                // ADR 0094 §4: an abort does not stop blocking work the task
+                // already started, so a task that missed the grace window is
+                // not a finished producer whatever its cancelled JoinError says.
+                assert!(!complete, "an aborted grace straggler must not count as finished");
+                agent.try_shutdown().await.unwrap();
             }
         }
     };

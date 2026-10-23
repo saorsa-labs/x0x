@@ -16,9 +16,51 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Compiled default flush budget. The transient ruling of 23 Oct 2026
+/// (ADR 0094 §4) sets the default at 30 s; `[update]
+/// shutdown_flush_timeout_secs` configures it per daemon up to `MAX_LIMIT`.
 pub(crate) const LIMIT: Duration = Duration::from_secs(30);
+/// Hard ceiling for a configured flush budget. The operator-facing floor
+/// (1 s) is validated with the config; the registration clamp only refuses
+/// a zero budget and this ceiling.
+pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
 pub(crate) const RECORD: &str = "upgrade-flush.json";
+pub(crate) const ROLLBACK_RECORD: &str = "upgrade-flush-rollback.json";
 type Hook = Arc<dyn Fn(Deadline) -> io::Result<()> + Send + Sync>;
+
+/// Why an `acknowledge` call failed, and whether this call had already
+/// started the flush when it failed. A caller whose failure is `started`
+/// has stopped the daemon behind the hook (no API, no network) and owns
+/// the recovery: restore the previous binary and exit `EX_TEMPFAIL`
+/// (engineer ruling 23 Oct 2026). A failure that is not `started` left
+/// the daemon serving; it is an ordinary refusal.
+#[derive(Debug)]
+pub(crate) struct FlushFailure {
+    pub(crate) error: io::Error,
+    pub(crate) started: bool,
+}
+
+impl FlushFailure {
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        self.error.kind()
+    }
+}
+
+impl std::fmt::Display for FlushFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl From<io::Error> for FlushFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            started: false,
+        }
+    }
+}
 
 /// The original transaction budget, including time spent suspended.
 pub(crate) struct Deadline {
@@ -105,6 +147,10 @@ impl Drop for Registration {
     }
 }
 
+// Default-budget registration and the explicit-budget acknowledge variant
+// are the regression macros' seams; production always registers the
+// configured budget and acknowledges with the entry's budget.
+#[cfg(test)]
 pub(crate) fn register(root: PathBuf, hook: Hook) -> io::Result<Registration> {
     register_with_limit(root, hook, LIMIT)
 }
@@ -129,7 +175,7 @@ pub(crate) fn register_with_limit(
         started: AtomicBool::new(false),
         shutdown_pending: AtomicBool::new(false),
         unused_released: tokio::sync::Notify::new(),
-        limit: limit.min(LIMIT),
+        limit: limit.max(Duration::from_millis(1)).min(MAX_LIMIT),
         #[cfg(test)]
         workers: Mutex::new(Vec::new()),
     });
@@ -250,7 +296,7 @@ impl Reservation {
 }
 
 fn check_previous(root: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(root.join("upgrade-flush-rollback.json")) {
+    match std::fs::symlink_metadata(root.join(ROLLBACK_RECORD)) {
         Ok(_) => {
             return Err(io::Error::other(
                 "previous shutdown flush requires recovery",
@@ -271,6 +317,65 @@ fn check_previous(root: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+/// Startup recovery (engineer ruling 23 Oct 2026): a receipt-less flush
+/// record or a rollback marker whose owning process is gone is debris from a
+/// failed or interrupted flush. The old owner held the instance data-root
+/// lock for its whole flush and never released it while alive, so a daemon
+/// running this cleanup after acquiring that lock proves the owner exited.
+/// Clear the debris, log the recorded cause, and leave that upgrade failed;
+/// a later apply starts fresh instead of being refused forever. A record
+/// holding a receipt proves a completed flush and is preserved. The manual
+/// fallback (stop the daemon, delete the files) is documented in
+/// docs/upgrade-system.md.
+pub(crate) fn clear_stale_records(root: &Path) {
+    match std::fs::symlink_metadata(root.join(ROLLBACK_RECORD)) {
+        Ok(_) => {
+            let reason = super::journal::read_auxiliary_record(&root.join(ROLLBACK_RECORD))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+                .and_then(|record| record.rollback_reason);
+            tracing::error!(
+                reason = reason.as_deref().unwrap_or("unknown"),
+                "previous shutdown flush failed; clearing its stale rollback record; \
+                 that upgrade is treated as failed"
+            );
+            if let Err(error) = std::fs::remove_file(root.join(ROLLBACK_RECORD)) {
+                tracing::error!(
+                    %error,
+                    "cannot remove the stale shutdown flush rollback record; \
+                     supervised apply stays disabled until it is cleared manually"
+                );
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(%error, "cannot inspect the shutdown flush rollback record"),
+    }
+    match super::journal::read_auxiliary_record(&root.join(RECORD)) {
+        Ok(bytes) => {
+            let resolved = validate(&bytes)
+                .ok()
+                .and_then(|()| serde_json::from_slice::<Record>(&bytes).ok())
+                .is_some_and(|record| record.receipt_id.is_some());
+            if resolved {
+                return;
+            }
+            tracing::error!(
+                "previous shutdown flush never returned its receipt; clearing the stale \
+                 record; that upgrade is treated as failed"
+            );
+            if let Err(error) = std::fs::remove_file(root.join(RECORD)) {
+                tracing::error!(
+                    %error,
+                    "cannot remove the stale shutdown flush record; \
+                     supervised apply stays disabled until it is cleared manually"
+                );
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(%error, "cannot inspect the shutdown flush record"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,17 +513,18 @@ pub(crate) fn acknowledge(
     root: &Path,
     binding: Binding,
     prepare: impl FnOnce() -> io::Result<()> + Send + 'static,
-) -> io::Result<Receipt> {
-    acknowledge_with_limit(root, binding, prepare, LIMIT)
+) -> Result<Receipt, FlushFailure> {
+    acknowledge_inner(root, binding, prepare, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn acknowledge_with_limit(
     root: &Path,
     binding: Binding,
     prepare: impl FnOnce() -> io::Result<()> + Send + 'static,
     limit: Duration,
-) -> io::Result<Receipt> {
-    acknowledge_inner(root, binding, prepare, limit, None)
+) -> Result<Receipt, FlushFailure> {
+    acknowledge_inner(root, binding, prepare, Some(limit), None)
 }
 
 pub(crate) fn acknowledge_reserved(
@@ -426,17 +532,17 @@ pub(crate) fn acknowledge_reserved(
     binding: Binding,
     prepare: impl FnOnce() -> io::Result<()> + Send + 'static,
     reservation: &Reservation,
-) -> io::Result<Receipt> {
-    acknowledge_inner(root, binding, prepare, LIMIT, Some(reservation))
+) -> Result<Receipt, FlushFailure> {
+    acknowledge_inner(root, binding, prepare, None, Some(reservation))
 }
 
 fn acknowledge_inner(
     root: &Path,
     binding: Binding,
     prepare: impl FnOnce() -> io::Result<()> + Send + 'static,
-    limit: Duration,
+    limit: Option<Duration>,
     reservation: Option<&Reservation>,
-) -> io::Result<Receipt> {
+) -> Result<Receipt, FlushFailure> {
     let hooks = HOOKS
         .lock()
         .map_err(|_| io::Error::other("flush registry poisoned"))?;
@@ -444,7 +550,7 @@ fn acknowledge_inner(
         .get(root)
         .cloned()
         .ok_or_else(|| io::Error::other("acknowledged shutdown owner unavailable"))?;
-    let limit = limit.min(entry.limit);
+    let limit = limit.unwrap_or(entry.limit).min(entry.limit);
     let deadline = Instant::now() + limit;
     let (boot_id, now) = clock()?;
     if let Some(reservation) = reservation {
@@ -452,16 +558,16 @@ fn acknowledge_inner(
             || !reservation.state.active.load(Ordering::Acquire)
             || !entry.armed.load(Ordering::Acquire)
         {
-            return Err(io::Error::other(
-                "shutdown reservation does not own admission",
-            ));
+            return Err(io::Error::other("shutdown reservation does not own admission").into());
         }
     } else if entry.armed.swap(true, Ordering::AcqRel) {
-        return Err(io::Error::other("shutdown flush already armed"));
+        return Err(io::Error::other("shutdown flush already armed").into());
     }
     if entry.started.swap(true, Ordering::AcqRel) {
-        return Err(io::Error::other("shutdown flush already started"));
+        return Err(io::Error::other("shutdown flush already started").into());
     }
+    // Past this gate this call owns the started flush: every later failure,
+    // including a deadline overrun, left the daemon stopped behind the hook.
     drop(hooks);
     let root = entry.root.clone();
     let record = Record {
@@ -534,7 +640,7 @@ fn acknowledge_inner(
                     rollback_reason: Some(reason),
                 };
                 if let Err(error) = super::journal::write_auxiliary_record(
-                    &rollback_root.join("upgrade-flush-rollback.json"),
+                    &rollback_root.join(ROLLBACK_RECORD),
                     &record,
                     validate,
                 ) {
@@ -550,7 +656,10 @@ fn acknowledge_inner(
             tracing::error!(%error, "failed to start shutdown flush rollback writer");
         }
     }
-    result
+    result.map_err(|error| FlushFailure {
+        error,
+        started: true,
+    })
 }
 
 #[cfg(test)]

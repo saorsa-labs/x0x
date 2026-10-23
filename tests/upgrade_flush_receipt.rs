@@ -183,6 +183,66 @@ macro_rules! flush_receipt_regression_tests {
                 }
                 owner.join_workers();
             }
+
+            #[test]
+            fn startup_clears_stale_flush_records_of_a_gone_owner() {
+                let dir = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                // Debris of an interrupted flush: a receipt-less record plus a
+                // rollback marker. check_previous refuses every later upgrade
+                // while either survives.
+                let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+                let (boot_id, _) = clock().unwrap();
+                let record = serde_json::json!({
+                    "schema_version": 1, "record_kind": "shutdown_flush",
+                    "binding": binding, "boot_id": boot_id,
+                    "deadline_ms": u64::MAX, "receipt_id": null, "rollback_reason": null,
+                });
+                crate::upgrade::journal::write_auxiliary_record(
+                    &root.join(RECORD),
+                    &record,
+                    validate,
+                )
+                .unwrap();
+                crate::upgrade::journal::write_auxiliary_record(
+                    &root.join(ROLLBACK_RECORD),
+                    &serde_json::json!({
+                        "schema_version": 1, "record_kind": "shutdown_flush",
+                        "binding": binding, "boot_id": boot_id,
+                        "deadline_ms": u64::MAX, "receipt_id": null,
+                        "rollback_reason": "interrupted by SIGTERM",
+                    }),
+                    validate,
+                )
+                .unwrap();
+                let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                assert!(
+                    ensure_ready(&root).is_err(),
+                    "stale debris must refuse the flush gate before the cleanup"
+                );
+                clear_stale_records(&root);
+                assert!(!root.join(RECORD).exists());
+                assert!(!root.join(ROLLBACK_RECORD).exists());
+                // With the debris cleared, the flush gate no longer refuses.
+                ensure_ready(&root).unwrap();
+                drop(owner);
+            }
+
+            #[test]
+            fn startup_keeps_a_receipt_bearing_flush_record() {
+                let dir = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+                acknowledge(&root, binding, || Ok(())).unwrap();
+                owner.join_workers();
+                assert!(root.join(RECORD).is_file());
+                clear_stale_records(&root);
+                assert!(
+                    root.join(RECORD).is_file(),
+                    "a completed receipt is evidence, not debris"
+                );
+            }
         }
     };
 }
