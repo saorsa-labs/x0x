@@ -31,6 +31,8 @@ mod routes;
 mod sse;
 mod state;
 mod update_check;
+#[cfg(unix)]
+mod upgrade_flush;
 pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
