@@ -14,7 +14,7 @@
 //!
 //! Pure wire types, limits and checks live in `crate::groups::recovery`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -328,18 +328,26 @@ impl ResponderBudget {
         });
     }
 
-    /// Admit one request from `requester`, or refuse it (§1 step 2).
-    fn admit(&mut self, requester: [u8; 32], now: Instant) -> bool {
+    /// Admit one request from `requester` (§1 step 2). A request over the
+    /// per-requester rate gets `refused {rate_limited}`. That refusal is a
+    /// response too (#1533 r10, §11): it takes a build slot and its bytes
+    /// count. With no slot or no byte budget left, nothing is sent.
+    fn admit(&mut self, requester: [u8; 32], now: Instant) -> Admission {
         self.roll(now);
-        if self.per_requester.contains_key(&requester)
-            || self.building >= s3::RESPONDER_CONCURRENT_BUILDS
+        if self.building >= s3::RESPONDER_CONCURRENT_BUILDS
             || self.bytes >= s3::RESPONDER_BYTES_PER_MINUTE
         {
-            return false;
+            return Admission::Drop;
         }
-        self.per_requester.insert(requester, now);
+        let admission = match self.per_requester.entry(requester) {
+            Entry::Vacant(slot) => {
+                slot.insert(now);
+                Admission::Build
+            }
+            Entry::Occupied(_) => Admission::Refuse,
+        };
         self.building += 1;
-        true
+        admission
     }
 
     fn may_sign(&mut self) -> bool {
@@ -356,6 +364,17 @@ impl ResponderBudget {
     }
 }
 
+/// What [`ResponderBudget::admit`] lets one request have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Build and send the answer.
+    Build,
+    /// Send a `rate_limited` refusal.
+    Refuse,
+    /// Send nothing.
+    Drop,
+}
+
 /// The subject's own recovery, per group.
 #[derive(Debug, Clone)]
 struct SubjectState {
@@ -365,8 +384,8 @@ struct SubjectState {
     next_retry_at: Instant,
     /// The index of the next target in the current round.
     next_target: usize,
-    /// The target asked last, and when.
-    pending: Option<([u8; 32], Instant)>,
+    /// The target asked last, when, and the head the request named.
+    pending: Option<([u8; 32], Instant, String)>,
     /// Each target asked and its last answer.
     asked: BTreeMap<String, String>,
     last_refusal: Option<String>,
@@ -603,7 +622,16 @@ where
             .cloned()
             .unwrap_or_default()
     };
+    let before = staging_containment(&candidate);
     mutate(&mut candidate);
+    let refused = matches!(
+        (before, staging_containment(&candidate)),
+        (Some(before), Some(after)) if before != after
+    );
+    if refused {
+        tracing::warn!(group_id = %LogHexId::group(stable_group_id), "ADR 0109 S3: a re-seat is staged; the original's containment stays until the swap, so this sidecar change is refused");
+        return false;
+    }
     candidate.generation = candidate.generation.saturating_add(1);
     if !write_sidecar(state, stable_group_id, &candidate).await {
         return false;
@@ -618,6 +646,62 @@ where
     }
     runtime.refresh_staging(stable_group_id, inner.sidecars.get(stable_group_id));
     true
+}
+
+/// The sidecar fields that hold the original record's S3 containment: its
+/// ATA, attestation conflict, served chain, queued terminal and the
+/// authoritative record behind its placeholder.
+type OriginalContainment = (
+    Option<AdminTerminalAttestation>,
+    Option<AdminTerminalAttestation>,
+    Vec<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<s3::AuthoritativeBindingV1>,
+);
+
+fn original_containment(body: &GroupRecoveryV1) -> OriginalContainment {
+    (
+        body.active_ata.clone(),
+        body.attestation_conflict.clone(),
+        body.served_chain.clone(),
+        body.queued_terminal.clone(),
+        body.authoritative_record.clone(),
+        body.authoritative_binding.clone(),
+    )
+}
+
+/// §3 step 2 (#1533 r10): while a re-seat journal is open and not yet
+/// `Swapping`, the live map holds the staged join, but the S3 state in the
+/// sidecar belongs to the journalled original, and the swap (or the
+/// rollback, which brings the original back) is the only exit. So no S3
+/// path that reads the staged record (retirement, arming, a reply, the
+/// placeholder maintenance) changes it: [`update_sidecar`] refuses such a
+/// change. `Some` with the frozen fields while that holds.
+fn staging_containment(body: &GroupRecoveryV1) -> Option<OriginalContainment> {
+    reseat_staged(body).then(|| original_containment(body))
+}
+
+/// A re-seat journal is open and not yet `Swapping`.
+fn reseat_staged(body: &GroupRecoveryV1) -> bool {
+    body.reseat_journal
+        .as_ref()
+        .is_some_and(|journal| journal.phase != ReseatPhase::Swapping)
+}
+
+/// The groups (stable ID) whose original containment is frozen for a
+/// staged re-seat ([`staging_containment`]).
+async fn staging_frozen_groups(state: &AppState) -> HashSet<String> {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .sidecars
+        .iter()
+        .filter(|(_, body)| reseat_staged(body))
+        .map(|(stable, _)| stable.clone())
+        .collect()
 }
 
 async fn sidecar_snapshot(state: &AppState, stable_group_id: &str) -> Option<GroupRecoveryV1> {
@@ -952,12 +1036,15 @@ pub(super) async fn legacy_store_view(
         return Ok(None);
     }
     let placeheld_ids: HashSet<String> = placeheld.keys().cloned().collect();
+    // #1533 r10: a staged re-seat keeps the original's authoritative
+    // record; the live record under the key is the staged join.
+    let frozen = staging_frozen_groups(state).await;
     let mut view: Option<HashMap<String, GroupInfo>> = None;
     for (stable, entry) in placeheld {
         let Some(canonical) = placeheld_key(groups, &stable, &entry).cloned() else {
             continue;
         };
-        if !entry.lost {
+        if !entry.lost && !frozen.contains(&stable) {
             sync_authoritative(state, &stable, &entry, &canonical, groups).await?;
         }
         for (key, info) in groups {
@@ -1407,6 +1494,10 @@ async fn ensure_placeholders(state: &AppState) {
     if bodies.is_empty() && registered.is_empty() {
         return;
     }
+    // #1533 r10: the live record of a staged re-seat is the staged join,
+    // not the original that the placeholder protects. Its placeholder, and
+    // the authoritative record behind it, stay as they are until the swap.
+    let frozen = staging_frozen_groups(state).await;
     let live: HashMap<String, (String, GroupInfo)> = {
         let groups = state.named_groups.read().await;
         let mut live = HashMap::new();
@@ -1424,6 +1515,9 @@ async fn ensure_placeholders(state: &AppState) {
     let mut resave = false;
     let mut unplacehold = Vec::new();
     for (stable, body) in &bodies {
+        if frozen.contains(stable) {
+            continue;
+        }
         let Some((key, info)) = live.get(stable) else {
             continue;
         };
@@ -1474,7 +1568,10 @@ async fn ensure_placeholders(state: &AppState) {
     }
     // A registered group whose sidecar no longer arms anything.
     for stable in registered.keys() {
-        if !bodies.iter().any(|(held, _)| held == stable) && !unplacehold.contains(stable) {
+        if !bodies.iter().any(|(held, _)| held == stable)
+            && !unplacehold.contains(stable)
+            && !frozen.contains(stable)
+        {
             unplacehold.push(stable.clone());
         }
     }
@@ -1774,24 +1871,28 @@ async fn answer_request(state: &Arc<AppState>, sender: AgentId, request: GroupAt
     }
     // Step 2: limits, before anything else.
     let now = Instant::now();
-    let admitted = state
+    let admission = state
         .group_recovery
         .inner
         .lock()
         .await
         .responder
         .admit(request.requester, now);
-    if !admitted {
-        let response = response_for(
-            &request,
-            AttestAnswer::Refused(AttestRefusalReason::RateLimited),
-        );
-        send_response(state, &group_key, sender, Guard::Refusal, &response, false).await;
-        return;
-    }
-    let (answer, guard) = build_answer(state, &group_key, &request).await;
-    let response = response_for(&request, answer);
-    let bytes = send_response(state, &group_key, sender, guard, &response, true).await;
+    let bytes = match admission {
+        Admission::Drop => return,
+        Admission::Refuse => {
+            let response = response_for(
+                &request,
+                AttestAnswer::Refused(AttestRefusalReason::RateLimited),
+            );
+            send_response(state, &group_key, sender, Guard::Refusal, &response, false).await
+        }
+        Admission::Build => {
+            let (answer, guard) = build_answer(state, &group_key, &request).await;
+            let response = response_for(&request, answer);
+            send_response(state, &group_key, sender, guard, &response, true).await
+        }
+    };
     state
         .group_recovery
         .inner
@@ -3164,7 +3265,7 @@ async fn next_target(
             };
         }
     }
-    if let Some((_, asked_at)) = subject.pending {
+    if let Some((_, asked_at, _)) = subject.pending {
         if now.saturating_duration_since(asked_at) < ANSWER_WAIT {
             return None;
         }
@@ -3199,7 +3300,7 @@ async fn next_target(
         return None;
     }
     let target = targets.get(subject.next_target).copied()?;
-    subject.pending = Some((*target.as_bytes(), now));
+    subject.pending = Some((*target.as_bytes(), now, info.state_hash.clone()));
     subject
         .asked
         .entry(hex::encode(target.as_bytes()))
@@ -3357,17 +3458,26 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
     let refs = live_refs(state, &info).await;
     let now = Instant::now();
     let mut inner = state.group_recovery.inner.lock().await;
+    // #1533 r10: only the reply of the target this node asked, for the
+    // head it asked about, moves the recovery state. A signed ATA carries
+    // its own authority (`arm_from_response` verifies it), as does a
+    // re-seat offer (above). Any other answer is the sender's word alone,
+    // so an unsolicited one (from any verified peer that knows the group
+    // and the head) changes nothing: no view, no round and no backoff.
+    let from_pending = inner.subjects.get(&stable).is_some_and(|subject| {
+        subject.pending.as_ref().is_some_and(|(target, _, head)| {
+            target == sender.as_bytes() && *head == response.for_head_state_hash
+        })
+    });
+    if !from_pending && !matches!(response.answer, AttestAnswer::Attested(_)) {
+        return;
+    }
     let subject = inner
         .subjects
         .entry(stable.clone())
         .or_insert_with(|| SubjectState::new(now, info.state_revision));
-    subject
-        .asked
-        .insert(sender_hex.clone(), answer_name.clone());
-    let from_pending = subject
-        .pending
-        .is_some_and(|(target, _)| target == *sender.as_bytes());
     if from_pending {
+        subject.asked.insert(sender_hex, answer_name);
         subject.pending = None;
     }
     match response.answer {
@@ -5808,14 +5918,17 @@ mod tests {
     fn responder_budget_limits_each_requester_and_builds() {
         let now = Instant::now();
         let mut budget = ResponderBudget::default();
-        assert!(budget.admit([1; 32], now));
-        assert!(!budget.admit([1; 32], now), "one response per interval");
+        assert_eq!(budget.admit([1; 32], now), Admission::Build);
         for id in 2..=4u8 {
-            assert!(budget.admit([id; 32], now));
+            assert_eq!(budget.admit([id; 32], now), Admission::Build);
         }
-        assert!(!budget.admit([9; 32], now), "four concurrent builds");
+        assert_eq!(
+            budget.admit([9; 32], now),
+            Admission::Drop,
+            "four concurrent builds"
+        );
         budget.finish(10);
-        assert!(budget.admit([9; 32], now));
+        assert_eq!(budget.admit([9; 32], now), Admission::Build);
         for _ in 0..s3::RESPONDER_SIGNATURES_PER_MINUTE {
             assert!(budget.may_sign());
         }
@@ -5824,6 +5937,209 @@ mod tests {
         budget.roll(later);
         assert!(budget.may_sign());
         assert!(budget.per_requester.is_empty());
+    }
+
+    /// Codex P2 (#1533 r10), ADR 0109 §11: a `rate_limited` refusal takes
+    /// a build slot and counts against the byte budget, so a request flood
+    /// from one capable peer stops at the concurrent-build and byte limits.
+    /// Before the fix every refused request started a response exchange
+    /// outside both.
+    #[test]
+    fn rate_limited_refusals_are_bounded_and_accounted() {
+        let now = Instant::now();
+        let mut budget = ResponderBudget::default();
+        assert_eq!(budget.admit([1; 32], now), Admission::Build);
+        budget.finish(10);
+        // H-S3-d7: every later request in the interval gets the refusal...
+        assert_eq!(budget.admit([1; 32], now), Admission::Refuse);
+        assert_eq!(budget.building, 1, "the refusal holds a build slot");
+        budget.finish(20);
+        assert_eq!(budget.bytes, 30, "the refusal's bytes count");
+        // ...while it fits the concurrent builds: a flood in flight stops.
+        for _ in 0..s3::RESPONDER_CONCURRENT_BUILDS {
+            assert_eq!(budget.admit([1; 32], now), Admission::Refuse);
+        }
+        for _ in 0..100 {
+            assert_eq!(budget.admit([1; 32], now), Admission::Drop);
+        }
+        assert_eq!(budget.admit([6; 32], now), Admission::Drop);
+        // And at the byte budget.
+        let mut spent = ResponderBudget::default();
+        assert_eq!(spent.admit([1; 32], now), Admission::Build);
+        spent.finish(s3::RESPONDER_BYTES_PER_MINUTE);
+        assert_eq!(spent.admit([1; 32], now), Admission::Drop);
+        // The next interval starts again.
+        let later = now + Duration::from_secs(61);
+        assert_eq!(
+            budget.admit([1; 32], later),
+            Admission::Drop,
+            "builds still held"
+        );
+        for _ in 0..s3::RESPONDER_CONCURRENT_BUILDS {
+            budget.finish(0);
+        }
+        assert_eq!(budget.admit([1; 32], later), Admission::Build);
+    }
+
+    /// Codex P1 (#1533 r10), ADR 0109 §3 step 2: while a re-seat join is
+    /// staged, the live map holds the staged record, but the placeholder,
+    /// the authoritative record behind it and the S3 state in the sidecar
+    /// stay the journalled original's until the swap. Before the fix the
+    /// placeholder maintenance read the staged record (off the ATA's
+    /// chain, so on its own it needs no placeholder), dropped the
+    /// placeholder and the authoritative record, and the legacy views got
+    /// the original's real record: no downgrade protection before the
+    /// durable swap. Any S3 path could also clear the original's ATA.
+    #[tokio::test]
+    async fn a_staged_reseat_keeps_the_originals_placeholder_and_s3_state() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        let original = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("armed record"))?;
+        assert!(open_staging_journal_for_test(&state, &key, &original).await?);
+        // The staged join under the key, at a head off the ATA's chain.
+        let mut staged = original.clone();
+        staged.seal_commit(&admin, 2_000)?;
+        assert!(armed_admin_ata(&state, &staged).await.is_none());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), staged.clone());
+
+        ensure_placeholders(&state).await;
+        assert!(is_placeheld(&state, &stable), "the placeholder stays");
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        ensure_placeholders(&state).await;
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&legacy), "downgrade protection kept");
+        assert_eq!(legacy.state_hash, original.state_hash);
+        let body = sidecar_on_disk(&state, &stable).await?;
+        let authoritative: GroupInfo = serde_json::from_slice(
+            body.authoritative_record
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("authoritative record"))?,
+        )?;
+        assert_eq!(authoritative.state_hash, original.state_hash);
+        assert!(body.active_ata.is_some());
+
+        // No S3 path that reads the staged record changes the original's
+        // S3 state: a retirement, a reply's conflict or a new ATA.
+        assert!(!update_sidecar(&state, &stable, |body| body.active_ata = None).await);
+        assert!(!update_sidecar(&state, &stable, |body| body.served_chain.push(Vec::new())).await);
+        let kept = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(kept.active_ata.is_some() && kept.served_chain.is_empty());
+        // Other fields still move (the journal's own phase, issued
+        // re-seats), and the swap may change the state once `Swapping`.
+        assert!(
+            update_sidecar(&state, &stable, |body| {
+                if let Some(journal) = body.reseat_journal.as_mut() {
+                    journal.phase = ReseatPhase::Swapping;
+                }
+            })
+            .await
+        );
+        assert!(update_sidecar(&state, &stable, |body| body.active_ata = None).await);
+        Ok(())
+    }
+
+    /// Codex P1 (#1533 r10), ADR 0109 §2/§3: a reply that is only the
+    /// sender's word (`not_on_chain`, `on_chain`, a refusal) moves the
+    /// recovery state only when it comes from the target this node asked,
+    /// for the head it asked about. Before the fix any verified peer that
+    /// knew the group and the head could send `not_on_chain` or
+    /// `banned_or_revoked` and change the view and the round.
+    #[tokio::test]
+    async fn only_the_asked_target_moves_the_recovery_state() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, _ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let stranger = x0x::identity::AgentKeypair::generate()?;
+        let response = |answer| GroupAttestResponseV1 {
+            group: stable.clone(),
+            subject: *state.agent.agent_id().as_bytes(),
+            for_head_state_hash: info.state_hash.clone(),
+            answer,
+        };
+        let not_on_chain = || {
+            AttestAnswer::NotOnChain(s3::AdminHead {
+                revision: 9,
+                state_hash: "f".repeat(64),
+            })
+        };
+        let banned = || AttestAnswer::Refused(AttestRefusalReason::BannedOrRevoked);
+        // Nobody was asked: nothing moves, from anyone.
+        for sender in [stranger.agent_id(), admin.agent_id()] {
+            handle_response(&state, sender, response(not_on_chain())).await;
+            handle_response(&state, sender, response(banned())).await;
+        }
+        assert!(!state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .contains_key(&stable));
+
+        // The admin is asked about this head; a stranger's reply still
+        // changes nothing.
+        let asked_at = Instant::now();
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .entry(stable.clone())
+            .or_insert_with(|| SubjectState::new(asked_at, info.state_revision))
+            .pending = Some((
+            *admin.agent_id().as_bytes(),
+            asked_at,
+            info.state_hash.clone(),
+        ));
+        handle_response(&state, stranger.agent_id(), response(banned())).await;
+        handle_response(&state, stranger.agent_id(), response(not_on_chain())).await;
+        {
+            let inner = state.group_recovery.inner.lock().await;
+            let subject = inner
+                .subjects
+                .get(&stable)
+                .ok_or_else(|| anyhow::anyhow!("subject"))?;
+            assert!(subject.pending.is_some(), "the round still waits");
+            assert!(subject.asked.is_empty());
+            assert!(!matches!(
+                subject.view,
+                SubjectView::Reseat { .. } | SubjectView::Refused { .. }
+            ));
+        }
+        // The asked target's reply counts.
+        handle_response(&state, admin.agent_id(), response(not_on_chain())).await;
+        let inner = state.group_recovery.inner.lock().await;
+        let subject = inner
+            .subjects
+            .get(&stable)
+            .ok_or_else(|| anyhow::anyhow!("subject"))?;
+        assert!(subject.pending.is_none());
+        assert!(matches!(
+            subject.view,
+            SubjectView::Reseat {
+                cause: "not_on_chain",
+                ..
+            }
+        ));
+        Ok(())
     }
 
     #[test]
