@@ -1462,10 +1462,9 @@ pub async fn serve_with_options(
                 Some(root) => root,
                 None => crate::storage::x0x_dir().await?,
             };
-            let limit = Duration::from_secs(config.update.shutdown_flush_timeout_secs.max(1));
             let exit: std::sync::Arc<dyn Fn(i32) + Send + Sync> =
                 std::sync::Arc::new(|code| std::process::exit(code));
-            upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root, limit, exit)
+            upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root, exit)
                 .map_err(anyhow::Error::from)
         }
         .await;

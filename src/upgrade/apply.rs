@@ -26,6 +26,11 @@ pub(crate) const HTTP_DEFERRED_RESTART_DELAY: std::time::Duration =
 /// The probe runs with the existing install locks held, before admission.
 type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + Send>;
 
+/// Restart continuation, handed the `(target, fresh backup)` pairs this
+/// transaction actually swapped so a failed flush restores exactly those —
+/// the daemon/CLI pair together or not at all.
+type RestartContinuation = Box<dyn FnOnce(&[(PathBuf, PathBuf)]) + Send>;
+
 #[cfg(unix)]
 async fn inspect_probe_admission(
     install: PathBuf,
@@ -127,12 +132,12 @@ fn arm_http_deferred_restart_owner(
     restart_plan: restart::RestartPlan,
     version: String,
     flush_reservation: Option<super::shutdown_flush::Reservation>,
-) -> Result<Box<dyn FnOnce() + Send>, std::io::Error> {
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+) -> Result<RestartContinuation, std::io::Error> {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<Vec<(PathBuf, PathBuf)>>();
     #[cfg(test)]
     let test_restart = http_deferred_restart_seam::capture(&restart_plan.executable);
     spawn_http_deferred_restart_thread(move || match go_rx.recv() {
-        Ok(()) => {
+        Ok(swapped) => {
             std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
             #[cfg(test)]
             if let Some(restart) = test_restart {
@@ -143,15 +148,19 @@ fn arm_http_deferred_restart_owner(
                 .with_stop_on_upgrade(stop_on_upgrade)
                 .with_restart_context(restart_context)
                 .with_flush_reservation(flush_reservation)
+                .with_swapped_artifacts(swapped)
                 .with_restart_on_success(false);
             if let Err(e) = owner.trigger_restart(&restart_plan, &version) {
+                // Refusal before any flush started: the daemon keeps serving
+                // and the installed bytes stay in place.
                 error!(
                     error = %e,
                     installed_bytes = true,
                     restart = "not_started",
                     readiness_observed = false,
+                    recovery = "none",
                     "Deferred HTTP restart did not obtain authorization: {e}; \
-                     process retained for manual recovery"
+                     refused before any flush started, the daemon keeps serving"
                 );
             }
         }
@@ -159,8 +168,8 @@ fn arm_http_deferred_restart_owner(
             // Pre-admission cancel / apply failure: sender dropped; no restart.
         }
     })?;
-    Ok(Box::new(move || {
-        if go_tx.send(()).is_err() {
+    Ok(Box::new(move |swapped: &[(PathBuf, PathBuf)]| {
+        if go_tx.send(swapped.to_vec()).is_err() {
             warn!(
                 installed_bytes = true,
                 restart = "not_started",
@@ -512,7 +521,7 @@ async fn apply_replacements_offloaded(
     target_version: semver::Version,
     companion: Option<(Upgrader, PathBuf)>,
     temp_guard: TempDirGuard,
-    on_success: Option<Box<dyn FnOnce() + Send>>,
+    on_success: Option<RestartContinuation>,
     probe_admission: Option<ProbeAdmission>,
 ) -> Result<UpgradeResult, UpgradeError> {
     apply_replacements_with_permit(
@@ -552,7 +561,7 @@ async fn apply_replacements_with_permit(
     target_version: semver::Version,
     companion: Option<(Upgrader, PathBuf)>,
     temp_guard: TempDirGuard,
-    mut on_success: Option<Box<dyn FnOnce() + Send>>,
+    mut on_success: Option<RestartContinuation>,
     probe_admission: Option<ProbeAdmission>,
     permit: Option<&ReleasePermit>,
     flush_reservation: Option<super::shutdown_flush::Reservation>,
@@ -649,24 +658,69 @@ async fn apply_replacements_with_permit(
         } else {
             None
         };
+        // (target, fresh backup) pairs this transaction actually swapped.
+        let mut companion_swapped: Vec<(PathBuf, PathBuf)> = Vec::new();
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
             match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
-                Ok(_) => info!("x0x companion upgraded successfully"),
+                Ok((_, Some(backup))) => {
+                    info!("x0x companion upgraded successfully");
+                    companion_swapped.push((x0x_upgrader.target_path().to_path_buf(), backup));
+                }
+                Ok((_, None)) => {
+                    info!("x0x companion already matches the incoming bytes; no swap")
+                }
                 Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
             }
         }
 
-        let result = upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version)?;
-        if matches!(result, UpgradeResult::Success { .. }) {
-            if let Some(cont) = on_success.take() {
-                // Clean temp before a continuation that may `_exit` / `exit`
-                // without running Drop (#1447 RC4 P2).
-                drop(temp_custody.take());
-                if let Some(admission) = &mut flush_admission {
-                    admission.handed_off = true;
-                }
-                cont();
+        // Roll the companion back whenever the daemon replace failed or
+        // rolled itself back: a daemon/CLI pair never ends mixed (engineer
+        // ruling, 23 Oct 2026).
+        let restore_companions = |companion_swapped: &[(PathBuf, PathBuf)]| {
+            if companion_swapped.is_empty() {
+                return;
             }
+            match super::restore_swapped_binaries(companion_swapped) {
+                Ok(()) => warn!(
+                    targets = ?companion_swapped
+                        .iter()
+                        .map(|(target, _)| target.display().to_string())
+                        .collect::<Vec<_>>(),
+                    "daemon replace failed; restored the companion binaries this transaction swapped"
+                ),
+                Err(error) => error!(
+                    %error,
+                    "cannot restore the companion binaries this transaction \
+                     swapped; manual recovery applies"
+                ),
+            }
+        };
+
+        let daemon_replace =
+            upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version);
+        let (result, daemon_backup) = match daemon_replace {
+            Ok(pair) => pair,
+            Err(error) => {
+                restore_companions(&companion_swapped);
+                return Err(error);
+            }
+        };
+        if !matches!(result, UpgradeResult::Success { .. }) {
+            restore_companions(&companion_swapped);
+            return Ok(result);
+        }
+        let mut swapped = companion_swapped;
+        if let Some(backup) = daemon_backup {
+            swapped.push((upgrader.target_path().to_path_buf(), backup));
+        }
+        if let Some(cont) = on_success.take() {
+            // Clean temp before a continuation that may `_exit` / `exit`
+            // without running Drop (#1447 RC4 P2).
+            drop(temp_custody.take());
+            if let Some(admission) = &mut flush_admission {
+                admission.handed_off = true;
+            }
+            cont(&swapped);
         }
         Ok(result)
     });
@@ -714,6 +768,11 @@ pub struct AutoApplyUpgrader {
     staging: Option<super::staging_runtime::Gate>,
     release_permit: Option<ReleasePermit>,
     flush_reservation: Option<super::shutdown_flush::Reservation>,
+    /// `(target, fresh backup)` pairs for exactly the artifacts this
+    /// transaction swapped. `None` (direct restart callers) restores the
+    /// plan's daemon pair, as before; `Some(..)` is what the apply worker
+    /// recorded, and may be empty when nothing swapped.
+    swapped_artifacts: Option<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl AutoApplyUpgrader {
@@ -728,7 +787,13 @@ impl AutoApplyUpgrader {
             staging: None,
             release_permit: None,
             flush_reservation: None,
+            swapped_artifacts: None,
         }
+    }
+
+    pub(crate) fn with_swapped_artifacts(mut self, artifacts: Vec<(PathBuf, PathBuf)>) -> Self {
+        self.swapped_artifacts = Some(artifacts);
+        self
     }
 
     pub(crate) fn with_release_permit(mut self, permit: ReleasePermit) -> Self {
@@ -979,6 +1044,7 @@ impl AutoApplyUpgrader {
             http_deferred_restart: self.http_deferred_restart,
             restart_context: self.restart_context.clone(),
             flush_reservation: self.flush_reservation.clone(),
+            swapped_artifacts: self.swapped_artifacts.clone(),
             #[cfg(unix)]
             staging: self.staging.clone(),
             release_permit: self.release_permit.clone(),
@@ -1167,6 +1233,33 @@ impl AutoApplyUpgrader {
         // replacement and restart — never re-derived post-swap.
         let restart_plan = self.resolve_restart_plan(&target_path).await?;
         self.check_release()?;
+        // Failed-upgrade hold (engineer ruling, 23 Oct 2026): a release whose
+        // started flush failed is not applied again automatically — neither
+        // here nor on any later check — until a newer release appears or the
+        // operator removes the hold file. Without this, a deterministic flush
+        // failure turns every restart into the same failed apply (an endless
+        // exit loop ADR 0094 §4 forbids).
+        #[cfg(unix)]
+        if let Some(held) =
+            super::shutdown_flush::release_is_held(&restart_plan.data_root, &target_version)
+                .map_err(|error| {
+                    UpgradeError::Other(format!("failed-upgrade hold unreadable: {error}"))
+                })?
+        {
+            error!(
+                held_release = %held,
+                target_version = %target_version,
+                hold = %restart_plan.data_root.join(super::shutdown_flush::HOLD_RECORD).display(),
+                "refusing to apply a release held by a failed acknowledged flush; \
+                 a strictly newer release applies, or stop the daemon and remove \
+                 the hold file"
+            );
+            return Err(UpgradeError::Other(format!(
+                "release {held} is held after a failed acknowledged shutdown flush \
+                 (see docs/upgrade-system.md); remove the hold file or apply a \
+                 newer release"
+            )));
+        }
         #[cfg(unix)]
         let probe_launch = super::probe::ProbeLaunch::capture(&restart_plan.cwd);
         // Refuse a failed Unix record barrier before download or replacement.
@@ -1429,23 +1522,28 @@ impl AutoApplyUpgrader {
         let stop_on_upgrade = self.stop_on_upgrade;
         let restart_context = self.restart_context.clone();
         let continuation_reservation = flush_reservation.clone();
-        let on_success: Option<Box<dyn FnOnce() + Send>> = if self.restart_on_success {
-            Some(Box::new(move || {
+        let on_success: Option<RestartContinuation> = if self.restart_on_success {
+            Some(Box::new(move |swapped: &[(PathBuf, PathBuf)]| {
                 let owner = AutoApplyUpgrader::new(&binary_name)
                     .with_stop_on_upgrade(stop_on_upgrade)
                     .with_restart_context(restart_context)
                     .with_flush_reservation(continuation_reservation)
+                    .with_swapped_artifacts(swapped.to_vec())
                     .with_restart_on_success(false);
                 if let Err(e) = owner.trigger_restart(&restart_plan_for_cont, &version_for_cont) {
+                    // Only a refusal can return here: it happened before any
+                    // flush started, so the daemon keeps serving, the
+                    // installed bytes stay in place and nothing is restored.
+                    // A started flush that failed restores and exits
+                    // EX_TEMPFAIL inside trigger_restart instead.
                     error!(
                         error = %e,
                         installed_bytes = true,
                         restart = "not_started",
                         readiness_observed = false,
-                        recovery = "exited_tempfail",
-                        "Restart did not obtain a flush receipt: {e}; the previous \
-                         binary is restored and the process exits EX_TEMPFAIL for a \
-                         supervisor restart"
+                        recovery = "none",
+                        "Restart did not obtain a flush receipt: {e}; refused \
+                         before any flush started, the daemon keeps serving"
                     );
                 }
             }))
@@ -1540,7 +1638,7 @@ impl AutoApplyUpgrader {
         &self,
         plan: &restart::RestartPlan,
         target_version: &str,
-        exit: impl FnOnce(i32),
+        mut exit: impl FnMut(i32),
     ) -> Result<(), UpgradeError> {
         let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
         let handoff_path = plan.handoff_path();
@@ -1577,26 +1675,48 @@ impl AutoApplyUpgrader {
                     Err(failure) if failure.started => {
                         // Engineer ruling 23 Oct 2026: a flush that started
                         // and failed or overran left this daemon stopped
-                        // behind the hook (no API, no network). Restore the
-                        // previous binary, leave the failed-upgrade rollback
-                        // record in place, log the cause, and exit
-                        // EX_TEMPFAIL so the service manager restarts the
-                        // daemon on the old version.
+                        // behind the hook (no API, no network). Record the
+                        // failed-release hold first so the restart loop this
+                        // exit creates cannot re-apply the same release,
+                        // restore every binary this transaction swapped, and
+                        // exit EX_TEMPFAIL so the service manager restarts
+                        // the daemon on the old version.
+                        let restore_set: Vec<(PathBuf, PathBuf)> =
+                            self.swapped_artifacts.clone().unwrap_or_else(|| {
+                                vec![(
+                                    plan.executable.clone(),
+                                    plan.executable.with_extension("backup"),
+                                )]
+                            });
                         error!(
                             error = %failure,
-                            installed_bytes = false,
+                            installed_bytes = true,
+                            restored_bytes = true,
                             restart = "not_started",
-                            "supervised shutdown flush failed; the previous binary is restored \
-                             and the process exits EX_TEMPFAIL for a supervisor restart"
+                            recovery = "exited_tempfail",
+                            "supervised shutdown flush failed after the daemon stopped; \
+                             the binaries this transaction swapped are restored and the \
+                             process exits EX_TEMPFAIL for a supervisor restart"
                         );
-                        let backup = plan.executable.with_extension("backup");
-                        if let Err(restore_error) =
-                            super::restore_backup_binary(&plan.executable, &backup)
-                        {
+                        if let Err(hold_error) = super::shutdown_flush::hold_failed_release(
+                            &plan.data_root,
+                            target_version,
+                            &failure.to_string(),
+                        ) {
+                            error!(
+                                error = %hold_error,
+                                "cannot persist the failed-upgrade hold; the next \
+                                 automatic check may retry this release once more"
+                            );
+                        }
+                        if let Err(restore_error) = super::restore_swapped_binaries(&restore_set) {
                             error!(
                                 error = %restore_error,
-                                target = %plan.executable.display(),
-                                "cannot restore the previous binary; manual recovery applies"
+                                restore_set = ?restore_set
+                                    .iter()
+                                    .map(|(target, _)| target.display().to_string())
+                                    .collect::<Vec<_>>(),
+                                "cannot restore the swapped binaries; manual recovery applies"
                             );
                         }
                         exit(restart::flush_failure_exit_code());
@@ -1611,9 +1731,7 @@ impl AutoApplyUpgrader {
                         )));
                     }
                 };
-                receipt
-                    .authorize(&binding)
-                    .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                authorize_receipt_after_stop(&receipt, &binding, &mut exit)?;
                 let exit_code = plan
                     .supervised_exit_code
                     .unwrap_or_else(restart::supervised_exit_code);
@@ -1632,6 +1750,33 @@ impl AutoApplyUpgrader {
             ),
         }
     }
+}
+
+/// The flush already succeeded, so the daemon is stopped behind the hook.
+/// Any error this late must still end in an exit (engineer ruling,
+/// 23 Oct 2026): returning Err would park a daemon with no API and no
+/// network. The new bytes are installed and durably flushed, so the exit
+/// restarts on them; nothing is restored.
+fn authorize_receipt_after_stop(
+    receipt: &super::shutdown_flush::Receipt,
+    binding: &super::shutdown_flush::Binding,
+    exit: &mut dyn FnMut(i32),
+) -> Result<(), UpgradeError> {
+    if let Err(error) = receipt.authorize(binding) {
+        error!(
+            error = %error,
+            installed_bytes = true,
+            restored_bytes = false,
+            restart = "not_started",
+            recovery = "exited_tempfail",
+            "flush receipt failed authorization after the daemon stopped; \
+             the process exits EX_TEMPFAIL for a supervisor restart"
+        );
+        exit(restart::flush_failure_exit_code());
+        #[allow(unreachable_code)]
+        return Err(UpgradeError::Other(error.to_string()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2155,13 +2300,13 @@ mod tests {
             );
         }
         // Otherwise the missing incoming path makes the real comparison return Err.
-        let owner = flush::register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+        let owner = flush::register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
         let reservation = flush::reserve(&root).unwrap();
         let retained_observer = reservation.clone();
         let continuation_reservation = reservation.clone();
         let called = Arc::new(AtomicBool::new(false));
         let observed = called.clone();
-        let on_success = Box::new(move || {
+        let on_success = Box::new(move |_: &[(PathBuf, PathBuf)]| {
             observed.store(true, Ordering::SeqCst);
             drop(continuation_reservation);
         });
@@ -2368,7 +2513,7 @@ mod tests {
                 TempDirGuard {
                     path: fixture.stage.clone(),
                 },
-                Some(Box::new(move || marker.store(true, Ordering::Release))),
+                Some(Box::new(move |_| marker.store(true, Ordering::Release))),
                 Some(Box::new(move |alive| {
                     let result = if failure == "timeout" {
                         super::super::probe::run_before_swap_with_options(
@@ -2433,7 +2578,7 @@ mod tests {
             TempDirGuard {
                 path: fixture.stage.clone(),
             },
-            Some(Box::new(move || {
+            Some(Box::new(move |_| {
                 assert_eq!(std::fs::read(primary).unwrap(), daemon_bytes);
                 assert_eq!(std::fs::read(cli).unwrap(), cli_bytes);
                 assert!(!stage.exists());
@@ -2477,7 +2622,7 @@ mod tests {
                     incoming_cli,
                 )),
                 TempDirGuard { path: stage },
-                Some(Box::new(move || marker.store(true, Ordering::Release))),
+                Some(Box::new(move |_| marker.store(true, Ordering::Release))),
                 Some(Box::new(move |alive| {
                     entered.send(()).unwrap();
                     released
@@ -3525,7 +3670,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Worker-owned continuation: same ownership site as production
             // restart_on_success (RC3). Pre-admission cancel must not run it.
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             apply_replacements_offloaded(
@@ -3650,7 +3795,7 @@ mod tests {
             TempDirGuard {
                 path: scratch.clone(),
             },
-            Some(Box::new(move || {
+            Some(Box::new(move |_| {
                 std::fs::write(marker, b"restart reached").unwrap();
             })),
             None,
@@ -3723,7 +3868,7 @@ mod tests {
         let scratch_for_task = scratch.clone();
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let replacement = apply_replacements_offloaded(
@@ -3938,7 +4083,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Worker-owned restart continuation (production restart_on_success
             // site). Survives abort of this async observer after admission.
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let result = apply_replacements_offloaded(
@@ -4101,7 +4246,7 @@ mod tests {
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let replacement = apply_replacements_offloaded(
@@ -4265,7 +4410,7 @@ mod tests {
             }
         })
         .expect("normal spawn must succeed");
-        let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
             let _ = go_tx.send(());
         }));
 
@@ -4353,7 +4498,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Mirrors production HTTP deferred ownership: arm at admission on
             // an OS thread (not a cancellable Tokio task), sleep, then restart.
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::thread::spawn(move || {
                     entered_worker.wait();
                     std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
@@ -4446,7 +4591,7 @@ mod tests {
         let scratch_watch = scratch.clone();
         let cleaned_before_cont = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cleaned_before_cont);
-        let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
             flag.store(!scratch_watch.exists(), Ordering::SeqCst);
         }));
 

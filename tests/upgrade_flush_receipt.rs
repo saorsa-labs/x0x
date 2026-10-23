@@ -62,7 +62,10 @@ macro_rules! flush_receipt_regression_tests {
                 let observed = called.clone();
                 let owner = register(
                     root.clone(),
-                    Arc::new(move |deadline| {
+                    Arc::new(move |deadline, stopped| {
+                        // This hook represents the flush owner from the stop
+                        // onward: everything it does runs behind the hook.
+                        stopped.store(true, Ordering::Release);
                         log_flush::flush_captured(&hook_callback, deadline.instant)?;
                         observed.store(true, Ordering::SeqCst);
                         match failure {
@@ -127,7 +130,7 @@ macro_rules! flush_receipt_regression_tests {
                 let observed = Arc::clone(&called);
                 let owner = register(
                     root.clone(),
-                    Arc::new(move |_| {
+                    Arc::new(move |_, _| {
                         observed.store(true, Ordering::SeqCst);
                         Ok(())
                     }),
@@ -143,12 +146,12 @@ macro_rules! flush_receipt_regression_tests {
                 assert!(!called.load(Ordering::SeqCst));
                 assert!(!root.join(RECORD).exists());
                 drop(owner);
-                let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
                 let reservation = reserve(&root).unwrap();
                 reservation.activate().unwrap();
                 drop(owner);
                 assert!(
-                    register(root, Arc::new(|_| Ok(()))).is_err(),
+                    register(root, Arc::new(|_, _| Ok(()))).is_err(),
                     "dropping an armed owner must not admit a second shutdown owner"
                 );
                 drop(reservation);
@@ -158,7 +161,7 @@ macro_rules! flush_receipt_regression_tests {
             fn flush_receipt_rejects_changed_transaction_generation_or_plan() {
                 let dir = fixture();
                 let root = dir.path().canonicalize().unwrap();
-                let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
                 let reservation = reserve(&root).unwrap();
                 reservation.activate().unwrap();
                 assert!(
@@ -215,7 +218,7 @@ macro_rules! flush_receipt_regression_tests {
                     validate,
                 )
                 .unwrap();
-                let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
                 assert!(
                     ensure_ready(&root).is_err(),
                     "stale debris must refuse the flush gate before the cleanup"
@@ -232,7 +235,7 @@ macro_rules! flush_receipt_regression_tests {
             fn startup_keeps_a_receipt_bearing_flush_record() {
                 let dir = fixture();
                 let root = dir.path().canonicalize().unwrap();
-                let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
                 let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
                 acknowledge(&root, binding, || Ok(())).unwrap();
                 owner.join_workers();
@@ -241,6 +244,47 @@ macro_rules! flush_receipt_regression_tests {
                 assert!(
                     root.join(RECORD).is_file(),
                     "a completed receipt is evidence, not debris"
+                );
+            }
+
+            #[test]
+            fn failed_release_hold_refuses_the_same_release_and_survives_startup_cleanup() {
+                let dir = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                hold_failed_release(&root, "2.0.0", "injected started flush failure").unwrap();
+                // A restart clears the flush debris but must keep the hold.
+                clear_stale_records(&root);
+                assert!(root.join(HOLD_RECORD).is_file());
+                for refused in ["2.0.0", "1.9.9"] {
+                    assert_eq!(
+                        release_is_held(&root, &semver::Version::parse(refused).unwrap())
+                            .unwrap()
+                            .as_deref(),
+                        Some("2.0.0"),
+                        "{refused} must stay refused"
+                    );
+                }
+                // A newer release is the automatic way past the hold.
+                assert_eq!(
+                    release_is_held(&root, &semver::Version::parse("2.0.1").unwrap()).unwrap(),
+                    None
+                );
+                // The operator's manual clearing: remove the hold file.
+                std::fs::remove_file(root.join(HOLD_RECORD)).unwrap();
+                assert_eq!(
+                    release_is_held(&root, &semver::Version::parse("2.0.0").unwrap()).unwrap(),
+                    None
+                );
+            }
+
+            #[test]
+            fn unreadable_failed_release_hold_refuses_instead_of_guessing() {
+                let dir = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                std::fs::write(root.join(HOLD_RECORD), b"not a hold record").unwrap();
+                assert!(
+                    release_is_held(&root, &semver::Version::parse("2.0.1").unwrap()).is_err(),
+                    "an unreadable hold must refuse every apply, even a newer release"
                 );
             }
         }
