@@ -231,7 +231,7 @@ struct WaitSlot<T> {
 /// A second waiter for the same id drops the first sender. That does not panic.
 /// Each waiter names the agent and machine that may complete it. Send
 /// failure, timeout and a dropped request remove the entry. Each map
-/// holds at most [`WAITER_CAP`] ids.
+/// holds at most 64 ids.
 #[derive(Debug, Default)]
 pub struct RemoteHub {
     epoch: AtomicU64,
@@ -261,7 +261,7 @@ impl RemoteHub {
 
     /// Register a show waiter bound to `agent` on `machine`.
     ///
-    /// `None` when this id is new and the map is already at [`WAITER_CAP`].
+    /// `None` when this id is new and the map is already at 64 ids.
     /// Replacing an existing id does not grow the map.
     pub fn begin_show(
         &self,
@@ -281,7 +281,7 @@ impl RemoteHub {
 
     /// Register an activity waiter bound to `agent` on `machine`.
     ///
-    /// `None` when this id is new and the map is already at [`WAITER_CAP`].
+    /// `None` when this id is new and the map is already at 64 ids.
     pub fn begin_activity(
         &self,
         request_id: [u8; 16],
