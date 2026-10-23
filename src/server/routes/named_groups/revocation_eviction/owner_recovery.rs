@@ -50,7 +50,8 @@ pub(in crate::server) const WAITING_FOR_RECOVERY_MEMBER: &str = "waiting_for_rec
 
 /// A send round runs no more often than this per mandate or commit.
 const ORC_RESEND_INTERVAL: Duration = Duration::from_secs(5);
-/// A retained mandate or stashed frame is dropped after this long.
+/// A stashed frame, held commit or parked share is dropped after this
+/// long. A held mandate is not (#1508 rc16).
 const ORC_RETAIN_TTL: Duration = Duration::from_secs(600);
 /// Frames held for a later retry.
 const ORC_STASH_CAP: usize = 32;
@@ -82,7 +83,6 @@ struct PendingMandate {
     /// The last typed wait of a commit attempt, with the named members.
     wait: Option<(&'static str, Vec<[u8; 32]>)>,
     next_at: Instant,
-    received_at: Instant,
 }
 
 /// The promoted member's delivery of one committed recovery.
@@ -554,10 +554,10 @@ pub(super) async fn drive(state: &Arc<AppState>) {
     drive_mandates(state).await;
     let due: Vec<String> = {
         let now = Instant::now();
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        inner.orc.pending.retain(|_, pending| {
-            now.saturating_duration_since(pending.received_at) <= ORC_RETAIN_TTL
-        });
+        // #1508 rc16 (Codex P2): a held mandate has no time limit. It ends
+        // when it commits or a check refuses it ([`try_commit`]); an
+        // upgrade wait keeps it (ADR 0110 §4, D76).
+        let inner = state.revocation_evictions.inner.lock().await;
         inner
             .orc
             .pending
@@ -772,7 +772,6 @@ async fn accept_mandate(state: &Arc<AppState>, mandate: orc::SignedOwnerRecovery
                 mandate,
                 wait: None,
                 next_at: now,
-                received_at: now,
             },
         );
     state.agent.s4_revocation_intake().request_reconcile();
@@ -837,7 +836,7 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
     ) {
         match refusal {
             // The revocation records may still be arriving, or this node
-            // is behind the mandate's head: keep it until its TTL.
+            // is behind the mandate's head: keep it.
             orc::OwnerRecoveryRefusal::RecoveryNotNeeded => {
                 set_wait(state, stable, Some((refusal.as_str(), Vec::new()))).await;
             }
@@ -1850,13 +1849,23 @@ pub(in crate::server) async fn promoted_admin_secret(
         return None;
     }
     // A revoked agent signs no step and sends no trusted share, as in the
-    // ordinary apply's revocation gate.
+    // ordinary apply's revocation gate. A revoked agent is not added either
+    // (the OwnerCertified add check).
     let (held, parked) = {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
         (
             held.into_iter()
-                .filter(|held| !revoked.is_agent_revoked(&held.author))
+                .filter(|held| {
+                    !revoked.is_agent_revoked(&held.author)
+                        && match &held.event {
+                            super::super::NamedGroupMetadataEvent::MemberAdded {
+                                agent_id, ..
+                            } => super::super::parse_agent_id_hex(agent_id)
+                                .is_ok_and(|agent| !revoked.is_agent_revoked(&agent)),
+                            _ => true,
+                        }
+                })
                 .collect::<Vec<_>>(),
             parked
                 .into_iter()
@@ -1899,10 +1908,10 @@ pub(in crate::server) async fn promoted_admin_secret(
 
 /// The state after the held commit `held` on `cursor`, checked as the
 /// ordinary apply checks it, or `None`. Only same-epoch roster and
-/// metadata steps (a role update or a rename) and an admin's GSS removal
-/// or ban to a later epoch (#1508 rc15) are walked; any other event,
-/// or one that fails a check, ends the walk, and the transition keeps
-/// waiting for its share.
+/// metadata steps (a role update, a rename or a GSS add, #1508 rc16) and
+/// an admin's GSS removal or ban to a later epoch (#1508 rc15) are walked;
+/// any other event, or one that fails a check, ends the walk, and the
+/// transition keeps waiting for its share.
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
     use super::super::NamedGroupMetadataEvent as Event;
     let commit = super::super::named_group_metadata_event_commit(&held.event)?;
@@ -1967,6 +1976,73 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                         next.description = description;
                     }
                     next.updated_at = commit.committed_at;
+                },
+            )
+        }
+        // #1508 rc16 (Codex P1): an admin's GSS add between the removal
+        // and a promotion. It seats a Member only and keeps the epoch.
+        // An OwnerCertified add carries a certificate that verifies
+        // against the owner, as in the ordinary apply; the caller drops an
+        // add whose target is revoked.
+        Event::MemberAdded {
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            certificate_b64,
+            ..
+        } => {
+            if !admin(actor)
+                || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                || cursor
+                    .members_v2
+                    .get(agent_id)
+                    .is_some_and(|m| m.is_active() || m.is_banned())
+            {
+                return None;
+            }
+            let certificate = match cursor.policy.admission.owner_certified_user_id() {
+                Some(owner) => {
+                    use base64::Engine as _;
+                    let bytes = super::super::BASE64
+                        .decode(certificate_b64.as_deref()?)
+                        .ok()?;
+                    let cert: x0x::identity::AgentCertificate =
+                        bincode::deserialize(&bytes).ok()?;
+                    x0x::groups::owner_cert::verify_cert_against_owner(
+                        owner,
+                        agent_id,
+                        &cert,
+                        false,
+                        x0x::groups::owner_cert::restore_clock_now(),
+                    )
+                    .ok()?;
+                    Some(cert)
+                }
+                None => None,
+            };
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision =
+                        super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    next.add_member(
+                        agent_id.clone(),
+                        x0x::groups::GroupRole::Member,
+                        Some(actor.clone()),
+                        display_name.clone(),
+                    );
+                    if let Some(cert) = certificate {
+                        // A mismatched digest fails the result hash check.
+                        let _ = next.set_member_certificate(agent_id, cert);
+                    }
+                    if let Some(name) = display_name.clone() {
+                        next.set_display_name(agent_id, name);
+                    }
                 },
             )
         }
@@ -3126,7 +3202,6 @@ mod tests {
                 mandate,
                 wait: None,
                 next_at: Instant::now(),
-                received_at: Instant::now(),
             },
         );
         let rounds = orc.head_round_groups();
@@ -3621,6 +3696,64 @@ mod tests {
             .unwrap());
         let admin_hex = hex::encode(admin.agent_id().as_bytes());
         (dir, state, info, admin_hex)
+    }
+
+    /// #1508 rc16 (Codex P2): the owner promotes its own agent, and a known
+    /// Active member L's advert lacks `owner_recovery_v1`. The mandate
+    /// waits for L's upgrade (D76) for longer than the retain TTL, and no
+    /// outbound mandate replaces it. It must stay held, with the wait
+    /// visible. Before the fix it was dropped after 600 s, so L's upgrade
+    /// did not resume the recovery.
+    #[tokio::test]
+    async fn an_upgrade_wait_keeps_the_held_mandate_past_the_retain_ttl() {
+        let (_dir, state, mut info, _admin_hex) = recovery_fixture().await;
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let legacy = x0x::identity::AgentKeypair::generate().unwrap();
+        let legacy_hex = hex::encode(legacy.agent_id().as_bytes());
+        let cert = x0x::identity::AgentCertificate::issue(owner, &legacy).unwrap();
+        let mut member = x0x::groups::GroupMember::new_member(legacy_hex.clone(), None, None, 1);
+        member.certificate_digest = Some(x0x::groups::owner_cert::certificate_digest_hex(&cert));
+        member.certificate = Some(cert);
+        info.members_v2.insert(legacy_hex, member);
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(stable.clone(), info.clone());
+        advertise(&state, legacy.agent_id(), 0, x0x::dm::now_unix_ms());
+
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        sync_head(&state, &info).await;
+        let upgrade = x0x::groups::eviction::WaitingCause::WaitingForReceiverUpgrade.as_str();
+        let wait = |state: Arc<AppState>, stable: String| async move {
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .pending
+                .get(&stable)
+                .map(|pending| pending.wait.as_ref().map(|(cause, _)| *cause))
+        };
+        try_commit(&state, &stable).await;
+        assert_eq!(
+            wait(Arc::clone(&state), stable.clone()).await,
+            Some(Some(upgrade))
+        );
+
+        tokio::time::advance(ORC_RETAIN_TTL + Duration::from_secs(1)).await;
+        drive(&state).await;
+        assert_eq!(
+            wait(Arc::clone(&state), stable.clone()).await,
+            Some(Some(upgrade)),
+            "the mandate is held until L upgrades"
+        );
+        state.agent.shutdown().await;
     }
 
     /// #1357 CI (493c2a6): a commit attempt that waited on the membership

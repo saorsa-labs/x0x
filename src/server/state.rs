@@ -1571,6 +1571,10 @@ pub(super) struct NamedGroupTestRecorders {
     /// #1508 rc14: whether the group's sends were held at each step of a
     /// parked GSS removal replay (`gss_replay_probe`).
     pub(super) gss_replay_holds: StdMutex<Vec<bool>>,
+    /// #1508 rc16: a one-shot pause after a GSS encrypt reads its key
+    /// (`gss_encrypt_after_key_probe`): `(reached, resume)`.
+    pub(super) gss_encrypt_pause:
+        StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }
