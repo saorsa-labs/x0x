@@ -225,6 +225,9 @@ debug = "line-tables-only"
 
 [profile.signing-acceptance.package.x0x]
 opt-level = 3
+# CI disables incremental builds; 16 default units make this large test crate
+# exceed runner memory. Keep units small while the job bounds parallel codegen.
+codegen-units = 256
 
 [profile.release-profiling]
 inherits = "release"
