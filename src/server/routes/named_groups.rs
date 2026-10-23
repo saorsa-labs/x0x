@@ -12540,6 +12540,12 @@ async fn apply_named_group_metadata_event_with_binding(
     } else {
         None
     };
+    // #1573: an installed share releases the GSS removals parked for it.
+    let share_group = if matches!(event, NamedGroupMetadataEvent::SecureShareDelivered { .. }) {
+        local_group_key_for_parking(state, named_group_metadata_event_group_id(&event)).await
+    } else {
+        None
+    };
     // #946 C3: a member who leaves or is removed/banned loses any
     // certificate-unobtainable refusal window, so a later rejoin starts
     // retryable. Captured before `event` moves.
@@ -12590,6 +12596,9 @@ async fn apply_named_group_metadata_event_with_binding(
         }
         if let Some(gid) = member_landing_group {
             replay_parked_role_updates(state, &gid).await;
+        }
+        if let Some(gid) = share_group {
+            replay_parked_gss_removals(state, &gid).await;
         }
         if let Some(group_id) = rekey_followup {
             schedule_self_leave_rekey_if_idle(state, &group_id).await;
@@ -12696,6 +12705,114 @@ fn park_role_update_for_late_member(
         sender,
         parked_at: Instant::now(),
     });
+}
+
+/// #1573 (ADR 0110 §3, #1508 rc12): whether a GSS removal or ban that
+/// rotates to `secret_epoch` waits for its share. It does when this node
+/// is a survivor (neither the removed member nor the actor, which seals no
+/// share to itself) and does not hold that epoch's secret yet. Installing
+/// the head first would end the committer's delivery on head convergence
+/// while this node cannot decrypt. TreeKEM removals carry their own key
+/// material and `SignedPublic` removals have no secret, so neither waits.
+fn gss_removal_waits_for_share(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    secret_epoch: Option<u64>,
+    treekem_removal: bool,
+    (actor_hex, target_hex): (&str, &str),
+    local_hex: &str,
+) -> bool {
+    secret_epoch.is_some_and(|epoch| {
+        !treekem_removal
+            && info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+            && target_hex != local_hex
+            && actor_hex != local_hex
+            && info.secret_epoch < epoch
+            && !legacy_gss_removal_receiver(state)
+    })
+}
+
+/// Test builds only: behave as an already-released receiver, which
+/// installs a GSS removal head before its share (the #1573 known gap).
+/// Tests of the keyless window that such a receiver, or an upgrade in that
+/// window, leaves on disk set it.
+#[cfg(test)]
+fn legacy_gss_removal_receiver(state: &AppState) -> bool {
+    state
+        .named_group_test_recorders
+        .legacy_gss_removal_receiver
+        .load(Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn legacy_gss_removal_receiver(_state: &AppState) -> bool {
+    false
+}
+
+/// #1573: park a verified GSS removal or ban until its share installs
+/// ([`gss_removal_waits_for_share`]). A resend of the same commit is not
+/// parked twice. Suppressed in replay contexts (`allow_queue` false).
+fn park_gss_removal_for_share(
+    state: &AppState,
+    group_key: &str,
+    event: &NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    allow_queue: bool,
+) {
+    tracing::info!(
+        group_id = %LogHexId::group(group_key),
+        "GSS removal waits for its sealed share; the head stays at the parent (#1573)"
+    );
+    if !allow_queue || !verified {
+        return;
+    }
+    let hash = named_group_metadata_event_commit(event).map(|commit| commit.state_hash.clone());
+    let mut lot = state
+        .parked_gss_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let list = lot.entry(group_key.to_string()).or_default();
+    list.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    if list.iter().any(|entry| {
+        named_group_metadata_event_commit(&entry.event).map(|commit| &commit.state_hash)
+            == hash.as_ref()
+    }) {
+        return;
+    }
+    while list.len() >= PARKED_ROLE_UPDATE_CAP {
+        list.remove(0);
+    }
+    list.push(ParkedRoleUpdate {
+        event: event.clone(),
+        sender,
+        parked_at: Instant::now(),
+    });
+}
+
+/// #1573: after a share installs, apply the group's parked GSS removals
+/// again through the ordinary apply. One that still waits (a share for
+/// another epoch) parks itself again.
+async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
+    let parked = state
+        .parked_gss_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(group_key)
+        .unwrap_or_default();
+    for entry in parked {
+        if entry.parked_at.elapsed() >= PENDING_JOIN_RESULT_TTL {
+            continue;
+        }
+        let _ = Box::pin(apply_named_group_metadata_event(
+            state,
+            entry.event,
+            entry.sender,
+            true,
+            None,
+        ))
+        .await;
+    }
 }
 
 /// #876 r3 (review finding 1): after a member lands, drain the group's
@@ -14163,6 +14280,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
+            if gss_removal_waits_for_share(
+                state,
+                &info,
+                secret_epoch,
+                !roster_only_removal,
+                (&actor, &agent_id),
+                &local_agent_hex,
+            ) {
+                park_gss_removal_for_share(
+                    state,
+                    &resolved_group_key,
+                    &event_for_log,
+                    sender,
+                    verified,
+                    allow_queue,
+                );
+                return ApplyMetadataResult::REJECTED;
+            }
             let signed_binding = commit.security_binding.clone();
             let current = info.clone();
             let Ok(mut next) = apply_stateful_event_with_evidence(
@@ -14651,6 +14786,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
+            if gss_removal_waits_for_share(
+                state,
+                &info,
+                secret_epoch,
+                treekem_payload.is_some(),
+                (&actor, &agent_id),
+                &local_agent_hex,
+            ) {
+                park_gss_removal_for_share(
+                    state,
+                    &resolved_group_key,
+                    &event_for_log,
+                    sender,
+                    verified,
+                    allow_queue,
+                );
+                return banned_reject("waiting_for_gss_share", &resolved_group_key);
+            }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -46742,6 +46895,7 @@ pub(in crate::server) mod tests {
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             parked_role_updates: StdMutex::new(HashMap::new()),
+            parked_gss_removals: StdMutex::new(HashMap::new()),
             join_result_staging_guards: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
@@ -54045,41 +54199,50 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// The pre-event view after a GSS removal that arrived without its
+    /// share: the head, the old secret and the victim's seat are unchanged.
+    async fn assert_gss_removal_held(f: &F1GssRotationFixture) -> Result<()> {
+        let groups = f.state.named_groups.read().await;
+        let Some(info) = groups.get(&f.group_id) else {
+            return Err(anyhow::anyhow!("held group missing"));
+        };
+        assert_ne!(
+            info.state_hash, f.committed_state_hash,
+            "the head stays at the parent until the share installs"
+        );
+        assert!(
+            info.has_active_member(&f.victim_hex),
+            "the removal is not installed"
+        );
+        assert_eq!(info.shared_secret.as_deref(), Some([9_u8; 32].as_slice()));
+        Ok(())
+    }
+
+    /// #1573 (ADR 0110 §3, #1508 rc12): the signed GSS `MemberRemoved`
+    /// lands before its `SecureShareDelivered` share. The survivor does not
+    /// install the head, so the head never converges while it cannot
+    /// decrypt and the committer keeps resending; the event is parked.
+    /// When the share arrives it installs and replays the parked removal.
+    /// Before the fix the head moved with `shared_secret = None`, which
+    /// ended the committer's delivery on head convergence.
     #[tokio::test]
-    async fn f1_gss_rotation_metadata_first_removes_then_installs_envelope() -> Result<()> {
+    async fn f1_gss_rotation_metadata_first_holds_the_head_until_the_share() -> Result<()> {
         let f = f1_gss_rotation_fixture("metadata-first").await?;
         let sender = f.admin_kp.agent_id();
-
-        // Metadata-first: the signed `MemberRemoved` lands before the
-        // envelope. The apply arm fail-closes the GSS (old epoch E < E+1
-        // wipes `shared_secret` to `None`) but advances epoch/binding from
-        // the signed commit alone.
-        let removed =
+        let held =
             apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
                 .await;
-        assert!(
-            removed.should_exit,
-            "MemberRemoved with a valid signed commit must apply (exits subscriber)"
-        );
-        {
-            let groups = f.state.named_groups.read().await;
-            let Some(info) = groups.get(&f.group_id) else {
-                return Err(anyhow::anyhow!("metadata-first group missing"));
-            };
-            assert_eq!(
-                info.shared_secret, None,
-                "metadata-first intermediate must fail-close shared_secret to None"
-            );
-            assert_eq!(
-                info.secret_epoch, f.new_epoch,
-                "metadata-first intermediate must already carry the rotated epoch"
-            );
-        }
+        assert!(!held.accepted, "the removal waits for its share");
+        assert_gss_removal_held(&f).await?;
+        // A resend of the same event is not installed either.
+        let resent =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
+        assert!(!resent.accepted);
+        assert_gss_removal_held(&f).await?;
 
-        // The envelope then delivers the fresh secret to the survivor. The
-        // strict-< stale check accepts equal-epoch delivery while the secret
-        // is still absent.
-        let delivered = apply_named_group_metadata_event(
+        // The share arrives: it installs and releases the parked removal.
+        let _ = apply_named_group_metadata_event(
             &f.state,
             f.envelope_event.clone(),
             sender,
@@ -54087,13 +54250,59 @@ pub(in crate::server) mod tests {
             None,
         )
         .await;
-        // SecureShareDelivered signals "no rebroadcast" (returns false);
-        // success is observed in stored state, not in this boolean.
-        assert!(
-            !delivered.should_exit,
-            "SecureShareDelivered does not exit the subscriber; convergence is asserted on stored state"
-        );
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        Ok(())
+    }
 
+    /// #1573: the survivor restarts between the held removal and its share,
+    /// so the parked event is gone (it lived in memory; nothing durable
+    /// changed). The share installs alone, and the committer's next resend
+    /// of the removal then installs with the secret held.
+    #[tokio::test]
+    async fn f1_gss_rotation_restart_between_held_removal_and_share_converges() -> Result<()> {
+        let f = f1_gss_rotation_fixture("held-restart").await?;
+        let sender = f.admin_kp.agent_id();
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
+        assert!(!held.accepted);
+        f.state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let _ = apply_named_group_metadata_event(
+            &f.state,
+            f.envelope_event.clone(),
+            sender,
+            true,
+            None,
+        )
+        .await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_ne!(
+                info.state_hash, f.committed_state_hash,
+                "no removal to replay"
+            );
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+        }
+        let resent =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
+        assert!(
+            resent.accepted,
+            "the resent removal installs with its secret"
+        );
         assert_gss_rotation_converged(
             &f.state,
             &f.group_id,
