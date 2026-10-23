@@ -303,8 +303,8 @@ pub(super) enum ResumeAction {
     /// The result is the head: resend the saved event after the restart
     /// sync wait, with no second rekey.
     Deliver,
-    /// The head moved past the result: discard the delivery; the next pass
-    /// completes the row from the chain.
+    /// An epoch change followed the result: discard the delivery; the next
+    /// pass completes the row from the chain.
     Discard,
     /// The legacy commit did not land: the row returns to `pending`.
     Abandon,
@@ -316,6 +316,11 @@ pub(super) enum ResumeAction {
 }
 
 /// Classify a saved removal against `info`'s verified chain (§3).
+///
+/// A later commit with no epoch change (a rename) leaves the removal on
+/// the chain at the current epoch: the saved event is delivered again,
+/// because after a restart it is the only source of a survivor's
+/// transition (#1508 rc12). Only a later epoch change discards it.
 pub(super) fn classify(
     info: &GroupInfo,
     parent_head: Option<&str>,
@@ -332,11 +337,25 @@ pub(super) fn classify(
     };
     match crypto_exclusion::classify_saved_frame(info, parent_head, result_head) {
         SavedFrameState::CurrentHead => ResumeAction::Deliver,
+        SavedFrameState::Superseded if delivery_retained(info, result_head) => {
+            ResumeAction::Deliver
+        }
         SavedFrameState::Superseded => ResumeAction::Discard,
         SavedFrameState::Abandoned => ResumeAction::Abandon,
         SavedFrameState::Fork => ResumeAction::Fork,
         SavedFrameState::Unknown => ResumeAction::WaitForHeadSync,
     }
+}
+
+/// §3: the one rule that keeps a saved removal's delivery and admits its
+/// writes. The removal stays on the verified chain at the current epoch
+/// ([`HeadRule::OnChainAtEpoch`]).
+fn delivery_rule(result_head: &str) -> HeadRule {
+    HeadRule::OnChainAtEpoch(result_head.to_string())
+}
+
+fn delivery_retained(info: &GroupInfo, result_head: &str) -> bool {
+    crypto_exclusion::head_rule_admits(info, &delivery_rule(result_head))
 }
 
 /// §3 restart: reconcile every open row that holds a saved removal event
@@ -471,9 +490,10 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             inner.ce.fork.insert(key.clone());
             continue;
         }
-        if info.state_hash != delivery.result_head {
-            // The head moved past the removal: never resend old crypto
-            // material after an epoch change.
+        if !delivery_retained(&info, &delivery.result_head) {
+            // The removal left the chain, or an epoch change followed it:
+            // never resend old crypto material. A later epoch-less commit
+            // keeps the delivery (#1508 rc12).
             let mut inner = runtime.inner.lock().await;
             inner.removals.remove(&key);
             inner.dirty = true;
@@ -572,7 +592,7 @@ pub(super) fn note_survivor_head(
 
 /// The guarded admission of one serve to `recipient` (§3 L231):
 /// [`crypto_exclusion::guarded_removal_admission`] with
-/// [`HeadRule::Current`]. The pre-phase runs under the group's membership
+/// [`delivery_rule`]. The pre-phase runs under the group's membership
 /// lock (ADR 0107 serving check, D60, head rule, no capability gate), and
 /// the synchronous seam check runs at once after it.
 async fn removal_write_admitted(
@@ -585,7 +605,7 @@ async fn removal_write_admitted(
         state,
         stable_group_id,
         recipient,
-        HeadRule::Current(result_head.to_string()),
+        delivery_rule(result_head),
     );
     let Some(seam) = admission().await else {
         return Err(x0x::dm::PINNED_ADMISSION_REFUSED.to_string());
@@ -642,7 +662,7 @@ async fn send_removal(
         state,
         stable_group_id,
         recipient,
-        HeadRule::Current(result_head.to_string()),
+        delivery_rule(result_head),
     );
     let deadline = std::time::Instant::now() + REMOVAL_EXCHANGE_TIMEOUT;
     if payload.len() <= x0x::dm::MAX_PAYLOAD_BYTES {
@@ -752,7 +772,7 @@ mod tests {
     use x0x::groups::state_commit::{GroupStateCommit, RetainedCommit};
     use x0x::groups::GroupRole;
 
-    fn commit(prev: &str, hash: &str) -> GroupStateCommit {
+    pub(super) fn commit(prev: &str, hash: &str) -> GroupStateCommit {
         GroupStateCommit {
             group_id: "g".to_string(),
             revision: 4,
@@ -841,10 +861,42 @@ mod tests {
         assert_eq!(classify(&info, None, "r"), ResumeAction::Deliver);
     }
 
+    /// `info` with each retained commit bound to its entry of `bindings`
+    /// and the head bound to `head_binding` (the epoch each commits to).
+    fn bound(mut info: GroupInfo, head_binding: &str, bindings: &[&str]) -> GroupInfo {
+        for (retained, binding) in info.commit_log.iter_mut().zip(bindings) {
+            retained.commit.security_binding = Some((*binding).to_string());
+        }
+        info.security_binding = Some(head_binding.to_string());
+        info
+    }
+
+    /// A later commit changed the epoch: the removal's crypto material is
+    /// old, so the saved event is never sent again.
     #[test]
-    fn committed_removal_behind_a_later_head_is_discarded() {
-        let info = info_with_log("later", &[("p", "r"), ("r", "later")]);
+    fn committed_removal_behind_a_later_epoch_is_discarded() {
+        let info = bound(
+            info_with_log("later", &[("p", "r"), ("r", "later")]),
+            "treekem:epoch=4",
+            &["treekem:epoch=3", "treekem:epoch=4"],
+        );
         assert_eq!(classify(&info, Some("p"), "r"), ResumeAction::Discard);
+    }
+
+    /// Codex P1 (#1508 rc12, ADR 0110 §3): a later roster commit with no
+    /// epoch change (a rename) moved the head past the removal. The
+    /// removal is still on the chain at the current epoch, and after a
+    /// restart the catch-up log is empty, so the saved event is the only
+    /// source of a survivor's transition: it is delivered again. Before
+    /// the fix it was discarded.
+    #[test]
+    fn a_removal_behind_an_epochless_later_commit_is_delivered_again() {
+        let info = bound(
+            info_with_log("renamed", &[("p", "r"), ("r", "renamed")]),
+            "treekem:epoch=3",
+            &["treekem:epoch=3", "treekem:epoch=3"],
+        );
+        assert_eq!(classify(&info, Some("p"), "r"), ResumeAction::Deliver);
     }
 
     #[test]
@@ -871,11 +923,61 @@ mod tests {
 
     #[test]
     fn resume_restores_the_delivery_to_each_survivor() {
+        resume_restores_the_delivery(info_with_log("r", &[("p", "r")]));
+    }
+
+    /// Codex P1 (#1508 rc12): the restart after a later epoch-less commit
+    /// (a rename) restores the saved removal's delivery; the restart after
+    /// an epoch change drops the saved event and keeps the row open for
+    /// the chain to complete.
+    #[test]
+    fn resume_after_a_later_commit_keeps_the_delivery_only_at_the_same_epoch() {
+        let log = [("p", "r"), ("r", "renamed")];
+        resume_restores_the_delivery(bound(
+            info_with_log("renamed", &log),
+            "treekem:epoch=3",
+            &["treekem:epoch=3", "treekem:epoch=3"],
+        ));
+        let (removals, store, key) = resume_one(bound(
+            info_with_log("renamed", &log),
+            "treekem:epoch=4",
+            &["treekem:epoch=3", "treekem:epoch=4"],
+        ));
+        assert!(removals.is_empty(), "no delivery after an epoch change");
+        let row = store.get(&key).expect("row");
+        assert_eq!(row.phase, Phase::CommittedDeliveryPending);
+        assert!(row.outgoing_event.is_none(), "the old event is dropped");
+    }
+
+    fn resume_restores_the_delivery(info: GroupInfo) {
+        let survivor = [0xcc; 32];
+        let (removals, store, key) = resume_one(info);
+        let delivery = removals.get(&key).expect("delivery resumed");
+        assert!(delivery.resumed);
+        assert_eq!(delivery.result_head, "r");
+        assert_eq!(
+            delivery.recipients.keys().copied().collect::<Vec<_>>(),
+            vec![survivor]
+        );
+        assert_eq!(
+            store.get(&key).expect("row").phase,
+            Phase::CommittedDeliveryPending
+        );
+    }
+
+    /// Restart over `info` with one open row whose saved removal of
+    /// `0xbb` went from head `p` to `r`.
+    fn resume_one(
+        mut info: GroupInfo,
+    ) -> (
+        HashMap<EvictionKey, RemovalDelivery>,
+        ObligationStore,
+        EvictionKey,
+    ) {
         // The creator in `info_with_log` is this node.
         let local = [1; 32];
         let target = [0xbb; 32];
         let survivor = [0xcc; 32];
-        let mut info = info_with_log("r", &[("p", "r")]);
         for id in [local, target, survivor] {
             info.add_member(hex::encode(id), GroupRole::Member, None, None);
         }
@@ -900,17 +1002,7 @@ mod tests {
         let mut ce_state = crypto_exclusion::CeState::default();
         let groups = vec![("g".to_string(), info)];
         resume_after_load(&groups, &local, &mut store, &mut removals, &mut ce_state);
-        let delivery = removals.get(&key).expect("delivery resumed");
-        assert!(delivery.resumed);
-        assert_eq!(delivery.result_head, "r");
-        assert_eq!(
-            delivery.recipients.keys().copied().collect::<Vec<_>>(),
-            vec![survivor]
-        );
-        assert_eq!(
-            store.get(&key).expect("row").phase,
-            Phase::CommittedDeliveryPending
-        );
+        (removals, store, key)
     }
 }
 
@@ -1066,6 +1158,122 @@ mod daemon_tests {
             delivery.recipients.get(survivor.as_bytes()),
             Some(&RecipientDelivery::Due),
             "the survivor's send started"
+        );
+        Ok(())
+    }
+
+    /// Codex P1 (#1508 rc12, ADR 0110 §3): a live removal delivery whose
+    /// result a later epoch-less roster commit (a rename) moved behind the
+    /// head keeps running, and its write is admitted: the removal is still
+    /// on the chain at the current epoch. After an epoch change the
+    /// delivery stops and no write is admitted. Before the fix the rename
+    /// ended the delivery, so a survivor that missed the removal lost its
+    /// transition.
+    #[tokio::test]
+    async fn a_removal_delivery_survives_a_later_commit_only_at_the_same_epoch() -> Result<()> {
+        let (state, _dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x53; 32]);
+        let target = [0x54; 32];
+        let group_id = "d6".repeat(16);
+        let mut info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), target);
+        // The removal's result is the current head at epoch binding "e3";
+        // then a rename commits on top with the same binding.
+        let result_head = info.state_hash.clone();
+        info.security_binding = Some("treekem:epoch=3".to_string());
+        let mut removal = super::tests::commit("p", &result_head);
+        removal.security_binding = info.security_binding.clone();
+        let mut rename = super::tests::commit(&result_head, "renamed");
+        rename.security_binding = info.security_binding.clone();
+        for commit in [removal, rename] {
+            info.commit_log
+                .push(x0x::groups::state_commit::RetainedCommit {
+                    commit,
+                    roster: std::collections::BTreeMap::new(),
+                    meta: None,
+                });
+        }
+        info.state_hash = "renamed".to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        let scheduled = Instant::now();
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .removals
+            .insert(
+                key.clone(),
+                new_delivery(
+                    removal_event(&group_id, &target),
+                    result_head.clone(),
+                    vec![*survivor.as_bytes()],
+                    false,
+                    scheduled,
+                ),
+            );
+
+        drive(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let delivery = inner
+                .removals
+                .get(&key)
+                .context("an epoch-less later commit keeps the delivery")?;
+            assert_ne!(
+                delivery.recipients.get(survivor.as_bytes()),
+                Some(&RecipientDelivery::Due),
+                "the survivor's send started"
+            );
+        }
+        let rule = HeadRule::OnChainAtEpoch(result_head.clone());
+        assert!(
+            admit(&state, &stable, &survivor, &rule)
+                .await
+                .is_some_and(|seam| seam()),
+            "the saved removal's write is admitted after the rename"
+        );
+
+        // An epoch change: the delivery stops and nothing is admitted.
+        info.security_binding = Some("treekem:epoch=4".to_string());
+        info.state_hash = "rekeyed".to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        assert!(
+            admit(&state, &stable, &survivor, &rule).await.is_none(),
+            "no write after an epoch change"
+        );
+        if let Some(delivery) = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .removals
+            .get_mut(&key)
+        {
+            delivery.next_at = Instant::now();
+            delivery
+                .recipients
+                .insert(*survivor.as_bytes(), RecipientDelivery::Due);
+        }
+        drive(&state).await;
+        assert!(
+            !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .contains_key(&key),
+            "an epoch change ends the delivery"
         );
         Ok(())
     }

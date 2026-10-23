@@ -1402,6 +1402,11 @@ pub(super) enum HeadRule {
     /// Catch-up: the frame's result must be on this node's verified chain
     /// (the current head or a retained commit).
     OnChain(String),
+    /// A saved removal (ADR 0110 §3): the frame's result is on this node's
+    /// verified chain and no epoch change followed it, so the current head
+    /// commits to the result's security binding. A later roster-only
+    /// commit (a rename) keeps the delivery; a later rekey ends it.
+    OnChainAtEpoch(String),
 }
 
 /// Whether `info` still admits a frame under `rule`. A quarantined or
@@ -1418,6 +1423,13 @@ pub(super) fn head_rule_admits(info: &GroupInfo, rule: &HeadRule) -> bool {
                     .commit_log
                     .iter()
                     .any(|retained| retained.commit.state_hash == *head)
+        }
+        HeadRule::OnChainAtEpoch(head) => {
+            info.state_hash == *head
+                || info.commit_log.iter().any(|retained| {
+                    retained.commit.state_hash == *head
+                        && retained.commit.security_binding == info.security_binding
+                })
         }
     }
 }
