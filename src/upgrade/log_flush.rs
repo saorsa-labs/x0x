@@ -37,6 +37,7 @@ struct State {
     queue: VecDeque<Message>,
     bytes: usize,
     failure: Option<(io::ErrorKind, &'static str)>,
+    setup_failure: Option<(io::ErrorKind, &'static str)>,
     deadline: Option<Instant>,
     closed: bool,
     alive: bool,
@@ -88,6 +89,7 @@ where
             queue: VecDeque::new(),
             bytes: 0,
             failure: None,
+            setup_failure: None,
             deadline: None,
             closed: false,
             alive: true,
@@ -114,11 +116,13 @@ where
 
 impl LogWriter {
     pub(crate) fn record_setup_error(&self, error: &io::Error) {
-        remember(
-            &self.shared,
-            error.kind(),
-            "configured log sink setup failed",
-        );
+        if let Ok(mut state) = self.shared.state.lock() {
+            // The configured sink never started, so later barriers cannot
+            // recover it. Directory-access warnings do not take this path.
+            state
+                .setup_failure
+                .get_or_insert((error.kind(), "configured log sink setup failed"));
+        }
     }
 
     pub(crate) fn flush_until(&self, deadline: Instant) -> io::Result<()> {
@@ -149,7 +153,7 @@ impl LogWriter {
             state.closed = terminal;
             // Errors after this marker belong to the next transaction. Sink
             // errors are ordered by the worker's own position in the queue.
-            let admission_failure = state.failure.take();
+            let admission_failure = state.setup_failure.or(state.failure.take());
             state.queue.push_back(Message::Flush {
                 deadline,
                 ack: ack.clone(),
@@ -314,12 +318,6 @@ fn run<W: Write, F: FnMut(&mut W) -> io::Result<()>>(mut sink: W, mut barrier: F
                 }
             }
         }
-    }
-}
-
-fn remember(shared: &Shared, kind: io::ErrorKind, message: &'static str) {
-    if let Ok(mut state) = shared.state.lock() {
-        state.failure.get_or_insert((kind, message));
     }
 }
 
