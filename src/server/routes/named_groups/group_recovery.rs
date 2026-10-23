@@ -3254,10 +3254,15 @@ async fn retire_marker_attested(state: &Arc<AppState>, group_key: &str, info: &G
         let Some(info) = crate::server::resolve_group_entry_mut_locked(groups, &key) else {
             return false;
         };
+        // #1533 review: the record can change after the snapshot above (a
+        // re-seat rollback restores the original with the same marker and
+        // without the evidenced commit). Re-check the retirement rule on
+        // the record that the write changes.
         let same = info
             .fork_quarantine
             .as_ref()
-            .is_some_and(|marker| RecoveryRef::from_marker(marker) == identity);
+            .is_some_and(|marker| RecoveryRef::from_marker(marker) == identity)
+            && marker_retires_under(info, &ata);
         if same {
             info.fork_quarantine = None;
             info.reset_fork_evidence_after_quarantine_clear();
@@ -4200,6 +4205,17 @@ pub(in crate::server) async fn reseat_group_member(
             None => return super::not_found("group not found").into_response(),
         }
     };
+    // #1533 review: the central Home mutation fence, before the owner and
+    // promoted-admin paths branch. A re-seat credential of an owner-axis
+    // group is a device-admission credential: a session bearer never
+    // mints one on either path.
+    if crate::server::group_access::is_home_or_owner_certified(&info) && !actor.is_durable_owner() {
+        return super::mint_refusal_response(
+            &id,
+            super::MintInviteRefusal::OwnerAxisNoDurableOwner,
+        )
+        .into_response();
+    }
     let stable = info.stable_group_id().to_string();
     if contained(&state, &info).await {
         return reseat_refusal(
@@ -5042,12 +5058,13 @@ async fn consume_reseat(
         .await
         .staging_live
         .insert(stable.clone());
+    let digest = journal.record_digest;
     if let Err(why) = prepare_reseat(state, group_key, &info, journal).await {
         drop(membership_guard);
         // The journal (when it became durable) holds the original record
         // and tree. The rollback closes it only once the original is
         // durable again; until then the worker retries it.
-        rollback_reseat(state, &stable, why).await;
+        rollback_reseat(state, &stable, digest, why).await;
         state
             .group_recovery
             .inner
@@ -5100,7 +5117,7 @@ async fn consume_reseat(
     if !response.status().is_success() {
         let status = response.status();
         tracing::warn!(group_id = %LogHexId::group(group_key), %status, "ADR 0109 S3: the staged join was refused; restoring the live record");
-        rollback_reseat(state, &stable, &format!("join_{}", status.as_u16())).await;
+        rollback_reseat(state, &stable, digest, &format!("join_{}", status.as_u16())).await;
     } else {
         // The join can return with the record already Active with keys:
         // swap now rather than at the next worker tick.
@@ -5195,10 +5212,19 @@ async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &G
 ///   again so that it is durable, with its tree untouched.
 /// - otherwise, or with no record under the key: any staging stub goes,
 ///   and the record and its tree are restored from the journal.
-async fn rollback_reseat(state: &Arc<AppState>, stable: &str, why: &str) {
+///
+/// `expected` is the `record_digest` of the journal that the caller
+/// decided to roll back. The journal is read again under the membership
+/// lock, which the swap also holds ([`swap_if_seated`]): when the swap
+/// closed that journal first, or another journal is open, nothing changes.
+/// The journal closes under the same lock.
+async fn rollback_reseat(state: &Arc<AppState>, stable: &str, expected: [u8; 32], why: &str) {
+    let lock = super::group_membership_lock(state, stable).await;
+    let membership_guard = lock.lock().await;
     let Some(journal) = sidecar_snapshot(state, stable)
         .await
         .and_then(|body| body.reseat_journal)
+        .filter(|journal| journal.record_digest == expected)
     else {
         return;
     };
@@ -5207,8 +5233,6 @@ async fn rollback_reseat(state: &Arc<AppState>, stable: &str, why: &str) {
         return;
     };
     let key = journal.live_key.clone();
-    let lock = super::group_membership_lock(state, &key).await;
-    let membership_guard = lock.lock().await;
     let still_live = if journal.phase == ReseatPhase::Prepared {
         state.named_groups.read().await.get(&key).cloned()
     } else {
@@ -5228,12 +5252,22 @@ async fn rollback_reseat(state: &Arc<AppState>, stable: &str, why: &str) {
             record.state_revision,
         ),
     };
-    drop(membership_guard);
     if !restored {
         tracing::warn!(group_id = %LogHexId::group(stable), why, "ADR 0109 S3: the re-seat rollback is not durable yet; the journal stays and the worker retries");
         return;
     }
-    if !update_sidecar(state, stable, |body| body.reseat_journal = None).await {
+    let closed = update_sidecar(state, stable, |body| {
+        if body
+            .reseat_journal
+            .as_ref()
+            .is_some_and(|open| open.record_digest == expected)
+        {
+            body.reseat_journal = None;
+        }
+    })
+    .await;
+    drop(membership_guard);
+    if !closed {
         // The original is durable; closing the journal is retried.
         return;
     }
@@ -5343,17 +5377,28 @@ async fn live_record_for(state: &AppState, stable: &str) -> Option<(String, Grou
 ///
 /// The worker tick calls this, and so do the staged join's return and the
 /// `recovery` object read, so a reader never sees `reseat_in_progress`
-/// for a record that is already Active. The closure re-checks the journal
-/// under the sidecar writer lock, so two concurrent callers retire the
-/// old record once.
-async fn swap_if_seated(
-    state: &AppState,
-    stable: &str,
-    live: Option<&(String, GroupInfo)>,
-    journal: &ReseatJournalV1,
-) -> bool {
+/// for a record that is already Active.
+///
+/// #1533 review: the whole swap runs under the group membership lock,
+/// which [`rollback_reseat`] also holds, and it reads the journal and the
+/// live record under that lock. A rollback that restored the original
+/// therefore comes before the readiness check (which then sees the
+/// original and does not swap) or after the swap closed the journal
+/// (which then makes the rollback a no-op). The swap never clears the
+/// original's marker. Returns `true` when no journal is open.
+async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
+    let lock = super::group_membership_lock(state, stable).await;
+    let _membership_guard = lock.lock().await;
+    let Some(journal) = sidecar_snapshot(state, stable)
+        .await
+        .and_then(|body| body.reseat_journal)
+    else {
+        return true;
+    };
+    let journal = &journal;
+    let live = live_record_for(state, stable).await;
     let local = local_hex(state);
-    let seated = match live {
+    let seated = match live.as_ref() {
         Some((key, info)) if !is_journalled_original(info, journal) => {
             let has_tree = state.treekem_groups.read().await.contains_key(key);
             journal.staged_result_ready(info, &local, has_tree)
@@ -5432,13 +5477,14 @@ async fn swap_if_seated(
 async fn lift_staging_marker(state: &AppState, stable: &str, journal: &ReseatJournalV1) -> bool {
     let held = journal.original_marker();
     let stable = stable.to_string();
+    let journal = journal.clone();
     // The write runs also when no record holds a marker: it is the swap's
-    // durable legacy write of the staged record.
+    // durable legacy write of the staged record. The journalled original
+    // keeps its marker: only a staged record drops it.
     let outcome = super::persist_named_groups_quarantine_clear_durable_only(state, move |groups| {
-        for info in groups
-            .values_mut()
-            .filter(|info| info.stable_group_id() == stable)
-        {
+        for info in groups.values_mut().filter(|info| {
+            info.stable_group_id() == stable && !is_journalled_original(info, &journal)
+        }) {
             if held.is_some() && info.fork_quarantine == held {
                 info.fork_quarantine = None;
                 info.reset_fork_evidence_after_quarantine_clear();
@@ -5453,14 +5499,7 @@ async fn lift_staging_marker(state: &AppState, stable: &str, journal: &ReseatJou
 /// Swap in the staged record of `stable` now if it is seated. A no-op when
 /// no re-seat journal is open.
 async fn swap_now_if_seated(state: &AppState, stable: &str) {
-    let Some(journal) = sidecar_snapshot(state, stable)
-        .await
-        .and_then(|body| body.reseat_journal)
-    else {
-        return;
-    };
-    let live = live_record_for(state, stable).await;
-    let _ = swap_if_seated(state, stable, live.as_ref(), &journal).await;
+    let _ = swap_if_seated(state, stable).await;
 }
 
 /// Swap, fail or roll back each open journal (§3 steps 3 and 4, and the
@@ -5486,14 +5525,20 @@ async fn reseat_progress(state: &Arc<AppState>) {
     for (stable, journal) in journals {
         if journal.phase == ReseatPhase::Prepared {
             if !preparing.contains(&stable) {
-                rollback_reseat(state, &stable, "reseat_preparation_interrupted").await;
+                rollback_reseat(
+                    state,
+                    &stable,
+                    journal.record_digest,
+                    "reseat_preparation_interrupted",
+                )
+                .await;
             }
             continue;
         }
-        let live = live_record_for(state, &stable).await;
-        if swap_if_seated(state, &stable, live.as_ref(), &journal).await {
+        if swap_if_seated(state, &stable).await {
             continue;
         }
+        let live = live_record_for(state, &stable).await;
         let failed_outcome = {
             let outcomes = state
                 .last_join_outcomes
@@ -5518,7 +5563,7 @@ async fn reseat_progress(state: &Arc<AppState>) {
             .expires_at_ms
             .saturating_add(u64::try_from(STAGING_GRACE.as_millis()).unwrap_or(u64::MAX));
         if failed_outcome || now_ms() > deadline {
-            rollback_reseat(state, &stable, "staged_join_ended").await;
+            rollback_reseat(state, &stable, journal.record_digest, "staged_join_ended").await;
         } else if staged_join_lost(
             &journal,
             live.as_ref().map(|(_, info)| info),
@@ -5526,7 +5571,7 @@ async fn reseat_progress(state: &Arc<AppState>) {
         ) {
             // No staged join runs in this process (a restart lost it) and
             // no staged record is durable: roll back.
-            rollback_reseat(state, &stable, "staged_join_lost").await;
+            rollback_reseat(state, &stable, journal.record_digest, "staged_join_lost").await;
         }
     }
 }
@@ -6547,6 +6592,86 @@ mod tests {
         Ok(())
     }
 
+    /// #1533 review (Codex P1): a re-seat credential of an owner-axis group
+    /// is a device-admission credential, so a session bearer never mints
+    /// one. This node holds no owner key, so the route takes the
+    /// promoted-admin path. Before the fix that path went on to its §3a
+    /// checks and its own mint, with no durable-token check.
+    #[tokio::test]
+    async fn a_session_token_cannot_reseat_an_owner_axis_group() -> anyhow::Result<()> {
+        use crate::server::rider_auth::ActorContext;
+        use axum::body::to_bytes;
+
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let keypair = state.agent.identity().agent_keypair();
+        let local = local_hex(&state);
+        let subject = "ab".repeat(32);
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?;
+        let mut info = GroupInfo::with_policy(
+            "adr0109-reseat-owner-axis".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "1533".repeat(16),
+            x0x::groups::GroupPolicy {
+                discoverability: x0x::groups::GroupDiscoverability::Hidden,
+                admission: x0x::groups::GroupAdmission::InviteOnly,
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..x0x::groups::GroupPolicy::default()
+            },
+        );
+        info.add_member(
+            subject.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local.clone()),
+            None,
+        );
+        info.seal_commit(keypair, 1_000)?;
+        info.remove_member(&subject, Some(local.clone()));
+        info.seal_commit(keypair, 2_000)?;
+        let basis = serde_json::json!({
+            "kind": "removal", "revision": info.state_revision, "state_hash": info.state_hash,
+        });
+        // The owner axis is set after the seals, which would otherwise
+        // need certificate evidence.
+        info.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner.user_id());
+        let key = info.mls_group_id.clone();
+        let stable = info.stable_group_id().to_string();
+        state.named_groups.write().await.insert(key.clone(), info);
+
+        let reseat = |durable: bool| {
+            let request: ReseatRequest = serde_json::from_value(serde_json::json!({
+                "reason": "forked while partitioned", "basis": basis,
+            }))
+            .expect("request decodes");
+            reseat_group_member(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(ActorContext::Owner { durable }),
+                Path((key.clone(), subject.clone())),
+                Json(request),
+            )
+        };
+        let response = reseat(false).await.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("durable API token")),
+            "{body}"
+        );
+        assert!(
+            sidecar_snapshot(&state, &stable)
+                .await
+                .is_none_or(|body| body.issued_reseats.is_empty()),
+            "a refused session re-seat records no authorisation"
+        );
+        // The durable token passes the fence and meets the §3a checks.
+        let response = reseat(true).await.into_response();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
     /// A SignedPublic group with this node Active, durable on disk, and a
     /// `Prepared` re-seat journal for it (the journal is not yet written).
     async fn reseat_fixture(
@@ -6658,6 +6783,7 @@ mod tests {
                 .staging_live
                 .insert(stable.clone());
             state.named_groups_save_fault.store(fault, Ordering::SeqCst);
+            let digest = journal.record_digest;
             let prepared = prepare_reseat(&state, &key, &info, journal).await;
             assert_eq!(prepared, Err("live_record_not_moved"), "fault {fault}");
             let open = open_journal(&state, &stable).await;
@@ -6668,7 +6794,7 @@ mod tests {
             );
             // The rollback cannot be durable while the fault holds: the
             // journal stays and the worker retries.
-            rollback_reseat(&state, &stable, "live_record_not_moved").await;
+            rollback_reseat(&state, &stable, digest, "live_record_not_moved").await;
             assert!(
                 open_journal(&state, &stable).await.is_some(),
                 "fault {fault}"
@@ -7016,6 +7142,93 @@ mod tests {
             .await
             .map_or(0, |body| body.retired.len());
         assert_eq!(retired, 1);
+        Ok(())
+    }
+
+    /// #1533 review (Codex P1): the swap and the rollback serialise on the
+    /// group membership lock. A rollback holds that lock while it restores
+    /// the original. A swap that starts then waits, and after the restore
+    /// it sees the original and keeps its marker. Before the fix the swap
+    /// read an unlocked snapshot of the staged record, then marked the
+    /// journal `Swapping`, lifted the marker from every record of the group
+    /// and closed the journal while the rollback ran, which released the
+    /// containment with no re-seat. Inert.
+    #[tokio::test]
+    async fn a_swap_during_a_rollback_keeps_the_original_contained() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, marker, _) = staged_reseat(&state).await?;
+        let stable = original.stable_group_id().to_string();
+        let journal = open_journal(&state, &stable)
+            .await
+            .expect("the re-seat journal is open");
+        // A rollback is in progress: it holds the membership lock.
+        let lock = super::super::group_membership_lock(&state, &stable).await;
+        let rollback_guard = lock.lock().await;
+        let swap = {
+            let state = Arc::clone(&state);
+            let stable = stable.clone();
+            tokio::spawn(async move { swap_now_if_seated(&state, &stable).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            open_journal(&state, &stable)
+                .await
+                .is_some_and(|open| open.phase == journal.phase),
+            "the swap waits for the rollback"
+        );
+        // The rollback restores the original under the lock, then ends.
+        assert!(restore_record_from_journal(&state, &stable, &key, &original, &journal).await);
+        drop(rollback_guard);
+        swap.await?;
+        let current_marker = || async {
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .and_then(|record| record.fork_quarantine.clone())
+        };
+        assert_eq!(current_marker().await, Some(marker.clone()));
+        assert!(
+            open_journal(&state, &stable).await.is_some(),
+            "the swap does not close a journal whose original is back"
+        );
+        // The rollback closes the journal; the original stays contained,
+        // in memory and on disk, and nothing is retired.
+        rollback_reseat(&state, &stable, journal.record_digest, "test_rollback").await;
+        assert!(open_journal(&state, &stable).await.is_none());
+        assert_eq!(current_marker().await, Some(marker.clone()));
+        let on_disk = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .expect("the original is on disk");
+        assert_eq!(on_disk.state_hash, original.state_hash);
+        assert_eq!(on_disk.fork_quarantine, Some(marker));
+        let retired = sidecar_snapshot(&state, &stable)
+            .await
+            .map_or(0, |body| body.retired.len());
+        assert_eq!(retired, 0);
+        Ok(())
+    }
+
+    /// #1533 review: a rollback decided on one journal never acts on
+    /// another. After the swap closed the journal, a late rollback with
+    /// the old journal's digest leaves the swapped-in record. Inert.
+    #[tokio::test]
+    async fn a_late_rollback_after_the_swap_keeps_the_swapped_record() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, _, staged) = staged_reseat(&state).await?;
+        let stable = original.stable_group_id().to_string();
+        let journal = open_journal(&state, &stable)
+            .await
+            .expect("the re-seat journal is open");
+        swap_now_if_seated(&state, &stable).await;
+        assert!(open_journal(&state, &stable).await.is_none());
+        rollback_reseat(&state, &stable, journal.record_digest, "late_rollback").await;
+        let live = state.named_groups.read().await.get(&key).cloned();
+        assert_eq!(
+            live.map(|record| record.state_hash),
+            Some(staged.state_hash)
+        );
         Ok(())
     }
 
@@ -8122,6 +8335,37 @@ mod tests {
         assert!(retire_marker_attested(&state, &key, &info).await);
         assert!(!live_marker(&state, &key).await);
         assert!(!disk_marker(&state, &key).await?);
+        Ok(())
+    }
+
+    /// #1533 review: the marker retirement decides on a snapshot, so its
+    /// write checks the retirement rule again on the record it changes.
+    /// Before the fix the write checked only the marker's identity, and a
+    /// record restored after the snapshot (same marker, evidenced commit
+    /// not applied) lost its marker. Inert.
+    #[tokio::test]
+    async fn a_marker_retirement_rechecks_the_record_it_writes() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _ata) = marker_fixture(&state).await?;
+        // After the snapshot, the live record changes to one with the same
+        // marker and without its evidenced commit (a re-seat rollback
+        // restores such an original).
+        let marker = info
+            .fork_quarantine
+            .clone()
+            .expect("the fixture is contained");
+        let mut restored = info.clone();
+        restored.commit_log.retain(|entry| {
+            !(entry.commit.revision == marker.revision
+                && entry.commit.state_hash == marker.state_hash)
+        });
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), restored);
+        assert!(!retire_marker_attested(&state, &key, &info).await);
+        assert!(live_marker(&state, &key).await, "the marker stays");
         Ok(())
     }
 
