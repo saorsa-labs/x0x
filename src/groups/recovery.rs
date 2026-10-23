@@ -1583,7 +1583,9 @@ impl ReseatJournalV1 {
     ///   journalled original's marker, which the staged record holds until
     ///   the swap lifts it), and its head is past the authorisation's invite
     ///   base (the re-seat `MemberAdded` seals after that base);
-    /// - this node is Active on it, with keys when the plane is TreeKEM.
+    /// - this node is Active on it and holds its group key
+    ///   ([`Self::group_key_installed`]): the tree on the TreeKEM plane,
+    ///   the shared secret of an encrypted GSS group.
     #[must_use]
     pub fn staged_result_ready(&self, live: &GroupInfo, local_hex: &str, has_tree: bool) -> bool {
         if self.phase == ReseatPhase::Prepared {
@@ -1596,7 +1598,21 @@ impl ReseatJournalV1 {
             && (live.fork_quarantine.is_none() || live.fork_quarantine == self.original_marker())
             && live.state_revision > self.authorisation.fields.invite_base_revision
             && live.has_active_member(local_hex)
-            && (live.secure_plane != crate::mls::SecureGroupPlane::TreeKem || has_tree)
+            && Self::group_key_installed(live, has_tree)
+    }
+
+    /// §3 step 3 (#1533 rc13): the swap needs this node's installed group
+    /// key on either plane. A staged GSS join holds no shared secret until
+    /// its `SecureShareDelivered` installs one, so its `MemberAdded` alone
+    /// does not seat it. A `SignedPublic` group has no key to wait for.
+    fn group_key_installed(live: &GroupInfo, has_tree: bool) -> bool {
+        match live.secure_plane {
+            crate::mls::SecureGroupPlane::TreeKem => has_tree,
+            crate::mls::SecureGroupPlane::Gss => {
+                live.policy.confidentiality != crate::groups::GroupConfidentiality::MlsEncrypted
+                    || live.shared_secret.is_some()
+            }
+        }
     }
 }
 
@@ -2530,6 +2546,20 @@ mod tests {
         let mut treekem = staged.clone();
         treekem.secure_plane = crate::mls::SecureGroupPlane::TreeKem;
         assert!(!journal.staged_result_ready(&treekem, &subject, false));
+        // #1533 rc13: an encrypted GSS group whose share has not arrived
+        // (no shared secret yet) is not seated either, tree or not.
+        assert_eq!(
+            staged.policy.confidentiality,
+            crate::groups::GroupConfidentiality::MlsEncrypted
+        );
+        let mut keyless = staged.clone();
+        keyless.shared_secret = None;
+        assert!(!journal.staged_result_ready(&keyless, &subject, true));
+        assert!(!journal.staged_result_ready(&keyless, &subject, false));
+        // A signed-public GSS group has no key to wait for.
+        let mut public = keyless.clone();
+        public.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        assert!(journal.staged_result_ready(&public, &subject, false));
     }
 
     #[test]

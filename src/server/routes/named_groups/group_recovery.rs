@@ -7170,6 +7170,59 @@ mod tests {
         Ok(())
     }
 
+    /// #1533 rc13 (Codex P2 @c226d28e), ADR 0109 §3 step 3: a staged GSS
+    /// join is Active on its `MemberAdded` before its `SecureShareDelivered`
+    /// installs the shared secret. Until the share arrives the swap does
+    /// not run: the original's containment stays and the journal stays
+    /// open (a share that never arrives ends at the journal deadline, which
+    /// rolls back). Before the fix the readiness check covered only the
+    /// TreeKEM tree, so the keyless record swapped in. Inert.
+    #[tokio::test]
+    async fn a_gss_reseat_swaps_only_once_its_share_is_installed() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, _, marker, staged) = staged_reseat(&state).await?;
+        let stable = staged.stable_group_id().to_string();
+        let set_secret = |secret: Option<Vec<u8>>| {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move {
+                let outcome = super::super::persist_named_groups_mutation(&state, move |groups| {
+                    groups.get_mut(&key).is_some_and(|record| {
+                        record.policy.confidentiality =
+                            x0x::groups::GroupConfidentiality::MlsEncrypted;
+                        record.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+                        record.shared_secret = secret;
+                        true
+                    })
+                })
+                .await?;
+                anyhow::ensure!(outcome == super::super::AtomicWriteOutcome::Durable);
+                anyhow::Ok(())
+            }
+        };
+        // Seated, encrypted, no share yet: no swap, however often it runs.
+        set_secret(None).await?;
+        for _ in 0..3 {
+            assert!(!swap_if_seated(&state, &stable).await);
+        }
+        assert!(open_journal(&state, &stable).await.is_some());
+        assert_eq!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .and_then(|record| record.fork_quarantine.clone()),
+            Some(marker),
+            "the staged record keeps the original's containment"
+        );
+        // The delayed share arrives: the next tick swaps.
+        set_secret(Some(vec![7; 32])).await?;
+        assert!(swap_if_seated(&state, &stable).await);
+        assert!(open_journal(&state, &stable).await.is_none());
+        Ok(())
+    }
+
     /// #1533 review (Codex P1): the swap and the rollback serialise on the
     /// group membership lock. A rollback holds that lock while it restores
     /// the original. A swap that starts then waits, and after the restore
