@@ -87,7 +87,7 @@ This improves future peer discovery quality scoring so that well-connected addre
 
 ## Relay and Coordinator Roles
 
-The `is_relay` and `is_coordinator` fields in announcements are informational. Agents that report `is_coordinator: true` can coordinate hole-punch timing for peers. Agents that report `is_relay: true` can forward traffic for peers that cannot otherwise connect.
+The `is_relay` and `is_coordinator` fields in announcements are informational only: no hint, join or selection path reads them (David's 20 Oct 2026 #1112 ruling, confirmed 22 Oct 2026, which replaces ADR 0071's community flag tiers). Coordinator and relay assistance comes from the operator tier — peers observed on a direct path from a compiled-in seed listener address — and from `ant-quic`'s deployment-configured bootstrap cache, not from self-assertion.
 
 These roles are set by `ant-quic`'s internal node status and are not controlled by x0x directly.
 

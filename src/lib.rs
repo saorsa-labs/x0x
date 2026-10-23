@@ -1708,6 +1708,21 @@ fn classify_with_cache(
     }
 }
 
+/// The operator bootstrap ADDRESS set (#1112 round 4): every seed
+/// listener row exactly. The operator hint tier matches the FULL observed
+/// socket address against this set, never the IP alone — a NATed peer
+/// with a relay slot on a seed advertises the seed's IP on an allocated
+/// port, and an IP-only match would wrongly enlist it as an operator
+/// hint.
+#[must_use]
+pub(crate) fn bootstrap_seed_addrs() -> std::collections::HashSet<std::net::SocketAddr> {
+    network::DEFAULT_BOOTSTRAP_PEERS
+        .iter()
+        .filter_map(|row| row.parse::<std::net::SocketAddr>().ok())
+        .map(network::normalize_v4_mapped_addr)
+        .collect()
+}
+
 /// The operator bootstrap IP set, deduped by IP across port rows
 /// (`DEFAULT_BOOTSTRAP_PEERS` carries :443 and :5483 rows for the same
 /// hosts — the IP set collapses them).
@@ -5521,11 +5536,56 @@ fn deserialize_machine_announcement(
         .deserialize(payload)
 }
 
+/// #1112 (round 10, refactored round 21): the cache-consumption fence is
+/// ADDRESS-scoped, like every other #1112 verdict. The seam evicts a
+/// mismatched identity's row on refusal, but a delayed ant-quic
+/// reachability write (`observe_direct_reachability` off connection
+/// completion) can re-create the row afterwards; the pair checks here
+/// are the durable fence.
+fn cached_addr_pinned_mismatch(peer_id: &ant_quic::PeerId, addr: &std::net::SocketAddr) -> bool {
+    matches!(
+        network::seed_pin_check(network::pinned_seed_peer_ids(*addr), peer_id.0),
+        network::SeedPinVerdict::Mismatch { .. }
+    )
+}
+
+/// The addresses of a cached row the pin verdict still allows. Phase 0
+/// dials only these (#1112 round 21, Codex P2: a mismatching sibling
+/// address costs itself, not the row's valid addresses — the whole-row
+/// drop used to lose every join path a mixed row still had).
+fn cached_row_addresses_allowed(
+    peer_id: &ant_quic::PeerId,
+    addresses: &[std::net::SocketAddr],
+) -> Vec<std::net::SocketAddr> {
+    addresses
+        .iter()
+        .filter(|addr| !cached_addr_pinned_mismatch(peer_id, addr))
+        .copied()
+        .collect()
+}
+
+/// A row is refused at consumption only when EVERY address mismatches a
+/// pin set that excludes the identity — a fully poisoned row is dialled
+/// by id never (#1112 round 3; the cache itself stays untouched for
+/// ant-quic's own accounting). A MIXED row keeps its Phase 1 candidacy
+/// (round 21): an id dial cannot be steered per address, so the
+/// post-dial pair partition and the live-session guards refuse a
+/// landing on the bad address instead.
+fn cached_row_fully_pinned_mismatch(
+    peer_id: &ant_quic::PeerId,
+    addresses: &[std::net::SocketAddr],
+) -> bool {
+    !addresses.is_empty()
+        && addresses
+            .iter()
+            .all(|addr| cached_addr_pinned_mismatch(peer_id, addr))
+}
+
 /// Compute coordinator / relay hint lists for an announcement.
 ///
-/// Collects machine IDs of currently-connected peers that the machine cache
-/// marks as coordinator- or relay-capable. Deduplicated, capped to
-/// `MAX_COORDINATOR_HINTS` each, and returned in stable order.
+/// Delegates the choice to [`select_capability_hints`] (#1112): one
+/// eligibility tier over the connected set, and never the announcer
+/// itself.
 ///
 /// Used to populate `reachable_via` / `relay_candidates` on outgoing
 /// announcements so that remote peers have concrete targets to dial when
@@ -5538,45 +5598,143 @@ async fn collect_coordinator_hints(
     own_machine_id: identity::MachineId,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
-    /// Upper bound on hint list length. Keeps the signed payload small and
-    /// avoids amplifying gossip if we accumulate many peers.
-    const MAX_COORDINATOR_HINTS: usize = 8;
-
-    let connected = network.connected_peers().await;
-    if connected.is_empty() {
+    let origins = network.connected_peer_origins().await;
+    if origins.is_empty() {
         // ADR-0035 metering: the announce wanted coordinator/relay hints
         // but nothing connected could supply them.
         selection_skew.record(SelectionChoice::NoneAvailable);
         return (Vec::new(), Vec::new());
     }
-
     // ADR-0035 metering: classify every hint this announce is about to
     // advertise — the supply-side choice skew.
     let bootstrap_ips = bootstrap_ip_set();
+    let seed_addrs = bootstrap_seed_addrs();
     let cache = machine_cache.read().await;
+    select_capability_hints(
+        &origins,
+        &cache,
+        own_machine_id,
+        &bootstrap_ips,
+        &seed_addrs,
+        selection_skew,
+    )
+}
+
+/// #1112: the coordinator / relay hint selection, as a pure function.
+///
+/// One eligibility tier:
+///
+/// - **Operator tier:** the peer is connected over a DIRECT path whose
+///   OBSERVED remote address (v4-mapped forms normalized) IS a
+///   compiled-in seed listener address — the full socket address — and
+///   the identity is inside that address's pin set when pinned. The
+///   operator fleet runs coordinator and relay roles by deployment, and
+///   a completed QUIC handshake with that source is deployment-derived
+///   evidence no announcement can forge. No capability flag is
+///   consulted, and a pin-mismatched identity never qualifies.
+///
+///   David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026) REPLACES
+///   ADR 0071's community flag tiers: the announcement's self-asserted
+///   `is_coordinator`/`is_relay` is informational wire data only and
+///   never grants a hint, on any selection path. The flags stay in the
+///   wire structs (compatibility) but no decision reads them.
+///
+/// Identities rejected by a seed-pin mismatch are excluded from the
+/// tier PAIR-SCOPED (review round 7): only the origin whose observed
+/// address mismatched its pin set is skipped — a mismatch at one seed
+/// address never suppresses the same identity's valid, pinned origin at
+/// another address, and no dial completion order changes that. Hints are
+/// deduplicated, capped to `MAX_COORDINATOR_HINTS` each, and returned in
+/// stable order. The announcer never hints itself.
+fn select_capability_hints(
+    origins: &[network::PeerOrigin],
+    cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
+    own_machine_id: identity::MachineId,
+    bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
+    seed_addrs: &std::collections::HashSet<std::net::SocketAddr>,
+    selection_skew: &SelectionSkew,
+) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
+    /// Upper bound on hint list length. Keeps the signed payload small and
+    /// avoids amplifying gossip if we accumulate many peers.
+    const MAX_COORDINATOR_HINTS: usize = 8;
+
     let mut reachable_via: Vec<identity::MachineId> = Vec::new();
     let mut relay_candidates: Vec<identity::MachineId> = Vec::new();
 
-    for peer_id in connected {
-        let mid = identity::MachineId(peer_id.0);
+    for origin in origins {
+        let mid = identity::MachineId(origin.peer_id.0);
         if mid == own_machine_id {
             continue;
         }
-        let Some(entry) = cache.get(&mid) else {
+        // Rounds 5-6 + 18: the selector validates the PAIR — when the
+        // observed address (whatever the path: ant-quic reports
+        // hole-punched paths as non-direct while still naming the
+        // peer's remote address, round 18) is a pinned seed address and
+        // the identity is OUTSIDE its pin set, the pair never qualifies.
+        // Inbound connections and `connect_peer_with_addrs` bypass the
+        // dial seam, so the selector cannot assume the seam already
+        // rejected a mismatched identity.
+        let observed_addr = origin.remote_addr.map(network::normalize_v4_mapped_addr);
+        let pin_mismatch_at_seed = observed_addr.is_some_and(|observed| {
+            matches!(
+                network::seed_pin_gate(observed, origin.peer_id.0),
+                network::SeedPinVerdict::Mismatch { .. }
+            )
+        });
+        if pin_mismatch_at_seed {
             continue;
-        };
-        if entry.is_coordinator == Some(true)
+        }
+        // Operator tier: the OBSERVED transport address of a DIRECT path
+        // IS a seed listener address — the FULL socket address, never the
+        // IP alone (round 4: a NATed peer with a relay slot on a seed
+        // advertises the seed's IP on an allocated port, and an IP-only
+        // match would wrongly enlist it). The peer cannot forge this by
+        // announcing anything. v4-mapped forms are normalized here as
+        // well as in `connected_peer_origins`, so the pure function's
+        // contract does not depend on the caller (review round 3).
+        let observed_seed_addr = origin
+            .direct
+            .then_some(observed_addr)
+            .flatten()
+            .filter(|observed| seed_addrs.contains(observed));
+        let on_operator_host = observed_seed_addr.is_some();
+        if !cache.contains_key(&mid) {
+            // No announcement seen: only the operator tier can qualify,
+            // under the same deduplication and cap as the announced case
+            // (review round 3).
+            if on_operator_host
+                && !reachable_via.contains(&mid)
+                && reachable_via.len() < MAX_COORDINATOR_HINTS
+            {
+                selection_skew.record(SelectionChoice::Bootstrap);
+                reachable_via.push(mid);
+            }
+            if on_operator_host
+                && !relay_candidates.contains(&mid)
+                && relay_candidates.len() < MAX_COORDINATOR_HINTS
+            {
+                selection_skew.record(SelectionChoice::Bootstrap);
+                relay_candidates.push(mid);
+            }
+            continue;
+        }
+        // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+        // replaces ADR 0071's community flag tiers: the announcement's
+        // self-asserted `is_coordinator`/`is_relay` grants nothing — the
+        // flags are informational wire data only. Only the operator tier
+        // qualifies an announced peer.
+        if on_operator_host
             && !reachable_via.contains(&mid)
             && reachable_via.len() < MAX_COORDINATOR_HINTS
         {
-            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
+            selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             reachable_via.push(mid);
         }
-        if entry.is_relay == Some(true)
+        if on_operator_host
             && !relay_candidates.contains(&mid)
             && relay_candidates.len() < MAX_COORDINATOR_HINTS
         {
-            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
+            selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             relay_candidates.push(mid);
         }
     }
@@ -5584,6 +5742,70 @@ async fn collect_coordinator_hints(
     reachable_via.sort_by_key(|id| id.0);
     relay_candidates.sort_by_key(|id| id.0);
     (reachable_via, relay_candidates)
+}
+
+/// #1112 (round 25): whether a bootstrap-cache row carries the evidence a
+/// transport helper mark needs.
+///
+/// The evidence is the row's own FRESH Global-scope direct observation:
+/// ant-quic records one only when THIS node's outbound dial to that
+/// address completed without coordinator or relay assistance
+/// (`observe_direct_reachability`), and every cache read drops records
+/// older than the reachability TTL first. The effective
+/// `supports_relay` / `supports_coordination` flags are NOT consulted:
+/// they also derive from the sticky `hinted_supports_*` marks, so reading
+/// them would let a mark justify itself. A LAN or loopback observation is
+/// not evidence that third parties can reach the peer.
+fn cache_row_has_verified_helper_evidence(row: &ant_quic::bootstrap_cache::CachedPeer) -> bool {
+    row.capabilities.has_global_direct_reachability()
+}
+
+/// #1112 (round 25): clear the `hinted_supports_*` marks that no fresh
+/// Global-scope direct observation supports. Returns the number of rows
+/// changed.
+///
+/// ant-quic persists a higher-layer helper hint as a sticky
+/// `hinted_supports_relay` / `hinted_supports_coordination` bit on the
+/// row, and `record_assist_hints(false, false)` never clears one. Before
+/// round 25 `seed_transport_peer_hints_for_target` marked every
+/// cache-selected fallback candidate, and earlier heads marked
+/// self-asserted roles, so a cache on disk can carry marks that no
+/// evidence supports; the marks also rank the row first in ant-quic's
+/// own helper selection. The row's addresses, direct observations,
+/// statistics and token are untouched, and a mark the row's current
+/// evidence supports is kept — the dial seeding would grant it again.
+///
+/// ant-quic offers no compare-and-swap on a row: each change re-reads the
+/// row and writes it back under two consecutive cache locks, which is
+/// the narrowest window its API allows. The endpoint's in-memory
+/// `PeerHintRecord` is private to ant-quic and merges marks
+/// monotonically; it starts empty at every process start, and after
+/// round 25 x0x feeds it a mark only on verified evidence.
+async fn clear_unsupported_helper_hint_marks(cache: &ant_quic::BootstrapCache) -> usize {
+    let mut cleared = 0usize;
+    for row in cache.all_peers().await {
+        if !(row.capabilities.hinted_supports_relay
+            || row.capabilities.hinted_supports_coordination)
+            || cache_row_has_verified_helper_evidence(&row)
+        {
+            continue;
+        }
+        let Some(fresh) = cache.get_peer(&row.peer_id).await else {
+            continue;
+        };
+        let mut caps = fresh.capabilities;
+        caps.hinted_supports_relay = false;
+        caps.hinted_supports_coordination = false;
+        cache.update_capabilities(&row.peer_id, caps).await;
+        cleared += 1;
+        tracing::debug!(
+            target: "x0x::connect",
+            stage = "clear_helper_hint_marks",
+            peer_prefix = %network::hex_prefix(&row.peer_id.0, 4),
+            "cleared an unsupported persisted helper mark"
+        );
+    }
+    cleared
 }
 
 fn build_machine_announcement_for_identity(
@@ -7769,25 +7991,47 @@ impl Agent {
         let mut helper_hints: std::collections::HashMap<ant_quic::PeerId, HelperHintEntry> =
             std::collections::HashMap::new();
 
+        // #1112 round 25: ant-quic's selectors return unverified fallback
+        // rows by design ("measure, don't trust"), and ant-quic itself keeps
+        // those as plain address candidates. A capability mark reaches
+        // ant-quic only on the row's own fresh Global-scope direct
+        // observation — evidence THIS node's outbound dial created and no
+        // announcement can forge. Every other row stays an address hint, so
+        // an address-only announcement can never be promoted into a
+        // persistent helper here (Codex P2 at d722045).
+        let mut cache_selector_verified = 0usize;
+        let mut cache_selector_address_only = 0usize;
         if let Some(ref cache) = self.bootstrap_cache {
             for peer in cache.select_coordinators(6).await {
+                let verified = cache_row_has_verified_helper_evidence(&peer);
+                if verified {
+                    cache_selector_verified += 1;
+                } else {
+                    cache_selector_address_only += 1;
+                }
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
                     "bootstrap_cache:coordinator",
                     peer.preferred_addresses(),
-                    true,
+                    verified,
                     false,
                 );
             }
             for peer in cache.select_relay_peers(6).await {
+                let verified = cache_row_has_verified_helper_evidence(&peer);
+                if verified {
+                    cache_selector_verified += 1;
+                } else {
+                    cache_selector_address_only += 1;
+                }
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
                     "bootstrap_cache:relay",
                     peer.preferred_addresses(),
                     false,
-                    true,
+                    verified,
                 );
             }
         }
@@ -7800,6 +8044,10 @@ impl Agent {
                 if advert_peer_id == target_peer_id {
                     continue;
                 }
+                // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct
+                // 2026) replaces ADR 0071's community flag tiers: the
+                // advert's self-asserted roles mark nothing — it only
+                // contributes address hints.
                 merge_helper_hint(
                     &mut helper_hints,
                     advert_peer_id,
@@ -7809,8 +8057,8 @@ impl Agent {
                         .into_iter()
                         .map(|hint| hint.addr)
                         .filter(|addr| is_publicly_advertisable(*addr)),
-                    advert.roles.coordinator || advert.roles.rendezvous,
-                    advert.roles.relay,
+                    false,
+                    false,
                 );
             }
         }
@@ -7823,13 +8071,19 @@ impl Agent {
             if candidate.machine_id == target.machine_id || candidate.machine_id.0 == [0u8; 32] {
                 continue;
             }
+            // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+            // replaces ADR 0071's community flag tiers: the machine
+            // cache's self-asserted flag fields mark nothing — the
+            // candidate only contributes address hints. Coordinator and
+            // relay capability reaches ant-quic only through the loop
+            // above, gated on the cache row's own direct evidence.
             merge_helper_hint(
                 &mut helper_hints,
                 ant_quic::PeerId(candidate.machine_id.0),
                 "machine_discovery_cache",
                 candidate.addresses.iter().copied(),
-                candidate.is_coordinator == Some(true),
-                candidate.is_relay == Some(true),
+                false,
+                false,
             );
         }
 
@@ -7843,6 +8097,8 @@ impl Agent {
             target_addr_count = target.addresses.len(),
             helper_candidate_count,
             helper_addr_total,
+            cache_selector_verified,
+            cache_selector_address_only,
             "prepared helper hints for peer-authenticated dial"
         );
 
@@ -14695,9 +14951,19 @@ impl Agent {
         // phase starts no dial, and a cancellation ends its dial batch.
         if let Some(ref cache) = self.bootstrap_cache {
             let coordinators = cache.select_coordinators(6).await;
+            // #1112 (round 10, address-scoped round 21): fence rejected
+            // pairs at cache consumption — the seam evicts a mismatched
+            // row, but a delayed ant-quic reachability write can re-create
+            // it; the pair check here is the durable filter, before any
+            // dial is spent. Round 21 (Codex P2): only the MISMATCHING
+            // addresses drop — a row with a stale pinned seed address and
+            // a valid address keeps the valid one (the whole-row filter
+            // used to lose both join paths).
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
                 .iter()
-                .flat_map(|peer| peer.preferred_addresses())
+                .flat_map(|peer| {
+                    cached_row_addresses_allowed(&peer.peer_id, &peer.preferred_addresses())
+                })
                 .collect();
 
             if !coordinator_addrs.is_empty() && !self.shutdown_token.is_cancelled() {
@@ -14713,10 +14979,20 @@ impl Agent {
                         &self.shutdown_token,
                     )
                     .await;
-                all_connected.extend(succeeded.iter().copied());
+                // #1112 (review round 2): the cached-coordinator tier gets
+                // the same pin verdict as the seed tiers — a pinned
+                // address that answered with an identity outside its pin
+                // set never becomes a join candidate, on any join path.
+                // Round 21: one shared per-address predicate
+                // (`cached_addr_pinned_mismatch`) backs every consumption
+                // check, pre- and post-dial.
+                let (admitted, _pin_rejected): (Vec<_>, Vec<_>) = succeeded
+                    .into_iter()
+                    .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(peer_id, addr));
+                all_connected.extend(admitted.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
-                    succeeded.len(),
+                    admitted.len(),
                     coordinator_addrs.len()
                 );
             }
@@ -15299,7 +15575,22 @@ impl Agent {
             return;
         };
         const PHASE1_PEER_CANDIDATES: usize = 12;
-        let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        let mut cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        // #1112 (review round 3, scoped rounds 7 and 21): cached joins
+        // take the pin verdict PAIR-SCOPED, and an id dial cannot be
+        // steered per address — so only a FULLY poisoned row (every
+        // address mismatches a pin set that excludes the identity) is
+        // dropped; the cache itself stays untouched for ant-quic's own
+        // accounting. A MIXED row (stale pinned seed address + valid
+        // address) stays a candidate (round 21, Codex P2: the whole-row
+        // drop used to lose the valid address too). If the id dial lands
+        // on the bad address anyway, the post-dial pair partition below
+        // and the live-session guards refuse that landing, and the dial
+        // seam plus its bounded backoff refuse the address on any later
+        // address dial.
+        cached_peers.retain(|peer| {
+            !cached_row_fully_pinned_mismatch(&peer.peer_id, &peer.preferred_addresses())
+        });
         if cached_peers.is_empty() || stop.is_cancelled() {
             return;
         }
@@ -15307,10 +15598,19 @@ impl Agent {
         let (succeeded, _failed) = self
             .connect_cached_peers_parallel_tracked(network, &cached_peers, stop)
             .await;
-        candidates.extend(succeeded.iter().copied());
+        // #1112 (round 21): ant-quic's id dial tries every cached address
+        // of a row, so a mixed row's landing can be the mismatching
+        // address — this tier takes the same post-dial pair partition as
+        // Phase 0 (round 2): a pinned address that answered with an
+        // identity outside its pin set never becomes a join candidate, on
+        // any join path.
+        let (admitted, _pin_rejected): (Vec<_>, Vec<_>) = succeeded
+            .into_iter()
+            .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(peer_id, addr));
+        candidates.extend(admitted.iter().copied());
         tracing::info!(
             "Phase 1: {}/{} cached peers connected",
-            succeeded.len(),
+            admitted.len(),
             cached_peers.len()
         );
     }
@@ -15521,6 +15821,12 @@ impl Agent {
                     };
                     match dialled {
                         Ok(Ok(peer_id)) => {
+                            // #1112 (round 4): the per-address seed pin is
+                            // enforced inside `connect_addr_with_origin`,
+                            // BEFORE the cache write, success record, and
+                            // PeerConnected event — a mismatched answer
+                            // never returns `Ok` from the dial at all, so
+                            // this batch only sees admitted hints.
                             tracing::info!("Connected to peer: {}", addr);
                             Ok((addr, peer_id))
                         }
@@ -22161,6 +22467,23 @@ impl AgentBuilder {
                             }
                         }
                     }
+                }
+            }
+        }
+        // #1112 round 25: a persisted helper mark survives only while the
+        // row's own direct evidence supports it. Caches written by earlier
+        // heads carry marks that no evidence supports (fallback promotion
+        // and, older still, self-asserted roles); clear them now, post-load,
+        // before any selection can read them, and persist the cleaned rows.
+        if let Some(cache) = bootstrap_cache.as_ref() {
+            let cleared = clear_unsupported_helper_hint_marks(cache).await;
+            if cleared > 0 {
+                tracing::info!(
+                    cleared,
+                    "#1112: cleared unsupported helper hint marks from the bootstrap cache"
+                );
+                if let Err(e) = cache.save().await {
+                    tracing::warn!("#1112: failed to persist the cleared helper hint marks: {e}");
                 }
             }
         }
@@ -40802,6 +41125,715 @@ mod peer_connected_handler_integration_tests {
         assert_eq!(back.placement_digests, unsigned.placement_digests);
         assert_eq!(back.machine_kem_public_key, unsigned.machine_kem_public_key);
         assert_eq!(back.move_protocol, unsigned.move_protocol);
+    }
+
+    mod issue1112_capability_hint_tests {
+        use super::*;
+
+        // ── Issue #1112: relay/coordinator hints from evidence, not self-report ──
+
+        fn issue1112_machine(
+            machine_id: identity::MachineId,
+            addresses: &[std::net::SocketAddr],
+            is_relay: Option<bool>,
+            is_coordinator: Option<bool>,
+        ) -> DiscoveredMachine {
+            DiscoveredMachine {
+                machine_id,
+                addresses: addresses.to_vec(),
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: vec![1],
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay,
+                is_coordinator,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            }
+        }
+
+        /// A directly-connected peer whose socket the local endpoint
+        /// observes at `observed` (issue #1112 evidence model).
+        fn issue1112_origin(peer: [u8; 32], observed: &str, direct: bool) -> network::PeerOrigin {
+            network::PeerOrigin {
+                peer_id: ant_quic::PeerId(peer),
+                remote_addr: Some(observed.parse().unwrap()),
+                direct,
+            }
+        }
+
+        #[test]
+        fn issue1112_forged_seed_address_grants_no_operator_tier() {
+            // Review rounds 1-3: an announcement's address list is a claim,
+            // not evidence. A peer that lists operator seed IPs but is
+            // observed from its own address gains nothing: the operator
+            // tier keys on the OBSERVED address. Self-asserted flags
+            // grant nothing either (David's 20 Oct 2026 ruling).
+            let mut cache = std::collections::HashMap::new();
+            let forger = identity::MachineId([0x11; 32]);
+            cache.insert(
+                forger,
+                issue1112_machine(
+                    forger,
+                    &[
+                        "142.93.199.50:5483".parse().unwrap(),
+                        "147.182.234.192:443".parse().unwrap(),
+                    ],
+                    None,
+                    None,
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x11; 32], "203.0.113.10:52000", true)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a forged seed address in an announcement must not grant the operator tier"
+            );
+        }
+
+        #[test]
+        fn issue1112_self_asserted_flags_alone_grant_no_hint() {
+            // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+            // REPLACES ADR 0071's community flag tiers: a peer that only
+            // self-asserts `is_relay`/`is_coordinator` gets NO hint. The
+            // flags stay in the wire structs as informational data, but
+            // no selection path reads them. Runtime-RED before the
+            // removal: this peer was hinted by its flags alone.
+            let mut cache = std::collections::HashMap::new();
+            let flagged = identity::MachineId([0x11; 32]);
+            cache.insert(
+                flagged,
+                issue1112_machine(
+                    flagged,
+                    &["203.0.113.10:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x11; 32], "198.51.100.99:52000", true)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert!(
+                coordinators.is_empty() && relays.is_empty(),
+                "self-asserted capability flags alone must not grant a hint"
+            );
+        }
+
+        #[test]
+        fn issue1112_operator_seed_host_is_a_hint_without_self_assertion() {
+            // Evidence side of #1112: a machine whose DIRECT connection the
+            // local socket OBSERVED on a compiled-in operator seed IP is a
+            // coordinator and relay hint even with no self-asserted flags —
+            // the operator fleet runs both roles by deployment. The announcer
+            // never hints itself. A dual-stack socket reports the same peer
+            // v4-mapped; the normalized form must work identically.
+            let seed_host = identity::MachineId([0x22; 32]);
+            let own = identity::MachineId([0x99; 32]);
+            let mut cache = std::collections::HashMap::new();
+            cache.insert(
+                seed_host,
+                issue1112_machine(
+                    seed_host,
+                    &["142.93.199.50:5483".parse().unwrap()],
+                    None,
+                    None,
+                ),
+            );
+            cache.insert(
+                own,
+                issue1112_machine(own, &["142.93.199.50:443".parse().unwrap()], None, None),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[
+                    issue1112_origin([0x22; 32], "142.93.199.50:5483", true),
+                    issue1112_origin([0x99; 32], "142.93.199.50:443", true),
+                    // Same seed host seen v4-mapped on a dual-stack socket
+                    // (review round 2): normalization must keep it a hint.
+                    issue1112_origin([0x55; 32], "[::ffff:65.21.157.229]:5483", true),
+                ],
+                &cache,
+                own,
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert!(coordinators.contains(&seed_host));
+            assert!(relays.contains(&seed_host));
+            // The mapped seed host (no cache entry) is also an
+            // operator-tier hint, and each hint-list entry records one
+            // bootstrap-classified choice: seed_host twice (its cache
+            // entry classifies) + the mapped peer twice (the no-cache
+            // operator branch). None for the self-entry.
+            let mapped_seed = identity::MachineId([0x55; 32]);
+            assert!(
+                coordinators.contains(&mapped_seed) && relays.contains(&mapped_seed),
+                "a v4-mapped observed seed address must stay an operator-tier hint"
+            );
+            assert_eq!(skew.snapshot().chosen_bootstrap, 4);
+            assert_eq!(skew.snapshot().chosen_non_bootstrap, 0);
+        }
+
+        #[test]
+        fn issue1112_pin_mismatch_exclusion_is_pair_scoped_not_identity_wide() {
+            // Review round 7: a seed-pin mismatch excludes the mismatching
+            // (address, identity) PAIR only. The selector's pair check
+            // (`seed_pin_gate`) is live the moment an operator pins rows;
+            // the identity-wide skip it used to carry is gone, because a
+            // rejection recorded at one seed address must not suppress the
+            // same identity's valid, pinned origin at another address —
+            // whatever the dial completion order. With the production pin
+            // table empty every pair is TOFU, so a healthy seed origin is
+            // hinted regardless of what happened at other addresses.
+            let mut cache = std::collections::HashMap::new();
+            let seed_host = identity::MachineId([0x33; 32]);
+            cache.insert(seed_host, issue1112_machine(seed_host, &[], None, None));
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[
+                    // The same identity seen at two distinct seed
+                    // listeners: no pin row rejects either pair, so both
+                    // origins are eligible — the ordering of any mismatch
+                    // elsewhere cannot change that.
+                    issue1112_origin([0x33; 32], "142.93.199.50:5483", true),
+                    issue1112_origin([0x33; 32], "147.182.234.192:443", true),
+                ],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert_eq!(coordinators, vec![seed_host]);
+            assert_eq!(relays, vec![seed_host]);
+            // The pair verdict itself — the only thing that can exclude an
+            // origin — stays scoped to the address that mismatched.
+            let pins = [network::SeedPeerPin {
+                addr: "142.93.199.50:5483",
+                expected_peer_ids: &[&[0xAA; 32]],
+            }];
+            assert!(matches!(
+                network::seed_pin_gate_in(&pins, "142.93.199.50:5483".parse().unwrap(), [0x33; 32]),
+                network::SeedPinVerdict::Mismatch { .. }
+            ));
+            assert_eq!(
+                network::seed_pin_gate_in(
+                    &pins,
+                    "147.182.234.192:443".parse().unwrap(),
+                    [0x33; 32]
+                ),
+                network::SeedPinVerdict::Unpinned,
+                "the other address's pair is untouched by the mismatch"
+            );
+        }
+
+        #[test]
+        fn issue1112_cache_consumption_refuses_a_rewritten_row() {
+            // Review round 10 (Codex P2: cache eviction races a pending
+            // transport write): the seam evicts a mismatched identity's
+            // row, but a delayed ant-quic reachability write can
+            // re-create it. The join tiers fence rejected pairs at cache
+            // CONSUMPTION — the row is never dialled, whatever wrote it.
+            // Runtime-RED before the consumption fence: Phase 0 dialled
+            // whatever `select_coordinators` returned. Round 21 keeps the
+            // fence address-scoped (see the mixed-row test below).
+            const PINNED_KEY: [u8; 32] = [0xAE; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&PINNED_KEY],
+            }];
+            let _pins = network::override_dial_pins_for_test(&PINS);
+            let rejected = ant_quic::PeerId([0x77; 32]);
+            let pinned_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
+            // The rewritten row (the delayed writer's product): every
+            // address mismatches, so no tier touches it.
+            assert!(
+                cached_row_fully_pinned_mismatch(&rejected, &[pinned_addr]),
+                "a re-created row for a mismatching pair is refused at consumption"
+            );
+            assert!(
+                cached_row_addresses_allowed(&rejected, &[pinned_addr]).is_empty(),
+                "a fully poisoned row contributes no dial address"
+            );
+            // Other addresses, and the pinned member itself, stay eligible.
+            assert!(!cached_row_fully_pinned_mismatch(
+                &rejected,
+                &["203.0.113.9:40000".parse().unwrap()]
+            ));
+            assert!(!cached_row_fully_pinned_mismatch(
+                &ant_quic::PeerId(PINNED_KEY),
+                &[pinned_addr]
+            ));
+        }
+
+        #[test]
+        fn issue1112_mixed_cache_row_keeps_its_valid_addresses() {
+            // Review round 21 (Codex P2: a valid cached address was
+            // discarded with a mismatching one): the consumption fence is
+            // ADDRESS-scoped. A row listing stale pinned seed address A
+            // (whose pin set excludes the identity) and valid address B
+            // keeps B on every join path: Phase 0 dials only B (A is
+            // filtered out before any dial is spent), and Phase 1 keeps
+            // the row — an id dial cannot be steered per address, so a
+            // landing on A is refused by the post-dial pair partition
+            // and the live-session guards, never by losing B. Runtime-RED
+            // before round 21: the any-mismatch row drop removed the row
+            // — and with it B — from both tiers.
+            const PINNED_KEY: [u8; 32] = [0xAF; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&PINNED_KEY],
+            }];
+            let _pins = network::override_dial_pins_for_test(&PINS);
+            let rejected = ant_quic::PeerId([0x66; 32]);
+            let bad_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
+            let good_addr: std::net::SocketAddr = "203.0.113.9:40000".parse().unwrap();
+            let mixed_row = [bad_addr, good_addr];
+            // Phase 0: only the valid address is dialled.
+            assert_eq!(
+                cached_row_addresses_allowed(&rejected, &mixed_row),
+                vec![good_addr],
+                "a mismatching sibling address must not cost the row its valid address"
+            );
+            // Phase 1: the mixed row stays a candidate; a fully poisoned
+            // row still drops, and the pinned member itself is untouched.
+            assert!(!cached_row_fully_pinned_mismatch(&rejected, &mixed_row));
+            assert!(cached_row_fully_pinned_mismatch(&rejected, &[bad_addr]));
+            assert!(!cached_row_fully_pinned_mismatch(
+                &ant_quic::PeerId(PINNED_KEY),
+                &[bad_addr]
+            ));
+            // The post-dial pair partition (round 21) uses the same
+            // per-address verdict: a landing on the bad address never
+            // becomes a join candidate; a landing on the good one does.
+            assert!(cached_addr_pinned_mismatch(&rejected, &bad_addr));
+            assert!(!cached_addr_pinned_mismatch(&rejected, &good_addr));
+        }
+
+        #[test]
+        fn issue1112_pin_mismatch_skips_both_tiers_on_a_nondirect_path() {
+            // Review round 18 (Codex P2: pin checks bypassed for
+            // hole-punched hint candidates): ant-quic reports hole-punched
+            // paths as non-direct while still naming the peer's remote
+            // address. The pin pair verdict runs on the OBSERVED address
+            // whatever the path, so a mismatched identity at a pinned seed
+            // address cannot enter either tier — not even through its
+            // cached capability flags. Runtime-RED before round 18: the
+            // pair check ran only for direct origins, so this origin
+            // reached both hint lists.
+            const NOT_IT: [u8; 32] = [0xB7; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&NOT_IT],
+            }];
+            let _pins = network::override_dial_pins_for_test(&PINS);
+            let mut cache = std::collections::HashMap::new();
+            let flagged = identity::MachineId([0x33; 32]);
+            cache.insert(
+                flagged,
+                issue1112_machine(
+                    flagged,
+                    &["198.51.100.7:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                // Non-direct (hole-punched shape) at the PINNED address,
+                // with both capability flags asserted.
+                &[issue1112_origin([0x33; 32], "198.51.100.7:5483", false)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a pin-mismatched pair skips both tiers on any path, flags or not"
+            );
+        }
+
+        #[test]
+        fn issue1112_allocated_relay_port_on_a_seed_ip_is_no_operator_tier() {
+            // Review round 4: a NATed peer with a relay slot on a seed
+            // advertises the seed's IP on an ALLOCATED port. The operator
+            // tier matches the full seed listener address, so an observed
+            // connection to that allocated port is the NATed peer's own
+            // path — never operator evidence.
+            let mut cache = std::collections::HashMap::new();
+            let nated = identity::MachineId([0x66; 32]);
+            cache.insert(
+                nated,
+                issue1112_machine(nated, &["142.93.199.50:61234".parse().unwrap()], None, None),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x66; 32], "142.93.199.50:61234", true)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a seed IP on an allocated relay port is not a seed listener address"
+            );
+        }
+
+        #[test]
+        fn issue1112_relayed_origin_grants_no_operator_tier() {
+            // A relayed path's observed address names the relay, not the
+            // peer — it is never OPERATOR-tier evidence, whatever the peer
+            // announces. The peer self-asserts both capability flags and
+            // still gets no hint: self-asserted flags grant nothing
+            // (David's 20 Oct 2026 ruling, confirmed 22 Oct 2026).
+            let mut cache = std::collections::HashMap::new();
+            let relayed = identity::MachineId([0x44; 32]);
+            cache.insert(
+                relayed,
+                issue1112_machine(
+                    relayed,
+                    &["142.93.199.50:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x44; 32], "142.93.199.50:5483", false)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a relayed observation of a seed IP is evidence about the relay, not the peer"
+            );
+        }
+
+        // ── Round 25: cache-selected helpers need the row's own evidence ──
+
+        /// A loopback-only network for an Agent that must never reach the
+        /// real network: no seeds, no mDNS, no port mapping.
+        fn issue1112_loopback_network_config() -> network::NetworkConfig {
+            network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+                bootstrap_nodes: Vec::new(),
+                port_mapping_enabled: false,
+                mdns_enabled: false,
+                ..network::NetworkConfig::default()
+            }
+        }
+
+        fn issue1112_target(byte: u8, addr: &str) -> DiscoveredAgent {
+            DiscoveredAgent {
+                agent_id: identity::AgentId([byte; 32]),
+                machine_id: identity::MachineId([byte; 32]),
+                user_id: None,
+                addresses: vec![addr.parse().expect("target addr")],
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: vec![1],
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+                self_name: None,
+            }
+        }
+
+        fn issue1112_cache_config(
+            cache_dir: &std::path::Path,
+            persist: bool,
+        ) -> ant_quic::BootstrapCacheConfig {
+            ant_quic::BootstrapCacheConfig::builder()
+                .cache_dir(cache_dir)
+                .min_peers_to_save(1)
+                .persist(persist)
+                .build()
+        }
+
+        /// Round 25 (Codex P2 at d722045): ant-quic's `select_coordinators`
+        /// and `select_relay_peers` return unverified fallback rows by
+        /// design ("measure, don't trust"). The dial seeding marked every
+        /// returned row capable and persisted the mark through
+        /// `upsert_peer_hints`, so an address-only row — all a gossip
+        /// advert or machine-cache candidate contributes since David's
+        /// ruling — became a persistent helper on the next dial. A mark now
+        /// needs the row's own fresh Global-scope direct observation.
+        /// Runtime-RED at d722045: the fallback row carried both marks
+        /// after the first call.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue1112_cache_fallback_row_gains_no_helper_mark_across_dials() {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(issue1112_loopback_network_config())
+                .build()
+                .await
+                .expect("agent");
+            let network = agent.network().expect("network").clone();
+            let cache = network.bootstrap_cache().expect("endpoint cache");
+
+            // An address-only row: what the advert and machine-cache
+            // sources leave behind, and the selectors' fallback in a
+            // small cache.
+            let fallback = ant_quic::PeerId([0x5a; 32]);
+            let fallback_addr: std::net::SocketAddr = "203.0.113.5:5483".parse().unwrap();
+            network
+                .upsert_peer_hints(fallback, vec![fallback_addr], None)
+                .await
+                .expect("address hint");
+            let target = issue1112_target(0x77, "198.51.100.7:5483");
+
+            for round in 1..=3 {
+                agent
+                    .seed_transport_peer_hints_for_target(&network, &target)
+                    .await
+                    .expect("seed hints");
+                let row = cache.get_peer(&fallback).await.expect("fallback row");
+                assert!(
+                    !row.capabilities.hinted_supports_coordination
+                        && !row.capabilities.hinted_supports_relay,
+                    "round {round}: an unverified fallback row must not gain a persisted helper mark"
+                );
+                assert!(
+                    !row.capabilities.supports_coordination && !row.capabilities.supports_relay,
+                    "round {round}: no effective helper capability without direct evidence"
+                );
+                assert_eq!(
+                    row.addresses,
+                    vec![fallback_addr],
+                    "round {round}: the address hint itself is kept"
+                );
+            }
+
+            // Control: a row with fresh Global-scope direct evidence — the
+            // transport's own outbound-verified observation — is granted.
+            let verified = ant_quic::PeerId([0x5b; 32]);
+            let verified_addr: std::net::SocketAddr = "203.0.113.6:5483".parse().unwrap();
+            cache
+                .observe_direct_reachability(verified, verified_addr)
+                .await;
+            agent
+                .seed_transport_peer_hints_for_target(&network, &target)
+                .await
+                .expect("seed hints");
+            let row = cache.get_peer(&verified).await.expect("verified row");
+            assert!(
+                row.capabilities.hinted_supports_coordination
+                    && row.capabilities.hinted_supports_relay,
+                "fresh Global-scope direct evidence earns the helper marks"
+            );
+            let row = cache.get_peer(&fallback).await.expect("fallback row");
+            assert!(
+                !row.capabilities.hinted_supports_coordination
+                    && !row.capabilities.hinted_supports_relay,
+                "the fallback row stays unmarked beside a verified one"
+            );
+        }
+
+        /// Round 25: a persisted `hinted_supports_*` mark is sticky in
+        /// ant-quic (`record_assist_hints(false, false)` clears nothing), so
+        /// a cache written by an earlier head carries marks no evidence
+        /// supports. The Agent's post-load hook clears a mark unless the
+        /// row has fresh Global-scope direct evidence, and leaves every
+        /// address, direct observation and verified capability intact.
+        /// Runtime-RED at d722045: the legacy row kept both marks after
+        /// the reload.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue1112_unsupported_legacy_helper_marks_are_cleared_on_load() {
+            use ant_quic::bootstrap_cache::{CachedPeer, PeerSource};
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let cache_dir = dir.path().join("peers");
+            let legacy = ant_quic::PeerId([0x61; 32]);
+            let legacy_addr: std::net::SocketAddr = "203.0.113.61:5483".parse().unwrap();
+            let verified = ant_quic::PeerId([0x62; 32]);
+            let verified_addr: std::net::SocketAddr = "203.0.113.62:5483".parse().unwrap();
+            let plain = ant_quic::PeerId([0x63; 32]);
+            let plain_addr: std::net::SocketAddr = "203.0.113.63:5483".parse().unwrap();
+            {
+                // The cache an earlier head left on disk.
+                let cache =
+                    ant_quic::BootstrapCache::open(issue1112_cache_config(&cache_dir, true))
+                        .await
+                        .expect("open fixture cache");
+                let mut row = CachedPeer::new(legacy, vec![legacy_addr], PeerSource::Merge);
+                row.capabilities.record_assist_hints(true, true);
+                cache.upsert(row).await;
+                let mut row = CachedPeer::new(verified, vec![verified_addr], PeerSource::Merge);
+                row.capabilities.record_assist_hints(true, true);
+                row.capabilities
+                    .record_direct_observation(verified_addr, std::time::SystemTime::now());
+                cache.upsert(row).await;
+                cache
+                    .upsert(CachedPeer::new(plain, vec![plain_addr], PeerSource::Merge))
+                    .await;
+                cache.save().await.expect("save fixture cache");
+            }
+
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_dir(&cache_dir)
+                .with_network_config(issue1112_loopback_network_config())
+                .build()
+                .await
+                .expect("agent");
+            let cache = agent
+                .network()
+                .expect("network")
+                .bootstrap_cache()
+                .expect("endpoint cache");
+
+            let row = cache
+                .get_peer(&legacy)
+                .await
+                .expect("legacy row survives the load");
+            assert!(
+                !row.capabilities.hinted_supports_relay
+                    && !row.capabilities.hinted_supports_coordination,
+                "an unsupported legacy mark is cleared at load"
+            );
+            assert!(
+                !row.capabilities.supports_relay && !row.capabilities.supports_coordination,
+                "no effective capability remains once the unsupported mark is gone"
+            );
+            assert_eq!(
+                row.addresses,
+                vec![legacy_addr],
+                "the legacy row keeps its address"
+            );
+
+            let row = cache.get_peer(&verified).await.expect("verified row");
+            assert!(
+                row.capabilities.has_global_direct_reachability(),
+                "the direct observation is kept"
+            );
+            assert!(
+                row.capabilities.supports_relay && row.capabilities.supports_coordination,
+                "a row with fresh Global-scope direct evidence keeps its capability"
+            );
+            assert!(
+                row.capabilities.hinted_supports_relay
+                    && row.capabilities.hinted_supports_coordination,
+                "a mark the evidence supports is kept"
+            );
+
+            let row = cache.get_peer(&plain).await.expect("plain row");
+            assert_eq!(row.addresses, vec![plain_addr]);
+            assert!(!row.capabilities.supports_relay && !row.capabilities.supports_coordination);
+        }
+
+        /// Round 25: the helper-evidence predicate counts FRESH Global-scope
+        /// direct evidence only. A sticky mark alone, a LAN observation and
+        /// an expired global observation grant nothing; the cleanup clears
+        /// exactly the unsupported mark and is idempotent.
+        #[tokio::test]
+        async fn issue1112_helper_evidence_needs_fresh_global_direct_reachability() {
+            use ant_quic::bootstrap_cache::{CachedPeer, PeerSource};
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let cache = ant_quic::BootstrapCache::open(issue1112_cache_config(dir.path(), false))
+                .await
+                .expect("open cache");
+            let now = std::time::SystemTime::now();
+            let global_a: std::net::SocketAddr = "203.0.113.71:5483".parse().unwrap();
+            let global_b: std::net::SocketAddr = "203.0.113.72:5483".parse().unwrap();
+            let lan_addr: std::net::SocketAddr = "192.168.1.9:5483".parse().unwrap();
+
+            let marked = ant_quic::PeerId([0x71; 32]);
+            let mut row = CachedPeer::new(marked, vec![global_a], PeerSource::Merge);
+            row.capabilities.record_assist_hints(true, true);
+            cache.upsert(row).await;
+
+            let lan = ant_quic::PeerId([0x72; 32]);
+            let mut row = CachedPeer::new(lan, vec![lan_addr], PeerSource::Merge);
+            row.capabilities.record_direct_observation(lan_addr, now);
+            cache.upsert(row).await;
+
+            let stale = ant_quic::PeerId([0x73; 32]);
+            let mut row = CachedPeer::new(stale, vec![global_a], PeerSource::Merge);
+            row.capabilities.record_direct_observation(
+                global_a,
+                now - cache.config().reachability_ttl - std::time::Duration::from_secs(60),
+            );
+            cache.upsert(row).await;
+
+            let fresh = ant_quic::PeerId([0x74; 32]);
+            let mut row = CachedPeer::new(fresh, vec![global_b], PeerSource::Merge);
+            row.capabilities.record_direct_observation(global_b, now);
+            cache.upsert(row).await;
+
+            for (peer, expected, why) in [
+                (marked, false, "a sticky mark alone is not evidence"),
+                (lan, false, "a LAN observation is not global evidence"),
+                (
+                    stale,
+                    false,
+                    "an expired global observation is not fresh evidence",
+                ),
+                (fresh, true, "a fresh global observation is evidence"),
+            ] {
+                let row = cache.get_peer(&peer).await.expect("row");
+                assert_eq!(
+                    cache_row_has_verified_helper_evidence(&row),
+                    expected,
+                    "{why}"
+                );
+            }
+
+            assert_eq!(
+                clear_unsupported_helper_hint_marks(&cache).await,
+                1,
+                "exactly the unsupported mark is cleared"
+            );
+            let row = cache.get_peer(&marked).await.expect("marked row");
+            assert!(
+                !row.capabilities.hinted_supports_relay
+                    && !row.capabilities.hinted_supports_coordination
+                    && !row.capabilities.supports_relay
+                    && !row.capabilities.supports_coordination
+            );
+            assert_eq!(row.addresses, vec![global_a], "the address is kept");
+            assert_eq!(
+                clear_unsupported_helper_hint_marks(&cache).await,
+                0,
+                "a second pass finds nothing to clear"
+            );
+        }
     }
 }
 

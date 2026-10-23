@@ -184,6 +184,29 @@ impl LinkNode {
         }
     }
 
+    /// Pin the send to `generation` (#1112 round 11): the bytes ride that
+    /// connection or none — a connection replaced between the caller's
+    /// policy check and the send fails instead of silently riding the
+    /// new (unchecked) winner.
+    pub(crate) async fn send_on_generation(
+        &self,
+        peer_id: &PeerId,
+        generation: u64,
+        data: &[u8],
+    ) -> Result<(), NodeError> {
+        match self {
+            Self::Quic(node) => node.send_on_generation(peer_id, generation, data).await,
+            #[cfg(test)]
+            Self::Sim(link) => {
+                if link.current_connection_generation(peer_id) != Some(generation) {
+                    Err(NodeError::Connection("sim: generation superseded".into()))
+                } else {
+                    link.send(peer_id, data)
+                }
+            }
+        }
+    }
+
     pub(crate) async fn send_on_generation_with_admission<B, F>(
         &self,
         peer_id: &PeerId,
