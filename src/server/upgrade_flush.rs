@@ -362,18 +362,8 @@ fn arm(
             // The flush started and the daemon stopped behind the hook. Hold
             // the failed release first (engineer ruling, 23 Oct 2026) so the
             // restart this exit creates cannot re-apply it, then restore
-            // every binary the transaction swapped — both or neither — and
-            // leave the EX_TEMPFAIL exit to `finish`.
-            tracing::error!(
-                error = %failure,
-                installed_bytes = true,
-                restored_bytes = true,
-                restart = "not_started",
-                recovery = "exited_tempfail",
-                "acknowledged shutdown flush failed after the daemon stopped; \
-                 holding release {} and restoring the swapped binaries",
-                plan.candidate_version
-            );
+            // every binary the transaction swapped and leave the EX_TEMPFAIL
+            // exit to `finish`.
             if let Err(error) = shutdown_flush::hold_failed_release(
                 root,
                 &plan.candidate_version,
@@ -385,16 +375,30 @@ fn arm(
                      check may retry this release once more"
                 );
             }
-            if let Err(error) = crate::upgrade::restore_swapped_binaries(&restore_set) {
-                tracing::error!(
-                    %error,
-                    restore_set = ?restore_set
-                        .iter()
-                        .map(|(target, _)| target.display().to_string())
-                        .collect::<Vec<_>>(),
-                    "cannot restore the swapped binaries; manual recovery applies"
-                );
-            }
+            let restored_bytes = match crate::upgrade::restore_swapped_binaries(&restore_set) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        restore_set = ?restore_set
+                            .iter()
+                            .map(|(target, _)| target.display().to_string())
+                            .collect::<Vec<_>>(),
+                        "cannot restore the swapped binaries; manual recovery applies"
+                    );
+                    false
+                }
+            };
+            tracing::error!(
+                error = %failure,
+                installed_bytes = true,
+                restored_bytes = restored_bytes,
+                restart = "not_started",
+                recovery = "exited_tempfail",
+                "acknowledged shutdown flush failed after the daemon stopped; \
+                 release {} is held and the process exits EX_TEMPFAIL",
+                plan.candidate_version
+            );
             Err(ArmFailure::FlushFailed(failure))
         }
         Err(failure) => Err(ArmFailure::Refused(failure.error)),

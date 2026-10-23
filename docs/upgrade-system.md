@@ -514,14 +514,25 @@ API and no network. "Started" means the daemon actually stopped behind the
 hook — the recovery begins at the moment the hook commits the daemon to
 stopping, nothing earlier. The daemon persists a per-release failed-upgrade
 hold (`upgrade-flush-hold.json`, below), restores every binary the
-transaction swapped — daemon and `x0x` CLI together, or neither — logs the
-cause, and exits `EX_TEMPFAIL` (75). The service manager then restarts the
-daemon on the old version. An error after the flush completed (for example
-a receipt that fails authorization) also ends in `EX_TEMPFAIL`; nothing is
-restored because the new bytes are already durable. A refusal that happens
-before the daemon stops (a missing flush owner, an unresolved predecessor,
-a mismatched arm request, a failed intent write) never stops the daemon,
-restores nothing and returns an ordinary error instead.
+transaction swapped, logs the cause, and exits `EX_TEMPFAIL` (75). Every
+backup is verified before the first rename, and a missing backup restores
+nothing; a rename that fails after an earlier rename succeeded can still
+leave the daemon and the `x0x` CLI on mixed versions — that state is logged
+for manual recovery, not silently accepted. The service manager then
+restarts the daemon on the old version. An error after the flush completed
+(for example a receipt that fails authorization) also ends in
+`EX_TEMPFAIL`; nothing is restored because the new bytes are already
+durable. A refusal that happens before the daemon stops (a missing flush
+owner, an unresolved predecessor, a mismatched arm request, a failed intent
+write) never stops the daemon, restores nothing and returns an ordinary
+error instead.
+
+The flush walk refuses any symlink under the data root or the identity
+root (`~/.x0x` by default): a symlink is not a verified store root, and its
+target is not walked or fsynced. A symlink an operator put there makes
+every flush fail the same way, so supervised update stays blocked on that
+host until the symlink is removed; the failed-upgrade hold keeps the
+restart loop from re-applying the release while it is investigated.
 
 The local control listener is a Unix socket, `upgrade-flush.sock` in the
 data directory, mode `0600`. It accepts one JSON request line carrying the

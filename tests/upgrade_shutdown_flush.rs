@@ -157,11 +157,16 @@ macro_rules! shutdown_flush_regression_tests {
             }
 
             #[test]
-            fn supervised_exit_after_failed_flush_restores_the_previous_binary() {
+            fn supervised_exit_after_failed_flush_without_a_swap_manifest_skips_the_restore() {
+                // No swapped-artifact manifest means no fresh backup this
+                // transaction owns. `<exe>.backup` may be a stale backup an
+                // earlier upgrade left (engineer call, 23 Oct 2026), so the
+                // recovery must not restore it; the hold and the EX_TEMPFAIL
+                // exit still happen.
                 let (_dir, plan) = fixture();
                 let backup = plan.executable.with_extension("backup");
                 std::fs::write(&plan.executable, b"swapped candidate").unwrap();
-                std::fs::write(&backup, b"previous binary").unwrap();
+                std::fs::write(&backup, b"possibly stale backup").unwrap();
                 let owner = flush::register(
                     plan.data_root.clone(),
                     Arc::new(|_, stopped| {
@@ -178,10 +183,14 @@ macro_rules! shutdown_flush_regression_tests {
                 );
                 owner.join_workers();
                 assert!(result.is_err());
-                // Keep the old binary: the EX_TEMPFAIL restart lands on it.
                 assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
-                assert_eq!(std::fs::read(&plan.executable).unwrap(), b"previous binary");
-                assert!(!backup.exists());
+                // The unverified backup is never installed over the live bytes.
+                assert_eq!(
+                    std::fs::read(&plan.executable).unwrap(),
+                    b"swapped candidate"
+                );
+                assert_eq!(std::fs::read(&backup).unwrap(), b"possibly stale backup");
+                assert!(plan.data_root.join(flush::HOLD_RECORD).is_file());
                 assert!(plan.data_root.join(flush::ROLLBACK_RECORD).is_file());
             }
 

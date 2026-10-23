@@ -463,7 +463,7 @@ fn sideline_path_for(target: &Path) -> PathBuf {
 /// version). A missing backup means no swap happened or the backup was
 /// already consumed; the error names that state so the caller can log it
 /// and still exit `EX_TEMPFAIL`.
-pub fn restore_backup_binary(target: &Path, backup: &Path) -> std::io::Result<()> {
+pub(crate) fn restore_backup_binary(target: &Path, backup: &Path) -> std::io::Result<()> {
     if !backup.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -473,13 +473,15 @@ pub fn restore_backup_binary(target: &Path, backup: &Path) -> std::io::Result<()
     std::fs::rename(backup, target)
 }
 
-/// Restore every artifact this transaction swapped, or none of them
-/// (engineer ruling, 23 Oct 2026): a daemon/CLI pair must never end a
-/// failed recovery mixed. Each entry is `(target, fresh_backup)` — exactly
-/// the pairs the swap step under `Upgrader`\'s host-locked finish reported
-/// as real swaps. A missing backup restores nothing and says so; the caller
-/// logs manual recovery and still exits `EX_TEMPFAIL`.
-pub fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+/// Restore the artifacts this transaction swapped (engineer ruling,
+/// 23 Oct 2026). Each entry is `(target, fresh_backup)` — exactly the
+/// pairs the swap step under `Upgrader`\'s host-locked finish reported
+/// as real swaps. Every backup is checked before the first rename, and a
+/// missing backup restores nothing. A rename that fails after an earlier
+/// rename succeeded can still leave a daemon/CLI pair on mixed versions;
+/// the caller logs that state for manual recovery and still exits
+/// `EX_TEMPFAIL`.
+pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
     for (target, backup) in artifacts {
         if !backup.is_file() {
             return Err(std::io::Error::new(
