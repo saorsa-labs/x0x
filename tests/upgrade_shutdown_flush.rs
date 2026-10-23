@@ -223,19 +223,13 @@ macro_rules! shutdown_flush_regression_tests {
                     assert!(plan.data_root.join(flush::HOLD_RECORD).is_file());
                     if cli_backup_exists {
                         // Both backups present: restore both, never a mixed pair.
-                        assert_eq!(
-                            std::fs::read(&plan.executable).unwrap(),
-                            b"previous daemon"
-                        );
+                        assert_eq!(std::fs::read(&plan.executable).unwrap(), b"previous daemon");
                         assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
                         assert!(!daemon_backup.exists());
                         assert!(!cli_backup.exists());
                     } else {
                         // Missing CLI backup: restore neither half of the pair.
-                        assert_eq!(
-                            std::fs::read(&plan.executable).unwrap(),
-                            b"swapped daemon"
-                        );
+                        assert_eq!(std::fs::read(&plan.executable).unwrap(), b"swapped daemon");
                         assert_eq!(std::fs::read(&cli).unwrap(), b"swapped cli");
                     }
                 }
