@@ -22,6 +22,12 @@ pub const SHOW_RESULT_PREFIX: &[u8] = b"x0x-gui-show-result-v1\0";
 /// Activity query and reply share this prefix. The bincode enum index
 /// selects the body.
 pub const ACTIVITY_PREFIX: &[u8] = b"x0x-gui-activity-v1\0";
+/// Refusal for `/direct/send` and WebSocket `send_direct`.
+///
+/// Those paths accept a caller-supplied payload and the daemon would sign
+/// it. Only `POST /gui/show` may emit these three prefixes. A durable
+/// owner token does not lift this refusal.
+pub const GENERIC_SEND_REFUSAL: &str = "reserved gui show payloads are only sent by /gui/show";
 /// Registry name for [`crate::dm::CapabilityRegistry::GUI_SHOW_V1`].
 pub const CAPABILITY_NAME: &str = "gui_show_v1";
 /// How long a visible GUI still counts as the active machine.

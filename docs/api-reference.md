@@ -91,6 +91,9 @@ Auth-class labels used throughout this reference:
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
+  The same two generic send paths refuse `x0x-gui-show-v1\0`,
+  `x0x-gui-show-result-v1\0`, and `x0x-gui-activity-v1\0` for every
+  token class. Only `POST /gui/show` emits those frames.
 - **rider-allowed** — the surfaces a rider token may reach (see the
   harness-boundary section below). `POST /gui/show` needs `gui:show`.
   Rider tokens authenticate in the `Authorization` header only.

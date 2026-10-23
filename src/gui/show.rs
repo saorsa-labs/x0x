@@ -17,6 +17,11 @@ use crate::identity::AgentId;
 
 use super::rate_limit::GuiShowRateLimit;
 
+/// Signers kept for a later rider Stop. One entry is one displayed show.
+const RIDER_PRESENTED_SIGNERS: usize = 64;
+/// Subjects kept for one signer.
+const RIDER_PRESENTED_SUBJECTS: usize = 32;
+
 /// Replaces one remote show send. Production leaves the slot empty.
 type ShowSendHook = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>> + Send + Sync,
@@ -420,7 +425,8 @@ pub struct GuiShowRuntime {
     /// Rider subjects presented by each envelope signer.
     ///
     /// Stop records `(signer, subject)` from this map and blocks the signer.
-    /// It does not add the subject to [`Self::blocked`].
+    /// It does not add the subject to [`Self::blocked`]. The map drops the
+    /// signer on Stop and evicts the lowest id past the caps below.
     rider_presented: Mutex<HashMap<[u8; 32], HashSet<[u8; 32]>>>,
     /// Rider shows refused for one `(envelope signer, subject)` pair.
     rider_pairs: Mutex<HashSet<([u8; 32], [u8; 32])>>,
@@ -872,25 +878,39 @@ impl GuiShowRuntime {
     }
 
     /// Remember that `signer` displayed a rider show naming `subject`.
+    ///
+    /// A signer or subject past the cap replaces the lowest id. Stop still
+    /// blocks the signer when that signer's row was evicted.
     pub fn note_rider_presentation(&self, signer: &AgentId, subject: &AgentId) {
         let Ok(mut presented) = self.rider_presented.lock() else {
             return;
         };
-        presented
-            .entry(*signer.as_bytes())
-            .or_default()
-            .insert(*subject.as_bytes());
+        let signer_key = *signer.as_bytes();
+        let subject_key = *subject.as_bytes();
+        if !presented.contains_key(&signer_key) && presented.len() >= RIDER_PRESENTED_SIGNERS {
+            if let Some(evict) = presented.keys().copied().min() {
+                presented.remove(&evict);
+            }
+        }
+        let subjects = presented.entry(signer_key).or_default();
+        if !subjects.contains(&subject_key) && subjects.len() >= RIDER_PRESENTED_SUBJECTS {
+            if let Some(evict) = subjects.iter().copied().min() {
+                subjects.remove(&evict);
+            }
+        }
+        subjects.insert(subject_key);
     }
 
     /// Record `(signer, subject)` for every subject this signer presented.
     ///
-    /// Does not add those subjects to the block list.
+    /// Does not add those subjects to the block list. The signer row is
+    /// removed, so a later show starts a new set.
     pub fn record_rider_stop(&self, signer: &AgentId) {
         let subjects = self
             .rider_presented
             .lock()
             .ok()
-            .and_then(|presented| presented.get(signer.as_bytes()).cloned())
+            .and_then(|mut presented| presented.remove(signer.as_bytes()))
             .unwrap_or_default();
         let Ok(mut pairs) = self.rider_pairs.lock() else {
             return;
@@ -2302,6 +2322,50 @@ exit 1
             src.contains("from that machine"),
             "the remote banner sentence selects the machine Stop control: {src}"
         );
+        assert!(
+            src.contains("gui_show_blocked.json") && src.contains("&&!rider"),
+            "an ordinary remote show uses the machine Stop label: {src}"
+        );
+        assert!(
+            !src.contains("!rider?'Stop local shows'"),
+            "an ordinary remote show must not say Stop local shows: {src}"
+        );
+    }
+
+    /// The presentation map stays bounded. Stop still blocks a signer whose
+    /// row was evicted, and a kept subject is still recorded.
+    #[test]
+    fn rider_presented_evicts_the_lowest_id_past_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let subject = AgentId([0x7F; 32]);
+        for n in 0..super::RIDER_PRESENTED_SIGNERS {
+            let mut id = [0u8; 32];
+            id[31] = u8::try_from(n).expect("signer index fits");
+            rt.note_rider_presentation(&AgentId(id), &subject);
+        }
+        let newest = AgentId([0xFF; 32]);
+        rt.note_rider_presentation(&newest, &subject);
+        let oldest = AgentId([0u8; 32]);
+        rt.record_rider_stop(&oldest);
+        assert!(
+            !rt.rider_pair_blocked(&oldest, &subject),
+            "the lowest signer id is evicted when the map is full"
+        );
+        rt.record_rider_stop(&newest);
+        assert!(rt.rider_pair_blocked(&newest, &subject));
+
+        let signer = AgentId([0x11; 32]);
+        for n in 0..super::RIDER_PRESENTED_SUBJECTS {
+            let mut id = [0u8; 32];
+            id[31] = u8::try_from(n).expect("subject index fits");
+            rt.note_rider_presentation(&signer, &AgentId(id));
+        }
+        let newest_subject = AgentId([0xEE; 32]);
+        rt.note_rider_presentation(&signer, &newest_subject);
+        rt.record_rider_stop(&signer);
+        assert!(!rt.rider_pair_blocked(&signer, &AgentId([0u8; 32])));
+        assert!(rt.rider_pair_blocked(&signer, &newest_subject));
     }
 
     #[test]

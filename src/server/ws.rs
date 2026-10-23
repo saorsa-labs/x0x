@@ -2242,6 +2242,20 @@ async fn handle_ws_command(
                 }
             };
 
+            // Gui-show frames are signed by this daemon on `POST /gui/show`
+            // only. A session connection and a durable-owner connection are
+            // both refused, matching REST `/direct/send`.
+            if crate::gui::remote::classify_prefix(&bytes).is_some() {
+                feed_droppable(
+                    tx,
+                    WsOutbound::Error {
+                        message: crate::gui::remote::GENERIC_SEND_REFUSAL.to_string(),
+                    },
+                    stats,
+                );
+                return;
+            }
+
             // Issue #446 (review round 2): reserved exec frames must not
             // be craftable over a session-authenticated WS connection —
             // same egress fence as REST /direct/send. The connection's
@@ -2669,6 +2683,66 @@ mod tests {
                 assert_eq!(
                     message, "send failed",
                     "past the gate, ordinary send failure"
+                );
+            }
+            other => panic!("expected send-failure frame, got {other:?}"),
+        }
+    }
+
+    /// Gui-show prefixes are refused on `send_direct` for a session
+    /// connection and for a durable-owner connection.
+    #[tokio::test]
+    async fn ws_send_direct_refuses_gui_show_prefixes() {
+        use base64::Engine as _;
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let prefixes = [
+            crate::gui::remote::SHOW_REQUEST_PREFIX,
+            crate::gui::remote::SHOW_RESULT_PREFIX,
+            crate::gui::remote::ACTIVITY_PREFIX,
+        ];
+        for (durable, label) in [(false, "session"), (true, "durable")] {
+            for prefix in prefixes {
+                let mut payload = prefix.to_vec();
+                payload.extend_from_slice(b"body");
+                let cmd = serde_json::json!({
+                    "type": "send_direct",
+                    "agent_id": hex::encode([0xab; 32]),
+                    "payload": base64::engine::general_purpose::STANDARD.encode(payload),
+                })
+                .to_string();
+                let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+                let stats = WsOutboundStats::default();
+                handle_ws_command(&state, label, &cmd, &tx, &stats, durable).await;
+                let refused = rx.recv().await.expect("error frame");
+                match refused {
+                    WsOutbound::Error { message } => {
+                        assert_eq!(
+                            message,
+                            crate::gui::remote::GENERIC_SEND_REFUSAL,
+                            "{label} must not emit a gui-show frame"
+                        );
+                    }
+                    other => panic!("expected error frame, got {other:?}"),
+                }
+            }
+        }
+        let plain = serde_json::json!({
+            "type": "send_direct",
+            "agent_id": hex::encode([0xab; 32]),
+            "payload": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "plain", &plain, &tx, &stats, false).await;
+        match rx.recv().await.expect("outcome frame") {
+            WsOutbound::Error { message } => {
+                assert_eq!(
+                    message, "send failed",
+                    "an ordinary DM passes the prefix gate"
                 );
             }
             other => panic!("expected send-failure frame, got {other:?}"),

@@ -646,8 +646,12 @@ async fn show_active(
     // run together: three sequential default ACK waits already pass 10 s.
     let replies = futures::future::join_all(prepared.into_iter().map(
         |(machine, agent, payload, qid, wait)| async move {
-            let sent =
-                tokio::time::timeout_at(deadline, send_gui_dm(state, &agent, payload, qid)).await;
+            let selected = MachineId(machine);
+            let sent = tokio::time::timeout_at(
+                deadline,
+                send_gui_dm(state, &agent, &selected, payload, qid),
+            )
+            .await;
             let body = if matches!(sent, Ok(Ok(()))) {
                 match tokio::time::timeout_at(deadline, wait.recv()).await {
                     Ok(Ok(body)) => Some(body),
@@ -765,11 +769,20 @@ async fn agents_on_machine(state: &AppState, machine: &MachineId) -> Vec<AgentId
 /// leaves the machine in the candidate list with no timestamp. A connected
 /// agent is preferred when several qualify. An offline agent with the bit
 /// is still returned so the send can time out as `unconfirmed`.
+///
+/// The capability advert must name this same machine. A newer advert on
+/// another machine is not a candidate. The pair must also be owner-trusted.
 async fn show_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
     let agents = agents_on_machine(state, machine).await;
     let mut offline = None;
     for agent in agents {
         if !agent_can_show(state, &agent) {
+            continue;
+        }
+        if !dispatch_names_machine(state, &agent, machine).await {
+            continue;
+        }
+        if !candidate_owner_trusted(state, &agent, machine).await {
             continue;
         }
         if state.agent.is_agent_connected(&agent).await {
@@ -780,6 +793,60 @@ async fn show_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
         }
     }
     offline
+}
+
+/// Owner trust for one `(agent, machine)` show candidate.
+///
+/// `evaluate_pair` is the authority. A `Blocked` contact or a machine-pin
+/// mismatch is refused. The test hook stands in only when this process has
+/// no owner, which is how the route tests build `AppState`.
+async fn candidate_owner_trusted(state: &AppState, agent: &AgentId, machine: &MachineId) -> bool {
+    let cache = state.agent.identity_discovery_cache();
+    let revoked = state.agent.revocation_set();
+    let pair = state
+        .agent
+        .owner_trust()
+        .evaluate_pair(
+            state.agent.contacts().as_ref(),
+            cache.as_ref(),
+            revoked.as_ref(),
+            agent,
+            machine,
+        )
+        .await;
+    if pair.owner_trusted {
+        return true;
+    }
+    if matches!(
+        pair.decision,
+        crate::trust::TrustDecision::RejectBlocked
+            | crate::trust::TrustDecision::RejectMachineMismatch
+    ) {
+        return false;
+    }
+    state.gui_show.trust_hook_allows(agent)
+}
+
+/// The retained binding and the capability advert both name `machine`.
+///
+/// `send_direct` addresses the machine on the capability advert. Dispatch
+/// sends only when that machine is the one this call selected.
+async fn dispatch_names_machine(state: &AppState, agent: &AgentId, machine: &MachineId) -> bool {
+    let advert_machine = state
+        .agent
+        .capability_store()
+        .lookup_binding(agent)
+        .map(|binding| binding.machine_id);
+    if advert_machine.as_ref() != Some(machine) {
+        return false;
+    }
+    state
+        .agent
+        .authenticated_machine_bindings()
+        .read()
+        .await
+        .peek(agent)
+        .is_some_and(|binding| binding.machine_id == *machine)
 }
 
 fn agent_can_show(state: &AppState, agent: &AgentId) -> bool {
@@ -848,7 +915,11 @@ async fn send_show_and_wait(
             None,
         );
     };
-    let sent = tokio::time::timeout_at(deadline, send_gui_dm(state, &agent, payload, bytes)).await;
+    let sent = tokio::time::timeout_at(
+        deadline,
+        send_gui_dm(state, &agent, &machine, payload, bytes),
+    )
+    .await;
     if !matches!(sent, Ok(Ok(()))) {
         return remote_json(
             GuiShowOutcome::Unconfirmed,
@@ -909,9 +980,16 @@ pub(crate) async fn fresh_gui_visible_at(state: &AppState) -> Option<u64> {
 async fn send_gui_dm(
     state: &AppState,
     to: &AgentId,
+    machine: &MachineId,
     payload: Vec<u8>,
     logical_request_id: [u8; 16],
 ) -> Result<(), crate::dm::DmError> {
+    // Check again at send time. The advert can move after `show_peer`.
+    if !dispatch_names_machine(state, to, machine).await {
+        return Err(crate::dm::DmError::RecipientUndiscovered(
+            "gui show dispatch is bound to the selected machine".to_string(),
+        ));
+    }
     if let Some(result) = state.gui_show.invoke_send_hook().await {
         return result;
     }
@@ -2347,6 +2425,12 @@ mod tests {
             .await;
         assert_eq!(
             show_peer(&state, &machine).await,
+            None,
+            "an ownerless pair is not a show target"
+        );
+        state.gui_show.trust_sender_for_test(&agent);
+        assert_eq!(
+            show_peer(&state, &machine).await,
             Some(agent),
             "an authenticated binding is queried without a direct connection"
         );
@@ -2369,6 +2453,10 @@ mod tests {
             .agent
             .capability_store()
             .insert(agent, machine, caps, now_ms));
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, machine, unix_secs())
+            .await;
         state.gui_show.arm_send_stall_for_test();
         let request_id = hex::encode([0x33u8; 16]);
         let started = std::time::Instant::now();
@@ -2445,6 +2533,7 @@ mod tests {
             .agent
             .record_authenticated_binding_for_testing(agent, real, now.saturating_add(1))
             .await;
+        state.gui_show.trust_sender_for_test(&agent);
         assert_eq!(
             show_peer(&state, &real).await,
             Some(agent),
@@ -2456,6 +2545,165 @@ mod tests {
             "an announce-only machine is not a show target"
         );
         Ok(())
+    }
+
+    /// A blocked contact is not chosen, including when a test hook is set.
+    #[tokio::test]
+    async fn blocked_contact_is_not_a_show_peer() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x51; 32]);
+        let machine = MachineId([0x52; 32]);
+        install_show_advert(&state, agent, machine);
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, machine, unix_secs())
+            .await;
+        state.gui_show.trust_sender_for_test(&agent);
+        state
+            .agent
+            .contacts()
+            .write()
+            .await
+            .set_trust(&agent, crate::contacts::TrustLevel::Blocked);
+        assert_eq!(
+            show_peer(&state, &machine).await,
+            None,
+            "evaluate_pair refuses a blocked contact"
+        );
+        Ok(())
+    }
+
+    /// The capability advert names a different machine than the selected
+    /// binding. Nothing is sent, and the stall hook does not run.
+    #[tokio::test]
+    async fn conflicting_advert_machine_is_not_dispatched() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x61; 32]);
+        let selected = MachineId([0x62; 32]);
+        let advertised = MachineId([0x63; 32]);
+        install_show_advert(&state, agent, advertised);
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, selected, unix_secs())
+            .await;
+        state.gui_show.trust_sender_for_test(&agent);
+        assert!(
+            agent_can_show(&state, &agent),
+            "the bit is present; the machine is what disagrees"
+        );
+        assert_eq!(
+            show_peer(&state, &selected).await,
+            None,
+            "a newer advert on another machine is not the selected pair"
+        );
+        state.gui_show.arm_send_stall_for_test();
+        let started = std::time::Instant::now();
+        let response = send_show_and_wait(
+            &state,
+            agent,
+            selected,
+            "people".to_string(),
+            false,
+            agent,
+            hex::encode([0x64u8; 16]),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a conflicting binding must not enter the send hook"
+        );
+        let bytes = to_bytes(response.into_body(), 1 << 20).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(body["outcome"], "unconfirmed", "{body}");
+        assert_eq!(
+            body["machine_id"],
+            hex::encode(selected.as_bytes()),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// `/direct/send` refuses every gui-show prefix for a session bearer
+    /// and for the durable owner token.
+    #[tokio::test]
+    async fn generic_direct_send_refuses_gui_show_prefixes() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let prefixes = [
+            crate::gui::SHOW_REQUEST_PREFIX,
+            crate::gui::SHOW_RESULT_PREFIX,
+            crate::gui::ACTIVITY_PREFIX,
+        ];
+        for durable in [false, true] {
+            let app = axum::Router::new()
+                .route(
+                    "/direct/send",
+                    post(crate::server::routes::direct::direct_send),
+                )
+                .layer(Extension(ActorContext::Owner { durable }))
+                .with_state(Arc::clone(&state));
+            for prefix in prefixes {
+                let mut payload = prefix.to_vec();
+                payload.extend_from_slice(b"body");
+                let (status, json) = post_json(
+                    &app,
+                    json!({
+                        "agent_id": "ab".repeat(32),
+                        "payload": base64::engine::general_purpose::STANDARD.encode(payload),
+                    }),
+                )
+                .await?;
+                assert_eq!(status, StatusCode::FORBIDDEN, "durable={durable}: {json}");
+                assert_eq!(
+                    json["error"],
+                    crate::gui::remote::GENERIC_SEND_REFUSAL,
+                    "{json}"
+                );
+            }
+            let (status, json) = post_json(
+                &app,
+                json!({
+                    "agent_id": "ab".repeat(32),
+                    "payload": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+                }),
+            )
+            .await?;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "an ordinary DM stays allowed: {json}"
+            );
+        }
+        Ok(())
+    }
+
+    fn install_show_advert(state: &AppState, agent: AgentId, machine: MachineId) {
+        let mut caps = crate::dm::DmCapabilities::pending();
+        caps.application_registry = crate::dm::CapabilityRegistry {
+            version: 1,
+            bits: crate::dm::CapabilityRegistry::GUI_SHOW_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            agent,
+            machine,
+            caps,
+            unix_secs().saturating_mul(1000),
+        ));
+    }
+
+    async fn post_json(
+        app: &axum::Router,
+        body: serde_json::Value,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/direct/send")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))?;
+        let resp = app.clone().oneshot(req).await?;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await?;
+        Ok((status, serde_json::from_slice(&bytes).unwrap_or_default()))
     }
 
     /// A 64-hex id that is not enrolled is refused. The opener does not run.
