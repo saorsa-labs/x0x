@@ -622,7 +622,7 @@ async fn enrolled_remote_machines(state: &AppState, local: &MachineId) -> Vec<Ma
     machines
 }
 
-async fn discovered_agents(state: &AppState, machine: &MachineId) -> Vec<AgentId> {
+async fn agents_on_machine(state: &AppState, machine: &MachineId) -> Vec<AgentId> {
     let cache = state.agent.identity_discovery_cache();
     let cache = cache.read().await;
     cache
@@ -637,7 +637,7 @@ async fn discovered_agents(state: &AppState, machine: &MachineId) -> Vec<AgentId
 /// No address, an offline agent, or a missing bit leaves the machine in
 /// the candidate list with no timestamp.
 async fn activity_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
-    let agents = discovered_agents(state, machine).await;
+    let agents = agents_on_machine(state, machine).await;
     for agent in agents {
         if state.agent.is_agent_connected(&agent).await && agent_can_show(state, &agent) {
             return Some(agent);
@@ -651,7 +651,7 @@ async fn activity_peer(state: &AppState, machine: &MachineId) -> Option<AgentId>
 /// Prefers a connected agent. An offline agent with the bit is still
 /// returned so the send can time out as `unconfirmed`.
 async fn show_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
-    let agents = discovered_agents(state, machine).await;
+    let agents = agents_on_machine(state, machine).await;
     let mut offline = None;
     for agent in agents {
         if !agent_can_show(state, &agent) {
