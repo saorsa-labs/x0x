@@ -348,17 +348,22 @@ restart-plan binding, boot ID and fixed deadline. The log barrier keeps admissio
 so a failed flush does not close the old process's log sinks. A transient dropped
 line fails its barrier window; it does not poison every later barrier.
 
-The instance data directory retains two private diagnostic records:
+The instance data directory retains three private diagnostic records:
 
 - `upgrade-flush.json` records the intent and, on success, the receipt ID.
-- `upgrade-flush-rollback.json` records a failed or unresolved flush. A late
-  worker cannot erase this separate failure record by writing a receipt.
+- `upgrade-flush-rollback.json` records a flush that stopped the daemon and
+  then failed. A late worker cannot erase this separate failure record by
+  writing a receipt.
+- `upgrade-flush-hold.json` holds the release whose started flush failed, so
+  the restart loop after `EX_TEMPFAIL` cannot re-apply it.
 
 A flush timeout, receipt-write failure or binding failure does not authorize
-the supervised exit. A flush that started and then failed or overran restores
-the previous binary and exits `EX_TEMPFAIL` (75) for a service-manager
-restart on the old version; a refusal before any flush started is an ordinary
-error and the daemon keeps serving. Both cases are described under
+the supervised exit. A flush that started — the daemon actually stopped
+behind the hook — and then failed or overran restores every binary the
+transaction swapped (daemon and `x0x` CLI together, or neither) and exits
+`EX_TEMPFAIL` (75) for a service-manager restart on the old version; a
+refusal before the daemon stops is an ordinary error, nothing is restored,
+and the daemon keeps serving. Both cases are described under
 [Acknowledged shutdown flush (supervised exit)](#acknowledged-shutdown-flush-supervised-exit)
 below, together with the startup cleanup that clears a receipt-less record or
 rollback marker whose owning process is gone. Do not apply the legacy
