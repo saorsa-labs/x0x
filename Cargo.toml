@@ -215,9 +215,8 @@ opt-level = 3
 [profile.test.package.ant-quic]
 opt-level = 3
 
-# x0x itself is optimized only for the #703 test (`--cargo-profile
-# signing-acceptance`). On `test` it compiled all ~115 x0x test binaries at
-# opt-level 3, which took the CI workspace test build from ~20 to ~57 minutes.
+# The #703 job uses a separate profile so its build-memory limits do not
+# affect ordinary tests or release binaries.
 [profile.signing-acceptance]
 inherits = "test"
 # This job checks counters and assertions, not debug metadata or local LTO.
@@ -225,9 +224,9 @@ debug = 0
 lto = "off"
 
 [profile.signing-acceptance.package.x0x]
-# Optimize the signing workload without level 3's memory cost across the
-# entire library test crate. Crypto dependencies keep their level 3 overrides.
-opt-level = 1
+# Compile the growing library test crate without optimization; the signing
+# workload's crypto dependencies keep their level 3 overrides above.
+opt-level = 0
 # Keep CI's non-incremental codegen units small; the job bounds parallel work.
 codegen-units = 256
 
