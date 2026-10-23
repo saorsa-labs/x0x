@@ -31038,7 +31038,11 @@ pub(in crate::server) async fn approve_join_request(
         if let Some(resp) = treekem_membership_unsupported(info) {
             return resp;
         }
-        let Some(req) = info.join_requests.get_mut(&request_id) else {
+        // #1533: approve on a private candidate. A refused seal (for
+        // example the ADR 0109 conflict bound) then leaves the live record
+        // without the Approved request and the new Active member.
+        let mut next = info.clone();
+        let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
         };
         if !req.is_pending() {
@@ -31048,14 +31052,14 @@ pub(in crate::server) async fn approve_join_request(
         req.reviewed_by = Some(caller_hex.clone());
         req.reviewed_at = Some(now_ms);
         let requester_hex = req.requester_agent_id.clone();
-        info.add_member(
+        next.add_member(
             requester_hex.clone(),
             x0x::groups::GroupRole::Member,
             Some(caller_hex.clone()),
             None,
         );
-        info.roster_revision = info.roster_revision.saturating_add(1);
-        let commit = match seal_commit_owner_certified(&state, &mut *info, signing_kp, now_ms).await
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
         {
             Ok(c) => c,
             Err(e) => {
@@ -31065,6 +31069,7 @@ pub(in crate::server) async fn approve_join_request(
                 );
             }
         };
+        *info = next;
         let metadata_topic = info.metadata_topic.clone();
         let event_group_id = info.stable_group_id().to_string();
         let revision = info.roster_revision;

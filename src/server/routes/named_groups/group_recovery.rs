@@ -1257,6 +1257,28 @@ async fn finish_arm(state: &AppState, stable: &str, write: LegacyWrite) -> bool 
     }
 }
 
+/// ADR 0109 §4 "S3 publishes to the live map only when both writes are
+/// Durable" (#1533 r9). The shared persist helper also installs its
+/// record on `ReplacedNotDurable` (the #759 rule), so an S3 transition
+/// that advances the record puts `before` back in the live map. The
+/// candidate stays only in the sidecar's durable authoritative record,
+/// and the group stays placeheld, so the worker writes again. A live
+/// record that is no longer `after` is not changed.
+async fn unpublish_not_durable(state: &AppState, key: &str, before: &GroupInfo, after: &GroupInfo) {
+    {
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        let mut groups = state.named_groups.write().await;
+        let Some(live) = groups
+            .get_mut(key)
+            .filter(|live| live.state_hash == after.state_hash)
+        else {
+            return;
+        };
+        *live = before.clone();
+    }
+    super::refresh_group_rosters_for_gossip(state).await;
+}
+
 /// The live record under `key` still has the epoch token `captured`
 /// (ADR 0067; §4 "A changed epoch token at commit aborts the transition").
 async fn epoch_unchanged(
@@ -2385,6 +2407,9 @@ pub(super) async fn apply_join_carry(
     } else {
         LegacyWrite::Dropped
     };
+    if write == LegacyWrite::ReplacedNotDurable {
+        unpublish_not_durable(state, &group_key, &current, &next).await;
+    }
     if !finish_arm(state, &stable, write).await {
         tracing::warn!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: attested links not durable");
         return false;
@@ -3452,7 +3477,8 @@ async fn show_conflict(state: &AppState, info: &GroupInfo) {
 /// `reseat_required {attestation_conflict}`. The record only adds
 /// containment, so when its durable write fails it is still held in
 /// memory (the gate honours it now, and the next sidecar write carries
-/// it).
+/// it). Two replies can both reach this point, so the record keeps the
+/// strongest bound ([`keep_strongest_conflict`]) in both writes.
 async fn record_conflict(
     state: &AppState,
     group_key: &str,
@@ -3462,7 +3488,7 @@ async fn record_conflict(
     let stable = info.stable_group_id().to_string();
     let kept = conflict.clone();
     if !update_sidecar(state, &stable, move |body| {
-        body.attestation_conflict = Some(kept);
+        keep_strongest_conflict(body, kept);
     })
     .await
     {
@@ -3470,14 +3496,40 @@ async fn record_conflict(
         let _writer = state.group_recovery.writer.lock().await;
         let mut inner = state.group_recovery.inner.lock().await;
         if !inner.sidecar_status.contains_key(&stable) {
-            inner
-                .sidecars
-                .entry(stable.clone())
-                .or_default()
-                .attestation_conflict = Some(conflict);
+            keep_strongest_conflict(inner.sidecars.entry(stable.clone()).or_default(), conflict);
         }
     }
     announce_conflict(state, group_key, info).await;
+}
+
+/// §2 "Conflict": "Nothing past the common prefix applies", for every
+/// conflict recorded. `candidate` replaces the recorded conflict only when
+/// its common prefix with the active ATA is shorter, so a later record
+/// never moves the bound forward (#1533 r9). Without an active ATA the
+/// recorded conflict stays.
+fn keep_strongest_conflict(body: &mut GroupRecoveryV1, candidate: AdminTerminalAttestation) {
+    let replace = match (body.active_ata.as_ref(), body.attestation_conflict.as_ref()) {
+        (_, None) => true,
+        (Some(active), Some(recorded)) => {
+            conflict_prefix_len(active, &candidate) < conflict_prefix_len(active, recorded)
+        }
+        (None, Some(_)) => false,
+    };
+    if replace {
+        body.attestation_conflict = Some(candidate);
+    }
+}
+
+/// The length of the common prefix of `active` and `conflict`. Two ATAs
+/// that agree bound the gate at the head ([`s3::conflict_gate_sequence`]),
+/// which is never weaker than a prefix, so they count as 0.
+fn conflict_prefix_len(
+    active: &AdminTerminalAttestation,
+    conflict: &AdminTerminalAttestation,
+) -> usize {
+    active
+        .divergence_from(conflict)
+        .map_or(0, |prefix| prefix.len())
 }
 
 /// Show and log a recorded attestation conflict.
@@ -6874,6 +6926,152 @@ mod tests {
         assert_eq!(next.state_hash, before.state_hash);
         assert_eq!(next.state_revision, before.state_revision);
         assert_eq!(next.commit_log.len(), before.commit_log.len());
+        Ok(())
+    }
+
+    /// #1533 r9 Codex P1 2 (ADR 0109 §2 "Conflict"): two replies can both
+    /// record a conflict. With active `[a1, a2]`, a conflict `[x1, x2]`
+    /// bounds the gate at the head (empty prefix). A later conflict
+    /// `[a1, z2]` replaced it and moved the bound to `[a1]`. The record now
+    /// keeps the strongest bound, in either order, durably and in the
+    /// memory-only fallback.
+    #[tokio::test]
+    async fn a_later_conflict_never_weakens_the_bound() -> anyhow::Result<()> {
+        for strong_first in [true, false] {
+            let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+            let (key, info, first, admin) = armed_fixture_with_signer(&state).await?;
+            let stable = info.stable_group_id().to_string();
+            let with_sequence = |sequence: &[&str]| {
+                let mut fields = first.fields.clone();
+                fields.sequence = sequence.iter().map(|hash| (*hash).to_string()).collect();
+                AdminTerminalAttestation::sign(fields, &admin)
+            };
+            let active = with_sequence(&["a1", "a2"])?;
+            assert!(
+                update_sidecar(&state, &stable, |body| body.active_ata =
+                    Some(active.clone()))
+                .await
+            );
+            let strong = with_sequence(&["x1", "x2"])?;
+            let weak = with_sequence(&["a1", "z2"])?;
+            let order = if strong_first {
+                [strong.clone(), weak.clone()]
+            } else {
+                [weak.clone(), strong.clone()]
+            };
+            for conflict in order.clone() {
+                record_conflict(&state, &key, &info, conflict).await;
+            }
+            for body in [
+                sidecar_snapshot(&state, &stable).await.unwrap_or_default(),
+                sidecar_on_disk(&state, &stable).await?,
+            ] {
+                assert_eq!(
+                    body.attestation_conflict.as_ref(),
+                    Some(&strong),
+                    "strong_first={strong_first}: the strongest bound is kept"
+                );
+                assert_eq!(body.active_ata.as_ref(), Some(&active));
+                assert!(
+                    !s3::conflict_admits_link(&active, &strong, &info.state_hash, "a1"),
+                    "nothing past the empty common prefix applies"
+                );
+            }
+            // The memory-only fallback uses the same rule.
+            let mut body = GroupRecoveryV1 {
+                active_ata: Some(active.clone()),
+                ..GroupRecoveryV1::default()
+            };
+            for conflict in order {
+                keep_strongest_conflict(&mut body, conflict);
+            }
+            assert_eq!(body.attestation_conflict.as_ref(), Some(&strong));
+        }
+        Ok(())
+    }
+
+    /// #1533 r9 Codex P2 (ADR 0109 §4 "S3 publishes to the live map only
+    /// when both writes are Durable"): the join carry advances the record.
+    /// On a `ReplacedNotDurable` legacy write the shared persist helper
+    /// kept the advanced record in the live map. Now the live map keeps
+    /// the record from before the carry, the group stays contained
+    /// (placeheld, ATA kept) and the worker's retry writes the placeholder
+    /// durably.
+    #[tokio::test]
+    async fn join_carry_not_durable_publishes_nothing() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let owner = x0x::identity::AgentKeypair::generate()?;
+        let owner_hex = hex::encode(owner.agent_id().as_bytes());
+        let mut base = GroupInfo::new(
+            "adr0109-carry-not-durable".to_string(),
+            String::new(),
+            owner.agent_id(),
+            "7109".repeat(16),
+        );
+        base.seal_commit(&owner, 1_000)?;
+        let key = base.mls_group_id.clone();
+        let stable = base.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), base.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let mut ahead = base.clone();
+        ahead.name = "renamed".to_string();
+        ahead.seal_commit(&owner, 2_000)?;
+        let links = links_after(&base, &ahead);
+        let mut joined = ahead.clone();
+        joined.add_member(
+            local.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(owner_hex.clone()),
+            None,
+        );
+        joined.seal_commit(&owner, 3_000)?;
+        let terminal = joined
+            .commit_log
+            .last()
+            .map(|entry| entry.commit.clone())
+            .ok_or_else(|| anyhow::anyhow!("terminal"))?;
+        let event = super::super::NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: stable.clone(),
+            revision: terminal.revision,
+            actor: owner_hex.clone(),
+            name: None,
+            description: None,
+            commit: Some(terminal.clone()),
+        };
+        let ata = sign_ata(&owner, &local, &base, &links)?;
+
+        state.named_groups_save_fault.store(3, Ordering::SeqCst);
+        let applied = apply_join_carry(&state, &key, &links, &terminal, &event, &ata).await;
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        assert!(!applied, "not published");
+        assert_eq!(
+            head_of(&state, &key).await.as_deref(),
+            Some(base.state_hash.as_str()),
+            "the live map keeps the record from before the carry"
+        );
+        assert!(is_placeheld(&state, &stable), "stays contained");
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(body.active_ata.is_some(), "the ATA is kept");
+        // The worker's retry writes the placeholder durably; the live
+        // record still does not move.
+        ensure_placeholders(&state).await;
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&legacy));
+        assert_eq!(
+            head_of(&state, &key).await.as_deref(),
+            Some(base.state_hash.as_str())
+        );
         Ok(())
     }
 
