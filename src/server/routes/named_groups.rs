@@ -14198,6 +14198,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !roster_only_removal {
                 self_leave_rekey_log_clear_group(&resolved_group_key);
                 self_leave_rekey_log_clear_group(next.stable_group_id());
+            } else if !rekey_persisted {
+                // ADR 0110 §2 (#1508 review P1): the crypto-only exclusion
+                // seals only from the leaver's own S4 row. The durable leave
+                // opens that row on the next pass; wake the worker now.
+                state.agent.s4_revocation_intake().request_reconcile();
             }
             ApplyMetadataResult::ACCEPTED_EXIT
         }
@@ -15313,6 +15318,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 secret_epoch,
                 "Phase D.2: stored new group shared secret (epoch {secret_epoch}) via KEM-sealed envelope"
             );
+            // ADR 0110 S4 (#1508 review P1): a GSS crypto-only exclusion
+            // waits for this secret; the worker retries the kept frame.
+            state.agent.s4_revocation_intake().request_reconcile();
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::MemberJoined {
@@ -25704,7 +25712,8 @@ async fn commit_treekem_self_leave_rekey_from(
     // ADR 0110 §2: a ranked fallback admin may commit after its fallback
     // time (`T_obs + W + (r − 1)·Δ`) when the designated admin did not.
     if designated != state.agent.agent_id()
-        && !revocation_eviction::s4_self_leave_fallback_allowed(state, info.stable_group_id()).await
+        && !revocation_eviction::s4_self_leave_fallback_allowed(state, info.stable_group_id(), None)
+            .await
     {
         let designated_hex = hex::encode(designated.as_bytes());
         let leaver = removed_member_log_id(&info);
@@ -25808,6 +25817,18 @@ async fn commit_treekem_self_leave_rekey_from(
         );
         return SelfLeaveRekeyStep::Deferred;
     };
+    // ADR 0110 §2 (#1508 review P1): a fallback admin seals only this
+    // leaver's own row, after that row's own fallback time.
+    if designated != state.agent.agent_id()
+        && !revocation_eviction::s4_self_leave_fallback_allowed(
+            state,
+            info.stable_group_id(),
+            Some(target_agent.as_bytes()),
+        )
+        .await
+    {
+        return SelfLeaveRekeyStep::Deferred;
+    }
     // ADR 0110 §3 and §4: the leaver is already Removed, so its retained
     // leaf is excluded by the signed crypto-only `CryptoExclusionV1`, gated
     // per receiver on `crypto_exclusion_v1` and held by the D76 rule. No
