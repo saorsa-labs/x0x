@@ -204,7 +204,8 @@ impl ReplayCache {
 /// A rider subject of all zeroes, or the target's own agent, is refused
 /// so Stop cannot turn off local show on the target. The envelope signer
 /// is still checked against `gui_show_blocked` and the rate limit. Stop
-/// on a rider show writes that signer, not this subject.
+/// on a rider show blocks shows from that machine: it writes the signer,
+/// not this subject.
 #[must_use]
 pub fn show_subject(
     envelope: &[u8; 32],

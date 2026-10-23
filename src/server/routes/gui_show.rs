@@ -23,10 +23,10 @@
 //! subject on the banner. It refuses the show when this daemon's agent is
 //! in `gui_show_blocked`, and it rate-limits this daemon as well as the
 //! subject. Stop on the target writes this daemon's agent, not a subject
-//! this daemon chose. A local Stop still blocks that rider, or turns local
-//! show off only when the sender is this daemon. A rider banner names
-//! `gui_show_blocked.json` and a daemon restart. A local banner names
-//! `gui_show_local_disabled`.
+//! this daemon chose. That Stop blocks shows from that machine. A local
+//! Stop still blocks that rider, or turns local show off only when the
+//! sender is this daemon. A remote rider banner says Stop blocks shows
+//! from that machine. A local banner names `gui_show_local_disabled`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -53,6 +53,12 @@ use crate::owner_sync::OwnerSyncStore;
 /// Stop for that agent writes `gui_show_blocked.json`. The sentence does
 /// not call the sender a rider.
 const REMOTE_SHOW_REENABLE: &str = "Remove this agent's id from gui_show_blocked.json in the data directory and restart the daemon to allow shows from this agent again.";
+
+/// Stop on a remote rider show writes the envelope signer.
+///
+/// The receiver cannot verify the subject. The block is the originating
+/// daemon, so later shows from that machine are refused.
+const REMOTE_RIDER_STOP: &str = "Stop blocks shows from that machine.";
 
 /// `reason` when the target has no verified `gui_show_v1` advert.
 const TARGET_NEEDS_UPGRADE: &str = "target_needs_upgrade";
@@ -385,9 +391,9 @@ pub(crate) fn apply_gui_block(state: &AppState, aid: AgentId) -> Result<(), Stri
 
 /// Banner text for one inbound remote show.
 ///
-/// `via_rider` uses the rider sentence. This daemon's own agent uses the
-/// local sentence. Any other sender names `gui_show_blocked.json` and does
-/// not use the word rider.
+/// `via_rider` says Stop blocks shows from that machine. This daemon's
+/// own agent uses the local sentence. Any other sender names
+/// `gui_show_blocked.json` and does not use the word rider.
 async fn remote_show_banner(
     state: &AppState,
     subject: &AgentId,
@@ -404,11 +410,10 @@ async fn remote_show_banner(
         let machine_label = local_machine_label(state, sender_machine)
             .await
             .unwrap_or_else(|| short_id_hex(&machine_hex));
-        let mut banner = origin_banner(&agent_label, &machine_label, true);
         let signer_short = short_id_hex(&hex::encode(envelope.as_bytes()));
-        banner.push_str(&format!(
-            " Stop writes {signer_short} to gui_show_blocked.json."
-        ));
+        let banner = format!(
+            "Opened by {agent_label} (rider) on {machine_label}. {REMOTE_RIDER_STOP} Remove {signer_short} from gui_show_blocked.json in the data directory and restart the daemon to allow shows from that machine again."
+        );
         return (banner, true);
     }
     if *subject == state.agent.agent_id() {
@@ -2567,7 +2572,21 @@ mod tests {
             .take_pending_for_session(&token, Instant::now())
             .expect("rider banner queued");
         assert!(pending.banner.contains("(rider)"));
-        assert!(pending.banner.contains(crate::gui::RIDER_SHOW_REENABLE));
+        assert!(
+            pending.banner.contains(REMOTE_RIDER_STOP),
+            "{}",
+            pending.banner
+        );
+        assert!(
+            pending.banner.contains("from that machine again"),
+            "{}",
+            pending.banner
+        );
+        assert!(
+            !pending.banner.contains("from this rider"),
+            "{}",
+            pending.banner
+        );
         assert!(pending.rider);
 
         let daemon = state.agent.agent_id();

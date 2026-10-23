@@ -2291,8 +2291,16 @@ exit 1
         );
         let src = fn_source(html, "function showGuiShowBanner", "function navigate");
         assert!(
-            src.contains("block.textContent=rider?'Stop shows from this rider':'Stop local shows'"),
-            "a rider Stop control must not say Stop local shows: {src}"
+            src.contains("Stop shows from this rider"),
+            "a local rider Stop names that rider: {src}"
+        );
+        assert!(
+            src.contains("Stop shows from this machine"),
+            "a remote rider Stop blocks shows from that machine: {src}"
+        );
+        assert!(
+            src.contains("from that machine"),
+            "the remote banner sentence selects the machine Stop control: {src}"
         );
     }
 

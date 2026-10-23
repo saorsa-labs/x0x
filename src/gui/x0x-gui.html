@@ -976,7 +976,7 @@ function showGuiShowBanner(text, agentId, rider){
   const hide=document.getElementById('gui-show-banner-dismiss');
   if(!bar||!label||!block||!hide)return;
   label.textContent=text;
-  block.textContent=rider?'Stop shows from this rider':'Stop local shows';
+  block.textContent=!rider?'Stop local shows':(text.indexOf('from that machine')>=0?'Stop shows from this machine':'Stop shows from this rider');
   bar.classList.add('visible');
   block.hidden=false;
   block.disabled=true;
