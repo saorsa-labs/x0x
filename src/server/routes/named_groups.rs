@@ -10,6 +10,8 @@ mod control_blob;
 mod direct_metadata_lanes;
 mod fair_admission;
 mod group_recovery;
+mod gss_share_hold;
+pub(in crate::server) use gss_share_hold::GssShareHolds;
 mod revocation_eviction;
 pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
@@ -12784,34 +12786,19 @@ fn legacy_gss_removal_receiver(_state: &AppState) -> bool {
     false
 }
 
-/// #1573: whether a GSS removal or ban parked for `group_key` still waits:
-/// it is not expired, it chains from the current head (the head did not
-/// move) and it rotates above this node's secret epoch. Only a removal
-/// whose signed commit the apply verified is parked, so a forged one
-/// withholds nothing. An installed share or an applied removal ends it.
+/// #1573: whether a GSS removal or ban parked for `group_key`, or a GSS
+/// crypto-only exclusion held for it, still waits: it chains from the
+/// current head (the head did not move) and it rotates above this node's
+/// secret epoch. Only a transition whose signed commit the apply verified
+/// is held, so a forged one withholds nothing. An installed share, an
+/// applied removal or a moved head ends it; time does not (#1508/#1533
+/// rc13), and the hold is durable across a restart ([`gss_share_hold`]).
 fn pending_gss_removal_withholds(
     state: &AppState,
     group_key: &str,
     info: &x0x::groups::GroupInfo,
 ) -> bool {
-    let lot = state
-        .parked_gss_removals
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    lot.get(group_key).is_some_and(|list| {
-        list.iter().any(|entry| {
-            let epoch = match &entry.event {
-                NamedGroupMetadataEvent::MemberRemoved { secret_epoch, .. }
-                | NamedGroupMetadataEvent::MemberBanned { secret_epoch, .. } => *secret_epoch,
-                _ => None,
-            };
-            entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL
-                && epoch.is_some_and(|epoch| epoch > info.secret_epoch)
-                && named_group_metadata_event_commit(&entry.event).is_some_and(|commit| {
-                    commit.prev_state_hash.as_deref() == Some(info.state_hash.as_str())
-                })
-        })
-    })
+    gss_share_hold::withholds(state, group_key, info)
 }
 
 /// A parked GSS removal of a placeholder member that chains from `info`'s
@@ -12864,7 +12851,7 @@ pub(in crate::server) fn park_pending_gss_removal_for_test(
 /// #1573: park a verified GSS removal or ban until its share installs
 /// ([`gss_removal_waits_for_share`]). A resend of the same commit is not
 /// parked twice. Suppressed in replay contexts (`allow_queue` false).
-fn park_gss_removal_for_share(
+async fn park_gss_removal_for_share(
     state: &AppState,
     group_key: &str,
     event: &NamedGroupMetadataEvent,
@@ -12879,43 +12866,50 @@ fn park_gss_removal_for_share(
     if !allow_queue || !verified {
         return;
     }
+    // The durable holds load first, so this write keeps the earlier ones.
+    gss_share_hold::ensure_loaded(state).await;
     let hash = named_group_metadata_event_commit(event).map(|commit| commit.state_hash.clone());
-    let mut lot = state
-        .parked_gss_removals
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let list = lot.entry(group_key.to_string()).or_default();
-    list.retain(|entry| entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL);
-    if list.iter().any(|entry| {
-        named_group_metadata_event_commit(&entry.event).map(|commit| &commit.state_hash)
-            == hash.as_ref()
-    }) {
-        return;
+    {
+        let mut lot = state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let list = lot.entry(group_key.to_string()).or_default();
+        // No time limit (#1508/#1533 rc13): an expired hold would seal
+        // under the secret that the removed member holds.
+        if list.iter().any(|entry| {
+            named_group_metadata_event_commit(&entry.event).map(|commit| &commit.state_hash)
+                == hash.as_ref()
+        }) {
+            return;
+        }
+        while list.len() >= PARKED_ROLE_UPDATE_CAP {
+            list.remove(0);
+        }
+        list.push(ParkedRoleUpdate {
+            event: event.clone(),
+            sender,
+            parked_at: Instant::now(),
+        });
     }
-    while list.len() >= PARKED_ROLE_UPDATE_CAP {
-        list.remove(0);
-    }
-    list.push(ParkedRoleUpdate {
-        event: event.clone(),
-        sender,
-        parked_at: Instant::now(),
-    });
+    gss_share_hold::persist_logged(state, group_key).await;
 }
 
 /// #1573: after a share installs, apply the group's parked GSS removals
 /// again through the ordinary apply. One that still waits (a share for
 /// another epoch) parks itself again.
 async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
+    gss_share_hold::ensure_loaded(state).await;
     let parked = state
         .parked_gss_removals
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(group_key)
         .unwrap_or_default();
+    if parked.is_empty() {
+        return;
+    }
     for entry in parked {
-        if entry.parked_at.elapsed() >= PENDING_JOIN_RESULT_TTL {
-            continue;
-        }
         let _ = Box::pin(apply_named_group_metadata_event(
             state,
             entry.event,
@@ -12925,6 +12919,9 @@ async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
         ))
         .await;
     }
+    // The file follows memory: an applied removal leaves it, one that
+    // still waits parked itself again.
+    gss_share_hold::persist_logged(state, group_key).await;
 }
 
 /// #876 r3 (review finding 1): after a member lands, drain the group's
@@ -14441,7 +14438,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     sender,
                     verified,
                     allow_queue,
-                );
+                )
+                .await;
                 return ApplyMetadataResult::REJECTED;
             }
             // Save the roster-only leave before any epoch commit. A failed
@@ -14949,7 +14947,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     sender,
                     verified,
                     allow_queue,
-                );
+                )
+                .await;
                 return banned_reject("waiting_for_gss_share", &resolved_group_key);
             }
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
@@ -24041,6 +24040,7 @@ async fn wipe_local_group_crypto_material(
         }
     }
 
+    gss_share_hold::forget_group(state, &aliases).await;
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
         let path = self_leave_rekey_outbox_path(state, alias);
@@ -24703,6 +24703,9 @@ pub(in crate::server) async fn group_ciphertext_withheld(
     group_id_hex: &str,
     guard: Option<&x0x::mls::TreeKemMlsGroup>,
 ) -> Option<GroupCiphertextHold> {
+    // A restarted node loads its durable GSS share holds before it seals
+    // anything (#1508/#1533 rc13). This takes no group or ratchet lock.
+    gss_share_hold::ensure_loaded(state).await;
     let info = {
         let groups = state.named_groups.read().await;
         let (key, info) = crate::server::resolve_group_entry_locked(&groups, group_id_hex)?;
@@ -47036,6 +47039,7 @@ pub(in crate::server) mod tests {
             treekem_pending_events: RwLock::new(HashMap::new()),
             parked_role_updates: StdMutex::new(HashMap::new()),
             parked_gss_removals: StdMutex::new(HashMap::new()),
+            gss_share_holds: GssShareHolds::default(),
             join_result_staging_guards: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
@@ -54402,10 +54406,11 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
-    /// #1573: the survivor restarts between the held removal and its share,
-    /// so the parked event is gone (it lived in memory; nothing durable
-    /// changed). The share installs alone, and the committer's next resend
-    /// of the removal then installs with the secret held.
+    /// #1573: the parked event is gone before its share (memory lost it and
+    /// no hold file was saved, e.g. a failed write; the durable restart is
+    /// `rc13_gss_pending_removal_hold_survives_restart`). The share
+    /// installs alone, and the committer's next resend of the removal then
+    /// installs with the secret held.
     #[tokio::test]
     async fn f1_gss_rotation_restart_between_held_removal_and_share_converges() -> Result<()> {
         let f = f1_gss_rotation_fixture("held-restart").await?;
@@ -54524,6 +54529,99 @@ pub(in crate::server) mod tests {
             f1_encrypt(&f).await.0,
             StatusCode::OK,
             "the share ends the hold"
+        );
+        Ok(())
+    }
+
+    /// #1508/#1533 rc13 (Codex P1): the hold has no time limit. Before
+    /// the fix a parked removal stopped holding after ten minutes, and the
+    /// survivor sealed new ciphertext under the secret that the removed
+    /// member holds.
+    #[tokio::test]
+    async fn rc13_gss_pending_removal_hold_has_no_time_limit() -> Result<()> {
+        let f = f1_gss_rotation_fixture("pending-ttl").await?;
+        let sender = f.admin_kp.agent_id();
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
+        assert!(!held.accepted);
+        gss_share_hold::test_seam::age_parked_removals(
+            &f.state,
+            PENDING_JOIN_RESULT_TTL + Duration::from_secs(1),
+        );
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            Some(GroupCiphertextHold::PendingGssRemoval),
+            "an old hold still holds"
+        );
+        assert_eq!(f1_encrypt(&f).await.0, StatusCode::CONFLICT);
+
+        let _ = apply_named_group_metadata_event(
+            &f.state,
+            f.envelope_event.clone(),
+            sender,
+            true,
+            None,
+        )
+        .await;
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        assert_eq!(f1_encrypt(&f).await.0, StatusCode::OK, "the share ends it");
+        Ok(())
+    }
+
+    /// #1508/#1533 rc13 (Codex P1): the hold is durable. A survivor that
+    /// restarts between the verified removal and its share still makes no
+    /// ciphertext, and the share replays the saved removal. Before the fix
+    /// the parked removal lived in memory only.
+    #[tokio::test]
+    async fn rc13_gss_pending_removal_hold_survives_restart() -> Result<()> {
+        let f = f1_gss_rotation_fixture("pending-restart").await?;
+        let sender = f.admin_kp.agent_id();
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
+        assert!(!held.accepted);
+        assert!(gss_share_hold::test_seam::hold_file_exists(
+            &f.state,
+            &f.group_id
+        ));
+        gss_share_hold::test_seam::simulate_restart(&f.state).await;
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            Some(GroupCiphertextHold::PendingGssRemoval),
+            "the restarted survivor still holds"
+        );
+        assert_eq!(f1_encrypt(&f).await.0, StatusCode::CONFLICT);
+
+        let _ = apply_named_group_metadata_event(
+            &f.state,
+            f.envelope_event.clone(),
+            sender,
+            true,
+            None,
+        )
+        .await;
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        assert_eq!(f1_encrypt(&f).await.0, StatusCode::OK);
+        assert!(
+            !gss_share_hold::test_seam::hold_file_exists(&f.state, &f.group_id),
+            "the applied removal leaves the file"
         );
         Ok(())
     }

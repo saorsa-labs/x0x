@@ -2024,6 +2024,12 @@ async fn install_gss(
             secret_epoch = next_secret_epoch,
             "ADR 0110 S4: GSS crypto-only exclusion waits for its sealed share"
         );
+        // The frame verified, and this node keeps the old secret, which the
+        // excluded member holds: make no ciphertext until the share
+        // installs. The hold is durable and has no time limit (#1508/#1533
+        // rc13).
+        ng::gss_share_hold::hold_exclusion(state, group_key, &info.state_hash, next_secret_epoch)
+            .await;
         return ReceiveOutcome::WaitingForShare;
     }
     let roster_revision = body.roster_revision;
@@ -2066,6 +2072,7 @@ async fn install_gss(
         secret_epoch = next_secret_epoch,
         "ADR 0110 S4: GSS crypto-only exclusion installed with its new secret"
     );
+    ng::gss_share_hold::release_exclusions(state, group_key, next_secret_epoch).await;
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
 }
@@ -4252,6 +4259,122 @@ mod daemon_tests {
                 .delivering()
                 .contains(&key),
             "the survivor's convergence ends the delivery"
+        );
+        Ok(())
+    }
+
+    /// #1508/#1533 rc13 (Codex P1): a survivor that verified a GSS
+    /// crypto-only exclusion keeps the old secret, which the excluded
+    /// member holds, until the share arrives. It makes no new ciphertext in
+    /// that wait, and a restart does not end the wait. The installed share
+    /// ends it. Before the fix this path had no send hold at all.
+    #[tokio::test]
+    async fn a_pending_gss_crypto_exclusion_withholds_ciphertext_across_restart() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let admin = fx.state.agent.agent_id();
+
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "no false hold before the exclusion"
+        );
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the verified exclusion holds new ciphertext"
+        );
+
+        // Get the share from the committer's next send.
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            parent.as_deref(),
+        )
+        .await;
+        if let Ok(mut scheduled) = fx
+            .state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+        {
+            scheduled.clear();
+        }
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        let share = shares_for(&fx.state, &survivor_hex)
+            .pop()
+            .context("the resend seals the secret to the survivor")?;
+
+        // The survivor restarts before the share arrives.
+        let mut restarted = ng::tests::secure_endpoint_test_state_at(
+            fx._replica_dir.path(),
+            Arc::clone(&fx.replica.agent),
+        )
+        .await?;
+        Arc::get_mut(&mut restarted)
+            .context("the restarted state is not shared yet")?
+            .agent_kem_keypair = Arc::clone(&fx.replica.agent_kem_keypair);
+        assert_eq!(head_of(&restarted, &fx.group_id).await, parent);
+        assert_eq!(
+            ng::group_ciphertext_withheld(&restarted, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the hold survives the restart"
+        );
+        super::super::load_persisted_obligations(&restarted).await;
+        retry_stash(&restarted).await;
+        assert_eq!(
+            ng::group_ciphertext_withheld(&restarted, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval)
+        );
+
+        let took = ng::apply_named_group_metadata_event(&restarted, share, admin, true, None).await;
+        assert!(took.accepted, "{took:?}");
+        retry_stash(&restarted).await;
+        assert_eq!(
+            ng::group_ciphertext_withheld(&restarted, &fx.group_id, None).await,
+            None,
+            "the installed share ends the hold"
+        );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&restarted, &fx.group_id),
+            0
         );
         Ok(())
     }
