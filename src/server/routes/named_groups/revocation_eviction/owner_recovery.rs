@@ -124,6 +124,20 @@ struct ParkedShare {
     at: Instant,
 }
 
+/// A verified catch-up commit of a GSS `OwnerCertified` group that does
+/// not chain on this node's head yet ([`hold_unchained_event`]): it may
+/// chain on a recovery that has not installed here.
+#[derive(Debug, Clone)]
+struct HeldEvent {
+    stable_group_id: String,
+    event: super::super::NamedGroupMetadataEvent,
+    /// The verified signer of the event's commit.
+    author: AgentId,
+    revision: u64,
+    prev_state_hash: Option<String>,
+    at: Instant,
+}
+
 /// The owner-recovery state held in the S4 runtime, keyed by stable
 /// group ID.
 #[derive(Debug, Default)]
@@ -134,6 +148,8 @@ pub(super) struct OrcState {
     stash: Vec<StashedFrame>,
     /// Early GSS shares, held until their recovery installs.
     early_shares: Vec<ParkedShare>,
+    /// Catch-up commits held until their recovery installs.
+    held_events: Vec<HeldEvent>,
     /// Authored and installed recovery commits, for catch-up serving; the
     /// authored and the received frames are durable ([`replay_log`]).
     log: replay_log::HeldLog<ORC_LOG_PER_GROUP>,
@@ -1649,7 +1665,8 @@ pub(in crate::server) async fn park_early_share(
         || orc::crypto_kind(info) != orc::RecoveryCryptoKind::Gss
         || *actor != sender_hex
         || !info.has_active_member(&sender_hex)
-        || *secret_epoch <= info.secret_epoch
+        || *secret_epoch < info.secret_epoch
+        || (*secret_epoch == info.secret_epoch && info.shared_secret.is_some())
     {
         return;
     }
@@ -1676,9 +1693,9 @@ pub(in crate::server) async fn park_early_share(
 enum ParkedKey {
     /// `body`'s actor sealed the secret of `epoch` to this node.
     Exact([u8; 32]),
-    /// No share of `epoch`, but an admin of the post-recovery roster
-    /// (`may_seal_later`) sealed a later epoch's secret to this node, and
-    /// it opens: the recovery is an intermediate head of the chain.
+    /// No share of `epoch`, but the actor (`may_seal_later`) sealed a later
+    /// epoch's secret to this node, and it opens: the recovery is an
+    /// intermediate head of the chain.
     Later,
     Missing,
 }
@@ -1747,6 +1764,119 @@ async fn parked_key(
         ParkedKey::Later
     } else {
         ParkedKey::Missing
+    }
+}
+
+/// #1508 rc12 (Codex P1): hold a verified commit of a GSS `OwnerCertified`
+/// group that does not chain on this node's head yet. It may chain on an
+/// owner recovery that has not installed here: a lagging survivor gets the
+/// recovery frame from any holder, on its own carrier, and the later
+/// commits on theirs (direct delivery, the topic or a catch-up page), in
+/// any order, so their ordinary apply refuses them. [`receive_commit`] uses
+/// a held commit that the recovery's actor signed on the recovery result
+/// as the evidence that the group moved on, and [`replay_held_events`]
+/// applies the held commits after the install, each as its verified
+/// signer (the catch-up rule for a relayed removal), so the ordinary apply
+/// checks every signer's authority on the chain. Nothing is applied here.
+/// Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`].
+pub(in crate::server) async fn hold_unchained_event(
+    state: &AppState,
+    event: &super::super::NamedGroupMetadataEvent,
+) {
+    let Some(commit) = super::super::named_group_metadata_event_commit(event) else {
+        return;
+    };
+    let group_id = super::super::named_group_metadata_event_group_id(event);
+    let Some(info) = ({
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, group_id).map(|(_, info)| info.clone())
+    }) else {
+        return;
+    };
+    if info.withdrawn
+        || info.policy.admission.owner_certified_user_id().is_none()
+        || orc::crypto_kind(&info) != orc::RecoveryCryptoKind::Gss
+        || commit.revision <= info.state_revision
+        || commit.prev_state_hash.as_deref() == Some(info.state_hash.as_str())
+    {
+        return;
+    }
+    let now = Instant::now();
+    {
+        let inner = state.revocation_evictions.inner.lock().await;
+        if inner.orc.held_events.iter().any(|held| {
+            super::super::named_group_metadata_event_commit(&held.event)
+                .is_some_and(|kept| kept.state_hash == commit.state_hash)
+        }) {
+            return;
+        }
+    }
+    if commit.verify_structure().is_err() {
+        return;
+    }
+    let Ok(author) = super::super::parse_agent_id_hex(&commit.committed_by) else {
+        return;
+    };
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    let kept = &mut inner.orc.held_events;
+    kept.retain(|held| now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL);
+    if kept.len() >= ORC_STASH_CAP {
+        kept.remove(0);
+    }
+    kept.push(HeldEvent {
+        stable_group_id: info.stable_group_id().to_string(),
+        event: event.clone(),
+        author,
+        revision: commit.revision,
+        prev_state_hash: commit.prev_state_hash.clone(),
+        at: now,
+    });
+}
+
+/// Whether this node holds a verified commit that `body`'s actor signed
+/// on the recovery result ([`hold_unchained_event`]).
+async fn holds_actor_successor(state: &AppState, body: &orc::OwnerRecoveryBodyV1) -> bool {
+    let now = Instant::now();
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .held_events
+        .iter()
+        .any(|held| {
+            held.stable_group_id == body.stable_group_id
+                && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
+                && held.author.as_bytes() == &body.actor
+                && held.prev_state_hash.as_deref() == Some(body.commit.state_hash.as_str())
+        })
+}
+
+/// Apply the held catch-up commits of `stable_group_id`, oldest first, once
+/// a GSS recovery installed here, each as its verified signer. A commit
+/// that still does not apply is dropped; catch-up serves it again.
+async fn replay_held_events(state: &Arc<AppState>, stable_group_id: &str) {
+    let now = Instant::now();
+    let mut due: Vec<HeldEvent> = {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        let (due, keep) = std::mem::take(&mut inner.orc.held_events)
+            .into_iter()
+            .filter(|held| now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL)
+            .partition(|held| held.stable_group_id == stable_group_id);
+        inner.orc.held_events = keep;
+        due
+    };
+    due.sort_by_key(|held| held.revision);
+    for held in due {
+        let _ = super::super::apply_named_group_metadata_event(
+            state,
+            held.event,
+            held.author,
+            true,
+            None,
+        )
+        .await;
     }
 }
 
@@ -1923,27 +2053,33 @@ async fn receive_commit(
         orc::OwnerRecoveryCryptoV1::Gss { next_secret_epoch }
             if info.secret_epoch < *next_secret_epoch || info.shared_secret.is_none() =>
         {
-            // #1508 rc12 (Codex P1): an admin of the post-recovery roster
-            // may have sealed only a later epoch's secret to this node,
-            // because a later rotation moved the group on while this node
-            // was away (catch-up seals the current secret only). The
-            // recovery is then an intermediate head: it installs with no
-            // secret, and the later share installs through
-            // [`replay_early_shares`]. This keeps the convergence rule
-            // sound. The author's live delivery of this recovery exists
-            // only while the author's head is this recovery's result (the
-            // delivery round drops it once the head moves), and a later
-            // epoch's secret exists only after a later commit. So no later
-            // share can exist while a head answer at this result can end
-            // that delivery. Only an admin of the post-recovery roster can
-            // seal a share that the replay accepts; a removed or revoked
-            // seat, or any other member, cannot make this node skip the key.
-            let mut post = info.clone();
-            orc::apply_roster_change(&mut post, &body);
-            let may_seal_later = |sender: &AgentId| {
-                post.caller_role(&hex::encode(sender.as_bytes()))
-                    .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
-            };
+            // #1508 rc12 (Codex P1): the group may have moved on past this
+            // recovery while this node was away, so no node seals this
+            // epoch's secret any more (catch-up seals the current secret
+            // only, and the holder that serves it may be an admin that the
+            // author promoted later). The recovery is then an intermediate
+            // head: it installs with no secret, the later commits chain on
+            // it ([`replay_held_events`]), and their current secret installs
+            // through the ordinary share rules ([`replay_early_shares`]).
+            //
+            // The evidence that the group moved on is rooted in the actor,
+            // the only admin of the post-recovery roster (§4b(1): every
+            // other admin seat is revoked and removed): a parked share of a
+            // later epoch that the actor sealed to this node, or a held,
+            // verified commit that the actor signed on this recovery's
+            // result. Either one exists only after the actor's own head
+            // left this result. The actor's live delivery of this recovery
+            // exists only while its head is this result (the delivery
+            // round drops it once the head moves; a restart restores it
+            // only at the head). So a keyless head here never answers a
+            // live delivery of this recovery, and the rule "an installed
+            // recovery head implies its key" holds for every head answer
+            // that can end that delivery. A share or a commit from any
+            // other member, or from a removed or revoked seat, is no such
+            // evidence; later admins get their authority from the actor's
+            // verified chain, which the replay applies first.
+            let actor = AgentId(body.actor);
+            let may_seal_later = |sender: &AgentId| *sender == actor;
             match parked_key(state, &body, *next_secret_epoch, may_seal_later).await {
                 ParkedKey::Exact(secret) => {
                     if let Err(error) = ng::ensure_named_group_key_material_install_allowed(
@@ -1964,6 +2100,14 @@ async fn receive_commit(
                         group_id = %ng::LogHexId::group(&group_key),
                         secret_epoch = next_secret_epoch,
                         "ADR 0110 S4: GSS owner recovery installs as an intermediate head; a later share holds the current secret"
+                    );
+                    None
+                }
+                ParkedKey::Missing if holds_actor_successor(state, &body).await => {
+                    tracing::info!(
+                        group_id = %ng::LogHexId::group(&group_key),
+                        secret_epoch = next_secret_epoch,
+                        "ADR 0110 S4: GSS owner recovery installs as an intermediate head; the actor's later commit is held"
                     );
                     None
                 }
@@ -2177,7 +2321,10 @@ async fn receive_commit(
         orc::RecoveryCryptoKind::TreeKem => {
             ng::replay_pending_treekem_events(state, &group_key).await;
         }
-        orc::RecoveryCryptoKind::Gss => replay_early_shares(state, &body.stable_group_id).await,
+        orc::RecoveryCryptoKind::Gss => {
+            replay_held_events(state, &body.stable_group_id).await;
+            replay_early_shares(state, &body.stable_group_id).await;
+        }
         orc::RecoveryCryptoKind::SignedPublic => {}
     }
     state.agent.s4_revocation_intake().request_reconcile();
@@ -4022,6 +4169,7 @@ mod restart_tests {
         author_dir: &std::path::Path,
         survivor_dir: &std::path::Path,
         bystander: Option<&x0x::identity::AgentKeypair>,
+        bystander_kem: Option<&[u8]>,
     ) -> Result<(
         Arc<AppState>,
         Arc<AppState>,
@@ -4058,12 +4206,12 @@ mod restart_tests {
         );
         let mut advertised = vec![survivor.agent.agent_id()];
         if let Some(bystander) = bystander {
-            let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+            let generated = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+            let kem = bystander_kem.unwrap_or(&generated.public_bytes);
             info.members_v2
                 .get_mut(&hex::encode(bystander.agent_id().as_bytes()))
                 .context("bystander seat")?
-                .kem_public_key_b64 =
-                Some(base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes));
+                .kem_public_key_b64 = Some(base64::engine::general_purpose::STANDARD.encode(kem));
             advertised.push(bystander.agent_id());
         }
         info.recompute_state_hash();
@@ -4157,7 +4305,7 @@ mod restart_tests {
     async fn a_lost_gss_recovery_share_keeps_the_delivery_until_the_key_installs() -> Result<()> {
         let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let (author, survivor, info, committed, frame, _admin) =
-            committed_gss_recovery(author_dir.path(), survivor_dir.path(), None).await?;
+            committed_gss_recovery(author_dir.path(), survivor_dir.path(), None, None).await?;
         let stable = info.stable_group_id().to_string();
         let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
         let new_secret = committed.shared_secret.clone().context("new secret")?;
@@ -4220,7 +4368,7 @@ mod restart_tests {
     async fn a_survivor_restart_before_the_gss_share_installs_the_new_secret() -> Result<()> {
         let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let (author, survivor, info, committed, frame, admin) =
-            committed_gss_recovery(author_dir.path(), survivor_dir.path(), None).await?;
+            committed_gss_recovery(author_dir.path(), survivor_dir.path(), None, None).await?;
         let stable = info.stable_group_id().to_string();
         let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
         let new_secret = committed.shared_secret.clone().context("new secret")?;
@@ -4284,9 +4432,13 @@ mod restart_tests {
         use super::super::super as ng;
         let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let bystander = x0x::identity::AgentKeypair::generate()?;
-        let (author, survivor, parent, committed, frame, _admin) =
-            committed_gss_recovery(author_dir.path(), survivor_dir.path(), Some(&bystander))
-                .await?;
+        let (author, survivor, parent, committed, frame, _admin) = committed_gss_recovery(
+            author_dir.path(),
+            survivor_dir.path(),
+            Some(&bystander),
+            None,
+        )
+        .await?;
         let stable = parent.stable_group_id().to_string();
         let survivor_id = survivor.agent.agent_id();
         let survivor_hex = hex::encode(survivor_id.as_bytes());
@@ -4392,9 +4544,13 @@ mod restart_tests {
         use super::super::super as ng;
         let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let bystander = x0x::identity::AgentKeypair::generate()?;
-        let (author, survivor, parent, committed, frame, _admin) =
-            committed_gss_recovery(author_dir.path(), survivor_dir.path(), Some(&bystander))
-                .await?;
+        let (author, survivor, parent, committed, frame, _admin) = committed_gss_recovery(
+            author_dir.path(),
+            survivor_dir.path(),
+            Some(&bystander),
+            None,
+        )
+        .await?;
         let stable = parent.stable_group_id().to_string();
         let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
         let kem = parent.members_v2[&survivor_hex]
@@ -4422,6 +4578,252 @@ mod restart_tests {
             Some(&parent.state_hash)
         );
         author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Seal `next` (already mutated) as `signer` on an owner-certified group.
+    fn seal_owner_certified(
+        next: &mut GroupInfo,
+        signer: &x0x::identity::AgentKeypair,
+    ) -> Result<x0x::groups::GroupStateCommit> {
+        let now_ms = super::super::super::now_millis_u64();
+        let verdict =
+            next.owner_cert_verdict(&x0x::groups::owner_cert::OwnerCertEvidence::new(now_ms));
+        Ok(next
+            .seal_commit_with_owner_certs(signer, now_ms, &verdict)?
+            .0)
+    }
+
+    /// The #1508 rc12 r3 chain: the recovery promotes P (the author) at
+    /// E+1; Q installs it with its share; P promotes Q (a roster-only
+    /// commit, still E+1). The survivor got P's promotion directly (its
+    /// ordinary apply refuses it: the recovery is not installed there) but
+    /// missed the recovery. Returns (P, Q, survivor, parent, recovery,
+    /// promotion head, frame, promotion event).
+    #[allow(clippy::type_complexity)]
+    async fn recovery_then_promotion(
+        dirs: [&std::path::Path; 3],
+    ) -> Result<(
+        Arc<AppState>,
+        Arc<AppState>,
+        Arc<AppState>,
+        GroupInfo,
+        GroupInfo,
+        GroupInfo,
+        Vec<u8>,
+    )> {
+        use super::super::super as ng;
+        let q = offline_daemon(dirs[2], None).await?;
+        let q_kp = q.agent.identity().agent_keypair();
+        let (p, survivor, parent, recovery, frame, admin) = committed_gss_recovery(
+            dirs[0],
+            dirs[1],
+            Some(q_kp),
+            Some(&q.agent_kem_keypair.public_bytes),
+        )
+        .await?;
+        let stable = parent.stable_group_id().to_string();
+        hold_persisted(&q, &parent).await?;
+        revoke(&q, &admin).await?;
+        let q_hex = hex::encode(q.agent.agent_id().as_bytes());
+        let p_hex = hex::encode(p.agent.agent_id().as_bytes());
+        // Q installs the recovery with its share.
+        let share = next_share(&p, &stable, &q_hex, 0).await?;
+        ng::apply_named_group_metadata_event(&q, share, p.agent.agent_id(), true, None).await;
+        anyhow::ensure!(
+            receive_bytes(&q, &frame).await? == ReceiveOutcome::Applied,
+            "Q installs the recovery"
+        );
+        // P promotes Q.
+        let mut promoted = recovery.clone();
+        promoted.set_member_role(&q_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let revision = promoted.roster_revision;
+        let commit = seal_owner_certified(&mut promoted, p.agent.identity().agent_keypair())?;
+        let promotion = ng::NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: stable.clone(),
+            revision,
+            actor: p_hex,
+            agent_id: q_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit),
+        };
+        hold_persisted(&p, &promoted).await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &q,
+            promotion.clone(),
+            p.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        anyhow::ensure!(applied.accepted, "Q applies its promotion: {applied:?}");
+        let refused = ng::apply_named_group_metadata_event(
+            &survivor,
+            promotion,
+            p.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        anyhow::ensure!(
+            !refused.accepted,
+            "the survivor cannot chain the promotion yet"
+        );
+        Ok((p, q, survivor, parent, recovery, promoted, frame))
+    }
+
+    /// Q serves the survivor's catch-up (the real serving path): the
+    /// recovery frame that Q holds, and Q's current secret. Returns the
+    /// share.
+    async fn catch_up_from(
+        q: &Arc<AppState>,
+        survivor: &AppState,
+        parent: &GroupInfo,
+    ) -> Result<super::super::super::NamedGroupMetadataEvent> {
+        let survivor_id = survivor.agent.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let stable = parent.stable_group_id().to_string();
+        // Q holds the survivor's current verified advert.
+        super::tests::advertise(
+            q,
+            survivor_id,
+            x0x::dm::CapabilityRegistry::current().bits,
+            x0x::dm_capability::now_unix_ms(),
+        );
+        let before = scheduled_shares(q).len();
+        serve_catchup(
+            q,
+            &survivor_id,
+            std::slice::from_ref(&stable),
+            parent.state_revision,
+        )
+        .await;
+        scheduled_shares(q)
+            .into_iter()
+            .skip(before)
+            .filter(|(to, _)| *to == survivor_hex)
+            .map(|(_, share)| share)
+            .next_back()
+            .context("Q seals its current secret to the survivor")
+    }
+
+    /// Codex P1 (#1508 rc12 r3): the recovery promotes P, P promotes Q,
+    /// then P goes offline. A lagging survivor catches up from Q only: Q
+    /// serves the recovery frame and its current secret (still E+1, the
+    /// promotion is roster-only). The survivor must install the recovery,
+    /// chain P's promotion and take Q's share, and end at Q's head with
+    /// the right secret. Before the fix the recovery accepted its epoch's
+    /// share only from P, Q's authority needed the recovery installed
+    /// first, and the frame waited forever.
+    #[tokio::test]
+    async fn a_gss_recovery_catchup_from_a_later_admin_reaches_its_head() -> Result<()> {
+        use super::super::super as ng;
+        let dirs = [
+            tempfile::tempdir()?,
+            tempfile::tempdir()?,
+            tempfile::tempdir()?,
+        ];
+        let (p, q, survivor, parent, recovery, promoted, frame) =
+            recovery_then_promotion([dirs[0].path(), dirs[1].path(), dirs[2].path()]).await?;
+        let stable = parent.stable_group_id().to_string();
+        p.agent.shutdown().await;
+
+        let share = catch_up_from(&q, &survivor, &parent).await?;
+        let early =
+            ng::apply_named_group_metadata_event(&survivor, share, q.agent.agent_id(), true, None)
+                .await;
+        assert!(
+            !early.accepted,
+            "Q is no admin on the survivor's roster yet"
+        );
+        let Ok(orc::OwnerRecoveryFrameV1::Commit(commit)) = orc::decode_frame(&frame) else {
+            anyhow::bail!("a recovery commit frame");
+        };
+        assert_eq!(
+            receive_commit(&survivor, q.agent.agent_id(), *commit, &frame).await,
+            ReceiveOutcome::Applied,
+            "the recovery installs from Q"
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, promoted.state_hash, "Q's head");
+        assert_eq!(held.secret_epoch, recovery.secret_epoch);
+        assert_eq!(
+            held.shared_secret.as_deref(),
+            recovery.shared_secret.as_deref(),
+            "the survivor holds the current secret"
+        );
+        q.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Codex P1 (#1508 rc12 r3), variant: after its promotion Q removes P
+    /// with a GSS rekey to E+2. The survivor catches up from Q only: Q's
+    /// removal, Q's E+2 share, then the recovery frame. It must end at Q's
+    /// removal head with the E+2 secret.
+    #[tokio::test]
+    async fn a_gss_recovery_catchup_after_a_later_admin_rotation_reaches_its_head() -> Result<()> {
+        use super::super::super as ng;
+        let dirs = [
+            tempfile::tempdir()?,
+            tempfile::tempdir()?,
+            tempfile::tempdir()?,
+        ];
+        let (p, q, survivor, parent, _recovery, promoted, frame) =
+            recovery_then_promotion([dirs[0].path(), dirs[1].path(), dirs[2].path()]).await?;
+        let stable = parent.stable_group_id().to_string();
+        let p_hex = hex::encode(p.agent.agent_id().as_bytes());
+        let q_hex = hex::encode(q.agent.agent_id().as_bytes());
+        p.agent.shutdown().await;
+
+        // Q removes P with a GSS rekey, as the admin removal path does.
+        let mut removed = promoted.clone();
+        removed.roster_revision = removed.roster_revision.saturating_add(1);
+        let revision = removed.roster_revision;
+        removed.remove_member(&p_hex, Some(q_hex.clone()));
+        let (new_secret, epoch) = removed.rotate_shared_secret();
+        let commit = seal_owner_certified(&mut removed, q.agent.identity().agent_keypair())?;
+        let removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: stable.clone(),
+            revision,
+            actor: q_hex,
+            agent_id: p_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(epoch),
+            commit: Some(commit),
+        };
+        hold_persisted(&q, &removed).await?;
+
+        // The survivor's catch-up from Q: the removal (a page event), Q's
+        // current (E+2) share, then the recovery frame.
+        let early_removal = ng::apply_named_group_metadata_event(
+            &survivor,
+            removal,
+            q.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!early_removal.accepted, "the removal cannot chain yet");
+        let share = catch_up_from(&q, &survivor, &parent).await?;
+        ng::apply_named_group_metadata_event(&survivor, share, q.agent.agent_id(), true, None)
+            .await;
+        let Ok(orc::OwnerRecoveryFrameV1::Commit(commit)) = orc::decode_frame(&frame) else {
+            anyhow::bail!("a recovery commit frame");
+        };
+        assert_eq!(
+            receive_commit(&survivor, q.agent.agent_id(), *commit, &frame).await,
+            ReceiveOutcome::Applied,
+            "the recovery installs from Q"
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, removed.state_hash, "Q's removal head");
+        assert_eq!(held.secret_epoch, epoch);
+        assert_eq!(held.shared_secret.as_deref(), Some(new_secret.as_slice()));
+        q.agent.shutdown().await;
         survivor.agent.shutdown().await;
         Ok(())
     }

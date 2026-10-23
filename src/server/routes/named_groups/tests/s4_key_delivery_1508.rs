@@ -266,3 +266,58 @@ async fn member_joined_admission_is_withheld_while_every_admin_seat_is_revoked()
     assert!(invite_kept, "the invite is not consumed");
     Ok(())
 }
+
+/// #1508 rc12 Codex P1 (ADR 0110 §5): a class-K share waits for roster
+/// durability, as an S4 frame does. The roster write renames the file and
+/// the directory fsync fails (`ReplacedNotDurable`), then every re-save
+/// fails. The share delivery is withheld (not purged), a fresh admission
+/// pre-phase refuses, and a seam taken before the write refuses. Once a
+/// re-save is durable, the share is delivered. Before the fix the share
+/// left at once, so a crash could lose the sender's new secret after a
+/// survivor installed it.
+#[tokio::test]
+async fn no_share_leaves_before_the_roster_is_durable() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_key = "d5".repeat(16);
+    let admin = state.agent.identity().agent_keypair();
+    let other = AgentId([0x6E; 32]);
+    let other_hex = hex::encode(other.as_bytes());
+    seed_group(&state, &group_key, admin, &other).await;
+    let info = state.named_groups.read().await[&group_key].clone();
+    let epoch = info.secret_epoch;
+    assert!(matches!(
+        secure_share_delivery_verdict(&state, &group_key, &other_hex, epoch).await,
+        SecureShareDeliveryVerdict::Deliver
+    ));
+    let seam = secure_share_admission(&state, &group_key, &other_hex, epoch)()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("admitted while the roster is durable"))?;
+
+    let fault = set_save_fault(&state, SaveFault::ReplacedNotDurableAfterWriteThenError);
+    assert_eq!(
+        persist_named_group_info(&state, &group_key, info).await?,
+        AtomicWriteOutcome::ReplacedNotDurable
+    );
+    assert!(!seam(), "the seam refuses while the roster is not durable");
+    assert!(
+        secure_share_admission(&state, &group_key, &other_hex, epoch)()
+            .await
+            .is_none(),
+        "the pre-phase refuses while every re-save fails"
+    );
+    assert!(matches!(
+        secure_share_delivery_verdict(&state, &group_key, &other_hex, epoch).await,
+        SecureShareDeliveryVerdict::Withhold("roster_not_durable")
+    ));
+
+    drop(fault);
+    assert!(matches!(
+        secure_share_delivery_verdict(&state, &group_key, &other_hex, epoch).await,
+        SecureShareDeliveryVerdict::Deliver
+    ));
+    let seam = secure_share_admission(&state, &group_key, &other_hex, epoch)()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("admitted once the re-save is durable"))?;
+    assert!(seam(), "the share leaves once the roster is durable");
+    Ok(())
+}

@@ -552,9 +552,10 @@ impl KvSecureContext for PublicGroupKvContext {
 pub struct GssKvSecureContext {
     state: Arc<std::sync::RwLock<GssState>>,
     changes: tokio::sync::watch::Sender<u64>,
-    /// The daemon's group ciphertext hold (ADR 0110 §4). While set, every
-    /// seal fails; opens are unchanged. Clones share it.
-    seal_withheld: Arc<std::sync::atomic::AtomicBool>,
+    /// The daemon's group ciphertext hold (ADR 0110 §4, #1573) and its
+    /// refusal text. While set, every seal fails; opens are unchanged.
+    /// Clones share it.
+    seal_withheld: Arc<std::sync::Mutex<Option<&'static str>>>,
 }
 
 /// Synchronous authorization view attached to an encrypted store whose wire
@@ -661,30 +662,31 @@ impl GssKvSecureContext {
         Some(Self {
             state: Arc::new(std::sync::RwLock::new(state)),
             changes,
-            seal_withheld: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            seal_withheld: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
-    /// Set or clear the group ciphertext hold. The daemon's refresh hook
-    /// sets it from its async boundary check (ADR 0110 §4: no eligible
-    /// admin) before every seal, because the seal itself is synchronous.
-    /// Crate-internal: it adds no public API.
-    pub(crate) fn set_seal_withheld(&self, withheld: bool) {
-        self.seal_withheld
-            .store(withheld, std::sync::atomic::Ordering::Release);
+    /// Set (`Some(reason)`) or clear the group ciphertext hold. The
+    /// daemon's refresh hook sets it from its async boundary check (ADR
+    /// 0110 §4: no eligible admin; #1573: a pending GSS removal) before
+    /// every seal, because the seal itself is synchronous. A refused seal
+    /// carries `reason`. Crate-internal: it adds no public API.
+    pub(crate) fn set_seal_withheld(&self, reason: Option<&'static str>) {
+        *self
+            .seal_withheld
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reason;
     }
 
     fn check_seal_allowed(&self) -> Result<()> {
-        if self
+        let withheld = *self
             .seal_withheld
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(KvError::SecureRecord(
-                "no_eligible_admin: verified revocations cover every admin seat; ciphertext is withheld"
-                    .to_string(),
-            ));
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match withheld {
+            Some(reason) => Err(KvError::SecureRecord(reason.to_string())),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// Refresh the snapshot from the authoritative group state.
@@ -1537,7 +1539,7 @@ mod tests {
         let store_id = KvStoreId::new([3; 32]);
         let (epoch, nonce, ciphertext) = ctx.seal(&store_id, b"before").expect("seal");
 
-        ctx.clone().set_seal_withheld(true);
+        ctx.clone().set_seal_withheld(Some("held"));
         assert!(ctx.seal(&store_id, b"held").is_err());
         assert!(ctx
             .seal_authorized(&signing, KvMutationKind::Delta, &store_id, b"held")
@@ -1548,7 +1550,7 @@ mod tests {
             b"before"
         );
 
-        ctx.set_seal_withheld(false);
+        ctx.set_seal_withheld(None);
         ctx.seal_authorized(&signing, KvMutationKind::Delta, &store_id, b"after")
             .expect("the hold clears");
     }

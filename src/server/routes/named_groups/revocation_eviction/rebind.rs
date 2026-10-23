@@ -103,12 +103,21 @@ struct StashedFrame {
 }
 
 /// The seat agent's `waiting_for_admin_rebind` (§4a, D155).
+///
+/// The wait keeps the renewed certificate itself, not only its digest: the
+/// worker hands it to the eligible admins again each round
+/// ([`drive_admin_waits`]) until a rebind or a removal of the seat lands
+/// ([`prune_admin_waits`]). One hand-off write is not delivery: an admin
+/// whose advert was unknown or stale, or a failed send, gets it on a
+/// later round (#1533 Codex P2).
 #[derive(Debug, Clone)]
 struct AdminRebindWait {
     designated: Option<[u8; 32]>,
     old_digest: String,
     renewal_digest: String,
     since_unix_ms: u64,
+    certificate: AgentCertificate,
+    next_at: Instant,
 }
 
 /// A self-rebind the route accepted but did not commit yet: a §4b(2)
@@ -137,6 +146,12 @@ pub(super) struct RebindState {
     admin_waits: HashMap<EvictionKey, AdminRebindWait>,
     /// Self-rebinds held by the §4b(2) D76 rule or for the §2 head sync.
     held: HashMap<EvictionKey, HeldSelfRebind>,
+    /// Test builds only: each hand-off write started, by admin.
+    #[cfg(test)]
+    handoff_sends: Vec<[u8; 32]>,
+    /// Test builds only: each `eviction_handoff_v1` advert refresh asked.
+    #[cfg(test)]
+    handoff_refreshes: Vec<[u8; 32]>,
 }
 
 impl RebindState {
@@ -281,19 +296,24 @@ fn rebind_support(state: &AppState, members: &[[u8; 32]]) -> Vec<([u8; 32], Opti
 fn refresh_unknown(state: &Arc<AppState>, support: &[([u8; 32], Option<bool>)]) {
     for (id, supported) in support {
         if supported.is_none() {
-            let task_state = Arc::clone(state);
-            let agent = AgentId(*id);
-            let _spawned = state.spawn_detached(async move {
-                task_state
-                    .agent
-                    .refresh_application_capability(
-                        agent,
-                        x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
-                    )
-                    .await;
-            });
+            refresh_advert(
+                state,
+                *id,
+                x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+            );
         }
     }
+}
+
+/// Ask `id` for a fresh advert of the application capability `bit`.
+fn refresh_advert(state: &Arc<AppState>, id: [u8; 32], bit: u64) {
+    let task_state = Arc::clone(state);
+    let _spawned = state.spawn_detached(async move {
+        task_state
+            .agent
+            .refresh_application_capability(AgentId(id), bit)
+            .await;
+    });
 }
 
 async fn revoked_ids(state: &AppState, ids: &[[u8; 32]]) -> BTreeSet<[u8; 32]> {
@@ -853,21 +873,7 @@ async fn hand_to_admins(
     let designated = s4::designate(admins.iter().copied(), &local).map(|d| d.designated);
     let old_digest = cr::committed_digest(seat).unwrap_or_default();
     let renewal_digest = x0x::groups::owner_cert::certificate_digest_hex(certificate);
-    let handed_to = match cr::encode_certificate(certificate) {
-        Some(bytes) => {
-            let handoff = s4::EvictionHandoffV1 {
-                stable_group_id: stable.clone(),
-                target: local,
-                observed_parent_head: info.state_hash.clone(),
-                revocation_records: Vec::new(),
-                self_leave_commit: None,
-                expired_certificate: None,
-                renewed_certificate: Some(bytes),
-            };
-            send_handoff(state, &handoff, &admins)
-        }
-        None => Vec::new(),
-    };
+    let handed_to = hand_off_renewal(state, info, &local, certificate, &admins).await;
     state
         .revocation_evictions
         .inner
@@ -882,6 +888,8 @@ async fn hand_to_admins(
                 old_digest,
                 renewal_digest: renewal_digest.clone(),
                 since_unix_ms: now_unix.saturating_mul(1000),
+                certificate: certificate.clone(),
+                next_at: Instant::now() + CRB_RESEND_INTERVAL,
             },
         );
     tracing::info!(
@@ -901,9 +909,36 @@ async fn hand_to_admins(
     )
 }
 
+/// Hand `certificate`, the renewal of `seat`, to `admins` in an
+/// `EvictionHandoffV1` on `info`'s current head. Returns the admins it was
+/// sent to.
+async fn hand_off_renewal(
+    state: &Arc<AppState>,
+    info: &GroupInfo,
+    seat: &[u8; 32],
+    certificate: &AgentCertificate,
+    admins: &[[u8; 32]],
+) -> Vec<[u8; 32]> {
+    let Some(bytes) = cr::encode_certificate(certificate) else {
+        return Vec::new();
+    };
+    let handoff = s4::EvictionHandoffV1 {
+        stable_group_id: info.stable_group_id().to_string(),
+        target: *seat,
+        observed_parent_head: info.state_hash.clone(),
+        revocation_records: Vec::new(),
+        self_leave_commit: None,
+        expired_certificate: None,
+        renewed_certificate: Some(bytes),
+    };
+    send_handoff(state, &handoff, admins).await
+}
+
 /// Send a hand-off to each admin whose current verified advert sets
-/// `eviction_handoff_v1`. Returns the admins it was sent to.
-fn send_handoff(
+/// `eviction_handoff_v1`, and ask each admin whose advert is unknown or
+/// stale for a refresh (ADR 0093), so a later round can send to it.
+/// Returns the admins it was sent to.
+async fn send_handoff(
     state: &Arc<AppState>,
     handoff: &s4::EvictionHandoffV1,
     admins: &[[u8; 32]],
@@ -918,12 +953,38 @@ fn send_handoff(
     let mut sent = Vec::new();
     for admin in admins {
         let agent = AgentId(*admin);
-        if capabilities
+        match capabilities
             .verified_registry_supports(&agent, x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1)
-            != Some(true)
         {
-            continue;
+            Some(true) => {}
+            Some(false) => continue,
+            None => {
+                #[cfg(test)]
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .rebind
+                    .handoff_refreshes
+                    .push(*admin);
+                refresh_advert(
+                    state,
+                    *admin,
+                    x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
+                );
+                continue;
+            }
         }
+        #[cfg(test)]
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .handoff_sends
+            .push(*admin);
         sent.push(*admin);
         let send_state = Arc::clone(state);
         let bytes = payload.clone();
@@ -1105,6 +1166,43 @@ pub(in crate::server) async fn drive(state: &Arc<AppState>) {
     retry_stash(state).await;
     drive_held(state).await;
     prune_admin_waits(state).await;
+    drive_admin_waits(state).await;
+}
+
+/// §4a (D155): hand each kept renewal to the seat's eligible admins again,
+/// once per [`CRB_RESEND_INTERVAL`], on the current roster and head. The
+/// wait ends only in [`prune_admin_waits`], when a rebind or a removal of
+/// the seat lands, so neither an admin with an unknown or stale advert
+/// nor a failed send loses the renewal (#1533 Codex P2).
+async fn drive_admin_waits(state: &Arc<AppState>) {
+    let now = Instant::now();
+    let due: Vec<(EvictionKey, AgentCertificate)> = {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner
+            .rebind
+            .admin_waits
+            .iter_mut()
+            .filter(|(_, wait)| wait.next_at <= now)
+            .map(|(key, wait)| {
+                wait.next_at = now + CRB_RESEND_INTERVAL;
+                (key.clone(), wait.certificate.clone())
+            })
+            .collect()
+    };
+    for (key, certificate) in due {
+        let info = {
+            let groups = state.named_groups.read().await;
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == key.stable_group_id && !info.withdrawn)
+                .cloned()
+        };
+        let Some(info) = info else {
+            continue;
+        };
+        let admins = eligible_admins(state, &info, &key.target).await;
+        let _sent = hand_off_renewal(state, &info, &key.target, &certificate, &admins).await;
+    }
 }
 
 /// Re-evaluate each held self-rebind with the route's rules
@@ -2259,6 +2357,13 @@ mod tests {
                 old_digest: "old".to_string(),
                 renewal_digest: "new".to_string(),
                 since_unix_ms: 5,
+                certificate: AgentCertificate::issue_with_expiry(
+                    &x0x::identity::UserKeypair::generate().expect("owner"),
+                    &x0x::identity::AgentKeypair::generate().expect("agent"),
+                    Some(10),
+                )
+                .expect("certificate"),
+                next_at: Instant::now(),
             },
         );
         let status = status_json(&rebind, &info);
@@ -3367,6 +3472,169 @@ pub(super) mod restart_tests {
                 .await
                 .is_empty(),
             "no rebind frame was planned"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1533 Codex P2: a renewal handed to the admins after the cutoff is
+    /// kept, with the certificate itself, while the seat agent shows
+    /// `waiting_for_admin_rebind`. The admin's advert is unknown at the
+    /// hand-off, so nothing is sent and a refresh is asked. Once the advert
+    /// arrives the next worker round sends the hand-off, and a failed send
+    /// (this daemon is offline) is sent again on the round after. Before
+    /// the fix the hand-off was one write, skipped for that admin with no
+    /// refresh, and only the digest was kept: the renewal was lost.
+    #[tokio::test]
+    async fn a_handed_off_renewal_is_kept_and_sent_again_until_an_admin_takes_it() -> Result<()> {
+        use base64::Engine as _;
+        use x0x::groups::policy::GroupAdmission;
+        let dir = tempfile::tempdir()?;
+        let state = offline_daemon(dir.path(), None).await?;
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let now = now_unix_ms() / 1000;
+        let local_kp = state.agent.identity().agent_keypair();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut info = GroupInfo::new(
+            "rebind".to_string(),
+            "hand-off retry".to_string(),
+            state.agent.agent_id(),
+            "c7".repeat(16),
+        );
+        info.policy.admission = GroupAdmission::OwnerCertified(owner.user_id());
+        // `not_after − τ` is past: the self-rebind window is closed.
+        cr::install_certificate(
+            &mut info,
+            &local_hex,
+            AgentCertificate::issue_with_expiry(&owner, local_kp, Some(now + 60))?,
+        );
+        let mut member = x0x::groups::GroupMember::new_member(
+            admin_hex.clone(),
+            None,
+            Some(local_hex.clone()),
+            1,
+        );
+        member.role = GroupRole::Admin;
+        info.members_v2.insert(admin_hex.clone(), member);
+        cr::install_certificate(
+            &mut info,
+            &admin_hex,
+            AgentCertificate::issue_with_expiry(&owner, &admin, Some(now + 86_400))?,
+        );
+        info.recompute_state_hash();
+        let group_key = info.mls_group_id.clone();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+
+        let renewal = AgentCertificate::issue_with_expiry(&owner, local_kp, Some(now + 86_400))?;
+        let request: RebindCertificateRequest = serde_json::from_value(serde_json::json!({
+            "certificate": base64::engine::general_purpose::STANDARD
+                .encode(renewal.to_storage_bytes()?),
+        }))?;
+        let (status, Json(body)) = rebind_member_certificate(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((group_key.clone(), local_hex.clone())),
+            Some(Json(request)),
+        )
+        .await;
+        anyhow::ensure!(status == StatusCode::CONFLICT, "route: {body}");
+        assert_eq!(body["error"], REBIND_WINDOW_CLOSED);
+
+        let admin_id = *admin.agent_id().as_bytes();
+        let key = EvictionKey::new(stable.clone(), *state.agent.agent_id().as_bytes());
+        let renewal_digest = x0x::groups::owner_cert::certificate_digest_hex(&renewal);
+        // Make the kept wait due now and run one worker round.
+        let round = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            let key = key.clone();
+            async move {
+                if let Some(wait) = state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .rebind
+                    .admin_waits
+                    .get_mut(&key)
+                {
+                    wait.next_at = Instant::now();
+                }
+                drive(&state).await;
+            }
+        };
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.rebind.handoff_sends.is_empty(),
+                "no hand-off to an admin whose advert is unknown"
+            );
+            assert_eq!(
+                inner.rebind.handoff_refreshes,
+                vec![admin_id],
+                "the unknown advert is refreshed"
+            );
+            let wait = inner
+                .rebind
+                .admin_waits
+                .get(&key)
+                .context("the seat agent waits for the admin")?;
+            assert_eq!(
+                x0x::groups::owner_cert::certificate_digest_hex(&wait.certificate),
+                renewal_digest,
+                "the wait keeps the renewal itself"
+            );
+        }
+
+        // The advert arrives: the next round sends the hand-off.
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::current().bits,
+        };
+        assert!(state.agent.capability_store().insert(
+            admin.agent_id(),
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            x0x::dm_capability::now_unix_ms(),
+        ));
+        round(&state).await;
+        assert_eq!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .handoff_sends,
+            vec![admin_id],
+            "the refreshed admin gets the hand-off"
+        );
+        // That write failed (no network); the round after sends it again.
+        round(&state).await;
+        assert_eq!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .handoff_sends,
+            vec![admin_id, admin_id],
+            "a failed hand-off is sent again"
+        );
+        let status = status_json(&state.revocation_evictions.inner.lock().await.rebind, &info);
+        assert_eq!(
+            status["waiting_for_admin_rebind"][0]["renewal_digest"],
+            renewal_digest
         );
         state.agent.shutdown().await;
         Ok(())

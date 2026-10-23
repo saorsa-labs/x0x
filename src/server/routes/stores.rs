@@ -1805,7 +1805,7 @@ pub(in crate::server) fn gss_kv_refresh(
                 let withheld =
                     super::named_groups::group_ciphertext_withheld(&state, &group_key, None)
                         .await
-                        .is_some();
+                        .map(super::named_groups::GroupCiphertextHold::reason);
                 ctx.set_seal_withheld(withheld);
             }
             if start_repair {
@@ -8176,5 +8176,70 @@ mod tests {
             ctx.is_active_member(&state.agent.agent_id()),
             "the hold does not invalidate the context: opens keep working"
         );
+    }
+
+    /// #1573 (#1508 rc12): a verified GSS removal waits for this
+    /// survivor's share, so the removed member still holds the secret. The
+    /// refresh hook holds every KV seal with the pending-removal reason;
+    /// once the share installs (the epoch moves up) the seal works again.
+    /// Before the fix the seal succeeded under the old secret.
+    #[tokio::test]
+    async fn gss_kv_seal_is_withheld_while_a_removal_waits_for_its_share() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin key");
+        let group_key = "eb".repeat(16);
+        let mut info = GroupInfo::new(
+            "gss".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        let ctx = Arc::new(x0x::groups::GssKvSecureContext::from_group(&info).expect("ctx"));
+        let hook = gss_kv_refresh(
+            &state,
+            Arc::clone(&ctx),
+            group_key.clone(),
+            format!("group/{group_key}/gss"),
+            admin.agent_id(),
+        );
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let store_id = x0x::kv::KvStoreId::new([9; 32]);
+
+        super::super::named_groups::park_pending_gss_removal_for_test(&state, &group_key, &info);
+        hook().await;
+        let error = ctx
+            .seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect_err("no GSS ciphertext while a removal waits for its share");
+        assert!(
+            matches!(&error, x0x::kv::KvError::SecureRecord(reason)
+                if reason == super::super::named_groups::GroupCiphertextHold::PendingGssRemoval.reason()),
+            "typed refusal, got {error}"
+        );
+
+        // The share installs: the local epoch reaches the removal's.
+        let mut keyed = info.clone();
+        let _ = keyed.rotate_shared_secret();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), keyed);
+        hook().await;
+        ctx.seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect("the installed share ends the hold");
     }
 }

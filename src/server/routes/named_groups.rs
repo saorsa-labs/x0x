@@ -2206,6 +2206,11 @@ async fn secure_share_delivery_verdict(
     let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
         return SecureShareDeliveryVerdict::Purge("group_unknown");
     };
+    // ADR 0110 §5: a share for a roster that is not yet durable waits
+    // (#1508 rc12). The barrier runs before the membership lock.
+    if !roster_durable_for_publication(state).await {
+        return SecureShareDeliveryVerdict::Withhold("roster_not_durable");
+    }
     let _membership_guard = lock.lock().await;
     // r6 (P4): terminal facts first. An obsolete share (the epoch moved on,
     // or its secret is gone) is purged before any eligibility question;
@@ -2248,6 +2253,9 @@ fn secure_share_admission(
         let group_id = group_id.clone();
         let recipient_hex = recipient_hex.clone();
         async move {
+            if !roster_durable_for_publication(&state).await {
+                return None;
+            }
             let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
             let evidence = {
                 let _membership_guard = lock.lock().await;
@@ -2265,7 +2273,9 @@ fn secure_share_admission(
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence).is_none()
+                roster_durable_at_seam(&state)
+                    && join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence)
+                        .is_none()
                     && state.named_groups.try_read().is_ok_and(|roster| {
                         crate::server::resolve_group_entry_locked(&roster, &group_id)
                             .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
@@ -7091,6 +7101,26 @@ async fn confirm_named_groups_durability_unlocked(state: &AppState) -> bool {
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => false,
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => false,
     }
+}
+
+/// ADR 0110 §5 "only then publish", the one durability barrier for every
+/// outgoing roster-bound write: an S4 frame (rebind, owner recovery,
+/// crypto exclusion, saved removal) and a class-K share. While a roster
+/// replacement waits for its directory fsync (`ReplacedNotDurable`), a
+/// crash can restore the old roster, so nothing that depends on the new one
+/// may leave. The pre-phase re-saves until `Durable`
+/// ([`confirm_named_groups_durability`]); the synchronous seam only reads
+/// the flag ([`roster_durable_at_seam`]).
+pub(in crate::server) async fn roster_durable_for_publication(state: &AppState) -> bool {
+    confirm_named_groups_durability(state).await
+}
+
+/// The seam half of [`roster_durable_for_publication`]: no roster
+/// replacement waits for its directory fsync.
+pub(in crate::server) fn roster_durable_at_seam(state: &AppState) -> bool {
+    !state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
 }
 
 pub(in crate::server) async fn persist_named_group_info(
@@ -12494,6 +12524,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     verified: bool,
     envelope_bytes: Option<&[u8]>,
 ) -> ApplyMetadataResult {
+    // ADR 0110 S4 (#1508 rc12): a commit that chains on a GSS owner
+    // recovery not yet installed here waits for it.
+    if verified {
+        revocation_eviction::owner_recovery::hold_unchained_event(state, &event).await;
+    }
     apply_named_group_metadata_event_with_binding(
         state,
         event,
@@ -12747,6 +12782,83 @@ fn legacy_gss_removal_receiver(state: &AppState) -> bool {
 #[cfg(not(test))]
 fn legacy_gss_removal_receiver(_state: &AppState) -> bool {
     false
+}
+
+/// #1573: whether a GSS removal or ban parked for `group_key` still waits:
+/// it is not expired, it chains from the current head (the head did not
+/// move) and it rotates above this node's secret epoch. Only a removal
+/// whose signed commit the apply verified is parked, so a forged one
+/// withholds nothing. An installed share or an applied removal ends it.
+fn pending_gss_removal_withholds(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
+    let lot = state
+        .parked_gss_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    lot.get(group_key).is_some_and(|list| {
+        list.iter().any(|entry| {
+            let epoch = match &entry.event {
+                NamedGroupMetadataEvent::MemberRemoved { secret_epoch, .. }
+                | NamedGroupMetadataEvent::MemberBanned { secret_epoch, .. } => *secret_epoch,
+                _ => None,
+            };
+            entry.parked_at.elapsed() < PENDING_JOIN_RESULT_TTL
+                && epoch.is_some_and(|epoch| epoch > info.secret_epoch)
+                && named_group_metadata_event_commit(&entry.event).is_some_and(|commit| {
+                    commit.prev_state_hash.as_deref() == Some(info.state_hash.as_str())
+                })
+        })
+    })
+}
+
+/// A parked GSS removal of a placeholder member that chains from `info`'s
+/// head and rotates one epoch above it (test builds only): the state
+/// [`park_gss_removal_for_share`] leaves after a verified removal.
+#[cfg(test)]
+pub(in crate::server) fn park_pending_gss_removal_for_test(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) {
+    let commit = x0x::groups::state_commit::GroupStateCommit {
+        group_id: info.stable_group_id().to_string(),
+        revision: info.state_revision.saturating_add(1),
+        prev_state_hash: Some(info.state_hash.clone()),
+        roster_root: String::new(),
+        policy_hash: String::new(),
+        public_meta_hash: String::new(),
+        security_binding: None,
+        state_hash: "pending".to_string(),
+        withdrawn: false,
+        committed_by: String::new(),
+        committed_at: 0,
+        signer_public_key: String::new(),
+        signature: String::new(),
+    };
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: info.stable_group_id().to_string(),
+        revision: info.roster_revision.saturating_add(1),
+        actor: String::new(),
+        agent_id: "ee".repeat(32),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: Some(info.secret_epoch.saturating_add(1)),
+        commit: Some(commit),
+    };
+    state
+        .parked_gss_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(group_key.to_string())
+        .or_default()
+        .push(ParkedRoleUpdate {
+            event,
+            sender: AgentId([0xee; 32]),
+            parked_at: Instant::now(),
+        });
 }
 
 /// #1573: park a verified GSS removal or ban until its share installs
@@ -14280,24 +14392,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
-            if gss_removal_waits_for_share(
-                state,
-                &info,
-                secret_epoch,
-                !roster_only_removal,
-                (&actor, &agent_id),
-                &local_agent_hex,
-            ) {
-                park_gss_removal_for_share(
-                    state,
-                    &resolved_group_key,
-                    &event_for_log,
-                    sender,
-                    verified,
-                    allow_queue,
-                );
-                return ApplyMetadataResult::REJECTED;
-            }
             let signed_binding = commit.security_binding.clone();
             let current = info.clone();
             let Ok(mut next) = apply_stateful_event_with_evidence(
@@ -14329,6 +14423,27 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             else {
                 return ApplyMetadataResult::REJECTED;
             };
+            // #1573: the commit is verified (signature, parent head,
+            // authority) above, before anything is parked, so a forged
+            // removal never holds this node's sends.
+            if gss_removal_waits_for_share(
+                state,
+                &info,
+                secret_epoch,
+                !roster_only_removal,
+                (&actor, &agent_id),
+                &local_agent_hex,
+            ) {
+                park_gss_removal_for_share(
+                    state,
+                    &resolved_group_key,
+                    &event_for_log,
+                    sender,
+                    verified,
+                    allow_queue,
+                );
+                return ApplyMetadataResult::REJECTED;
+            }
             // Save the roster-only leave before any epoch commit. A failed
             // save is a failure before that commit: the leave is not stored
             // and the rekey does not run.
@@ -14786,24 +14901,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
-            if gss_removal_waits_for_share(
-                state,
-                &info,
-                secret_epoch,
-                treekem_payload.is_some(),
-                (&actor, &agent_id),
-                &local_agent_hex,
-            ) {
-                park_gss_removal_for_share(
-                    state,
-                    &resolved_group_key,
-                    &event_for_log,
-                    sender,
-                    verified,
-                    allow_queue,
-                );
-                return banned_reject("waiting_for_gss_share", &resolved_group_key);
-            }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -14834,6 +14931,27 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             else {
                 return banned_reject("apply_stateful_event_with_evidence", &resolved_group_key);
             };
+            // #1573: the commit is verified (signature, parent head,
+            // authority) above, before anything is parked, so a forged
+            // removal never holds this node's sends.
+            if gss_removal_waits_for_share(
+                state,
+                &info,
+                secret_epoch,
+                treekem_payload.is_some(),
+                (&actor, &agent_id),
+                &local_agent_hex,
+            ) {
+                park_gss_removal_for_share(
+                    state,
+                    &resolved_group_key,
+                    &event_for_log,
+                    sender,
+                    verified,
+                    allow_queue,
+                );
+                return banned_reject("waiting_for_gss_share", &resolved_group_key);
+            }
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
             if banned_self {
@@ -24540,6 +24658,10 @@ pub(in crate::server) enum GroupCiphertextHold {
     /// revocations cover every Admin-or-higher Active seat. The revoked
     /// admins still hold the current epoch keys.
     NoEligibleAdmin,
+    /// #1573 (ADR 0110 §3): a verified GSS removal or ban that rotates the
+    /// secret waits for this node's share. The removed member still holds
+    /// the current secret, so nothing is sealed under it.
+    PendingGssRemoval,
 }
 
 impl GroupCiphertextHold {
@@ -24555,14 +24677,18 @@ impl GroupCiphertextHold {
             Self::NoEligibleAdmin => {
                 "no_eligible_admin: verified revocations cover every admin seat; ciphertext is withheld"
             }
+            Self::PendingGssRemoval => {
+                "a verified removal waits for its new group secret; ciphertext is withheld"
+            }
         }
     }
 }
 
 /// THE group ciphertext boundary. Every path that makes new group
 /// ciphertext calls this just before the AEAD or ratchet step: REST
-/// encrypt, the TreeKEM KV seal (and so TreeKEM task-list seals), and the
-/// GSS task-list seal. A `Some` result means: make no ciphertext.
+/// encrypt on both planes, the TreeKEM KV seal (and so TreeKEM task-list
+/// seals), the GSS KV seal (through its refresh hook) and the GSS
+/// task-list seal. A `Some` result means: make no ciphertext.
 ///
 /// `guard` is the held TreeKEM ratchet, or `None` on the GSS plane (the
 /// self-leave hold is a TreeKEM leaf check).
@@ -24584,6 +24710,9 @@ pub(in crate::server) async fn group_ciphertext_withheld(
             || self_leave_startup_open(state, info.stable_group_id());
         if self_leave_open && guard.is_some_and(|guard| removed_member_has_live_leaf(info, guard)) {
             return Some(GroupCiphertextHold::SelfLeaveExclusion);
+        }
+        if pending_gss_removal_withholds(state, key, info) {
+            return Some(GroupCiphertextHold::PendingGssRemoval);
         }
         info.clone()
     };
@@ -32892,7 +33021,10 @@ async fn treekem_group_encrypt_for_actor(
     }
     match group_ciphertext_withheld(state, group_id_hex, Some(&*guard)).await {
         None => {}
-        Some(hold @ GroupCiphertextHold::SelfLeaveExclusion) => {
+        Some(
+            hold @ (GroupCiphertextHold::SelfLeaveExclusion
+            | GroupCiphertextHold::PendingGssRemoval),
+        ) => {
             return api_error(StatusCode::CONFLICT, hold.reason());
         }
         Some(hold @ GroupCiphertextHold::NoEligibleAdmin) => {
@@ -33249,6 +33381,12 @@ pub(in crate::server) async fn secure_group_encrypt(
     let epoch = info.secret_epoch;
     let group_id_clone = info.stable_group_id().to_string();
     drop(groups);
+    // The group ciphertext boundary, as on the TreeKEM plane (#1573).
+    if let Some(hold) = group_ciphertext_withheld(&state, &id, None).await {
+        return revocation_eviction::s4_no_eligible_admin_refusal(&state, &id)
+            .await
+            .unwrap_or_else(|| api_error(StatusCode::CONFLICT, hold.reason()));
+    }
 
     use base64::Engine as _;
     let plaintext = match BASE64.decode(&req.payload_b64) {
@@ -42299,9 +42437,11 @@ async fn join_artifact_no_eligible_admin(
     group_id: &str,
 ) -> std::result::Result<(), JoinArtifactRefusal> {
     // With no ratchet guard, the only hold is `NoEligibleAdmin`.
+    // A pending GSS removal (#1573) does not hold join artifacts: they
+    // carry key material to a member, not group ciphertext.
     match group_ciphertext_withheld(state, group_id, None).await {
-        Some(_) => Err(JoinArtifactRefusal::NoEligibleAdmin),
-        None => Ok(()),
+        Some(GroupCiphertextHold::NoEligibleAdmin) => Err(JoinArtifactRefusal::NoEligibleAdmin),
+        Some(_) | None => Ok(()),
     }
 }
 
@@ -54312,6 +54452,111 @@ pub(in crate::server) mod tests {
             &f.committed_state_hash,
         )
         .await?;
+        Ok(())
+    }
+
+    async fn f1_encrypt(f: &F1GssRotationFixture) -> (StatusCode, serde_json::Value) {
+        let (status, Json(body)) = secure_group_encrypt(
+            State(Arc::clone(&f.state)),
+            Path(f.group_id.clone()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"after removal"),
+            }),
+        )
+        .await;
+        (status, body)
+    }
+
+    /// #1573 (Codex P1, #1508 rc12): while a verified GSS removal waits
+    /// for this survivor's share, the removed member still holds the
+    /// current secret, so the survivor makes no group ciphertext: REST
+    /// encrypt is `409` and the shared boundary reports the hold. The head
+    /// stays at the parent. Once the share installs (and the removal
+    /// applies) sending works again. Before the fix the survivor kept
+    /// encrypting under the old secret.
+    #[tokio::test]
+    async fn f1_gss_pending_removal_withholds_sends_until_the_share() -> Result<()> {
+        let f = f1_gss_rotation_fixture("pending-send").await?;
+        let sender = f.admin_kp.agent_id();
+        assert_eq!(f1_encrypt(&f).await.0, StatusCode::OK, "no false refusal");
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
+        assert!(!held.accepted);
+        assert_gss_removal_held(&f).await?;
+        let (status, body) = f1_encrypt(&f).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"],
+            GroupCiphertextHold::PendingGssRemoval.reason(),
+            "{body}"
+        );
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            Some(GroupCiphertextHold::PendingGssRemoval)
+        );
+        assert_gss_removal_held(&f).await?;
+
+        let _ = apply_named_group_metadata_event(
+            &f.state,
+            f.envelope_event.clone(),
+            sender,
+            true,
+            None,
+        )
+        .await;
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        assert_eq!(
+            f1_encrypt(&f).await.0,
+            StatusCode::OK,
+            "the share ends the hold"
+        );
+        Ok(())
+    }
+
+    /// #1573: a removal whose signed commit does not verify is refused
+    /// before anything is parked, so it cannot hold the survivor's sends
+    /// (no denial of service by a forged removal).
+    #[tokio::test]
+    async fn f1_gss_forged_removal_withholds_nothing() -> Result<()> {
+        let f = f1_gss_rotation_fixture("forged-send").await?;
+        let sender = f.admin_kp.agent_id();
+        let mut forged = f.remove_event.clone();
+        if let NamedGroupMetadataEvent::MemberRemoved {
+            commit: Some(commit),
+            ..
+        } = &mut forged
+        {
+            commit.signature = BASE64.encode([7_u8; 64]);
+        }
+        let refused = apply_named_group_metadata_event(&f.state, forged, sender, true, None).await;
+        assert!(!refused.accepted);
+        assert!(f
+            .state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .all(Vec::is_empty));
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        assert_eq!(f1_encrypt(&f).await.0, StatusCode::OK);
         Ok(())
     }
 
