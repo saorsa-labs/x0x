@@ -1083,6 +1083,13 @@ pub async fn evaluate_grant_access(
     .access
 }
 
+/// #1239: one budget for this evaluation's EvidenceRuntime reads — the
+/// Lookup and the local usable views. Five seconds matches the load barrier
+/// and the ADR-0074 reauth bound; it is an internal budget, not a wire,
+/// storage or API constant. A read still waiting at the deadline fails
+/// closed (`Err(())`, so gates report Busy) and the next evaluation retries.
+const EVIDENCE_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// With `allow_network_lookup = false`, skip EvidenceV1 wait/lookup but still
 /// read local usable evidence (`try_usable`) so a reauth pass keeps
 /// authenticated bindings without network I/O.
@@ -1099,7 +1106,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     requester_agent: &AgentId,
     requester_machine: &MachineId,
     now_unix: u64,
-    evidence: Option<&crate::peer_evidence::EvidenceRuntime>,
+    evidence: Option<&std::sync::Arc<crate::peer_evidence::EvidenceRuntime>>,
     allow_network_lookup: bool,
 ) -> Result<GrantAccessEval, ()> {
     let evaluated_at = std::time::Instant::now();
@@ -1113,6 +1120,11 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     if candidates.is_empty() {
         return Ok(access);
     }
+    // #1239: the Lookup and the usable views below run their synchronous
+    // evidence reads on the runtime's bounded blocking workers, so a held
+    // store can no longer stall this evaluation's Tokio worker. Sources are
+    // re-read after the Lookup exactly as before.
+    let deadline = tokio::time::Instant::now() + EVIDENCE_READ_BUDGET;
     if allow_network_lookup
         && crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
             .await
@@ -1120,28 +1132,53 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     {
         if let Some(evidence) = evidence {
             if evidence.wait(0).await {
-                evidence
-                    .lookup(*requester_agent, Some(*requester_machine))
+                let _ = evidence
+                    .lookup_before(*requester_agent, Some(*requester_machine), deadline)
                     .await;
             }
         }
     }
     let now_unix = now_unix.saturating_add(evaluated_at.elapsed().as_secs());
     let now_ms = now_unix.saturating_mul(1000);
-    // Local usable view: `Err(())` is lock contention on the nonblocking path.
-    let usable_view = |runtime: &crate::peer_evidence::EvidenceRuntime| -> Result<Option<_>, ()> {
+    // Local usable view: `Err(())` is lock contention on the nonblocking
+    // path, or contention past the budget on the bounded path.
+    async fn usable_view(
+        runtime: &std::sync::Arc<crate::peer_evidence::EvidenceRuntime>,
+        requester_agent: &AgentId,
+        requester_machine: &MachineId,
+        now_ms: u64,
+        allow_network_lookup: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<std::sync::Arc<crate::peer_evidence::EvidenceView>>, ()> {
         if allow_network_lookup {
-            Ok(runtime.usable(*requester_agent, *requester_machine, now_ms))
+            runtime
+                .usable_before(*requester_agent, Some(*requester_machine), deadline)
+                .await
         } else {
             runtime.try_usable(*requester_agent, *requester_machine, now_ms)
         }
-    };
+    }
     match crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent).await {
         Some(bound) if bound == *requester_machine => {}
-        None => match evidence.map(usable_view).transpose()?.flatten() {
-            Some(_) => {}
-            None => return Ok(access),
-        },
+        None => {
+            let view = match evidence {
+                Some(runtime) => {
+                    usable_view(
+                        runtime,
+                        requester_agent,
+                        requester_machine,
+                        now_ms,
+                        allow_network_lookup,
+                        deadline,
+                    )
+                    .await?
+                }
+                None => None,
+            };
+            if view.is_none() {
+                return Ok(access);
+            }
+        }
         _ => return Ok(access),
     }
     let live: Vec<ShareGrant> = {
@@ -1168,11 +1205,19 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
             .and_then(|entry| entry.agent_certificate.clone());
         match from_discovery {
             Some(cert) => Some(cert),
-            None => evidence
-                .map(usable_view)
-                .transpose()?
-                .flatten()
+            None => match evidence {
+                Some(runtime) => usable_view(
+                    runtime,
+                    requester_agent,
+                    requester_machine,
+                    now_ms,
+                    allow_network_lookup,
+                    deadline,
+                )
+                .await?
                 .and_then(|v| v.certificate.clone()),
+                None => None,
+            },
         }
     } else {
         None

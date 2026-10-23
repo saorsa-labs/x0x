@@ -556,7 +556,7 @@ impl OwnerTrust {
             agent_id,
             machine_id,
             now_unix,
-            evidence.as_deref(),
+            evidence.as_ref(),
             allow_evidence_lookup,
         )
         .await

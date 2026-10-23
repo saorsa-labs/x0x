@@ -121,7 +121,7 @@ impl<'a> SendEvidence<'a> {
             .before(
                 self.agent
                     .peer_evidence()
-                    .lookup_before(self.recipient, self.deadline),
+                    .lookup_before(self.recipient, None, self.deadline),
             )
             .await;
         self.optional("evidence Lookup", result.and_then(|result| result))
