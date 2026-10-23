@@ -11,6 +11,7 @@ pub(crate) mod fleet_policy;
 #[cfg(unix)]
 mod inventory_accounts;
 pub(crate) mod journal;
+pub(crate) mod log_flush;
 pub mod manifest;
 pub mod monitor;
 pub(crate) mod pair;
