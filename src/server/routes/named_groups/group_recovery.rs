@@ -1461,6 +1461,19 @@ async fn arm_in_place(
         tracing::info!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the group's epoch moved before arming; re-evaluated on the next answer");
         return false;
     }
+    // §4 (D81): every arming path ends here, so the Home gate is checked
+    // here too, on the record as it is under the lock. Nothing is written
+    // for a Home-policy group: no sidecar and no placeholder.
+    let home = is_home_policy_group(captured)
+        || state
+            .named_groups
+            .read()
+            .await
+            .get(group_key)
+            .is_none_or(is_home_policy_group);
+    if home {
+        return false;
+    }
     let mut slot = ArmSlot::Installed;
     let candidate = ata.clone();
     let written = update_sidecar(state, &stable, |body| {
@@ -3525,6 +3538,13 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
     let Some(info) = state.named_groups.read().await.get(&group_key).cloned() else {
         return;
     };
+    // §4 (D81): Home activation ships off. A Home-policy group takes no
+    // answer, asked for or not: no ATA arms it and no re-seat starts, as
+    // on the issuing and requesting paths (`answer_request`, `subject_tick`).
+    if is_home_policy_group(&info) {
+        tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: answer for a Home-policy group ignored (Home activation is off)");
+        return;
+    }
     let stable = info.stable_group_id().to_string();
     let sender_hex = hex::encode(sender.as_bytes());
     let answer_name = response.answer.name().to_string();
@@ -4989,6 +5009,11 @@ async fn consume_reseat(
     let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
         return;
     };
+    // §4 (D81): no re-seat for a Home-policy group while Home activation
+    // is off; its live record and legacy views stay as they are.
+    if is_home_policy_group(&info) {
+        return;
+    }
     let stable = info.stable_group_id().to_string();
     if sidecar_snapshot(state, &stable)
         .await
@@ -9159,5 +9184,111 @@ mod tests {
             Some("authorisation_refused:basis_unknown")
         );
         original_kept(&state, &key, &info).await
+    }
+
+    /// #1533 rc13 (Codex P1 @c226d28e, ZCode MAJOR 1), ADR 0109 §4 (D81):
+    /// Home activation ships off, so an answer for a Home-policy group
+    /// changes nothing on disk or in memory, even when it carries a valid
+    /// ATA from an active admin, asked for or not. Before the fix the
+    /// unsolicited ATA reached `arm_in_place`: it wrote the sidecar and
+    /// placeheld the group (the §4 legacy placeholder).
+    #[tokio::test]
+    async fn a_home_policy_group_takes_no_answer() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut info = GroupInfo::new(
+            "adr0109-home".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "4110".repeat(16),
+        );
+        info.home = Some(x0x::groups::HomeMetadata {
+            primary_agent: admin_hex.clone(),
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 1,
+        });
+        info.add_member(
+            local.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.seal_commit(&admin, 1_000)?;
+        anyhow::ensure!(is_home_policy_group(&info));
+        let key = info.mls_group_id.clone();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let files = || async {
+            (
+                tokio::fs::read(&state.named_groups_path).await.ok(),
+                tokio::fs::read(&state.home_suite_groups_path).await.ok(),
+            )
+        };
+        let before = files().await;
+        let ata = AdminTerminalAttestation::sign(
+            AtaFields {
+                group: stable.clone(),
+                subject: local.clone(),
+                attested_by: admin_hex,
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                from_revision: info.state_revision,
+                from_state_hash: info.state_hash.clone(),
+                sequence: vec!["a1".to_string(), "a2".to_string()],
+                segment_terminal_revision: info.state_revision + 2,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &admin,
+        )?;
+        // Unsolicited: this node asked nobody.
+        let response = GroupAttestResponseV1 {
+            group: stable.clone(),
+            subject: *state.agent.agent_id().as_bytes(),
+            for_head_state_hash: info.state_hash.clone(),
+            answer: AttestAnswer::Attested(Box::new(ata.clone())),
+        };
+        handle_response(&state, admin.agent_id(), response).await;
+        // The arming choke point refuses on its own as well.
+        arm_from_response(&state, &key, &info, ata.clone()).await;
+        assert!(!arm_in_place(&state, &key, &info, ata).await);
+        ensure_placeholders(&state).await;
+        // A re-seat offer for the Home group starts nothing either: it is
+        // not even checked, so no refusal is recorded.
+        let (basis, revision, hash) = unseen_removal(&info);
+        let offer = reseat_offer(
+            &info,
+            &admin,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        assert_eq!(deliver_offer(&state, &info, &admin, offer).await, None);
+
+        assert!(sidecar_snapshot(&state, &stable).await.is_none());
+        assert!(!is_placeheld(&state, &stable));
+        assert!(open_journal(&state, &stable).await.is_none());
+        assert_eq!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .map(serde_json::to_value)
+                .transpose()?,
+            Some(serde_json::to_value(&info)?),
+            "the live record is unchanged"
+        );
+        assert_eq!(files().await, before, "the Home files are unchanged");
+        Ok(())
     }
 }
