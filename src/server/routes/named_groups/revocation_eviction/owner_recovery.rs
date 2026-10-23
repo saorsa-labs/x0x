@@ -1222,7 +1222,8 @@ async fn finish_commit(
         }
         // #1508 r6: `ReplacedNotDurable` installed the new roster (only
         // the directory fsync failed), so the commit stands and the frame
-        // and its delivery must stay.
+        // and its delivery must stay. The guarded egress publishes nothing
+        // until the re-save is durable (§5, #1508 rc12).
         None => matches!(
             ng::persist_named_group_info(state, group_key, next.clone()).await,
             Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
@@ -1665,6 +1666,61 @@ pub(in crate::server) async fn park_early_share(
         sender,
         at: now,
     });
+    drop(inner);
+    // A stashed GSS recovery waits for this share (#1508 rc12).
+    state.agent.s4_revocation_intake().request_reconcile();
+}
+
+/// The secret of epoch `epoch` that `body`'s actor sealed to this node in
+/// a parked early share, opened with this node's KEM key. The share stays
+/// parked: [`replay_early_shares`] runs its full apply after the install.
+async fn parked_secret(
+    state: &AppState,
+    body: &orc::OwnerRecoveryBodyV1,
+    epoch: u64,
+) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let parked = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .early_shares
+        .clone();
+    let b64 = base64::engine::general_purpose::STANDARD;
+    parked
+        .iter()
+        .filter(|share| {
+            share.stable_group_id == body.stable_group_id && share.sender.as_bytes() == &body.actor
+        })
+        .find_map(|share| {
+            let super::super::NamedGroupMetadataEvent::SecureShareDelivered {
+                group_id,
+                recipient,
+                secret_epoch,
+                kem_ciphertext_b64,
+                aead_nonce_b64,
+                aead_ciphertext_b64,
+                ..
+            } = &share.event
+            else {
+                return None;
+            };
+            if *secret_epoch != epoch || *recipient != local_hex {
+                return None;
+            }
+            let nonce: [u8; 12] = b64.decode(aead_nonce_b64).ok()?.try_into().ok()?;
+            x0x::groups::kem_envelope::open_group_secret(
+                &state.agent_kem_keypair,
+                &x0x::groups::aad::secure_share_aad(group_id, recipient, epoch),
+                &b64.decode(kem_ciphertext_b64).ok()?,
+                &nonce,
+                &b64.decode(aead_ciphertext_b64).ok()?,
+            )
+            .ok()
+        })
 }
 
 /// Apply again, through the ordinary share apply, every early share of
@@ -1829,6 +1885,40 @@ async fn receive_commit(
     if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
         return ReceiveOutcome::Retained;
     }
+    // #1508 rc12 (Codex P1): a GSS recovery installs only with its new
+    // secret, as a GSS crypto-only exclusion does. The installed head is
+    // the author's convergence evidence, so a head without its key would
+    // end the delivery while this survivor cannot decrypt. Until the
+    // share arrives the frame waits, durable and in the stash; the share
+    // wakes the worker ([`park_early_share`]), and the author seals it
+    // again after each frame write.
+    let gss_secret = match &body.crypto {
+        orc::OwnerRecoveryCryptoV1::Gss { next_secret_epoch }
+            if info.secret_epoch < *next_secret_epoch || info.shared_secret.is_none() =>
+        {
+            let Some(secret) = parked_secret(state, &body, *next_secret_epoch).await else {
+                tracing::info!(
+                    group_id = %ng::LogHexId::group(&group_key),
+                    secret_epoch = next_secret_epoch,
+                    "ADR 0110 S4: GSS owner recovery waits for its sealed share"
+                );
+                return ReceiveOutcome::Retained;
+            };
+            if let Err(error) = ng::ensure_named_group_key_material_install_allowed(
+                state,
+                &group_key,
+                Some(&body.stable_group_id),
+                "owner_recovery_gss_share",
+            )
+            .await
+            {
+                tracing::warn!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery secret refused: {error}");
+                return ReceiveOutcome::Retained;
+            }
+            Some(secret)
+        }
+        _ => None,
+    };
     let signed_binding = commit.security_binding.clone();
     let roster_revision = body.roster_revision;
     let crypto = body.crypto.clone();
@@ -1854,8 +1944,9 @@ async fn receive_commit(
                     next.security_binding = signed_binding;
                 }
                 orc::OwnerRecoveryCryptoV1::Gss { next_secret_epoch } => {
-                    if next.secret_epoch < *next_secret_epoch {
-                        next.shared_secret = None;
+                    // The secret and its epoch install with the head.
+                    if let Some(secret) = &gss_secret {
+                        next.shared_secret = Some(secret.to_vec());
                     }
                     next.secret_epoch = *next_secret_epoch;
                     next.security_binding = Some(orc::gss_binding(*next_secret_epoch));
@@ -3857,6 +3948,249 @@ mod restart_tests {
         );
         author.agent.shutdown().await;
         survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// A committed GSS owner recovery on `author` with one survivor that
+    /// has a roster KEM key: (author, survivor, parent, committed, frame,
+    /// revoked admin).
+    #[allow(clippy::type_complexity)]
+    async fn committed_gss_recovery(
+        author_dir: &std::path::Path,
+        survivor_dir: &std::path::Path,
+    ) -> Result<(
+        Arc<AppState>,
+        Arc<AppState>,
+        GroupInfo,
+        GroupInfo,
+        Vec<u8>,
+        x0x::identity::AgentKeypair,
+    )> {
+        use base64::Engine as _;
+        let author = offline_author(author_dir, [0x72; 32]).await?;
+        let survivor = offline_daemon(survivor_dir, None).await?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                survivor.agent.identity().agent_keypair(),
+            ],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        info.members_v2
+            .get_mut(&survivor_hex)
+            .context("survivor seat")?
+            .kem_public_key_b64 = Some(
+            base64::engine::general_purpose::STANDARD
+                .encode(&survivor.agent_kem_keypair.public_bytes),
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &survivor] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        super::tests::advertise(
+            &author,
+            survivor.agent.agent_id(),
+            x0x::dm::CapabilityRegistry::current().bits,
+            x0x::dm_capability::now_unix_ms(),
+        );
+        let (committed, frame) = commit_own_recovery(&author, &stable, &info).await?;
+        Ok((author, survivor, info, committed, frame, admin))
+    }
+
+    /// Run `author`'s worker, with its resend interval elapsed, until it
+    /// sealed more than `seen` shares to `recipient`; the newest one.
+    async fn next_share(
+        author: &Arc<AppState>,
+        stable: &str,
+        recipient: &str,
+        seen: usize,
+    ) -> Result<super::super::super::NamedGroupMetadataEvent> {
+        for _ in 0..100 {
+            if let Some(delivery) = author
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .deliveries
+                .get_mut(stable)
+            {
+                delivery.next_at = Instant::now();
+            }
+            worker_tick(author).await;
+            let shares: Vec<_> = scheduled_shares(author)
+                .into_iter()
+                .filter(|(to, _)| to == recipient)
+                .map(|(_, share)| share)
+                .collect();
+            if shares.len() > seen {
+                return shares.last().cloned().context("a share");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        anyhow::bail!("the author sealed no new share to {recipient}")
+    }
+
+    /// The survivor answers the author's head ask with its current head.
+    async fn report_head(author: &AppState, survivor: &AppState, stable: &str) -> Result<()> {
+        let head = head_of(survivor, stable).await.context("survivor head")?;
+        let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
+        super::super::note_catchup_head(author, &[stable.to_string()], &survivor_hex, Some(&head))
+            .await;
+        Ok(())
+    }
+
+    /// Whether `author` still delivers `stable`'s recovery to `survivor`.
+    async fn still_delivering(author: &AppState, stable: &str, survivor: &AppState) -> bool {
+        author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .deliveries
+            .get(stable)
+            .and_then(|delivery| {
+                delivery
+                    .recipients
+                    .get(survivor.agent.agent_id().as_bytes())
+                    .copied()
+            })
+            .is_some_and(|status| status != RecipientDelivery::Converged)
+    }
+
+    /// Codex P1 (#1508 rc12), lost share: a survivor gets a GSS recovery
+    /// frame, and its share is lost. It must not install the recovery head
+    /// without the new secret, because that head is the author's
+    /// convergence evidence: the author keeps the delivery and seals the
+    /// share again, and the survivor installs head and secret together.
+    /// Before the fix the survivor installed the head with no secret, its
+    /// head answer ended the delivery, and no share came again.
+    #[tokio::test]
+    async fn a_lost_gss_recovery_share_keeps_the_delivery_until_the_key_installs() -> Result<()> {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (author, survivor, info, committed, frame, _admin) =
+            committed_gss_recovery(author_dir.path(), survivor_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+        // The first share is sealed and lost.
+        next_share(&author, &stable, &survivor_hex, 0).await?;
+
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Retained,
+            "the frame waits for its share"
+        );
+        assert_eq!(
+            head_of(&survivor, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "no recovery head without its secret"
+        );
+        report_head(&author, &survivor, &stable).await?;
+        assert!(
+            still_delivering(&author, &stable, &survivor).await,
+            "the survivor's head answer does not end the delivery"
+        );
+
+        // The author seals the share again; it arrives, then the frame.
+        let share = next_share(&author, &stable, &survivor_hex, 1).await?;
+        let early = super::super::super::apply_named_group_metadata_event(
+            &survivor,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!early.accepted, "the share is parked");
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Applied
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, committed.state_hash);
+        assert_eq!(held.secret_epoch, committed.secret_epoch);
+        assert_eq!(held.shared_secret.as_deref(), Some(new_secret.as_slice()));
+        report_head(&author, &survivor, &stable).await?;
+        assert!(
+            !still_delivering(&author, &stable, &survivor).await,
+            "the delivery ends once the key installed"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Codex P1 (#1508 rc12), receiver restart: the survivor gets the GSS
+    /// recovery frame and restarts before its share arrives. The frame is
+    /// durable; after the real restart the share arrives, the real worker
+    /// installs the kept frame with the new epoch's secret, and the
+    /// author's delivery did not end before that. Before the fix the
+    /// survivor restarted at the recovery head with no secret, and its
+    /// head answer ended the delivery.
+    #[tokio::test]
+    async fn a_survivor_restart_before_the_gss_share_installs_the_new_secret() -> Result<()> {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (author, survivor, info, committed, frame, admin) =
+            committed_gss_recovery(author_dir.path(), survivor_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+        let kem = Arc::clone(&survivor.agent_kem_keypair);
+        next_share(&author, &stable, &survivor_hex, 0).await?;
+        receive_bytes(&survivor, &frame).await?;
+
+        // The survivor restarts; the share sent meanwhile is lost.
+        survivor.agent.shutdown().await;
+        drop(survivor);
+        let mut restarted = offline_daemon(survivor_dir.path(), None).await?;
+        Arc::get_mut(&mut restarted)
+            .context("the restarted state is not shared yet")?
+            .agent_kem_keypair = kem;
+        // The test revocation set is in memory: hold the record again.
+        revoke(&restarted, &admin).await?;
+        ensure_restored(&restarted).await;
+        report_head(&author, &restarted, &stable).await?;
+        assert!(
+            still_delivering(&author, &stable, &restarted).await,
+            "the restarted survivor's head answer does not end the delivery"
+        );
+
+        let share = next_share(&author, &stable, &survivor_hex, 1).await?;
+        super::super::super::apply_named_group_metadata_event(
+            &restarted,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        drive(&restarted).await;
+        let held = restarted.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            held.state_hash, committed.state_hash,
+            "the kept frame installs"
+        );
+        assert_eq!(held.secret_epoch, committed.secret_epoch);
+        assert_eq!(
+            held.shared_secret.as_deref(),
+            Some(new_secret.as_slice()),
+            "the restarted survivor holds the new epoch's secret"
+        );
+        author.agent.shutdown().await;
+        restarted.agent.shutdown().await;
         Ok(())
     }
 

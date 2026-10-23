@@ -2715,6 +2715,7 @@ mod tests {
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await?;
         drop(store);

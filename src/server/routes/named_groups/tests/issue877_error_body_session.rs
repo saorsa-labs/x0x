@@ -153,6 +153,7 @@ async fn issue877_nonmember_session_cannot_read_quarantine_error_body() -> Resul
             None,
             None,
             crate::server::rider_auth::unix_now_secs(),
+            Vec::new(),
         )
         .await?
         .0;

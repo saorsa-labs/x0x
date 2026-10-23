@@ -3564,6 +3564,7 @@ pub(in crate::server::routes) mod tests {
                     None,
                     None,
                     crate::server::rider_auth::unix_now_secs(),
+                    Vec::new(),
                 )
                 .await?;
             token
@@ -4519,6 +4520,7 @@ pub(in crate::server::routes) mod tests {
             token_id: 1,
             token_hash: "cd".repeat(32),
             groups: vec![home_id.clone()],
+            scopes: Vec::new(),
         };
         assert!(
             rider.rider_allows_group(&home_id),
@@ -4884,6 +4886,7 @@ pub(in crate::server::routes) mod tests {
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await?;
         drop(store);
@@ -5121,6 +5124,7 @@ pub(in crate::server::routes) mod tests {
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await?;
         drop(store);
@@ -5221,6 +5225,7 @@ pub(in crate::server::routes) mod tests {
                     None,
                     None,
                     crate::server::rider_auth::unix_now_secs(),
+                    Vec::new(),
                 )
                 .await?;
             token

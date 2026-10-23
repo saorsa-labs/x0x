@@ -159,6 +159,7 @@ mod issue870_session_read_tests {
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await?
             .0)
@@ -1964,6 +1965,7 @@ mod discovery_auth_tests {
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await
             .expect("rider token issues");
@@ -3056,6 +3058,7 @@ mod adr0116_policy_tests {
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await
             .expect("rider token issues");

@@ -466,6 +466,7 @@ pub async fn owner_riders_list(client: &DaemonClient) -> Result<()> {
 }
 
 /// `x0x owner riders issue` — POST /owner/riders (ADR-0039).
+#[allow(clippy::too_many_arguments)]
 pub async fn owner_riders_issue(
     client: &DaemonClient,
     sub_agent_id: &str,
@@ -474,8 +475,13 @@ pub async fn owner_riders_issue(
     ttl_secs: Option<u64>,
     delegation_payload_b64: Option<&str>,
     delegation_signature: Option<&str>,
+    scopes: &[String],
 ) -> Result<()> {
-    let mut body = serde_json::json!({ "sub_agent_id": sub_agent_id, "groups": groups });
+    let mut body = serde_json::json!({
+        "sub_agent_id": sub_agent_id,
+        "groups": groups,
+        "scopes": scopes,
+    });
     if let Some(label) = label {
         body["label"] = serde_json::json!(label);
     }
@@ -660,6 +666,7 @@ mod tests {
             Some(3600),
             Some("cGF5bG9hZA=="),
             Some("sig-hex"),
+            &[],
         )
         .await
         .unwrap();
@@ -667,6 +674,27 @@ mod tests {
         assert_eq!(body["delegation"]["payload_b64"], "cGF5bG9hZA==");
         assert_eq!(body["delegation"]["signature"], "sig-hex");
         assert_eq!(body["ttl_secs"], 3600);
+        assert_eq!(body["scopes"], serde_json::json!([]));
+    }
+
+    /// `gui:show` is a rider-token scope on the same mint body.
+    #[tokio::test]
+    async fn rider_issue_serializes_gui_show_scope() {
+        let (client, captured, _shutdown) = capture_client().await;
+        owner_riders_issue(
+            &client,
+            &"ab".repeat(32),
+            &[],
+            None,
+            None,
+            Some("cGF5bG9hZA=="),
+            Some("sig-hex"),
+            &["gui:show".to_string()],
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["scopes"], serde_json::json!(["gui:show"]));
     }
 
     /// WHY (review r2, finding 2): the DELETE body reason is only visible

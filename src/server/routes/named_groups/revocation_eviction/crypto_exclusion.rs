@@ -889,7 +889,8 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
         return;
     }
     // The rotated group record. A rename without the directory fsync has
-    // installed the epoch, as in the TreeKEM path.
+    // installed the epoch, as in the TreeKEM path; the guarded egress holds
+    // the frame until the re-save is durable (§5).
     if !matches!(
         ng::persist_named_group_info(state, group_key, next.clone()).await,
         Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
@@ -1401,6 +1402,11 @@ pub(super) enum HeadRule {
     /// Catch-up: the frame's result must be on this node's verified chain
     /// (the current head or a retained commit).
     OnChain(String),
+    /// A saved removal (ADR 0110 §3): the frame's result is on this node's
+    /// verified chain and no epoch change followed it, so the current head
+    /// commits to the result's security binding. A later roster-only
+    /// commit (a rename) keeps the delivery; a later rekey ends it.
+    OnChainAtEpoch(String),
 }
 
 /// Whether `info` still admits a frame under `rule`. A quarantined or
@@ -1417,6 +1423,13 @@ pub(super) fn head_rule_admits(info: &GroupInfo, rule: &HeadRule) -> bool {
                     .commit_log
                     .iter()
                     .any(|retained| retained.commit.state_hash == *head)
+        }
+        HeadRule::OnChainAtEpoch(head) => {
+            info.state_hash == *head
+                || info.commit_log.iter().any(|retained| {
+                    retained.commit.state_hash == *head
+                        && retained.commit.security_binding == info.security_binding
+                })
         }
     }
 }
@@ -1504,6 +1517,15 @@ pub(in crate::server) async fn serve_catchup(
 /// the head rule synchronously, immediately before the write. The seam of
 /// `send_direct_pinned_admitted` adds this agent's own revocation, pairing
 /// and binding checks.
+///
+/// ADR 0110 §5, "only then publish": the pre-phase also confirms that no
+/// roster replacement waits for its directory fsync, and the seam
+/// re-checks it. A commit whose roster write returned `ReplacedNotDurable`
+/// keeps its frame and delivery, but no frame leaves until the re-save is
+/// `Durable`. This is the one rule for every S4 publishing path (rebind,
+/// owner recovery, crypto exclusion and saved removals, live and
+/// catch-up), so a crash cannot restore the old roster after a peer took
+/// the new commit (#1508 rc12 Codex P1).
 pub(super) fn guarded_admission(
     state: &Arc<AppState>,
     group_id: &str,
@@ -1562,6 +1584,9 @@ fn guarded_admission_gated(
         let group_id = group_id.clone();
         let rule = rule.clone();
         Box::pin(async move {
+            if !ng::confirm_named_groups_durability(&state).await {
+                return None;
+            }
             let recipient_hex = hex::encode(recipient.as_bytes());
             let lock = ng::group_membership_lock_for_known_group(&state, &group_id).await?;
             let evidence = {
@@ -1587,6 +1612,12 @@ fn guarded_admission_gated(
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                if state
+                    .named_groups_requires_durability_confirmation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return false;
+                }
                 if ng::join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence)
                     .is_some()
                 {
@@ -2792,6 +2823,60 @@ mod daemon_tests {
                 .await
                 .insert(group_id.clone(), info.clone());
         }
+        Ok(())
+    }
+
+    /// #1508 rc12 Codex P1 (ADR 0110 §5, "only then publish"): the roster
+    /// write renames the file and the directory fsync fails
+    /// (`ReplacedNotDurable`), then every re-save fails. No S4 frame
+    /// leaves: the seam taken before the write refuses, and a fresh
+    /// pre-phase refuses. Once a re-save is durable, the frame leaves.
+    /// Before the fix both admitted the write, so a crash could restore the
+    /// old roster after a peer took the new commit.
+    #[tokio::test]
+    async fn no_frame_leaves_before_the_roster_is_durable() -> Result<()> {
+        use anyhow::Context as _;
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let survivor = AgentId([0x78; 32]);
+        let group_id = "cd".repeat(16);
+        let mut info = GroupInfo::new("cd".into(), String::new(), admin, group_id.clone());
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        let rule = HeadRule::Current(info.state_hash.clone());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        advertise_crypto_exclusion(&state, survivor);
+        let seam = admit(&state, &stable, &survivor, &rule)
+            .await
+            .context("an eligible recipient is admitted while the roster is durable")?;
+
+        let fault =
+            ng::set_save_fault(&state, ng::SaveFault::ReplacedNotDurableAfterWriteThenError);
+        assert_eq!(
+            ng::persist_named_group_info(&state, &group_id, info.clone()).await?,
+            ng::AtomicWriteOutcome::ReplacedNotDurable
+        );
+        assert!(!seam(), "the seam refuses while the roster is not durable");
+        assert!(
+            admit(&state, &stable, &survivor, &rule).await.is_none(),
+            "the pre-phase refuses while every re-save fails"
+        );
+
+        drop(fault);
+        let seam = admit(&state, &stable, &survivor, &rule)
+            .await
+            .context("the pre-phase re-save is durable")?;
+        assert!(seam(), "the frame leaves once the roster is durable");
         Ok(())
     }
 

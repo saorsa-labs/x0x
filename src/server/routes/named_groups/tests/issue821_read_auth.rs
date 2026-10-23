@@ -57,6 +57,7 @@ async fn named_group_reads_enforce_session_membership_through_auth_middleware() 
                 None,
                 None,
                 crate::server::rider_auth::unix_now_secs(),
+                Vec::new(),
             )
             .await?
             .0
