@@ -1589,7 +1589,7 @@ pub async fn serve_with_options(
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
-        sync.attach_view(Arc::new(routes::DaemonView::new(Arc::clone(&state))));
+        routes::DaemonView::attach(sync, &state).await;
         let service = Arc::clone(sync);
         let shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
@@ -3491,6 +3491,16 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
             );
         }
     }
+    // #1545: the owner-sync store runs each durable write in its own task,
+    // so an abort above stops only the wait of its caller. Wait for those
+    // writes, and refuse new ones, before the instance locks are released:
+    // a daemon restarted on this data dir must not see a late write land
+    // over its own state. The issuance journal writer runs each write in
+    // its own task too; wait for one in flight from any other caller.
+    if let Some(sync) = state.owner_sync.as_ref() {
+        sync.store().release_write_custody().await;
+    }
+    crate::profile::IssuedCertRecord::wait_for_writes().await;
 }
 
 /// Whether two directory paths refer to the same directory, tolerating
