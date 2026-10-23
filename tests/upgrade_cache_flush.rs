@@ -14,7 +14,7 @@ macro_rules! upgrade_cache_flush_tests {
                 std::sync::Arc<ant_quic::BootstrapCache>,
             ) {
                 let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join(".planning/upgrade-cache-tests");
+                    .join("target/upgrade-cache-tests");
                 std::fs::create_dir_all(&root).unwrap();
                 let dir = tempfile::tempdir_in(root).unwrap();
                 let mut agent = Agent::builder()
