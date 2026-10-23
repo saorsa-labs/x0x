@@ -12836,7 +12836,7 @@ async fn gss_replay_probe(_state: &AppState, _group_key: &str) {}
 /// verified is held, so a forged one withholds nothing. Only a secret of
 /// that epoch or later ends it; time and a moved head do not (#1508/#1533
 /// rc13), and the hold is durable across a restart ([`gss_share_hold`]).
-fn pending_gss_removal_withholds(
+pub(in crate::server) fn pending_gss_removal_withholds(
     state: &AppState,
     group_key: &str,
     info: &x0x::groups::GroupInfo,
@@ -12906,12 +12906,19 @@ async fn later_admin_removal_secret(
 /// #1573: park a verified GSS removal or ban until its share installs
 /// ([`gss_removal_waits_for_share`]). A resend of the same commit is not
 /// parked twice. Suppressed in replay contexts (`allow_queue` false).
+///
+/// #1533 rc16 (Codex P1): the hold is added under the GSS publication gate
+/// held exclusively. A sealed GSS task record rechecks the hold under a read
+/// permit on that gate and publishes under the same permit, so a record
+/// sealed before the park is not published after it. `gss_gate_held` is
+/// `true` when the caller already holds the gate exclusively.
 async fn park_gss_removal_for_share(
     state: &AppState,
     group_key: &str,
     event: &NamedGroupMetadataEvent,
     sender: AgentId,
     allow_queue: bool,
+    gss_gate_held: bool,
 ) {
     tracing::info!(
         group_id = %LogHexId::group(group_key),
@@ -12928,6 +12935,11 @@ async fn park_gss_removal_for_share(
     // The durable holds load first, so this write keeps the earlier ones.
     gss_share_hold::ensure_loaded(state).await;
     let hash = named_group_metadata_event_commit(event).map(|commit| commit.state_hash.clone());
+    let gss_gate = if gss_gate_held {
+        None
+    } else {
+        Some(state.gss_publication_gate.write().await)
+    };
     let evicted = {
         let mut lot = state
             .parked_gss_removals
@@ -12955,6 +12967,7 @@ async fn park_gss_removal_for_share(
         }
     };
     let Some(evicted) = evicted else {
+        drop(gss_gate);
         // A resend is not parked twice, but it retries a failed write
         // (#1508 rc14): otherwise the hold stays memory-only and a restart
         // loses it.
@@ -12965,6 +12978,7 @@ async fn park_gss_removal_for_share(
     for entry in &evicted {
         gss_share_hold::keep_evicted_removal(state, group_key, &entry.event);
     }
+    drop(gss_gate);
     gss_share_hold::persist_logged(state, group_key).await;
 }
 
@@ -14542,6 +14556,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             &event_for_log,
                             sender,
                             allow_queue,
+                            held_gss_guard.is_some(),
                         )
                         .await;
                         return ApplyMetadataResult::REJECTED;
@@ -15057,6 +15072,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             &event_for_log,
                             sender,
                             allow_queue,
+                            held_gss_guard.is_some(),
                         )
                         .await;
                         return banned_reject("waiting_for_gss_share", &resolved_group_key);
@@ -42579,13 +42595,34 @@ async fn join_artifact_no_eligible_admin(
     state: &AppState,
     group_id: &str,
 ) -> std::result::Result<(), JoinArtifactRefusal> {
-    // With no ratchet guard, the only hold is `NoEligibleAdmin`.
     // A pending GSS removal (#1573) does not hold join artifacts: they
-    // carry key material to a member, not group ciphertext.
-    match group_ciphertext_withheld(state, group_id, None).await {
-        Some(GroupCiphertextHold::NoEligibleAdmin) => Err(JoinArtifactRefusal::NoEligibleAdmin),
-        Some(_) | None => Ok(()),
+    // carry key material to a member, not group ciphertext. Admin
+    // eligibility is checked on its own (#1533 rc16, Codex P2): the shared
+    // boundary returns its first hold, so a pending removal would mask it.
+    let info = {
+        let groups = state.named_groups.read().await;
+        match crate::server::resolve_group_entry_locked(&groups, group_id) {
+            Some((_, info)) => info.clone(),
+            None => return Ok(()),
+        }
+    };
+    if revocation_eviction::s4_withholds_ciphertext(state, &info).await {
+        Err(JoinArtifactRefusal::NoEligibleAdmin)
+    } else {
+        Ok(())
     }
+}
+
+/// Whether [`join_artifact_no_eligible_admin`] holds key material for
+/// `group_id` (test builds only).
+#[cfg(test)]
+pub(in crate::server) async fn join_artifacts_held_for_no_eligible_admin_for_test(
+    state: &AppState,
+    group_id: &str,
+) -> bool {
+    join_artifact_no_eligible_admin(state, group_id)
+        .await
+        .is_err()
 }
 
 /// The record-local guard, plus (OwnerCertified groups only) the
@@ -55229,6 +55266,7 @@ pub(in crate::server) mod tests {
             &removal(0, high),
             AgentId([0xee; 32]),
             true,
+            false,
         )
         .await;
         for at in 1..=PARKED_ROLE_UPDATE_CAP {
@@ -55238,6 +55276,7 @@ pub(in crate::server) mod tests {
                 &removal(at, low),
                 AgentId([0xee; 32]),
                 true,
+                false,
             )
             .await;
         }

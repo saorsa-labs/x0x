@@ -511,7 +511,9 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
     /// - GSS: the daemon's GSS publication gate (#973). Every authoritative
     ///   roster commit holds it exclusively from installing the rotated
     ///   secret through durable save or rollback, so under a read permit the
-    ///   live `secret_epoch` cannot move.
+    ///   live `secret_epoch` cannot move. A GSS share hold (a verified
+    ///   removal that waits for its share) is added under it too, so the
+    ///   hold cannot start between the check and the publish (#1533 rc16).
     /// - TreeKEM: the group's membership lock, then its live ratchet mutex —
     ///   the same order `seal_record` takes them. Every ratchet epoch change
     ///   needs the ratchet mutex.
@@ -533,26 +535,37 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
             match body {
                 x0x::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
                     let permit = Arc::clone(&state.gss_publication_gate).read_owned().await;
+                    // #1533 rc16 (Codex P1): a verified removal that parks
+                    // after the seal leaves the epoch unchanged, and the
+                    // removed member holds that secret. The hold is added
+                    // under this gate held exclusively, so it is checked
+                    // here, under the permit. `seal` loaded the durable
+                    // holds.
                     let current = {
                         let groups = state.named_groups.read().await;
                         crate::server::resolve_group_entry_locked(&groups, &self.group_id).map(
-                            |(_, info)| {
+                            |(key, info)| {
                                 (
                                     info.secret_epoch,
                                     info.secure_plane == x0x::mls::SecureGroupPlane::Gss,
+                                    super::named_groups::pending_gss_removal_withholds(
+                                        &state, key, info,
+                                    ),
                                 )
                             },
                         )
                     };
-                    let (current_epoch, still_gss) =
+                    let (current_epoch, still_gss, removal_held) =
                         current.ok_or_else(|| unavailable("group is not known"))?;
-                    Ok(if still_gss && current_epoch == record.epoch {
-                        x0x::crdt::TaskPublication::Current(
-                            x0x::crdt::TaskPublicationPermit::holding(permit),
-                        )
-                    } else {
-                        x0x::crdt::TaskPublication::Stale
-                    })
+                    Ok(
+                        if still_gss && !removal_held && current_epoch == record.epoch {
+                            x0x::crdt::TaskPublication::Current(
+                                x0x::crdt::TaskPublicationPermit::holding(permit),
+                            )
+                        } else {
+                            x0x::crdt::TaskPublication::Stale
+                        },
+                    )
                 }
                 x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record) => {
                     let group_key = {
@@ -2692,6 +2705,109 @@ mod tests {
                 seal_once(&state, &topic).await,
                 Ok(Some(SealedTaskRecordBody::Gss(_)))
             ));
+        }
+
+        /// #1533 rc16 (Codex P1): a GSS task record sealed before a
+        /// verified removal parks is not published after it. The park
+        /// leaves the epoch unchanged and the removed member holds that
+        /// secret. Before the fix `confirm_publication` checked the plane
+        /// and epoch only and answered `Current`.
+        #[tokio::test]
+        async fn gss_task_record_sealed_before_a_removal_parks_is_not_published() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b5".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let protector = group_task_list_binding(&state, &topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            let Ok(Some(body)) = protector
+                .seal(x0x::kv::KvMutationKind::Delta, b"delta")
+                .await
+            else {
+                panic!("the delta seals before the removal");
+            };
+
+            super::super::super::named_groups::park_pending_gss_removal_for_test(
+                &state, &group_key, &info,
+            );
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Stale)
+            ));
+
+            // The installed share ends the hold; the old-epoch record is
+            // still stale, and a fresh seal publishes.
+            let mut keyed = info.clone();
+            let _ = keyed.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), keyed);
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Stale)
+            ));
+            let Ok(Some(fresh)) = seal_once(&state, &topic).await else {
+                panic!("the delta seals after the share installs");
+            };
+            assert!(matches!(
+                protector.confirm_publication(&fresh).await,
+                Ok(x0x::crdt::TaskPublication::Current(_))
+            ));
+        }
+
+        /// #1533 rc16 (Codex P2): a pending GSS removal does not mask the
+        /// no-eligible-admin hold on key material. With both holds, the
+        /// shared boundary reports the removal first; before the fix the
+        /// join-artifact guard read only that first hold and served shares,
+        /// Welcomes and join results.
+        #[tokio::test]
+        async fn join_artifacts_stay_held_when_a_removal_also_waits() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b6".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            super::super::super::named_groups::park_pending_gss_removal_for_test(
+                &state, &group_key, &info,
+            );
+            // A pending removal alone does not hold key material.
+            assert!(
+                !super::super::super::named_groups::join_artifacts_held_for_no_eligible_admin_for_test(
+                    &state, &group_key,
+                )
+                .await
+            );
+            revoke_agent(&state, &admin).await;
+            assert_eq!(
+                super::super::super::named_groups::group_ciphertext_withheld(
+                    &state, &group_key, None,
+                )
+                .await,
+                Some(super::super::super::named_groups::GroupCiphertextHold::PendingGssRemoval),
+                "both holds apply; the boundary reports the removal first"
+            );
+            assert!(
+                super::super::super::named_groups::join_artifacts_held_for_no_eligible_admin_for_test(
+                    &state, &group_key,
+                )
+                .await
+            );
         }
 
         /// Codex P2 (#1508 r6), ADR 0110 §4b(3): a `SignedPublic` group's
