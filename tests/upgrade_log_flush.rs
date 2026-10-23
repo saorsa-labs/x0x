@@ -239,6 +239,110 @@ macro_rules! log_flush_regression_tests {
                 );
             }
 
+            #[cfg(unix)]
+            fn directory_fixture() -> tempfile::TempDir {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("target/upgrade-log-directory-tests");
+                std::fs::create_dir_all(&root).unwrap();
+                tempfile::tempdir_in(root).unwrap()
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn shutdown_log_directory_existing_folders_are_not_synced() {
+                let root = directory_fixture();
+                let existing = root.path().join("existing");
+                std::fs::create_dir(&existing).unwrap();
+                let mut synced = Vec::new();
+                prepare_log_dir(
+                    &existing,
+                    |path| {
+                        synced.push(path.to_path_buf());
+                        Ok(())
+                    },
+                    |_, error| panic!("unexpected directory warning: {error}"),
+                )
+                .unwrap();
+                assert!(synced.is_empty());
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn shutdown_log_directory_syncs_only_folders_it_created() {
+                let root = directory_fixture();
+                let nested = root.path().join("new/deep");
+                let mut synced = Vec::new();
+                prepare_log_dir(
+                    &nested,
+                    |path| {
+                        synced.push(path.to_path_buf());
+                        File::open(path)?.sync_all()
+                    },
+                    |_, error| panic!("unexpected directory warning: {error}"),
+                )
+                .unwrap();
+                assert_eq!(synced, vec![nested.clone(), root.path().join("new")]);
+                assert!(nested.is_dir());
+            }
+
+            #[cfg(unix)]
+            #[test]
+            fn shutdown_log_directory_unreadable_folder_only_warns() {
+                let root = directory_fixture();
+                let nested = root.path().join("new/deep");
+                let mut warnings = Vec::new();
+                prepare_log_dir(
+                    &nested,
+                    |_| {
+                        Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "unreadable folder",
+                        ))
+                    },
+                    |path, error| warnings.push((path.to_path_buf(), error.kind())),
+                )
+                .unwrap();
+                assert_eq!(
+                    warnings,
+                    vec![
+                        (nested.clone(), io::ErrorKind::PermissionDenied),
+                        (root.path().join("new"), io::ErrorKind::PermissionDenied),
+                    ]
+                );
+                let path = nested.join("daemon.log");
+                let file = File::create(&path).unwrap();
+                // Directory access was unavailable; the file remains writable and flushable.
+                let (mut writer, _guard) = acknowledged_file(file, None).unwrap();
+                writer
+                    .write_all(b"file logging survives directory warning")
+                    .unwrap();
+                writer.flush().unwrap();
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    b"file logging survives directory warning"
+                );
+            }
+
+            #[test]
+            fn shutdown_log_flush_retains_an_unrecovered_sink_setup_failure() {
+                let mut fixture = Fixture::new(None, false, 8);
+                fixture.writer.record_setup_error(&io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "configured sink did not open",
+                ));
+                for _ in 0..2 {
+                    fixture.writer.write_all(b"stdout still works").unwrap();
+                    assert_eq!(
+                        fixture.writer.flush().unwrap_err().kind(),
+                        io::ErrorKind::PermissionDenied
+                    );
+                }
+                assert_eq!(
+                    *fixture.bytes.lock().unwrap(),
+                    b"stdout still worksstdout still works"
+                );
+            }
+
             #[test]
             fn shutdown_log_flush_uses_the_owning_dispatch_bridge() {
                 use tracing_subscriber::layer::SubscriberExt;
