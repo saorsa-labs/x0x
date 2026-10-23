@@ -244,14 +244,6 @@ child before restoration. Never assume it can resume after a failed flush.
 The launcher restarts restored bytes as needed. Unprotected paths require
 manual recovery. The flush time bound needs a ruling.
 
-> Transient ruling, 23 Oct 2026 (engineer note, recorded in place of a new
-> ADR file): the shutdown-flush time bound is 30 seconds by default,
-> configurable per daemon (`[update] shutdown_flush_timeout_secs`, bounds
-> 1..=3600). A flush that started and then failed or overran restores the
-> previous binary, marks the upgrade failed and exits `EX_TEMPFAIL` (75) so
-> the service manager restarts the old version. An annotation against this
-> section's open question; not a status change to this ADR.
-
 Count candidate launch attempts, including exec failures, before spawning.
 The candidate records its boot before initialization. Bound uncommitted boots,
 per-attempt readiness and total time; David must set those limits. Persist boot
