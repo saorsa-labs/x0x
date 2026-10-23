@@ -517,11 +517,14 @@ pub fn validate_against_parent(
 ///
 /// The parent snapshot keeps digests, not certificate bytes. The old and
 /// the admin certificates are taken from `current` when their digests
-/// match. When the old bytes are held, the new certificate must expire
-/// later. Bytes that are not held do not refuse, as for the admin
-/// certificate in [`validate_against_parent`]: this node's own branch may
-/// already have replaced them, and a sibling only contains the group; it
-/// never applies.
+/// match, and they are required: the new certificate must expire later
+/// than the old one, and an admin signer's certificate must not be
+/// expired (#1533 r11). A sibling quarantines the whole group, so it is
+/// never trusted without that parent evidence. When this node's own branch
+/// has already replaced a certificate, its bytes are not held and the
+/// frame is refused with `rebind_certificate_evidence_missing`: it records
+/// nothing (an older but unexpired certificate from the same owner is no
+/// fork evidence).
 ///
 /// The caller has already run [`verify_signatures`], so the signer signed
 /// the frame and the embedded commit.
@@ -583,15 +586,18 @@ pub fn validate_sibling(
             .and_then(committed_certificate)
             .filter(|cert| Some(&owner_cert::certificate_digest_hex(cert)) == digest)
     };
-    if body.signer != body.seat
-        && held_certificate(
+    if body.signer != body.seat {
+        let signer_cert = held_certificate(
             &signer_hex,
             signer_at_parent.and_then(|snapshot| snapshot.certificate_digest.as_ref()),
         )
-        .and_then(AgentCertificate::not_after)
-        .is_some_and(|not_after| own_expiry_trigger_due(not_after, now_unix))
-    {
-        return Err(CertificateRebindRefusal::SignerIneligible);
+        .ok_or(CertificateRebindRefusal::CertificateEvidenceMissing)?;
+        if signer_cert
+            .not_after()
+            .is_some_and(|not_after| own_expiry_trigger_due(not_after, now_unix))
+        {
+            return Err(CertificateRebindRefusal::SignerIneligible);
+        }
     }
     let Some(seat) = parent
         .roster
@@ -618,10 +624,10 @@ pub fn validate_sibling(
     )
     .map_err(|_| CertificateRebindRefusal::CertificateInvalid)?;
     let new_digest = owner_cert::certificate_digest_hex(&new_cert);
-    let old_not_after = held_certificate(&seat_hex, seat.certificate_digest.as_ref())
-        .map(AgentCertificate::not_after);
+    let old_cert = held_certificate(&seat_hex, seat.certificate_digest.as_ref())
+        .ok_or(CertificateRebindRefusal::CertificateEvidenceMissing)?;
     if new_digest == body.old_certificate_digest
-        || old_not_after.is_some_and(|old| !expires_later(new_cert.not_after(), old))
+        || !expires_later(new_cert.not_after(), old_cert.not_after())
     {
         return Err(CertificateRebindRefusal::NotLater);
     }
@@ -1244,5 +1250,114 @@ mod tests {
         assert!(!is_self_rebind_link(&before, &added, "b"));
         // An unchanged digest is not a rebind.
         assert!(!is_self_rebind_link(&before, &before, "b"));
+    }
+
+    /// A retained parent (the admin renews its own certificate) and this
+    /// node's head on it, where `own_seat`'s certificate was replaced by a
+    /// valid rebind (#1533 r11 Codex P1). The parent's certificate bytes
+    /// for that seat are no longer held.
+    fn own_branch_replaced(f: &Fixture, own_seat: &AgentKeypair) -> (GroupInfo, GroupInfo) {
+        let admin_renewal = cert(&f.owner, &f.admin, Some(NOW + 700));
+        let (parent, _) = seal(
+            &f.info,
+            *f.admin.agent_id().as_bytes(),
+            &admin_renewal,
+            &f.admin,
+            NOW * 1000,
+        )
+        .expect("parent");
+        let renewal = cert(&f.owner, own_seat, Some(NOW + 900));
+        let (current, _) = seal(
+            &parent,
+            *own_seat.agent_id().as_bytes(),
+            &renewal,
+            &f.admin,
+            NOW * 1000 + 1,
+        )
+        .expect("own branch");
+        assert!(
+            current
+                .commit_log
+                .iter()
+                .any(|retained| retained.commit.state_hash == parent.state_hash),
+            "the parent is retained"
+        );
+        (parent, current)
+    }
+
+    /// #1533 r11 Codex P1: after a valid rebind replaced the seat's parent
+    /// certificate, a regular member signs a sibling self-rebind with an
+    /// older (but unexpired) certificate from the same owner. Without the
+    /// parent bytes the later-expiry check cannot run, so it is no fork
+    /// evidence: no quarantine.
+    #[test]
+    fn sibling_without_parent_seat_certificate_is_no_fork_evidence() {
+        let f = fixture();
+        let (parent, current) = own_branch_replaced(&f, &f.member);
+        let older = cert(&f.owner, &f.member, Some(NOW + 300));
+        let (_, frame) = seal(
+            &parent,
+            *f.member.agent_id().as_bytes(),
+            &older,
+            &f.member,
+            NOW * 1000 + 2,
+        )
+        .expect("sibling");
+        verify_signatures(&frame).expect("signatures");
+        assert_eq!(
+            validate_sibling(&frame.body, &current, NOW, |_| false).err(),
+            Some(CertificateRebindRefusal::CertificateEvidenceMissing)
+        );
+    }
+
+    /// #1533 r11, the same class for the signer: an admin signer's
+    /// expiry check needs its parent certificate. When this node's branch
+    /// replaced it, the sibling is refused, not trusted.
+    #[test]
+    fn sibling_without_parent_admin_certificate_is_no_fork_evidence() {
+        let f = fixture();
+        let (parent, current) = own_branch_replaced(&f, &f.admin);
+        let renewal = cert(&f.owner, &f.member, Some(NOW + 6000));
+        let (_, frame) = seal(
+            &parent,
+            *f.member.agent_id().as_bytes(),
+            &renewal,
+            &f.admin,
+            NOW * 1000 + 2,
+        )
+        .expect("sibling");
+        assert_eq!(
+            validate_sibling(&frame.body, &current, NOW, |_| false).err(),
+            Some(CertificateRebindRefusal::CertificateEvidenceMissing)
+        );
+    }
+
+    /// The control: with the parent bytes held, an older certificate is
+    /// refused as not later and a later one is a valid sibling.
+    #[test]
+    fn sibling_with_parent_certificates_checks_expiry() {
+        let f = fixture();
+        // This node's branch changes another seat: the admin renews again.
+        let (parent, current) = own_branch_replaced(&f, &f.admin);
+        let sibling = |not_after| {
+            let renewal = cert(&f.owner, &f.member, Some(not_after));
+            seal(
+                &parent,
+                *f.member.agent_id().as_bytes(),
+                &renewal,
+                &f.member,
+                NOW * 1000 + 2,
+            )
+            .expect("sibling")
+            .1
+        };
+        assert_eq!(
+            validate_sibling(&sibling(NOW + 300).body, &current, NOW, |_| false).err(),
+            Some(CertificateRebindRefusal::NotLater)
+        );
+        assert_eq!(
+            validate_sibling(&sibling(NOW + 6000).body, &current, NOW, |_| false),
+            Ok(RebindSigner::SeatAgent)
+        );
     }
 }

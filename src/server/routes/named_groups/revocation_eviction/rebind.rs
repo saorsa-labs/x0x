@@ -1747,6 +1747,14 @@ pub(in crate::server) async fn receive(
                             sibling = Some(kind);
                             Err(cr::CertificateRebindRefusal::HeadMismatch)
                         }
+                        // #1533 r11: this node's branch no longer holds
+                        // the parent's certificate bytes, so the sibling
+                        // cannot be checked. It stays unvalidated and
+                        // records nothing; a fetch of the current bytes
+                        // would not supply the parent's.
+                        Err(cr::CertificateRebindRefusal::CertificateEvidenceMissing) => {
+                            Err(cr::CertificateRebindRefusal::HeadMismatch)
+                        }
                         Err(refused) => Err(refused),
                     }
                 }

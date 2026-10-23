@@ -609,12 +609,43 @@ async fn update_sidecar<F>(state: &AppState, stable_group_id: &str, mutate: F) -
 where
     F: FnOnce(&mut GroupRecoveryV1),
 {
+    update_sidecar_if(state, stable_group_id, |body| {
+        mutate(body);
+        true
+    })
+    .await
+        == SidecarWrite::Written
+}
+
+/// The result of [`update_sidecar_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarWrite {
+    /// The change is durable and in memory.
+    Written,
+    /// The guard declined the change; nothing was written.
+    Declined,
+    /// The sidecar has a fault, a staged re-seat refused the change, or
+    /// the write is not durable; memory is unchanged.
+    NotDurable,
+}
+
+/// [`update_sidecar`] for a guarded transition (#1533 r11): `mutate` runs
+/// on the latest sidecar under the writer lock, so it is where a
+/// transition re-checks the recovery and attestation state it depends on.
+/// When it returns `false` nothing is written and the result is
+/// [`SidecarWrite::Declined`]. A check on an earlier snapshot is only a
+/// fast path: a concurrent reply can change the state between that read
+/// and the write.
+async fn update_sidecar_if<F>(state: &AppState, stable_group_id: &str, mutate: F) -> SidecarWrite
+where
+    F: FnOnce(&mut GroupRecoveryV1) -> bool,
+{
     let runtime = &state.group_recovery;
     let _writer = runtime.writer.lock().await;
     let mut candidate = {
         let inner = runtime.inner.lock().await;
         if inner.sidecar_status.contains_key(stable_group_id) {
-            return false;
+            return SidecarWrite::NotDurable;
         }
         inner
             .sidecars
@@ -623,18 +654,20 @@ where
             .unwrap_or_default()
     };
     let before = staging_containment(&candidate);
-    mutate(&mut candidate);
+    if !mutate(&mut candidate) {
+        return SidecarWrite::Declined;
+    }
     let refused = matches!(
         (before, staging_containment(&candidate)),
         (Some(before), Some(after)) if before != after
     );
     if refused {
         tracing::warn!(group_id = %LogHexId::group(stable_group_id), "ADR 0109 S3: a re-seat is staged; the original's containment stays until the swap, so this sidecar change is refused");
-        return false;
+        return SidecarWrite::NotDurable;
     }
     candidate.generation = candidate.generation.saturating_add(1);
     if !write_sidecar(state, stable_group_id, &candidate).await {
-        return false;
+        return SidecarWrite::NotDurable;
     }
     let mut inner = runtime.inner.lock().await;
     if candidate.is_empty() {
@@ -645,7 +678,7 @@ where
             .insert(stable_group_id.to_string(), candidate);
     }
     runtime.refresh_staging(stable_group_id, inner.sidecars.get(stable_group_id));
-    true
+    SidecarWrite::Written
 }
 
 /// The sidecar fields that hold the original record's S3 containment: its
@@ -1316,7 +1349,12 @@ impl LegacyWrite {
 /// `Dropped` nothing is published and the candidate is dropped: the group
 /// is no longer placeheld and the sidecar's arming (the ATA and the
 /// authoritative record) is rolled back. Returns whether it is published.
-async fn finish_arm(state: &AppState, stable: &str, write: LegacyWrite) -> bool {
+async fn finish_arm(
+    state: &AppState,
+    stable: &str,
+    write: LegacyWrite,
+    armed: &AdminTerminalAttestation,
+) -> bool {
     match write {
         LegacyWrite::Durable => {
             with_placeheld(state, |placeheld| {
@@ -1332,8 +1370,14 @@ async fn finish_arm(state: &AppState, stable: &str, write: LegacyWrite) -> bool 
         }
         LegacyWrite::Dropped => {
             with_placeheld(state, |placeheld| placeheld.remove(stable));
+            // #1533 r11: a reply can record a conflict against the armed
+            // ATA, or replace it, while the legacy write runs. Only this
+            // arming's ATA is withdrawn, and never under a conflict: the
+            // conflict keeps its ATA, or its bound is lost.
             let _ = update_sidecar(state, stable, |body| {
-                body.active_ata = None;
+                if body.attestation_conflict.is_none() && body.active_ata.as_ref() == Some(armed) {
+                    body.active_ata = None;
+                }
                 body.authoritative_record = None;
                 body.authoritative_binding = None;
             })
@@ -1454,7 +1498,7 @@ async fn arm_in_place(
     }
     begin_placehold(state, group_key, captured);
     let outcome = super::save_named_groups_checked(state).await;
-    finish_arm(state, &stable, LegacyWrite::of(&outcome)).await
+    finish_arm(state, &stable, LegacyWrite::of(&outcome), &ata).await
 }
 
 /// Write the legacy views again (the placeholder, or the real record once
@@ -2489,15 +2533,34 @@ pub(super) async fn apply_join_carry(
         .collect();
     let ata_kept = ata.clone();
     let terminal_json = serde_json::to_vec(terminal_event).ok();
-    if !update_sidecar(state, &stable, move |body| {
+    // #1533 r11: the armed and conflict checks above read a snapshot; a
+    // reply can arm another ATA or record a conflict before this write.
+    // Check both again on the latest sidecar: a conflict, or another armed
+    // ATA, keeps its state and this carry does not apply.
+    let carried = update_sidecar_if(state, &stable, |body| {
+        let other_armed = body
+            .active_ata
+            .as_ref()
+            .is_some_and(|active| active != &ata_kept && armed_on(active, &current));
+        if body.attestation_conflict.is_some() || other_armed {
+            return false;
+        }
         body.served_chain = served_json;
         body.active_ata = Some(ata_kept);
         body.queued_terminal = terminal_json;
+        true
     })
-    .await
-    {
-        tracing::warn!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: sidecar not durable; join carry not applied");
-        return false;
+    .await;
+    match carried {
+        SidecarWrite::Written => {}
+        SidecarWrite::Declined => {
+            tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: a conflict or another armed ATA arrived first; join carry not applied");
+            return false;
+        }
+        SidecarWrite::NotDurable => {
+            tracing::warn!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: sidecar not durable; join carry not applied");
+            return false;
+        }
     }
     // §4 "Transactions": the sidecar (above, and the authoritative record
     // inside the roster save) first, then the legacy views with the S3
@@ -2511,7 +2574,7 @@ pub(super) async fn apply_join_carry(
     if write == LegacyWrite::ReplacedNotDurable {
         unpublish_not_durable(state, &group_key, &current, &next).await;
     }
-    if !finish_arm(state, &stable, write).await {
+    if !finish_arm(state, &stable, write, ata).await {
         tracing::warn!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: attested links not durable");
         return false;
     }
@@ -2596,7 +2659,11 @@ async fn conflict_admits_head(
         (Some(active), Some(conflict)) => {
             s3::conflict_admits_link(active, conflict, &current.state_hash, &commit.state_hash)
         }
-        _ => true,
+        // #1533 r11: a conflict keeps its ATA until a re-seat. A conflict
+        // without it has no common prefix to bound, so nothing past the
+        // head applies (fail closed) rather than everything.
+        (None, Some(_)) => false,
+        (_, None) => true,
     }
 }
 
@@ -2781,9 +2848,15 @@ pub(super) async fn armed_admin_ata(
     let ata = sidecar_snapshot(state, info.stable_group_id())
         .await?
         .active_ata?;
+    armed_on(&ata, info).then_some(ata)
+}
+
+/// Whether `ata` is armed on `info`: the head is on its sequence (or is
+/// its `from`) and its segment terminal is not yet reached.
+fn armed_on(ata: &AdminTerminalAttestation, info: &GroupInfo) -> bool {
     let on_sequence = info.state_hash == ata.fields.from_state_hash
         || ata.fields.sequence.contains(&info.state_hash);
-    (on_sequence && info.state_revision < ata.fields.segment_terminal_revision).then_some(ata)
+    on_sequence && info.state_revision < ata.fields.segment_terminal_revision
 }
 
 /// The #846 gate under an admin-armed ATA (§2): `Some(sequence)` while
@@ -2888,13 +2961,20 @@ pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
     {
         return;
     }
-    if !update_sidecar(state, &stable, |body| {
+    // #1533 r11: a reply can record a conflict, or replace the ATA, after
+    // the snapshot above. Retire only the ATA that converged, and never
+    // under a recorded conflict, which keeps its ATA until a re-seat.
+    let retired = update_sidecar_if(state, &stable, |body| {
+        if body.attestation_conflict.is_some() || body.active_ata.as_ref() != Some(&ata) {
+            return false;
+        }
         body.served_chain.clear();
         body.active_ata = None;
         body.queued_terminal = None;
+        true
     })
-    .await
-    {
+    .await;
+    if retired != SidecarWrite::Written {
         return;
     }
     state
@@ -3589,6 +3669,13 @@ async fn show_conflict(state: &AppState, info: &GroupInfo) {
 /// memory (the gate honours it now, and the next sidecar write carries
 /// it). Two replies can both reach this point, so the record keeps the
 /// strongest bound ([`keep_strongest_conflict`]) in both writes.
+///
+/// The caller compared `conflict` with a snapshot of the active ATA. The
+/// write checks again on the latest sidecar (#1533 r11): a conflict is
+/// recorded only beside an active ATA that it still diverges from, whose
+/// signer is verified on `info`. A conflict without its active ATA has no
+/// common prefix to bound; when the ATA was retired or replaced meanwhile,
+/// nothing is recorded and the next answer is evaluated on the new head.
 async fn record_conflict(
     state: &AppState,
     group_key: &str,
@@ -3596,17 +3683,41 @@ async fn record_conflict(
     conflict: AdminTerminalAttestation,
 ) {
     let stable = info.stable_group_id().to_string();
+    let still_diverges = |body: &GroupRecoveryV1, candidate: &AdminTerminalAttestation| {
+        body.active_ata.as_ref().is_some_and(|active| {
+            active.conflicts_with(candidate) && active.signer_verified_on(info)
+        })
+    };
     let kept = conflict.clone();
-    if !update_sidecar(state, &stable, move |body| {
+    let written = update_sidecar_if(state, &stable, |body| {
+        if !still_diverges(body, &kept) {
+            return false;
+        }
         keep_strongest_conflict(body, kept);
+        true
     })
-    .await
+    .await;
+    match written {
+        SidecarWrite::Written => {
+            announce_conflict(state, group_key, info).await;
+            return;
+        }
+        SidecarWrite::Declined => {
+            tracing::info!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the active ATA changed before the conflict was recorded; the answer is evaluated again");
+            return;
+        }
+        SidecarWrite::NotDurable => {}
+    }
+    tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the attestation conflict is not durable yet; it is held in memory");
     {
-        tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the attestation conflict is not durable yet; it is held in memory");
         let _writer = state.group_recovery.writer.lock().await;
         let mut inner = state.group_recovery.inner.lock().await;
         if !inner.sidecar_status.contains_key(&stable) {
-            keep_strongest_conflict(inner.sidecars.entry(stable.clone()).or_default(), conflict);
+            let body = inner.sidecars.entry(stable.clone()).or_default();
+            if !still_diverges(body, &conflict) {
+                return;
+            }
+            keep_strongest_conflict(body, conflict);
         }
     }
     announce_conflict(state, group_key, info).await;
@@ -8054,6 +8165,132 @@ mod tests {
             .await
             .is_none_or(|body| body.active_ata.is_none()));
         drop(dir);
+        Ok(())
+    }
+
+    /// A diverging ATA for `ata`'s head: the same fields with another
+    /// sequence. The sidecar checks below never verify it.
+    fn diverging(ata: &AdminTerminalAttestation) -> AdminTerminalAttestation {
+        let mut other = ata.clone();
+        other.fields.sequence = vec!["x1".to_string()];
+        other
+    }
+
+    /// #1533 r11 Codex P1 (retirement can disable a recorded conflict):
+    /// a reply records a conflict after `retire_converged` read its
+    /// snapshot (here: while the retirement retires the marker and waits
+    /// for the sidecar writer). The retirement re-checks inside the
+    /// serialized write, so the conflict keeps its ATA and its bound.
+    /// Before the fix the ATA was cleared and the conflict bounded
+    /// nothing. Inert.
+    #[tokio::test]
+    async fn a_conflict_recorded_during_retirement_keeps_its_ata() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = marker_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let conflict = diverging(&ata);
+        let writer = state.group_recovery.writer.lock().await;
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move { retire_converged(&state, &key).await }
+        });
+        // The marker retires after the snapshot and before the sidecar
+        // write, so its retirement shows the snapshot was read.
+        for _ in 0..500 {
+            if !live_marker(&state, &key).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !live_marker(&state, &key).await,
+            "the retirement read its snapshot"
+        );
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .sidecars
+            .get_mut(&stable)
+            .ok_or_else(|| anyhow::anyhow!("the sidecar"))?
+            .attestation_conflict = Some(conflict.clone());
+        drop(writer);
+        task.await?;
+        let body = sidecar_snapshot(&state, &stable)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the sidecar stays"))?;
+        assert_eq!(body.active_ata, Some(ata), "the conflict keeps its ATA");
+        assert_eq!(body.attestation_conflict, Some(conflict));
+        Ok(())
+    }
+
+    /// #1533 r11: a conflict without its active ATA has no common prefix,
+    /// so it admits nothing past the head (it admitted everything before).
+    /// A conflict whose ATA was retired before it could be recorded is not
+    /// recorded at all. Inert.
+    #[tokio::test]
+    async fn a_conflict_never_stands_without_its_ata() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = marker_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(update_sidecar(&state, &stable, |body| body.active_ata = None).await);
+        record_conflict(&state, &key, &info, diverging(&ata)).await;
+        assert!(
+            sidecar_snapshot(&state, &stable)
+                .await
+                .is_none_or(|body| body.attestation_conflict.is_none()),
+            "no conflict is recorded without the ATA it diverges from"
+        );
+
+        let orphan = diverging(&ata);
+        assert!(
+            update_sidecar(&state, &stable, move |body| body.attestation_conflict =
+                Some(orphan))
+            .await
+        );
+        let mut commit = info.terminal_commit_header();
+        commit.revision = info.state_revision + 1;
+        commit.prev_state_hash = Some(info.state_hash.clone());
+        commit.state_hash = ata.fields.sequence.first().cloned().unwrap_or_default();
+        assert!(
+            !conflict_admits_commit(&state, &info, &commit).await,
+            "a conflict without its ATA admits nothing past the head"
+        );
+        Ok(())
+    }
+
+    /// #1533 r11: an arming whose legacy write is dropped withdraws only
+    /// its own ATA, and never one that a recorded conflict holds. Inert.
+    #[tokio::test]
+    async fn a_dropped_arming_keeps_a_conflict_and_another_ata() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, ata) = marker_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let conflict = diverging(&ata);
+        let kept = conflict.clone();
+        assert!(
+            update_sidecar(&state, &stable, move |body| body.attestation_conflict =
+                Some(kept))
+            .await
+        );
+        assert!(!finish_arm(&state, &stable, LegacyWrite::Dropped, &ata).await);
+        let body = sidecar_snapshot(&state, &stable)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("sidecar"))?;
+        assert_eq!(
+            body.active_ata,
+            Some(ata.clone()),
+            "the conflict keeps its ATA"
+        );
+
+        assert!(update_sidecar(&state, &stable, |body| body.attestation_conflict = None).await);
+        assert!(!finish_arm(&state, &stable, LegacyWrite::Dropped, &conflict).await);
+        let body = sidecar_snapshot(&state, &stable)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("sidecar"))?;
+        assert_eq!(body.active_ata, Some(ata), "another arming's ATA stays");
         Ok(())
     }
 
