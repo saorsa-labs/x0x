@@ -209,6 +209,32 @@ pub(crate) async fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
     .map_err(std::io::Error::other)?
 }
 
+/// #1545: make the file at `path`, as it is now, durable: fsync the file
+/// when it exists, and then its parent directory. A reader that acts on
+/// what it loads calls this before the load. After a stop between a
+/// rename and its directory fsync, the bytes are visible but not durable,
+/// and a host crash can take them back after the reader acted on them.
+///
+/// # Errors
+/// Returns the IO error of an fsync, or of an open other than a missing
+/// file.
+pub(crate) async fn make_durable(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::File::open(path).await {
+        Ok(file) => file.sync_all().await?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::File::open(dir).await?.sync_all().await?;
+    }
+    #[cfg(test)]
+    if path.exists() {
+        crash_sim::note_durable(path);
+    }
+    Ok(())
+}
+
 /// Write `bytes` to `path` via a unique temp file + rename (atomic on both
 /// unix and windows for same-directory renames). The temp name embeds the
 /// pid + a counter so concurrent writers never collide.
@@ -409,7 +435,7 @@ impl IssuedCertRecord {
         record: &Self,
         writer: JournalWriter,
         held: H,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<H> {
         let line = serde_json::to_string(record)
             .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
         // Append via read-modify-write under a temp+rename: JSONL appends
@@ -421,7 +447,7 @@ impl IssuedCertRecord {
         content.push(b'\n');
         Self::replace_locked(path, content, writer, held)
             .await
-            .map(drop)
+            .map(|(_, held)| held)
     }
 
     /// Replace the journal at `path` with `content`, durably, and give the
@@ -536,7 +562,8 @@ impl IssuedCertRecord {
     /// decision and the append are one step: every journal writer in this
     /// process holds the journal writer lock for its read-modify-write.
     /// `decide` runs under that lock, so it must not append to the journal.
-    /// `held` moves into each write (see [`Self::replace_locked`]).
+    /// `held` moves into each write (see [`Self::replace_locked`]), and
+    /// comes back with the result.
     ///
     /// # Errors
     /// Returns the underlying IO error of the append.
@@ -544,7 +571,7 @@ impl IssuedCertRecord {
         path: &Path,
         held: H,
         decide: F,
-    ) -> std::io::Result<bool>
+    ) -> std::io::Result<(bool, H)>
     where
         F: FnOnce(Vec<Self>) -> Fut,
         Fut: std::future::Future<Output = Option<Self>>,
@@ -557,10 +584,10 @@ impl IssuedCertRecord {
         let (writer, held) = Self::make_durable_locked(path, writer, held).await?;
         let existing = Self::load(path).await;
         let Some(record) = decide(existing).await else {
-            return Ok(false);
+            return Ok((false, held));
         };
-        Self::append_locked(path, &record, writer, held).await?;
-        Ok(true)
+        let held = Self::append_locked(path, &record, writer, held).await?;
+        Ok((true, held))
     }
 
     /// Load the journal for a writer that publishes its lines (owner
@@ -850,6 +877,7 @@ mod tests {
                 })
                 .await
                 .unwrap()
+                .0
             })
         };
         deciding_rx

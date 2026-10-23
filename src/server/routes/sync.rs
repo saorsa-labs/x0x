@@ -73,11 +73,20 @@ impl DaemonView {
     ///
     /// #1545: first remove the pending applies that the loaded profile
     /// already holds (`OwnerSyncStore::settle_saved`), so that no pass
-    /// applies them over a local edit saved before the start.
+    /// applies them over a local edit saved before the start. The loaded
+    /// profile is made durable first: a save that stopped after its
+    /// rename and before its directory fsync is visible but not durable,
+    /// and a host crash after the settle would bring back the old profile
+    /// with nothing owed. When it cannot be made durable, nothing settles.
     pub(in crate::server) async fn attach(service: &OwnerSyncService, state: &Arc<AppState>) {
-        let durable = names_of(&*state.profile.read().await);
-        if let Err(e) = service.store().settle_saved(&durable).await {
-            tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to settle saved names");
+        {
+            // The read lock keeps every save out until the settle is done.
+            let profile = state.profile.read().await;
+            if let Err(e) = crate::profile::make_durable(&state.profile_path).await {
+                tracing::warn!(target: "x0x::owner_sync", error = %e, "cannot make the loaded profile durable; saved names not settled");
+            } else if let Err(e) = service.store().settle_saved(&names_of(&profile)).await {
+                tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to settle saved names");
+            }
         }
         service.attach_daemon_view(Arc::new(Self::new(Arc::clone(state))));
     }

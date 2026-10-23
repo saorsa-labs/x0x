@@ -1195,6 +1195,26 @@ impl OwnerSyncStore {
         tokio::fs::create_dir_all(&dir).await.map_err(|e| {
             SyncError::Io(format!("failed to create sync dir {}: {e}", dir.display()))
         })?;
+        // #1545: a write can stop after its rename and before its
+        // directory fsync. Its bytes are then visible but not durable, and
+        // a host crash can take them back after this start has acted on
+        // them (a journal recovery removes its intent, a settle removes an
+        // obligation). So make every state file durable before it is read.
+        for file in [
+            RECORDS_FILE,
+            DEVICES_FILE,
+            APPLY_PENDING_FILE,
+            TOMBSTONES_FILE,
+            JOURNAL_INTENT_FILE,
+        ] {
+            let path = dir.join(file);
+            crate::profile::make_durable(&path).await.map_err(|e| {
+                SyncError::Io(format!(
+                    "cannot make sync state file {} durable: {e} — refusing to start",
+                    path.display()
+                ))
+            })?;
+        }
         let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
         let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
         let pending_apply: PersistedPendingApplies =
@@ -1729,20 +1749,22 @@ impl OwnerSyncStore {
     /// Append the line for the register value `value` to the journal file
     /// at `path` when this device needs it ([`synced_line_needed`]).
     /// `published` is the register's value before the commit that accepted
-    /// `value`. The caller holds `journal_apply`, so the register cannot
+    /// `value`. `held` holds `journal_apply`, so the register cannot
     /// change and no reconcile can read the journal until this returns.
+    /// `held` moves into the append and comes back after it (#1545).
     ///
     /// # Errors
     ///
     /// The IO error of a failed append. The caller must not then persist
     /// `value` to the register (see `journal_apply`).
-    async fn apply_journal_value(
+    async fn apply_journal_value<H: Send + 'static>(
         &self,
         path: &Path,
         owner_hex: &str,
         value: &SyncValue,
         published: Option<SyncValue>,
-    ) -> std::io::Result<()> {
+        held: H,
+    ) -> std::io::Result<H> {
         let SyncValue::IssuanceJournal {
             agent_id,
             cert_digest,
@@ -1750,7 +1772,7 @@ impl OwnerSyncStore {
             not_after,
         } = value
         else {
-            return Ok(());
+            return Ok(held);
         };
         #[cfg(test)]
         if self
@@ -1763,37 +1785,41 @@ impl OwnerSyncStore {
             Some(SyncValue::IssuanceJournal { cert_digest, .. }) => Some(cert_digest),
             _ => None,
         };
-        // #1545: the journal write holds the store's write custody until it
-        // lands, so shutdown waits for it even when this caller is
-        // aborted, and a write after shutdown is refused.
+        // #1545: the journal write holds the store's write custody, and
+        // `held`, until it lands, so shutdown waits for it even when this
+        // caller is aborted, and a write after shutdown is refused.
         let custody = self
             .write_custody()
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        crate::profile::IssuedCertRecord::append_when(path, custody, |existing| async move {
-            #[cfg(test)]
-            self.pause_after_journal_check().await;
-            synced_line_needed(
-                &existing,
-                owner_hex,
-                agent_id,
-                cert_digest,
-                *issued_at,
-                *not_after,
-                published_digest.as_deref(),
-            )
-            .then(|| {
-                synced_journal_line(
-                    owner_hex.to_string(),
-                    agent_id.clone(),
-                    cert_digest.clone(),
+        let (_, (_, held)) = crate::profile::IssuedCertRecord::append_when(
+            path,
+            (custody, held),
+            |existing| async move {
+                #[cfg(test)]
+                self.pause_after_journal_check().await;
+                synced_line_needed(
+                    &existing,
+                    owner_hex,
+                    agent_id,
+                    cert_digest,
                     *issued_at,
                     *not_after,
+                    published_digest.as_deref(),
                 )
-            })
-        })
+                .then(|| {
+                    synced_journal_line(
+                        owner_hex.to_string(),
+                        agent_id.clone(),
+                        cert_digest.clone(),
+                        *issued_at,
+                        *not_after,
+                    )
+                })
+            },
+        )
         .await?;
-        Ok(())
+        Ok(held)
     }
 
     /// Apply accepted `IssuanceJournal` records to the issuance journal at
@@ -2169,17 +2195,21 @@ impl OwnerSyncStore {
 
     /// [`Self::commit_batch`] after its `journal_apply` step. `journal` is
     /// the journal file to apply accepted `IssuanceJournal` values to;
-    /// `held` then holds `journal_apply`. `held` moves into each write of
-    /// the journal intent and of the register (`run_to_completion`), and
-    /// comes back on success. `admission` is the session admission to
-    /// re-validate under the gate and the records lock.
+    /// `held` then holds `journal_apply`. `admission` is the session
+    /// admission to re-validate under the gate and the records lock.
+    ///
+    /// #1545: every guard the commit holds (the gate, the records lock,
+    /// the revocation read guard and `held`) moves into each of its
+    /// durable writes (`run_to_completion`) and comes back after it. A
+    /// cancelled caller thus releases no guard while a write of the commit
+    /// can still land; `held` comes back on success.
     async fn commit_locked<H: Send + 'static>(
         &self,
         batch: Vec<VersionedRecord>,
         owner: &UserId,
         admission: Option<&SessionAdmission<'_>>,
         journal: Option<&PathBuf>,
-        mut held: H,
+        held: H,
     ) -> Result<(CommitOutcome, H), SyncError> {
         // #449 r3 P2: an inbound batch that can change the canonical Home
         // register waits behind any in-flight seat mint, and blocks the next
@@ -2196,7 +2226,7 @@ impl OwnerSyncStore {
         // #1055 RC1/RC2: a session commit re-validates the peer's admission
         // under the gate and the records lock, and holds the revocation
         // read guard to the end of the commit (see `commit_session_batch`).
-        let _revocations = match admission {
+        let revocations = match admission {
             Some(admission) => {
                 admission.enrollment_current().await?;
                 admission.revocations_checked().await?
@@ -2261,6 +2291,7 @@ impl OwnerSyncStore {
             Some(_) => Self::journal_updates(&records, &next, &touched),
             None => Vec::new(),
         };
+        let mut hold = (records, canonical_gate, revocations, held);
         if let Some(path) = journal.filter(|_| !updates.is_empty()) {
             // The intent first: after a stop between the two writes, the
             // journal holds lines that came from these records, and the
@@ -2268,12 +2299,13 @@ impl OwnerSyncStore {
             // (see `recover_journal_commit`). The intent holds every
             // accepted record of the batch, not only the journal ones, so
             // the recovery commits all of it or none.
-            held = self
-                .persist_journal_intent(held, outcome.accepted.clone())
+            hold = self
+                .persist_journal_intent(hold, outcome.accepted.clone())
                 .await?;
             let owner_hex = hex::encode(owner.0);
             for (record, published) in &updates {
-                self.apply_journal_value(path, &owner_hex, &record.value, published.clone())
+                hold = self
+                    .apply_journal_value(path, &owner_hex, &record.value, published.clone(), hold)
                     .await
                     .map_err(|e| {
                         SyncError::Io(format!("failed to append synced journal line: {e}"))
@@ -2286,13 +2318,15 @@ impl OwnerSyncStore {
         }
         // #1545: the obligation to apply the names before the register
         // holds them (see `pending_apply`).
-        self.add_pending_applies(&outcome.accepted).await?;
-        let (_, mut held) = self
-            .replace_records(records, next, (canonical_gate, held))
+        let (records, canonical_gate, revocations, held) =
+            self.add_pending_applies(&outcome.accepted, hold).await?;
+        let mut guards = self
+            .replace_records(records, next, (canonical_gate, revocations, held))
             .await?;
         if !updates.is_empty() {
-            held = self.remove_journal_intent(held).await?;
+            guards = self.remove_journal_intent(guards).await?;
         }
+        let (_, _, held) = guards;
         Ok((outcome, held))
     }
 
@@ -2373,13 +2407,19 @@ impl OwnerSyncStore {
     }
 
     /// Add the name records of a commit to `pending_apply` and its file.
-    async fn add_pending_applies(&self, accepted: &[VersionedRecord]) -> Result<(), SyncError> {
+    /// `held` holds the guards of the commit; it moves into the write and
+    /// comes back (`replace_pending`).
+    async fn add_pending_applies<H: Send + 'static>(
+        &self,
+        accepted: &[VersionedRecord],
+        held: H,
+    ) -> Result<H, SyncError> {
         let names: Vec<&VersionedRecord> = accepted
             .iter()
             .filter(|r| matches!(r.kind, SyncKind::OwnerProfile | SyncKind::MachineNames))
             .collect();
         if names.is_empty() {
-            return Ok(());
+            return Ok(held);
         }
         let pending = Arc::clone(&self.pending_apply).lock_owned().await;
         let mut next = pending.clone();
@@ -2401,7 +2441,7 @@ impl OwnerSyncStore {
             }
         }
         next.epoch = next.epoch.wrapping_add(1);
-        self.replace_pending(pending, next).await
+        self.replace_pending(pending, next, held).await
     }
 
     /// #1545: the generation of the pending applies
@@ -2429,20 +2469,24 @@ impl OwnerSyncStore {
     /// back after a crash with the obligations it removed.
     ///
     /// The write and the update run to their end in one task
-    /// (`run_to_completion`), which owns `pending` until then. A caller
-    /// cancelled during the write stops only its wait: no later change of
-    /// the pending applies can start before the write lands, and memory
-    /// ends as the disk holds it (Codex review of #1545, b17cd8bf).
+    /// (`run_to_completion`), which owns `pending` and `held` (the other
+    /// guards of the caller, such as the `records` lock) until then. A
+    /// caller cancelled during the write stops only its wait: no later
+    /// change of the pending applies, and no change that a guard in
+    /// `held` keeps out, can start before the write lands, and memory ends
+    /// as the disk holds it (Codex review of #1545, b17cd8bf, 17e0dae3).
+    /// `held` comes back on success.
     ///
     /// # Errors
     ///
     /// [`SyncError::Io`] when the file cannot be written; `pending` does
     /// not change.
-    async fn replace_pending(
+    async fn replace_pending<H: Send + 'static>(
         &self,
         mut pending: tokio::sync::OwnedMutexGuard<PendingApplies>,
         mut next: PendingApplies,
-    ) -> Result<(), SyncError> {
+        held: H,
+    ) -> Result<H, SyncError> {
         let path = self.dir.join(APPLY_PENDING_FILE);
         let bytes = serde_json::to_vec(&PersistedPendingApplies {
             applies: next
@@ -2463,7 +2507,7 @@ impl OwnerSyncStore {
                 })?;
             next.applies.retain(|_, p| !p.discharged);
             *pending = next;
-            Ok(())
+            Ok(held)
         })
         .await
     }
@@ -2550,7 +2594,7 @@ impl OwnerSyncStore {
         if !changed {
             return Ok(());
         }
-        self.replace_pending(pending, next).await
+        self.replace_pending(pending, next, ()).await
     }
 
     /// #1545: remove `done` from the pending applies, after the daemon has
@@ -2581,7 +2625,7 @@ impl OwnerSyncStore {
     ) -> Result<(), SyncError> {
         #[cfg(test)]
         Self::take_pause(&self.discharge_pause).await;
-        let records = self.records.read().await;
+        let records = Arc::clone(&self.records).read_owned().await;
         let mut pending = Arc::clone(&self.pending_apply).lock_owned().await;
         let mut retired = false;
         for (record, applied) in done {
@@ -2609,7 +2653,7 @@ impl OwnerSyncStore {
             return Err(SyncError::Io("injected discharge failure".into()));
         }
         let next = pending.clone();
-        self.replace_pending(pending, next).await
+        self.replace_pending(pending, next, records).await.map(drop)
     }
 
     /// #1545: remove the pending applies that a durable profile with
@@ -2624,7 +2668,7 @@ impl OwnerSyncStore {
     /// stay in memory as discharged, as in `discharge_applies`.
     pub(crate) async fn settle_saved(&self, durable: &SyncProfileNames) -> Result<(), SyncError> {
         let saved = SavedNames::from(durable);
-        let _records = self.records.read().await;
+        let records = Arc::clone(&self.records).read_owned().await;
         let mut pending = Arc::clone(&self.pending_apply).lock_owned().await;
         let mut settled = false;
         for entry in pending.applies.values_mut() {
@@ -2638,7 +2682,7 @@ impl OwnerSyncStore {
         }
         pending.epoch = pending.epoch.wrapping_add(1);
         let next = pending.clone();
-        self.replace_pending(pending, next).await
+        self.replace_pending(pending, next, records).await.map(drop)
     }
 
     /// #1542: finish a commit that stopped after its journal intent was
@@ -3098,7 +3142,7 @@ pub(crate) async fn run_sync_session_with_recheck<S, R, F>(
     send: &mut S,
     recv: &mut R,
     store: &OwnerSyncStore,
-    revocations: Option<&tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    revocations: Option<&Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
     owner: &UserKeypair,
     local_machine: &MachineId,
     peer_machine: &MachineId,
@@ -3183,7 +3227,7 @@ async fn negotiate_sync_session<S, R>(
     send: &mut S,
     recv: &mut R,
     store: &OwnerSyncStore,
-    revocations: Option<&tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    revocations: Option<&Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
     owner: &UserKeypair,
     local_machine: &MachineId,
     peer_machine: &MachineId,
@@ -3776,7 +3820,7 @@ struct SessionAdmission<'a> {
     /// Machine revocation set (ADR-0018) when the caller has one: the
     /// daemon paths pass the agent's set; library sessions pass `None`
     /// and re-check enrollment currency alone.
-    revocations: Option<&'a tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    revocations: Option<&'a Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
     owner: &'a UserId,
     peer: &'a MachineId,
 }
@@ -3805,15 +3849,19 @@ impl SessionAdmission<'_> {
     /// (#1055 RC2): a revocation that lands concurrently either precedes
     /// this check (the commit is refused) or waits for the guard and
     /// applies after the commit — never between the check and the
-    /// mutation.
+    /// mutation. The guard is owned, so it can move into each durable
+    /// write of the commit (`run_to_completion`) and outlive a cancelled
+    /// caller until the write lands (#1545).
     async fn revocations_checked(
         &self,
-    ) -> Result<Option<tokio::sync::RwLockReadGuard<'_, crate::revocation::RevocationSet>>, SyncError>
-    {
+    ) -> Result<
+        Option<tokio::sync::OwnedRwLockReadGuard<crate::revocation::RevocationSet>>,
+        SyncError,
+    > {
         match self.revocations {
             None => Ok(None),
             Some(revocations) => {
-                let revoked = revocations.read().await;
+                let revoked = Arc::clone(revocations).read_owned().await;
                 if revoked.revocation_resync_required() || revoked.is_machine_revoked(self.peer) {
                     return Err(SyncError::MachineRevoked {
                         machine: self.peer.0,
@@ -4380,7 +4428,7 @@ impl OwnerSyncService {
             send,
             recv,
             &self.store,
-            Some(revocations.as_ref()),
+            Some(&revocations),
             owner_kp,
             local_machine,
             peer,
@@ -5779,6 +5827,7 @@ mod tests {
                     not_after: Some(5_000),
                 },
                 None,
+                (),
             )
             .await
             .expect("apply d1");
@@ -8717,7 +8766,7 @@ mod issuance_journal_sync_tests {
         // The commit of `B` stops after its obligation is durable and
         // before its register write.
         local
-            .add_pending_applies(std::slice::from_ref(&b))
+            .add_pending_applies(std::slice::from_ref(&b), ())
             .await
             .expect("obligation of B");
         drop(local);
@@ -9118,7 +9167,7 @@ mod cancellation_tests {
                 let peer = machine(2);
                 let admission = SessionAdmission {
                     store: &local,
-                    revocations: Some(revocations.as_ref()),
+                    revocations: Some(&revocations),
                     owner: &owner_id,
                     peer: &peer,
                 };
@@ -9473,7 +9522,7 @@ mod issue_1055_tests {
                 &mut s_send,
                 &mut s_recv,
                 &session_store,
-                Some(session_revocations.as_ref()),
+                Some(&session_revocations),
                 &session_owner,
                 &local,
                 &peer,
@@ -10149,7 +10198,7 @@ mod issue_1055_tests {
             &mut s_send,
             &mut s_recv,
             &store,
-            Some(revocations.as_ref()),
+            Some(&revocations),
             &owner,
             &local,
             &peer,
@@ -10171,7 +10220,7 @@ mod issue_1055_tests {
             let commit_owner_id = commit_owner.user_id();
             let admission = SessionAdmission {
                 store: &commit_store,
-                revocations: Some(commit_revocations.as_ref()),
+                revocations: Some(&commit_revocations),
                 owner: &commit_owner_id,
                 peer: &commit_peer,
             };
