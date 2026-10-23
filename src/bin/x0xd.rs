@@ -783,22 +783,38 @@ fn init_logging(level: &str, format: &str) -> Result<Vec<log_flush::LogGuard>> {
     let mut guards = vec![stdout_guard];
     let file_writer = log_dir.as_ref().and_then(|dir| {
         let open = || -> std::io::Result<_> {
-            std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
-            {
-                // Persist new directory entries before acknowledging logs.
-                let canonical = std::fs::canonicalize(dir)?;
-                for ancestor in canonical.ancestors() {
-                    std::fs::File::open(ancestor)?.sync_all()?;
-                }
-            }
+            log_flush::prepare_log_dir(
+                dir,
+                |path| std::fs::File::open(path)?.sync_all(),
+                |path, error| {
+                    eprintln!(
+                        "x0xd: log directory {} sync warning: {error}",
+                        path.display()
+                    );
+                },
+            )?;
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(dir)?;
             let path = dir.join(format!("x0xd-{}.log", std::process::id()));
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)?;
             #[cfg(unix)]
-            let (writer, guard) = log_flush::acknowledged_file(file, std::fs::File::open(dir)?)?;
+            let (writer, guard) = {
+                let parent = match std::fs::File::open(dir) {
+                    Ok(parent) => Some(parent),
+                    Err(error) => {
+                        eprintln!(
+                            "x0xd: log directory {} open warning: {error}",
+                            dir.display()
+                        );
+                        None
+                    }
+                };
+                log_flush::acknowledged_file(file, parent)?
+            };
             #[cfg(not(unix))]
             let (writer, guard) = log_flush::acknowledged(file)?;
             Ok((path, writer, guard))
