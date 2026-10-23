@@ -245,10 +245,18 @@ enum TraceEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct SimConnection {
     generation: u64,
+    /// The remote peer's fabric address (#1112 round 9), so the guards'
+    /// session pair check exercises the same path as the QUIC backend.
+    addr: SocketAddr,
     closed: Arc<AtomicBool>,
 }
 
 impl SimConnection {
+    /// The remote peer's fabric address (#1112 round 9).
+    pub(crate) fn remote_address(&self) -> SocketAddr {
+        self.addr
+    }
+
     pub(crate) fn stable_id(&self) -> usize {
         usize::try_from(self.generation).unwrap_or(usize::MAX)
     }
@@ -2232,14 +2240,14 @@ impl SimLink {
     }
 
     pub(crate) fn session_connection(&self, peer: &PeerId) -> Option<SimConnection> {
-        self.fabric
-            .lock()
-            .links
-            .get(&pair(self.me.0, peer.0))
-            .map(|link| SimConnection {
-                generation: link.generation_for(self.me.0),
-                closed: Arc::clone(&link.closed),
-            })
+        let state = self.fabric.lock();
+        let link = state.links.get(&pair(self.me.0, peer.0))?;
+        let addr = state.nodes.get(&peer.0).map(|slot| slot.addr)?;
+        Some(SimConnection {
+            generation: link.generation_for(self.me.0),
+            addr,
+            closed: Arc::clone(&link.closed),
+        })
     }
 
     pub(crate) fn note_publish(&self, topic: &str, payload: &[u8]) {
