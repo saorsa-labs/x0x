@@ -1437,27 +1437,25 @@ pub async fn serve_with_options(
     // only on exactly its pinned ids; anything else stays down with a
     // reason in `GET /forwards`. Local work only — it never blocks startup
     // on the network. Names of peers not yet discovered resolve later, so
-    // forwards still down are retried until they come up or are deleted
-    // (a retry can only ever bring a forward up on its pinned ids).
+    // transient failures use a bounded backoff. Permanent failures stay down
+    // until owner action; retries can only bring up the pinned ids.
     if state.forward_service.is_some() {
         let restore_state = Arc::clone(&state);
         let mut shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-                routes::connect::FORWARD_RESTORE_RETRY_SECS,
-            ));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut next = tokio::time::Instant::now();
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => {}
+                    _ = tokio::time::sleep_until(next) => {}
                     _ = shutdown_rx.changed() => return,
                 }
                 if *shutdown_rx.borrow() {
                     return;
                 }
-                if routes::connect::restore_forwards(&restore_state).await == 0 {
+                let Some(deadline) = routes::connect::restore_forwards(&restore_state).await else {
                     return;
-                }
+                };
+                next = deadline;
             }
         }));
     }
@@ -1602,7 +1600,7 @@ pub async fn serve_with_options(
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
-        sync.attach_view(Arc::new(routes::DaemonView::new(Arc::clone(&state))));
+        routes::DaemonView::attach(sync, &state).await;
         let service = Arc::clone(sync);
         let shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
@@ -3503,6 +3501,16 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
             );
         }
     }
+    // #1545: the owner-sync store runs each durable write in its own task,
+    // so an abort above stops only the wait of its caller. Wait for those
+    // writes, and refuse new ones, before the instance locks are released:
+    // a daemon restarted on this data dir must not see a late write land
+    // over its own state. The issuance journal writer runs each write in
+    // its own task too; wait for one in flight from any other caller.
+    if let Some(sync) = state.owner_sync.as_ref() {
+        sync.store().release_write_custody().await;
+    }
+    crate::profile::IssuedCertRecord::wait_for_writes().await;
 }
 
 /// Whether two directory paths refer to the same directory, tolerating

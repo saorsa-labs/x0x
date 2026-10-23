@@ -26,7 +26,7 @@ use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, 
 use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::monitor::VerifiedRelease;
 use x0x::upgrade::restart::RestartOwnershipError;
-use x0x::upgrade::signature::verify_manifest_signature;
+use x0x::upgrade::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
 use x0x::Agent;
 
 const UPGRADE_CHECK_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -445,6 +445,7 @@ pub(in crate::server) async fn run_startup_update_check(
     let Some(verified) = checked else {
         return Ok(None);
     };
+    x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest)?;
 
     tracing::info!(
         new_version = %verified.manifest.version,
@@ -596,6 +597,9 @@ pub(in crate::server) async fn broadcast_current_manifest(
 
     match monitor.fetch_current_manifest().await {
         Ok(Some(verified)) => {
+            if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
+                return;
+            }
             // Sync SKILL.md with current manifest
             update_skill_if_changed(&verified.manifest, data_dir).await;
 
@@ -604,6 +608,9 @@ pub(in crate::server) async fn broadcast_current_manifest(
                 "Broadcasting current release manifest v{} to gossip",
                 verified.manifest.version
             );
+            if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
+                return;
+            }
             let gossip_payload = verified.gossip_payload;
             {
                 let mut self_published = self_published_release_manifests.lock().await;
@@ -1072,17 +1079,21 @@ pub(in crate::server) async fn run_gossip_update_listener(
 }
 
 fn verify_gossip_release(payload: &[u8]) -> Option<VerifiedRelease> {
+    verify_gossip_release_with_key(payload, RELEASE_SIGNING_KEY)
+}
+
+fn verify_gossip_release_with_key(payload: &[u8], trusted_key: &[u8]) -> Option<VerifiedRelease> {
     let (json, signature) = decode_signed_manifest(payload).ok()?;
     let manifest: ReleaseManifest = serde_json::from_slice(json).ok()?;
     if !is_newer(&manifest.version, x0x::VERSION) {
         return None;
     }
-    if let Err(error) = verify_manifest_signature(json, signature) {
+    if let Err(error) = verify_bytes_signature_with_key(json, signature, trusted_key) {
         tracing::warn!(%error, "Release manifest signature verification failed");
         return None;
     }
     if let Err(error) = x0x::upgrade::monitor::validate_manifest_timestamp(&manifest) {
-        tracing::warn!(%error, "Rejecting stale gossip manifest");
+        tracing::warn!(%error, "Rejecting ineligible gossip manifest");
         return None;
     }
     Some(VerifiedRelease {
@@ -1117,6 +1128,9 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
             release = releases.next() => match release { Some(release) => release, None => return },
             _ = shutdown.changed() => return,
         };
+        if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
+            continue;
+        }
         let decision = {
             let mut published = self_published.lock().await;
             decide_release_manifest_rebroadcast(
@@ -1237,6 +1251,9 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
                 continue;
             }
         };
+        if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
+            continue;
+        }
         if let Some(submit) = submit
             .as_ref()
             .filter(|submit| submit.in_retry_backoff(&verified))
@@ -1419,6 +1436,9 @@ async fn update_skill_inner(
     {
         return;
     }
+    if x0x::upgrade::monitor::validate_manifest_timestamp(manifest).is_err() {
+        return;
+    }
     let skill_path = data_dir.join("SKILL.md");
 
     let local_hash = match tokio::fs::read(&skill_path).await {
@@ -1481,6 +1501,9 @@ async fn update_skill_inner(
             } else {
                 data_dir
             };
+            if x0x::upgrade::monitor::validate_manifest_timestamp(manifest).is_err() {
+                return;
+            }
             let skill_path = data_dir.join("SKILL.md");
             // The startup check and the startup manifest broadcast can
             // both reach this write concurrently (#1086): stage the
@@ -1493,6 +1516,7 @@ async fn update_skill_inner(
                 std::process::id(),
                 SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
             ));
+            let admitted_manifest = manifest.clone();
             let install = x0x::upgrade::apply::run_owned_blocking_with_permit(
                 permit.as_ref(),
                 move |caller_alive| {
@@ -1547,6 +1571,7 @@ async fn update_skill_inner(
                     }
                     #[cfg(test)]
                     observation.before_write();
+                    x0x::upgrade::monitor::validate_manifest_timestamp(&admitted_manifest)?;
                     let result = std::fs::write(&tmp_path, &new_contents)
                         .and_then(|()| std::fs::rename(&tmp_path, &skill_path));
                     if result.is_err() {
@@ -2093,8 +2118,12 @@ mod tests {
     fn manifest_with_version(version: &str) -> ReleaseManifest {
         ReleaseManifest {
             schema_version: SCHEMA_VERSION,
+            channel: "stable".into(),
             version: version.to_string(),
-            timestamp: 4_102_444_800,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs(),
             assets: vec![PlatformAsset {
                 target: "x86_64-unknown-linux-gnu".to_string(),
                 archive_url: "https://example.com/x0x-linux-x64-gnu.tar.gz".to_string(),
@@ -2103,6 +2132,95 @@ mod tests {
             }],
             skill_url: "https://example.com/SKILL.md".to_string(),
             skill_sha256: [0xBB; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_eligibility_gates_gossip_and_both_forwarders() {
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .unwrap();
+        let good =
+            serde_json::to_value(manifest_with_version(&version_newer_than_current())).unwrap();
+        let now = good["timestamp"].as_u64().unwrap();
+        let mut cases = vec![("valid", good.clone(), true)];
+        for (field, value) in [
+            ("channel", serde_json::json!(0)),
+            ("channel", serde_json::json!("")),
+            ("channel", serde_json::json!("unknown")),
+            ("channel", serde_json::json!("prerelease")),
+            ("version", serde_json::json!("99.0.0-rc.1")),
+            ("timestamp", serde_json::json!(0)),
+            ("timestamp", serde_json::json!(now + 3600)),
+            ("timestamp", serde_json::json!(now - 31 * 86400)),
+        ] {
+            let mut value_case = good.clone();
+            value_case[field] = value;
+            cases.push((field, value_case, false));
+        }
+        for field in ["channel", "timestamp"] {
+            let mut missing = good.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            cases.push((field, missing, false));
+        }
+        let mut prerelease = good.clone();
+        prerelease["channel"] = serde_json::json!("prerelease");
+        prerelease["version"] = serde_json::json!("99.0.0-rc.1");
+        cases.push(("prerelease ban", prerelease, false));
+        for (label, value, eligible) in cases {
+            let json = serde_json::to_vec(&value).unwrap();
+            let signature = sign_with_context(&sk.to_bytes(), &json).unwrap();
+            let payload = x0x::upgrade::manifest::encode_signed_manifest(&json, &signature);
+            assert_eq!(
+                verify_gossip_release_with_key(&payload, &pk.to_bytes()).is_some(),
+                eligible,
+                "{label}"
+            );
+            let Ok(manifest) = serde_json::from_slice::<ReleaseManifest>(&json) else {
+                continue;
+            };
+            let verified = VerifiedRelease {
+                manifest,
+                manifest_json: json,
+                signature,
+                gossip_payload: payload,
+            };
+            let (_keep_running, shutdown) = watch::channel(false);
+            let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = Arc::clone(&published);
+            run_gossip_update_driver(
+                futures::stream::iter([verified.clone()]),
+                None,
+                Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                move |_| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+                shutdown.clone(),
+            )
+            .await;
+            let count = Arc::clone(&published);
+            run_fallback_update_driver(
+                futures::stream::iter([()]),
+                move || {
+                    let verified = verified.clone();
+                    async { Ok(Some(verified)) }
+                },
+                None,
+                Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+                move |_| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+                shutdown,
+            )
+            .await;
+            assert_eq!(
+                published.load(std::sync::atomic::Ordering::SeqCst),
+                if eligible { 2 } else { 0 },
+                "{label}"
+            );
         }
     }
 
@@ -2317,8 +2435,12 @@ mod tests {
     fn manifest_for_this_platform(version: &str) -> ReleaseManifest {
         ReleaseManifest {
             schema_version: SCHEMA_VERSION,
+            channel: "stable".into(),
             version: version.to_string(),
-            timestamp: 4_102_444_800,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs(),
             assets: vec![PlatformAsset {
                 target: x0x::upgrade::manifest::current_platform_target()
                     .expect("current platform target")

@@ -1090,6 +1090,7 @@ impl AutoApplyUpgrader {
         manifest: &ReleaseManifest,
     ) -> Result<UpgradeResult, UpgradeError> {
         self.check_release()?;
+        super::monitor::validate_manifest_timestamp(manifest)?;
         let current_version_str = crate::VERSION;
         let target_version = semver::Version::parse(&manifest.version)
             .map_err(|e| UpgradeError::Other(format!("invalid version: {e}")))?;
@@ -1340,9 +1341,7 @@ impl AutoApplyUpgrader {
                 super::probe::run_before_swap(&request, alive)
                     .map(|_| ())
                     .map_err(|error| UpgradeError::Other(error.to_string()))?;
-                if staging.is_some() {
-                    super::monitor::validate_manifest_timestamp(&admitted_manifest)?;
-                }
+                super::monitor::validate_manifest_timestamp(&admitted_manifest)?;
                 Ok(())
             }))
         };
@@ -1403,6 +1402,7 @@ impl AutoApplyUpgrader {
         };
 
         self.check_release()?;
+        super::monitor::validate_manifest_timestamp(manifest)?;
         let result = apply_replacements_with_permit(
             upgrader,
             extracted_path,
@@ -3017,7 +3017,11 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "not-a-version".to_string(),
-            timestamp: 0,
+            channel: "stable".to_owned(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             assets: vec![],
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
@@ -3038,7 +3042,11 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "0.1.0".to_string(),
-            timestamp: 0,
+            channel: "stable".to_owned(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             assets: vec![],
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
@@ -3056,7 +3064,11 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "99.99.99".to_string(),
-            timestamp: 0,
+            channel: "stable".to_owned(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             assets: vec![], // No platform assets
             skill_url: String::new(),
             skill_sha256: [0u8; 32],

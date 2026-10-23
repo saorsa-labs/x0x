@@ -115,6 +115,11 @@ impl Default for SidecarStatus {
 #[derive(Debug, Clone)]
 struct StoredEvaluation {
     permission: Option<CommitPermission>,
+    /// The cause this pass derived for the row, before the last refused
+    /// attempt's cause is shown on it. A seal decision reads this one: an
+    /// attempt's cause is a record of the past, and the seal re-checks the
+    /// head live (#1508 review P1).
+    cause: Option<WaitingCause>,
     action: RowAction,
     stable_group_key: String,
 }
@@ -596,6 +601,13 @@ async fn local_epoch_of(state: &AppState, group_key: &str, info: &GroupInfo) -> 
 /// head and the evidence on every call, so a caller can check just before
 /// a seal.
 pub(super) async fn group_head_synced(state: &AppState, group_key: &str) -> bool {
+    group_head_synced_at(state, group_key, None).await
+}
+
+/// [`group_head_synced`] with the local TreeKEM epoch given by a caller
+/// that already holds the group's TreeKEM lock (that lock is not
+/// re-entrant).
+async fn group_head_synced_at(state: &AppState, group_key: &str, tree_epoch: Option<u64>) -> bool {
     let runtime = &state.revocation_evictions;
     let now = Instant::now();
     if !runtime.restart_wait_elapsed(now) {
@@ -608,7 +620,10 @@ pub(super) async fn group_head_synced(state: &AppState, group_key: &str) -> bool
     }) else {
         return false;
     };
-    let local_epoch = local_epoch_of(state, &key, &info).await;
+    let local_epoch = match tree_epoch {
+        Some(epoch) => epoch,
+        None => local_epoch_of(state, &key, &info).await,
+    };
     let unresolved = unresolved_head_evidence(state, &key, &info, local_epoch).await;
     let local = *state.agent.agent_id().as_bytes();
     let inner = runtime.inner.lock().await;
@@ -1068,6 +1083,19 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             local_certificate_expired: local_certificate_expired(info, &local, now_unix),
         };
         let mut evaluation = s4::evaluate_row(&row, &ctx, &runtime.timing);
+        // §3 (#1508 review P1): this node cannot read the target's leaf
+        // without its committed KeyPackage. Every node asks for it through
+        // the one evidence route, so the committer can exclude the leaf and
+        // every survivor can complete the row from its own tree.
+        if !target_seated && leaves.undecided(&key.stable_group_id, &key.target) {
+            super::request_missing_leaf_evidence(state, group_key, &target_hex);
+            if evaluation.action != RowAction::None && evaluation.waiting.is_none() {
+                evaluation.waiting = Some(WaitingState::cause(
+                    WaitingCause::WaitingForMemberKeyPackage,
+                ));
+            }
+        }
+        let derived_cause = evaluation.waiting.as_ref().map(|waiting| waiting.cause);
         if inner.rebuilding {
             evaluation.waiting = Some(WaitingState::cause(WaitingCause::RebuildingObligationStore));
             evaluation.action = RowAction::None;
@@ -1176,6 +1204,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             key,
             StoredEvaluation {
                 permission: evaluation.permission,
+                cause: derived_cause,
                 action: evaluation.action,
                 stable_group_key: (*group_key).clone(),
             },
@@ -1285,7 +1314,15 @@ fn revocation_seats(groups: &[(String, GroupInfo)], leaves: &RetainedLeaves) -> 
 
 /// Every group with its roster map key. Withdrawn groups are kept so
 /// that their rows terminate (`group_deleted`).
+///
+/// These are the committed group records. The copy runs under the persistence lock
+/// (#1508 review P1): `persist_named_group_info` shows its candidate in
+/// the map before the write and restores the map when the write fails, so
+/// a read without the lock can see a roster that is never durable. A row
+/// that completed, or a ban that dropped, on that roster would stay done
+/// after the rollback. Call it with no S4 lock held.
 async fn snapshot_groups(state: &AppState) -> Vec<(String, GroupInfo)> {
+    let _committed = state.named_groups_persistence_lock.lock().await;
     state
         .named_groups
         .read()
@@ -1344,8 +1381,9 @@ type TrackedLeaves = (Vec<[u8; 32]>, u64);
 ///
 /// A TreeKEM member whose leaf this node cannot decide from the tree (no
 /// committed KeyPackage here, and not in the local leaf map) is in
-/// `undecided`. It is neither retained nor excluded: its work stays
-/// pending (#1508 review P1).
+/// `undecided`. It is neither retained nor excluded: a trigger on it opens
+/// an evidence-waiting row, the pass asks for the KeyPackage, and the row
+/// stays open until the tree decides (#1508 review P1).
 #[derive(Default)]
 struct RetainedLeaves {
     by_group: HashMap<String, Option<TrackedLeaves>>,
@@ -1366,6 +1404,14 @@ impl RetainedLeaves {
             Some(None) => None,
             None => Some(false),
         }
+    }
+
+    /// Whether `agent`'s leaf is undecided: this node has a tree for the
+    /// group but not the evidence to read the leaf.
+    fn undecided(&self, stable_group_id: &str, agent: &[u8; 32]) -> bool {
+        self.undecided
+            .get(stable_group_id)
+            .is_some_and(|agents| agents.contains(agent))
     }
 
     fn epoch(&self, stable_group_id: &str) -> Option<u64> {
@@ -1419,11 +1465,12 @@ async fn snapshot_retained_leaves(
         let entry = match tree.try_lock() {
             Ok(group) => {
                 let mut tracked = Vec::new();
-                for member in info.members_v2.values() {
-                    let Ok(agent) = super::parse_agent_id_hex(&member.agent_id) else {
+                let presence = super::roster_treekem_leaf_presence(&group, info);
+                for (member, present) in presence {
+                    let Ok(agent) = super::parse_agent_id_hex(&member) else {
                         continue;
                     };
-                    match super::member_treekem_leaf_present(&group, member) {
+                    match present {
                         Some(true) => tracked.push(*agent.as_bytes()),
                         Some(false) => {}
                         None => {
@@ -1478,7 +1525,12 @@ fn derive_triggers(
                 continue;
             };
             let target = *agent.as_bytes();
-            let retained_leaf = leaves.tracks(stable, &target).unwrap_or(false);
+            // An undecided leaf may still be retained: it opens the work
+            // like a retained one, so the designated or a fallback admin
+            // fetches the KeyPackage and excludes the leaf. A miss is never
+            // read as an absent leaf (§3, #1508 review P1).
+            let retained_leaf = leaves.tracks(stable, &target).unwrap_or(false)
+                || leaves.undecided(stable, &target);
             let seated = is_seated(member.state);
             let incarnation = ce::seat_incarnation(info, &member.agent_id);
             // §1: an Agent-subject revocation creates work where the target
@@ -1754,81 +1806,16 @@ async fn manual_request_gate(
         info.stable_group_id().to_string()
     };
     let key = EvictionKey::new(stable.clone(), *target.as_bytes());
-    let permission = {
-        let inner = state.revocation_evictions.inner.lock().await;
-        // §1a/D135 (#1508 review): the reconciliation can end the row of
-        // the worker's own prepared removal (a rebind landed while the
-        // journal was written). That removal stops; it never continues as
-        // an ordinary removal of the renewed seat.
-        // The worker's own removal skips the rest of the gate: it checked
-        // the head and the intake itself just before it sealed.
-        if s4_prepared_removal_of(&key) {
-            return (inner.store.get(&key).map(|row| row.phase) != Some(Phase::Prepared))
-                .then(s4_exclusion_cancelled_response);
-        }
-        let row = inner.store.get(&key)?;
-        if !row.phase.is_open() {
-            return None;
-        }
-        let permission = inner.evaluations.get(&key)?.permission.clone()?;
-        let stored = row
-            .waiting
-            .as_ref()
-            .map(|waiting| waiting.cause)
-            .filter(|cause| blocks_manual_request(*cause))
-            // Durability is read live, as the evaluation computes it.
-            .or_else(|| {
-                (inner.sidecar.state.writable() && inner.not_durable.contains_key(&key))
-                    .then_some(WaitingCause::WaitingForDurableIntake)
-            });
-        match permission {
-            CommitPermission::Wait {
-                designated,
-                remaining,
-            } => Err((designated, remaining)),
-            CommitPermission::Designated | CommitPermission::Fallback { .. } => Ok(stored),
-            CommitPermission::NotEligible => return None,
-        }
-    };
-    let (status, waiting) = match permission {
-        Err((designated, remaining)) => {
-            let inner = state.revocation_evictions.inner.lock().await;
-            let rank = inner
-                .store
-                .get(&key)
-                .and_then(|row| {
-                    row.ranks
-                        .iter()
-                        .position(|id| id == state.agent.agent_id().as_bytes())
-                })
-                .map(|index| index.saturating_add(1));
-            drop(inner);
-            let now_ms = now_unix_ms();
-            (
-                WaitingCause::WaitingForDesignatedAdmin,
-                serde_json::json!({
-                    "cause": WaitingCause::WaitingForDesignatedAdmin.as_str(),
-                    "designated_admin": hex::encode(designated),
-                    "detail": "rank",
-                    "local_rank": rank,
-                    "remaining_ms": s4::duration_ms(remaining),
-                    "fallback_at_unix_ms": now_ms.saturating_add(s4::duration_ms(remaining)),
-                }),
-            )
-        }
-        Ok(stored) => {
-            // §2: re-read the head just before the seal, as the worker does
-            // (`commit_removal`); the stored evaluation may be a pass old.
-            let cause = match stored {
-                Some(cause) => cause,
-                None if !group_head_synced(state, group_key).await => {
-                    WaitingCause::WaitingForHeadSync
-                }
-                None => return None,
-            };
-            (cause, serde_json::json!({ "cause": cause.as_str() }))
-        }
-    };
+    // §1a/D135 (#1508 review): the reconciliation can end the row of the
+    // worker's own prepared removal (a rebind landed while the journal was
+    // written). That removal stops; it never continues as an ordinary
+    // removal of the renewed seat. A still-prepared removal takes the same
+    // §2 re-check as every other seal, plus its own parent head (#1508
+    // review P1): it never skips the gate.
+    if s4_prepared_removal_of(&key) {
+        return prepared_removal_recheck(state, group_key, &key).await;
+    }
+    let (status, waiting) = seal_wait(state, group_key, &key, SealMode::Manual).await?;
     let now_ms = now_unix_ms();
     {
         let mut inner = state.revocation_evictions.inner.lock().await;
@@ -1868,11 +1855,226 @@ async fn manual_request_gate(
     ))
 }
 
+/// The §2 seal decision for one S4 target, read now: `None` when this node
+/// may seal, otherwise the cause it waits for and the `waiting` JSON. It
+/// reads the last evaluation (designation and rank), the stored blocking
+/// cause, live intake durability and a live [`group_head_synced`].
+/// `mode` says what a missing row and an ineligible node mean.
+async fn seal_wait(
+    state: &Arc<AppState>,
+    group_key: &str,
+    key: &EvictionKey,
+    mode: SealMode,
+) -> Option<(WaitingCause, serde_json::Value)> {
+    let ineligible = || {
+        let cause = WaitingCause::LocalCommitterIneligible;
+        (cause, serde_json::json!({ "cause": cause.as_str() }))
+    };
+    let permission = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        let row = inner.store.get(key).filter(|row| row.phase.is_open());
+        let evaluation = row.and_then(|_| inner.evaluations.get(key));
+        let permission = evaluation.and_then(|evaluation| evaluation.permission.clone());
+        let (Some(evaluation), Some(permission)) = (evaluation, permission) else {
+            return (mode != SealMode::Manual).then(ineligible);
+        };
+        let stored = evaluation
+            .cause
+            .filter(|cause| blocks_manual_request(*cause))
+            // Durability is read live, as the evaluation computes it.
+            .or_else(|| {
+                (inner.sidecar.state.writable() && inner.not_durable.contains_key(key))
+                    .then_some(WaitingCause::WaitingForDurableIntake)
+            });
+        match permission {
+            CommitPermission::Wait {
+                designated,
+                remaining,
+            } => Err((designated, remaining)),
+            CommitPermission::Designated | CommitPermission::Fallback { .. } => Ok(stored),
+            CommitPermission::NotEligible => {
+                return (mode != SealMode::Manual).then(ineligible);
+            }
+        }
+    };
+    Some(match permission {
+        Err((designated, remaining)) => {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let rank = inner
+                .store
+                .get(key)
+                .and_then(|row| {
+                    row.ranks
+                        .iter()
+                        .position(|id| id == state.agent.agent_id().as_bytes())
+                })
+                .map(|index| index.saturating_add(1));
+            drop(inner);
+            let now_ms = now_unix_ms();
+            (
+                WaitingCause::WaitingForDesignatedAdmin,
+                serde_json::json!({
+                    "cause": WaitingCause::WaitingForDesignatedAdmin.as_str(),
+                    "designated_admin": hex::encode(designated),
+                    "detail": "rank",
+                    "local_rank": rank,
+                    "remaining_ms": s4::duration_ms(remaining),
+                    "fallback_at_unix_ms": now_ms.saturating_add(s4::duration_ms(remaining)),
+                }),
+            )
+        }
+        Ok(stored) => {
+            // §2: re-read the head just before the seal, as the worker does
+            // (`commit_removal`); the stored evaluation may be a pass old.
+            let cause = match stored {
+                Some(cause) => cause,
+                None if !group_head_synced_at(state, group_key, mode.tree_epoch()).await => {
+                    WaitingCause::WaitingForHeadSync
+                }
+                None => return None,
+            };
+            (cause, serde_json::json!({ "cause": cause.as_str() }))
+        }
+    })
+}
+
+/// ADR 0110 §2 (#1508 review P1): the one re-check before every S4-owned
+/// seal, run under the group's membership lock just before the seal: the
+/// worker's prepared removal or ban, the crypto-only exclusion (TreeKEM
+/// and GSS) and, through [`s4_seal_request_recheck_under_lock`], the
+/// explicit seal. Manual remove and ban run the same [`seal_wait`] through
+/// [`s4_manual_request_recheck_under_lock`]. Returns the cause to wait
+/// for, also kept as the row's attempt state, or `None` to seal.
+pub(super) async fn s4_seal_recheck_locked(
+    state: &Arc<AppState>,
+    group_key: &str,
+    key: &EvictionKey,
+    mode: SealMode,
+) -> Option<WaitingCause> {
+    let (cause, _) = seal_wait(state, group_key, key, mode).await?;
+    record_attempt_wait(state, key, cause).await;
+    Some(cause)
+}
+
+/// Whether `key` has an open S4 row.
+pub(super) async fn s4_row_open(state: &AppState, key: &EvictionKey) -> bool {
+    let inner = state.revocation_evictions.inner.lock().await;
+    inner.store.get(key).is_some_and(|row| row.phase.is_open())
+}
+
+/// Keep a refused seal's cause as the row's attempt state. A seal with no
+/// open row records nothing: there is no row to show it on, and a later
+/// row must not inherit it.
+async fn record_attempt_wait(state: &AppState, key: &EvictionKey, cause: WaitingCause) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    if !inner.store.get(key).is_some_and(|row| row.phase.is_open()) {
+        return;
+    }
+    inner
+        .attempt_wait
+        .insert(key.clone(), WaitingState::cause(cause));
+}
+
+/// The worker's own prepared removal or ban, under the membership lock:
+/// cancelled when its row ended, and otherwise refused while the head is
+/// not the one its `.evjournal` names or [`s4_seal_recheck_locked`]
+/// waits. A refusal returns the row to `pending` ([`commit_removal`]).
+async fn prepared_removal_recheck(
+    state: &Arc<AppState>,
+    group_key: &str,
+    key: &EvictionKey,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let (head, seat) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_key);
+        (
+            info.map(|info| info.state_hash.clone()),
+            info.and_then(|info| info.members_v2.get(&hex::encode(key.target)))
+                .cloned(),
+        )
+    };
+    // A rebind that changed the seat's certificate cancels the removal
+    // first (§1a/D135); a moved head only defers it.
+    if locked_removal_state(state, key, seat.as_ref()).await != LockedRemoval::Prepared {
+        return Some(s4_exclusion_cancelled_response());
+    }
+    let parent_head = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        inner.store.get(key).and_then(|row| row.parent_head.clone())
+    };
+    let cause = if parent_head.is_none() || head != parent_head {
+        let cause = WaitingCause::WaitingForHeadSync;
+        record_attempt_wait(state, key, cause).await;
+        cause
+    } else {
+        s4_seal_recheck_locked(state, group_key, key, SealMode::S4Work).await?
+    };
+    Some((
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": S4_SEAL_RECHECK_WAIT,
+            "waiting": { "cause": cause.as_str() },
+        })),
+    ))
+}
+
+/// What [`seal_wait`] does when there is no open row, or when this node is
+/// not an eligible committer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SealMode {
+    /// A manual remove, ban or seal: with no S4 work, or with no S4 rank
+    /// here, the route's own checks decide.
+    Manual,
+    /// S4 work (the worker's removal, a GSS crypto-only exclusion): a
+    /// missing row or evaluation, or an ineligible node, waits.
+    S4Work,
+    /// The responsive self-leave rekey (#1337), as [`Self::S4Work`]: it
+    /// seals only with the target's own open row and current evaluation,
+    /// never before the pass opened them (#1508 review P1). The caller
+    /// holds the TreeKEM lock, so it gives the tree epoch.
+    SelfLeaveRekey { tree_epoch: u64 },
+}
+
+impl SealMode {
+    fn tree_epoch(self) -> Option<u64> {
+        match self {
+            Self::SelfLeaveRekey { tree_epoch } => Some(tree_epoch),
+            Self::Manual | Self::S4Work => None,
+        }
+    }
+}
+
+/// The worker's refused prepared removal ([`prepared_removal_recheck`]).
+const S4_SEAL_RECHECK_WAIT: &str = "s4_seal_recheck_wait";
+
 /// §2: an explicit seal in an `OwnerCertified` group would evict a pending
 /// S4 target as a side effect (ADR-0038 seal-time re-check). Before this
 /// node's fallback time it defers the seal. Returns the `202` response, or
 /// `None` when the seal may proceed.
 pub(in crate::server) async fn s4_seal_request_gate(
+    state: &Arc<AppState>,
+    group_key: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    // As [`s4_manual_request_gate`]: bring intake up to date and write it.
+    revocation_eviction_pass(state).await;
+    persist_obligations(state).await;
+    seal_request_gate(state, group_key).await
+}
+
+/// [`s4_seal_request_gate`] again under the group's membership lock, just
+/// before the explicit seal evicts anything: the head, the designation or
+/// the intake may have changed since the first check (ADR 0110 §2, #1508
+/// review P1). It does not run a pass (the pass takes the membership
+/// lock).
+pub(in crate::server) async fn s4_seal_request_recheck_under_lock(
+    state: &Arc<AppState>,
+    group_key: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    seal_request_gate(state, group_key).await
+}
+
+async fn seal_request_gate(
     state: &Arc<AppState>,
     group_key: &str,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -1895,7 +2097,6 @@ pub(in crate::server) async fn s4_seal_request_gate(
         (info.stable_group_id().to_string(), seated)
     };
     let pending: Vec<String> = {
-        revocation_eviction_pass(state).await;
         let inner = state.revocation_evictions.inner.lock().await;
         inner
             .store
@@ -1906,7 +2107,7 @@ pub(in crate::server) async fn s4_seal_request_gate(
     };
     for target in pending {
         if let Some(resp) =
-            s4_manual_request_gate(state, group_key, &target, ManualRequestKind::Seal).await
+            manual_request_gate(state, group_key, &target, ManualRequestKind::Seal).await
         {
             return Some(resp);
         }
@@ -1997,6 +2198,69 @@ async fn revoked_admin_cover_now(state: &AppState, info: &GroupInfo) -> Option<R
 /// lock while it waits for a group, membership or TreeKEM lock.
 pub(in crate::server) async fn s4_withholds_ciphertext(state: &AppState, info: &GroupInfo) -> bool {
     revoked_admin_cover_now(state, info).await.is_some()
+}
+
+/// The worker steps that open, evaluate and drive S4 work, run a few
+/// times (test builds only): the self-leave rekey seals only from the
+/// row they open (#1508 review P1).
+#[cfg(test)]
+pub(in crate::server) async fn run_worker_steps_for_test(state: &Arc<AppState>) {
+    for _ in 0..3 {
+        open_rows_for_test(state).await;
+        drive_exclusions(state).await;
+    }
+}
+
+/// Only the per-group head round holds an S4 seal, not the boot wait
+/// (test builds only; ADR 0110 §2). A shared state is left unchanged.
+#[cfg(test)]
+pub(in crate::server) fn zero_restart_wait_for_test(state: &mut Arc<AppState>) {
+    if let Some(fresh) = Arc::get_mut(state) {
+        fresh.revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+    }
+}
+
+/// One pass and its `.evs` write (test builds only): the S4 rows of the
+/// current rosters are open and durable.
+#[cfg(test)]
+pub(in crate::server) async fn open_rows_for_test(state: &Arc<AppState>) {
+    revocation_eviction_pass(state).await;
+    persist_obligations(state).await;
+}
+
+/// An open self-leave row of `target` whose evaluation lets this node
+/// seal at its rank-1 fallback time (test builds only): an older
+/// departure whose fallback time has passed.
+#[cfg(test)]
+pub(in crate::server) async fn open_fallback_row_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+    target: [u8; 32],
+    group_key: &str,
+) {
+    let key = EvictionKey::new(stable_group_id.to_string(), target);
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.store.intake(
+        &key,
+        EvictionTrigger::SelfLeave {
+            commit_hash: "older-departure".to_string(),
+        },
+        None,
+        now_unix_ms(),
+        state.revocation_evictions.boot_id,
+    );
+    inner.evaluations.insert(
+        key,
+        StoredEvaluation {
+            permission: Some(CommitPermission::Fallback { rank: 1 }),
+            cause: None,
+            action: RowAction::SelfLeaveRekey { rank: 1 },
+            stable_group_key: group_key.to_string(),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -2734,7 +2998,7 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
                     key.clone(),
                     WaitingState::cause(WaitingCause::WaitingForMemberKeyPackage),
                 );
-            } else if status != StatusCode::NOT_FOUND && !cancelled {
+            } else if unexpected_refusal(status, cancelled, error) {
                 tracing::warn!(
                     group_id = %super::LogHexId::group(group_key),
                     target = %super::LogHexId::agent(&target_hex),
@@ -2756,6 +3020,13 @@ async fn commit_removal(state: &Arc<AppState>, key: &EvictionKey, group_key: &st
     if persist_obligations(state).await {
         remove_file_durably(&journal_path).await;
     }
+}
+
+/// Whether a refused worker exclusion is worth a warning. A missing
+/// group, a cancelled row and a `S4_SEAL_RECHECK_WAIT` refusal (its cause
+/// is already the attempt state, [`prepared_removal_recheck`]) are not.
+fn unexpected_refusal(status: StatusCode, cancelled: bool, error: &str) -> bool {
+    status != StatusCode::NOT_FOUND && !cancelled && error != S4_SEAL_RECHECK_WAIT
 }
 
 tokio::task_local! {
@@ -3110,14 +3381,23 @@ fn prepared_journal(row: &ObligationRow, parent_head: String, next_revision: u64
 /// §2 for the responsive self-leave rekey: whether this node's ranked
 /// fallback time for an open crypto-only row of `stable_group_id` has
 /// passed. The #1337 pass lets only the lowest active admin commit; S4
-/// adds the ranked fallback after W.
+/// adds the ranked fallback after W. With `target`, only that target's
+/// own row counts (#1508 review P1): the fallback time of an older
+/// departure never authorizes a fresh one. Without it, the answer only
+/// lets the pass look for the leaf; the seal asks again for its target.
 pub(super) async fn s4_self_leave_fallback_allowed(
     state: &AppState,
     stable_group_id: &str,
+    target: Option<&[u8; 32]>,
 ) -> bool {
     let inner = state.revocation_evictions.inner.lock().await;
     inner.evaluations.iter().any(|(key, evaluation)| {
         key.stable_group_id == stable_group_id
+            && target.is_none_or(|target| &key.target == target)
+            && inner
+                .store
+                .get(key)
+                .is_some_and(|row| row.phase == Phase::Pending)
             && matches!(evaluation.action, RowAction::SelfLeaveRekey { rank } if rank > 0)
             && matches!(
                 evaluation.permission,
@@ -3208,8 +3488,11 @@ async fn abandon_crypto_exclusion(state: &AppState, key: &EvictionKey) {
             .next_attempt
             .insert(key.clone(), Instant::now() + S4_COMMIT_RETRY);
     }
-    persist_obligations(state).await;
-    remove_file_durably(&evjournal_path(state, &key.stable_group_id)).await;
+    // The journal goes only after the `.evs` holds the change (#1508
+    // review P1); a restart reconciles a kept journal with the chain.
+    if persist_obligations(state).await {
+        remove_file_durably(&evjournal_path(state, &key.stable_group_id)).await;
+    }
 }
 
 /// §5 last steps: the legacy transaction is durable. The row moves to
@@ -3247,8 +3530,11 @@ async fn committed_crypto_exclusion(
         );
         inner.dirty = true;
     }
-    persist_obligations(state).await;
-    remove_file_durably(&evjournal_path(state, &key.stable_group_id)).await;
+    // As in `commit_removal`: the journal is the durable copy of the
+    // committed frame until the `.evs` holds `committed_delivery_pending`.
+    if persist_obligations(state).await {
+        remove_file_durably(&evjournal_path(state, &key.stable_group_id)).await;
+    }
 }
 
 /// §3 restart: reconcile every row that holds a saved crypto-only frame
@@ -3723,7 +4009,7 @@ async fn load_persisted_obligations(state: &AppState) {
         }
     }
     // Speculative preparation never survives a restart on its own (§5).
-    let journals = reconcile_evjournals(state).await;
+    let (journals, journal_paths) = reconcile_evjournals(state).await;
     for row in store.to_rows() {
         if row.phase == Phase::Prepared && !journals.contains_key(&row.key()) {
             if let Some(stored) = store.get_mut(&row.key()) {
@@ -3770,17 +4056,53 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.queued_bans = queued_bans;
     inner.dirty = !journals.is_empty();
     drop(inner);
+    // §5 (#1508 review P1): a journal is the only durable copy of its
+    // prepared or committed transition until the `.evs` holds the row this
+    // load adopted from it. Write that `.evs` now (this load holds the
+    // writer lock) and retire the journals only after the write.
+    if !journal_paths.is_empty() {
+        let (snapshot, writable) = {
+            let mut inner = runtime.inner.lock().await;
+            let writable = inner.sidecar.state.writable();
+            (
+                begin_persist(&mut inner, host_commit_gate_open(state)),
+                writable,
+            )
+        };
+        let held = match snapshot {
+            Ok(snapshot) => {
+                let written = write_bytes_durably(&path, &snapshot.bytes, None)
+                    .await
+                    .is_ok();
+                let mut inner = runtime.inner.lock().await;
+                finish_persist(&mut inner, snapshot.change_seq, written);
+                written
+            }
+            // Nothing to write: the journals adopted no row. A memory-only
+            // `.evs` holds nothing, so its journals stay.
+            Err(durable) => durable && writable,
+        };
+        if held {
+            for journal in &journal_paths {
+                remove_file_durably(journal).await;
+            }
+        }
+    }
     handoff_log::load(state).await;
 }
 
-/// Read every `.evjournal` in the TreeKEM directory, classify it, and
-/// retire it (§5). Damaged journals are quarantined with no replacement
-/// (ADR 0110 §5 "a missing journal is the normal state"). Returns the keys
-/// of the prepared transitions found.
-async fn reconcile_evjournals(state: &AppState) -> HashMap<EvictionKey, EvJournalV1> {
+/// Read every `.evjournal` in the TreeKEM directory and classify it (§5).
+/// Damaged journals are quarantined with no replacement (ADR 0110 §5 "a
+/// missing journal is the normal state"). Returns the keys of the prepared
+/// transitions found and the paths of the decoded journals; the caller
+/// retires those after the `.evs` holds what it adopted from them.
+async fn reconcile_evjournals(
+    state: &AppState,
+) -> (HashMap<EvictionKey, EvJournalV1>, Vec<std::path::PathBuf>) {
     let mut keys = HashMap::new();
+    let mut decoded = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(&state.treekem_dir).await else {
-        return keys;
+        return (keys, decoded);
     };
     let mut paths = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -3797,7 +4119,7 @@ async fn reconcile_evjournals(state: &AppState) -> HashMap<EvictionKey, EvJourna
             Ok(journal) => {
                 let key = EvictionKey::new(journal.stable_group_id.clone(), journal.target);
                 keys.insert(key, journal);
-                remove_file_durably(&path).await;
+                decoded.push(path);
             }
             Err(SidecarDecodeError::NewerFormat(_)) => {}
             Err(SidecarDecodeError::Damaged(reason)) => {
@@ -3813,7 +4135,7 @@ async fn reconcile_evjournals(state: &AppState) -> HashMap<EvictionKey, EvJourna
             }
         }
     }
-    keys
+    (keys, decoded)
 }
 
 // ─── Public status (D64) ───────────────────────────────────────────────────
@@ -5128,6 +5450,126 @@ mod tests {
         Ok(())
     }
 
+    /// #1508 review P1 (ADR 0110 §5): a restart reads each `.evjournal` and
+    /// adopts its transition into the store. The journal stays until the
+    /// `.evs` holds that row: here the `.evs` write fails, so the journal
+    /// must still be on disk for the next start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_loaded_journal_stays_until_the_evs_holds_its_row() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::os::unix::fs::PermissionsExt;
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        // A prepared removal of a revoked member: its row is in the `.evs`
+        // and its journal beside it, as a crash after the prepare leaves.
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "b9".repeat(16);
+        let info = hold_remote_admin_group(&state, &group_id, &target.agent_id(), true).await?;
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), *target.agent_id().as_bytes());
+        revoke_agent(&state, &target).await?;
+        revocation_eviction_pass(&state).await;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get_mut(&key).context("row")?;
+            row.phase = Phase::Prepared;
+            row.parent_head = Some(info.state_hash.clone());
+            inner.dirty = true;
+        }
+        assert!(
+            persist_obligations(&state).await,
+            "the prepared row is durable"
+        );
+        let journal = EvJournalV1 {
+            txid: [7; 16],
+            stable_group_id: stable.clone(),
+            target: key.target,
+            parent_head: info.state_hash.clone(),
+            next_revision: 2,
+            result_epoch: None,
+            evidence: vec![[1; 32]],
+            outgoing_event: Vec::new(),
+            result_head: None,
+        };
+        let path = evjournal_path(&state, &stable);
+        tokio::fs::write(&path, s4::encode_evjournal(&journal)?).await?;
+        // The `.evs` cannot be written: its directory is read-only.
+        let data_dir = state.data_dir.clone();
+        let before = tokio::fs::metadata(&data_dir).await?.permissions();
+        tokio::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).await?;
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        tokio::fs::set_permissions(&data_dir, before).await?;
+        assert!(
+            tokio::fs::try_exists(&path).await?,
+            "the journal is the only durable copy until the .evs holds its row"
+        );
+        // With a writable `.evs` the next start writes it and retires the
+        // journal.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        assert!(
+            !tokio::fs::try_exists(&path).await?,
+            "retired after the write"
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1 (ADR 0110 §1, §5): a pass that runs while
+    /// `persist_named_group_info` shows a candidate roster must not
+    /// complete a row from it. Here the candidate removes the revoked
+    /// target and then rolls back (the write failed): the row stays open,
+    /// so the eviction still runs.
+    #[tokio::test]
+    async fn a_pass_never_completes_a_row_from_a_rolled_back_roster() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "a8".repeat(16);
+        let mut committed =
+            hold_remote_admin_group(&state, &group_id, &target.agent_id(), true).await?;
+        // A `SignedPublic` group: no seat is the whole completion proof.
+        committed.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::SignedPublic;
+        committed.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), committed.clone());
+        let key = EvictionKey::new(committed.stable_group_id(), *target.agent_id().as_bytes());
+        revoke_agent(&state, &target).await?;
+        revocation_eviction_pass(&state).await;
+        assert!(s4_row_open(&state, &key).await, "work opens");
+
+        // A writer holds the persistence lock and shows its candidate.
+        let persistence = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = committed.clone();
+        candidate.remove_member(&hex::encode(target.agent_id().as_bytes()), None);
+        candidate.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let pass_state = Arc::clone(&state);
+        let pass = tokio::spawn(async move { revocation_eviction_pass(&pass_state).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The write fails: the map is restored, then the lock released.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), committed);
+        drop(persistence);
+        pass.await?;
+        assert!(
+            s4_row_open(&state, &key).await,
+            "a rolled-back removal must not complete the row"
+        );
+        Ok(())
+    }
+
     /// #1508 r7 (Codex P2 6, ADR 0110 §2 L175/L194): the fallback budget
     /// that a waiting row consumes is written to the `.evs`, so a restart
     /// resumes it and cannot extend the window.
@@ -5235,9 +5677,111 @@ mod tests {
         if let Some(member) = info.members_v2.get_mut(&leaver_hex) {
             member.treekem_key_package_b64 = None;
         }
-        let groups = vec![(group_id, info)];
+        let groups = vec![(group_id.clone(), info.clone())];
         let leaves = snapshot_retained_leaves(&state, &groups).await;
         assert_eq!(leaves.tracks(&stable, leaver.as_bytes()), None);
+        // #1508 review P1: the undecided leaf still opens the work, so a
+        // fallback admin can pass its gate and fetch the KeyPackage when
+        // the designated admin is offline.
+        let triggers = derive_triggers(&groups, &leaves, &[], 0);
+        assert!(
+            triggers
+                .iter()
+                .any(|(key, trigger, _)| key.target == *leaver.as_bytes()
+                    && matches!(trigger, EvictionTrigger::SelfLeave { .. })),
+            "an undecided leaf opens evidence-waiting self-leave work"
+        );
+        // The pass opens the row and asks for the evidence through the one
+        // route (the leaver's inviter first).
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        state.treekem_catchup_throttle.write().await.clear();
+        revocation_eviction_pass(&state).await;
+        let key = EvictionKey::new(stable, *leaver.as_bytes());
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .is_some_and(|row| row.phase.is_open()),
+            "the evidence-waiting row is open"
+        );
+        let asked = format!("{group_id}:member:{leaver_hex}:{creator_hex}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state
+            .treekem_catchup_throttle
+            .read()
+            .await
+            .contains_key(&asked)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the pass asks for the KeyPackage"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// #1508 review P1: an old self-leaver whose KeyPackage this node never
+    /// held is decided from the tree when every active leaf belongs to a
+    /// member this node can identify. No leaf is left for it, so it opens
+    /// no work and does not wait for evidence forever.
+    #[tokio::test]
+    async fn a_fully_accounted_tree_decides_a_hash_only_leaver() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "e6".repeat(16);
+        let local = state.agent.agent_id();
+        let mut local_group =
+            x0x::mls::TreeKemMlsGroup::create(hex::decode(&group_id)?, local, &[3u8; 32])?;
+        let member = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let member_kp = x0x::mls::TreeKemMlsGroup::prepare_member(member, &[4u8; 32])?
+            .key_package_bytes()
+            .to_vec();
+        local_group.add_member(member, &member_kp)?;
+        let leaver = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let leaver_kp = x0x::mls::TreeKemMlsGroup::prepare_member(leaver, &[5u8; 32])?
+            .key_package_bytes()
+            .to_vec();
+
+        let mut info = GroupInfo::new("accounted".into(), String::new(), local, group_id.clone());
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        let local_hex = hex::encode(local.as_bytes());
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        info.add_member(
+            hex::encode(member.as_bytes()),
+            GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+        );
+        info.add_member(leaver_hex.clone(), GroupRole::Member, Some(local_hex), None);
+        info.set_member_treekem_key_package(
+            &leaver_hex,
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &leaver_kp),
+        );
+        info.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        if let Some(seat) = info.members_v2.get_mut(&leaver_hex) {
+            seat.treekem_key_package_b64 = None;
+        }
+        let stable = info.stable_group_id().to_string();
+        state.treekem_groups.write().await.insert(
+            group_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(local_group)),
+        );
+        let groups = vec![(group_id, info)];
+        let leaves = snapshot_retained_leaves(&state, &groups).await;
+        assert_eq!(leaves.tracks(&stable, leaver.as_bytes()), Some(false));
+        assert!(
+            derive_triggers(&groups, &leaves, &[], 0).is_empty(),
+            "an accounted tree leaves no leaf for the old self-leaver"
+        );
         Ok(())
     }
 
@@ -5277,6 +5821,7 @@ mod tests {
                 key.clone(),
                 StoredEvaluation {
                     permission: Some(CommitPermission::Designated),
+                    cause: None,
                     action: RowAction::None,
                     stable_group_key: group_id.clone(),
                 },
@@ -5333,6 +5878,148 @@ mod tests {
                 .contains_key(&key),
             "the accepted ban is queued"
         );
+        Ok(())
+    }
+
+    /// One open S4 row on `target` in a group where the local node is the
+    /// designated admin, with its evaluation. The restart sync wait of a
+    /// fresh state has not passed, so the head is not synced.
+    async fn designated_row(
+        state: &Arc<AppState>,
+        group_id: &str,
+        info: GroupInfo,
+        target: [u8; 32],
+    ) -> EvictionKey {
+        let key = EvictionKey::new(info.stable_group_id(), target);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        inner.store.intake(
+            &key,
+            EvictionTrigger::AgentRevocation {
+                record_hash: [1; 32],
+                record_bytes: vec![1],
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        inner.evaluations.insert(
+            key.clone(),
+            StoredEvaluation {
+                permission: Some(CommitPermission::Designated),
+                cause: None,
+                action: RowAction::CommitRemoval { rank: 0 },
+                stable_group_key: group_id.to_string(),
+            },
+        );
+        key
+    }
+
+    /// #1508 review P1 (ADR 0110 §2): the worker's prepared removal checked
+    /// the head before it wrote its journal and took the membership lock.
+    /// Under the lock it is checked again like every seal: a head that
+    /// moved since the journal, or a head that is not synced, stops it
+    /// (the row returns to `pending`). Red before: the prepared removal
+    /// skipped the gate.
+    #[tokio::test]
+    async fn a_prepared_removal_is_rechecked_under_the_lock() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let target_hex = hex::encode(target.as_bytes());
+        let group_id = "e7".repeat(16);
+        let mut info = group_with(*state.agent.agent_id().as_bytes(), *target.as_bytes());
+        info.mls_group_id = group_id.clone();
+        let head = info.state_hash.clone();
+        let key = designated_row(&state, &group_id, info, *target.as_bytes()).await;
+        let recheck = |parent_head: &str| {
+            let state = Arc::clone(&state);
+            let (group_id, target_hex, key) = (group_id.clone(), target_hex.clone(), key.clone());
+            let parent_head = parent_head.to_string();
+            async move {
+                let scope = {
+                    let mut inner = state.revocation_evictions.inner.lock().await;
+                    let row = inner.store.get_mut(&key).expect("row");
+                    row.phase = Phase::Prepared;
+                    row.parent_head = Some(parent_head);
+                    eviction_seal_scope(&inner.store, &key)
+                };
+                assert!(scope.prepared_removal, "premise: the worker's own removal");
+                S4_EVICTION_SEAL
+                    .scope(
+                        scope,
+                        s4_manual_request_recheck_under_lock(
+                            &state,
+                            &group_id,
+                            &target_hex,
+                            ManualRequestKind::Remove,
+                        ),
+                    )
+                    .await
+                    .map(|(code, Json(body))| {
+                        (
+                            code,
+                            body["error"].as_str().map(str::to_string),
+                            body["waiting"]["cause"].as_str().map(str::to_string),
+                        )
+                    })
+            }
+        };
+        let refused = Some((
+            StatusCode::CONFLICT,
+            Some(S4_SEAL_RECHECK_WAIT.to_string()),
+            Some("waiting_for_head_sync".to_string()),
+        ));
+        // An intervening commit moved the head after the journal named it.
+        assert_eq!(recheck("an older head").await, refused);
+        // The journal's head is current, but the head is not synced.
+        assert_eq!(recheck(&head).await, refused);
+        assert_eq!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .attempt_wait
+                .get(&key)
+                .map(|wait| wait.cause),
+            Some(WaitingCause::WaitingForHeadSync),
+            "the row shows what it waits for"
+        );
+        Ok(())
+    }
+
+    /// #1508 review P1 (ADR 0110 §2): the explicit seal of an
+    /// `OwnerCertified` group re-checks the S4 gate under the membership
+    /// lock, just before it evicts. A designated admin whose head is not
+    /// synced does not seal (red before: the seal checked only before it
+    /// took the lock).
+    #[tokio::test]
+    async fn the_explicit_seal_is_rechecked_under_the_lock() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let group_id = "e8".repeat(16);
+        let local = *state.agent.agent_id().as_bytes();
+        let mut info = group_with(local, *target.as_bytes());
+        info.mls_group_id = group_id.clone();
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        designated_row(&state, &group_id, info, *target.as_bytes()).await;
+        let local_hex = hex::encode(local);
+        let result =
+            super::super::owner_certified_seal_with_eviction(&state, &group_id, &local_hex).await;
+        let Some(Err((code, Json(body)))) = result else {
+            panic!("the explicit seal must wait under the lock");
+        };
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(body["status"].as_str(), Some("waiting_for_head_sync"));
+        assert_eq!(body["request"].as_str(), Some("seal"));
         Ok(())
     }
 }

@@ -11,6 +11,7 @@ pub(crate) mod fleet_policy;
 #[cfg(unix)]
 mod inventory_accounts;
 pub(crate) mod journal;
+pub(crate) mod log_flush;
 pub mod manifest;
 pub mod monitor;
 pub(crate) mod pair;
@@ -547,6 +548,14 @@ pub enum UpgradeError {
 
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
+
+    /// D182: distinguish future-clock skew from stale or malformed manifests.
+    #[error("manifest timestamp {timestamp} exceeds local time {now} by more than {max_future_skew_secs} seconds")]
+    ManifestTimestampInFuture {
+        timestamp: u64,
+        now: u64,
+        max_future_skew_secs: u64,
+    },
 
     #[error("manifest signature verification failed")]
     ManifestSignatureInvalid,

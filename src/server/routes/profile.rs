@@ -95,15 +95,37 @@ pub(in crate::server) async fn update_profile(
         display_name: req.display_name.as_ref().map(|v| v.trim().to_string()),
         machine_name: req.machine_name.as_ref().map(|v| v.trim().to_string()),
     };
-    let (profile, persist_err) = {
-        let mut profile = state.profile.write().await;
-        let _changed = profile.merge(&update);
-        let persist_err = profile.save_to(&state.profile_path).await.err();
-        // The announce name follows the stored profile even if persistence
-        // fails — the daemon's live view stays coherent; the error is
-        // reported so the operator can fix the disk.
-        state.agent.set_self_name(profile.display_name.clone());
-        (profile.clone(), persist_err)
+    // #1545: the edit and its save run to their end as a shielded apply.
+    // A client that goes away stops only this wait: the profile lock stays
+    // held until the save is done, so the save of a cancelled PUT cannot
+    // land after the save of a later one.
+    let edit = {
+        let state = Arc::clone(&state);
+        async move {
+            let mut profile = state.profile.write().await;
+            // #1545: the synced names committed before this edit come
+            // first, so a later replay of them cannot put them over this
+            // edit.
+            let owed = super::sync::fold_owed_names(&state, &mut profile).await;
+            let _changed = profile.merge(&update);
+            let persist_err = super::sync::save_profile(&state, &profile, owed.map(|(_, f)| f))
+                .await
+                .err();
+            // The announce name follows the stored profile even if
+            // persistence fails — the daemon's live view stays coherent;
+            // the error is reported so the operator can fix the disk.
+            state.agent.set_self_name(profile.display_name.clone());
+            (profile.clone(), persist_err)
+        }
+    };
+    let Some((profile, persist_err)) = state.run_shielded(edit).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "failed to persist profile: the daemon is shutting down",
+            })),
+        );
     };
     if let Some(e) = persist_err {
         return (
