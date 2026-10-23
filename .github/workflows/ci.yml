@@ -390,6 +390,19 @@ jobs:
           mkdir -m 700 "${artifact}"
           test ! -e "${artifact}/proof.json"
 
+      # The x0x lib test unit at opt-level 3 peaked at 15.7 of 16 GB RAM
+      # and 2.9 of 3 GB swap (run 40002832571). A larger lib went past
+      # that, and the runner stopped with exit 143 before a test ran
+      # (#1533 runs 40003771420, 39995270646).
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
       - name: Sample signing-path build resources
         shell: bash
         run: |

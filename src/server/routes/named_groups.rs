@@ -172,6 +172,13 @@ static RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY: StdMutex<
     Option<(String, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
 
+/// Entered after the GSS encrypt path copies its key and drops the group
+/// guard (#1533 rc15 test seam).
+#[cfg(test)]
+static GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY: StdMutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = StdMutex::new(None);
+
 #[cfg(test)]
 static B8_BEFORE_FINAL_AUTHORIZATION_NOW_NOTIFY: StdMutex<
     Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
@@ -29009,8 +29016,9 @@ pub(in crate::server) async fn seal_commit_owner_certified(
     }
     // ADR 0109 §2 "Conflict" (#1533 r8): every ordinary local commit
     // seals here, so the conflict bound is checked here for each of them.
-    // The check runs after the seal, so a conflict recorded meanwhile by a
-    // reply (which does not take the roster lock) still bounds it.
+    // The check runs after the seal. A reply records a conflict under the
+    // roster lock (#1533 rc15), so a caller that holds that lock until the
+    // commit is saved cannot install past a prefix recorded meanwhile.
     let before = info.clone();
     let commit = seal_owner_certified_unbounded(state, info, signing_kp, now_ms).await?;
     if group_recovery::local_seal_admitted(state, &before, &commit).await {
@@ -33350,6 +33358,8 @@ pub(in crate::server) async fn secure_group_encrypt(
         return resp;
     }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // The GSS share hold is read under the group guard below (#1533 rc15).
+    gss_share_hold::ensure_loaded(&state).await;
     let groups = state.named_groups.read().await;
     // #1166 S2: the entry admission (raw-id lookup 404 with the
     // ADR0066-LOOKUP-WAIVER — a miss is a 404 before any gate, so it
@@ -33482,6 +33492,19 @@ pub(in crate::server) async fn secure_group_encrypt(
         .await;
     }
 
+    // The GSS share hold and the key are read under one guard (#1533
+    // rc15). A replacement share installs the next key and ends the hold
+    // under the write lock. Before the fix the key was read here and the
+    // hold only in `group_ciphertext_withheld` after the guard dropped, so
+    // a share installed between the two let the old key through.
+    if crate::server::resolve_group_entry_locked(&groups, &id)
+        .is_none_or(|(group_key, entry)| pending_gss_removal_withholds(&state, group_key, entry))
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            GroupCiphertextHold::PendingGssRemoval.reason(),
+        );
+    }
     let Some(key) = info.secure_message_key() else {
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
@@ -33491,6 +33514,16 @@ pub(in crate::server) async fn secure_group_encrypt(
     let epoch = info.secret_epoch;
     let group_id_clone = info.stable_group_id().to_string();
     drop(groups);
+    #[cfg(test)]
+    let key_selected_hook = GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    #[cfg(test)]
+    if let Some((entered, release)) = key_selected_hook {
+        entered.notify_one();
+        release.notified().await;
+    }
     // The group ciphertext boundary, as on the TreeKEM plane (#1573).
     if let Some(hold) = group_ciphertext_withheld(&state, &id, None).await {
         return revocation_eviction::s4_no_eligible_admin_refusal(&state, &id)
@@ -54650,6 +54683,63 @@ pub(in crate::server) mod tests {
             StatusCode::OK,
             "the share ends the hold"
         );
+        Ok(())
+    }
+
+    /// #1533 rc15 (Codex P1): the encrypt path reads the key and the GSS
+    /// share hold under one guard. Here the replacement share installs
+    /// after the key is read but before the boundary check. Before the fix
+    /// the check saw the new key, ended the hold, and the survivor sealed
+    /// with the old key, which the removed member holds.
+    #[tokio::test]
+    async fn rc15_gss_encrypt_never_seals_with_the_key_read_under_a_hold() -> Result<()> {
+        let f = f1_gss_rotation_fixture("pending-race").await?;
+        let sender = f.admin_kp.agent_id();
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
+        assert!(!held.accepted);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        let encrypt = f1_encrypt(&f);
+        tokio::pin!(encrypt);
+        let (status, body) = tokio::select! {
+            result = &mut encrypt => result,
+            () = entered.notified() => {
+                let _ = apply_named_group_metadata_event(
+                    &f.state,
+                    f.envelope_event.clone(),
+                    sender,
+                    true,
+                    None,
+                )
+                .await;
+                release.notify_one();
+                encrypt.await
+            }
+        };
+        GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if status == StatusCode::OK {
+            assert_eq!(
+                body["secret_epoch"].as_u64(),
+                Some(f.new_epoch),
+                "sealed with the removed member's key: {body}"
+            );
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(
+                body["error"],
+                GroupCiphertextHold::PendingGssRemoval.reason(),
+                "{body}"
+            );
+        }
         Ok(())
     }
 

@@ -1477,15 +1477,17 @@ async fn arm_in_place(
     let mut slot = ArmSlot::Installed;
     let candidate = ata.clone();
     let written = update_sidecar(state, &stable, |body| {
-        if body.attestation_conflict.is_some() {
-            slot = ArmSlot::Stopped;
-        } else if body
+        // A diverging ATA is recorded even beside an earlier conflict: it
+        // can bound the gate at a shorter prefix (#1533 rc15).
+        if body
             .active_ata
             .as_ref()
             .is_some_and(|active| verified_conflict(active, &candidate, captured))
         {
             slot = ArmSlot::Conflict;
-            body.attestation_conflict = Some(candidate);
+            keep_strongest_conflict(body, candidate);
+        } else if body.attestation_conflict.is_some() {
+            slot = ArmSlot::Stopped;
         } else {
             body.active_ata = Some(candidate);
         }
@@ -1499,9 +1501,9 @@ async fn arm_in_place(
             return false;
         }
         // The record only adds containment: when its write failed,
-        // `record_conflict` holds it in memory.
+        // `record_conflict_locked` holds it in memory.
         ArmSlot::Conflict if !written => {
-            record_conflict(state, group_key, captured, ata).await;
+            record_conflict_locked(state, group_key, captured, ata).await;
             return false;
         }
         ArmSlot::Conflict => {
@@ -3703,7 +3705,24 @@ async fn show_conflict(state: &AppState, info: &GroupInfo) {
 /// signer is verified on `info`. A conflict without its active ATA has no
 /// common prefix to bound; when the ATA was retired or replaced meanwhile,
 /// nothing is recorded and the next answer is evaluated on the new head.
+///
+/// The record is written under the group's membership lock (#1533 rc15).
+/// A local commit holds that lock from `local_seal_admitted` until it is
+/// saved and published, so no local commit passes the conflict bound and
+/// then installs past a common prefix recorded meanwhile.
 async fn record_conflict(
+    state: &AppState,
+    group_key: &str,
+    info: &GroupInfo,
+    conflict: AdminTerminalAttestation,
+) {
+    let lock = super::group_membership_lock(state, group_key).await;
+    let _membership_guard = lock.lock().await;
+    record_conflict_locked(state, group_key, info, conflict).await;
+}
+
+/// [`record_conflict`] for a caller that holds the membership lock.
+async fn record_conflict_locked(
     state: &AppState,
     group_key: &str,
     info: &GroupInfo,
@@ -3837,11 +3856,6 @@ async fn arm_from_response(
         tracing::info!(group_id = %LogHexId::group(group_key), reason = refusal.as_str(), "ADR 0109 S3: ATA refused");
         return;
     }
-    if conflict_recorded(state, &stable).await {
-        // Automatic catch-up stopped at the conflict; no ATA arms again.
-        show_conflict(state, info).await;
-        return;
-    }
     if let Some(active) = sidecar_snapshot(state, &stable)
         .await
         .and_then(|body| body.active_ata)
@@ -3850,10 +3864,17 @@ async fn arm_from_response(
         // signer's diverging sequence stops automatic catch-up. An active
         // ATA whose signer an applied link demoted has stopped (§2) and no
         // longer attests its remaining links, so it causes none either.
+        // This runs before the recorded-conflict stop, so a later conflict
+        // with a shorter common prefix still narrows the gate (#1533 rc15).
         if verified_conflict(&active, &ata, info) {
             record_conflict(state, group_key, info, ata).await;
             return;
         }
+    }
+    if conflict_recorded(state, &stable).await {
+        // Automatic catch-up stopped at the conflict; no ATA arms again.
+        show_conflict(state, info).await;
+        return;
     }
     // A pre-Welcome joiner that kept its served chain applies it now.
     let pre_welcome = !info.has_active_member(&local)
@@ -4009,10 +4030,8 @@ async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupIn
         }
         s3::ProvisionalPath::Verified => {
             clear_provisional(state, &stable).await;
-            if conflict_recorded(state, &stable).await {
-                show_conflict(state, info).await;
-                return;
-            }
+            // A diverging ATA is recorded before the recorded-conflict
+            // stop, so it can narrow the gate (#1533 rc15).
             let diverges = sidecar_snapshot(state, &stable)
                 .await
                 .and_then(|body| body.active_ata)
@@ -4021,6 +4040,10 @@ async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupIn
                 });
             if diverges {
                 record_conflict(state, group_key, info, ata).await;
+                return;
+            }
+            if conflict_recorded(state, &stable).await {
+                show_conflict(state, info).await;
                 return;
             }
             let owner_armed = info
@@ -7527,6 +7550,88 @@ mod tests {
         let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
         assert_eq!(body.active_ata.as_ref(), Some(&active));
         assert!(bound(&body, "a1") && !bound(&body, "a2"));
+        Ok(())
+    }
+
+    /// #1533 rc15 Codex P1 (ADR 0109 §2 "Conflict"): a later reply whose
+    /// common prefix with the active ATA is shorter narrows the gate, on
+    /// the receiver path. Active `[a1,a2]`, then `[a1,x2]`, then
+    /// `[y1,y2]`: the common prefix is empty, so `a1` does not apply.
+    /// Before the fix the receiver stopped at the first recorded conflict
+    /// and the gate still admitted `a1`.
+    #[tokio::test]
+    async fn a_later_reply_with_a_shorter_prefix_narrows_the_gate() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, active, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let sequence = |links: &[&str]| -> anyhow::Result<AdminTerminalAttestation> {
+            let mut fields = active.fields.clone();
+            fields.sequence = links.iter().map(|link| (*link).to_string()).collect();
+            Ok(AdminTerminalAttestation::sign(fields, &admin)?)
+        };
+        let admits = |body: &GroupRecoveryV1, link: &str| {
+            matches!(
+                (body.active_ata.as_ref(), body.attestation_conflict.as_ref()),
+                (Some(active), Some(conflict))
+                    if s3::conflict_admits_link(active, conflict, &info.state_hash, link)
+            )
+        };
+        arm_from_response(&state, &key, &info, active.clone()).await;
+        arm_from_response(&state, &key, &info, sequence(&["a1", "x2"])?).await;
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert_eq!(body.active_ata.as_ref(), Some(&active));
+        assert!(admits(&body, "a1"), "the prefix [a1] applies");
+
+        arm_from_response(&state, &key, &info, sequence(&["y1", "y2"])?).await;
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert_eq!(body.active_ata.as_ref(), Some(&active));
+        assert!(
+            !admits(&body, "a1"),
+            "the empty common prefix admits nothing"
+        );
+        let on_disk = sidecar_on_disk(&state, &stable).await?;
+        assert!(!admits(&on_disk, "a1"), "the narrower bound is durable");
+
+        // A weaker reply does not move the bound forward again.
+        arm_from_response(&state, &key, &info, sequence(&["a1", "z2"])?).await;
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(!admits(&body, "a1"));
+        Ok(())
+    }
+
+    /// #1533 rc15 Codex P1 (ADR 0109 §2 "Conflict"): a conflict is
+    /// recorded under the group's membership lock. A local commit holds
+    /// that lock from its conflict check until it is saved and published,
+    /// so the record waits for it. Before the fix the record was written
+    /// while the commit was in flight, and the commit then installed past
+    /// the new common prefix.
+    #[tokio::test]
+    async fn a_conflict_record_waits_for_a_local_commit_in_flight() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, active, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        arm_from_response(&state, &key, &info, active.clone()).await;
+        let mut fields = active.fields.clone();
+        fields.sequence = vec!["y1".to_string(), "y2".to_string()];
+        let conflict = AdminTerminalAttestation::sign(fields, &admin)?;
+
+        let lock = super::super::group_membership_lock(&state, &key).await;
+        let commit_in_flight = lock.lock().await;
+        let record = {
+            let (state, key, info) = (Arc::clone(&state), key.clone(), info.clone());
+            tokio::spawn(async move { record_conflict(&state, &key, &info, conflict).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!record.is_finished(), "the record waits for the lock");
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(
+            body.attestation_conflict.is_none(),
+            "no conflict is recorded while a local commit holds the lock"
+        );
+        drop(commit_in_flight);
+        record.await?;
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(body.attestation_conflict.is_some(), "then it is recorded");
         Ok(())
     }
 
