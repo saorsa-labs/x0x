@@ -302,9 +302,10 @@ the installed binaries untouched.
   job matching this instance's arguments — **refuses** the apply before
   replacement, because exiting 0 into an unconfirmed policy is the
   silent-service-disappearance failure. The refusal names what was found
-  and points at the manual recovery procedure below. The daemon then exits
-  0 (100 on Windows) for the supervisor to re-exec the new bytes, and
-  launches **no** helper. A *missing TTY* is **not** supervision —
+  and points at the manual recovery procedure below. After a successful
+  replacement, the daemon must commit an acknowledged shutdown receipt before
+  it exits 0 (100 on Windows) for the supervisor to re-exec the new bytes.
+  It launches **no** helper. A *missing TTY* is **not** supervision —
   nohup/background/detached stdin never qualifies, and neither does "some
   ancestor is launchd" (every macOS process has that).
 - **Refused** — recognized supervision **and** `stop_on_upgrade = false`. That
@@ -320,6 +321,42 @@ the installed binaries untouched.
   unsupervised `stop_on_upgrade = false`. The old `exec()` path is gone: it
   could not roll back.
 
+### Acknowledged shutdown before supervised exit
+
+A supervised apply needs a live shutdown-flush owner before it downloads or
+replaces bytes. If the owner is unavailable, the apply fails closed. The exit
+and owner slices of the #1374 stack must land together before a release; an
+intermediate build without the owner cannot perform a supervised update.
+
+Before replacement, the apply reserves shutdown admission under the same lock
+that ordinary shutdown uses. If replacement fails or rolls back before an
+acknowledgement starts, the unused reservation is released. Later upgrades can
+try again. An ordinary shutdown already waiting on that reservation can finish,
+and its admission stays closed. A started acknowledgement keeps recovery custody
+if it fails; an unused reservation cannot release that custody.
+
+After successful replacement, the daemon writes the handoff intent and requests
+a bounded shutdown flush. The owner drains producers and completes the store,
+cache and log barriers before the receipt is committed. The persisted record contains the
+restart-plan binding, boot ID and fixed deadline. The log barrier keeps admission open
+so a failed flush does not close the old process's log sinks. A transient dropped
+line fails its barrier window; it does not poison every later barrier.
+
+The instance data directory retains two private diagnostic records:
+
+- `upgrade-flush.json` records the intent and, on success, the receipt ID.
+- `upgrade-flush-rollback.json` records a failed or unresolved flush. A late
+  worker cannot erase this separate failure record by writing a receipt.
+
+A flush timeout, receipt-write failure or binding failure does not authorize
+the supervised exit. The old process stays for manual recovery and logs the
+failed restart at ERROR. It may already be quiesced; a live PID does not prove a
+healthy API. Preserve the records and logs, check the running process and the
+installed bytes, and use the owning service manager for recovery. An unresolved
+receipt or rollback record blocks later upgrade admission. There is no automatic
+record reset in this slice; do not apply the legacy handoff deletion procedure
+below to these flush records.
+
 ### What a successful apply does and does not prove
 
 Installed bytes, a pending restart, observed readiness and recovery are four
@@ -332,16 +369,18 @@ only the transactional handoff observes
 
 ### Manual recovery after a failed supervised upgrade (ADR-0061 §6)
 
-On the supervised path a successful apply installs the new bytes, writes the
-intent record, and exits 0 for the service manager. x0xd **never** rolls
-back automatically on this path — recovery is this manual procedure, run by
+On the supervised path, the daemon installs the new bytes, writes the intent
+record and commits the acknowledged shutdown receipt before it requests the
+service-manager restart. A failed flush keeps the old process for manual recovery,
+as described above. After the supervised exit, x0xd **never** rolls the installed
+bytes back automatically — recovery is this manual procedure, run by
 the operator who owns the service manager. That is deliberate: a second,
 self-appointed restarter beside the manager is the #493 duplicate-daemon
 bug this design exists to prevent.
 
 The scenario: a migrated/supervised job took the supervised exit, the
-replacement failed to start, and the daemon is now down. Two artifacts
-survive the attempt and are all you need:
+replacement failed to start, and the daemon is now down. Keep the flush records
+above with these two recovery artifacts:
 
 - `<target>.backup` — the exact bytes that were serving before the swap,
   written beside the installed binary (`<target>`).

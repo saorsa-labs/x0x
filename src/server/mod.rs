@@ -162,6 +162,27 @@ async fn finish_startup_error(
     }
 }
 
+async fn drain_http_server(
+    mut server: tokio::task::JoinHandle<std::io::Result<()>>,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(anyhow::Error::new(error).context("API server error")),
+        Ok(Err(error)) => Err(anyhow::Error::new(error).context("API server task failed")),
+        Err(_) => {
+            tracing::warn!(
+                "API server did not shut down within 2s; aborting lingering connections"
+            );
+            server.abort();
+            let _ = server.await;
+            // Aborting the accept task does not join request-owned blocking writes.
+            Err(anyhow::anyhow!(
+                "HTTP request drain exceeded 2s; request work may remain"
+            ))
+        }
+    }
+}
+
 fn combine_server_shutdown_results(
     server: anyhow::Result<()>,
     agent_shutdown: x0x::error::NetworkResult<()>,
@@ -3182,19 +3203,7 @@ pub async fn serve_with_options(
         // captured above; otherwise await it (with a bound) and propagate.
         let server_result: anyhow::Result<()> = match server_result {
             Some(res) => res,
-            None => match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
-                Ok(Ok(Ok(()))) => Ok(()),
-                Ok(Ok(Err(e))) => Err(anyhow::Error::new(e).context("API server error")),
-                Ok(Err(e)) => Err(anyhow::Error::new(e).context("API server task failed")),
-                Err(_) => {
-                    tracing::warn!(
-                        "API server did not shut down within 2s; aborting lingering connections"
-                    );
-                    server.abort();
-                    let _ = server.await;
-                    Ok(())
-                }
-            },
+            None => drain_http_server(server).await,
         };
 
         // Fix C (Issue #110 Phase 2 + 2b): tear down the server-owned tasks, the

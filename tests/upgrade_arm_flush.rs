@@ -252,6 +252,17 @@ macro_rules! arm_flush_regression_tests {
             }
 
             #[tokio::test(start_paused = true)]
+            async fn shutdown_flush_refuses_an_incomplete_http_drain() {
+                let server = tokio::spawn(std::future::pending::<std::io::Result<()>>());
+                let task = server.abort_handle();
+                let result = crate::server::drain_http_server(server).await;
+                assert!(result.is_err());
+                assert!(task.is_finished(), "timed-out HTTP task must be aborted and joined");
+                assert!(crate::server::combine_server_shutdown_results(result, Ok(())).is_err());
+                assert!(crate::server::drain_http_server(tokio::spawn(async { Ok(()) })).await.is_ok());
+            }
+
+            #[tokio::test(start_paused = true)]
             async fn shutdown_flush_requires_the_real_server_producer_drain_to_finish() {
                 use futures::FutureExt;
                 for blocked in [true, false] {
