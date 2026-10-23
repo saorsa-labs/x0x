@@ -294,14 +294,21 @@ macro_rules! arm_flush_regression_tests {
             }
 
             #[tokio::test(start_paused = true)]
-            async fn shutdown_flush_refuses_an_incomplete_http_drain() {
+            async fn http_drain_timeout_keeps_exit_zero_and_marks_only_the_receipt_unfinished() {
                 let server = tokio::spawn(std::future::pending::<std::io::Result<()>>());
                 let task = server.abort_handle();
-                let result = crate::server::drain_http_server(server).await;
-                assert!(result.is_err());
+                let (result, drained) = crate::server::drain_http_server(server).await;
                 assert!(task.is_finished(), "timed-out HTTP task must be aborted and joined");
-                assert!(crate::server::combine_server_shutdown_results(result, Ok(())).is_err());
-                assert!(crate::server::drain_http_server(tokio::spawn(async { Ok(()) })).await.is_ok());
+                // Ordinary shutdown keeps the clean-stop exit-0 contract
+                // (#261/#363): a drain that misses the bound is not a process
+                // error. Only the flush receipt sees the unfinished flag.
+                assert!(result.is_ok());
+                assert!(!drained, "an aborted HTTP producer is not a finished producer");
+                assert!(crate::server::combine_server_shutdown_results(result, Ok(())).is_ok());
+                let (clean, drained) =
+                    crate::server::drain_http_server(tokio::spawn(async { Ok(()) })).await;
+                assert!(clean.is_ok());
+                assert!(drained);
             }
 
             #[tokio::test(start_paused = true)]

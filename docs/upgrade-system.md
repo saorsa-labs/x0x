@@ -340,7 +340,10 @@ if it fails; an unused reservation cannot release that custody.
 
 After successful replacement, the daemon writes the handoff intent and requests
 a bounded shutdown flush. The owner drains producers and completes the store,
-cache and log barriers before the receipt is committed. The persisted record contains the
+cache and log barriers before the receipt is committed. HTTP connections that
+miss the 2 s drain bound are aborted, not waited on: an abort does not join
+request-owned blocking writes (ADR 0094 §4), so the flush receipt is refused
+while the ordinary-shutdown exit stays 0 (#261/#363). The persisted record contains the
 restart-plan binding, boot ID and fixed deadline. The log barrier keeps admission open
 so a failed flush does not close the old process's log sinks. A transient dropped
 line fails its barrier window; it does not poison every later barrier.
@@ -352,13 +355,15 @@ The instance data directory retains two private diagnostic records:
   worker cannot erase this separate failure record by writing a receipt.
 
 A flush timeout, receipt-write failure or binding failure does not authorize
-the supervised exit. The old process stays for manual recovery and logs the
-failed restart at ERROR. It may already be quiesced; a live PID does not prove a
-healthy API. Preserve the records and logs, check the running process and the
-installed bytes, and use the owning service manager for recovery. An unresolved
-receipt or rollback record blocks later upgrade admission. There is no automatic
-record reset in this slice; do not apply the legacy handoff deletion procedure
-below to these flush records.
+the supervised exit. A flush that started and then failed or overran restores
+the previous binary and exits `EX_TEMPFAIL` (75) for a service-manager
+restart on the old version; a refusal before any flush started is an ordinary
+error and the daemon keeps serving. Both cases are described under
+[Acknowledged shutdown flush (supervised exit)](#acknowledged-shutdown-flush-supervised-exit)
+below, together with the startup cleanup that clears a receipt-less record or
+rollback marker whose owning process is gone. Do not apply the legacy
+handoff deletion procedure below to flush records while the daemon runs; the
+documented manual fallback stops the daemon first.
 
 ### What a successful apply does and does not prove
 
@@ -374,9 +379,10 @@ only the transactional handoff observes
 
 On the supervised path, the daemon installs the new bytes, writes the intent
 record and commits the acknowledged shutdown receipt before it requests the
-service-manager restart. A failed flush keeps the old process for manual recovery,
-as described above. After the supervised exit, x0xd **never** rolls the installed
-bytes back automatically — recovery is this manual procedure, run by
+service-manager restart. A failed flush restores the previous binary and
+exits `EX_TEMPFAIL`, as described above. After the supervised exit, x0xd
+**never** rolls the installed bytes back automatically — recovery is this
+manual procedure, run by
 the operator who owns the service manager. That is deliberate: a second,
 self-appointed restarter beside the manager is the #493 duplicate-daemon
 bug this design exists to prevent.

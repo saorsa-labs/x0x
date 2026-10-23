@@ -595,6 +595,37 @@ mod arm_flush_regressions_unused_reservation {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_finish_refuses_the_receipt_when_producers_are_unfinished() {
+        let (_dir, root) = fixture();
+        let (owner, receive, _called, _exit_code) = owner(&root, false);
+        let reservation = shutdown_flush::reserve(&root).unwrap();
+        reservation.activate().unwrap();
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let mut finish = tokio::spawn(async move {
+            owner.finish(&Ok(()), false, &worker_cancel).await;
+        });
+        // A clean process result cannot authorize a receipt while a producer
+        // (an aborted HTTP drain or background straggler) remains unfinished.
+        let refusal =
+            tokio::task::spawn_blocking(move || receive.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(refusal.to_string(), "shutdown producers remain unfinished");
+        // The unused reservation releases the parked ordinary shutdown.
+        drop(reservation);
+        match tokio::time::timeout(Duration::from_secs(2), &mut finish).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                cancel.cancel();
+                finish.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_exits_tempfail_after_a_failed_started_flush() {
         let (_dir, root) = fixture();
         let (owner, receive, _called, exit_code) = owner(&root, true);

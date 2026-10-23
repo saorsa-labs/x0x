@@ -162,23 +162,32 @@ async fn finish_startup_error(
     }
 }
 
+/// Drain the axum accept task with a 2 s bound. The returned result keeps
+/// the ordinary-shutdown exit-0 contract (#261/#363): a drain that misses
+/// the bound is aborted and joined, not turned into a process error. The
+/// companion flag reports whether every HTTP producer finished on its own;
+/// an abort does not join request-owned blocking writes (ADR 0094 §4), so
+/// only the acknowledged-flush receipt consumes the flag, never the exit.
 async fn drain_http_server(
     mut server: tokio::task::JoinHandle<std::io::Result<()>>,
-) -> anyhow::Result<()> {
+) -> (anyhow::Result<()>, bool) {
     match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(error))) => Err(anyhow::Error::new(error).context("API server error")),
-        Ok(Err(error)) => Err(anyhow::Error::new(error).context("API server task failed")),
+        Ok(Ok(Ok(()))) => (Ok(()), true),
+        Ok(Ok(Err(error))) => (
+            Err(anyhow::Error::new(error).context("API server error")),
+            true,
+        ),
+        Ok(Err(error)) => (
+            Err(anyhow::Error::new(error).context("API server task failed")),
+            true,
+        ),
         Err(_) => {
             tracing::warn!(
                 "API server did not shut down within 2s; aborting lingering connections"
             );
             server.abort();
             let _ = server.await;
-            // Aborting the accept task does not join request-owned blocking writes.
-            Err(anyhow::anyhow!(
-                "HTTP request drain exceeded 2s; request work may remain"
-            ))
+            (Ok(()), false)
         }
     }
 }
@@ -3212,9 +3221,11 @@ pub async fn serve_with_options(
 
         // Drain the axum server result and propagate any failure. If the select
         // already observed it ending, `server` was consumed there and its result
-        // captured above; otherwise await it (with a bound) and propagate.
-        let server_result: anyhow::Result<()> = match server_result {
-            Some(res) => res,
+        // captured above; otherwise await it (with a bound) and propagate. The
+        // drain flag records whether every HTTP producer finished on its own;
+        // it feeds only the flush receipt below, never the exit code.
+        let (server_result, _http_drained) = match server_result {
+            Some(res) => (res, true),
             None => drain_http_server(server).await,
         };
 
@@ -3334,8 +3345,15 @@ pub async fn serve_with_options(
         let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
         #[cfg(unix)]
         if let Some(owner) = &upgrade_flush {
+            // An HTTP producer aborted at the drain bound is as unfinished as
+            // an aborted background task (ADR 0094 §4): the receipt refuses,
+            // while the ordinary-shutdown exit above stays 0 (#261/#363).
             owner
-                .finish(&result, _server_tasks_finished, &supervisor_cancel)
+                .finish(
+                    &result,
+                    _server_tasks_finished && _http_drained,
+                    &supervisor_cancel,
+                )
                 .await;
         }
         result
