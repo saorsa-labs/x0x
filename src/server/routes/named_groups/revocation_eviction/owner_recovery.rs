@@ -1636,13 +1636,14 @@ pub(in crate::server) fn spawn_receipt(
 
 /// #1508 r5: hold a `SecureShareDelivered` that the share arm refused
 /// because its actor is not an admin on this node's roster, when it can be
-/// the share of a GSS owner recovery that has not installed here yet. The
-/// share and the recovery frame use different carriers, so the share can
-/// arrive first, and the sender seals it only once. The group is a GSS
-/// `OwnerCertified` group, the sender is the actor and an Active member,
-/// and the share is for a later epoch. Nothing is opened or installed
-/// here: [`replay_early_shares`] runs the full share apply again after the
-/// recovery installs. Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`].
+/// the share of a GSS owner recovery, or of a GSS crypto-only exclusion,
+/// that has not installed here yet (#1508 rc13: the sender can be an admin
+/// that a later commit promotes). The share and the frame use different
+/// carriers, so the share can arrive first, and the sender seals it only
+/// once. The group is a GSS group, the sender is the actor and an Active
+/// member, and the share is for a later epoch. Nothing is opened or
+/// installed here: [`replay_early_shares`] runs the full share apply again
+/// after the frame installs. Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`].
 pub(in crate::server) async fn park_early_share(
     state: &AppState,
     info: &GroupInfo,
@@ -1661,7 +1662,6 @@ pub(in crate::server) async fn park_early_share(
     let sender_hex = hex::encode(sender.as_bytes());
     if !verified
         || info.withdrawn
-        || info.policy.admission.owner_certified_user_id().is_none()
         || orc::crypto_kind(info) != orc::RecoveryCryptoKind::Gss
         || *actor != sender_hex
         || !info.has_active_member(&sender_hex)
@@ -1767,13 +1767,13 @@ async fn parked_key(
     }
 }
 
-/// #1508 rc12 (Codex P1): hold a verified commit of a GSS `OwnerCertified`
-/// group that does not chain on this node's head yet. It may chain on an
-/// owner recovery that has not installed here: a lagging survivor gets the
-/// recovery frame from any holder, on its own carrier, and the later
-/// commits on theirs (direct delivery, the topic or a catch-up page), in
-/// any order, so their ordinary apply refuses them. [`receive_commit`] uses
-/// a held commit that the recovery's actor signed on the recovery result
+/// #1508 rc12 (Codex P1): hold a verified commit of a GSS group that does
+/// not chain on this node's head yet. It may chain on an owner recovery,
+/// or a crypto-only exclusion (#1508 rc13), that has not installed here: a
+/// lagging survivor gets the frame from any holder, on its own carrier,
+/// and the later commits on theirs (direct delivery, the topic or a
+/// catch-up page), in any order, so their ordinary apply refuses them.
+/// [`receive_commit`] uses a held commit that the recovery's actor signed on the recovery result
 /// as the evidence that the group moved on, and [`replay_held_events`]
 /// applies the held commits after the install, each as its verified
 /// signer (the catch-up rule for a relayed removal), so the ordinary apply
@@ -1794,7 +1794,6 @@ pub(in crate::server) async fn hold_unchained_event(
         return;
     };
     if info.withdrawn
-        || info.policy.admission.owner_certified_user_id().is_none()
         || orc::crypto_kind(&info) != orc::RecoveryCryptoKind::Gss
         || commit.revision <= info.state_revision
         || commit.prev_state_hash.as_deref() == Some(info.state_hash.as_str())
@@ -1833,9 +1832,15 @@ pub(in crate::server) async fn hold_unchained_event(
     });
 }
 
-/// Whether this node holds a verified commit that `body`'s actor signed
-/// on the recovery result ([`hold_unchained_event`]).
-async fn holds_actor_successor(state: &AppState, body: &orc::OwnerRecoveryBodyV1) -> bool {
+/// Whether this node holds a verified commit that `actor` signed on the
+/// frame result `result_state_hash` of `stable_group_id`
+/// ([`hold_unchained_event`]).
+pub(super) async fn holds_actor_successor(
+    state: &AppState,
+    stable_group_id: &str,
+    actor: &[u8; 32],
+    result_state_hash: &str,
+) -> bool {
     let now = Instant::now();
     state
         .revocation_evictions
@@ -1846,16 +1851,17 @@ async fn holds_actor_successor(state: &AppState, body: &orc::OwnerRecoveryBodyV1
         .held_events
         .iter()
         .any(|held| {
-            held.stable_group_id == body.stable_group_id
+            held.stable_group_id == stable_group_id
                 && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
-                && held.author.as_bytes() == &body.actor
-                && held.prev_state_hash.as_deref() == Some(body.commit.state_hash.as_str())
+                && held.author.as_bytes() == actor
+                && held.prev_state_hash.as_deref() == Some(result_state_hash)
         })
 }
 
 /// Apply the held catch-up commits of `stable_group_id`, oldest first, once
-/// a GSS recovery installed here, each as its verified signer. A commit
-/// that still does not apply is dropped; catch-up serves it again.
+/// a GSS recovery or crypto-only exclusion installed here, each as its
+/// verified signer. A commit that still does not apply is dropped;
+/// catch-up serves it again.
 async fn replay_held_events(state: &Arc<AppState>, stable_group_id: &str) {
     let now = Instant::now();
     let mut due: Vec<HeldEvent> = {
@@ -1881,9 +1887,9 @@ async fn replay_held_events(state: &Arc<AppState>, stable_group_id: &str) {
 }
 
 /// Apply again, through the ordinary share apply, every early share of
-/// `stable_group_id` once a GSS recovery installed here. Call it with no
-/// group lock held. A share that the apply refuses again is held again
-/// only if the park rule still holds.
+/// `stable_group_id` once a GSS recovery or crypto-only exclusion installed
+/// here. Call it with no group lock held. A share that the apply refuses
+/// again is held again only if the park rule still holds.
 async fn replay_early_shares(state: &Arc<AppState>, stable_group_id: &str) {
     let now = Instant::now();
     let due: Vec<ParkedShare> = {
@@ -1905,6 +1911,14 @@ async fn replay_early_shares(state: &Arc<AppState>, stable_group_id: &str) {
         )
         .await;
     }
+}
+
+/// After a GSS recovery or crypto-only exclusion installed here: apply the
+/// held commits that chain on it, then the parked shares. Call it with no
+/// group lock held: both re-enter the ordinary apply.
+pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group_id: &str) {
+    replay_held_events(state, stable_group_id).await;
+    replay_early_shares(state, stable_group_id).await;
 }
 
 async fn retry_stash(state: &Arc<AppState>) {
@@ -2092,7 +2106,15 @@ async fn receive_commit(
                     );
                     None
                 }
-                ParkedKey::Missing if holds_actor_successor(state, &body).await => {
+                ParkedKey::Missing
+                    if holds_actor_successor(
+                        state,
+                        &body.stable_group_id,
+                        &body.actor,
+                        &body.commit.state_hash,
+                    )
+                    .await =>
+                {
                     tracing::info!(
                         group_id = %ng::LogHexId::group(&group_key),
                         secret_epoch = next_secret_epoch,
@@ -2312,8 +2334,7 @@ async fn receive_commit(
             ng::replay_pending_treekem_events(state, &group_key).await;
         }
         orc::RecoveryCryptoKind::Gss => {
-            replay_held_events(state, &body.stable_group_id).await;
-            replay_early_shares(state, &body.stable_group_id).await;
+            replay_after_gss_install(state, &body.stable_group_id).await;
         }
         orc::RecoveryCryptoKind::SignedPublic => {}
     }

@@ -15503,7 +15503,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
                 // ADR 0110 §4b(1), #1508 r5: an owner-recovery share can
-                // arrive before the recovery that makes its sender an admin.
+                // arrive before the recovery that makes its sender an admin,
+                // and a later admin's share before the GSS crypto-only
+                // exclusion and promotion it chains on (#1508 rc13).
                 if allow_queue {
                     revocation_eviction::owner_recovery::park_early_share(
                         state,
