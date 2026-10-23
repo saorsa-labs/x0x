@@ -6,7 +6,7 @@ Relay, self-update, diagnostics, troubleshooting, and configuration.
 
 ### 7.1 Relay & bootstraps
 
-Relay is an application-level fallback for DMs that cannot hole-punch (ADR-0035). `x0xd --relay` selects Full gossip participation and sends the capability advertisement (ADR-0034). The advertisement is informational only: since #1112, no hint path reads the self-asserted relay/coordinator flags. The relay header v2 (`digest_support`, #445) binds the RelayHeader to the inner payload — substituted-payload relays are refused, downgrades are TTL-bounded.
+Relay is an application-level fallback for DMs that cannot hole-punch (ADR-0035). `x0xd --relay` selects Full participation and sends the capability advertisement (ADR-0034). It is informational only: since #1112, no hint path reads the self-asserted relay/coordinator flags. The relay header v2 (`digest_support`, #445) binds the RelayHeader to the inner payload — substituted-payload relays are refused, downgrades are TTL-bounded.
 
 ```bash
 x0xd --relay                        # offer relay service (needs Full participation, not Leaf)
