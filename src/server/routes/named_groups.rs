@@ -9664,6 +9664,34 @@ pub(in crate::server) fn member_treekem_leaf_present(
     group.member_leaf_present(&agent, package.as_deref())
 }
 
+/// [`member_treekem_leaf_present`] for every roster member of `info`, read
+/// once against `group`. A member with no evidence stays `None` unless
+/// every active leaf of the tree already belongs to a member this node
+/// can identify: a leaf belongs to one member only, so no leaf is left
+/// for it and it is `Some(false)`. This decides old self-leavers of a
+/// fully accounted tree on a Welcome joiner, which never held their
+/// KeyPackages; an unaccounted leaf keeps them `None` (#1508 review P1).
+pub(in crate::server) fn roster_treekem_leaf_presence(
+    group: &x0x::mls::TreeKemMlsGroup,
+    info: &x0x::groups::GroupInfo,
+) -> BTreeMap<String, Option<bool>> {
+    let mut presence: BTreeMap<String, Option<bool>> = info
+        .members_v2
+        .iter()
+        .map(|(id, member)| (id.clone(), member_treekem_leaf_present(group, member)))
+        .collect();
+    let accounted = presence
+        .values()
+        .filter(|present| **present == Some(true))
+        .count();
+    if accounted >= group.member_count() as usize {
+        for present in presence.values_mut().filter(|present| present.is_none()) {
+            *present = Some(false);
+        }
+    }
+    presence
+}
+
 /// Install a recovered KeyPackage while the caller holds this group's
 /// [`group_membership_lock`]. Keeping resolution and mutation under the same
 /// guard prevents a stale full-`GroupInfo` write-back from erasing the package.
@@ -9941,18 +9969,7 @@ async fn resolve_member_treekem_kp_for_removal_locked(
     // client's retry asks again after a restart. Before this, sequential
     // requests to unavailable witnesses kept this AppState, and with it
     // `history.db`, alive after `shutdown_and_wait`.
-    let bg_state = Arc::clone(state);
-    let bg_group = group_id.to_string();
-    let bg_member = agent_id_hex.to_string();
-    if !state.spawn_detached(async move {
-        request_member_key_package_catchup(&bg_state, &bg_group, &bg_member).await;
-    }) {
-        tracing::debug!(
-            group_id = %LogHexId::group(group_id),
-            member = %LogHexId::agent(agent_id_hex),
-            "shutdown has begun; member-keyed KeyPackage catch-up not requested"
-        );
-    }
+    request_missing_leaf_evidence(state, group_id, agent_id_hex);
     Err((
         StatusCode::FAILED_DEPENDENCY,
         Json(serde_json::json!({
@@ -12151,6 +12168,35 @@ fn epoch_ahead_catchup_peers(
         .take(TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS)
         .map(|(_, peer)| peer)
         .collect()
+}
+
+/// ADR 0110 §3: the one route for missing leaf evidence. Every S4 path
+/// that cannot decide a member's leaf because it lacks that member's
+/// committed KeyPackage calls this, then keeps its work pending: the
+/// sender's removal, the self-leave rekey, the obligation pass, and the
+/// crypto-only and owner-recovery receivers (#1508 review P1). It starts
+/// the authenticated, member-keyed catch-up
+/// ([`request_member_key_package_catchup`]) on a detached task, so a
+/// caller that holds the membership lock never waits on a send. The
+/// answer installs through [`apply_recovered_member_key_package`] only
+/// when it matches the hash the roster commits, and the caller retries.
+pub(in crate::server) fn request_missing_leaf_evidence(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+) {
+    let bg_state = Arc::clone(state);
+    let bg_group = group_id.to_string();
+    let bg_member = member_agent_id.to_string();
+    if !state.spawn_detached(async move {
+        request_member_key_package_catchup(&bg_state, &bg_group, &bg_member).await;
+    }) {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            "shutdown has begun; member-keyed KeyPackage catch-up not requested"
+        );
+    }
 }
 
 /// Issue #205: ask peers that witnessed a member's join for that member's
@@ -25733,11 +25779,7 @@ async fn commit_treekem_self_leave_rekey_from(
                     "self-leave TreeKEM rekey deferred: roster holds the KeyPackage hash and not the bytes"
                 );
             }
-            let bg_state = Arc::clone(state);
-            let bg_group = group_key.to_string();
-            let _ = state.spawn_detached(async move {
-                request_member_key_package_catchup(&bg_state, &bg_group, &missing).await;
-            });
+            request_missing_leaf_evidence(state, group_key, &missing);
         }
         return SelfLeaveRekeyStep::Deferred;
     };
@@ -26750,6 +26792,11 @@ async fn owner_certified_seal_with_eviction(
 
     let membership_lock = group_membership_lock(state, id).await;
     let _membership_guard = membership_lock.lock().await;
+    // ADR 0110 §2 (#1508 review P1): re-check the S4 gate under the lock,
+    // just before a seal that may evict an S4 target.
+    if let Some(resp) = revocation_eviction::s4_seal_request_recheck_under_lock(state, id).await {
+        return Some(Err(resp));
+    }
     let signing_kp = state.agent.identity().agent_keypair();
     let mut evicted_total: Vec<String> = Vec::new();
     let mut last_commit: Option<x0x::groups::GroupStateCommit> = None;

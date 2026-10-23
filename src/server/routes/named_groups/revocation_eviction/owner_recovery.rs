@@ -956,7 +956,7 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
     orc::apply_roster_change(&mut next, &body);
     match kind {
         orc::RecoveryCryptoKind::TreeKem => {
-            commit_treekem(state, &group_key, &info, next, body, &revocations, &named).await;
+            commit_treekem(state, &group_key, &info, next, body, &revocations).await;
         }
         orc::RecoveryCryptoKind::Gss => {
             let (secret, next_secret_epoch) = next.rotate_shared_secret();
@@ -1019,7 +1019,6 @@ async fn commit_treekem(
     mut next: GroupInfo,
     mut body: orc::OwnerRecoveryBodyV1,
     revocations: &orc::VerifiedAgentRevocations,
-    named: &BTreeSet<[u8; 32]>,
 ) {
     use super::super as ng;
     use base64::Engine as _;
@@ -1098,7 +1097,10 @@ async fn commit_treekem(
         commits,
         next_epoch,
     };
-    let installed = finish_commit(
+    // The removed admins' attested `MemberJoined` entries stay cached:
+    // they are the leaf evidence a survivor that holds only the committed
+    // hash asks for before it can prove this commit (#1508 review P1).
+    finish_commit(
         state,
         group_key,
         info,
@@ -1108,18 +1110,6 @@ async fn commit_treekem(
         Some((&mut *guard, rollback_snapshot.as_slice())),
     )
     .await;
-    drop(guard);
-    if installed {
-        for agent in named {
-            let _ = ng::prune_treekem_cache_member(
-                state,
-                group_key,
-                &hex::encode(agent),
-                "owner_recovery",
-            )
-            .await;
-        }
-    }
 }
 
 /// Seal, sign, self-check, persist and schedule delivery. `tree` is the
@@ -1896,12 +1886,14 @@ async fn receive_commit(
             // seat's committed leaf. The local leaf map alone is not proof;
             // a seat with no evidence keeps the frame pending (#1508
             // review P1).
+            let presence = ng::roster_treekem_leaf_presence(guard, &info);
             let leaves: Vec<Option<bool>> = removed
                 .iter()
                 .map(|agent| {
-                    info.members_v2
+                    presence
                         .get(&hex::encode(agent.as_bytes()))
-                        .and_then(|member| ng::member_treekem_leaf_present(guard, member))
+                        .copied()
+                        .flatten()
                 })
                 .collect();
             // An undecided seat keeps the frame pending even when another
@@ -1916,6 +1908,19 @@ async fn receive_commit(
                     guard,
                     "owner_recovery_leaf_unproven",
                 );
+                // Ask for each undecided seat's KeyPackage before the
+                // retry (#1508 review P1).
+                for (agent, _) in removed
+                    .iter()
+                    .zip(&leaves)
+                    .filter(|(_, leaf)| leaf.is_none())
+                {
+                    ng::request_missing_leaf_evidence(
+                        state,
+                        &group_key,
+                        &hex::encode(agent.as_bytes()),
+                    );
+                }
                 return ReceiveOutcome::Retained;
             }
             if !installed || leaves.contains(&Some(true)) {
@@ -1981,10 +1986,8 @@ async fn receive_commit(
     for agent in &removed {
         let agent_hex = hex::encode(agent.as_bytes());
         ng::purge_join_artifacts_if_ineligible(state, &group_key, &agent_hex).await;
-        if kind == orc::RecoveryCryptoKind::TreeKem {
-            let _ = ng::prune_treekem_cache_member(state, &group_key, &agent_hex, "owner_recovery")
-                .await;
-        }
+        // The cached `MemberJoined` stays: later survivors ask this node
+        // for it (#1508 review P1).
     }
     drop(membership_guard);
     {

@@ -564,6 +564,19 @@ pub(in crate::server) async fn commit_locked(
     ) else {
         return SelfLeaveRekeyStep::Deferred;
     };
+    // ADR 0110 §2 (#1508 review P1): the one locked S4 re-check, before
+    // this seal touches the tree: head synced, this node still designated
+    // or past its fallback time, intake durable. The caller holds the
+    // membership lock, so no roster change lands before the seal.
+    let mode = super::SealMode::SelfLeaveRekey {
+        tree_epoch: tree.epoch(),
+    };
+    if super::s4_seal_recheck_locked(state, group_key, &key, mode)
+        .await
+        .is_some()
+    {
+        return SelfLeaveRekeyStep::Deferred;
+    }
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = ng::now_millis_u64();
     let mut next = info.clone();
@@ -690,7 +703,11 @@ pub(in crate::server) async fn commit_locked(
         }
     }
     ng::purge_join_artifacts_if_ineligible(state, group_key, leaver_hex).await;
-    let _ = ng::prune_treekem_cache_member(state, group_key, leaver_hex, "crypto_exclusion").await;
+    // The target's attested `MemberJoined` stays cached: it is the leaf
+    // evidence a survivor that holds only the committed hash asks for
+    // before it can prove this exclusion (#1508 review P1). It never
+    // refills the Removed seat (#205); it serves and installs only on a
+    // hash match.
     let recipients = survivors(&next, &local, target.as_bytes());
     super::committed_crypto_exclusion(
         state,
@@ -741,14 +758,18 @@ pub(super) async fn gss_group(state: &AppState, group_key: &str) -> bool {
 /// frame under the same guarded, capability-gated delivery.
 pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_key: &str) {
     use super::super as ng;
-    // §2: re-read the head and the evidence just before the seal.
-    if !super::group_head_synced(state, group_key).await {
-        return;
-    }
     let local = *state.agent.agent_id().as_bytes();
     let target_hex = hex::encode(key.target);
     let membership_lock = ng::group_membership_lock(state, group_key).await;
     let _membership_guard = membership_lock.lock().await;
+    // §2 (#1508 review P1): re-read the head and the evidence under the
+    // lock, just before the seal.
+    if super::s4_seal_recheck_locked(state, group_key, key, super::SealMode::S4Work)
+        .await
+        .is_some()
+    {
+        return;
+    }
     let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
         return;
     };
@@ -1836,10 +1857,9 @@ pub(in crate::server) async fn receive(
     // The cryptographic removal proof: the tree no longer holds the
     // target's committed leaf. The local leaf map alone is not proof; with
     // no evidence the frame stays pending (#1508 review P1).
-    let leaf_present = info
-        .members_v2
-        .get(&hex::encode(target.as_bytes()))
-        .and_then(|member| ng::member_treekem_leaf_present(&guard, member));
+    let leaf_present = ng::roster_treekem_leaf_presence(&guard, &info)
+        .remove(&hex::encode(target.as_bytes()))
+        .flatten();
     match leaf_present {
         Some(false) => {}
         Some(true) => {
@@ -1848,7 +1868,10 @@ pub(in crate::server) async fn receive(
             return unhold_unless_kept(state, stable, refused).await;
         }
         None => {
+            // No KeyPackage here (a Welcome joiner holds only the hash):
+            // ask for the evidence, keep the frame, retry (#1508 review P1).
             refuse(&mut guard, "crypto_exclusion_leaf_unproven");
+            ng::request_missing_leaf_evidence(state, &group_key, &hex::encode(target.as_bytes()));
             return ReceiveOutcome::LocalFailure;
         }
     }
@@ -1870,13 +1893,8 @@ pub(in crate::server) async fn receive(
     }
     drop(guard);
     ng::refresh_group_card_cache_from_info(state, &group_key, &next).await;
-    let _ = ng::prune_treekem_cache_member(
-        state,
-        &group_key,
-        &hex::encode(body.target),
-        "crypto_exclusion",
-    )
-    .await;
+    // The target's cached `MemberJoined` stays: later survivors ask this
+    // node for it (#1508 review P1).
     remember_installed(state, &body, frame_bytes).await;
     drop(membership_guard);
     tracing::info!(
@@ -2892,6 +2910,172 @@ mod daemon_tests {
                 .map(|info| info.state_hash.clone()),
             Some(result_head)
         );
+        Ok(())
+    }
+
+    /// #1508 review P1: a non-admin survivor that joined through a Welcome
+    /// holds only the leaver's committed KeyPackage hash, so it cannot
+    /// prove the exclusion from its tree. It keeps the frame, asks for the
+    /// evidence through the member-keyed catch-up (red before: it only
+    /// retried and stayed on the old epoch), and installs the frame on the
+    /// retry once the KeyPackage arrives.
+    #[tokio::test]
+    async fn a_hash_only_survivor_asks_for_the_leavers_key_package() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        state
+            .named_group_test_recorders
+            .metadata_publish_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let admin = state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let group_id = "c7".repeat(16);
+        let group_id_bytes = hex::decode(&group_id)?;
+        let seed = ng::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let mut admin_group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), admin, &seed)?;
+        let leaver_kp = x0x::identity::AgentKeypair::generate()?;
+        let leaver = leaver_kp.agent_id();
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(leaver, &[9u8; 32])?;
+        let leaver_kp_bytes = prepared.key_package_bytes().to_vec();
+        admin_group.add_member(leaver, &leaver_kp_bytes)?;
+        // The survivor (the replica's own agent) joins after the leaver.
+        let (replica, _replica_dir) = ng::tests::secure_endpoint_test_state().await?;
+        let survivor = replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        // The daemon's own seed: a rollback restores the tree with it.
+        let survivor_seed = ng::agent_treekem_seed(replica.agent.as_ref(), &group_id_bytes);
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(survivor, &survivor_seed)?;
+        let survivor_kp_bytes = prepared.key_package_bytes().to_vec();
+        let added = admin_group.add_member(survivor, &survivor_kp_bytes)?;
+        let survivor_tree = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+        assert!(
+            !survivor_tree.tracks_member(&leaver),
+            "premise: the Welcome joiner's leaf map lacks the leaver"
+        );
+        let epoch = admin_group.epoch();
+
+        let mut info = GroupInfo::new(
+            "ce-hash-only".into(),
+            String::new(),
+            admin,
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        for (member_hex, kp_bytes) in [
+            (&leaver_hex, &leaver_kp_bytes),
+            (&survivor_hex, &survivor_kp_bytes),
+        ] {
+            info.add_member(
+                member_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(admin_hex.clone()),
+                None,
+            );
+            info.set_member_treekem_key_package(
+                member_hex,
+                base64::engine::general_purpose::STANDARD.encode(kp_bytes),
+            );
+        }
+        info.secret_epoch = epoch;
+        info.security_binding = Some(format!("treekem:epoch={epoch}"));
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state.treekem_groups.write().await.insert(
+            group_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(admin_group)),
+        );
+        let pre_leave = info.clone();
+
+        let mut leaving = info.clone();
+        leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+        let revision = leaving.roster_revision;
+        leaving.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        let leave_commit = leaving.seal_commit(&leaver_kp, ng::now_millis_u64())?;
+        let leave = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision,
+            actor: leaver_hex.clone(),
+            agent_id: leaver_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(leave_commit),
+        };
+        let applied =
+            ng::apply_named_group_metadata_event(&state, leave.clone(), leaver, true, None).await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        let frame = latest_frame_for_test(&state, &stable)
+            .await
+            .expect("the crypto-only exclusion committed");
+        let result_head = ce::decode_frame(&frame)
+            .map(|frame| frame.body.commit.state_hash)
+            .expect("frame");
+
+        // The survivor's roster commits the leaver's hash, not its bytes.
+        let mut hash_only = pre_leave;
+        if let Some(member) = hash_only.members_v2.get_mut(&leaver_hex) {
+            member.treekem_key_package_b64 = None;
+        }
+        replica
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), hash_only);
+        replica.treekem_groups.write().await.insert(
+            group_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(survivor_tree)),
+        );
+        let replica_leave =
+            ng::apply_named_group_metadata_event(&replica, leave, leaver, true, None).await;
+        assert!(replica_leave.accepted, "{replica_leave:?}");
+        replica.treekem_catchup_throttle.write().await.clear();
+
+        assert_eq!(
+            receive(&replica, admin, &frame).await,
+            ReceiveOutcome::LocalFailure,
+            "no evidence is no proof: the frame stays pending"
+        );
+        let asked = format!("{group_id}:member:{leaver_hex}:{admin_hex}");
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !replica
+            .treekem_catchup_throttle
+            .read()
+            .await
+            .contains_key(&asked)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the survivor must ask the leaver's inviter for the KeyPackage"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_ne!(
+            head_of(&replica, &group_id).await,
+            Some(result_head.clone())
+        );
+
+        // The KeyPackage arrives (as the catch-up answer installs it); the
+        // retry proves the exclusion from the tree and installs it.
+        {
+            let mut groups = replica.named_groups.write().await;
+            let stored = groups.get_mut(&group_id).expect("group");
+            stored.set_member_treekem_key_package(
+                &leaver_hex,
+                base64::engine::general_purpose::STANDARD.encode(&leaver_kp_bytes),
+            );
+        }
+        assert_eq!(
+            receive(&replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "with the evidence the survivor installs the exclusion"
+        );
+        assert_eq!(head_of(&replica, &group_id).await, Some(result_head));
         Ok(())
     }
 
