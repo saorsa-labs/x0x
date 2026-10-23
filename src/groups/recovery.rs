@@ -1584,7 +1584,7 @@ impl ReseatJournalV1 {
     ///   the swap lifts it), and its head is past the authorisation's invite
     ///   base (the re-seat `MemberAdded` seals after that base);
     /// - this node is Active on it and holds its group key
-    ///   ([`Self::group_key_installed`]): the tree on the TreeKEM plane,
+    ///   (`group_key_installed`): the tree on the TreeKEM plane,
     ///   the shared secret of an encrypted GSS group.
     #[must_use]
     pub fn staged_result_ready(&self, live: &GroupInfo, local_hex: &str, has_tree: bool) -> bool {
