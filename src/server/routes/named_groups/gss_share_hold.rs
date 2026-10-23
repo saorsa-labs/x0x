@@ -10,15 +10,18 @@
 //! transition is written to `gss-share-holds/<blake3(group key)>.json`
 //! (0600, parent directory synced) when it parks. A restarted node loads
 //! the files before its first ciphertext check, so it does not seal under
-//! the old secret again. The hold ends when the node holds the new epoch's
-//! secret (the share installed) or when the head moves away from the
-//! parent that the transition chains from. The file then drops the entry.
+//! the old secret again. The hold ends only when the node holds a secret
+//! of the transition's epoch or later (a verified key transition
+//! completed). A moved head does not end it: a sibling commit can move the
+//! head and keep the old secret (#1533 rc13). A file that cannot be read
+//! or decoded holds its group, and a directory that cannot be read holds
+//! every GSS group, until a load succeeds (fail closed).
 //!
 //! Only transitions whose signed commit the apply verified are written, so
 //! a forged removal holds nothing. The file is local state only: it is not
 //! a wire format and not an API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
@@ -46,6 +49,12 @@ pub(in crate::server) struct GssShareHolds {
     /// file.
     write: tokio::sync::Mutex<()>,
     exclusions: StdMutex<HashMap<String, Vec<ExclusionHold>>>,
+    /// The hold files that exist but did not decode. Each holds its group
+    /// and is never replaced by a write.
+    undecodable: StdMutex<HashSet<PathBuf>>,
+    /// `true` while the hold directory, or a file in it, cannot be read:
+    /// every GSS group is held until a load succeeds.
+    unreadable: std::sync::atomic::AtomicBool,
 }
 
 /// A verified GSS crypto-only exclusion that waits for its share.
@@ -82,7 +91,7 @@ fn hold_path(state: &AppState, group_key: &str) -> PathBuf {
     hold_dir(state).join(format!("{name}.json"))
 }
 
-fn removal_epoch(event: &NamedGroupMetadataEvent) -> Option<u64> {
+pub(super) fn removal_epoch(event: &NamedGroupMetadataEvent) -> Option<u64> {
     match event {
         NamedGroupMetadataEvent::MemberRemoved { secret_epoch, .. }
         | NamedGroupMetadataEvent::MemberBanned { secret_epoch, .. } => *secret_epoch,
@@ -90,30 +99,41 @@ fn removal_epoch(event: &NamedGroupMetadataEvent) -> Option<u64> {
     }
 }
 
-/// Whether a held transition from `parent` to `epoch` still holds `info`:
-/// the head did not move and this node does not hold that epoch's secret.
-fn holds(info: &x0x::groups::GroupInfo, parent: Option<&str>, epoch: Option<u64>) -> bool {
-    epoch.is_some_and(|epoch| epoch > info.secret_epoch) && parent == Some(info.state_hash.as_str())
+/// Whether a held transition to `epoch` still holds `info`: this node
+/// holds no secret of that epoch or a later one. The head is not checked:
+/// a sibling commit can move it and keep the old secret.
+pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
+    epoch.is_some_and(|epoch| {
+        epoch > info.secret_epoch || (epoch == info.secret_epoch && info.shared_secret.is_none())
+    })
 }
 
 /// Whether a parked removal or ban, or a held crypto-only exclusion, still
 /// holds new ciphertext for `group_key`. There is no time limit: only the
 /// share or a moved head ends a hold. Call [`ensure_loaded`] first.
 pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) -> bool {
+    if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        && (state
+            .gss_share_holds
+            .unreadable
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || state
+                .gss_share_holds
+                .undecodable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&hold_path(state, group_key)))
+    {
+        return true;
+    }
     let removal = state
         .parked_gss_removals
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(group_key)
         .is_some_and(|list| {
-            list.iter().any(|entry| {
-                holds(
-                    info,
-                    named_group_metadata_event_commit(&entry.event)
-                        .and_then(|commit| commit.prev_state_hash.as_deref()),
-                    removal_epoch(&entry.event),
-                )
-            })
+            list.iter()
+                .any(|entry| holds(info, removal_epoch(&entry.event)))
         });
     removal
         || state
@@ -122,15 +142,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
-            .is_some_and(|list| {
-                list.iter().any(|hold| {
-                    holds(
-                        info,
-                        Some(hold.parent_state_hash.as_str()),
-                        Some(hold.secret_epoch),
-                    )
-                })
-            })
+            .is_some_and(|list| list.iter().any(|hold| holds(info, Some(hold.secret_epoch))))
 }
 
 /// Load the durable holds once per process, before the first ciphertext
@@ -149,7 +161,12 @@ pub(super) async fn ensure_loaded(state: &AppState) {
             return;
         }
         Err(error) => {
-            // Not loaded: the next check tries again.
+            // Not loaded: every GSS group is held, and the next check
+            // tries again.
+            state
+                .gss_share_holds
+                .unreadable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             tracing::error!(
                 "#1573 GSS share holds not read from {}: {error}",
                 dir.display()
@@ -163,6 +180,10 @@ pub(super) async fn ensure_loaded(state: &AppState) {
             Ok(Some(entry)) => files.push(entry.path()),
             Ok(None) => break,
             Err(error) => {
+                state
+                    .gss_share_holds
+                    .unreadable
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::error!(
                     "#1573 GSS share holds not listed in {}: {error}",
                     dir.display()
@@ -181,19 +202,34 @@ pub(super) async fn ensure_loaded(state: &AppState) {
         {
             Ok(Ok(file)) => file,
             Ok(Err(error)) => {
+                // Its group stays held: the file may hold a removal.
                 tracing::error!(
-                    "#1573 GSS share hold {} is not readable: {error}",
+                    "#1573 GSS share hold {} is not readable; its group makes no ciphertext until the file is repaired or removed and the daemon restarts: {error}",
                     path.display()
                 );
+                state
+                    .gss_share_holds
+                    .undecodable
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(path);
                 continue;
             }
             Err(error) => {
+                state
+                    .gss_share_holds
+                    .unreadable
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::error!("#1573 GSS share hold {} not read: {error}", path.display());
                 return;
             }
         };
         absorb(state, file);
     }
+    state
+        .gss_share_holds
+        .unreadable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     *loaded = true;
 }
 
@@ -270,6 +306,17 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
         .cloned()
         .unwrap_or_default();
     let path = hold_path(state, group_key);
+    if state
+        .gss_share_holds
+        .undecodable
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&path)
+    {
+        return Err(std::io::Error::other(
+            "an undecodable hold file is kept, not replaced",
+        ));
+    }
     if removals.is_empty() && exclusions.is_empty() {
         return match tokio::fs::remove_file(&path).await {
             Ok(()) => super::sync_parent_dir_for_path(&path),
@@ -416,6 +463,12 @@ pub(in crate::server) mod test_seam {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        state
+            .gss_share_holds
+            .undecodable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         *state.gss_share_holds.loaded.lock().await = false;
     }
 
@@ -442,6 +495,10 @@ pub(in crate::server) mod test_seam {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
             .map_or(0, Vec::len)
+    }
+
+    pub(in crate::server) fn hold_path_for(state: &AppState, group_key: &str) -> PathBuf {
+        hold_path(state, group_key)
     }
 
     pub(in crate::server) fn hold_file_exists(state: &AppState, group_key: &str) -> bool {
