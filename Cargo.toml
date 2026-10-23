@@ -224,9 +224,10 @@ inherits = "test"
 debug = "line-tables-only"
 
 [profile.signing-acceptance.package.x0x]
-opt-level = 3
-# CI disables incremental builds; 16 default units make this large test crate
-# exceed runner memory. Keep units small while the job bounds parallel codegen.
+# Optimize the signing workload without level 3's memory cost across the
+# entire library test crate. Crypto dependencies keep their level 3 overrides.
+opt-level = 1
+# Keep CI's non-incremental codegen units small; the job bounds parallel work.
 codegen-units = 256
 
 [profile.release-profiling]
