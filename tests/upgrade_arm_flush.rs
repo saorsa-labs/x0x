@@ -11,7 +11,7 @@ macro_rules! arm_flush_regression_tests {
 
             fn fixture() -> (tempfile::TempDir, Value, Value, ControlContext) {
                 let base = std::env::var_os("X0X_UPGRADE_FLUSH_EVIDENCE_DIR").map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".planning/upgrade-flush-fixtures"));
+                    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/upgrade-flush-fixtures"));
                 std::fs::create_dir_all(&base).unwrap();
                 let dir = tempfile::Builder::new().prefix("arm-").tempdir_in(base).unwrap();
                 let root = dir.path().canonicalize().unwrap();
@@ -58,7 +58,7 @@ macro_rules! arm_flush_regression_tests {
                 journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let counted = Arc::clone(&calls);
-                let owner = shutdown_flush::register(root.clone(), Arc::new(move |_| {
+                let owner = shutdown_flush::register(root.clone(), Arc::new(move |_, _| {
                     counted.fetch_add(1, Ordering::SeqCst); Ok(())
                 })).unwrap();
                 for (field, value) in [
@@ -112,7 +112,7 @@ macro_rules! arm_flush_regression_tests {
                     journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                     let called = Arc::new(AtomicBool::new(false));
                     let observed = Arc::clone(&called);
-                    let owner = shutdown_flush::register(root.clone(), Arc::new(move |_| {
+                    let owner = shutdown_flush::register(root.clone(), Arc::new(move |_, _| {
                         observed.store(true, Ordering::SeqCst); Ok(())
                     })).unwrap();
                     assert!(arm(&state, &root, &serde_json::to_vec(&request).unwrap()).is_err());
@@ -152,7 +152,7 @@ macro_rules! arm_flush_regression_tests {
                 let (entered, entering) = mpsc::channel();
                 let (release, released) = mpsc::channel();
                 let released = Mutex::new(released);
-                let owner = shutdown_flush::register_with_limit(root.clone(), Arc::new(move |deadline| {
+                let owner = shutdown_flush::register_with_limit(root.clone(), Arc::new(move |deadline, _| {
                     sync_tree_with(&store, &deadline, &mut |_| {
                         if counted.fetch_add(1, Ordering::SeqCst) == 0 {
                             let _ = entered.send(());
@@ -182,29 +182,67 @@ macro_rules! arm_flush_regression_tests {
                 let root = dir.path().canonicalize().unwrap();
                 // The frozen plan's daemon target is pinned to the running
                 // executable by the journal's participant/install consistency
-                // rule, so byte restoration is proven at the trigger level
-                // (supervised_exit_after_failed_flush_restores_the_previous_binary);
-                // here the plan's backup does not exist and the recovery must
-                // stay non-destructive.
+                // rule, so daemon byte restoration is proven at the trigger
+                // level (supervised_exit_after_failed_flush_restores_the_previous_binary).
+                // Here the journal says both artifacts swapped, the CLI has a
+                // backup, and the daemon's backup is absent: the
+                // both-or-neither rule must restore neither.
                 let target: PathBuf =
                     serde_json::from_value(journal["plan"]["daemon"]["target_path"].clone())
                         .unwrap();
+                let cli: PathBuf =
+                    serde_json::from_value(journal["plan"]["cli"]["target_path"].clone()).unwrap();
+                let cli_backup: PathBuf =
+                    serde_json::from_value(journal["plan"]["cli"]["backup_path"].clone()).unwrap();
+                std::fs::write(&cli, b"swapped candidate cli").unwrap();
+                std::fs::write(&cli_backup, b"previous cli").unwrap();
                 let before = std::fs::read(&target).unwrap();
-                let owner = shutdown_flush::register(root.clone(), Arc::new(|_| {
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|_, stopped| {
+                    stopped.store(true, Ordering::SeqCst);
                     Err(io::Error::other("injected started flush failure"))
                 }))
                 .unwrap();
                 let failure = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
                 owner.join_workers();
-                // Engineer ruling 23 Oct 2026: a started flush that failed is
-                // a FlushFailed (the process exits EX_TEMPFAIL for a restart
-                // on the old version), never a plain refusal.
+                // Engineer ruling 23 Oct 2026: a flush that started and the
+                // daemon stopped behind is a FlushFailed (the process exits
+                // EX_TEMPFAIL for a restart on the old version), never a
+                // plain refusal.
                 assert!(matches!(failure, ArmFailure::FlushFailed(_)));
                 assert_eq!(std::fs::read(&target).unwrap(), before);
+                // Missing daemon backup ⇒ neither artifact is restored.
+                assert_eq!(std::fs::read(&cli).unwrap(), b"swapped candidate cli");
                 assert!(root.join(shutdown_flush::ROLLBACK_RECORD).is_file());
+                // The failed release is held; the retry loop is broken.
+                let hold: Value = serde_json::from_slice(
+                    &std::fs::read(root.join(shutdown_flush::HOLD_RECORD)).unwrap()).unwrap();
+                assert_eq!(hold["record_kind"], json!("shutdown_flush_hold"));
+                assert_eq!(hold["held_version"], journal["plan"]["candidate_version"]);
                 let saved: Value = serde_json::from_slice(
                     &std::fs::read(root.join(shutdown_flush::RECORD)).unwrap()).unwrap();
                 assert!(saved["receipt_id"].is_null());
+            }
+
+            #[test]
+            fn arm_flush_refusal_before_the_daemon_stops_restores_and_holds_nothing() {
+                let (dir, journal, request, state) = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let cli: PathBuf =
+                    serde_json::from_value(journal["plan"]["cli"]["target_path"].clone()).unwrap();
+                std::fs::write(&cli, b"swapped candidate cli").unwrap();
+                // The hook fails before the daemon stops behind it: an
+                // ordinary refusal keeps the daemon serving (engineer ruling,
+                // 23 Oct 2026) — nothing restored, nothing held.
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|_, _| {
+                    Err(io::Error::other("injected refusal before the stop"))
+                }))
+                .unwrap();
+                let failure = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                owner.join_workers();
+                assert!(matches!(failure, ArmFailure::Refused(_)));
+                assert_eq!(std::fs::read(&cli).unwrap(), b"swapped candidate cli");
+                assert!(!root.join(shutdown_flush::HOLD_RECORD).exists());
+                assert!(!root.join(shutdown_flush::ROLLBACK_RECORD).exists());
             }
 
             // Socket execution belongs to the isolated Linux CI runner.
@@ -245,7 +283,7 @@ macro_rules! arm_flush_regression_tests {
                     let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
                     let observed_exit = Arc::clone(&exit_code);
                     let mut owner = tracing::dispatcher::with_default(&dispatch,
-                        || FlushOwner::start(&state, &root, &root, shutdown_flush::LIMIT,
+                        || FlushOwner::start(&state, &root, &root,
                             Arc::new(move |code| observed_exit.store(code, std::sync::atomic::Ordering::SeqCst))))
                         .unwrap();
                     let mut stream = tokio::net::UnixStream::connect(root.join(SOCKET)).await.unwrap();

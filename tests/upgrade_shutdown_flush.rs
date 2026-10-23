@@ -61,7 +61,7 @@ macro_rules! shutdown_flush_regression_tests {
                 let completed = Arc::clone(&flushed);
                 let owner = flush::register(
                     plan.data_root.clone(),
-                    Arc::new(move |_| {
+                    Arc::new(move |_, _| {
                         assert!(observed.handoff_path().is_file());
                         assert!(record(&observed)["receipt_id"].is_null());
                         completed.store(true, Ordering::SeqCst);
@@ -92,43 +92,68 @@ macro_rules! shutdown_flush_regression_tests {
             }
 
             #[test]
-            fn supervised_exit_refuses_failed_flush_or_failed_receipt_write() {
-                for receipt_write_failure in [false, true] {
-                    let (_dir, plan) = fixture();
-                    let original = std::fs::read(&plan.executable).unwrap();
-                    let path = plan.data_root.join(flush::RECORD);
-                    let owner = flush::register(
-                        plan.data_root.clone(),
-                        Arc::new(move |_| {
-                            if receipt_write_failure {
-                                std::fs::remove_file(&path)?;
-                                std::fs::create_dir(&path)?;
-                                Ok(())
-                            } else {
-                                Err(io::Error::other("injected component flush failure"))
-                            }
-                        }),
-                    )
-                    .unwrap();
-                    let mut exit_code = None;
-                    let result = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
-                        &plan,
-                        "2.0.0",
-                        |code| exit_code = Some(code),
-                    );
-                    owner.join_workers();
-                    assert!(result.is_err());
-                    // Engineer ruling 23 Oct 2026: the started flush failed, so
-                    // the process exits EX_TEMPFAIL instead of staying up with
-                    // no API and no network. No backup exists in this fixture;
-                    // the installed bytes stay untouched by the recovery.
-                    assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
-                    assert_eq!(std::fs::read(&plan.executable).unwrap(), original);
-                    if !receipt_write_failure {
-                        assert!(record(&plan)["receipt_id"].is_null());
-                    }
-                    assert!(plan.data_root.join(flush::ROLLBACK_RECORD).is_file());
-                }
+            fn supervised_exit_refusal_before_the_stop_keeps_the_daemon_running() {
+                let (_dir, plan) = fixture();
+                let original = std::fs::read(&plan.executable).unwrap();
+                // The hook fails before the daemon stops behind it. Engineer
+                // ruling 23 Oct 2026: an ordinary refusal — no exit, no
+                // restore, no hold.
+                let owner = flush::register(
+                    plan.data_root.clone(),
+                    Arc::new(|_, _| Err(io::Error::other("injected pre-stop refusal"))),
+                )
+                .unwrap();
+                let mut exit_code = None;
+                let result = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
+                    &plan,
+                    "2.0.0",
+                    |code| exit_code = Some(code),
+                );
+                owner.join_workers();
+                assert!(result.is_err());
+                assert_eq!(exit_code, None, "a pre-stop refusal must not exit");
+                assert_eq!(std::fs::read(&plan.executable).unwrap(), original);
+                assert!(!plan.data_root.join(flush::ROLLBACK_RECORD).exists());
+                assert!(!plan.data_root.join(flush::HOLD_RECORD).exists());
+                // The receipt-less intent the worker wrote still refuses a
+                // re-arm until the startup cleanup clears it.
+                assert!(record(&plan)["receipt_id"].is_null());
+            }
+
+            #[test]
+            fn supervised_exit_receipt_write_failure_after_the_stop_exits_tempfail() {
+                let (_dir, plan) = fixture();
+                let path = plan.data_root.join(flush::RECORD);
+                let owner = flush::register(
+                    plan.data_root.clone(),
+                    Arc::new(move |_, stopped| {
+                        stopped.store(true, Ordering::SeqCst);
+                        // The intent is already durable; refuse only the
+                        // receipt publication, after the daemon stopped.
+                        std::fs::remove_file(&path)?;
+                        std::fs::create_dir(&path)?;
+                        Ok(())
+                    }),
+                )
+                .unwrap();
+                let mut exit_code = None;
+                let result = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
+                    &plan,
+                    "2.0.0",
+                    |code| exit_code = Some(code),
+                );
+                owner.join_workers();
+                assert!(result.is_err());
+                // Engineer ruling 23 Oct 2026: the started flush failed, so
+                // the process exits EX_TEMPFAIL instead of staying up with
+                // no API and no network, and the release is held.
+                assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
+                let hold: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(plan.data_root.join(flush::HOLD_RECORD)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(hold["held_version"], serde_json::json!("2.0.0"));
+                assert!(plan.data_root.join(flush::ROLLBACK_RECORD).is_file());
             }
 
             #[test]
@@ -139,7 +164,10 @@ macro_rules! shutdown_flush_regression_tests {
                 std::fs::write(&backup, b"previous binary").unwrap();
                 let owner = flush::register(
                     plan.data_root.clone(),
-                    Arc::new(|_| Err(io::Error::other("injected started flush failure"))),
+                    Arc::new(|_, stopped| {
+                        stopped.store(true, Ordering::SeqCst);
+                        Err(io::Error::other("injected started flush failure"))
+                    }),
                 )
                 .unwrap();
                 let mut exit_code = None;
@@ -155,6 +183,136 @@ macro_rules! shutdown_flush_regression_tests {
                 assert_eq!(std::fs::read(&plan.executable).unwrap(), b"previous binary");
                 assert!(!backup.exists());
                 assert!(plan.data_root.join(flush::ROLLBACK_RECORD).is_file());
+            }
+
+            #[test]
+            fn supervised_exit_after_failed_flush_restores_the_daemon_and_cli_pair() {
+                // One flush per registration, so each half gets its own
+                // fixture. The pairs the apply worker recorded stand in for
+                // the swapped daemon and CLI, each with a fresh backup.
+                for cli_backup_exists in [false, true] {
+                    let (_dir, plan) = fixture();
+                    let cli = plan.data_root.join("x0x");
+                    let cli_backup = plan.data_root.join("x0x.backup");
+                    let daemon_backup = plan.executable.with_extension("backup");
+                    std::fs::write(&plan.executable, b"swapped daemon").unwrap();
+                    std::fs::write(&daemon_backup, b"previous daemon").unwrap();
+                    std::fs::write(&cli, b"swapped cli").unwrap();
+                    if cli_backup_exists {
+                        std::fs::write(&cli_backup, b"previous cli").unwrap();
+                    }
+                    let owner = flush::register(
+                        plan.data_root.clone(),
+                        Arc::new(|_, stopped| {
+                            stopped.store(true, Ordering::SeqCst);
+                            Err(io::Error::other("injected started flush failure"))
+                        }),
+                    )
+                    .unwrap();
+                    let set = vec![
+                        (plan.executable.clone(), daemon_backup.clone()),
+                        (cli.clone(), cli_backup.clone()),
+                    ];
+                    let mut exit_code = None;
+                    let result = AutoApplyUpgrader::new("x0xd")
+                        .with_swapped_artifacts(set)
+                        .trigger_restart_with_exit(&plan, "2.0.0", |code| exit_code = Some(code));
+                    owner.join_workers();
+                    assert!(result.is_err());
+                    assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
+                    assert!(plan.data_root.join(flush::HOLD_RECORD).is_file());
+                    if cli_backup_exists {
+                        // Both backups present: restore both, never a mixed pair.
+                        assert_eq!(
+                            std::fs::read(&plan.executable).unwrap(),
+                            b"previous daemon"
+                        );
+                        assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                        assert!(!daemon_backup.exists());
+                        assert!(!cli_backup.exists());
+                    } else {
+                        // Missing CLI backup: restore neither half of the pair.
+                        assert_eq!(
+                            std::fs::read(&plan.executable).unwrap(),
+                            b"swapped daemon"
+                        );
+                        assert_eq!(std::fs::read(&cli).unwrap(), b"swapped cli");
+                    }
+                }
+            }
+
+            #[test]
+            fn failed_flush_then_restart_still_refuses_the_held_release() {
+                // A deterministic flush failure applied twice must not retry
+                // the same release: the first failed attempt writes the hold,
+                // the restart's stale-record cleanup keeps it, and the next
+                // apply of the same release is refused at the gate.
+                let (_dir, plan) = fixture();
+                let owner = flush::register(
+                    plan.data_root.clone(),
+                    Arc::new(|_, stopped| {
+                        stopped.store(true, Ordering::SeqCst);
+                        Err(io::Error::other("deterministic flush failure"))
+                    }),
+                )
+                .unwrap();
+                let mut exit_code = None;
+                let result = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
+                    &plan,
+                    "2.0.0",
+                    |code| exit_code = Some(code),
+                );
+                owner.join_workers();
+                assert!(result.is_err());
+                assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
+                // The next startup runs exactly this cleanup.
+                flush::clear_stale_records(&plan.data_root);
+                assert!(plan.data_root.join(flush::HOLD_RECORD).is_file());
+                assert_eq!(
+                    flush::release_is_held(&plan.data_root, &semver::Version::new(2, 0, 0))
+                        .unwrap()
+                        .as_deref(),
+                    Some("2.0.0"),
+                    "the second application of the held release must be refused"
+                );
+                // A newer release is the automatic way past the hold.
+                assert_eq!(
+                    flush::release_is_held(&plan.data_root, &semver::Version::new(2, 0, 1))
+                        .unwrap(),
+                    None
+                );
+            }
+
+            #[test]
+            fn receipt_authorization_failure_after_the_stop_exits_tempfail() {
+                // Engineer ruling 23 Oct 2026: any error after the flush
+                // started ends in exit 75; a parked daemon with no API and
+                // no network is forbidden. The receipt is real; only the
+                // authorization binding mismatches.
+                let (_dir, plan) = fixture();
+                let owner = flush::register(
+                    plan.data_root.clone(),
+                    Arc::new(|_, stopped| {
+                        stopped.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                )
+                .unwrap();
+                let binding =
+                    flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+                let receipt = flush::acknowledge(&plan.data_root, binding, || Ok(())).unwrap();
+                owner.join_workers();
+                let other =
+                    flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+                let mut exit_code = None;
+                let result = authorize_receipt_after_stop(&receipt, &other, &mut |code| {
+                    exit_code = Some(code)
+                });
+                assert!(result.is_err());
+                assert_eq!(exit_code, Some(restart::flush_failure_exit_code()));
+                // Nothing is restored and no hold is written: the flush
+                // itself succeeded and the new bytes are durable.
+                assert!(!plan.data_root.join(flush::HOLD_RECORD).exists());
             }
 
             #[test]
@@ -182,7 +340,7 @@ macro_rules! shutdown_flush_regression_tests {
                     let owner = Arc::new(
                         flush::register(
                             plan.data_root.clone(),
-                            Arc::new(move |_| {
+                            Arc::new(move |_, _| {
                                 observed.store(true, Ordering::SeqCst);
                                 Ok(())
                             }),
@@ -198,7 +356,7 @@ macro_rules! shutdown_flush_regression_tests {
                     let exited = Arc::clone(&exit);
                     let restarted_plan = plan.clone();
                     let for_restart = reservation.clone();
-                    let on_success = Box::new(move || {
+                    let on_success = Box::new(move |_: &[(PathBuf, PathBuf)]| {
                         assert!(
                             retained.seal_admission(),
                             "normal shutdown must retain the admitted replacement owner"
@@ -249,7 +407,8 @@ macro_rules! shutdown_flush_regression_tests {
                 let released = std::sync::Mutex::new(released);
                 let owner = flush::register_with_limit(
                     plan.data_root.clone(),
-                    Arc::new(move |_| {
+                    Arc::new(move |_, stopped| {
+                        stopped.store(true, Ordering::SeqCst);
                         let _ = entered.send(());
                         released
                             .lock()

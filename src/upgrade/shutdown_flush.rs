@@ -16,17 +16,22 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Compiled default flush budget. The transient ruling of 23 Oct 2026
-/// (ADR 0094 §4) sets the default at 30 s; `[update]
-/// shutdown_flush_timeout_secs` configures it per daemon up to `MAX_LIMIT`.
+/// Fixed internal flush budget (engineer ruling, 23 Oct 2026): 30 s. Not
+/// operator-configurable; only tests override it through the
+/// `*_with_limit` seams. A follow-up issue proposes making it configurable.
 pub(crate) const LIMIT: Duration = Duration::from_secs(30);
-/// Hard ceiling for a configured flush budget. The operator-facing floor
-/// (1 s) is validated with the config; the registration clamp only refuses
-/// a zero budget and this ceiling.
-pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
 pub(crate) const RECORD: &str = "upgrade-flush.json";
 pub(crate) const ROLLBACK_RECORD: &str = "upgrade-flush-rollback.json";
-type Hook = Arc<dyn Fn(Deadline) -> io::Result<()> + Send + Sync>;
+pub(crate) const HOLD_RECORD: &str = "upgrade-flush-hold.json";
+/// Hard ceiling for a test-supplied flush budget; the registration clamp
+/// only refuses a zero budget and this ceiling.
+#[cfg(test)]
+pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
+/// The hook stores `true` in the marker as soon as the daemon is committed
+/// to stopping behind it. Only that point and beyond count as a started
+/// flush for recovery: earlier failures leave the daemon serving and are
+/// ordinary refusals (engineer ruling, 23 Oct 2026).
+type Hook = Arc<dyn Fn(Deadline, &AtomicBool) -> io::Result<()> + Send + Sync>;
 
 /// Why an `acknowledge` call failed, and whether this call had already
 /// started the flush when it failed. A caller whose failure is `started`
@@ -147,19 +152,25 @@ impl Drop for Registration {
     }
 }
 
-// Default-budget registration and the explicit-budget acknowledge variant
-// are the regression macros' seams; production always registers the
-// configured budget and acknowledges with the entry's budget.
-#[cfg(test)]
+// Production registers the fixed budget. The explicit-budget registration
+// and acknowledge variants are the regression macros' test seams.
 pub(crate) fn register(root: PathBuf, hook: Hook) -> io::Result<Registration> {
-    register_with_limit(root, hook, LIMIT)
+    register_inner(root, hook, LIMIT)
 }
 
+#[cfg(test)]
 pub(crate) fn register_with_limit(
     root: PathBuf,
     hook: Hook,
     limit: Duration,
 ) -> io::Result<Registration> {
+    register_inner(root, hook, limit)
+}
+
+fn register_inner(root: PathBuf, hook: Hook, limit: Duration) -> io::Result<Registration> {
+    // The clamp bounds only test-supplied budgets; production passes LIMIT.
+    #[cfg(test)]
+    let limit = limit.max(Duration::from_millis(1)).min(MAX_LIMIT);
     let supplied_root = root.clone();
     let root = std::fs::canonicalize(root)?;
     let mut hooks = HOOKS
@@ -175,7 +186,7 @@ pub(crate) fn register_with_limit(
         started: AtomicBool::new(false),
         shutdown_pending: AtomicBool::new(false),
         unused_released: tokio::sync::Notify::new(),
-        limit: limit.max(Duration::from_millis(1)).min(MAX_LIMIT),
+        limit,
         #[cfg(test)]
         workers: Mutex::new(Vec::new()),
     });
@@ -329,7 +340,12 @@ fn check_previous(root: &Path) -> io::Result<()> {
 /// holding a receipt proves a completed flush and is preserved. The manual
 /// fallback (stop the daemon, delete the files) is documented in
 /// docs/upgrade-system.md.
+///
+/// A failed-upgrade hold ([`HOLD_RECORD`]) is never debris: it outlives this
+/// cleanup so the held release is not applied again automatically (engineer
+/// ruling, 23 Oct 2026).
 pub(crate) fn clear_stale_records(root: &Path) {
+    log_failed_release_hold(root);
     match std::fs::symlink_metadata(root.join(ROLLBACK_RECORD)) {
         Ok(_) => {
             let reason = super::journal::read_auxiliary_record(&root.join(ROLLBACK_RECORD))
@@ -375,6 +391,106 @@ pub(crate) fn clear_stale_records(root: &Path) {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => tracing::warn!(%error, "cannot inspect the shutdown flush record"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HoldRecord {
+    pub(crate) schema_version: u32,
+    pub(crate) record_kind: String,
+    pub(crate) held_version: String,
+    pub(crate) reason: String,
+}
+
+fn validate_hold(bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::other("failed-upgrade hold exceeds size limit"));
+    }
+    let record: HoldRecord = serde_json::from_slice(bytes)?;
+    if record.schema_version != 1
+        || record.record_kind != "shutdown_flush_hold"
+        || semver::Version::parse(&record.held_version).is_err()
+        || record.reason.trim().is_empty()
+    {
+        return Err(io::Error::other("unknown failed-upgrade hold record"));
+    }
+    Ok(())
+}
+
+/// Persist the per-release failed-upgrade hold (engineer ruling, 23 Oct
+/// 2026). A flush that started and failed exits `EX_TEMPFAIL`; without this
+/// hold the startup check would re-apply the same release after every
+/// restart, an endless exit loop ADR 0094 §4 forbids. The hold is separate
+/// from the rollback record exactly because startup stale-record cleanup
+/// must not erase it.
+pub(crate) fn hold_failed_release(root: &Path, version: &str, reason: &str) -> io::Result<()> {
+    let record = HoldRecord {
+        schema_version: 1,
+        record_kind: "shutdown_flush_hold".into(),
+        held_version: version.to_string(),
+        reason: reason.to_string(),
+    };
+    let path = root.join(HOLD_RECORD);
+    super::journal::write_auxiliary_record(&path, &record, validate_hold)?;
+    tracing::error!(
+        held_release = %version,
+        hold = %path.display(),
+        reason,
+        "failed-upgrade hold recorded: release {version} will not be applied again \
+         automatically until a newer release appears or the operator removes \
+        this hold file (stop the daemon first)"
+    );
+    Ok(())
+}
+
+/// The held release, if any. `Err` means a hold exists but cannot be
+/// understood; callers must refuse to apply rather than guess.
+pub(crate) fn failed_release_hold(root: &Path) -> io::Result<Option<HoldRecord>> {
+    match super::journal::read_auxiliary_record(&root.join(HOLD_RECORD)) {
+        Ok(bytes) => {
+            validate_hold(&bytes)?;
+            Ok(Some(serde_json::from_slice(&bytes)?))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The release an apply of `target` must be refused for, if the hold says
+/// so. The held release is refused (and so is anything older); a strictly
+/// newer release passes, which is how a newer release clears the hold.
+pub(crate) fn release_is_held(root: &Path, target: &semver::Version) -> io::Result<Option<String>> {
+    let Some(hold) = failed_release_hold(root)? else {
+        return Ok(None);
+    };
+    let held = semver::Version::parse(&hold.held_version)
+        .map_err(|error| io::Error::other(format!("invalid held release: {error}")))?;
+    if target <= &held {
+        Ok(Some(hold.held_version))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Announce an active hold at startup, loudly; never remove it here.
+fn log_failed_release_hold(root: &Path) {
+    match failed_release_hold(root) {
+        Ok(Some(hold)) => tracing::error!(
+            held_release = %hold.held_version,
+            hold = %root.join(HOLD_RECORD).display(),
+            reason = %hold.reason,
+            "failed-upgrade hold is active: release {} will not be applied \
+             automatically; remove the hold file (daemon stopped) to clear it",
+            hold.held_version
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::error!(
+            %error,
+            hold = %root.join(HOLD_RECORD).display(),
+            "failed-upgrade hold cannot be read; every automatic apply stays \
+             refused until the hold file is removed (daemon stopped)"
+        ),
     }
 }
 
@@ -483,11 +599,11 @@ fn check_clock(boot_id: &str, deadline_ms: u64, deadline: Instant) -> io::Result
 }
 
 fn wait_receipt(
-    receive: &mpsc::Receiver<io::Result<Receipt>>,
+    receive: &mpsc::Receiver<(io::Result<Receipt>, bool)>,
     boot_id: &str,
     deadline_ms: u64,
     deadline: Instant,
-) -> io::Result<Receipt> {
+) -> io::Result<(io::Result<Receipt>, bool)> {
     loop {
         check_clock(boot_id, deadline_ms, deadline)?;
         match receive.recv_timeout(
@@ -495,9 +611,9 @@ fn wait_receipt(
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(50)),
         ) {
-            Ok(result) => {
+            Ok(reported) => {
                 check_clock(boot_id, deadline_ms, deadline)?;
-                return result;
+                return Ok(reported);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -589,6 +705,10 @@ fn acknowledge_inner(
         .name("x0x-upgrade-flush".into())
         .spawn(move || {
             let mut record = record;
+            // True only from the moment the daemon is committed to stopping
+            // behind the hook. The hook marks it via the `&AtomicBool`; a
+            // returned hook proves it retroactively.
+            let stopped = AtomicBool::new(false);
             let outcome = (|| {
                 check_deadline(&record, deadline)?;
                 let path = root.join(RECORD);
@@ -596,11 +716,15 @@ fn acknowledge_inner(
                 super::journal::write_auxiliary_record(&path, &record, validate)?;
                 prepare()?;
                 check_deadline(&record, deadline)?;
-                hook(Deadline {
-                    instant: deadline,
-                    boot_id: record.boot_id.clone(),
-                    deadline_ms: record.deadline_ms,
-                })?;
+                hook(
+                    Deadline {
+                        instant: deadline,
+                        boot_id: record.boot_id.clone(),
+                        deadline_ms: record.deadline_ms,
+                    },
+                    &stopped,
+                )?;
+                stopped.store(true, Ordering::Release);
                 check_deadline(&record, deadline)?;
                 let receipt_id = uuid::Uuid::new_v4().to_string();
                 record.receipt_id = Some(receipt_id.clone());
@@ -611,55 +735,74 @@ fn acknowledge_inner(
                     receipt_id,
                 })
             })();
-            let _ = send.send(outcome);
+            let started = stopped.load(Ordering::Acquire);
+            let _ = send.send((outcome, started));
         });
-    let result = match spawn {
+    let result: Result<Receipt, FlushFailure> = match spawn {
         Ok(worker) => {
             #[cfg(test)]
             entry.workers.lock().expect("flush workers").push(worker);
             #[cfg(not(test))]
             drop(worker);
-            wait_receipt(&receive, &rollback_boot, rollback_deadline, deadline)
+            match wait_receipt(&receive, &rollback_boot, rollback_deadline, deadline) {
+                Ok((Ok(receipt), _)) => Ok(receipt),
+                Ok((Err(error), started)) => Err(FlushFailure { error, started }),
+                // A wait-level failure means the fixed deadline passed or the
+                // worker died mid-flush. The daemon may already be stopped
+                // behind the hook, so recovery must assume it is (engineer
+                // ruling, 23 Oct 2026): never a parked, stop-less daemon.
+                Err(error) => Err(FlushFailure {
+                    error,
+                    started: true,
+                }),
+            }
         }
-        Err(error) => Err(error),
+        // The worker never ran, so the hook never stopped the daemon.
+        Err(error) => Err(FlushFailure {
+            error,
+            started: false,
+        }),
     };
-    if let Err(error) = &result {
-        let reason = error.to_string();
-        // This separate marker cannot be overwritten by a late receipt worker.
-        // The old process must remain alive; blocked I/O never permits exit.
-        let rollback_worker = std::thread::Builder::new()
-            .name("x0x-flush-rollback".into())
-            .spawn(move || {
-                let record = Record {
-                    schema_version: 1,
-                    record_kind: "shutdown_flush".into(),
-                    binding: rollback_binding,
-                    boot_id: rollback_boot,
-                    deadline_ms: rollback_deadline,
-                    receipt_id: None,
-                    rollback_reason: Some(reason),
-                };
-                if let Err(error) = super::journal::write_auxiliary_record(
-                    &rollback_root.join(ROLLBACK_RECORD),
-                    &record,
-                    validate,
-                ) {
-                    tracing::error!(%error, "failed to persist shutdown flush rollback request");
-                }
-            });
-        #[cfg(test)]
-        if let Ok(worker) = rollback_worker {
-            entry.workers.lock().expect("flush workers").push(worker);
-        }
-        #[cfg(not(test))]
-        if let Err(error) = rollback_worker {
-            tracing::error!(%error, "failed to start shutdown flush rollback writer");
+    if let Err(failure) = &result {
+        // Only a failure that stopped the daemon writes the rollback mark:
+        // a refusal leaves the daemon serving and records nothing beyond the
+        // receipt-less intent the worker already wrote.
+        if failure.started {
+            let reason = failure.error.to_string();
+            // This separate marker cannot be overwritten by a late receipt
+            // worker. The old process must remain alive; blocked I/O never
+            // permits exit.
+            let rollback_worker = std::thread::Builder::new()
+                .name("x0x-flush-rollback".into())
+                .spawn(move || {
+                    let record = Record {
+                        schema_version: 1,
+                        record_kind: "shutdown_flush".into(),
+                        binding: rollback_binding,
+                        boot_id: rollback_boot,
+                        deadline_ms: rollback_deadline,
+                        receipt_id: None,
+                        rollback_reason: Some(reason),
+                    };
+                    if let Err(error) = super::journal::write_auxiliary_record(
+                        &rollback_root.join(ROLLBACK_RECORD),
+                        &record,
+                        validate,
+                    ) {
+                        tracing::error!(%error, "failed to persist shutdown flush rollback request");
+                    }
+                });
+            #[cfg(test)]
+            if let Ok(worker) = rollback_worker {
+                entry.workers.lock().expect("flush workers").push(worker);
+            }
+            #[cfg(not(test))]
+            if let Err(error) = rollback_worker {
+                tracing::error!(%error, "failed to start shutdown flush rollback writer");
+            }
         }
     }
-    result.map_err(|error| FlushFailure {
-        error,
-        started: true,
-    })
+    result
 }
 
 #[cfg(test)]
@@ -688,7 +831,7 @@ mod reservation_release_regressions {
     fn reservation_last_unused_owner_reopens_upgrade_and_shutdown_admission() {
         let dir = fixture();
         let root = dir.path().canonicalize().unwrap();
-        let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+        let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
         let reservation = reserve(&root).unwrap();
         reservation.activate().unwrap();
         let continuation = reservation.clone();
@@ -712,7 +855,7 @@ mod reservation_release_regressions {
     fn reservation_failed_competing_activation_does_not_disarm_the_winner() {
         let dir = fixture();
         let root = dir.path().canonicalize().unwrap();
-        let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+        let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
         let winner = reserve(&root).unwrap();
         let loser = reserve(&root).unwrap();
         winner.activate().unwrap();
@@ -735,10 +878,11 @@ mod reservation_release_regressions {
         let observed = called.clone();
         let owner = register(
             root.clone(),
-            Arc::new(move |_| {
+            Arc::new(move |_, stopped| {
                 observed.store(true, Ordering::SeqCst);
+                stopped.store(true, Ordering::Release);
                 Err(io::Error::other(
-                    "injected failure after acknowledgment started",
+                    "injected failure after the daemon stopped",
                 ))
             }),
         )

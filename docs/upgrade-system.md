@@ -503,19 +503,25 @@ identity roots, flushes the captured logs, and only then publishes a receipt
 (`upgrade-flush.json` with a `receipt_id`). A fired shutdown hook,
 cancellation or a port release is never proof of flush (ADR 0094 §4).
 
-The flush budget is 30 seconds by default and configurable per daemon with
-`[update] shutdown_flush_timeout_secs` (bounds 1..=3600; ADR 0094 §4
-transient ruling, 23 Oct 2026).
+The flush budget is fixed at 30 seconds (engineer ruling, 23 Oct 2026). It
+is an internal constant, not configuration; only tests override it. A
+follow-up issue proposes making it operator-configurable — the public
+config surface needs David's go.
 
 Failure behaviour (engineer ruling, 23 Oct 2026): a flush that started and
 then failed or overran its budget must not leave the daemon running with no
-API and no network. The daemon restores the previous binary from the
-transaction's backup, leaves the rollback record
-(`upgrade-flush-rollback.json`) in place as the failed-upgrade mark, logs the
+API and no network. "Started" means the daemon actually stopped behind the
+hook — the recovery begins at the moment the hook commits the daemon to
+stopping, nothing earlier. The daemon persists a per-release failed-upgrade
+hold (`upgrade-flush-hold.json`, below), restores every binary the
+transaction swapped — daemon and `x0x` CLI together, or neither — logs the
 cause, and exits `EX_TEMPFAIL` (75). The service manager then restarts the
-daemon on the old version. A refusal that happens before any flush starts
-(a missing flush owner, an unresolved predecessor, a mismatched arm request)
-never stops the daemon and returns an ordinary error instead.
+daemon on the old version. An error after the flush completed (for example
+a receipt that fails authorization) also ends in `EX_TEMPFAIL`; nothing is
+restored because the new bytes are already durable. A refusal that happens
+before the daemon stops (a missing flush owner, an unresolved predecessor,
+a mismatched arm request, a failed intent write) never stops the daemon,
+restores nothing and returns an ordinary error instead.
 
 The local control listener is a Unix socket, `upgrade-flush.sock` in the
 data directory, mode `0600`. It accepts one JSON request line carrying the
@@ -537,6 +543,28 @@ instance data-root lock, which proves the flush's owning process is gone —
 the daemon clears this debris, logs the recorded cause, and treats that
 upgrade as failed; a later apply is not refused by these records. A record
 that carries a receipt proves a completed flush and is preserved.
+
+#### Failed-upgrade hold
+
+A flush that started (the daemon stopped behind the hook) and then failed
+writes `<data_dir>/upgrade-flush-hold.json` before it restores and exits
+`EX_TEMPFAIL`. The record names the held release and the failure cause.
+Without it, every service-manager restart would re-apply the same release
+and fail the same way — the endless exit loop ADR 0094 §4 forbids.
+
+The hold is deliberately **not** debris: the startup stale-record cleanup
+above never removes it, and every apply path — the startup check, the
+gossip release listener, the fallback poll and a manual `/upgrade/apply` —
+refuses the held release (and anything older), loudly, before downloading
+anything. A strictly newer release applies normally, which is the automatic
+way past the hold. The manual way is:
+
+1. Stop the daemon.
+2. Remove `<data_dir>/upgrade-flush-hold.json` (keep an evidence copy).
+3. Start the daemon again.
+
+There is no CLI or API for this. An unreadable hold file refuses every
+apply the same way; remove the file to recover.
 
 Manual fallback, if the debris somehow survives or the record cannot be
 parsed: stop the daemon, keep an evidence copy, then delete

@@ -73,7 +73,6 @@ impl FlushOwner {
         state: &Arc<AppState>,
         data_root: &Path,
         identity_root: &Path,
-        limit: Duration,
         exit: Arc<dyn Fn(i32) + Send + Sync>,
     ) -> io::Result<Self> {
         use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -87,17 +86,25 @@ impl FlushOwner {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let listener = tokio::net::UnixListener::bind(&socket)?;
+        // Create the socket with 0600 from the first byte: a umask-widened
+        // window between bind and chmod is closed at the source.
+        let previous_umask = unsafe { libc::umask(0o077) };
+        let bound = tokio::net::UnixListener::bind(&socket);
+        unsafe { libc::umask(previous_umask) };
+        let listener = bound?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         let logs = log_flush::capture(&tracing::dispatcher::get_default(Clone::clone))?;
         let stop = super::routes::daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let (complete, receive) = mpsc::sync_channel(1);
         let receive = Mutex::new(receive);
-        let registration = shutdown_flush::register_with_limit(
+        let registration = shutdown_flush::register(
             root.clone(),
-            Arc::new(move |deadline| {
+            Arc::new(move |deadline, stopped| {
                 deadline.check()?;
                 stop();
+                // The daemon is committed to stopping behind this hook from
+                // here: mark the point every later failure recovers from.
+                stopped.store(true, std::sync::atomic::Ordering::Release);
                 receive
                     .lock()
                     .map_err(|_| io::Error::other("shutdown acknowledgement poisoned"))?
@@ -109,7 +116,6 @@ impl FlushOwner {
                 deadline.check()?;
                 log_flush::flush_captured(&logs, deadline.instant)
             }),
-            limit,
         )?;
         let state = Arc::new(ControlContext {
             api_token: state.api_token.clone(),
@@ -234,6 +240,9 @@ struct AdmittedArm {
     plan: journal::FrozenPlan,
     binding: shutdown_flush::Binding,
     handoff: journal::M2HandoffRecord,
+    /// `(target, backup)` for exactly the artifacts the transaction swapped.
+    /// A failed flush restores these together or not at all.
+    restore_set: Vec<(PathBuf, PathBuf)>,
 }
 
 fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<AdmittedArm> {
@@ -312,10 +321,19 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         request.generation,
         &(request.instance_id, request.plan),
     )?;
+    let restore_set = [
+        (record.daemon_progress.swapped, &plan.daemon),
+        (record.cli_progress.swapped, &plan.cli),
+    ]
+    .into_iter()
+    .filter(|(swapped, _)| *swapped)
+    .map(|(_, artifact)| (artifact.target_path.clone(), artifact.backup_path.clone()))
+    .collect();
     Ok(AdmittedArm {
         plan,
         binding,
         handoff,
+        restore_set,
     })
 }
 
@@ -332,6 +350,7 @@ fn arm(
         plan,
         binding,
         handoff,
+        restore_set,
     } = admitted;
     let handoff_path = root.join(journal::HANDOFF_FILE_NAME);
     let flush = shutdown_flush::acknowledge(root, binding, move || {
@@ -340,21 +359,40 @@ fn arm(
     match flush {
         Ok(receipt) => Ok(receipt),
         Err(failure) if failure.started => {
-            // The flush started and failed or overran: this daemon is
-            // stopped behind the hook. Keep the old binary (engineer
-            // ruling 23 Oct 2026) so the EX_TEMPFAIL restart lands on it.
+            // The flush started and the daemon stopped behind the hook. Hold
+            // the failed release first (engineer ruling, 23 Oct 2026) so the
+            // restart this exit creates cannot re-apply it, then restore
+            // every binary the transaction swapped — both or neither — and
+            // leave the EX_TEMPFAIL exit to `finish`.
             tracing::error!(
                 error = %failure,
-                target = %plan.daemon.target_path.display(),
-                "acknowledged shutdown flush failed; restoring the previous daemon binary"
+                installed_bytes = true,
+                restored_bytes = true,
+                restart = "not_started",
+                recovery = "exited_tempfail",
+                "acknowledged shutdown flush failed after the daemon stopped; \
+                 holding release {} and restoring the swapped binaries",
+                plan.candidate_version
             );
-            if let Err(error) = crate::upgrade::restore_backup_binary(
-                &plan.daemon.target_path,
-                &plan.daemon.backup_path,
+            if let Err(error) = shutdown_flush::hold_failed_release(
+                root,
+                &plan.candidate_version,
+                &failure.to_string(),
             ) {
                 tracing::error!(
                     %error,
-                    "cannot restore the previous daemon binary; manual recovery applies"
+                    "cannot persist the failed-upgrade hold; the next automatic \
+                     check may retry this release once more"
+                );
+            }
+            if let Err(error) = crate::upgrade::restore_swapped_binaries(&restore_set) {
+                tracing::error!(
+                    %error,
+                    restore_set = ?restore_set
+                        .iter()
+                        .map(|(target, _)| target.display().to_string())
+                        .collect::<Vec<_>>(),
+                    "cannot restore the swapped binaries; manual recovery applies"
                 );
             }
             Err(ArmFailure::FlushFailed(failure))
@@ -363,19 +401,26 @@ fn arm(
     }
 }
 
-// All producers are drained before this barrier. A symlink is not a verified
-// store root; refuse it rather than silently omit storage from the receipt.
 fn sync_tree(path: &Path, deadline: &shutdown_flush::Deadline) -> io::Result<()> {
     sync_tree_with(path, deadline, &mut std::fs::File::sync_all)
 }
 
+// All producers are drained before this barrier. A symlink is not a verified
+// store root; refuse it rather than silently omit storage from the receipt.
+// A path that vanishes mid-walk (the CLI deletes a scratch file under the
+// shared identity root between read_dir and open) has nothing left to sync:
+// skip it instead of failing the flush.
 fn sync_tree_with(
     path: &Path,
     deadline: &shutdown_flush::Deadline,
     sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
     deadline.check()?;
-    let meta = std::fs::symlink_metadata(path)?;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
     deadline.check()?;
     if meta.file_type().is_symlink() {
         return Err(io::Error::other("unverified symlink in shutdown state"));
@@ -388,12 +433,20 @@ fn sync_tree_with(
             let entry = entries.next();
             deadline.check()?;
             let Some(entry) = entry else { break };
-            sync_tree_with(&entry?.path(), deadline, sync)?;
+            match entry {
+                Ok(entry) => sync_tree_with(&entry.path(), deadline, sync)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
         }
     }
     if meta.is_dir() || meta.is_file() {
         deadline.check()?;
-        let file = std::fs::File::open(path)?;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
         deadline.check()?;
         sync(&file)?;
         deadline.check()?;
@@ -493,9 +546,10 @@ mod arm_flush_regressions_unused_reservation {
         let observed = called.clone();
         let registration = shutdown_flush::register(
             root.to_path_buf(),
-            Arc::new(move |_| {
+            Arc::new(move |_, stopped| {
                 observed.store(true, Ordering::SeqCst);
                 if fail {
+                    stopped.store(true, Ordering::SeqCst);
                     Err(io::Error::other("injected started flush failure"))
                 } else {
                     Ok(())

@@ -186,7 +186,9 @@ impl Upgrader {
         // Dropping the guard releases the OS lock; the lock file is never
         // unlinked, so reclaim cannot remove a file another process still holds.
         let _host_lock = acquire_host_upgrade_lock(&self.target_path)?;
-        self.finish_upgrade_under_host_lock(new_binary_path, target_version)
+        let (result, _fresh_backup) =
+            self.finish_upgrade_under_host_lock(new_binary_path, target_version)?;
+        Ok(result)
     }
 
     /// Compare / backup / replace while the caller already holds this target's
@@ -195,16 +197,19 @@ impl Upgrader {
     /// restart owner).
     ///
     /// When disk already matches the incoming bytes, backup and replace are
-    /// skipped and [`UpgradeResult::Success`] is returned so public
-    /// `perform_upgrade` matches main and auto-apply can still own restart.
-    /// On Unix, Success still requires the installed target to be executable
+    /// skipped and [`UpgradeResult::Success`] is returned (with no backup
+    /// path) so public `perform_upgrade` matches main and auto-apply can
+    /// still own restart. On a real swap the returned backup path is the
+    /// fresh backup of the bytes that were serving; a failed flush restores
+    /// exactly the artifacts that report one, never a stale backup. On
+    /// Unix, Success still requires the installed target to be executable
     /// (`0o755`), matching `atomic_replace`; a permission repair failure is
-    /// an error, never Success. The preserved backup is not rewritten.
+    /// an error, never Success.
     pub(super) fn finish_upgrade_under_host_lock(
         &self,
         new_binary_path: &Path,
         target_version: &Version,
-    ) -> Result<UpgradeResult, UpgradeError> {
+    ) -> Result<(UpgradeResult, Option<PathBuf>), UpgradeError> {
         if on_disk_matches_incoming(&self.target_path, new_binary_path)? {
             // Host lock is held: repair execute bits without clobbering backup.
             ensure_target_executable(&self.target_path)?;
@@ -213,9 +218,12 @@ impl Upgrader {
                 target = %self.target_path.display(),
                 "On-disk target already matches incoming binary; skipping backup and replace"
             );
-            return Ok(UpgradeResult::Success {
-                version: target_version.to_string(),
-            });
+            return Ok((
+                UpgradeResult::Success {
+                    version: target_version.to_string(),
+                },
+                None,
+            ));
         }
 
         let backup_path = self.create_backup()?;
@@ -227,16 +235,22 @@ impl Upgrader {
         match self.atomic_replace(new_binary_path) {
             Ok(()) => {
                 info!(version = %target_version, "Successfully upgraded to version {}", target_version);
-                Ok(UpgradeResult::Success {
-                    version: target_version.to_string(),
-                })
+                Ok((
+                    UpgradeResult::Success {
+                        version: target_version.to_string(),
+                    },
+                    Some(backup_path),
+                ))
             }
             Err(replace_err) => {
                 warn!(error = %replace_err, "Binary replacement failed: {}", replace_err);
                 match self.restore_from_backup(&backup_path) {
-                    Ok(()) => Ok(UpgradeResult::RolledBack {
-                        reason: format!("Replacement failed: {replace_err}"),
-                    }),
+                    Ok(()) => Ok((
+                        UpgradeResult::RolledBack {
+                            reason: format!("Replacement failed: {replace_err}"),
+                        },
+                        Some(backup_path),
+                    )),
                     Err(restore_err) => {
                         tracing::error!(
                             error = %replace_err,
@@ -457,6 +471,31 @@ pub fn restore_backup_binary(target: &Path, backup: &Path) -> std::io::Result<()
         ));
     }
     std::fs::rename(backup, target)
+}
+
+/// Restore every artifact this transaction swapped, or none of them
+/// (engineer ruling, 23 Oct 2026): a daemon/CLI pair must never end a
+/// failed recovery mixed. Each entry is `(target, fresh_backup)` — exactly
+/// the pairs the swap step under `Upgrader`\'s host-locked finish reported
+/// as real swaps. A missing backup restores nothing and says so; the caller
+/// logs manual recovery and still exits `EX_TEMPFAIL`.
+pub fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    for (target, backup) in artifacts {
+        if !backup.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no backup binary at {} for target {}; nothing is restored",
+                    backup.display(),
+                    target.display()
+                ),
+            ));
+        }
+    }
+    for (target, backup) in artifacts {
+        restore_backup_binary(target, backup)?;
+    }
+    Ok(())
 }
 
 /// Reclaim leftover upgrade artifacts from interrupted or failed attempts.
@@ -748,12 +787,16 @@ mod tests {
         // finish_* under an already-held lock is the same Success result so
         // auto-apply can arm restart for an old-running process.
         let _lock = acquire_host_upgrade_lock(&binary_path).unwrap();
-        let restart_owner = upgrader
+        let (restart_owner, fresh_backup) = upgrader
             .finish_upgrade_under_host_lock(&second, &Version::new(2, 0, 0))
             .unwrap();
         assert!(
             matches!(restart_owner, UpgradeResult::Success { .. }),
             "finish on match must stay Success for restart ownership: {restart_owner:?}"
+        );
+        assert!(
+            fresh_backup.is_none(),
+            "an already-matching target has no fresh backup to restore"
         );
     }
 
