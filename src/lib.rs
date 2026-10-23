@@ -26885,6 +26885,9 @@ mod tests {
             crate::exec::EXEC_DM_PREFIX,
             b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),
             b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n".as_slice(),
+            crate::gui::remote::SHOW_REQUEST_PREFIX,
+            crate::gui::remote::SHOW_RESULT_PREFIX,
+            crate::gui::remote::ACTIVITY_PREFIX,
         ] {
             let mut payload = prefix.to_vec();
             payload.extend_from_slice(b"unverified-startup-window-frame");

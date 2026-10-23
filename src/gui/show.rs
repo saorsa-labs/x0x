@@ -382,6 +382,12 @@ pub struct GuiShowRuntime {
     /// token the socket no longer searches. A socket already in the roster
     /// is updated after this map. Registration consults the map too.
     session_successors: Mutex<HashMap<String, (String, Instant)>>,
+    /// Waiters shared by the remote show sender and the receive handler.
+    remote_hub: crate::gui::remote::RemoteHub,
+    /// Unix seconds when a GUI window was last visible.
+    last_gui_visible_at: Mutex<Option<u64>>,
+    /// Show request ids already seen, for the ADR 0050 replay window.
+    replay: Mutex<crate::gui::remote::ReplayCache>,
 }
 
 impl std::fmt::Debug for GuiShowRuntime {
@@ -418,6 +424,9 @@ impl GuiShowRuntime {
             open_stop: Arc::new(AtomicBool::new(false)),
             pending: Mutex::new(VecDeque::new()),
             session_successors: Mutex::new(HashMap::new()),
+            remote_hub: crate::gui::remote::RemoteHub::new(),
+            last_gui_visible_at: Mutex::new(None),
+            replay: Mutex::new(crate::gui::remote::ReplayCache::new()),
         };
         // Honour a stop recorded before this process. The marker wins over
         // a config that already says `local_enabled = true`, because Stop
@@ -442,6 +451,52 @@ impl GuiShowRuntime {
             config.local_enabled = false;
         }
         config
+    }
+
+    /// Hub the requester waits on and the receive handler completes.
+    pub fn remote_hub(&self) -> &crate::gui::remote::RemoteHub {
+        &self.remote_hub
+    }
+
+    /// Record that a GUI window was visible at `unix_secs`.
+    ///
+    /// Active-machine selection reads this stamp. A poisoned lock is recovered.
+    pub fn note_gui_visible(&self, unix_secs: u64) {
+        *self
+            .last_gui_visible_at
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(unix_secs);
+    }
+
+    /// Last unix time a GUI window was visible, if one has been seen.
+    pub fn last_gui_visible_at(&self) -> Option<u64> {
+        *self
+            .last_gui_visible_at
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Remember a show request. True when that id is still inside the replay window.
+    pub fn observe_show_replay(
+        &self,
+        sender: &[u8; 32],
+        request_id: [u8; 16],
+        now_unix: u64,
+    ) -> bool {
+        self.with_replay_cache(|cache| cache.observe(sender, request_id, now_unix))
+    }
+
+    /// Run `body` against the show replay cache.
+    ///
+    /// The receive handler passes this cache into ingress_show. The lock
+    /// ends when `body` returns, so it is not held across an await. A
+    /// poisoned lock is recovered.
+    pub(crate) fn with_replay_cache<R>(
+        &self,
+        body: impl FnOnce(&mut crate::gui::remote::ReplayCache) -> R,
+    ) -> R {
+        let mut cache = self.replay.lock().unwrap_or_else(|err| err.into_inner());
+        body(&mut cache)
     }
 
     fn config_snapshot(&self) -> GuiShowConfig {

@@ -1,4 +1,4 @@
-//! `POST /gui/show` — ADR 0083 slice 1 (local show).
+//! `POST /gui/show` — ADR 0083 local show, and remote show (slice 3).
 //!
 //! Validates the view grammar, applies `[gui_show] local_enabled`, the block
 //! list and the rate limit, then either queues a `gui.show` frame on a
@@ -6,6 +6,10 @@
 //! `navigated` is returned only when that tab's GUI session is still valid
 //! and its outbound queue accepts the frame. The response never contains a
 //! URL or session token.
+//!
+//! An absent, null, or empty `target_machine` stays on this machine.
+//! `active` and a 64-hex machine id are slice 3. The remote branch builds
+//! its JSON directly so the local body stays `GuiShowResponse`.
 //!
 //! An owner token must be the durable API token. A GUI session bearer is
 //! refused. A rider bearer is admitted only when the token carries
@@ -19,9 +23,10 @@
 //! the sender is this daemon. A rider banner names `gui_show_blocked.json`
 //! and a daemon restart. A local banner names `gui_show_local_disabled`.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
@@ -35,7 +40,107 @@ use crate::gui::{
     new_request_id, origin_banner, short_id_hex, view_route, GuiShowOutcome, GuiShowRequest,
     GuiShowResponse, PendingGuiShow,
 };
-use crate::identity::AgentId;
+use crate::identity::{AgentId, MachineId, UserId};
+use crate::owner_sync::OwnerSyncStore;
+
+/// Second sentence for a show opened by another owner agent.
+///
+/// Stop for that agent writes `gui_show_blocked.json`. The sentence does
+/// not call the sender a rider.
+const REMOTE_SHOW_REENABLE: &str = "Remove this agent's id from gui_show_blocked.json in the data directory and restart the daemon to allow shows from this agent again.";
+
+/// `reason` when the target has no verified `gui_show_v1` advert.
+const TARGET_NEEDS_UPGRADE: &str = "target_needs_upgrade";
+
+/// How `target_machine` is spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetKind {
+    /// Absent or empty.
+    Local,
+    /// The exact string `active`.
+    Active,
+    /// 32-byte machine id.
+    Explicit([u8; 32]),
+    /// Not `active` and not 64 hex characters.
+    Invalid,
+}
+
+/// What the originator does with a classified target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteTargetDecision {
+    /// Display on this daemon. Send no DM.
+    LocalDisplay,
+    /// Ask enrolled machines which GUI was visible.
+    QueryActive,
+    /// Send a show to this other machine.
+    Remote([u8; 32]),
+    /// Do not send.
+    Refused,
+}
+
+/// Classify `target_machine`. Empty is local. `active` is exact.
+pub(crate) fn classify_target(raw: &str) -> TargetKind {
+    if raw.is_empty() {
+        return TargetKind::Local;
+    }
+    if raw == "active" {
+        return TargetKind::Active;
+    }
+    match decode_machine_id(raw) {
+        Some(id) => TargetKind::Explicit(id),
+        None => TargetKind::Invalid,
+    }
+}
+
+/// `true` only for a current verified advert that sets the bit.
+pub(crate) fn capability_allows(supports: Option<bool>) -> bool {
+    matches!(supports, Some(true))
+}
+
+/// Enrollment gate for an explicit machine, then local versus remote.
+///
+/// `enrolled` is the result of `OwnerSyncStore::is_enrolled`. No owner, or
+/// a machine that is not enrolled, is [`RemoteTargetDecision::Refused`].
+pub(crate) fn remote_target_decision(
+    kind: TargetKind,
+    has_owner: bool,
+    enrolled: bool,
+    local_machine: &[u8; 32],
+) -> RemoteTargetDecision {
+    match kind {
+        TargetKind::Local => RemoteTargetDecision::LocalDisplay,
+        TargetKind::Active => RemoteTargetDecision::QueryActive,
+        TargetKind::Invalid => RemoteTargetDecision::Refused,
+        TargetKind::Explicit(id) => {
+            if !has_owner || !enrolled {
+                RemoteTargetDecision::Refused
+            } else if &id == local_machine {
+                RemoteTargetDecision::LocalDisplay
+            } else {
+                RemoteTargetDecision::Remote(id)
+            }
+        }
+    }
+}
+
+fn decode_machine_id(raw: &str) -> Option<[u8; 32]> {
+    if raw.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(raw).ok()?;
+    <[u8; 32]>::try_from(bytes).ok()
+}
+
+fn parse_request_id(hex_id: &str) -> Option<[u8; 16]> {
+    let bytes = hex::decode(hex_id).ok()?;
+    <[u8; 16]>::try_from(bytes).ok()
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
 
 /// POST /gui/show
 pub(in crate::server) async fn gui_show(
@@ -55,20 +160,35 @@ pub(in crate::server) async fn gui_show(
 
     let machine_id = hex::encode(state.agent.machine_id().as_bytes());
     let request_id = new_request_id();
-
-    // Slice 1: only local (absent / null target). Remote is #1394.
-    if let Some(target) = req.target_machine.as_deref() {
-        if !target.is_empty() {
-            return json_outcome(GuiShowOutcome::Refused, machine_id, request_id);
-        }
+    let target = req.target_machine.as_deref().unwrap_or("");
+    // Absent, null, and empty stay on the local path, including its
+    // durable-token rule (already applied) and its rate-limit bucket.
+    if matches!(classify_target(target), TargetKind::Local) {
+        return local_show(&state, &actor, rider, &req.view, machine_id, request_id).await;
     }
+    remote_show(
+        &state, &actor, rider, &req.view, target, machine_id, request_id,
+    )
+    .await
+}
 
+/// Local show. `target_machine` is absent, empty, or `active` selected
+/// this machine. Remote sends do not call this, so they do not spend the
+/// local rate-limit bucket.
+async fn local_show(
+    state: &AppState,
+    actor: &ActorContext,
+    rider: bool,
+    view: &str,
+    machine_id: String,
+    request_id: String,
+) -> Response {
     let cfg = state.gui_show.config();
     if !cfg.local_enabled {
         return json_outcome(GuiShowOutcome::Disabled, machine_id, request_id);
     }
 
-    let parsed = match view_route::parse(&req.view) {
+    let parsed = match view_route::parse(view) {
         Ok(v) => v,
         Err(_) => {
             return json_outcome(GuiShowOutcome::InvalidView, machine_id, request_id);
@@ -80,7 +200,7 @@ pub(in crate::server) async fn gui_show(
     // on the requesting agent. A rider's requesting agent is the
     // authenticated `sub_agent_id`, not this daemon. A bad id is refused
     // here so it cannot fall back onto the daemon's identity.
-    let Some(sender) = show_sender(&state, &actor) else {
+    let Some(sender) = show_sender(state, actor) else {
         return json_outcome(GuiShowOutcome::Refused, machine_id, request_id);
     };
     if state.gui_show.is_blocked(&sender) {
@@ -93,9 +213,33 @@ pub(in crate::server) async fn gui_show(
     }
 
     let agent_hex = hex::encode(sender.as_bytes());
-    let (agent_label, machine_label) = resolve_banner_labels(&state, &agent_hex, rider).await;
+    let (agent_label, machine_label) = resolve_banner_labels(state, &agent_hex, rider).await;
     let banner = origin_banner(&agent_label, &machine_label, rider);
+    let outcome = display_show(
+        state,
+        route,
+        banner,
+        agent_hex,
+        &machine_id,
+        rider,
+        &request_id,
+    )
+    .await;
+    json_outcome(outcome, machine_id, request_id)
+}
 
+/// Navigate a live tab, or open a loopback GUI URL on this machine.
+///
+/// Local show and [`deliver_remote_show`] both use this path.
+async fn display_show(
+    state: &AppState,
+    route: String,
+    banner: String,
+    agent_hex: String,
+    machine_id: &str,
+    rider: bool,
+    request_id: &str,
+) -> GuiShowOutcome {
     // Deliver on the tab's own queue. A broadcast would return before the
     // forwarder runs, and a full queue there drops the frame and closes
     // the socket. Reconnect does not replay that broadcast. The socket
@@ -105,9 +249,9 @@ pub(in crate::server) async fn gui_show(
         view: route.clone(),
         banner: banner.clone(),
         agent_id: agent_hex.clone(),
-        machine_id: machine_id.clone(),
+        machine_id: machine_id.to_string(),
         rider,
-        request_id: request_id.clone(),
+        request_id: request_id.to_string(),
     };
     let decided_at = Instant::now();
     let accepted = {
@@ -123,7 +267,7 @@ pub(in crate::server) async fn gui_show(
         accepted
     };
     if accepted {
-        return json_outcome(GuiShowOutcome::Navigated, machine_id, request_id);
+        return GuiShowOutcome::Navigated;
     }
 
     // Mint a fresh session; never put the durable token in the URL.
@@ -136,9 +280,9 @@ pub(in crate::server) async fn gui_show(
         view: route,
         banner,
         agent_id: agent_hex,
-        machine_id: machine_id.clone(),
+        machine_id: machine_id.to_string(),
         rider,
-        request_id: request_id.clone(),
+        request_id: request_id.to_string(),
         session_token: session.clone(),
         created_at: Instant::now(),
     });
@@ -149,7 +293,7 @@ pub(in crate::server) async fn gui_show(
     let Some(opener) = state.gui_show.opener_for_launch() else {
         state.sessions.revoke(&session);
         state.gui_show.drop_pending_for_session(&session);
-        return json_outcome(GuiShowOutcome::NoDisplay, machine_id, request_id);
+        return GuiShowOutcome::NoDisplay;
     };
     let stop = state.gui_show.open_stop_flag();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -168,16 +312,479 @@ pub(in crate::server) async fn gui_show(
     if !admitted {
         state.sessions.revoke(&session);
         state.gui_show.drop_pending_for_session(&session);
-        return json_outcome(GuiShowOutcome::NoDisplay, machine_id, request_id);
+        return GuiShowOutcome::NoDisplay;
     }
     let opened = rx.await.unwrap_or(false);
     if opened {
-        json_outcome(GuiShowOutcome::Opened, machine_id, request_id)
+        GuiShowOutcome::Opened
     } else {
         state.sessions.revoke(&session);
         state.gui_show.drop_pending_for_session(&session);
-        json_outcome(GuiShowOutcome::NoDisplay, machine_id, request_id)
+        GuiShowOutcome::NoDisplay
     }
+}
+
+/// Target-side display after the receive path has checked trust,
+/// `remote_enabled`, replay, freshness, the block list, and the rate limit.
+///
+/// Parses `view` again. A grammar failure is [`GuiShowOutcome::InvalidView`]
+/// and does not open a window. `request_id` is the 32-character hex id
+/// stored on the frame. Names in the banner are resolved on this machine.
+pub(crate) async fn deliver_remote_show(
+    state: &AppState,
+    sender: AgentId,
+    sender_machine: MachineId,
+    view: &str,
+    via_rider: bool,
+    request_id: &str,
+) -> GuiShowOutcome {
+    let parsed = match view_route::parse(view) {
+        Ok(route) => route,
+        Err(_) => return GuiShowOutcome::InvalidView,
+    };
+    let (banner, rider) = remote_show_banner(state, &sender, &sender_machine, via_rider).await;
+    let machine_hex = hex::encode(sender_machine.as_bytes());
+    display_show(
+        state,
+        parsed.as_route(),
+        banner,
+        hex::encode(sender.as_bytes()),
+        &machine_hex,
+        rider,
+        request_id,
+    )
+    .await
+}
+
+/// Banner text for one inbound remote show.
+///
+/// `via_rider` uses the rider sentence. This daemon's own agent uses the
+/// local sentence. Any other sender names `gui_show_blocked.json` and does
+/// not use the word rider.
+async fn remote_show_banner(
+    state: &AppState,
+    sender: &AgentId,
+    sender_machine: &MachineId,
+    via_rider: bool,
+) -> (String, bool) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    let machine_hex = hex::encode(sender_machine.as_bytes());
+    if via_rider {
+        let machine_label = short_id_hex(&machine_hex);
+        return (
+            origin_banner(&short_id_hex(&sender_hex), &machine_label, true),
+            true,
+        );
+    }
+    if *sender == state.agent.agent_id() {
+        let (agent_label, machine_label) = resolve_banner_labels(state, &sender_hex, false).await;
+        return (origin_banner(&agent_label, &machine_label, false), false);
+    }
+    let banner = format!(
+        "Opened by {} on {}. {REMOTE_SHOW_REENABLE}",
+        short_id_hex(&sender_hex),
+        short_id_hex(&machine_hex)
+    );
+    (banner, false)
+}
+
+/// Originator path once `target_machine` is present and non-empty.
+async fn remote_show(
+    state: &AppState,
+    actor: &ActorContext,
+    rider: bool,
+    view: &str,
+    target: &str,
+    local_hex: String,
+    request_id: String,
+) -> Response {
+    // Grammar fails on this daemon. Nothing is sent.
+    let parsed = match view_route::parse(view) {
+        Ok(route) => route,
+        Err(_) => {
+            return remote_json(
+                GuiShowOutcome::InvalidView,
+                local_hex,
+                request_id,
+                None,
+                None,
+            );
+        }
+    };
+    let route = parsed.as_route();
+    let local_machine = state.agent.machine_id();
+    let kind = classify_target(target);
+    let owner = state.agent.owner_trust().local_owner();
+    let decision = match kind {
+        TargetKind::Explicit(id) => {
+            let enrolled = explicit_is_enrolled(state, owner.as_ref(), &MachineId(id)).await;
+            remote_target_decision(
+                TargetKind::Explicit(id),
+                owner.is_some(),
+                enrolled,
+                local_machine.as_bytes(),
+            )
+        }
+        other => remote_target_decision(other, owner.is_some(), false, local_machine.as_bytes()),
+    };
+    match decision {
+        RemoteTargetDecision::LocalDisplay => {
+            local_show(state, actor, rider, &route, local_hex, request_id).await
+        }
+        RemoteTargetDecision::Refused => {
+            let machine_hex = match kind {
+                TargetKind::Explicit(id) => hex::encode(id),
+                _ => local_hex,
+            };
+            remote_json(GuiShowOutcome::Refused, machine_hex, request_id, None, None)
+        }
+        RemoteTargetDecision::QueryActive => {
+            show_active(state, actor, rider, route, local_hex, request_id).await
+        }
+        RemoteTargetDecision::Remote(id) => {
+            show_explicit(state, MachineId(id), route, rider, request_id).await
+        }
+    }
+}
+
+/// `OwnerSyncStore::is_enrolled` for one explicit machine.
+///
+/// The store is the one `OwnerSyncService` installs on owner trust. No
+/// owner, or no store, is not enrolled.
+async fn explicit_is_enrolled(
+    state: &AppState,
+    owner: Option<&UserId>,
+    machine: &MachineId,
+) -> bool {
+    let Some(owner) = owner else {
+        return false;
+    };
+    let Some(store) = owner_device_store(state) else {
+        return false;
+    };
+    store.is_enrolled(machine, owner).await
+}
+
+/// Device set shared with owner trust.
+///
+/// `OwnerTrust::device_store` is private. Daemon startup installs this
+/// same `Arc` with `Agent::install_owner_device_store`.
+fn owner_device_store(state: &AppState) -> Option<Arc<OwnerSyncStore>> {
+    state
+        .owner_sync
+        .as_ref()
+        .map(|service| Arc::clone(service.store()))
+}
+
+async fn show_explicit(
+    state: &AppState,
+    machine: MachineId,
+    route: String,
+    rider: bool,
+    request_id: String,
+) -> Response {
+    let target_hex = hex::encode(machine.as_bytes());
+    let Some(agent) = show_peer(state, &machine).await else {
+        return remote_json(
+            GuiShowOutcome::Refused,
+            target_hex,
+            request_id,
+            Some(TARGET_NEEDS_UPGRADE),
+            None,
+        );
+    };
+    send_show_and_wait(state, agent, target_hex, route, rider, request_id).await
+}
+
+async fn show_active(
+    state: &AppState,
+    actor: &ActorContext,
+    rider: bool,
+    route: String,
+    local_hex: String,
+    request_id: String,
+) -> Response {
+    use crate::gui::remote::{
+        select_active, ActiveChoice, ActivityCandidate, GuiActivityBody, RESULT_WAIT,
+    };
+
+    let local_machine = state.agent.machine_id();
+    let mut candidates = vec![ActivityCandidate {
+        machine_id: local_machine.0,
+        last_gui_visible_at: state.gui_show.last_gui_visible_at(),
+        remote_enabled: true,
+    }];
+    let mut peers = HashMap::new();
+    let mut waits = Vec::new();
+    let deadline = tokio::time::Instant::now() + RESULT_WAIT;
+    for machine in enrolled_remote_machines(state, &local_machine).await {
+        let Some(agent) = activity_peer(state, &machine).await else {
+            candidates.push(quiet_candidate(machine.0));
+            continue;
+        };
+        let Some(qid) = parse_request_id(&new_request_id()) else {
+            candidates.push(quiet_candidate(machine.0));
+            continue;
+        };
+        let query = GuiActivityBody::Query { request_id: qid };
+        let Some(payload) = query.to_dm_payload() else {
+            candidates.push(quiet_candidate(machine.0));
+            continue;
+        };
+        // Register before send so a fast reply is not lost.
+        let rx = state.gui_show.remote_hub().wait_activity(qid);
+        if send_gui_dm(state, &agent, payload, qid).await.is_err() {
+            candidates.push(quiet_candidate(machine.0));
+            continue;
+        }
+        peers.insert(machine.0, agent);
+        waits.push((machine.0, rx));
+    }
+    let replies = futures::future::join_all(waits.into_iter().map(|(machine, rx)| async move {
+        let body = match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(body)) => Some(body),
+            _ => None,
+        };
+        (machine, body)
+    }))
+    .await;
+    for (machine, body) in replies {
+        let (last_gui_visible_at, remote_enabled) = match body {
+            Some(GuiActivityBody::Reply {
+                last_gui_visible_at,
+                remote_enabled: true,
+                ..
+            }) => (last_gui_visible_at, true),
+            Some(GuiActivityBody::Reply { .. }) => (None, false),
+            Some(GuiActivityBody::Query { .. }) | None => (None, true),
+        };
+        candidates.push(ActivityCandidate {
+            machine_id: machine,
+            last_gui_visible_at,
+            remote_enabled,
+        });
+    }
+    match select_active(unix_secs(), &candidates) {
+        ActiveChoice::None { candidates: ids } => remote_json(
+            GuiShowOutcome::NoActiveMachine,
+            local_hex,
+            request_id,
+            None,
+            Some(ids),
+        ),
+        ActiveChoice::Machine(id) if id == local_machine.0 => {
+            local_show(state, actor, rider, &route, local_hex, request_id).await
+        }
+        ActiveChoice::Machine(id) => {
+            let target_hex = hex::encode(id);
+            let Some(agent) = peers.get(&id).copied() else {
+                return remote_json(
+                    GuiShowOutcome::Refused,
+                    target_hex,
+                    request_id,
+                    Some(TARGET_NEEDS_UPGRADE),
+                    None,
+                );
+            };
+            send_show_and_wait(state, agent, target_hex, route, rider, request_id).await
+        }
+    }
+}
+
+/// A machine `select_active` can list but cannot choose.
+fn quiet_candidate(machine_id: [u8; 32]) -> crate::gui::remote::ActivityCandidate {
+    crate::gui::remote::ActivityCandidate {
+        machine_id,
+        last_gui_visible_at: None,
+        remote_enabled: true,
+    }
+}
+
+async fn enrolled_remote_machines(state: &AppState, local: &MachineId) -> Vec<MachineId> {
+    let Some(owner) = state.agent.owner_trust().local_owner() else {
+        return Vec::new();
+    };
+    let Some(store) = owner_device_store(state) else {
+        return Vec::new();
+    };
+    let mut machines = Vec::new();
+    for record in store.enrolled_devices().await {
+        if record.machine_id == local.0 {
+            continue;
+        }
+        let machine = MachineId(record.machine_id);
+        if store.is_enrolled(&machine, &owner).await {
+            machines.push(machine);
+        }
+    }
+    machines.sort_by_key(|machine| machine.0);
+    machines.dedup();
+    machines
+}
+
+async fn discovered_agents(state: &AppState, machine: &MachineId) -> Vec<AgentId> {
+    let cache = state.agent.identity_discovery_cache();
+    let cache = cache.read().await;
+    cache
+        .iter()
+        .filter(|(_, found)| found.machine_id == *machine)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// Online enrolled machine that advertises `gui_show_v1`.
+///
+/// No address, an offline agent, or a missing bit leaves the machine in
+/// the candidate list with no timestamp.
+async fn activity_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
+    let agents = discovered_agents(state, machine).await;
+    for agent in agents {
+        if state.agent.is_agent_connected(&agent).await && agent_can_show(state, &agent) {
+            return Some(agent);
+        }
+    }
+    None
+}
+
+/// Agent on `machine` whose verified advert allows a show.
+///
+/// Prefers a connected agent. An offline agent with the bit is still
+/// returned so the send can time out as `unconfirmed`.
+async fn show_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
+    let agents = discovered_agents(state, machine).await;
+    let mut offline = None;
+    for agent in agents {
+        if !agent_can_show(state, &agent) {
+            continue;
+        }
+        if state.agent.is_agent_connected(&agent).await {
+            return Some(agent);
+        }
+        if offline.is_none() {
+            offline = Some(agent);
+        }
+    }
+    offline
+}
+
+fn agent_can_show(state: &AppState, agent: &AgentId) -> bool {
+    let supports = state
+        .agent
+        .capability_store()
+        .verified_registry_supports(agent, crate::dm::CapabilityRegistry::GUI_SHOW_V1);
+    capability_allows(supports)
+}
+
+async fn send_show_and_wait(
+    state: &AppState,
+    agent: AgentId,
+    target_hex: String,
+    route: String,
+    via_rider: bool,
+    request_id: String,
+) -> Response {
+    use crate::gui::remote::{GuiShowDmRequest, RESULT_WAIT};
+
+    if !agent_can_show(state, &agent) {
+        return remote_json(
+            GuiShowOutcome::Refused,
+            target_hex,
+            request_id,
+            Some(TARGET_NEEDS_UPGRADE),
+            None,
+        );
+    }
+    let Some(bytes) = parse_request_id(&request_id) else {
+        return remote_json(
+            GuiShowOutcome::Unconfirmed,
+            target_hex,
+            request_id,
+            None,
+            None,
+        );
+    };
+    let body = GuiShowDmRequest {
+        request_id: bytes,
+        view: route,
+        issued_at: unix_secs(),
+        via_rider,
+    };
+    let Some(payload) = body.to_dm_payload() else {
+        return remote_json(
+            GuiShowOutcome::Unconfirmed,
+            target_hex,
+            request_id,
+            None,
+            None,
+        );
+    };
+    let deadline = tokio::time::Instant::now() + RESULT_WAIT;
+    // Register before send so a fast result is not lost.
+    let rx = state.gui_show.remote_hub().wait_show(bytes);
+    if send_gui_dm(state, &agent, payload, bytes).await.is_err() {
+        return remote_json(
+            GuiShowOutcome::Unconfirmed,
+            target_hex,
+            request_id,
+            None,
+            None,
+        );
+    }
+    match tokio::time::timeout_at(deadline, rx).await {
+        Ok(Ok(result)) => remote_json(result.outcome, target_hex, request_id, None, None),
+        _ => remote_json(
+            GuiShowOutcome::Unconfirmed,
+            target_hex,
+            request_id,
+            None,
+            None,
+        ),
+    }
+}
+
+async fn send_gui_dm(
+    state: &AppState,
+    to: &AgentId,
+    payload: Vec<u8>,
+    logical_request_id: [u8; 16],
+) -> Result<(), crate::dm::DmError> {
+    let config = crate::dm::DmSendConfig {
+        max_retries: 0,
+        require_durable_app_ack: false,
+        logical_request_id: Some(logical_request_id),
+        ..crate::dm::DmSendConfig::default()
+    };
+    state
+        .agent
+        .send_direct_with_config(to, payload, config)
+        .await
+        .map(|_| ())
+}
+
+fn remote_json(
+    outcome: GuiShowOutcome,
+    machine_id: String,
+    request_id: String,
+    reason: Option<&str>,
+    candidates: Option<Vec<String>>,
+) -> Response {
+    let mut body = serde_json::json!({
+        "outcome": outcome,
+        "machine_id": machine_id,
+        "request_id": request_id,
+    });
+    if let Some(object) = body.as_object_mut() {
+        if let Some(reason) = reason {
+            object.insert(
+                "reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+        if let Some(candidates) = candidates {
+            object.insert("candidates".to_string(), serde_json::json!(candidates));
+        }
+    }
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 fn json_outcome(outcome: GuiShowOutcome, machine_id: String, request_id: String) -> Response {
@@ -1241,6 +1848,316 @@ mod tests {
                 .map(|e| e.cli_name),
             Some("show")
         );
+    }
+
+    #[test]
+    fn classify_target_splits_local_active_explicit_and_invalid() {
+        assert_eq!(classify_target(""), TargetKind::Local);
+        assert_eq!(classify_target("active"), TargetKind::Active);
+        assert_eq!(classify_target("Active"), TargetKind::Invalid);
+        let id = "ab".repeat(32);
+        let bytes = hex::decode(&id).unwrap();
+        assert_eq!(
+            classify_target(&id),
+            TargetKind::Explicit(bytes.try_into().unwrap())
+        );
+        assert_eq!(classify_target(&"ab".repeat(31)), TargetKind::Invalid);
+        assert_eq!(classify_target(&"zz".repeat(32)), TargetKind::Invalid);
+    }
+
+    #[test]
+    fn capability_allows_only_some_true() {
+        assert!(capability_allows(Some(true)));
+        assert!(!capability_allows(Some(false)));
+        assert!(!capability_allows(None));
+    }
+
+    #[test]
+    fn remote_target_decision_refuses_an_unenrolled_explicit_machine() {
+        let local = [1_u8; 32];
+        let other = [2_u8; 32];
+        assert_eq!(
+            remote_target_decision(TargetKind::Explicit(other), true, false, &local),
+            RemoteTargetDecision::Refused
+        );
+        assert_eq!(
+            remote_target_decision(TargetKind::Explicit(other), false, true, &local),
+            RemoteTargetDecision::Refused
+        );
+        assert_eq!(
+            remote_target_decision(TargetKind::Explicit(other), false, false, &local),
+            RemoteTargetDecision::Refused
+        );
+        assert_eq!(
+            remote_target_decision(TargetKind::Explicit(other), true, true, &local),
+            RemoteTargetDecision::Remote(other)
+        );
+        assert_eq!(
+            remote_target_decision(TargetKind::Explicit(local), true, true, &local),
+            RemoteTargetDecision::LocalDisplay
+        );
+        assert_eq!(
+            remote_target_decision(TargetKind::Invalid, true, true, &local),
+            RemoteTargetDecision::Refused
+        );
+        assert_eq!(
+            remote_target_decision(TargetKind::Active, false, false, &local),
+            RemoteTargetDecision::QueryActive
+        );
+    }
+
+    #[tokio::test]
+    async fn null_and_empty_target_stay_on_the_local_response() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        install_capturing_opener(&state);
+        let app = router(Arc::clone(&state));
+        for body in [
+            json!({ "view": "people", "target_machine": null }),
+            json!({ "view": "people", "target_machine": "" }),
+        ] {
+            let (status, body) = post_show(&app, body).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let outcome = body["outcome"].as_str().unwrap_or("");
+            assert!(
+                outcome == "opened" || outcome == "navigated" || outcome == "no_display",
+                "{body}"
+            );
+            let parsed: GuiShowResponse =
+                serde_json::from_value(body.clone()).expect("local body is GuiShowResponse");
+            assert_eq!(parsed.request_id.len(), 32);
+            assert!(body.get("reason").is_none(), "{body}");
+            assert!(body.get("candidates").is_none(), "{body}");
+        }
+        Ok(())
+    }
+
+    /// `active` with no visible GUI and an empty device set lists this
+    /// machine and does not open a window.
+    #[tokio::test]
+    async fn active_with_no_visible_gui_is_no_active_machine() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        assert!(state.gui_show.last_gui_visible_at().is_none());
+        assert!(state.owner_sync.is_none());
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(
+            &app,
+            json!({ "view": "people", "target_machine": "active" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "no_active_machine", "{body}");
+        assert!(body.get("reason").is_none(), "{body}");
+        let local = hex::encode(state.agent.machine_id().as_bytes());
+        let candidates = body["candidates"]
+            .as_array()
+            .expect("no_active_machine lists candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|id| id.as_str() == Some(local.as_str())),
+            "{body}"
+        );
+        assert!(body.get("url").is_none(), "{body}");
+        assert!(!body.to_string().contains("http"));
+        assert!(cap.urls.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    /// A GUI that was just visible is the active machine, so `active` shows
+    /// here. Removing `select_active` (or ignoring the local stamp) leaves
+    /// this as `no_active_machine`.
+    #[tokio::test]
+    async fn active_uses_the_local_visibility_stamp() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        state.gui_show.note_gui_visible(now);
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(
+            &app,
+            json!({ "view": "people", "target_machine": "active" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let outcome = body["outcome"].as_str().unwrap_or("");
+        assert!(outcome == "opened" || outcome == "navigated", "{body}");
+        assert!(body.get("candidates").is_none(), "{body}");
+        assert!(body.get("reason").is_none(), "{body}");
+        assert!(!body.to_string().contains("http"));
+        assert!(!cap.urls.lock().unwrap().is_empty() || outcome == "navigated");
+        Ok(())
+    }
+
+    /// Missing, negative, and positive `gui_show_v1` adverts. Removing the
+    /// bit test in `agent_can_show` makes the first two asserts fail.
+    #[tokio::test]
+    async fn missing_gui_show_capability_is_not_a_send_target() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0xAB; 32]);
+        let machine = MachineId([0xCD; 32]);
+        assert!(
+            !agent_can_show(&state, &agent),
+            "no verified advert is target_needs_upgrade"
+        );
+
+        let mut caps = crate::dm::DmCapabilities::pending();
+        caps.application_registry = crate::dm::CapabilityRegistry {
+            version: 1,
+            bits: crate::dm::CapabilityRegistry::current().bits
+                & !crate::dm::CapabilityRegistry::GUI_SHOW_V1,
+        };
+        let now_ms = unix_secs().saturating_mul(1000);
+        assert!(state
+            .agent
+            .capability_store()
+            .insert(agent, machine, caps.clone(), now_ms));
+        assert!(
+            !agent_can_show(&state, &agent),
+            "an advert without gui_show_v1 is target_needs_upgrade"
+        );
+
+        caps.application_registry.bits |= crate::dm::CapabilityRegistry::GUI_SHOW_V1;
+        assert!(state.agent.capability_store().insert(
+            agent,
+            machine,
+            caps,
+            now_ms.saturating_add(1)
+        ));
+        assert!(
+            agent_can_show(&state, &agent),
+            "a current advert with the bit may be sent"
+        );
+        Ok(())
+    }
+
+    /// A 64-hex id that is not enrolled is refused. The opener does not run.
+    #[tokio::test]
+    async fn explicit_machine_that_is_not_enrolled_is_refused() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let app = router(Arc::clone(&state));
+        let id = "cd".repeat(32);
+        let (status, body) =
+            post_show(&app, json!({ "view": "people", "target_machine": id })).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "refused", "{body}");
+        assert!(body.get("reason").is_none(), "{body}");
+        assert!(body.get("candidates").is_none(), "{body}");
+        assert_eq!(body["machine_id"], id, "{body}");
+        assert!(cap.urls.lock().unwrap().is_empty());
+        let bad = "not-a-machine";
+        let (status, body) =
+            post_show(&app, json!({ "view": "people", "target_machine": bad })).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "refused", "{body}");
+        assert!(cap.urls.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_target_rejects_a_url_view_without_opening() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let app = router(Arc::clone(&state));
+        for target in ["active", "cd".repeat(32).as_str()] {
+            let (status, body) = post_show(
+                &app,
+                json!({ "view": "https://evil.example", "target_machine": target }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{target} {body}");
+            assert_eq!(body["outcome"], "invalid_view", "{target} {body}");
+            assert!(body.get("reason").is_none(), "{body}");
+            assert!(body.get("candidates").is_none(), "{body}");
+            assert!(!body.to_string().contains("http://"));
+        }
+        assert!(cap.urls.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deliver_remote_show_rejects_a_url_and_names_a_remote_agent() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let request_id = "ab".repeat(16);
+        let sender = AgentId([0x11; 32]);
+        let machine = MachineId([0x22; 32]);
+        let outcome = deliver_remote_show(
+            &state,
+            sender,
+            machine,
+            "https://evil.example",
+            false,
+            &request_id,
+        )
+        .await;
+        assert_eq!(outcome, GuiShowOutcome::InvalidView);
+        assert!(cap.urls.lock().unwrap().is_empty());
+
+        let outcome =
+            deliver_remote_show(&state, sender, machine, "people", false, &request_id).await;
+        assert_eq!(outcome, GuiShowOutcome::Opened);
+        let token = {
+            let urls = cap.urls.lock().unwrap();
+            assert_eq!(urls.len(), 1);
+            assert!(urls[0].contains("#/people"));
+            assert!(!urls[0].contains(&request_id));
+            session_token_from_show_url(&urls[0])
+        };
+        let pending = state
+            .gui_show
+            .take_pending_for_session(&token, Instant::now())
+            .expect("banner queued");
+        assert_eq!(pending.request_id, request_id);
+        assert!(pending.banner.starts_with("Opened by "));
+        assert!(pending.banner.contains(REMOTE_SHOW_REENABLE));
+        assert!(!pending.banner.contains("rider"));
+        assert!(!pending.banner.contains("http"));
+        assert!(!pending.rider);
+
+        let rider_outcome =
+            deliver_remote_show(&state, sender, machine, "network", true, &request_id).await;
+        assert_eq!(rider_outcome, GuiShowOutcome::Opened);
+        let token = {
+            let urls = cap.urls.lock().unwrap();
+            session_token_from_show_url(urls.last().unwrap())
+        };
+        let pending = state
+            .gui_show
+            .take_pending_for_session(&token, Instant::now())
+            .expect("rider banner queued");
+        assert!(pending.banner.contains("(rider)"));
+        assert!(pending.banner.contains(crate::gui::RIDER_SHOW_REENABLE));
+        assert!(pending.rider);
+
+        let daemon = state.agent.agent_id();
+        let local_machine = state.agent.machine_id();
+        let local_outcome = deliver_remote_show(
+            &state,
+            daemon,
+            local_machine,
+            "settings",
+            false,
+            &request_id,
+        )
+        .await;
+        assert_eq!(local_outcome, GuiShowOutcome::Opened);
+        let token = {
+            let urls = cap.urls.lock().unwrap();
+            session_token_from_show_url(urls.last().unwrap())
+        };
+        let pending = state
+            .gui_show
+            .take_pending_for_session(&token, Instant::now())
+            .expect("local banner queued");
+        assert!(pending.banner.contains("gui_show_local_disabled"));
+        assert!(!pending.banner.contains("gui_show_blocked.json"));
+        assert!(!pending.rider);
+        Ok(())
     }
 
     /// Three slow opens used to share one mutex and an `Arc<AppState>` on

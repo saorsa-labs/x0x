@@ -20,6 +20,7 @@ mod crdt_subscriptions;
 mod delegations;
 mod delivery_gate;
 mod group_access;
+mod gui_show_remote;
 /// M1 structured `/health` verdict (#1380). `pub` because the `x0xd`
 /// binary installs [`health_verdict::ErrorCountLayer`] in its tracing
 /// registry — the ERROR-event count is the verdict's log input.
@@ -910,6 +911,9 @@ pub async fn serve_with_options(
     // ADR-0070 §2: durable typed route for share-grant deliveries.
     let (share_grant_dm_tx, mut share_grant_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
+    // ADR 0083 slice 3: one channel, three prefixes. No validator — a
+    // validator would parse the body before owner trust.
+    let (gui_show_dm_tx, mut gui_show_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -1881,6 +1885,7 @@ pub async fn serve_with_options(
     let dm_inbox_public_group_bootstrap_route_tx = public_group_bootstrap_dm_tx.clone();
     let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
     let dm_inbox_share_grant_route_tx = share_grant_dm_tx.clone();
+    let dm_inbox_gui_show_route_tx = gui_show_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
@@ -1890,6 +1895,7 @@ pub async fn serve_with_options(
         dm_inbox_kv_store_delta_route_tx,
         dm_inbox_predecessor_relay_route_tx,
         dm_inbox_share_grant_route_tx,
+        dm_inbox_gui_show_route_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -2663,6 +2669,17 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
                 let _ = grant_agent.handle_share_grant_delivery(typed).await;
+            }
+        }));
+    }
+
+    // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
+    // the body is decoded.
+    {
+        let gui_show_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = gui_show_dm_rx.recv().await {
+                crate::server::gui_show_remote::handle_gui_show_typed(&gui_show_state, typed).await;
             }
         }));
     }
@@ -3625,6 +3642,7 @@ async fn start_dm_inbox_when_gossip_ready(
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    gui_show_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -3668,10 +3686,25 @@ async fn start_dm_inbox_when_gossip_ready(
         // ADR-0070 §2: durable, never validated-and-fallthrough — a
         // malformed grant must fail the handler (ACK withheld), never be
         // shown as a generic DM.
-        let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
-            x0x::share_grant::SHARE_GRANT_DM_PREFIX,
-            share_grant_route_tx.clone(),
-        );
+        let dm_inbox_config = dm_inbox_config
+            .with_durable_typed_payload_route(
+                x0x::share_grant::SHARE_GRANT_DM_PREFIX,
+                share_grant_route_tx.clone(),
+            )
+            // ADR 0083 slice 3: durable, not validated. A validator would
+            // parse the body before owner trust.
+            .with_durable_typed_payload_route(
+                x0x::gui::remote::SHOW_REQUEST_PREFIX,
+                gui_show_route_tx.clone(),
+            )
+            .with_durable_typed_payload_route(
+                x0x::gui::remote::SHOW_RESULT_PREFIX,
+                gui_show_route_tx.clone(),
+            )
+            .with_durable_typed_payload_route(
+                x0x::gui::remote::ACTIVITY_PREFIX,
+                gui_show_route_tx.clone(),
+            );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await

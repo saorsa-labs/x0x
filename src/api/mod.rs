@@ -1801,7 +1801,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/gui/show",
         cli_name: "show",
-        description: "Show a GUI view to the human (ADR 0083 local show)",
+        description: "Show a GUI view on this machine or, with --on, on an owner machine",
         category: "gui",
         request: RequestSpec::Fields(&[
             RequestField::body_as("view", true, "VIEW"),

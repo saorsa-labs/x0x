@@ -1467,6 +1467,11 @@ async fn handle_ws_connection(
         return;
     };
     let call_forwarder = armed.forwarder;
+    // `gui=1` means the tab is visible at connect. A later hide does not
+    // clear `last_gui_visible_at`.
+    if visible_gui.load(Ordering::Acquire) {
+        note_gui_tab_visible(&state);
+    }
 
     tracing::info!(session_id = %session_id, direct_mode, "WebSocket session opened");
 
@@ -2378,26 +2383,49 @@ fn restore_requested_visibility(session: &WsSession) {
 }
 
 async fn apply_requested_gui_visibility(state: &AppState, session_id: &str) {
-    if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+    let became_visible = if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+        let was_visible = session.is_visible_gui();
         restore_requested_visibility(session);
+        !was_visible && session.is_visible_gui()
+    } else {
+        false
+    };
+    if became_visible {
+        note_gui_tab_visible(state);
     }
 }
 
 /// The queued frame has left the wait. Apply the latest visibility request
 /// when the send was accepted and this was the last waiting reveal.
 async fn finish_queued_reveal(state: &AppState, session_id: &str, sent: bool) {
-    let sessions = state.ws_sessions.read().await;
-    let Some(session) = sessions.get(session_id) else {
-        return;
+    let became_visible = {
+        let sessions = state.ws_sessions.read().await;
+        let Some(session) = sessions.get(session_id) else {
+            return;
+        };
+        let _guard = visibility_lock(session);
+        let was_visible = session.is_visible_gui();
+        session.reveal_inflight.fetch_sub(1, Ordering::AcqRel);
+        if sent
+            && session.reveal_inflight.load(Ordering::Acquire) == 0
+            && session.requested_visible.load(Ordering::Acquire)
+        {
+            session.set_visible_gui(true);
+        }
+        !was_visible && session.is_visible_gui()
     };
-    let _guard = visibility_lock(session);
-    session.reveal_inflight.fetch_sub(1, Ordering::AcqRel);
-    if sent
-        && session.reveal_inflight.load(Ordering::Acquire) == 0
-        && session.requested_visible.load(Ordering::Acquire)
-    {
-        session.set_visible_gui(true);
+    if became_visible {
+        note_gui_tab_visible(state);
     }
+}
+
+/// Record the last time a GUI tab became visible. Hiding the tab does not
+/// clear the timestamp.
+fn note_gui_tab_visible(state: &AppState) {
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    state.gui_show.note_gui_visible(unix_secs);
 }
 
 /// A full outbound queue with one pending origin banner. The receiver stays
