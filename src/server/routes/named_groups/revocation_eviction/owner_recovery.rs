@@ -133,7 +133,6 @@ struct HeldEvent {
     event: super::super::NamedGroupMetadataEvent,
     /// The verified signer of the event's commit.
     author: AgentId,
-    revision: u64,
     prev_state_hash: Option<String>,
     at: Instant,
 }
@@ -1709,8 +1708,6 @@ async fn parked_key(
     epoch: u64,
     may_seal_later: impl Fn(&AgentId) -> bool,
 ) -> ParkedKey {
-    use base64::Engine as _;
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let parked = state
         .revocation_evictions
         .inner
@@ -1719,34 +1716,7 @@ async fn parked_key(
         .orc
         .early_shares
         .clone();
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let open = |share: &ParkedShare| -> Option<(u64, [u8; 32])> {
-        let super::super::NamedGroupMetadataEvent::SecureShareDelivered {
-            group_id,
-            recipient,
-            secret_epoch,
-            kem_ciphertext_b64,
-            aead_nonce_b64,
-            aead_ciphertext_b64,
-            ..
-        } = &share.event
-        else {
-            return None;
-        };
-        if *recipient != local_hex {
-            return None;
-        }
-        let nonce: [u8; 12] = b64.decode(aead_nonce_b64).ok()?.try_into().ok()?;
-        let secret = x0x::groups::kem_envelope::open_group_secret(
-            &state.agent_kem_keypair,
-            &x0x::groups::aad::secure_share_aad(group_id, recipient, *secret_epoch),
-            &b64.decode(kem_ciphertext_b64).ok()?,
-            &nonce,
-            &b64.decode(aead_ciphertext_b64).ok()?,
-        )
-        .ok()?;
-        Some((*secret_epoch, secret))
-    };
+    let open = |share: &ParkedShare| open_parked_share(state, share);
     let mut later = false;
     for share in parked
         .iter()
@@ -1765,6 +1735,97 @@ async fn parked_key(
     } else {
         ParkedKey::Missing
     }
+}
+
+/// Open a parked share addressed to this node with its KEM key: its
+/// secret epoch and secret.
+fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8; 32])> {
+    use base64::Engine as _;
+    let super::super::NamedGroupMetadataEvent::SecureShareDelivered {
+        group_id,
+        recipient,
+        secret_epoch,
+        kem_ciphertext_b64,
+        aead_nonce_b64,
+        aead_ciphertext_b64,
+        ..
+    } = &share.event
+    else {
+        return None;
+    };
+    if *recipient != hex::encode(state.agent.agent_id().as_bytes()) {
+        return None;
+    }
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let nonce: [u8; 12] = b64.decode(aead_nonce_b64).ok()?.try_into().ok()?;
+    let secret = x0x::groups::kem_envelope::open_group_secret(
+        &state.agent_kem_keypair,
+        &x0x::groups::aad::secure_share_aad(group_id, recipient, *secret_epoch),
+        &b64.decode(kem_ciphertext_b64).ok()?,
+        &nonce,
+        &b64.decode(aead_ciphertext_b64).ok()?,
+    )
+    .ok()?;
+    Some((*secret_epoch, secret))
+}
+
+/// #1508 rc13 (Codex P1): the secret of `epoch` for a GSS removal, ban or
+/// crypto-only exclusion of `stable_group_id` by `actor` with result
+/// `result_state_hash`, from a later admin. The transition's actor can
+/// promote an admin and go offline; a lagging survivor then catches up
+/// from that admin. Its share is refused while it is a Member here, and
+/// the promotion chains on the transition, which waits for a share.
+///
+/// The share is used only with authenticated chain evidence: a held,
+/// verified `MemberRoleUpdated` that `actor` signed directly on the
+/// transition's result and that makes the share's sender an admin
+/// ([`hold_unchained_event`]). The transition then installs with this
+/// secret, so its head still means that the key is installed: a keyless
+/// head could end a key delivery that later same-epoch commits keep open.
+/// The ordinary apply checks the promotion again when it replays.
+pub(in crate::server) async fn promoted_admin_secret(
+    state: &AppState,
+    stable_group_id: &str,
+    actor: &[u8; 32],
+    result_state_hash: &str,
+    epoch: u64,
+) -> Option<[u8; 32]> {
+    let now = Instant::now();
+    let (held, parked) = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        (
+            inner.orc.held_events.clone(),
+            inner.orc.early_shares.clone(),
+        )
+    };
+    let promoted = |sender: &AgentId| {
+        let sender_hex = hex::encode(sender.as_bytes());
+        held.iter().any(|held| {
+            held.stable_group_id == stable_group_id
+                && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
+                && held.author.as_bytes() == actor
+                && held.prev_state_hash.as_deref() == Some(result_state_hash)
+                && matches!(
+                    &held.event,
+                    super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
+                        agent_id,
+                        role,
+                        ..
+                    } if *agent_id == sender_hex && role.at_least(x0x::groups::GroupRole::Admin)
+                )
+        })
+    };
+    parked
+        .iter()
+        .filter(|share| {
+            share.stable_group_id == stable_group_id
+                && now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL
+                && promoted(&share.sender)
+        })
+        .find_map(|share| match open_parked_share(state, share) {
+            Some((at, secret)) if at == epoch => Some(secret),
+            _ => None,
+        })
 }
 
 /// #1508 rc12 (Codex P1): hold a verified commit of a GSS group that does
@@ -1826,10 +1887,12 @@ pub(in crate::server) async fn hold_unchained_event(
         stable_group_id: info.stable_group_id().to_string(),
         event: event.clone(),
         author,
-        revision: commit.revision,
         prev_state_hash: commit.prev_state_hash.clone(),
         at: now,
     });
+    drop(inner);
+    // A stashed frame can wait for this commit (#1508 rc13).
+    state.agent.s4_revocation_intake().request_reconcile();
 }
 
 /// Whether this node holds a verified commit that `actor` signed on the
@@ -1858,24 +1921,16 @@ pub(super) async fn holds_actor_successor(
         })
 }
 
-/// Apply the held catch-up commits of `stable_group_id`, oldest first, once
-/// a GSS recovery or crypto-only exclusion installed here, each as its
-/// verified signer. A commit that still does not apply is dropped;
-/// catch-up serves it again.
-async fn replay_held_events(state: &Arc<AppState>, stable_group_id: &str) {
-    let now = Instant::now();
-    let mut due: Vec<HeldEvent> = {
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        let (due, keep) = std::mem::take(&mut inner.orc.held_events)
-            .into_iter()
-            .filter(|held| now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL)
-            .partition(|held| held.stable_group_id == stable_group_id);
-        inner.orc.held_events = keep;
-        due
-    };
-    due.sort_by_key(|held| held.revision);
-    for held in due {
-        let _ = super::super::apply_named_group_metadata_event(
+/// Apply the held catch-up commits of `stable_group_id` that chain on
+/// this node's head, one after another, each as its verified signer.
+/// Commits that do not chain stay held (bounded by [`ORC_STASH_CAP`] and
+/// [`ORC_RETAIN_TTL`]); they are not applied, so they bump no refusal
+/// counter. A chaining commit that the apply refuses is dropped, and the
+/// next one is tried. Returns whether any commit applied.
+async fn replay_held_events(state: &Arc<AppState>, stable_group_id: &str) -> bool {
+    let mut any = false;
+    while let Some(held) = take_chaining_held(state, stable_group_id).await {
+        let applied = super::super::apply_named_group_metadata_event(
             state,
             held.event,
             held.author,
@@ -1883,7 +1938,28 @@ async fn replay_held_events(state: &Arc<AppState>, stable_group_id: &str) {
             None,
         )
         .await;
+        any |= applied.accepted;
     }
+    any
+}
+
+/// Remove and return the held commit of `stable_group_id` whose parent is
+/// this node's head now.
+async fn take_chaining_held(state: &AppState, stable_group_id: &str) -> Option<HeldEvent> {
+    let head = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, stable_group_id)
+            .map(|(_, info)| info.state_hash.clone())?
+    };
+    let now = Instant::now();
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    let held = &mut inner.orc.held_events;
+    held.retain(|kept| now.saturating_duration_since(kept.at) <= ORC_RETAIN_TTL);
+    let at = held.iter().position(|kept| {
+        kept.stable_group_id == stable_group_id
+            && kept.prev_state_hash.as_deref() == Some(head.as_str())
+    })?;
+    Some(held.remove(at))
 }
 
 /// Apply again, through the ordinary share apply, every early share of
@@ -1919,6 +1995,15 @@ async fn replay_early_shares(state: &Arc<AppState>, stable_group_id: &str) {
 pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group_id: &str) {
     replay_held_events(state, stable_group_id).await;
     replay_early_shares(state, stable_group_id).await;
+}
+
+/// #1508 rc13: after any accepted commit of `stable_group_id`, apply the
+/// held commits that now chain on it and, if one applied (a later admin's
+/// promotion), the parked shares of that group.
+pub(in crate::server) async fn replay_after_commit(state: &Arc<AppState>, stable_group_id: &str) {
+    if replay_held_events(state, stable_group_id).await {
+        replay_early_shares(state, stable_group_id).await;
+    }
 }
 
 async fn retry_stash(state: &Arc<AppState>) {

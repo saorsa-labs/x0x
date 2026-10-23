@@ -2016,18 +2016,11 @@ pub(in crate::server) async fn receive(
 /// waits, kept durable in the `.celog` and in the stash; the share
 /// wakes the worker, which retries it.
 ///
-/// #1508 rc13 (Codex P1): the one exception is an intermediate head. The
-/// actor can promote an admin and go offline; a lagging survivor then
-/// catches up from that admin, whose share it refuses until the promotion
-/// applies, and the promotion chains on this frame. If this node holds a
-/// verified commit that the actor signed on this frame's result, the
-/// frame installs with no secret (the old one is dropped, so nothing is
-/// sealed under it), the held commits replay as their signers, and the
-/// parked share installs through the ordinary share rules. The actor's
-/// live delivery of this frame runs only while its head is this result,
-/// and that commit exists only after its head left it, so a keyless head
-/// here never ends that delivery. The owner-recovery path uses the same
-/// rule.
+/// #1508 rc13 (Codex P1): the share can come from a later admin that the
+/// actor promoted on this frame's result and that this node does not know
+/// as an admin yet ([`super::owner_recovery::promoted_admin_secret`]). The
+/// frame then installs with that secret, and the held promotion and the
+/// parked share replay after it.
 async fn install_gss(
     state: &Arc<AppState>,
     group_key: &str,
@@ -2038,16 +2031,20 @@ async fn install_gss(
     frame_bytes: Arc<Vec<u8>>,
 ) -> ReceiveOutcome {
     use super::super as ng;
-    let intermediate = info.secret_epoch < next_secret_epoch || info.shared_secret.is_none();
-    if intermediate
-        && !super::owner_recovery::holds_actor_successor(
+    let waiting = info.secret_epoch < next_secret_epoch || info.shared_secret.is_none();
+    let promoted = if waiting {
+        super::owner_recovery::promoted_admin_secret(
             state,
             &body.stable_group_id,
             &body.actor,
             &body.commit.state_hash,
+            next_secret_epoch,
         )
         .await
-    {
+    } else {
+        None
+    };
+    if waiting && promoted.is_none() {
         tracing::info!(
             group_id = %LogHexId::group(group_key),
             secret_epoch = next_secret_epoch,
@@ -2073,10 +2070,10 @@ async fn install_gss(
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             // The secret and its epoch came with the share (checked above),
-            // or this is an intermediate head with no secret of its epoch.
+            // or from a later admin's share.
             next.roster_revision = ng::adopt_roster_revision(next.roster_revision, roster_revision);
-            if intermediate && next.secret_epoch < next_secret_epoch {
-                next.shared_secret = None;
+            if let Some(secret) = promoted {
+                next.shared_secret = Some(secret.to_vec());
                 next.secret_epoch = next_secret_epoch;
             }
             next.security_binding = Some(ce::gss_binding(next_secret_epoch));
@@ -2101,19 +2098,12 @@ async fn install_gss(
     ng::refresh_group_card_cache_from_info(state, group_key, &next).await;
     ng::purge_join_artifacts_if_ineligible(state, group_key, &hex::encode(body.target)).await;
     remember_installed(state, body, frame_bytes).await;
-    if intermediate {
-        tracing::info!(
-            group_id = %LogHexId::group(group_key),
-            secret_epoch = next_secret_epoch,
-            "ADR 0110 S4: GSS crypto-only exclusion installs as an intermediate head; the actor's later commit is held"
-        );
-    } else {
-        tracing::info!(
-            group_id = %LogHexId::group(group_key),
-            secret_epoch = next_secret_epoch,
-            "ADR 0110 S4: GSS crypto-only exclusion installed with its new secret"
-        );
-    }
+    tracing::info!(
+        group_id = %LogHexId::group(group_key),
+        secret_epoch = next_secret_epoch,
+        from_later_admin = promoted.is_some(),
+        "ADR 0110 S4: GSS crypto-only exclusion installed with its new secret"
+    );
     ng::gss_share_hold::release_exclusions(state, group_key, next_secret_epoch).await;
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
@@ -4438,9 +4428,9 @@ mod daemon_tests {
     /// promotes B and goes offline. A lagging survivor catches up from B
     /// only: the frame that B relays, A's signed promotion (it does not
     /// chain here yet) and B's share of the new secret (refused while B is
-    /// a Member here). The survivor must install the frame as an
-    /// intermediate head, chain the promotion, take B's share and end at
-    /// A's promotion head with the new secret. Before the fix the frame
+    /// a Member here). The survivor must install the frame with B's
+    /// secret, chain the promotion and end at A's promotion head with the
+    /// new secret. Before the fix the frame
     /// waited for a share from an admin and B's share waited for the
     /// promotion, for ever. B's share alone, with no commit of the actor
     /// on the frame's result, still installs nothing.
@@ -4567,6 +4557,95 @@ mod daemon_tests {
         assert_eq!(
             ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
             None
+        );
+        Ok(())
+    }
+
+    /// #1508 rc13 (Codex P1): the share is lost and A then commits a
+    /// same-epoch rename on the exclusion's result. A's delivery stays open
+    /// across that commit, and a survivor head at the rename result would
+    /// end it. So the survivor must not install the exclusion without its
+    /// key: it stays at the parent, holding sends. Before the fix the held
+    /// rename made the exclusion install as a keyless intermediate head.
+    #[tokio::test]
+    async fn a_lost_gss_exclusion_share_with_a_later_rename_keeps_the_parent() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let excluded = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        let admin = fx.state.agent.agent_id();
+        let mut renamed = excluded.clone();
+        renamed.name = "renamed".to_string();
+        let commit = renamed.seal_commit(
+            fx.state.agent.identity().agent_keypair(),
+            ng::now_millis_u64(),
+        )?;
+        let rename = ng::NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: fx.group_id.clone(),
+            revision: renamed.roster_revision,
+            actor: hex::encode(admin.as_bytes()),
+            name: Some("renamed".to_string()),
+            description: None,
+            commit: Some(commit),
+        };
+
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare
+        );
+        fx.replica
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .stash
+            .push(StashedFrame {
+                sender: admin,
+                bytes: frame.clone(),
+                at: Instant::now(),
+            });
+        let refused =
+            ng::apply_named_group_metadata_event(&fx.replica, rename, admin, true, None).await;
+        assert!(!refused.accepted, "the rename does not chain yet");
+        retry_stash(&fx.replica).await;
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no head past the exclusion without its key"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval)
         );
         Ok(())
     }
