@@ -41096,7 +41096,12 @@ mod peer_connected_handler_integration_tests {
             // the operator fleet runs both roles by deployment. The announcer
             // never hints itself. A dual-stack socket reports the same peer
             // v4-mapped; the normalized form must work identically.
-            let seed_host = identity::MachineId([0x22; 32]);
+            // Post-pins the operator tier requires the observed
+            // (address, identity) pair to MATCH the compiled-in pin, so
+            // the fixtures carry the production pinned PeerIds.
+            let nyc_5483 = *network::pinned_seed_peer_ids("142.93.199.50:5483".parse().unwrap())[0];
+            let hel_5483 = *network::pinned_seed_peer_ids("65.21.157.229:5483".parse().unwrap())[0];
+            let seed_host = identity::MachineId(nyc_5483);
             let own = identity::MachineId([0x99; 32]);
             let mut cache = std::collections::HashMap::new();
             cache.insert(
@@ -41115,11 +41120,11 @@ mod peer_connected_handler_integration_tests {
             let skew = SelectionSkew::default();
             let (coordinators, relays) = select_capability_hints(
                 &[
-                    issue1112_origin([0x22; 32], "142.93.199.50:5483", true),
+                    issue1112_origin(nyc_5483, "142.93.199.50:5483", true),
                     issue1112_origin([0x99; 32], "142.93.199.50:443", true),
                     // Same seed host seen v4-mapped on a dual-stack socket
                     // (review round 2): normalization must keep it a hint.
-                    issue1112_origin([0x55; 32], "[::ffff:65.21.157.229]:5483", true),
+                    issue1112_origin(hel_5483, "[::ffff:65.21.157.229]:5483", true),
                 ],
                 &cache,
                 own,
@@ -41134,7 +41139,7 @@ mod peer_connected_handler_integration_tests {
             // bootstrap-classified choice: seed_host twice (its cache
             // entry classifies) + the mapped peer twice (the no-cache
             // operator branch). None for the self-entry.
-            let mapped_seed = identity::MachineId([0x55; 32]);
+            let mapped_seed = identity::MachineId(hel_5483);
             assert!(
                 coordinators.contains(&mapped_seed) && relays.contains(&mapped_seed),
                 "a v4-mapped observed seed address must stay an operator-tier hint"
@@ -41151,9 +41156,22 @@ mod peer_connected_handler_integration_tests {
             // the identity-wide skip it used to carry is gone, because a
             // rejection recorded at one seed address must not suppress the
             // same identity's valid, pinned origin at another address —
-            // whatever the dial completion order. With the production pin
-            // table empty every pair is TOFU, so a healthy seed origin is
-            // hinted regardless of what happened at other addresses.
+            // whatever the dial completion order. Both fixture rows below
+            // pin the SAME machine identity (the deployment shape where
+            // one key serves two listeners), so every origin pair is a
+            // member and stays eligible.
+            const PAIR_IDS: [&[u8; 32]; 1] = [&[0x33; 32]];
+            static PAIR_PINS: [network::SeedPeerPin; 2] = [
+                network::SeedPeerPin {
+                    addr: "142.93.199.50:5483",
+                    expected_peer_ids: &PAIR_IDS,
+                },
+                network::SeedPeerPin {
+                    addr: "147.182.234.192:443",
+                    expected_peer_ids: &PAIR_IDS,
+                },
+            ];
+            let _pins = network::override_dial_pins_for_test(&PAIR_PINS);
             let mut cache = std::collections::HashMap::new();
             let seed_host = identity::MachineId([0x33; 32]);
             cache.insert(seed_host, issue1112_machine(seed_host, &[], None, None));
@@ -41161,8 +41179,8 @@ mod peer_connected_handler_integration_tests {
             let (coordinators, relays) = select_capability_hints(
                 &[
                     // The same identity seen at two distinct seed
-                    // listeners: no pin row rejects either pair, so both
-                    // origins are eligible — the ordering of any mismatch
+                    // listeners: both pairs are members, so both origins
+                    // are eligible — the ordering of any mismatch
                     // elsewhere cannot change that.
                     issue1112_origin([0x33; 32], "142.93.199.50:5483", true),
                     issue1112_origin([0x33; 32], "147.182.234.192:443", true),
@@ -41358,9 +41376,14 @@ mod peer_connected_handler_integration_tests {
             // peer — it is never OPERATOR-tier evidence, whatever the peer
             // announces. The peer self-asserts both capability flags and
             // still gets no hint: self-asserted flags grant nothing
-            // (David's 20 Oct 2026 ruling, confirmed 22 Oct 2026).
+            // (David's 20 Oct 2026 ruling, confirmed 22 Oct 2026). The
+            // fixture identity is the production pinned PeerId for the
+            // observed address, so the pin pair matches and the relayed
+            // path is the ONLY thing that can exclude the origin.
+            let seed_nyc_5483 =
+                *network::pinned_seed_peer_ids("142.93.199.50:5483".parse().unwrap())[0];
+            let relayed = identity::MachineId(seed_nyc_5483);
             let mut cache = std::collections::HashMap::new();
-            let relayed = identity::MachineId([0x44; 32]);
             cache.insert(
                 relayed,
                 issue1112_machine(
@@ -41372,7 +41395,7 @@ mod peer_connected_handler_integration_tests {
             );
             let skew = SelectionSkew::default();
             let (coordinators, relays) = select_capability_hints(
-                &[issue1112_origin([0x44; 32], "142.93.199.50:5483", false)],
+                &[issue1112_origin(seed_nyc_5483, "142.93.199.50:5483", false)],
                 &cache,
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),

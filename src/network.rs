@@ -569,12 +569,170 @@ pub(crate) struct SeedPeerPin {
     pub(crate) expected_peer_ids: &'static [&'static [u8; 32]],
 }
 
-/// Compiled-in seed PeerId pins (issue #1112). Empty today: no production
-/// seed PeerId is pinned yet — the only repo-held captures are six months
-/// stale and bind only the `:5483` listeners, and a stale pin would drop
-/// the hint for every client. Pinning is a deliberate operator change:
-/// add one `SeedPeerPin` row per seed address after live-key verification.
-pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[];
+/// Compiled-in seed PeerId pins (issue #1112), filled 23 Oct 2026 from
+/// live-verified production keys: 22 of the 24 seed addresses. Per-row
+/// provenance: 16 ids from a fresh ephemeral handshake probe on 22 Oct
+/// (ant-quic 0.27.61, `peer_connected`), 6 from a live direct session on
+/// a production daemon at that exact address (22–23 Oct); the six
+/// `:5483` ids also match the April 2026 v0.19.0 sustained-watch
+/// captures, so they have been stable for six months. Two addresses —
+/// `65.21.157.229:443` and `116.203.101.172:5483` (the Hetzner IPv4
+/// rows) — are deliberately NOT pinned: their PeerIds rest on the local
+/// bootstrap cache only, and fresh handshake probes to the Hetzner hosts
+/// time out from this network (22–23 Oct), so those rows keep
+/// trust-on-first-use until a handshake at that exact address verifies
+/// them. A row's set carries more than one id only across a key rotation
+/// (the overlap window); the rotation policy lives in
+/// `docs/trust-and-connectivity.md`.
+// One identity per host LISTENER: the :443 and :5483 instances on a host
+// hold separate machine keys, while the IPv4 and IPv6 addresses of the
+// same listener answer with the same PeerId.
+const SEED_ID_NYC_443: [u8; 32] = [
+    0x57, 0x55, 0x30, 0x26, 0xdb, 0x95, 0x18, 0xeb, 0xfd, 0x4e, 0x07, 0x73, 0x6b, 0x94, 0x7a, 0x12,
+    0x61, 0x72, 0xd6, 0xf2, 0x0e, 0xda, 0xf3, 0xdb, 0xe3, 0x79, 0xf6, 0x7f, 0xdf, 0x67, 0xc4, 0x22,
+];
+const SEED_ID_SFO_443: [u8; 32] = [
+    0xd5, 0x2e, 0x23, 0xd0, 0xae, 0x49, 0x42, 0xd3, 0x9c, 0x14, 0xb4, 0x6d, 0x50, 0x80, 0x23, 0x1e,
+    0x5f, 0x84, 0xfb, 0x08, 0x9d, 0x40, 0xb8, 0xc1, 0x86, 0xd8, 0x21, 0xf2, 0x3f, 0x9d, 0x6c, 0xe3,
+];
+const SEED_ID_SGP_443: [u8; 32] = [
+    0x3d, 0x51, 0x59, 0x50, 0xad, 0x61, 0x0e, 0xfe, 0x75, 0xfa, 0x3f, 0x79, 0x14, 0x62, 0x92, 0x65,
+    0x55, 0x36, 0xd7, 0x08, 0xe7, 0xd5, 0x2b, 0x78, 0xc9, 0x50, 0x74, 0xa7, 0x4e, 0x7b, 0xc5, 0x68,
+];
+const SEED_ID_SYD_443: [u8; 32] = [
+    0xcd, 0x5b, 0xad, 0xfb, 0x86, 0xc1, 0xed, 0xd0, 0xbe, 0xb6, 0x63, 0x0a, 0xe4, 0x12, 0x8c, 0x96,
+    0xff, 0x5b, 0x1c, 0x23, 0x65, 0x9f, 0xd8, 0xb3, 0xd2, 0x1c, 0x48, 0xf0, 0x27, 0x3a, 0x91, 0x73,
+];
+const SEED_ID_HEL_443: [u8; 32] = [
+    0x61, 0xbd, 0x01, 0xaa, 0x5a, 0xec, 0xd5, 0x09, 0x1d, 0x53, 0xa8, 0x3e, 0xac, 0x41, 0xc5, 0xf0,
+    0xc8, 0x74, 0x96, 0xf1, 0xc9, 0x00, 0x7c, 0x11, 0x98, 0x0e, 0x56, 0xfc, 0xa7, 0x1f, 0x6b, 0x2d,
+];
+const SEED_ID_NUR_443: [u8; 32] = [
+    0x9b, 0xd7, 0xa4, 0xd5, 0xd3, 0x90, 0x62, 0x1b, 0xc9, 0x7f, 0x83, 0x62, 0x71, 0xef, 0x67, 0x76,
+    0x3b, 0xef, 0x3d, 0xc0, 0x83, 0x4e, 0x6e, 0x88, 0xb3, 0x80, 0xf4, 0xc7, 0x6e, 0xe4, 0x68, 0x52,
+];
+const SEED_ID_NYC_5483: [u8; 32] = [
+    0x0b, 0x7b, 0xb5, 0xa3, 0xb9, 0x95, 0x1f, 0x8a, 0x63, 0x01, 0xbe, 0xbc, 0xc4, 0x99, 0xb1, 0xac,
+    0x2d, 0xbd, 0x93, 0xd1, 0x18, 0x5b, 0xf1, 0x9b, 0xc1, 0x09, 0x06, 0x61, 0x45, 0x38, 0x0c, 0x5c,
+];
+const SEED_ID_SFO_5483: [u8; 32] = [
+    0xdc, 0x09, 0x0f, 0xd3, 0xd0, 0x58, 0x88, 0xa3, 0xb6, 0x22, 0x8c, 0xdf, 0xce, 0x54, 0x83, 0x0d,
+    0x41, 0x40, 0xe5, 0x33, 0x22, 0x48, 0x08, 0x7c, 0x9b, 0x04, 0x28, 0x41, 0x61, 0x61, 0x9b, 0x31,
+];
+const SEED_ID_SGP_5483: [u8; 32] = [
+    0xbc, 0xf4, 0x3d, 0xc0, 0x2a, 0x77, 0xa0, 0x58, 0x77, 0x77, 0xd4, 0x5f, 0xb0, 0x31, 0x4e, 0xa4,
+    0x06, 0x00, 0x82, 0x00, 0x8d, 0x5a, 0x1d, 0xf4, 0x76, 0x05, 0xd0, 0x35, 0x7c, 0x76, 0x5a, 0xdc,
+];
+const SEED_ID_SYD_5483: [u8; 32] = [
+    0xb7, 0xa2, 0x3e, 0x48, 0xaa, 0xe4, 0x60, 0x82, 0xf9, 0xc9, 0x52, 0xde, 0x2f, 0x22, 0x5c, 0x7c,
+    0x4b, 0xaf, 0xee, 0xe5, 0x0f, 0xea, 0x88, 0xef, 0x50, 0xc5, 0x1b, 0xd0, 0xa6, 0xc4, 0x7c, 0xe8,
+];
+const SEED_ID_HEL_5483: [u8; 32] = [
+    0x16, 0xf0, 0xbf, 0x03, 0x37, 0xc6, 0x34, 0xed, 0xfd, 0xcf, 0x8a, 0xad, 0xcd, 0xd5, 0x96, 0x8d,
+    0x2d, 0x33, 0xab, 0xbf, 0x0a, 0xc2, 0xa4, 0x7c, 0x34, 0x67, 0x10, 0x61, 0x64, 0xe2, 0xd2, 0x2c,
+];
+const SEED_ID_NUR_5483: [u8; 32] = [
+    0x6a, 0x24, 0xbd, 0xed, 0xdd, 0x82, 0x8e, 0x1e, 0x85, 0x9b, 0x63, 0xd7, 0x2f, 0x0d, 0xae, 0x63,
+    0x55, 0x57, 0xc5, 0xf2, 0x12, 0x07, 0xb4, 0xba, 0xc5, 0xf2, 0x4a, 0xa3, 0xed, 0x54, 0x37, 0x6e,
+];
+pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[
+    // ── UDP/443, IPv4 ──
+    SeedPeerPin {
+        addr: "142.93.199.50:443",
+        expected_peer_ids: &[&SEED_ID_NYC_443],
+    },
+    SeedPeerPin {
+        addr: "147.182.234.192:443",
+        expected_peer_ids: &[&SEED_ID_SFO_443],
+    },
+    // 65.21.157.229:443 (Helsinki, IPv4): cache-only PeerId — no handshake
+    // at this exact address yet (probes time out); stays TOFU until one.
+    SeedPeerPin {
+        addr: "116.203.101.172:443",
+        expected_peer_ids: &[&SEED_ID_NUR_443],
+    },
+    SeedPeerPin {
+        addr: "152.42.210.67:443",
+        expected_peer_ids: &[&SEED_ID_SGP_443],
+    },
+    SeedPeerPin {
+        addr: "170.64.176.102:443",
+        expected_peer_ids: &[&SEED_ID_SYD_443],
+    },
+    // ── UDP/443, IPv6 ──
+    SeedPeerPin {
+        addr: "[2604:a880:400:d1:0:3:7db3:f001]:443",
+        expected_peer_ids: &[&SEED_ID_NYC_443],
+    },
+    SeedPeerPin {
+        addr: "[2604:a880:4:1d0:0:1:6ba1:f000]:443",
+        expected_peer_ids: &[&SEED_ID_SFO_443],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f9:c012:684b::1]:443",
+        expected_peer_ids: &[&SEED_ID_HEL_443],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f8:1c1a:31e6::1]:443",
+        expected_peer_ids: &[&SEED_ID_NUR_443],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:0:d2:0:2:d30b:d000]:443",
+        expected_peer_ids: &[&SEED_ID_SGP_443],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:10:200::ba69:b000]:443",
+        expected_peer_ids: &[&SEED_ID_SYD_443],
+    },
+    // ── UDP/5483, IPv4 ──
+    SeedPeerPin {
+        addr: "142.93.199.50:5483",
+        expected_peer_ids: &[&SEED_ID_NYC_5483],
+    },
+    SeedPeerPin {
+        addr: "147.182.234.192:5483",
+        expected_peer_ids: &[&SEED_ID_SFO_5483],
+    },
+    SeedPeerPin {
+        addr: "65.21.157.229:5483",
+        expected_peer_ids: &[&SEED_ID_HEL_5483],
+    },
+    // 116.203.101.172:5483 (Nuremberg, IPv4): cache-only PeerId — no
+    // handshake at this exact address yet; stays TOFU until one.
+    SeedPeerPin {
+        addr: "152.42.210.67:5483",
+        expected_peer_ids: &[&SEED_ID_SGP_5483],
+    },
+    SeedPeerPin {
+        addr: "170.64.176.102:5483",
+        expected_peer_ids: &[&SEED_ID_SYD_5483],
+    },
+    // ── UDP/5483, IPv6 ──
+    SeedPeerPin {
+        addr: "[2604:a880:400:d1:0:3:7db3:f001]:5483",
+        expected_peer_ids: &[&SEED_ID_NYC_5483],
+    },
+    SeedPeerPin {
+        addr: "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",
+        expected_peer_ids: &[&SEED_ID_SFO_5483],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f9:c012:684b::1]:5483",
+        expected_peer_ids: &[&SEED_ID_HEL_5483],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f8:1c1a:31e6::1]:5483",
+        expected_peer_ids: &[&SEED_ID_NUR_5483],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:0:d2:0:2:d30b:d000]:5483",
+        expected_peer_ids: &[&SEED_ID_SGP_5483],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:10:200::ba69:b000]:5483",
+        expected_peer_ids: &[&SEED_ID_SYD_5483],
+    },
+];
 
 /// How long a seed-pin mismatch refuses its address (issue #1112): a
 /// scoped, bounded, expiring backoff — never a process-lifetime
@@ -11114,13 +11272,46 @@ mod tests {
             "[2400:6180:10:200::ba69:b000]:5483",
         ];
         assert_eq!(DEFAULT_BOOTSTRAP_PEERS, EXPECTED);
-        // No production PeerId is pinned yet: the repo's only captures are
-        // six months stale (see docs/trust-and-connectivity.md). Unpinned
-        // rows keep trust-on-first-use, exactly as before #1112.
-        assert!(
-            SEED_PEER_ID_PINS.is_empty(),
-            "production pins must be a deliberate operator change"
-        );
+    }
+
+    #[test]
+    fn issue1112_every_pinned_seed_address_has_exactly_one_pin() {
+        // #1112: the pin table is filled per address. Every pinned row
+        // must name a real seed address (byte-identical to its
+        // DEFAULT_BOOTSTRAP_PEERS entry), a pinned address must appear in
+        // exactly ONE row — a second row would be a silent override, not
+        // an error — and a row must pin at least one PeerId (an empty set
+        // is the unpinned/TOFU state and has no business in the table).
+        for pin in SEED_PEER_ID_PINS {
+            assert!(
+                DEFAULT_BOOTSTRAP_PEERS.contains(&pin.addr),
+                "pin row '{}' is not a DEFAULT_BOOTSTRAP_PEERS address",
+                pin.addr
+            );
+            assert!(
+                !pin.expected_peer_ids.is_empty(),
+                "pin row '{}' pins no PeerId; remove the row to keep TOFU",
+                pin.addr
+            );
+            let rows = SEED_PEER_ID_PINS
+                .iter()
+                .filter(|other| other.addr == pin.addr)
+                .count();
+            assert_eq!(
+                rows, 1,
+                "pin row '{}' must be the only row for that address",
+                pin.addr
+            );
+            let mut ids = pin.expected_peer_ids.iter().collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                pin.expected_peer_ids.len(),
+                "pin row '{}' lists a PeerId twice",
+                pin.addr
+            );
+        }
     }
 
     #[test]
@@ -11189,9 +11380,14 @@ mod tests {
             pinned_peer_ids_in(&table, "198.51.100.10:5483".parse().unwrap()),
             &NO_PINS[..]
         );
-        // The production table ships unpinned (see the list-content test).
+        // The compiled-in table's live state: the first seed is pinned,
+        // and the two cache-only Hetzner IPv4 rows stay TOFU until a
+        // handshake at that exact address verifies them (see the pins
+        // content test).
         let first_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
-        assert!(pinned_seed_peer_ids(first_seed).is_empty());
+        assert!(!pinned_seed_peer_ids(first_seed).is_empty());
+        assert!(pinned_seed_peer_ids("65.21.157.229:443".parse().unwrap()).is_empty());
+        assert!(pinned_seed_peer_ids("116.203.101.172:5483".parse().unwrap()).is_empty());
         // Review round 2: v4-mapped and plain forms of the same address
         // resolve to the same pin row.
         let table = [SeedPeerPin {
@@ -11255,11 +11451,18 @@ mod tests {
             ),
             SeedPinVerdict::Match(_)
         ));
-        // The compiled-in table is empty: every production dial is TOFU
-        // today (the seam and the selector turn on together with the
-        // first pin).
-        let any_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
-        assert_eq!(seed_pin_gate(any_seed, OTHER), SeedPinVerdict::Unpinned);
+        // The compiled-in table is live: at a pinned seed a non-member
+        // identity is a mismatch, and the two cache-only Hetzner IPv4
+        // rows are still TOFU (see the pins content test).
+        let pinned_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
+        assert!(matches!(
+            seed_pin_gate(pinned_seed, OTHER),
+            SeedPinVerdict::Mismatch { .. }
+        ));
+        assert_eq!(
+            seed_pin_gate("65.21.157.229:443".parse().unwrap(), OTHER),
+            SeedPinVerdict::Unpinned
+        );
     }
 
     #[test]
