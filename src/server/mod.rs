@@ -1282,6 +1282,7 @@ pub async fn serve_with_options(
         treekem_pending_events: RwLock::new(HashMap::new()),
         parked_role_updates: StdMutex::new(HashMap::new()),
         parked_gss_removals: StdMutex::new(HashMap::new()),
+        gss_share_holds: crate::server::routes::named_groups::GssShareHolds::default(),
         join_result_staging_guards: StdMutex::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),

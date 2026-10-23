@@ -1088,6 +1088,11 @@ pub(super) struct AppState {
     /// until the `SecureShareDelivered` share installs; the share replays
     /// them. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
     pub(super) parked_gss_removals: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
+    /// #1573 (#1508/#1533 rc13): the durable side of the GSS share hold.
+    /// Parked removals above and held crypto-only exclusions are written to
+    /// `gss-share-holds/` and loaded again at restart, so no time limit or
+    /// restart resumes sealing under the removed member's secret.
+    pub(in crate::server) gss_share_holds: crate::server::routes::named_groups::GssShareHolds,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by

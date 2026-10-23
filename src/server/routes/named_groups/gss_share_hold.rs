@@ -1,0 +1,450 @@
+//! #1573 (ADR 0110 §3, #1508/#1533 rc13): the durable GSS share hold.
+//!
+//! A survivor that verified a GSS removal, ban or crypto-only exclusion
+//! keeps the old group secret until the new epoch's sealed share arrives.
+//! The removed member holds that old secret, so the survivor makes no new
+//! group ciphertext while the transition waits
+//! ([`super::GroupCiphertextHold::PendingGssRemoval`]).
+//!
+//! The hold has no time limit, and it survives a restart. Each waiting
+//! transition is written to `gss-share-holds/<blake3(group key)>.json`
+//! (0600, parent directory synced) when it parks. A restarted node loads
+//! the files before its first ciphertext check, so it does not seal under
+//! the old secret again. The hold ends when the node holds the new epoch's
+//! secret (the share installed) or when the head moves away from the
+//! parent that the transition chains from. The file then drops the entry.
+//!
+//! Only transitions whose signed commit the apply verified are written, so
+//! a forged removal holds nothing. The file is local state only: it is not
+//! a wire format and not an API.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex as StdMutex;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use crate as x0x;
+use crate::identity::AgentId;
+use crate::server::state::AppState;
+
+use super::{
+    named_group_metadata_event_commit, LogHexId, NamedGroupMetadataEvent, ParkedRoleUpdate,
+};
+
+const HOLD_DIR: &str = "gss-share-holds";
+
+/// The in-memory side of the durable holds. Removals and bans live in
+/// [`AppState::parked_gss_removals`] (the share replays them); this keeps
+/// the crypto-only exclusions and the load state.
+#[derive(Debug, Default)]
+pub(in crate::server) struct GssShareHolds {
+    /// `true` once the files are loaded in this process.
+    loaded: tokio::sync::Mutex<bool>,
+    /// One writer at a time, so an older snapshot never replaces a newer
+    /// file.
+    write: tokio::sync::Mutex<()>,
+    exclusions: StdMutex<HashMap<String, Vec<ExclusionHold>>>,
+}
+
+/// A verified GSS crypto-only exclusion that waits for its share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExclusionHold {
+    /// The head the exclusion chains from.
+    parent_state_hash: String,
+    /// The secret epoch the exclusion rotates to.
+    secret_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeldRemoval {
+    event: NamedGroupMetadataEvent,
+    /// The hex agent id of the sender, for the replay.
+    sender: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct HoldFile {
+    group_key: String,
+    #[serde(default)]
+    removals: Vec<HeldRemoval>,
+    #[serde(default)]
+    exclusions: Vec<ExclusionHold>,
+}
+
+fn hold_dir(state: &AppState) -> PathBuf {
+    state.data_dir.join(HOLD_DIR)
+}
+
+fn hold_path(state: &AppState, group_key: &str) -> PathBuf {
+    let name = blake3::hash(group_key.as_bytes()).to_hex().to_string();
+    hold_dir(state).join(format!("{name}.json"))
+}
+
+fn removal_epoch(event: &NamedGroupMetadataEvent) -> Option<u64> {
+    match event {
+        NamedGroupMetadataEvent::MemberRemoved { secret_epoch, .. }
+        | NamedGroupMetadataEvent::MemberBanned { secret_epoch, .. } => *secret_epoch,
+        _ => None,
+    }
+}
+
+/// Whether a held transition from `parent` to `epoch` still holds `info`:
+/// the head did not move and this node does not hold that epoch's secret.
+fn holds(info: &x0x::groups::GroupInfo, parent: Option<&str>, epoch: Option<u64>) -> bool {
+    epoch.is_some_and(|epoch| epoch > info.secret_epoch) && parent == Some(info.state_hash.as_str())
+}
+
+/// Whether a parked removal or ban, or a held crypto-only exclusion, still
+/// holds new ciphertext for `group_key`. There is no time limit: only the
+/// share or a moved head ends a hold. Call [`ensure_loaded`] first.
+pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) -> bool {
+    let removal = state
+        .parked_gss_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .is_some_and(|list| {
+            list.iter().any(|entry| {
+                holds(
+                    info,
+                    named_group_metadata_event_commit(&entry.event)
+                        .and_then(|commit| commit.prev_state_hash.as_deref()),
+                    removal_epoch(&entry.event),
+                )
+            })
+        });
+    removal
+        || state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_key)
+            .is_some_and(|list| {
+                list.iter().any(|hold| {
+                    holds(
+                        info,
+                        Some(hold.parent_state_hash.as_str()),
+                        Some(hold.secret_epoch),
+                    )
+                })
+            })
+}
+
+/// Load the durable holds once per process, before the first ciphertext
+/// check, park or replay. A file that cannot be read stays on disk and is
+/// logged; it is never replaced by a write.
+pub(super) async fn ensure_loaded(state: &AppState) {
+    let mut loaded = state.gss_share_holds.loaded.lock().await;
+    if *loaded {
+        return;
+    }
+    let dir = hold_dir(state);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            *loaded = true;
+            return;
+        }
+        Err(error) => {
+            // Not loaded: the next check tries again.
+            tracing::error!(
+                "#1573 GSS share holds not read from {}: {error}",
+                dir.display()
+            );
+            return;
+        }
+    };
+    let mut files = Vec::new();
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => files.push(entry.path()),
+            Ok(None) => break,
+            Err(error) => {
+                tracing::error!(
+                    "#1573 GSS share holds not listed in {}: {error}",
+                    dir.display()
+                );
+                return;
+            }
+        }
+    }
+    for path in files {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let file = match tokio::fs::read(&path)
+            .await
+            .map(|bytes| serde_json::from_slice::<HoldFile>(&bytes))
+        {
+            Ok(Ok(file)) => file,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    "#1573 GSS share hold {} is not readable: {error}",
+                    path.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::error!("#1573 GSS share hold {} not read: {error}", path.display());
+                return;
+            }
+        };
+        absorb(state, file);
+    }
+    *loaded = true;
+}
+
+fn absorb(state: &AppState, file: HoldFile) {
+    if !file.removals.is_empty() {
+        let mut lot = state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let list = lot.entry(file.group_key.clone()).or_default();
+        for held in file.removals {
+            let Some(sender) = hex::decode(&held.sender)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            else {
+                continue;
+            };
+            let hash = named_group_metadata_event_commit(&held.event)
+                .map(|commit| commit.state_hash.clone());
+            if list.iter().any(|entry| {
+                named_group_metadata_event_commit(&entry.event)
+                    .map(|commit| commit.state_hash.clone())
+                    == hash
+            }) {
+                continue;
+            }
+            list.push(ParkedRoleUpdate {
+                event: held.event,
+                sender: AgentId(sender),
+                parked_at: Instant::now(),
+            });
+        }
+    }
+    if !file.exclusions.is_empty() {
+        let mut lot = state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let list = lot.entry(file.group_key).or_default();
+        for hold in file.exclusions {
+            if !list.contains(&hold) {
+                list.push(hold);
+            }
+        }
+    }
+}
+
+/// Write the group's holds as memory holds them now (or remove the file
+/// when none is left).
+pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Result<()> {
+    ensure_loaded(state).await;
+    let _writer = state.gss_share_holds.write.lock().await;
+    let removals: Vec<HeldRemoval> = state
+        .parked_gss_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .map(|list| {
+            list.iter()
+                .map(|entry| HeldRemoval {
+                    event: entry.event.clone(),
+                    sender: hex::encode(entry.sender.0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let exclusions = state
+        .gss_share_holds
+        .exclusions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .cloned()
+        .unwrap_or_default();
+    let path = hold_path(state, group_key);
+    if removals.is_empty() && exclusions.is_empty() {
+        return match tokio::fs::remove_file(&path).await {
+            Ok(()) => super::sync_parent_dir_for_path(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+    }
+    let file = HoldFile {
+        group_key: group_key.to_string(),
+        removals,
+        exclusions,
+    };
+    let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    crate::storage::save_private_bytes_to(&path, bytes)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    super::sync_parent_dir_for_path(&path)
+}
+
+/// Log a failed write. Memory still holds the transition, so this process
+/// keeps withholding; only a restart before the next good write loses it.
+pub(super) async fn persist_logged(state: &AppState, group_key: &str) {
+    if let Err(error) = persist(state, group_key).await {
+        tracing::error!(
+            group_id = %LogHexId::group(group_key),
+            "#1573 GSS share hold not saved; sends stay withheld in this process: {error}"
+        );
+    }
+}
+
+/// A verified GSS crypto-only exclusion from `parent_state_hash` waits
+/// for the share of `secret_epoch`: hold new ciphertext until it installs.
+pub(super) async fn hold_exclusion(
+    state: &AppState,
+    group_key: &str,
+    parent_state_hash: &str,
+    secret_epoch: u64,
+) {
+    ensure_loaded(state).await;
+    let added = {
+        let mut lot = state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let list = lot.entry(group_key.to_string()).or_default();
+        let hold = ExclusionHold {
+            parent_state_hash: parent_state_hash.to_string(),
+            secret_epoch,
+        };
+        if list.contains(&hold) {
+            false
+        } else {
+            while list.len() >= super::PARKED_ROLE_UPDATE_CAP {
+                list.remove(0);
+            }
+            list.push(hold);
+            true
+        }
+    };
+    if added {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// The exclusion installed with its secret at `secret_epoch`: its hold,
+/// and every older one, ends.
+pub(super) async fn release_exclusions(state: &AppState, group_key: &str, secret_epoch: u64) {
+    ensure_loaded(state).await;
+    let removed = {
+        let mut lot = state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(list) = lot.get_mut(group_key) else {
+            return;
+        };
+        let before = list.len();
+        list.retain(|hold| hold.secret_epoch > secret_epoch);
+        let removed = list.len() != before;
+        if list.is_empty() {
+            lot.remove(group_key);
+        }
+        removed
+    };
+    if removed {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// The group is gone from this node: drop its holds and their files.
+pub(super) async fn forget_group<'a>(
+    state: &AppState,
+    aliases: impl IntoIterator<Item = &'a String> + Clone,
+) {
+    ensure_loaded(state).await;
+    let _writer = state.gss_share_holds.write.lock().await;
+    {
+        let mut lot = state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for alias in aliases.clone() {
+            lot.remove(alias);
+        }
+    }
+    {
+        let mut lot = state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for alias in aliases.clone() {
+            lot.remove(alias);
+        }
+    }
+    for alias in aliases {
+        let path = hold_path(state, alias);
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            let _ = super::sync_parent_dir_for_path(&path);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::server) mod test_seam {
+    use super::*;
+
+    /// A restart: memory loses every parked removal and held exclusion,
+    /// and the next check loads the files again.
+    pub(in crate::server) async fn simulate_restart(state: &AppState) {
+        state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *state.gss_share_holds.loaded.lock().await = false;
+    }
+
+    /// Age every parked removal past the old ten-minute limit.
+    pub(in crate::server) fn age_parked_removals(state: &AppState, by: std::time::Duration) {
+        let mut lot = state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for list in lot.values_mut() {
+            for entry in list.iter_mut() {
+                if let Some(earlier) = entry.parked_at.checked_sub(by) {
+                    entry.parked_at = earlier;
+                }
+            }
+        }
+    }
+
+    pub(in crate::server) fn held_exclusions(state: &AppState, group_key: &str) -> usize {
+        state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_key)
+            .map_or(0, Vec::len)
+    }
+
+    pub(in crate::server) fn hold_file_exists(state: &AppState, group_key: &str) -> bool {
+        hold_path(state, group_key).exists()
+    }
+}
