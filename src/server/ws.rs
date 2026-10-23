@@ -2283,16 +2283,9 @@ async fn handle_ws_command(
                     return;
                 }
             };
-            if aid == state.agent.agent_id() {
-                // Local Stop writes the data-dir marker and turns show off
-                // in memory. There is no success frame. A marker write
-                // failure uses the existing error frame. Show stays off.
-                if let Err(message) = state.gui_show.disable_local_show() {
-                    feed_droppable(tx, WsOutbound::Error { message }, stats);
-                }
-                return;
+            if let Err(message) = super::routes::gui_show::apply_gui_block(state, aid) {
+                feed_droppable(tx, WsOutbound::Error { message }, stats);
             }
-            state.gui_show.block_agent(&aid);
         }
 
         WsInbound::GuiVisible { visible } => {

@@ -19,10 +19,14 @@
 //! After admission, a rider show uses that token's `sub_agent_id` for the
 //! block list, the rate limit, the origin banner, and the outgoing
 //! `subject`. The ADR 0050 envelope stays signed by this daemon, because
-//! the daemon does not hold the sub-agent secret. The target attributes
-//! that subject. Stop then blocks that rider, or turns local show off only
-//! when the sender is this daemon. A rider banner names `gui_show_blocked.json`
-//! and a daemon restart. A local banner names `gui_show_local_disabled`.
+//! the daemon does not hold the sub-agent secret. The target names that
+//! subject on the banner. It refuses the show when this daemon's agent is
+//! in `gui_show_blocked`, and it rate-limits this daemon as well as the
+//! subject. Stop on the target writes this daemon's agent, not a subject
+//! this daemon chose. A local Stop still blocks that rider, or turns local
+//! show off only when the sender is this daemon. A rider banner names
+//! `gui_show_blocked.json` and a daemon restart. A local banner names
+//! `gui_show_local_disabled`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -333,7 +337,8 @@ async fn display_show(
 /// stored on the frame. Names in the banner are resolved on this machine.
 pub(crate) async fn deliver_remote_show(
     state: &AppState,
-    sender: AgentId,
+    subject: AgentId,
+    envelope: AgentId,
     sender_machine: MachineId,
     view: &str,
     via_rider: bool,
@@ -343,18 +348,39 @@ pub(crate) async fn deliver_remote_show(
         Ok(route) => route,
         Err(_) => return GuiShowOutcome::InvalidView,
     };
-    let (banner, rider) = remote_show_banner(state, &sender, &sender_machine, via_rider).await;
+    let (banner, rider) =
+        remote_show_banner(state, &subject, &envelope, &sender_machine, via_rider).await;
+    // Stop writes the envelope signer for a rider show. The named subject
+    // stays off the block list, so a forged subject keeps its direct shows.
+    let stop_agent = if via_rider { envelope } else { subject };
+    if via_rider {
+        state.gui_show.note_rider_presentation(&envelope, &subject);
+    }
     let machine_hex = hex::encode(sender_machine.as_bytes());
     display_show(
         state,
         parsed.as_route(),
         banner,
-        hex::encode(sender.as_bytes()),
+        hex::encode(stop_agent.as_bytes()),
         &machine_hex,
         rider,
         request_id,
     )
     .await
+}
+
+/// `gui.block` for one agent id.
+///
+/// This daemon's agent turns local show off. Any other id is written to
+/// `gui_show_blocked`. When that id is an envelope signer, Stop also records
+/// each `(signer, subject)` pair and does not add the subject.
+pub(crate) fn apply_gui_block(state: &AppState, aid: AgentId) -> Result<(), String> {
+    if aid == state.agent.agent_id() {
+        return state.gui_show.disable_local_show();
+    }
+    state.gui_show.record_rider_stop(&aid);
+    state.gui_show.block_agent(&aid);
+    Ok(())
 }
 
 /// Banner text for one inbound remote show.
@@ -364,29 +390,60 @@ pub(crate) async fn deliver_remote_show(
 /// not use the word rider.
 async fn remote_show_banner(
     state: &AppState,
-    sender: &AgentId,
+    subject: &AgentId,
+    envelope: &AgentId,
     sender_machine: &MachineId,
     via_rider: bool,
 ) -> (String, bool) {
-    let sender_hex = hex::encode(sender.as_bytes());
+    let subject_hex = hex::encode(subject.as_bytes());
     let machine_hex = hex::encode(sender_machine.as_bytes());
     if via_rider {
-        let machine_label = short_id_hex(&machine_hex);
-        return (
-            origin_banner(&short_id_hex(&sender_hex), &machine_label, true),
-            true,
-        );
+        let agent_label = local_agent_label(state, subject)
+            .await
+            .unwrap_or_else(|| short_id_hex(&subject_hex));
+        let machine_label = local_machine_label(state, sender_machine)
+            .await
+            .unwrap_or_else(|| short_id_hex(&machine_hex));
+        let mut banner = origin_banner(&agent_label, &machine_label, true);
+        let signer_short = short_id_hex(&hex::encode(envelope.as_bytes()));
+        banner.push_str(&format!(
+            " Stop writes {signer_short} to gui_show_blocked.json."
+        ));
+        return (banner, true);
     }
-    if *sender == state.agent.agent_id() {
-        let (agent_label, machine_label) = resolve_banner_labels(state, &sender_hex, false).await;
+    if *subject == state.agent.agent_id() {
+        let (agent_label, machine_label) = resolve_banner_labels(state, &subject_hex, false).await;
         return (origin_banner(&agent_label, &machine_label, false), false);
     }
     let banner = format!(
         "Opened by {} on {}. {REMOTE_SHOW_REENABLE}",
-        short_id_hex(&sender_hex),
+        short_id_hex(&subject_hex),
         short_id_hex(&machine_hex)
     );
     (banner, false)
+}
+
+/// Contact label for `agent`, when this machine has one.
+async fn local_agent_label(state: &AppState, agent: &AgentId) -> Option<String> {
+    let contacts = state.agent.contacts().read().await;
+    contacts
+        .get(agent)
+        .and_then(|contact| contact.label.clone())
+        .filter(|label| !label.is_empty())
+}
+
+/// Contact machine label for `machine`, when this machine has one.
+async fn local_machine_label(state: &AppState, machine: &MachineId) -> Option<String> {
+    let contacts = state.agent.contacts().read().await;
+    contacts.list().into_iter().find_map(|contact| {
+        contact.machines.iter().find_map(|record| {
+            if record.machine_id == *machine {
+                record.label.clone().filter(|label| !label.is_empty())
+            } else {
+                None
+            }
+        })
+    })
 }
 
 /// Originator path once `target_machine` is present and non-empty.
@@ -554,7 +611,7 @@ async fn show_active(
     let deadline = tokio::time::Instant::now() + RESULT_WAIT;
     let mut prepared = Vec::new();
     for machine in enrolled_remote_machines(state, &local_machine).await {
-        let Some(agent) = activity_peer(state, &machine).await else {
+        let Some(agent) = show_peer(state, &machine).await else {
             candidates.push(quiet_candidate(machine.0));
             continue;
         };
@@ -698,30 +755,11 @@ async fn agents_on_machine(state: &AppState, machine: &MachineId) -> Vec<AgentId
 
 /// Enrolled machine with an authenticated binding that advertises `gui_show_v1`.
 ///
-/// A direct QUIC connection is not required. ADR 0050 delivers the query
-/// over gossip. A missing bit leaves the machine in the candidate list
-/// with no timestamp. A connected agent is preferred when several qualify.
-async fn activity_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
-    let agents = agents_on_machine(state, machine).await;
-    let mut offline = None;
-    for agent in agents {
-        if !agent_can_show(state, &agent) {
-            continue;
-        }
-        if state.agent.is_agent_connected(&agent).await {
-            return Some(agent);
-        }
-        if offline.is_none() {
-            offline = Some(agent);
-        }
-    }
-    offline
-}
-
-/// Agent on `machine` whose verified advert allows a show.
-///
-/// Prefers a connected agent. An offline agent with the bit is still
-/// returned so the send can time out as `unconfirmed`.
+/// Activity queries and show sends use this lookup. A direct QUIC connection
+/// is not required. ADR 0050 delivers the query over gossip. A missing bit
+/// leaves the machine in the candidate list with no timestamp. A connected
+/// agent is preferred when several qualify. An offline agent with the bit
+/// is still returned so the send can time out as `unconfirmed`.
 async fn show_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
     let agents = agents_on_machine(state, machine).await;
     let mut offline = None;
@@ -869,15 +907,8 @@ async fn send_gui_dm(
     payload: Vec<u8>,
     logical_request_id: [u8; 16],
 ) -> Result<(), crate::dm::DmError> {
-    #[cfg(test)]
-    if state.gui_show.send_stalled_for_test() {
-        // Longer than `RESULT_WAIT`. The caller must bound this wait.
-        // The stall never reaches the network.
-        tokio::time::sleep(crate::gui::remote::RESULT_WAIT + std::time::Duration::from_secs(30))
-            .await;
-        return Err(crate::dm::DmError::RecipientUndiscovered(
-            "gui show test stall".to_string(),
-        ));
+    if let Some(result) = state.gui_show.invoke_send_hook().await {
+        return result;
     }
     let config = crate::dm::DmSendConfig {
         max_retries: 0,
@@ -2310,7 +2341,7 @@ mod tests {
             .record_authenticated_binding_for_testing(agent, machine, now)
             .await;
         assert_eq!(
-            activity_peer(&state, &machine).await,
+            show_peer(&state, &machine).await,
             Some(agent),
             "an authenticated binding is queried without a direct connection"
         );
@@ -2410,7 +2441,7 @@ mod tests {
             .record_authenticated_binding_for_testing(agent, real, now.saturating_add(1))
             .await;
         assert_eq!(
-            activity_peer(&state, &real).await,
+            show_peer(&state, &real).await,
             Some(agent),
             "the authenticated machine stays the show target"
         );
@@ -2477,6 +2508,7 @@ mod tests {
         let outcome = deliver_remote_show(
             &state,
             sender,
+            sender,
             machine,
             "https://evil.example",
             false,
@@ -2486,8 +2518,16 @@ mod tests {
         assert_eq!(outcome, GuiShowOutcome::InvalidView);
         assert!(cap.urls.lock().unwrap().is_empty());
 
-        let outcome =
-            deliver_remote_show(&state, sender, machine, "people", false, &request_id).await;
+        let outcome = deliver_remote_show(
+            &state,
+            sender,
+            sender,
+            machine,
+            "people",
+            false,
+            &request_id,
+        )
+        .await;
         assert_eq!(outcome, GuiShowOutcome::Opened);
         let token = {
             let urls = cap.urls.lock().unwrap();
@@ -2507,8 +2547,16 @@ mod tests {
         assert!(!pending.banner.contains("http"));
         assert!(!pending.rider);
 
-        let rider_outcome =
-            deliver_remote_show(&state, sender, machine, "network", true, &request_id).await;
+        let rider_outcome = deliver_remote_show(
+            &state,
+            sender,
+            sender,
+            machine,
+            "network",
+            true,
+            &request_id,
+        )
+        .await;
         assert_eq!(rider_outcome, GuiShowOutcome::Opened);
         let token = {
             let urls = cap.urls.lock().unwrap();
@@ -2526,6 +2574,7 @@ mod tests {
         let local_machine = state.agent.machine_id();
         let local_outcome = deliver_remote_show(
             &state,
+            daemon,
             daemon,
             local_machine,
             "settings",
@@ -2546,6 +2595,91 @@ mod tests {
         assert!(!pending.banner.contains("gui_show_blocked.json"));
         assert!(!pending.rider);
         Ok(())
+    }
+
+    /// A local contact label replaces the short id. A missing label falls back.
+    #[tokio::test]
+    async fn rider_banner_uses_a_contact_label_or_the_short_id() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let subject = AgentId([0x41; 32]);
+        let envelope = AgentId([0x42; 32]);
+        let machine = MachineId([0x43; 32]);
+        state
+            .agent
+            .contacts()
+            .write()
+            .await
+            .add(crate::contacts::Contact {
+                agent_id: subject,
+                trust_level: crate::contacts::TrustLevel::Known,
+                label: Some("Ada".to_string()),
+                added_at: 1,
+                last_seen: None,
+                identity_type: crate::contacts::IdentityType::Known,
+                machines: vec![crate::contacts::MachineRecord::new(
+                    machine,
+                    Some("studio".to_string()),
+                )],
+                dm_capabilities: None,
+            });
+        let named = deliver_remote_show(
+            &state,
+            subject,
+            envelope,
+            machine,
+            "people",
+            true,
+            &"cd".repeat(16),
+        )
+        .await;
+        assert_eq!(named, GuiShowOutcome::Opened);
+        let pending = take_show_pending(&state, &cap, 0);
+        assert!(pending.banner.contains("Ada"), "{}", pending.banner);
+        assert!(pending.banner.contains("studio"), "{}", pending.banner);
+        assert!(pending.banner.contains("(rider)"), "{}", pending.banner);
+        assert_eq!(pending.agent_id, hex::encode(envelope.as_bytes()));
+        let signer_short = short_id_hex(&pending.agent_id);
+        assert!(pending.banner.contains(&signer_short), "{}", pending.banner);
+
+        let bare = AgentId([0x44; 32]);
+        let other_machine = MachineId([0x45; 32]);
+        let unnamed = deliver_remote_show(
+            &state,
+            bare,
+            envelope,
+            other_machine,
+            "network",
+            true,
+            &"ce".repeat(16),
+        )
+        .await;
+        assert_eq!(unnamed, GuiShowOutcome::Opened);
+        let pending = take_show_pending(&state, &cap, 1);
+        let bare_short = short_id_hex(&hex::encode(bare.as_bytes()));
+        let machine_short = short_id_hex(&hex::encode(other_machine.as_bytes()));
+        assert!(pending.banner.contains(&bare_short), "{}", pending.banner);
+        assert!(
+            pending.banner.contains(&machine_short),
+            "{}",
+            pending.banner
+        );
+        assert!(!pending.banner.contains("Ada"), "{}", pending.banner);
+        Ok(())
+    }
+
+    fn take_show_pending(
+        state: &AppState,
+        cap: &CapturingOpener,
+        index: usize,
+    ) -> crate::gui::PendingGuiShow {
+        let urls = cap.urls.lock().expect("urls");
+        let token = session_token_from_show_url(&urls[index]);
+        drop(urls);
+        state
+            .gui_show
+            .take_pending_for_session(&token, Instant::now())
+            .expect("banner queued")
     }
 
     /// Three slow opens used to share one mutex and an `Arc<AppState>` on

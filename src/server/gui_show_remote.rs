@@ -51,9 +51,20 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
 
     let remote_enabled = state.gui_show.config().remote_enabled;
     let control = show_control(state, &typed.sender, &ingress);
+    let via_rider = matches!(
+        &ingress,
+        ShowIngress::Trusted(show) if show.request.via_rider
+    );
+    // The envelope signer is blocked even when `via_rider` names another
+    // subject. A rider pair block does not add that subject.
     let blocked = match &control {
-        Some(agent) => state.gui_show.is_blocked(agent) || subject_barred(state, agent).await,
-        None => false,
+        Some(agent) => {
+            state.gui_show.is_blocked(&typed.sender)
+                || state.gui_show.is_blocked(agent)
+                || (via_rider && state.gui_show.rider_pair_blocked(&typed.sender, agent))
+                || subject_barred(state, agent).await
+        }
+        None => state.gui_show.is_blocked(&typed.sender),
     };
     let mut preview = receive_action(&ingress, remote_enabled, blocked, false);
     // A rider subject that names this daemon, or is empty, must not display.
@@ -62,7 +73,13 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
         preview = ReceiveAction::Reply(crate::gui::GuiShowOutcome::Refused);
     }
     let rate_limited = if let (Some(agent), ReceiveAction::Display { .. }) = (&control, &preview) {
-        !state.gui_show.try_rate_limit(agent, Instant::now())
+        let mut agents = vec![typed.sender];
+        if agent != &typed.sender {
+            agents.push(*agent);
+        }
+        !state
+            .gui_show
+            .try_rate_limit_agents(&agents, Instant::now())
     } else {
         false
     };
@@ -110,6 +127,7 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
             let outcome = deliver_remote_show(
                 state,
                 sender,
+                typed.sender,
                 typed.machine_id,
                 &route,
                 via_rider,
@@ -185,7 +203,8 @@ async fn handle_activity(state: &Arc<AppState>, typed: DmTypedPayload) {
 /// impl-api owns this function in `src/server/routes/gui_show.rs`.
 async fn deliver_remote_show(
     state: &Arc<AppState>,
-    sender: AgentId,
+    subject: AgentId,
+    envelope: AgentId,
     sender_machine: MachineId,
     route: &str,
     via_rider: bool,
@@ -193,7 +212,8 @@ async fn deliver_remote_show(
 ) -> crate::gui::GuiShowOutcome {
     crate::server::routes::gui_show::deliver_remote_show(
         state.as_ref(),
-        sender,
+        subject,
+        envelope,
         sender_machine,
         route,
         via_rider,
@@ -246,8 +266,7 @@ fn request_id_of(ingress: &ShowIngress) -> Option<[u8; 16]> {
 /// `evaluate_pair` runs `OwnerTrust::is_owner_trusted` and forces
 /// `owner_trusted` false for a `Blocked` contact (ADR 0083 §2).
 async fn owner_trusted(state: &AppState, typed: &DmTypedPayload) -> bool {
-    #[cfg(test)]
-    if state.gui_show.sender_trusted_for_test(&typed.sender) {
+    if state.gui_show.trust_hook_allows(&typed.sender) {
         return true;
     }
     let cache = state.agent.identity_discovery_cache();
@@ -919,6 +938,143 @@ mod adr_remote {
         assert!(
             !cap.urls.lock().expect("urls").is_empty(),
             "another rider on the same daemon still displays"
+        );
+    }
+
+    /// A signer already on `gui_show_blocked` cannot display by setting `via_rider`.
+    #[tokio::test]
+    async fn stopped_signer_with_via_rider_is_refused() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let cap = CapturingOpener::new();
+        state
+            .gui_show
+            .replace_opener_for_test(Arc::new(cap.clone()));
+        let signer = AgentId([0x11; 32]);
+        let subject = AgentId([0x22; 32]);
+        state.gui_show.trust_sender_for_test(&signer);
+        state.gui_show.block_agent(&signer);
+        handle_gui_show_typed(
+            &state,
+            show_typed(signer, MachineId([0x44; 32]), [9; 16], subject, true),
+        )
+        .await;
+        assert!(
+            cap.urls.lock().expect("urls").is_empty(),
+            "a blocked envelope signer must not open a rider show"
+        );
+    }
+
+    /// A new subject does not refill the envelope signer's burst.
+    #[tokio::test]
+    async fn rotating_subjects_hit_the_per_signer_limit() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let cap = CapturingOpener::new();
+        state
+            .gui_show
+            .replace_opener_for_test(Arc::new(cap.clone()));
+        let signer = AgentId([0x11; 32]);
+        state.gui_show.trust_sender_for_test(&signer);
+        let machine = MachineId([0x44; 32]);
+        for n in 0..3u8 {
+            let mut subject = [0xA0; 32];
+            subject[0] = n.saturating_add(1);
+            let mut request_id = [0xB0; 16];
+            request_id[0] = n;
+            handle_gui_show_typed(
+                &state,
+                show_typed(signer, machine, request_id, AgentId(subject), true),
+            )
+            .await;
+        }
+        assert_eq!(
+            cap.urls.lock().expect("urls").len(),
+            3,
+            "the signer burst is three shows"
+        );
+        handle_gui_show_typed(
+            &state,
+            show_typed(signer, machine, [0xB4; 16], AgentId([0xA4; 32]), true),
+        )
+        .await;
+        assert_eq!(
+            cap.urls.lock().expect("urls").len(),
+            3,
+            "a fourth subject must not bypass the signer burst"
+        );
+    }
+
+    /// Stop on a rider banner blocks the envelope signer, not the named subject.
+    #[tokio::test]
+    async fn stop_on_a_forged_subject_does_not_block_that_agents_direct_shows() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let cap = CapturingOpener::new();
+        state
+            .gui_show
+            .replace_opener_for_test(Arc::new(cap.clone()));
+        let signer = AgentId([0x11; 32]);
+        let victim = AgentId([0x22; 32]);
+        let machine = MachineId([0x44; 32]);
+        state.gui_show.trust_sender_for_test(&signer);
+        state.gui_show.trust_sender_for_test(&victim);
+        handle_gui_show_typed(&state, show_typed(signer, machine, [1; 16], victim, true)).await;
+        let token = {
+            let urls = cap.urls.lock().expect("urls");
+            assert_eq!(urls.len(), 1, "the forged rider show displayed");
+            urls[0]
+                .split("token=")
+                .nth(1)
+                .unwrap_or("")
+                .split(['&', '#'])
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        let pending = state
+            .gui_show
+            .take_pending_for_session(&token, std::time::Instant::now())
+            .expect("rider banner");
+        assert_eq!(pending.agent_id, hex::encode(signer.as_bytes()));
+        assert_ne!(pending.agent_id, hex::encode(victim.as_bytes()));
+        let bytes = hex::decode(&pending.agent_id).expect("agent hex");
+        let mut stopped = [0u8; 32];
+        stopped.copy_from_slice(&bytes);
+        crate::server::routes::gui_show::apply_gui_block(&state, AgentId(stopped)).expect("stop");
+        assert!(
+            state.gui_show.is_blocked(&signer),
+            "Stop writes the envelope signer"
+        );
+        assert!(
+            !state.gui_show.is_blocked(&victim),
+            "Stop does not write the forged subject"
+        );
+        assert!(
+            state.gui_show.rider_pair_blocked(&signer, &victim),
+            "Stop records the (signer, subject) pair"
+        );
+        handle_gui_show_typed(&state, show_typed(victim, machine, [2; 16], victim, false)).await;
+        assert_eq!(
+            cap.urls.lock().expect("urls").len(),
+            2,
+            "the forged subject's own direct show still displays"
+        );
+        handle_gui_show_typed(
+            &state,
+            show_typed(signer, machine, [3; 16], AgentId([0x55; 32]), true),
+        )
+        .await;
+        assert_eq!(
+            cap.urls.lock().expect("urls").len(),
+            2,
+            "that signer's later rider shows stay refused"
         );
     }
 }

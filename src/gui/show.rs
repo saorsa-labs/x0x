@@ -4,7 +4,9 @@
 //! the platform opener behind a test seam.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use crate::identity::AgentId;
 
 use super::rate_limit::GuiShowRateLimit;
+
+/// Replaces one remote show send. Production leaves the slot empty.
+type ShowSendHook = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>> + Send + Sync,
+>;
 
 /// Reply sends that may be in flight together.
 const REPLY_SEND_SLOTS: usize = 4;
@@ -410,6 +417,23 @@ pub struct GuiShowRuntime {
     reply_permits: Arc<tokio::sync::Semaphore>,
     /// Refusals sent to senders that are not owner-trusted.
     untrusted_refusals: Mutex<UntrustedRefusalWindow>,
+    /// Rider subjects presented by each envelope signer.
+    ///
+    /// Stop records `(signer, subject)` from this map and blocks the signer.
+    /// It does not add the subject to [`Self::blocked`].
+    rider_presented: Mutex<HashMap<[u8; 32], HashSet<[u8; 32]>>>,
+    /// Rider shows refused for one `(envelope signer, subject)` pair.
+    rider_pairs: Mutex<HashSet<([u8; 32], [u8; 32])>>,
+    /// Senders a test treats as owner-trusted. Production leaves this empty.
+    ///
+    /// The AppState test agent has no user key. Installing one starts
+    /// owner sync, and that constructor dials.
+    trusted_senders: Mutex<HashSet<AgentId>>,
+    /// Replaces the remote show send when a test installs it.
+    ///
+    /// Production leaves this empty. The send function calls it and does
+    /// not branch on `cfg(test)`.
+    send_hook: Mutex<Option<ShowSendHook>>,
     /// Test seam: milliseconds `send_show_result` waits before it returns.
     ///
     /// Zero uses the real send. The receive tests arm this so one slow
@@ -419,16 +443,6 @@ pub struct GuiShowRuntime {
     /// How many test reply sends ran while `reply_delay_ms` was set.
     #[cfg(test)]
     reply_sends: std::sync::atomic::AtomicU32,
-    /// Test seam: `send_gui_dm` waits past the show deadline and does not
-    /// reach the network. Production builds have no stall.
-    #[cfg(test)]
-    send_stall: std::sync::atomic::AtomicBool,
-    /// Test seam: senders the receive handler treats as owner-trusted.
-    ///
-    /// The AppState test agent has no user key. Installing one starts
-    /// owner sync, and that constructor dials. Empty unless a test opts in.
-    #[cfg(test)]
-    trusted_senders: Mutex<HashSet<AgentId>>,
 }
 
 impl std::fmt::Debug for GuiShowRuntime {
@@ -470,14 +484,14 @@ impl GuiShowRuntime {
             replay: Mutex::new(crate::gui::remote::ReplayCache::new()),
             reply_permits: Arc::new(tokio::sync::Semaphore::new(REPLY_SEND_SLOTS)),
             untrusted_refusals: Mutex::new(UntrustedRefusalWindow::default()),
+            rider_presented: Mutex::new(HashMap::new()),
+            rider_pairs: Mutex::new(HashSet::new()),
+            trusted_senders: Mutex::new(HashSet::new()),
+            send_hook: Mutex::new(None),
             #[cfg(test)]
             reply_delay_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             reply_sends: std::sync::atomic::AtomicU32::new(0),
-            #[cfg(test)]
-            send_stall: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            trusted_senders: Mutex::new(HashSet::new()),
         };
         // Honour a stop recorded before this process. The marker wins over
         // a config that already says `local_enabled = true`, because Stop
@@ -538,17 +552,23 @@ impl GuiShowRuntime {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Make `send_gui_dm` wait past the 10 s show deadline.
+    /// Make the remote show send wait past the 10 s deadline.
+    ///
+    /// The wait lives in this hook. `send_gui_dm` only calls the hook.
     #[cfg(test)]
     pub fn arm_send_stall_for_test(&self) {
-        self.send_stall
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether a test stalled the remote show send.
-    #[cfg(test)]
-    pub(crate) fn send_stalled_for_test(&self) -> bool {
-        self.send_stall.load(std::sync::atomic::Ordering::Relaxed)
+        let hook: ShowSendHook = Arc::new(|| {
+            Box::pin(async {
+                tokio::time::sleep(super::remote::RESULT_WAIT + std::time::Duration::from_secs(30))
+                    .await;
+                Err(crate::dm::DmError::RecipientUndiscovered(
+                    "gui show test stall".to_string(),
+                ))
+            }) as Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>>
+        });
+        if let Ok(mut guard) = self.send_hook.lock() {
+            *guard = Some(hook);
+        }
     }
 
     /// Treat `agent` as owner-trusted on the receive path.
@@ -557,15 +577,6 @@ impl GuiShowRuntime {
         if let Ok(mut guard) = self.trusted_senders.lock() {
             guard.insert(*agent);
         }
-    }
-
-    /// Whether a test opted this sender in as owner-trusted.
-    #[cfg(test)]
-    pub(crate) fn sender_trusted_for_test(&self, agent: &AgentId) -> bool {
-        self.trusted_senders
-            .lock()
-            .map(|guard| guard.contains(agent))
-            .unwrap_or(false)
     }
 
     /// One slot for a detached reply send. `None` when every slot is in use.
@@ -847,10 +858,71 @@ impl GuiShowRuntime {
 
     /// Rate-limit gate; `true` means the show may proceed.
     pub fn try_rate_limit(&self, agent: &AgentId, now: Instant) -> bool {
+        self.try_rate_limit_agents(std::slice::from_ref(agent), now)
+    }
+
+    /// Rate-limit gate for every distinct agent on one show.
+    ///
+    /// One hourly slot is spent when every agent still has a token.
+    pub fn try_rate_limit_agents(&self, agents: &[AgentId], now: Instant) -> bool {
         self.rate_limit
             .lock()
-            .map(|mut g| g.try_acquire(agent, now))
+            .map(|mut guard| guard.try_acquire_all(agents, now))
             .unwrap_or(false)
+    }
+
+    /// Remember that `signer` displayed a rider show naming `subject`.
+    pub fn note_rider_presentation(&self, signer: &AgentId, subject: &AgentId) {
+        let Ok(mut presented) = self.rider_presented.lock() else {
+            return;
+        };
+        presented
+            .entry(*signer.as_bytes())
+            .or_default()
+            .insert(*subject.as_bytes());
+    }
+
+    /// Record `(signer, subject)` for every subject this signer presented.
+    ///
+    /// Does not add those subjects to the block list.
+    pub fn record_rider_stop(&self, signer: &AgentId) {
+        let subjects = self
+            .rider_presented
+            .lock()
+            .ok()
+            .and_then(|presented| presented.get(signer.as_bytes()).cloned())
+            .unwrap_or_default();
+        let Ok(mut pairs) = self.rider_pairs.lock() else {
+            return;
+        };
+        for subject in subjects {
+            pairs.insert((*signer.as_bytes(), subject));
+        }
+    }
+
+    /// Whether Stop on a rider show from `signer` named `subject`.
+    pub fn rider_pair_blocked(&self, signer: &AgentId, subject: &AgentId) -> bool {
+        self.rider_pairs
+            .lock()
+            .map(|pairs| pairs.contains(&(*signer.as_bytes(), *subject.as_bytes())))
+            .unwrap_or(false)
+    }
+
+    /// Whether a test opted this sender in as owner-trusted.
+    ///
+    /// Production stays false. The receive path calls this instead of a
+    /// `cfg(test)` branch.
+    pub(crate) fn trust_hook_allows(&self, agent: &AgentId) -> bool {
+        self.trusted_senders
+            .lock()
+            .map(|guard| guard.contains(agent))
+            .unwrap_or(false)
+    }
+
+    /// Run a test send replacement. `None` means use the real send.
+    pub(crate) async fn invoke_send_hook(&self) -> Option<Result<(), crate::dm::DmError>> {
+        let hook = self.send_hook.lock().ok().and_then(|guard| guard.clone())?;
+        Some(hook().await)
     }
 
     /// Opener for one launch.

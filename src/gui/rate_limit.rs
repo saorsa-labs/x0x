@@ -32,26 +32,57 @@ pub struct GuiShowRateLimit {
 impl GuiShowRateLimit {
     /// Returns `true` when the request may proceed; records the acceptance.
     pub fn try_acquire(&mut self, agent: &AgentId, now: Instant) -> bool {
+        self.try_acquire_all(std::slice::from_ref(agent), now)
+    }
+
+    /// One show charged to every distinct agent, and once against the hourly cap.
+    ///
+    /// A rider show names a subject and an envelope signer. Both buckets
+    /// must have a token. Rotating the subject does not refill the signer.
+    /// A refusal spends nothing.
+    pub fn try_acquire_all(&mut self, agents: &[AgentId], now: Instant) -> bool {
         self.hourly.retain(|t| now.duration_since(*t) < HOUR);
         if self.hourly.len() >= HOURLY_CAP {
             return false;
         }
-        let key = *agent.as_bytes();
-        let bucket = self.agents.entry(key).or_insert(AgentBucket {
-            tokens: BURST,
-            last_refill: now,
-        });
-        let elapsed = now.saturating_duration_since(bucket.last_refill);
-        let refill = elapsed.as_secs_f64() / (REFILL_SECS as f64);
-        bucket.tokens = (bucket.tokens + refill).min(BURST);
-        bucket.last_refill = now;
-        if bucket.tokens < 1.0 {
+        let mut keys: Vec<[u8; 32]> = agents.iter().map(|agent| *agent.as_bytes()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        if keys.is_empty() {
             return false;
         }
-        bucket.tokens -= 1.0;
+        for key in &keys {
+            let bucket = self.agents.entry(*key).or_insert(AgentBucket {
+                tokens: BURST,
+                last_refill: now,
+            });
+            refill_bucket(bucket, now);
+        }
+        let denied = keys.iter().any(|key| {
+            self.agents
+                .get(key)
+                .map(|bucket| bucket.tokens < 1.0)
+                .unwrap_or(true)
+        });
+        if denied {
+            return false;
+        }
+        for key in &keys {
+            let Some(bucket) = self.agents.get_mut(key) else {
+                return false;
+            };
+            bucket.tokens -= 1.0;
+        }
         self.hourly.push(now);
         true
     }
+}
+
+fn refill_bucket(bucket: &mut AgentBucket, now: Instant) {
+    let elapsed = now.saturating_duration_since(bucket.last_refill);
+    let refill = elapsed.as_secs_f64() / (REFILL_SECS as f64);
+    bucket.tokens = (bucket.tokens + refill).min(BURST);
+    bucket.last_refill = now;
 }
 
 #[cfg(test)]
