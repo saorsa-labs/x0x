@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use sha2::{Digest, Sha256};
 
@@ -126,6 +126,7 @@ fn arm_http_deferred_restart_owner(
     restart_context: RestartContext,
     restart_plan: restart::RestartPlan,
     version: String,
+    flush_reservation: Option<super::shutdown_flush::Reservation>,
 ) -> Result<Box<dyn FnOnce() + Send>, std::io::Error> {
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     #[cfg(test)]
@@ -141,15 +142,16 @@ fn arm_http_deferred_restart_owner(
             let owner = AutoApplyUpgrader::new(&binary_name)
                 .with_stop_on_upgrade(stop_on_upgrade)
                 .with_restart_context(restart_context)
+                .with_flush_reservation(flush_reservation)
                 .with_restart_on_success(false);
             if let Err(e) = owner.trigger_restart(&restart_plan, &version) {
-                warn!(
+                error!(
                     error = %e,
                     installed_bytes = true,
                     restart = "not_started",
                     readiness_observed = false,
-                    "Deferred HTTP restart after successful upgrade did not start: {e}; \
-                     old process keeps serving"
+                    "Deferred HTTP restart did not obtain authorization: {e}; \
+                     process retained for manual recovery"
                 );
             }
         }
@@ -522,8 +524,24 @@ async fn apply_replacements_offloaded(
         on_success,
         probe_admission,
         None,
+        None,
     )
     .await
+}
+
+// An unsuccessful replacement releases admission even while a parked HTTP
+// continuation still holds a clone. Success transfers custody to that owner.
+struct UnusedFlushReservation {
+    reservation: super::shutdown_flush::Reservation,
+    handed_off: bool,
+}
+
+impl Drop for UnusedFlushReservation {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            self.reservation.release_unused();
+        }
+    }
 }
 
 // Keep the existing replacement inputs together with its admission custody.
@@ -537,6 +555,7 @@ async fn apply_replacements_with_permit(
     mut on_success: Option<Box<dyn FnOnce() + Send>>,
     probe_admission: Option<ProbeAdmission>,
     permit: Option<&ReleasePermit>,
+    flush_reservation: Option<super::shutdown_flush::Reservation>,
 ) -> Result<UpgradeResult, UpgradeError> {
     let caller_alive = Arc::new(AtomicBool::new(true));
     let registration = permit
@@ -619,6 +638,17 @@ async fn apply_replacements_with_permit(
         // Admission: locks held + caller still alive. From here the worker
         // owns mutation through on_success — the async caller is only an
         // observer and may be cancelled without orphaning restart.
+        let mut flush_admission = if let Some(reservation) = &flush_reservation {
+            reservation.activate().map_err(|error| {
+                UpgradeError::Other(format!("shutdown won upgrade admission: {error}"))
+            })?;
+            Some(UnusedFlushReservation {
+                reservation: reservation.clone(),
+                handed_off: false,
+            })
+        } else {
+            None
+        };
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
             match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
                 Ok(_) => info!("x0x companion upgraded successfully"),
@@ -632,6 +662,9 @@ async fn apply_replacements_with_permit(
                 // Clean temp before a continuation that may `_exit` / `exit`
                 // without running Drop (#1447 RC4 P2).
                 drop(temp_custody.take());
+                if let Some(admission) = &mut flush_admission {
+                    admission.handed_off = true;
+                }
                 cont();
             }
         }
@@ -680,6 +713,7 @@ pub struct AutoApplyUpgrader {
     #[cfg(unix)]
     staging: Option<super::staging_runtime::Gate>,
     release_permit: Option<ReleasePermit>,
+    flush_reservation: Option<super::shutdown_flush::Reservation>,
 }
 
 impl AutoApplyUpgrader {
@@ -693,11 +727,20 @@ impl AutoApplyUpgrader {
             #[cfg(unix)]
             staging: None,
             release_permit: None,
+            flush_reservation: None,
         }
     }
 
     pub(crate) fn with_release_permit(mut self, permit: ReleasePermit) -> Self {
         self.release_permit = Some(permit);
+        self
+    }
+
+    fn with_flush_reservation(
+        mut self,
+        reservation: Option<super::shutdown_flush::Reservation>,
+    ) -> Self {
+        self.flush_reservation = reservation;
         self
     }
 
@@ -935,6 +978,7 @@ impl AutoApplyUpgrader {
             restart_on_success: self.restart_on_success,
             http_deferred_restart: self.http_deferred_restart,
             restart_context: self.restart_context.clone(),
+            flush_reservation: self.flush_reservation.clone(),
             #[cfg(unix)]
             staging: self.staging.clone(),
             release_permit: self.release_permit.clone(),
@@ -1202,6 +1246,20 @@ impl AutoApplyUpgrader {
             return Ok(result);
         }
 
+        let flush_reservation = if restart_plan.mode == restart::RestartMode::SupervisedExit
+            && (self.restart_on_success || self.http_deferred_restart)
+        {
+            super::shutdown_flush::ensure_ready(&restart_plan.data_root).map_err(|error| {
+                UpgradeError::Other(format!("shutdown flush unavailable: {error}"))
+            })?;
+            Some(
+                super::shutdown_flush::reserve(&restart_plan.data_root)
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
@@ -1334,6 +1392,7 @@ impl AutoApplyUpgrader {
             let staging = self.staging.clone();
             let staging_plan = restart_plan.clone();
             let admitted_manifest = manifest.clone();
+            let reserve_supervised_restart = flush_reservation.is_some();
             Some(Box::new(move |alive| {
                 if let Some(gate) = &staging {
                     gate.require_due(&request.install, &staging_plan)?;
@@ -1342,6 +1401,13 @@ impl AutoApplyUpgrader {
                     .map(|_| ())
                     .map_err(|error| UpgradeError::Other(error.to_string()))?;
                 super::monitor::validate_manifest_timestamp(&admitted_manifest)?;
+                if staging_plan.mode == restart::RestartMode::SupervisedExit
+                    && reserve_supervised_restart
+                {
+                    super::shutdown_flush::ensure_ready(&staging_plan.data_root).map_err(
+                        |error| UpgradeError::Other(format!("shutdown flush unavailable: {error}")),
+                    )?;
+                }
                 Ok(())
             }))
         };
@@ -1362,20 +1428,22 @@ impl AutoApplyUpgrader {
         let binary_name = self.binary_name.clone();
         let stop_on_upgrade = self.stop_on_upgrade;
         let restart_context = self.restart_context.clone();
+        let continuation_reservation = flush_reservation.clone();
         let on_success: Option<Box<dyn FnOnce() + Send>> = if self.restart_on_success {
             Some(Box::new(move || {
                 let owner = AutoApplyUpgrader::new(&binary_name)
                     .with_stop_on_upgrade(stop_on_upgrade)
                     .with_restart_context(restart_context)
+                    .with_flush_reservation(continuation_reservation)
                     .with_restart_on_success(false);
                 if let Err(e) = owner.trigger_restart(&restart_plan_for_cont, &version_for_cont) {
-                    warn!(
+                    error!(
                         error = %e,
                         installed_bytes = true,
                         restart = "not_started",
                         readiness_observed = false,
-                        "Restart after successful upgrade did not start: {e}; \
-                         old process keeps serving"
+                        "Restart did not obtain authorization: {e}; \
+                         process retained for manual recovery"
                     );
                 }
             }))
@@ -1390,6 +1458,7 @@ impl AutoApplyUpgrader {
                     restart_context,
                     restart_plan_for_cont,
                     version_for_cont,
+                    continuation_reservation,
                 )
                 .map_err(|e| {
                     UpgradeError::Other(format!(
@@ -1412,6 +1481,7 @@ impl AutoApplyUpgrader {
             on_success,
             probe_admission,
             self.release_permit.as_ref(),
+            flush_reservation,
         )
         .await?;
 
@@ -1449,7 +1519,8 @@ impl AutoApplyUpgrader {
     /// before replacement, so this only carries it out.
     ///
     /// - `SupervisedExit` (supervision present **and** `stop_on_upgrade`
-    ///   true) writes the intent record and exits for the external owner.
+    ///   true) writes the intent, awaits a durable flush receipt and exits for
+    ///   the external owner. An error or timeout never requests that restart.
     ///   ADR-0061 §5: no detached helper is spawned on this path, so nothing
     ///   can start a second daemon on the same data root.
     /// - `TransactionalHandoff` (genuinely unsupervised, including the default
@@ -1460,21 +1531,51 @@ impl AutoApplyUpgrader {
         plan: &restart::RestartPlan,
         target_version: &str,
     ) -> Result<(), UpgradeError> {
+        self.trigger_restart_with_exit(plan, target_version, |code| std::process::exit(code))
+    }
+
+    fn trigger_restart_with_exit(
+        &self,
+        plan: &restart::RestartPlan,
+        target_version: &str,
+        exit: impl FnOnce(i32),
+    ) -> Result<(), UpgradeError> {
         let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
         let handoff_path = plan.handoff_path();
 
         match plan.mode {
             restart::RestartMode::SupervisedExit => {
-                // I3: write the intent file BEFORE exiting so a supervisor
-                // crash loop is diagnosable. Best-effort — the exit contract
-                // with Restart=always units must not depend on disk health.
-                if let Err(e) = handoff.write(&handoff_path) {
-                    warn!(
-                        handoff = %handoff_path.display(),
-                        error = %e,
-                        "Failed to write upgrade intent file before supervised exit"
-                    );
+                // The live unprotected path binds its existing frozen restart
+                // plan. This receipt permits the restart request, not M2
+                // launcher ownership or protected candidate-start authority.
+                // Its fresh ID binds this call only, not a host transaction.
+                info!("Awaiting acknowledged shutdown flush before supervised restart request");
+                let binding = super::shutdown_flush::Binding::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    1,
+                    &handoff,
+                )
+                .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                let prepare = move || handoff.write(&handoff_path);
+                let receipt = match &self.flush_reservation {
+                    Some(reservation) => super::shutdown_flush::acknowledge_reserved(
+                        &plan.data_root,
+                        binding.clone(),
+                        prepare,
+                        reservation,
+                    ),
+                    None => super::shutdown_flush::acknowledge(
+                        &plan.data_root,
+                        binding.clone(),
+                        prepare,
+                    ),
                 }
+                .map_err(|error| {
+                    UpgradeError::Other(format!("supervised shutdown flush failed: {error}"))
+                })?;
+                receipt
+                    .authorize(&binding)
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?;
                 let exit_code = plan
                     .supervised_exit_code
                     .unwrap_or_else(restart::supervised_exit_code);
@@ -1482,18 +1583,9 @@ impl AutoApplyUpgrader {
                 // named in `supervision`. It is not health acceptance, and it
                 // arms no automatic rollback — recovery on this path is the
                 // documented manual operator procedure.
-                info!(
-                    exit_code = exit_code,
-                    supervision = plan.supervision_signal.as_deref().unwrap_or("none"),
-                    installed_bytes = true,
-                    restart = "requested_from_supervisor",
-                    readiness_observed = false,
-                    automatic_rollback = false,
-                    "Exiting with code {} to request a restart from the service manager; \
-                     replacement readiness is observed by the supervisor, not by x0xd",
-                    exit_code
-                );
-                std::process::exit(exit_code);
+                // No logs are emitted after their acknowledged barrier.
+                exit(exit_code);
+                Ok(())
             }
             restart::RestartMode::TransactionalHandoff => restart::begin_transactional_handoff(
                 handoff,
@@ -1503,6 +1595,11 @@ impl AutoApplyUpgrader {
         }
     }
 }
+
+#[cfg(test)]
+include!("../../tests/upgrade_shutdown_flush.rs");
+#[cfg(test)]
+shutdown_flush_regression_tests!();
 
 /// Get the path to the currently running binary.
 ///
@@ -1994,6 +2091,93 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    async fn check_supervised_unused_reservation_after_replacement(rollback: bool) {
+        use crate::upgrade::shutdown_flush as flush;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/upgrade-unused-reservation-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = tempfile::tempdir_in(root).unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let primary = root.join("x0xd");
+        let original = b"old daemon";
+        std::fs::write(&primary, original).unwrap();
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let incoming = scratch.join("candidate");
+        if rollback {
+            // A directory cannot replace the installed file. The real backup
+            // and restore paths run, without a permission or timing seam.
+            std::fs::create_dir(&incoming).unwrap();
+            assert_ne!(
+                std::fs::metadata(&incoming).unwrap().len(),
+                original.len() as u64
+            );
+        }
+        // Otherwise the missing incoming path makes the real comparison return Err.
+        let owner = flush::register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+        let reservation = flush::reserve(&root).unwrap();
+        let retained_observer = reservation.clone();
+        let continuation_reservation = reservation.clone();
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let on_success = Box::new(move || {
+            observed.store(true, Ordering::SeqCst);
+            drop(continuation_reservation);
+        });
+        let result = apply_replacements_with_permit(
+            Upgrader::new(primary.clone(), semver::Version::new(1, 0, 0)),
+            incoming,
+            semver::Version::new(2, 0, 0),
+            None,
+            TempDirGuard { path: scratch },
+            Some(on_success),
+            None,
+            None,
+            Some(reservation),
+        )
+        .await;
+        if rollback {
+            assert!(
+                matches!(result, Ok(UpgradeResult::RolledBack { .. })),
+                "{result:?}"
+            );
+        } else {
+            assert!(matches!(result, Err(UpgradeError::Other(_))), "{result:?}");
+        }
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "failed replacement must not restart"
+        );
+        assert_eq!(std::fs::read(primary).unwrap(), original);
+        assert!(
+            !root.join(flush::RECORD).exists(),
+            "no acknowledgment started"
+        );
+        // An extra clone can outlive apply (as a parked HTTP owner can). The
+        // finished replacement must release its unused admission immediately.
+        flush::ensure_ready(&root).unwrap();
+        drop(flush::reserve(&root).unwrap());
+        assert!(
+            !owner.seal_admission(),
+            "ordinary shutdown must remain available"
+        );
+        drop(retained_observer);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_replacement_error_releases_unused_reservation() {
+        check_supervised_unused_reservation_after_replacement(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_replacement_rollback_releases_unused_reservation() {
+        check_supervised_unused_reservation_after_replacement(true).await;
+    }
 
     #[cfg(unix)]
     struct ProbePairFixture {
@@ -3433,6 +3617,7 @@ mod tests {
             })),
             None,
             Some(&permit),
+            None,
         ));
         tokio::time::timeout(Duration::from_secs(3), async {
             tokio::select! {
@@ -3987,6 +4172,7 @@ mod tests {
             RestartContext::default(),
             plan,
             "2.0.0".into(),
+            None,
         );
         assert!(
             arm.is_err(),

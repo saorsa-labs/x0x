@@ -133,7 +133,9 @@ macro_rules! flush_receipt_regression_tests {
                     }),
                 )
                 .unwrap();
+                let pending = reserve(&root).unwrap();
                 assert!(!owner.seal_admission());
+                assert!(pending.activate().is_err());
                 assert!(ensure_ready(&root).is_err());
                 let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
                 assert!(acknowledge(&root, binding, || Ok(())).is_err());
@@ -147,9 +149,20 @@ macro_rules! flush_receipt_regression_tests {
                 let dir = fixture();
                 let root = dir.path().canonicalize().unwrap();
                 let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                let reservation = reserve(&root).unwrap();
+                reservation.activate().unwrap();
+                assert!(
+                    owner.seal_admission(),
+                    "admitted replacement retains shutdown custody"
+                );
                 let binding =
                     Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"frozen plan").unwrap();
-                let receipt = acknowledge(&root, binding.clone(), || Ok(())).unwrap();
+                assert!(acknowledge(&root, binding.clone(), || Ok(())).is_err());
+                let receipt =
+                    acknowledge_reserved(&root, binding.clone(), || Ok(()), &reservation).unwrap();
+                assert!(
+                    acknowledge_reserved(&root, binding.clone(), || Ok(()), &reservation).is_err()
+                );
                 receipt.authorize(&binding).unwrap();
                 for changed in [
                     Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"frozen plan").unwrap(),
