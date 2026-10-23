@@ -2184,6 +2184,11 @@ async fn secure_share_delivery_verdict(
     let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
         return SecureShareDeliveryVerdict::Purge("group_unknown");
     };
+    // ADR 0110 §5: a share for a roster that is not yet durable waits
+    // (#1508 rc12). The barrier runs before the membership lock.
+    if !roster_durable_for_publication(state).await {
+        return SecureShareDeliveryVerdict::Withhold("roster_not_durable");
+    }
     let _membership_guard = lock.lock().await;
     // r6 (P4): terminal facts first. An obsolete share (the epoch moved on,
     // or its secret is gone) is purged before any eligibility question;
@@ -2226,6 +2231,9 @@ fn secure_share_admission(
         let group_id = group_id.clone();
         let recipient_hex = recipient_hex.clone();
         async move {
+            if !roster_durable_for_publication(&state).await {
+                return None;
+            }
             let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
             let evidence = {
                 let _membership_guard = lock.lock().await;
@@ -2243,7 +2251,9 @@ fn secure_share_admission(
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence).is_none()
+                roster_durable_at_seam(&state)
+                    && join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence)
+                        .is_none()
                     && state.named_groups.try_read().is_ok_and(|roster| {
                         crate::server::resolve_group_entry_locked(&roster, &group_id)
                             .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
@@ -6989,6 +6999,26 @@ async fn confirm_named_groups_durability_unlocked(state: &AppState) -> bool {
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => false,
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => false,
     }
+}
+
+/// ADR 0110 §5 "only then publish", the one durability barrier for every
+/// outgoing roster-bound write: an S4 frame (rebind, owner recovery,
+/// crypto exclusion, saved removal) and a class-K share. While a roster
+/// replacement waits for its directory fsync (`ReplacedNotDurable`), a
+/// crash can restore the old roster, so nothing that depends on the new one
+/// may leave. The pre-phase re-saves until `Durable`
+/// ([`confirm_named_groups_durability`]); the synchronous seam only reads
+/// the flag ([`roster_durable_at_seam`]).
+pub(in crate::server) async fn roster_durable_for_publication(state: &AppState) -> bool {
+    confirm_named_groups_durability(state).await
+}
+
+/// The seam half of [`roster_durable_for_publication`]: no roster
+/// replacement waits for its directory fsync.
+pub(in crate::server) fn roster_durable_at_seam(state: &AppState) -> bool {
+    !state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
 }
 
 pub(in crate::server) async fn persist_named_group_info(

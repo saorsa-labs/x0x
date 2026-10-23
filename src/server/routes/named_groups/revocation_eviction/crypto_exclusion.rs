@@ -1584,7 +1584,7 @@ fn guarded_admission_gated(
         let group_id = group_id.clone();
         let rule = rule.clone();
         Box::pin(async move {
-            if !ng::confirm_named_groups_durability(&state).await {
+            if !ng::roster_durable_for_publication(&state).await {
                 return None;
             }
             let recipient_hex = hex::encode(recipient.as_bytes());
@@ -1612,10 +1612,7 @@ fn guarded_admission_gated(
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                if state
-                    .named_groups_requires_durability_confirmation
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
+                if !ng::roster_durable_at_seam(&state) {
                     return false;
                 }
                 if ng::join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence)
