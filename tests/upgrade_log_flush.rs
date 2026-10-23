@@ -78,15 +78,113 @@ macro_rules! log_flush_regression_tests {
             }
 
             #[test]
-            fn shutdown_log_flush_keeps_write_and_flush_failures_sticky() {
+            fn shutdown_log_flush_limits_write_and_flush_failures_to_one_transaction() {
                 for failure in [false, true] {
                     let mut fixture = Fixture::new(Some(failure), false, 8);
                     fixture.writer.write_all(b"first").unwrap();
                     assert!(fixture.writer.flush().is_err());
                     fixture.writer.write_all(b"healthy tail").unwrap();
-                    assert!(fixture.writer.flush_until(Instant::now() + BOUND).is_err());
+                    fixture.writer.flush().unwrap();
                     assert!(fixture.bytes.lock().unwrap().ends_with(b"healthy tail"));
                 }
+            }
+
+            fn captured(fixture: &Fixture) -> FlushCallback {
+                use tracing_subscriber::layer::SubscriberExt;
+                let dispatch = tracing::Dispatch::new(
+                    tracing_subscriber::registry()
+                        .with(FlushLayer::new(vec![fixture.writer.clone()]).unwrap()),
+                );
+                capture(&dispatch).unwrap()
+            }
+
+            #[test]
+            fn shutdown_log_flush_barrier_keeps_admission_open_for_rollback() {
+                let mut fixture = Fixture::new(None, true, 1);
+                let callback = captured(&fixture);
+                fixture.block();
+                fixture.writer.write_all(b"second").unwrap();
+                let deadline = Instant::now() + BOUND;
+                // Upgrade barriers need their own slot even when writes fill the queue.
+                let mut receivers = callback(deadline);
+                let receiver = receivers.pop().unwrap();
+                assert!(matches!(
+                    receiver.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                fixture.release.send(()).unwrap();
+                wait_ack(&receiver, deadline).unwrap();
+                fixture.writer.write_all(b"after rollback").unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstsecondafter rollback");
+            }
+
+            #[test]
+            fn shutdown_log_flush_dropped_line_fails_only_the_current_transaction() {
+                let mut fixture = Fixture::new(None, true, 1);
+                let callback = captured(&fixture);
+                fixture.block();
+                fixture.writer.write_all(b"accepted").unwrap();
+                assert_eq!(
+                    fixture.writer.write_all(b"dropped").unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                let deadline = Instant::now() + BOUND;
+                let mut receivers = callback(deadline);
+                fixture.release.send(()).unwrap();
+                assert_eq!(
+                    wait_ack(&receivers.pop().unwrap(), deadline)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                fixture.writer.write_all(b"healthy tail").unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstacceptedhealthy tail");
+            }
+
+            #[test]
+            fn shutdown_log_flush_loss_after_a_queued_barrier_belongs_to_the_next_window() {
+                let mut fixture = Fixture::new(None, true, 1);
+                let callback = captured(&fixture);
+                fixture.block();
+                fixture.writer.write_all(b"accepted").unwrap();
+                let deadline = Instant::now() + BOUND;
+                let mut receivers = callback(deadline);
+                assert_eq!(
+                    fixture.writer.write_all(b"later drop").unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                fixture.release.send(()).unwrap();
+                wait_ack(&receivers.pop().unwrap(), deadline).unwrap();
+                assert_eq!(
+                    flush_captured(&callback, Instant::now() + BOUND)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                fixture.writer.write_all(b"healthy tail").unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstacceptedhealthy tail");
+            }
+
+            #[test]
+            fn shutdown_log_flush_hook_timeout_allows_later_writes_and_barriers() {
+                let mut fixture = Fixture::new(None, true, 8);
+                let callback = captured(&fixture);
+                fixture.block();
+                assert_eq!(
+                    flush_captured(&callback, Instant::now() + Duration::from_millis(50))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::TimedOut
+                );
+                // Admission must resume while the timed-out worker is still blocked.
+                let admitted = fixture.writer.write_all(b"after timeout");
+                fixture.release.send(()).unwrap();
+                admitted.unwrap();
+                flush_captured(&callback, Instant::now() + BOUND).unwrap();
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"firstafter timeout");
             }
 
             #[test]

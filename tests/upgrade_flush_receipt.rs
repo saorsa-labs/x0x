@@ -12,13 +12,111 @@ macro_rules! flush_receipt_regression_tests {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
                         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .join(".planning/upgrade-flush-fixtures")
+                            .join("target/upgrade-flush-fixtures")
                     });
                 std::fs::create_dir_all(&root).unwrap();
                 tempfile::Builder::new()
                     .prefix("receipt-")
                     .tempdir_in(root)
                     .unwrap()
+            }
+
+            #[derive(Clone)]
+            struct RecordedSink(Arc<Mutex<Vec<u8>>>);
+
+            impl std::io::Write for RecordedSink {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            #[derive(Clone, Copy)]
+            enum AfterHookFailure {
+                Deadline,
+                ReceiptWrite,
+                HookTimeout,
+            }
+
+            fn failed_receipt_keeps_logging(failure: AfterHookFailure) {
+                use crate::upgrade::log_flush;
+                use std::io::Write;
+                use tracing_subscriber::layer::SubscriberExt;
+
+                let dir = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let bytes = Arc::new(Mutex::new(Vec::new()));
+                let (mut writer, _guard) =
+                    log_flush::acknowledged(RecordedSink(bytes.clone())).unwrap();
+                let dispatch = tracing::Dispatch::new(
+                    tracing_subscriber::registry()
+                        .with(log_flush::FlushLayer::new(vec![writer.clone()]).unwrap()),
+                );
+                let callback = log_flush::capture(&dispatch).unwrap();
+                let hook_callback = callback.clone();
+                let hook_root = root.clone();
+                let called = Arc::new(AtomicBool::new(false));
+                let observed = called.clone();
+                let owner = register(
+                    root.clone(),
+                    Arc::new(move |deadline| {
+                        log_flush::flush_captured(&hook_callback, deadline)?;
+                        observed.store(true, Ordering::SeqCst);
+                        match failure {
+                            AfterHookFailure::ReceiptWrite => {
+                                // The intent is already durable. Refuse only receipt publication.
+                                std::fs::remove_file(hook_root.join(RECORD))?;
+                                std::fs::create_dir(hook_root.join(RECORD))?;
+                                Ok(())
+                            }
+                            AfterHookFailure::Deadline => {
+                                std::thread::sleep(
+                                    deadline.saturating_duration_since(Instant::now())
+                                        + Duration::from_millis(20),
+                                );
+                                Ok(())
+                            }
+                            AfterHookFailure::HookTimeout => Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "injected hook timeout after the log barrier",
+                            )),
+                        }
+                    }),
+                )
+                .unwrap();
+                writer.write_all(b"before upgrade").unwrap();
+                let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+                let result =
+                    acknowledge_with_limit(&root, binding, || Ok(()), Duration::from_millis(500));
+                owner.join_workers();
+                assert!(result.is_err(), "fault must refuse the receipt");
+                assert!(
+                    called.load(Ordering::SeqCst),
+                    "hook must complete its log barrier"
+                );
+                assert!(root.join("upgrade-flush-rollback.json").is_file());
+                writer.write_all(b"after rollback").unwrap();
+                log_flush::flush_captured(&callback, Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+                assert_eq!(*bytes.lock().unwrap(), b"before upgradeafter rollback");
+            }
+
+            #[test]
+            fn flush_receipt_deadline_after_hook_preserves_logging() {
+                failed_receipt_keeps_logging(AfterHookFailure::Deadline);
+            }
+
+            #[test]
+            fn flush_receipt_write_failure_after_hook_preserves_logging() {
+                failed_receipt_keeps_logging(AfterHookFailure::ReceiptWrite);
+            }
+
+            #[test]
+            fn flush_receipt_hook_timeout_preserves_logging() {
+                failed_receipt_keeps_logging(AfterHookFailure::HookTimeout);
             }
 
             #[test]
