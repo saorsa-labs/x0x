@@ -5524,10 +5524,16 @@ fn deserialize_machine_announcement(
 /// mismatched identity's row on refusal, but a delayed ant-quic
 /// reachability write (`observe_direct_reachability` off connection
 /// completion) can re-create the row afterwards; the pair checks here
-/// are the durable fence.
-fn cached_addr_pinned_mismatch(peer_id: &ant_quic::PeerId, addr: &std::net::SocketAddr) -> bool {
+/// are the durable fence. The pin table is a parameter (Codex 23 Oct
+/// 2026 review): production passes the live dial table, tests their own
+/// table, so no verdict depends on the process-global test override.
+fn cached_addr_pinned_mismatch(
+    pins: &[network::SeedPeerPin],
+    peer_id: &ant_quic::PeerId,
+    addr: &std::net::SocketAddr,
+) -> bool {
     matches!(
-        network::seed_pin_check(network::pinned_seed_peer_ids(*addr), peer_id.0),
+        network::seed_pin_gate_in(pins, *addr, peer_id.0),
         network::SeedPinVerdict::Mismatch { .. }
     )
 }
@@ -5537,12 +5543,13 @@ fn cached_addr_pinned_mismatch(peer_id: &ant_quic::PeerId, addr: &std::net::Sock
 /// address costs itself, not the row's valid addresses — the whole-row
 /// drop used to lose every join path a mixed row still had).
 fn cached_row_addresses_allowed(
+    pins: &[network::SeedPeerPin],
     peer_id: &ant_quic::PeerId,
     addresses: &[std::net::SocketAddr],
 ) -> Vec<std::net::SocketAddr> {
     addresses
         .iter()
-        .filter(|addr| !cached_addr_pinned_mismatch(peer_id, addr))
+        .filter(|addr| !cached_addr_pinned_mismatch(pins, peer_id, addr))
         .copied()
         .collect()
 }
@@ -5555,13 +5562,14 @@ fn cached_row_addresses_allowed(
 /// post-dial pair partition and the live-session guards refuse a
 /// landing on the bad address instead.
 fn cached_row_fully_pinned_mismatch(
+    pins: &[network::SeedPeerPin],
     peer_id: &ant_quic::PeerId,
     addresses: &[std::net::SocketAddr],
 ) -> bool {
     !addresses.is_empty()
         && addresses
             .iter()
-            .all(|addr| cached_addr_pinned_mismatch(peer_id, addr))
+            .all(|addr| cached_addr_pinned_mismatch(pins, peer_id, addr))
 }
 
 /// Compute coordinator / relay hint lists for an announcement.
@@ -5592,6 +5600,7 @@ async fn collect_coordinator_hints(
     // advertise — the supply-side choice skew.
     let bootstrap_ips = bootstrap_ip_set();
     let seed_addrs = bootstrap_seed_addrs();
+    let dial_pins = network::dial_pin_table();
     let cache = machine_cache.read().await;
     select_capability_hints(
         &origins,
@@ -5599,6 +5608,7 @@ async fn collect_coordinator_hints(
         own_machine_id,
         &bootstrap_ips,
         &seed_addrs,
+        dial_pins,
         selection_skew,
     )
 }
@@ -5629,12 +5639,17 @@ async fn collect_coordinator_hints(
 /// another address, and no dial completion order changes that. Hints are
 /// deduplicated, capped to `MAX_COORDINATOR_HINTS` each, and returned in
 /// stable order. The announcer never hints itself.
+///
+/// The pin table is a parameter (Codex 23 Oct 2026 review): production
+/// passes the live dial table, tests their own table, so the selector's
+/// verdicts never depend on the process-global test override.
 fn select_capability_hints(
     origins: &[network::PeerOrigin],
     cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
     own_machine_id: identity::MachineId,
     bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
     seed_addrs: &std::collections::HashSet<std::net::SocketAddr>,
+    pins: &[network::SeedPeerPin],
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
     /// Upper bound on hint list length. Keeps the signed payload small and
@@ -5660,7 +5675,7 @@ fn select_capability_hints(
         let observed_addr = origin.remote_addr.map(network::normalize_v4_mapped_addr);
         let pin_mismatch_at_seed = observed_addr.is_some_and(|observed| {
             matches!(
-                network::seed_pin_gate(observed, origin.peer_id.0),
+                network::seed_pin_gate_in(pins, observed, origin.peer_id.0),
                 network::SeedPinVerdict::Mismatch { .. }
             )
         });
@@ -14935,10 +14950,15 @@ impl Agent {
             // addresses drop — a row with a stale pinned seed address and
             // a valid address keeps the valid one (the whole-row filter
             // used to lose both join paths).
+            let dial_pins = network::dial_pin_table();
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
                 .iter()
                 .flat_map(|peer| {
-                    cached_row_addresses_allowed(&peer.peer_id, &peer.preferred_addresses())
+                    cached_row_addresses_allowed(
+                        dial_pins,
+                        &peer.peer_id,
+                        &peer.preferred_addresses(),
+                    )
                 })
                 .collect();
 
@@ -14962,9 +14982,10 @@ impl Agent {
                 // Round 21: one shared per-address predicate
                 // (`cached_addr_pinned_mismatch`) backs every consumption
                 // check, pre- and post-dial.
-                let (admitted, _pin_rejected): (Vec<_>, Vec<_>) = succeeded
-                    .into_iter()
-                    .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(peer_id, addr));
+                let (admitted, _pin_rejected): (Vec<_>, Vec<_>) =
+                    succeeded.into_iter().partition(|(addr, peer_id)| {
+                        !cached_addr_pinned_mismatch(dial_pins, peer_id, addr)
+                    });
                 all_connected.extend(admitted.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
@@ -15564,8 +15585,9 @@ impl Agent {
         // and the live-session guards refuse that landing, and the dial
         // seam plus its bounded backoff refuse the address on any later
         // address dial.
+        let dial_pins = network::dial_pin_table();
         cached_peers.retain(|peer| {
-            !cached_row_fully_pinned_mismatch(&peer.peer_id, &peer.preferred_addresses())
+            !cached_row_fully_pinned_mismatch(dial_pins, &peer.peer_id, &peer.preferred_addresses())
         });
         if cached_peers.is_empty() || stop.is_cancelled() {
             return;
@@ -15582,7 +15604,7 @@ impl Agent {
         // any join path.
         let (admitted, _pin_rejected): (Vec<_>, Vec<_>) = succeeded
             .into_iter()
-            .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(peer_id, addr));
+            .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(dial_pins, peer_id, addr));
         candidates.extend(admitted.iter().copied());
         tracing::info!(
             "Phase 1: {}/{} cached peers connected",
@@ -41046,6 +41068,7 @@ mod peer_connected_handler_integration_tests {
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
                 &skew,
             );
             assert!(
@@ -41080,6 +41103,7 @@ mod peer_connected_handler_integration_tests {
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
                 &skew,
             );
             assert!(
@@ -41098,9 +41122,19 @@ mod peer_connected_handler_integration_tests {
             // v4-mapped; the normalized form must work identically.
             // Post-pins the operator tier requires the observed
             // (address, identity) pair to MATCH the compiled-in pin, so
-            // the fixtures carry the production pinned PeerIds.
-            let nyc_5483 = *network::pinned_seed_peer_ids("142.93.199.50:5483".parse().unwrap())[0];
-            let hel_5483 = *network::pinned_seed_peer_ids("65.21.157.229:5483".parse().unwrap())[0];
+            // the fixtures carry the production pinned PeerIds. The reads
+            // go to the compiled-in table itself, never the live
+            // `pinned_seed_peer_ids`: a concurrently-running override
+            // test in a shared libtest process must not be able to empty
+            // them (Codex 23 Oct 2026 review).
+            let nyc_5483 = *network::pinned_peer_ids_in(
+                network::SEED_PEER_ID_PINS,
+                "142.93.199.50:5483".parse().unwrap(),
+            )[0];
+            let hel_5483 = *network::pinned_peer_ids_in(
+                network::SEED_PEER_ID_PINS,
+                "65.21.157.229:5483".parse().unwrap(),
+            )[0];
             let seed_host = identity::MachineId(nyc_5483);
             let own = identity::MachineId([0x99; 32]);
             let mut cache = std::collections::HashMap::new();
@@ -41130,6 +41164,7 @@ mod peer_connected_handler_integration_tests {
                 own,
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
                 &skew,
             );
             assert!(coordinators.contains(&seed_host));
@@ -41159,7 +41194,11 @@ mod peer_connected_handler_integration_tests {
             // whatever the dial completion order. Both fixture rows below
             // pin the SAME machine identity (the deployment shape where
             // one key serves two listeners), so every origin pair is a
-            // member and stays eligible.
+            // member and stays eligible. The table is injected into the
+            // selector, not installed as the process-global dial override:
+            // the verdicts stay this test's own whatever concurrently
+            // runs in a shared libtest process (Codex 23 Oct 2026
+            // review).
             const PAIR_IDS: [&[u8; 32]; 1] = [&[0x33; 32]];
             static PAIR_PINS: [network::SeedPeerPin; 2] = [
                 network::SeedPeerPin {
@@ -41171,7 +41210,6 @@ mod peer_connected_handler_integration_tests {
                     expected_peer_ids: &PAIR_IDS,
                 },
             ];
-            let _pins = network::override_dial_pins_for_test(&PAIR_PINS);
             let mut cache = std::collections::HashMap::new();
             let seed_host = identity::MachineId([0x33; 32]);
             cache.insert(seed_host, issue1112_machine(seed_host, &[], None, None));
@@ -41189,6 +41227,7 @@ mod peer_connected_handler_integration_tests {
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
+                &PAIR_PINS,
                 &skew,
             );
             assert_eq!(coordinators, vec![seed_host]);
@@ -41223,31 +41262,34 @@ mod peer_connected_handler_integration_tests {
             // CONSUMPTION — the row is never dialled, whatever wrote it.
             // Runtime-RED before the consumption fence: Phase 0 dialled
             // whatever `select_coordinators` returned. Round 21 keeps the
-            // fence address-scoped (see the mixed-row test below).
+            // fence address-scoped (see the mixed-row test below). The
+            // table is passed to each fence call, never installed as the
+            // process-global dial override (Codex 23 Oct 2026 review).
             const PINNED_KEY: [u8; 32] = [0xAE; 32];
             const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
                 addr: "198.51.100.7:5483",
                 expected_peer_ids: &[&PINNED_KEY],
             }];
-            let _pins = network::override_dial_pins_for_test(&PINS);
             let rejected = ant_quic::PeerId([0x77; 32]);
             let pinned_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
             // The rewritten row (the delayed writer's product): every
             // address mismatches, so no tier touches it.
             assert!(
-                cached_row_fully_pinned_mismatch(&rejected, &[pinned_addr]),
+                cached_row_fully_pinned_mismatch(&PINS, &rejected, &[pinned_addr]),
                 "a re-created row for a mismatching pair is refused at consumption"
             );
             assert!(
-                cached_row_addresses_allowed(&rejected, &[pinned_addr]).is_empty(),
+                cached_row_addresses_allowed(&PINS, &rejected, &[pinned_addr]).is_empty(),
                 "a fully poisoned row contributes no dial address"
             );
             // Other addresses, and the pinned member itself, stay eligible.
             assert!(!cached_row_fully_pinned_mismatch(
+                &PINS,
                 &rejected,
                 &["203.0.113.9:40000".parse().unwrap()]
             ));
             assert!(!cached_row_fully_pinned_mismatch(
+                &PINS,
                 &ant_quic::PeerId(PINNED_KEY),
                 &[pinned_addr]
             ));
@@ -41265,36 +41307,44 @@ mod peer_connected_handler_integration_tests {
             // landing on A is refused by the post-dial pair partition
             // and the live-session guards, never by losing B. Runtime-RED
             // before round 21: the any-mismatch row drop removed the row
-            // — and with it B — from both tiers.
+            // — and with it B — from both tiers. The table is passed to
+            // each fence call, never installed as the process-global
+            // dial override (Codex 23 Oct 2026 review).
             const PINNED_KEY: [u8; 32] = [0xAF; 32];
             const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
                 addr: "198.51.100.7:5483",
                 expected_peer_ids: &[&PINNED_KEY],
             }];
-            let _pins = network::override_dial_pins_for_test(&PINS);
             let rejected = ant_quic::PeerId([0x66; 32]);
             let bad_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
             let good_addr: std::net::SocketAddr = "203.0.113.9:40000".parse().unwrap();
             let mixed_row = [bad_addr, good_addr];
             // Phase 0: only the valid address is dialled.
             assert_eq!(
-                cached_row_addresses_allowed(&rejected, &mixed_row),
+                cached_row_addresses_allowed(&PINS, &rejected, &mixed_row),
                 vec![good_addr],
                 "a mismatching sibling address must not cost the row its valid address"
             );
             // Phase 1: the mixed row stays a candidate; a fully poisoned
             // row still drops, and the pinned member itself is untouched.
-            assert!(!cached_row_fully_pinned_mismatch(&rejected, &mixed_row));
-            assert!(cached_row_fully_pinned_mismatch(&rejected, &[bad_addr]));
             assert!(!cached_row_fully_pinned_mismatch(
+                &PINS, &rejected, &mixed_row
+            ));
+            assert!(cached_row_fully_pinned_mismatch(
+                &PINS,
+                &rejected,
+                &[bad_addr]
+            ));
+            assert!(!cached_row_fully_pinned_mismatch(
+                &PINS,
                 &ant_quic::PeerId(PINNED_KEY),
                 &[bad_addr]
             ));
             // The post-dial pair partition (round 21) uses the same
             // per-address verdict: a landing on the bad address never
             // becomes a join candidate; a landing on the good one does.
-            assert!(cached_addr_pinned_mismatch(&rejected, &bad_addr));
-            assert!(!cached_addr_pinned_mismatch(&rejected, &good_addr));
+            assert!(cached_addr_pinned_mismatch(&PINS, &rejected, &bad_addr));
+            assert!(!cached_addr_pinned_mismatch(&PINS, &rejected, &good_addr));
         }
 
         #[test]
@@ -41307,13 +41357,14 @@ mod peer_connected_handler_integration_tests {
             // address cannot enter either tier — not even through its
             // cached capability flags. Runtime-RED before round 18: the
             // pair check ran only for direct origins, so this origin
-            // reached both hint lists.
+            // reached both hint lists. The table is injected into the
+            // selector, not installed as the process-global dial override
+            // (Codex 23 Oct 2026 review).
             const NOT_IT: [u8; 32] = [0xB7; 32];
             const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
                 addr: "198.51.100.7:5483",
                 expected_peer_ids: &[&NOT_IT],
             }];
-            let _pins = network::override_dial_pins_for_test(&PINS);
             let mut cache = std::collections::HashMap::new();
             let flagged = identity::MachineId([0x33; 32]);
             cache.insert(
@@ -41334,6 +41385,7 @@ mod peer_connected_handler_integration_tests {
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
+                &PINS,
                 &skew,
             );
             assert!(
@@ -41362,6 +41414,7 @@ mod peer_connected_handler_integration_tests {
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
                 &skew,
             );
             assert!(
@@ -41379,9 +41432,13 @@ mod peer_connected_handler_integration_tests {
             // (David's 20 Oct 2026 ruling, confirmed 22 Oct 2026). The
             // fixture identity is the production pinned PeerId for the
             // observed address, so the pin pair matches and the relayed
-            // path is the ONLY thing that can exclude the origin.
-            let seed_nyc_5483 =
-                *network::pinned_seed_peer_ids("142.93.199.50:5483".parse().unwrap())[0];
+            // path is the ONLY thing that can exclude the origin. The
+            // read goes to the compiled-in table itself, never the live
+            // `pinned_seed_peer_ids` (Codex 23 Oct 2026 review).
+            let seed_nyc_5483 = *network::pinned_peer_ids_in(
+                network::SEED_PEER_ID_PINS,
+                "142.93.199.50:5483".parse().unwrap(),
+            )[0];
             let relayed = identity::MachineId(seed_nyc_5483);
             let mut cache = std::collections::HashMap::new();
             cache.insert(
@@ -41400,6 +41457,7 @@ mod peer_connected_handler_integration_tests {
                 identity::MachineId([0x99; 32]),
                 &bootstrap_ip_set(),
                 &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
                 &skew,
             );
             assert!(

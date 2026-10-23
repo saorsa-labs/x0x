@@ -794,7 +794,16 @@ pub(crate) fn seed_pin_check(expected: &[&[u8; 32]], answered: [u8; 32]) -> Seed
 /// (#484/#1380 rule, review round 2): a pin configured as
 /// `[::ffff:142.93.199.50]:443` must answer for a dial to
 /// `142.93.199.50:443` and vice versa.
-fn pinned_peer_ids_in(pins: &[SeedPeerPin], addr: SocketAddr) -> &'static [&'static [u8; 32]] {
+///
+/// Reads the table it is GIVEN, never the process-global test override:
+/// a test that needs the compiled-in production pins passes
+/// [`SEED_PEER_ID_PINS`] here, so a concurrently-running override test in
+/// a shared libtest process cannot empty or rewrite the read (Codex
+/// 23 Oct 2026 review).
+pub(crate) fn pinned_peer_ids_in(
+    pins: &[SeedPeerPin],
+    addr: SocketAddr,
+) -> &'static [&'static [u8; 32]] {
     let addr = normalize_v4_mapped_addr(addr);
     pins.iter()
         .find(|pin| {
@@ -838,17 +847,14 @@ impl Drop for TestPinTableGuard {
     }
 }
 
-/// Test-only accessor for the pin-table override (issue #1112, round 10),
-/// so lib-level tests can fence cache rows against a populated table.
-#[cfg(test)]
-pub(crate) fn override_dial_pins_for_test(pins: &'static [SeedPeerPin]) -> TestPinTableGuard {
-    TestPinTableGuard::set(pins)
-}
-
 /// The pin table the dial seam and the guards read (issue #1112). The
 /// production answer is the compiled-in [`SEED_PEER_ID_PINS`]; test builds
-/// may substitute a populated table (see [`TEST_DIAL_PIN_TABLE`]).
-fn dial_pin_table() -> &'static [SeedPeerPin] {
+/// may substitute a populated table (see [`TEST_DIAL_PIN_TABLE`]). The
+/// lib.rs hint selector and cache-consumption fence call this once and
+/// pass the result down, so production keeps one live table while lib
+/// tests inject their own table and never read the override (Codex
+/// 23 Oct 2026 review).
+pub(crate) fn dial_pin_table() -> &'static [SeedPeerPin] {
     #[cfg(test)]
     if let Some(pins) = *TEST_DIAL_PIN_TABLE
         .lock()
@@ -884,9 +890,10 @@ pub(crate) fn seed_pin_gate(addr: SocketAddr, answered: [u8; 32]) -> SeedPinVerd
     seed_pin_check(pinned_seed_peer_ids(addr), answered)
 }
 
-/// The same gate over an injected table, for tests that must not read
-/// the compiled-in table.
-#[cfg(test)]
+/// The same gate over an injected table: the form the hint selector and
+/// the cache-consumption fence use, so their verdicts come from the table
+/// they are handed (the live [`dial_pin_table`] in production, the test's
+/// own table in tests) and never from the process-global override.
 pub(crate) fn seed_pin_gate_in(
     pins: &[SeedPeerPin],
     addr: SocketAddr,
@@ -11383,11 +11390,19 @@ mod tests {
         // The compiled-in table's live state: the first seed is pinned,
         // and the two cache-only Hetzner IPv4 rows stay TOFU until a
         // handshake at that exact address verifies them (see the pins
-        // content test).
+        // content test). The read goes to the table itself, never the
+        // live `pinned_seed_peer_ids`: a seam test holding the override
+        // in a shared libtest process must not be able to mask these
+        // rows (Codex 23 Oct 2026 review).
         let first_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
-        assert!(!pinned_seed_peer_ids(first_seed).is_empty());
-        assert!(pinned_seed_peer_ids("65.21.157.229:443".parse().unwrap()).is_empty());
-        assert!(pinned_seed_peer_ids("116.203.101.172:5483".parse().unwrap()).is_empty());
+        assert!(!pinned_peer_ids_in(SEED_PEER_ID_PINS, first_seed).is_empty());
+        assert!(
+            pinned_peer_ids_in(SEED_PEER_ID_PINS, "65.21.157.229:443".parse().unwrap()).is_empty()
+        );
+        assert!(
+            pinned_peer_ids_in(SEED_PEER_ID_PINS, "116.203.101.172:5483".parse().unwrap())
+                .is_empty()
+        );
         // Review round 2: v4-mapped and plain forms of the same address
         // resolve to the same pin row.
         let table = [SeedPeerPin {
