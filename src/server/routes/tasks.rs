@@ -2646,6 +2646,54 @@ mod tests {
             assert_withheld(seal_once(&state, &topic).await);
         }
 
+        /// #1573 (#1508 rc12): a GSS task delta is not sealed while a
+        /// verified removal waits for this survivor's share (the removed
+        /// member still holds the secret); the installed share ends the
+        /// hold. Before the fix the delta was sealed under the old secret.
+        #[tokio::test]
+        async fn gss_task_seal_is_withheld_while_a_removal_waits_for_its_share() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b4".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+
+            super::super::super::named_groups::park_pending_gss_removal_for_test(
+                &state, &group_key, &info,
+            );
+            let reason =
+                super::super::super::named_groups::GroupCiphertextHold::PendingGssRemoval.reason();
+            match seal_once(&state, &topic).await {
+                Err(x0x::crdt::CrdtError::Gossip(text)) => {
+                    assert!(text.contains(reason), "typed refusal, got {text}")
+                }
+                Err(other) => panic!("wrong refusal: {other}"),
+                Ok(_) => panic!("a task delta was sealed while a removal waits for its share"),
+            }
+
+            let mut keyed = info.clone();
+            let _ = keyed.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), keyed);
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+        }
+
         /// Codex P2 (#1508 r6), ADR 0110 §4b(3): a `SignedPublic` group's
         /// task delta is a member send too. It is refused while verified
         /// revocations cover every admin seat, like the encrypted planes.
