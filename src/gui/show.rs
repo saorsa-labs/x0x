@@ -419,6 +419,10 @@ pub struct GuiShowRuntime {
     /// How many test reply sends ran while `reply_delay_ms` was set.
     #[cfg(test)]
     reply_sends: std::sync::atomic::AtomicU32,
+    /// Test seam: `send_gui_dm` waits past the show deadline and does not
+    /// reach the network. Production builds have no stall.
+    #[cfg(test)]
+    send_stall: std::sync::atomic::AtomicBool,
     /// Test seam: senders the receive handler treats as owner-trusted.
     ///
     /// The AppState test agent has no user key. Installing one starts
@@ -470,6 +474,8 @@ impl GuiShowRuntime {
             reply_delay_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             reply_sends: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            send_stall: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             trusted_senders: Mutex::new(HashSet::new()),
         };
@@ -530,6 +536,19 @@ impl GuiShowRuntime {
     pub(crate) fn count_reply_send_for_test(&self) {
         self.reply_sends
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make `send_gui_dm` wait past the 10 s show deadline.
+    #[cfg(test)]
+    pub fn arm_send_stall_for_test(&self) {
+        self.send_stall
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a test stalled the remote show send.
+    #[cfg(test)]
+    pub(crate) fn send_stalled_for_test(&self) -> bool {
+        self.send_stall.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Treat `agent` as owner-trusted on the receive path.

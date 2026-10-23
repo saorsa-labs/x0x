@@ -286,14 +286,18 @@ fn detach_reply(state: &Arc<AppState>, job: ReplyJob) {
         tracing::debug!("gui show reply skipped: send slots are full");
         return;
     };
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
+    let task_state = Arc::clone(state);
+    // The shutdown drain owns this task. A bare spawn would keep `AppState`
+    // alive after the supervisor returns.
+    if !state.spawn_detached(async move {
         let _permit = permit;
         match job {
-            ReplyJob::Result { to, result } => send_show_result(&state, to, result).await,
-            ReplyJob::Activity { to, body } => send_activity(&state, to, body).await,
+            ReplyJob::Result { to, result } => send_show_result(&task_state, to, result).await,
+            ReplyJob::Activity { to, body } => send_activity(&task_state, to, body).await,
         }
-    });
+    }) {
+        tracing::debug!("gui show reply skipped: shutdown closed task admission");
+    }
 }
 
 async fn send_show_result(state: &AppState, to: AgentId, result: GuiShowDmResult) {
@@ -824,6 +828,46 @@ mod adr_remote {
             "a stranger flood sent {sends} refusals; the cap is one per minute"
         );
         state.gui_show.arm_reply_delay_for_test(0);
+    }
+
+    /// Shutdown takes the reply task out of the registry and aborts it.
+    /// A bare `tokio::spawn` leaves the sleep outside that registry.
+    #[tokio::test]
+    async fn shutdown_drains_a_delayed_reply() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        state.gui_show.arm_reply_delay_for_test(60_000);
+        let stranger = AgentId([0x71; 32]);
+        handle_gui_show_typed(
+            &state,
+            show_typed(stranger, MachineId([0x72; 32]), [0x73; 16], stranger, false),
+        )
+        .await;
+        let tasks = state
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("admission open");
+        assert_eq!(
+            tasks.len(),
+            1,
+            "a delayed reply must sit in the shutdown task registry"
+        );
+        for task in &tasks {
+            task.abort();
+        }
+        let started = std::time::Instant::now();
+        for task in tasks {
+            let _ = task.await;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "shutdown did not drain the delayed reply: {elapsed:?}"
+        );
     }
 
     #[tokio::test]

@@ -1058,7 +1058,12 @@ mod tests {
     fn capability_bit_is_required_before_a_show_is_sent() {
         use crate::dm::CapabilityRegistry;
         assert!(CapabilityRegistry::current().supports(CapabilityRegistry::GUI_SHOW_V1));
-        assert_eq!(CapabilityRegistry::GUI_SHOW_V1, 1 << 4);
+        assert_eq!(CapabilityRegistry::GUI_SHOW_V1, 1 << 10);
+        assert_ne!(
+            CapabilityRegistry::GUI_SHOW_V1,
+            1 << 4,
+            "bit 4 is eviction_handoff_v1"
+        );
         let payload = request("people", 1, [1; 16]);
         assert_eq!(
             CapabilityRegistry::required_for_payload(&payload),

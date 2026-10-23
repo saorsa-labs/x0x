@@ -791,6 +791,7 @@ async fn send_show_and_wait(
     let deadline = tokio::time::Instant::now() + RESULT_WAIT;
     // Register before send so a fast result is not lost. The guard removes
     // the waiter when send fails, the wait times out, or this task is dropped.
+    // The same deadline bounds the send and the result wait.
     let Some(wait) = state
         .gui_show
         .remote_hub()
@@ -804,7 +805,8 @@ async fn send_show_and_wait(
             None,
         );
     };
-    if send_gui_dm(state, &agent, payload, bytes).await.is_err() {
+    let sent = tokio::time::timeout_at(deadline, send_gui_dm(state, &agent, payload, bytes)).await;
+    if !matches!(sent, Ok(Ok(()))) {
         return remote_json(
             GuiShowOutcome::Unconfirmed,
             target_hex,
@@ -867,6 +869,16 @@ async fn send_gui_dm(
     payload: Vec<u8>,
     logical_request_id: [u8; 16],
 ) -> Result<(), crate::dm::DmError> {
+    #[cfg(test)]
+    if state.gui_show.send_stalled_for_test() {
+        // Longer than `RESULT_WAIT`. The caller must bound this wait.
+        // The stall never reaches the network.
+        tokio::time::sleep(crate::gui::remote::RESULT_WAIT + std::time::Duration::from_secs(30))
+            .await;
+        return Err(crate::dm::DmError::RecipientUndiscovered(
+            "gui show test stall".to_string(),
+        ));
+    }
     let config = crate::dm::DmSendConfig {
         max_retries: 0,
         require_durable_app_ack: false,
@@ -2302,6 +2314,54 @@ mod tests {
             Some(agent),
             "an authenticated binding is queried without a direct connection"
         );
+        Ok(())
+    }
+
+    /// A send that outlives the deadline still returns inside that deadline.
+    #[tokio::test]
+    async fn stalled_show_send_returns_inside_the_deadline() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x31; 32]);
+        let machine = MachineId([0x32; 32]);
+        let mut caps = crate::dm::DmCapabilities::pending();
+        caps.application_registry = crate::dm::CapabilityRegistry {
+            version: 1,
+            bits: crate::dm::CapabilityRegistry::GUI_SHOW_V1,
+        };
+        let now_ms = unix_secs().saturating_mul(1000);
+        assert!(state
+            .agent
+            .capability_store()
+            .insert(agent, machine, caps, now_ms));
+        state.gui_show.arm_send_stall_for_test();
+        let request_id = hex::encode([0x33u8; 16]);
+        let started = std::time::Instant::now();
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            send_show_and_wait(
+                &state,
+                agent,
+                machine,
+                "people".to_string(),
+                false,
+                agent,
+                request_id,
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let response = finished.unwrap_or_else(|_| panic!("stalled send ran for {elapsed:?}"));
+        assert!(
+            elapsed <= std::time::Duration::from_secs(12),
+            "stalled send ran for {elapsed:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(9),
+            "stalled send returned before the deadline: {elapsed:?}"
+        );
+        let bytes = to_bytes(response.into_body(), 1 << 20).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(body["outcome"], "unconfirmed", "{body}");
         Ok(())
     }
 
