@@ -12378,6 +12378,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     verified: bool,
     envelope_bytes: Option<&[u8]>,
 ) -> ApplyMetadataResult {
+    // ADR 0110 S4 (#1508 rc12): a commit that chains on a GSS owner
+    // recovery not yet installed here waits for it.
+    if verified {
+        revocation_eviction::owner_recovery::hold_unchained_event(state, &event).await;
+    }
     apply_named_group_metadata_event_with_binding(
         state,
         event,
