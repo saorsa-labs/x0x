@@ -1082,6 +1082,12 @@ pub(super) struct AppState {
     /// never dropped; replayed after the group's next accepted
     /// `MemberAdded`. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
     pub(super) parked_role_updates: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
+    /// #1573 (ADR 0110 §3): signed GSS `MemberRemoved`/`MemberBanned`
+    /// events that rotate the secret epoch and arrived before this
+    /// survivor holds the new epoch's secret. The head stays at the parent
+    /// until the `SecureShareDelivered` share installs; the share replays
+    /// them. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
+    pub(super) parked_gss_removals: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by
@@ -1554,6 +1560,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// #1113 startup catch-up: tests that want a page send to count as
     /// delivered set this. Production builds omit the recorders.
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
+    /// #1573: install a GSS removal head before its share, as a released
+    /// receiver does (`legacy_gss_removal_receiver`).
+    pub(super) legacy_gss_removal_receiver: std::sync::atomic::AtomicBool,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }

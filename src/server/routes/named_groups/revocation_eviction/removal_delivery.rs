@@ -71,16 +71,21 @@ pub(super) struct RemovalDelivery {
     resumed: bool,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
-    /// A resumed GSS removal or ban: the rotated secret epoch whose shares
-    /// the first round sends again.
-    reshare_epoch: Option<u64>,
+    /// A GSS removal or ban: the rotated secret epoch whose share each
+    /// resend round seals again to every survivor it writes to, until that
+    /// survivor converges (#1573). A survivor holds the removal head until
+    /// its share installs, so a lost share is sent again.
+    gss_epoch: Option<u64>,
+    /// The next round seals the share too. A live delivery's first round
+    /// does not: the route published the shares with the event.
+    share_due: bool,
 }
 
 #[cfg(test)]
 impl RemovalDelivery {
     /// The rotated secret epoch whose shares the first round sends again.
     pub(super) fn reshare_epoch_for_test(&self) -> Option<u64> {
-        self.reshare_epoch
+        self.gss_epoch.filter(|_| self.share_due)
     }
 }
 
@@ -142,6 +147,7 @@ fn new_delivery(
     resumed: bool,
     next_at: Instant,
 ) -> RemovalDelivery {
+    let gss_epoch = gss_secret_epoch(&event);
     RemovalDelivery {
         event: Arc::new(event),
         result_head,
@@ -151,7 +157,8 @@ fn new_delivery(
             .map(|id| (id, RecipientDelivery::Due))
             .collect(),
         next_at,
-        reshare_epoch: None,
+        gss_epoch,
+        share_due: resumed,
     }
 }
 
@@ -280,9 +287,7 @@ pub(in crate::server) async fn record_committed_removal(
             false,
             Instant::now() + REMOVAL_FIRST_SEND_DELAY,
         );
-        if reshare {
-            delivery.reshare_epoch = gss_secret_epoch(&delivery.event);
-        }
+        delivery.share_due = reshare;
         inner.removals.insert(key, delivery);
         inner.dirty = true;
     }
@@ -390,15 +395,13 @@ pub(super) fn resume_after_load(
             ResumeAction::Deliver => {
                 row.phase = Phase::CommittedDeliveryPending;
                 row.result_head = Some(saved.result_head.clone());
-                let reshare_epoch = gss_secret_epoch(&saved.event);
-                let mut delivery = new_delivery(
+                let delivery = new_delivery(
                     saved.event,
                     saved.result_head,
                     survivors(info, local, &key.target),
                     true,
                     Instant::now(),
                 );
-                delivery.reshare_epoch = reshare_epoch;
                 removals.insert(key.clone(), delivery);
             }
             ResumeAction::Discard => {
@@ -543,7 +546,9 @@ pub(super) async fn drive(state: &Arc<AppState>) {
                 continue;
             };
             let started = crypto_exclusion::apply_round(&mut stored.recipients, updates);
-            let reshare_epoch = stored.reshare_epoch.take();
+            let reshare_epoch = stored.gss_epoch.filter(|_| stored.share_due);
+            // #1573: every later round seals the share again.
+            stored.share_due = true;
             if crypto_exclusion::all_converged(&stored.recipients) {
                 inner.removals.remove(&key);
                 inner.dirty = true;
@@ -552,9 +557,11 @@ pub(super) async fn drive(state: &Arc<AppState>) {
         };
         crypto_exclusion::ask_heads(state, &key.stable_group_id, head_asks);
         if let Some(epoch) = reshare_epoch {
-            // The head is synced and still the result: the survivors get
-            // the saved epoch's secret again, once per resume.
-            redeliver_secret_shares(state, &info, &active, epoch);
+            // The removal is still on the chain at its epoch: each survivor
+            // written to this round gets the epoch's secret again (#1573).
+            let written: std::collections::BTreeSet<[u8; 32]> =
+                started.iter().map(|(recipient, _)| *recipient).collect();
+            redeliver_secret_shares(state, &info, &written, epoch);
         }
         for (recipient, attempt) in started {
             spawn_send(
@@ -1275,6 +1282,142 @@ mod daemon_tests {
                 .contains_key(&key),
             "an epoch change ends the delivery"
         );
+        Ok(())
+    }
+
+    /// The shares `state` scheduled to `recipient_hex`.
+    fn shares_to(state: &AppState, recipient_hex: &str) -> usize {
+        state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map(|scheduled| {
+                scheduled
+                    .iter()
+                    .filter(|(_, recipient, _)| recipient == recipient_hex)
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    /// #1573 (#1508 rc12), committer side: a GSS removal's delivery seals
+    /// the survivor's share again on every resend round until that
+    /// survivor converges. A live delivery's first round sends none (the
+    /// route published it with the event); a resumed one sends it at once.
+    /// Before the fix a live delivery never sent the share again and a
+    /// resumed one sent it once, so a lost share was never replaced.
+    #[tokio::test]
+    async fn a_gss_removal_reseals_the_share_each_round_until_convergence() -> Result<()> {
+        use base64::Engine as _;
+        for resumed in [false, true] {
+            let (state, _dir) = state_past_restart_wait().await?;
+            let survivor = AgentId([0x55; 32]);
+            let survivor_hex = hex::encode(survivor.as_bytes());
+            let target = [0x56; 32];
+            let group_id = "d7".repeat(16);
+            let mut info = insert_group(&state, &group_id, &survivor).await;
+            let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+            let member = info
+                .members_v2
+                .get_mut(&survivor_hex)
+                .context("survivor seat")?;
+            member.kem_public_key_b64 =
+                Some(base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes));
+            info.secret_epoch = 5;
+            info.shared_secret = Some(vec![5; 32]);
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info.clone());
+            let stable = info.stable_group_id().to_string();
+            let key = EvictionKey::new(stable.clone(), target);
+            let mut event = removal_event(&group_id, &target);
+            if let NamedGroupMetadataEvent::MemberRemoved { secret_epoch, .. } = &mut event {
+                *secret_epoch = Some(5);
+            }
+            {
+                let mut inner = state.revocation_evictions.inner.lock().await;
+                inner.head_rounds.insert(
+                    stable.clone(),
+                    HeadRound::new(&info.state_hash, Instant::now()),
+                );
+                inner.removals.insert(
+                    key.clone(),
+                    new_delivery(
+                        event,
+                        info.state_hash.clone(),
+                        vec![*survivor.as_bytes()],
+                        resumed,
+                        Instant::now(),
+                    ),
+                );
+            }
+            // One resend round: the survivor's write is not converged.
+            let round = || async {
+                if let Some(delivery) = state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .removals
+                    .get_mut(&key)
+                {
+                    delivery.next_at = Instant::now();
+                    delivery
+                        .recipients
+                        .insert(*survivor.as_bytes(), RecipientDelivery::Sent);
+                }
+                drive(&state).await;
+            };
+            let first = usize::from(resumed);
+            round().await;
+            assert_eq!(shares_to(&state, &survivor_hex), first, "resumed={resumed}");
+            round().await;
+            assert_eq!(
+                shares_to(&state, &survivor_hex),
+                first + 1,
+                "resumed={resumed}"
+            );
+            round().await;
+            assert_eq!(
+                shares_to(&state, &survivor_hex),
+                first + 2,
+                "resumed={resumed}"
+            );
+            // The survivor converges: the delivery ends and no share follows.
+            {
+                let mut inner = state.revocation_evictions.inner.lock().await;
+                let installed: std::collections::BTreeSet<String> =
+                    [info.state_hash.clone()].into_iter().collect();
+                note_survivor_head(
+                    &mut inner.removals,
+                    &stable,
+                    survivor.as_bytes(),
+                    &installed,
+                );
+                if let Some(delivery) = inner.removals.get_mut(&key) {
+                    delivery.next_at = Instant::now();
+                }
+            }
+            drive(&state).await;
+            assert!(
+                !state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .removals
+                    .contains_key(&key),
+                "convergence ends the delivery"
+            );
+            round().await;
+            assert_eq!(
+                shares_to(&state, &survivor_hex),
+                first + 2,
+                "resumed={resumed}"
+            );
+        }
         Ok(())
     }
 
