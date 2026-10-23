@@ -425,8 +425,9 @@ async fn commit_locked(
     let persisted = match ng::persist_named_group_info(state, group_key, next.clone()).await {
         Ok(ng::AtomicWriteOutcome::Durable) => Ok(()),
         Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
-            // The replacement is visible on disk and in memory; deliver it
-            // so the chain stays coherent, and say so.
+            // The replacement is visible on disk and in memory, so the
+            // commit stands and its delivery is scheduled. The guarded
+            // egress sends nothing until the re-save is durable (§5).
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
         }

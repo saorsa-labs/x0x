@@ -1222,7 +1222,8 @@ async fn finish_commit(
         }
         // #1508 r6: `ReplacedNotDurable` installed the new roster (only
         // the directory fsync failed), so the commit stands and the frame
-        // and its delivery must stay.
+        // and its delivery must stay. The guarded egress publishes nothing
+        // until the re-save is durable (§5, #1508 rc12).
         None => matches!(
             ng::persist_named_group_info(state, group_key, next.clone()).await,
             Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
