@@ -5719,6 +5719,70 @@ fn select_capability_hints(
     (reachable_via, relay_candidates)
 }
 
+/// #1112 (round 25): whether a bootstrap-cache row carries the evidence a
+/// transport helper mark needs.
+///
+/// The evidence is the row's own FRESH Global-scope direct observation:
+/// ant-quic records one only when THIS node's outbound dial to that
+/// address completed without coordinator or relay assistance
+/// (`observe_direct_reachability`), and every cache read drops records
+/// older than the reachability TTL first. The effective
+/// `supports_relay` / `supports_coordination` flags are NOT consulted:
+/// they also derive from the sticky `hinted_supports_*` marks, so reading
+/// them would let a mark justify itself. A LAN or loopback observation is
+/// not evidence that third parties can reach the peer.
+fn cache_row_has_verified_helper_evidence(row: &ant_quic::bootstrap_cache::CachedPeer) -> bool {
+    row.capabilities.has_global_direct_reachability()
+}
+
+/// #1112 (round 25): clear the `hinted_supports_*` marks that no fresh
+/// Global-scope direct observation supports. Returns the number of rows
+/// changed.
+///
+/// ant-quic persists a higher-layer helper hint as a sticky
+/// `hinted_supports_relay` / `hinted_supports_coordination` bit on the
+/// row, and `record_assist_hints(false, false)` never clears one. Before
+/// round 25 `seed_transport_peer_hints_for_target` marked every
+/// cache-selected fallback candidate, and earlier heads marked
+/// self-asserted roles, so a cache on disk can carry marks that no
+/// evidence supports; the marks also rank the row first in ant-quic's
+/// own helper selection. The row's addresses, direct observations,
+/// statistics and token are untouched, and a mark the row's current
+/// evidence supports is kept — the dial seeding would grant it again.
+///
+/// ant-quic offers no compare-and-swap on a row: each change re-reads the
+/// row and writes it back under two consecutive cache locks, which is
+/// the narrowest window its API allows. The endpoint's in-memory
+/// `PeerHintRecord` is private to ant-quic and merges marks
+/// monotonically; it starts empty at every process start, and after
+/// round 25 x0x feeds it a mark only on verified evidence.
+async fn clear_unsupported_helper_hint_marks(cache: &ant_quic::BootstrapCache) -> usize {
+    let mut cleared = 0usize;
+    for row in cache.all_peers().await {
+        if !(row.capabilities.hinted_supports_relay
+            || row.capabilities.hinted_supports_coordination)
+            || cache_row_has_verified_helper_evidence(&row)
+        {
+            continue;
+        }
+        let Some(fresh) = cache.get_peer(&row.peer_id).await else {
+            continue;
+        };
+        let mut caps = fresh.capabilities;
+        caps.hinted_supports_relay = false;
+        caps.hinted_supports_coordination = false;
+        cache.update_capabilities(&row.peer_id, caps).await;
+        cleared += 1;
+        tracing::debug!(
+            target: "x0x::connect",
+            stage = "clear_helper_hint_marks",
+            peer_prefix = %network::hex_prefix(&row.peer_id.0, 4),
+            "cleared an unsupported persisted helper mark"
+        );
+    }
+    cleared
+}
+
 fn build_machine_announcement_for_identity(
     identity: &identity::Identity,
     addresses: Vec<std::net::SocketAddr>,
@@ -7900,25 +7964,47 @@ impl Agent {
         let mut helper_hints: std::collections::HashMap<ant_quic::PeerId, HelperHintEntry> =
             std::collections::HashMap::new();
 
+        // #1112 round 25: ant-quic's selectors return unverified fallback
+        // rows by design ("measure, don't trust"), and ant-quic itself keeps
+        // those as plain address candidates. A capability mark reaches
+        // ant-quic only on the row's own fresh Global-scope direct
+        // observation — evidence THIS node's outbound dial created and no
+        // announcement can forge. Every other row stays an address hint, so
+        // an address-only announcement can never be promoted into a
+        // persistent helper here (Codex P2 at d722045).
+        let mut cache_selector_verified = 0usize;
+        let mut cache_selector_address_only = 0usize;
         if let Some(ref cache) = self.bootstrap_cache {
             for peer in cache.select_coordinators(6).await {
+                let verified = cache_row_has_verified_helper_evidence(&peer);
+                if verified {
+                    cache_selector_verified += 1;
+                } else {
+                    cache_selector_address_only += 1;
+                }
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
                     "bootstrap_cache:coordinator",
                     peer.preferred_addresses(),
-                    true,
+                    verified,
                     false,
                 );
             }
             for peer in cache.select_relay_peers(6).await {
+                let verified = cache_row_has_verified_helper_evidence(&peer);
+                if verified {
+                    cache_selector_verified += 1;
+                } else {
+                    cache_selector_address_only += 1;
+                }
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
                     "bootstrap_cache:relay",
                     peer.preferred_addresses(),
                     false,
-                    true,
+                    verified,
                 );
             }
         }
@@ -7962,8 +8048,8 @@ impl Agent {
             // replaces ADR 0071's community flag tiers: the machine
             // cache's self-asserted flag fields mark nothing — the
             // candidate only contributes address hints. Coordinator and
-            // relay capability reaches ant-quic through its own
-            // deployment-configured bootstrap cache (the loop above).
+            // relay capability reaches ant-quic only through the loop
+            // above, gated on the cache row's own direct evidence.
             merge_helper_hint(
                 &mut helper_hints,
                 ant_quic::PeerId(candidate.machine_id.0),
@@ -7984,6 +8070,8 @@ impl Agent {
             target_addr_count = target.addresses.len(),
             helper_candidate_count,
             helper_addr_total,
+            cache_selector_verified,
+            cache_selector_address_only,
             "prepared helper hints for peer-authenticated dial"
         );
 
@@ -22210,6 +22298,23 @@ impl AgentBuilder {
                             }
                         }
                     }
+                }
+            }
+        }
+        // #1112 round 25: a persisted helper mark survives only while the
+        // row's own direct evidence supports it. Caches written by earlier
+        // heads carry marks that no evidence supports (fallback promotion
+        // and, older still, self-asserted roles); clear them now, post-load,
+        // before any selection can read them, and persist the cleaned rows.
+        if let Some(cache) = bootstrap_cache.as_ref() {
+            let cleared = clear_unsupported_helper_hint_marks(cache).await;
+            if cleared > 0 {
+                tracing::info!(
+                    cleared,
+                    "#1112: cleared unsupported helper hint marks from the bootstrap cache"
+                );
+                if let Err(e) = cache.save().await {
+                    tracing::warn!("#1112: failed to persist the cleared helper hint marks: {e}");
                 }
             }
         }
@@ -41216,6 +41321,307 @@ mod peer_connected_handler_integration_tests {
             assert!(
                 relays.is_empty() && coordinators.is_empty(),
                 "a relayed observation of a seed IP is evidence about the relay, not the peer"
+            );
+        }
+
+        // ── Round 25: cache-selected helpers need the row's own evidence ──
+
+        /// A loopback-only network for an Agent that must never reach the
+        /// real network: no seeds, no mDNS, no port mapping.
+        fn issue1112_loopback_network_config() -> network::NetworkConfig {
+            network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+                bootstrap_nodes: Vec::new(),
+                port_mapping_enabled: false,
+                mdns_enabled: false,
+                ..network::NetworkConfig::default()
+            }
+        }
+
+        fn issue1112_target(byte: u8, addr: &str) -> DiscoveredAgent {
+            DiscoveredAgent {
+                agent_id: identity::AgentId([byte; 32]),
+                machine_id: identity::MachineId([byte; 32]),
+                user_id: None,
+                addresses: vec![addr.parse().expect("target addr")],
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: vec![1],
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+                self_name: None,
+            }
+        }
+
+        fn issue1112_cache_config(
+            cache_dir: &std::path::Path,
+            persist: bool,
+        ) -> ant_quic::BootstrapCacheConfig {
+            ant_quic::BootstrapCacheConfig::builder()
+                .cache_dir(cache_dir)
+                .min_peers_to_save(1)
+                .persist(persist)
+                .build()
+        }
+
+        /// Round 25 (Codex P2 at d722045): ant-quic's `select_coordinators`
+        /// and `select_relay_peers` return unverified fallback rows by
+        /// design ("measure, don't trust"). The dial seeding marked every
+        /// returned row capable and persisted the mark through
+        /// `upsert_peer_hints`, so an address-only row — all a gossip
+        /// advert or machine-cache candidate contributes since David's
+        /// ruling — became a persistent helper on the next dial. A mark now
+        /// needs the row's own fresh Global-scope direct observation.
+        /// Runtime-RED at d722045: the fallback row carried both marks
+        /// after the first call.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue1112_cache_fallback_row_gains_no_helper_mark_across_dials() {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(issue1112_loopback_network_config())
+                .build()
+                .await
+                .expect("agent");
+            let network = agent.network().expect("network").clone();
+            let cache = network.bootstrap_cache().expect("endpoint cache");
+
+            // An address-only row: what the advert and machine-cache
+            // sources leave behind, and the selectors' fallback in a
+            // small cache.
+            let fallback = ant_quic::PeerId([0x5a; 32]);
+            let fallback_addr: std::net::SocketAddr = "203.0.113.5:5483".parse().unwrap();
+            network
+                .upsert_peer_hints(fallback, vec![fallback_addr], None)
+                .await
+                .expect("address hint");
+            let target = issue1112_target(0x77, "198.51.100.7:5483");
+
+            for round in 1..=3 {
+                agent
+                    .seed_transport_peer_hints_for_target(&network, &target)
+                    .await
+                    .expect("seed hints");
+                let row = cache.get_peer(&fallback).await.expect("fallback row");
+                assert!(
+                    !row.capabilities.hinted_supports_coordination
+                        && !row.capabilities.hinted_supports_relay,
+                    "round {round}: an unverified fallback row must not gain a persisted helper mark"
+                );
+                assert!(
+                    !row.capabilities.supports_coordination && !row.capabilities.supports_relay,
+                    "round {round}: no effective helper capability without direct evidence"
+                );
+                assert_eq!(
+                    row.addresses,
+                    vec![fallback_addr],
+                    "round {round}: the address hint itself is kept"
+                );
+            }
+
+            // Control: a row with fresh Global-scope direct evidence — the
+            // transport's own outbound-verified observation — is granted.
+            let verified = ant_quic::PeerId([0x5b; 32]);
+            let verified_addr: std::net::SocketAddr = "203.0.113.6:5483".parse().unwrap();
+            cache
+                .observe_direct_reachability(verified, verified_addr)
+                .await;
+            agent
+                .seed_transport_peer_hints_for_target(&network, &target)
+                .await
+                .expect("seed hints");
+            let row = cache.get_peer(&verified).await.expect("verified row");
+            assert!(
+                row.capabilities.hinted_supports_coordination
+                    && row.capabilities.hinted_supports_relay,
+                "fresh Global-scope direct evidence earns the helper marks"
+            );
+            let row = cache.get_peer(&fallback).await.expect("fallback row");
+            assert!(
+                !row.capabilities.hinted_supports_coordination
+                    && !row.capabilities.hinted_supports_relay,
+                "the fallback row stays unmarked beside a verified one"
+            );
+        }
+
+        /// Round 25: a persisted `hinted_supports_*` mark is sticky in
+        /// ant-quic (`record_assist_hints(false, false)` clears nothing), so
+        /// a cache written by an earlier head carries marks no evidence
+        /// supports. The Agent's post-load hook clears a mark unless the
+        /// row has fresh Global-scope direct evidence, and leaves every
+        /// address, direct observation and verified capability intact.
+        /// Runtime-RED at d722045: the legacy row kept both marks after
+        /// the reload.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue1112_unsupported_legacy_helper_marks_are_cleared_on_load() {
+            use ant_quic::bootstrap_cache::{CachedPeer, PeerSource};
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let cache_dir = dir.path().join("peers");
+            let legacy = ant_quic::PeerId([0x61; 32]);
+            let legacy_addr: std::net::SocketAddr = "203.0.113.61:5483".parse().unwrap();
+            let verified = ant_quic::PeerId([0x62; 32]);
+            let verified_addr: std::net::SocketAddr = "203.0.113.62:5483".parse().unwrap();
+            let plain = ant_quic::PeerId([0x63; 32]);
+            let plain_addr: std::net::SocketAddr = "203.0.113.63:5483".parse().unwrap();
+            {
+                // The cache an earlier head left on disk.
+                let cache =
+                    ant_quic::BootstrapCache::open(issue1112_cache_config(&cache_dir, true))
+                        .await
+                        .expect("open fixture cache");
+                let mut row = CachedPeer::new(legacy, vec![legacy_addr], PeerSource::Merge);
+                row.capabilities.record_assist_hints(true, true);
+                cache.upsert(row).await;
+                let mut row = CachedPeer::new(verified, vec![verified_addr], PeerSource::Merge);
+                row.capabilities.record_assist_hints(true, true);
+                row.capabilities
+                    .record_direct_observation(verified_addr, std::time::SystemTime::now());
+                cache.upsert(row).await;
+                cache
+                    .upsert(CachedPeer::new(plain, vec![plain_addr], PeerSource::Merge))
+                    .await;
+                cache.save().await.expect("save fixture cache");
+            }
+
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_dir(&cache_dir)
+                .with_network_config(issue1112_loopback_network_config())
+                .build()
+                .await
+                .expect("agent");
+            let cache = agent
+                .network()
+                .expect("network")
+                .bootstrap_cache()
+                .expect("endpoint cache");
+
+            let row = cache
+                .get_peer(&legacy)
+                .await
+                .expect("legacy row survives the load");
+            assert!(
+                !row.capabilities.hinted_supports_relay
+                    && !row.capabilities.hinted_supports_coordination,
+                "an unsupported legacy mark is cleared at load"
+            );
+            assert!(
+                !row.capabilities.supports_relay && !row.capabilities.supports_coordination,
+                "no effective capability remains once the unsupported mark is gone"
+            );
+            assert_eq!(
+                row.addresses,
+                vec![legacy_addr],
+                "the legacy row keeps its address"
+            );
+
+            let row = cache.get_peer(&verified).await.expect("verified row");
+            assert!(
+                row.capabilities.has_global_direct_reachability(),
+                "the direct observation is kept"
+            );
+            assert!(
+                row.capabilities.supports_relay && row.capabilities.supports_coordination,
+                "a row with fresh Global-scope direct evidence keeps its capability"
+            );
+            assert!(
+                row.capabilities.hinted_supports_relay
+                    && row.capabilities.hinted_supports_coordination,
+                "a mark the evidence supports is kept"
+            );
+
+            let row = cache.get_peer(&plain).await.expect("plain row");
+            assert_eq!(row.addresses, vec![plain_addr]);
+            assert!(!row.capabilities.supports_relay && !row.capabilities.supports_coordination);
+        }
+
+        /// Round 25: the helper-evidence predicate counts FRESH Global-scope
+        /// direct evidence only. A sticky mark alone, a LAN observation and
+        /// an expired global observation grant nothing; the cleanup clears
+        /// exactly the unsupported mark and is idempotent.
+        #[tokio::test]
+        async fn issue1112_helper_evidence_needs_fresh_global_direct_reachability() {
+            use ant_quic::bootstrap_cache::{CachedPeer, PeerSource};
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let cache = ant_quic::BootstrapCache::open(issue1112_cache_config(dir.path(), false))
+                .await
+                .expect("open cache");
+            let now = std::time::SystemTime::now();
+            let global_a: std::net::SocketAddr = "203.0.113.71:5483".parse().unwrap();
+            let global_b: std::net::SocketAddr = "203.0.113.72:5483".parse().unwrap();
+            let lan_addr: std::net::SocketAddr = "192.168.1.9:5483".parse().unwrap();
+
+            let marked = ant_quic::PeerId([0x71; 32]);
+            let mut row = CachedPeer::new(marked, vec![global_a], PeerSource::Merge);
+            row.capabilities.record_assist_hints(true, true);
+            cache.upsert(row).await;
+
+            let lan = ant_quic::PeerId([0x72; 32]);
+            let mut row = CachedPeer::new(lan, vec![lan_addr], PeerSource::Merge);
+            row.capabilities.record_direct_observation(lan_addr, now);
+            cache.upsert(row).await;
+
+            let stale = ant_quic::PeerId([0x73; 32]);
+            let mut row = CachedPeer::new(stale, vec![global_a], PeerSource::Merge);
+            row.capabilities.record_direct_observation(
+                global_a,
+                now - cache.config().reachability_ttl - std::time::Duration::from_secs(60),
+            );
+            cache.upsert(row).await;
+
+            let fresh = ant_quic::PeerId([0x74; 32]);
+            let mut row = CachedPeer::new(fresh, vec![global_b], PeerSource::Merge);
+            row.capabilities.record_direct_observation(global_b, now);
+            cache.upsert(row).await;
+
+            for (peer, expected, why) in [
+                (marked, false, "a sticky mark alone is not evidence"),
+                (lan, false, "a LAN observation is not global evidence"),
+                (
+                    stale,
+                    false,
+                    "an expired global observation is not fresh evidence",
+                ),
+                (fresh, true, "a fresh global observation is evidence"),
+            ] {
+                let row = cache.get_peer(&peer).await.expect("row");
+                assert_eq!(
+                    cache_row_has_verified_helper_evidence(&row),
+                    expected,
+                    "{why}"
+                );
+            }
+
+            assert_eq!(
+                clear_unsupported_helper_hint_marks(&cache).await,
+                1,
+                "exactly the unsupported mark is cleared"
+            );
+            let row = cache.get_peer(&marked).await.expect("marked row");
+            assert!(
+                !row.capabilities.hinted_supports_relay
+                    && !row.capabilities.hinted_supports_coordination
+                    && !row.capabilities.supports_relay
+                    && !row.capabilities.supports_coordination
+            );
+            assert_eq!(row.addresses, vec![global_a], "the address is kept");
+            assert_eq!(
+                clear_unsupported_helper_hint_marks(&cache).await,
+                0,
+                "a second pass finds nothing to clear"
             );
         }
     }

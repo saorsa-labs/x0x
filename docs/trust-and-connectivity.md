@@ -141,12 +141,15 @@ completion order. An entry with no generation evidence (the mismatching
 connection closed before capture) stays address-scoped: it refuses a
 session on its own address only, never the identity's sessions elsewhere.
 Independent of every recorded entry, the guards also apply the timeless
-pair verdict to the live session and connection set whenever any pin row
-exists — with no entry and after an entry expires: the session lookup
-reads the winner map the transport reader actually uses, which does not
-depend on the `connected_peers()` metadata a freshly materialized
-internal connection may not have registered yet, and every current
-connection of the identity is checked against the pin rows too. A frame
+pair verdict to the current session whenever any pin row exists — with
+no entry and after an entry expires: the session lookup reads the winner
+map the transport reader actually uses, which does not depend on the
+`connected_peers()` metadata a freshly materialized internal connection
+may not have registered yet. The walk over EVERY current connection of
+the identity fires only for an identity with a live rejection entry
+(Engineer ruling, 23 Oct 2026): entry-less identities — including every
+pin-matching seed, whatever its ledger history — never pay the
+connection-list scan on the receive path. A frame
 is additionally refused by its SOURCE session: a session-address ledger
 (recorded at the dial seams, the accept loop, the receive pump while a
 generation is live, and by an always-on lifecycle watcher on every
@@ -220,8 +223,17 @@ but no hint, join or selection path reads them: a peer that only
 self-asserts the flags gets no hint. The same applies to the transport
 helper hints (`seed_transport_peer_hints_for_target`, `src/lib.rs`):
 gossip-advert roles and machine-cache flags contribute address hints
-only, never coordinator/relay capability marks — the seeds keep theirs
-through ant-quic's deployment-configured bootstrap cache.
+only, never coordinator/relay capability marks — and so do the rows
+ant-quic's own `select_coordinators` / `select_relay_peers` return, which
+deliberately include unverified fallback peers ("measure, don't trust").
+A capability mark is fed to ant-quic only when the row carries its own
+fresh Global-scope direct observation — evidence this node's outbound
+dial created and no announcement can forge. ant-quic persists a
+higher-layer mark as a sticky `hinted_supports_*` bit that a false hint
+cannot clear, so at load x0x clears every persisted mark the row's
+current direct evidence does not support (addresses, direct observations
+and statistics are kept); marks older heads wrote by self-assertion or
+fallback promotion disappear at the next start.
 
 A pin-mismatched (observed address, identity) PAIR is excluded from the
 tier — pair-scoped, never identity-wide, so a mismatch at one seed
