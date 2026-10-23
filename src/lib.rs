@@ -9601,14 +9601,6 @@ impl Agent {
             tracing::info!("Presence system shut down");
         }
 
-        if let Some(ref cache) = self.bootstrap_cache {
-            if let Err(e) = cache.save().await {
-                tracing::warn!("Failed to save bootstrap cache on shutdown: {e}");
-            } else {
-                tracing::info!("Bootstrap cache saved on shutdown");
-            }
-        }
-
         // Issue #110 Phase 2: tear down the gossip runtime and the QUIC node so
         // an in-process embedder gets the socket and all background tasks back
         // when `shutdown()` returns. The gossip runtime's dispatcher/peer-sync/
@@ -9639,6 +9631,49 @@ impl Agent {
                 shutdown_errors.push(format!("network node: {e}"));
             } else {
                 tracing::info!("Network node shut down");
+            }
+        }
+
+        // Final cache save follows gossip/network teardown. save() alone neither
+        // fsyncs nor removes an old snapshot when the final cache is empty.
+        if let Some(cache) = self
+            .bootstrap_cache
+            .as_ref()
+            .filter(|cache| cache.config().persist)
+        {
+            // Non-Unix keeps ordinary shutdown; the M2 receipt clock is unsupported.
+            #[cfg(not(unix))]
+            let flushed = cache.save().await;
+            #[cfg(unix)]
+            let flushed: std::io::Result<()> = async {
+                let config = cache.config();
+                let path = config.cache_dir.join("bootstrap_cache.json");
+                let count = cache.peer_count().await;
+                if count == 0 {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    tokio::fs::File::open(&config.cache_dir)
+                        .await?
+                        .sync_all()
+                        .await
+                } else {
+                    if count < config.min_peers_to_save {
+                        return Err(std::io::Error::other(
+                            "cache save threshold would skip the final snapshot",
+                        ));
+                    }
+                    cache.save().await?;
+                    storage::confirm_published_durability(&path)
+                        .await
+                        .map_err(std::io::Error::other)
+                }
+            }
+            .await;
+            if let Err(error) = flushed {
+                shutdown_errors.push(format!("bootstrap cache: {error}"));
             }
         }
 
@@ -41702,3 +41737,8 @@ mod issue1099_tests;
 
 #[cfg(test)]
 mod issue1239_tests;
+
+#[cfg(test)]
+include!("../tests/upgrade_cache_flush.rs");
+#[cfg(test)]
+upgrade_cache_flush_tests!();
