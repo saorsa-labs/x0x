@@ -1041,8 +1041,9 @@ pub(super) async fn note_handoff_renewal(
 /// member's current verified advert sets `certificate_rebind_v1`.
 ///
 /// Returns whether the row was handled here: the rebind committed, or a
-/// rebind is due but this replica's head is not synced (§2), so the row
-/// waits with `waiting_for_head_sync` and retries next tick rather than
+/// rebind is due but this replica's head is not synced (§2) or a local
+/// write failed, so the row waits (`waiting_for_head_sync`,
+/// `waiting_for_durable_intake`) and retries next tick rather than
 /// evicting. On `false` the caller evicts.
 pub(super) async fn try_admin_rebind(
     state: &Arc<AppState>,
@@ -1114,14 +1115,22 @@ pub(super) async fn try_admin_rebind(
         // higher-head evidence is required. A rebind is due, so an
         // unsynced head waits; it never evicts instead.
         Err(CommitError::HeadNotSynced) => {
-            let mut inner = state.revocation_evictions.inner.lock().await;
-            inner.attempt_wait.insert(
-                key.clone(),
-                WaitingState::cause(WaitingCause::WaitingForHeadSync),
+            wait_and_retry(state, key, WaitingCause::WaitingForHeadSync).await;
+            true
+        }
+        // §4a (ZCode MAJOR 3, #1533 rc13): a local storage fault (the
+        // `.crblog` frame or the group record was not written) is not a
+        // reason to evict. The seat holds a verified renewal and every
+        // member can take the rebind, so the row waits and retries next
+        // tick. Only a refusal of the renewal itself evicts.
+        Err(CommitError::Persist(error)) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_key),
+                target = %LogHexId::agent(&hex::encode(key.target)),
+                %error,
+                "ADR 0110 S4: admin certificate rebind not persisted; retrying, not evicting"
             );
-            inner
-                .next_attempt
-                .insert(key.clone(), Instant::now() + super::S4_WORKER_TICK);
+            wait_and_retry(state, key, WaitingCause::WaitingForDurableIntake).await;
             true
         }
         Ok(_) => {
@@ -1144,6 +1153,17 @@ pub(super) async fn try_admin_rebind(
             false
         }
     }
+}
+
+/// A due admin rebind waits with `cause` and runs again next tick.
+async fn wait_and_retry(state: &AppState, key: &EvictionKey, cause: WaitingCause) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner
+        .attempt_wait
+        .insert(key.clone(), WaitingState::cause(cause));
+    inner
+        .next_attempt
+        .insert(key.clone(), Instant::now() + super::S4_WORKER_TICK);
 }
 
 // ─── Worker ────────────────────────────────────────────────────────────────
@@ -3004,6 +3024,113 @@ pub(super) mod restart_tests {
         }
         info.recompute_state_hash();
         Ok(info)
+    }
+
+    /// ZCode MAJOR 3 (ADR 0110 §4a, #1533 rc13): the designated admin
+    /// holds a verified renewal for an expiry-only seat and every member
+    /// can take the rebind, but the local group write fails. The row must
+    /// wait and retry, never evict the still-valid member; the next try
+    /// commits the rebind. Before the fix any error but `HeadNotSynced`
+    /// returned `false`, and the caller ran `commit_removal`.
+    #[tokio::test]
+    async fn an_admin_rebind_persist_failure_retries_and_never_evicts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let seat = AgentKeypair::generate()?;
+        let seat_id = seat.agent_id();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let info = certified_group(&owner, state.agent.identity().agent_keypair(), &[&seat])?;
+        hold_persisted(&state, &info).await?;
+        let group_key = info.stable_group_id().to_string();
+        let seat_hex = hex::encode(seat_id.as_bytes());
+        let old_digest = info
+            .members_v2
+            .get(&seat_hex)
+            .and_then(cr::committed_digest)
+            .context("the seat's committed digest")?;
+        // D129: the seat's current verified advert sets the bit.
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            seat_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        let key = EvictionKey::new(group_key.clone(), *seat_id.as_bytes());
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, &seat, Some(now_unix_ms() / 1000 + 6000))?;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                group_key.clone(),
+                HeadRound::new(&info.state_hash, Instant::now()),
+            );
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::CertificateExpiry {
+                    certificate_digest: old_digest.clone(),
+                    not_after: now_unix_ms() / 1000,
+                },
+                None,
+                now_unix_ms(),
+                [0; 16],
+            );
+            inner.rebind.renewals.insert(key.clone(), renewal);
+        }
+
+        let blocked = block_install(&state).await?;
+        assert!(
+            try_admin_rebind(&state, &key, &group_key).await,
+            "a local write failure is handled here; the caller must not evict"
+        );
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.attempt_wait.get(&key).map(|wait| wait.cause),
+                Some(WaitingCause::WaitingForDurableIntake)
+            );
+            assert!(inner.next_attempt.contains_key(&key), "retried next tick");
+            assert!(
+                inner.rebind.renewals.contains_key(&key),
+                "the renewal is kept"
+            );
+        }
+        unblock_install(blocked).await?;
+
+        assert!(try_admin_rebind(&state, &key, &group_key).await);
+        let rebound = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .context("group")?;
+        let member = rebound.members_v2.get(&seat_hex).context("the seat")?;
+        assert_eq!(member.state, GroupMemberState::Active, "the seat stays");
+        assert_ne!(
+            cr::committed_digest(member),
+            Some(old_digest),
+            "the retry commits the rebind"
+        );
+        assert!(!state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .attempt_wait
+            .contains_key(&key));
+        state.agent.shutdown().await;
+        Ok(())
     }
 
     /// ADR 0110 §4a run (10): the chain the receiver holds when a delayed
