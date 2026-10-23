@@ -1913,6 +1913,11 @@ pub fn treekem_epoch_of(commit: &crate::groups::state_commit::GroupStateCommit) 
 /// change and a GSS security-binding change, and takes no tree and no
 /// epoch: the TreeKEM commit is skipped.
 ///
+/// The committer must be an admin, with the one exception the chain walk
+/// also takes (ADR 0110 §4, D129): a certificate self-rebind link, signed
+/// by the seat's own Active agent and changing only that seat's
+/// certificate digest, needs only that seat (#1533 rc13).
+///
 /// # Errors
 ///
 /// The refusal reason.
@@ -1932,8 +1937,19 @@ pub fn apply_link_state_only(
         members_v2: &current.members_v2,
         group_id: current.stable_group_id(),
     };
-    sc::validate_apply(&ctx, commit, sc::ActionKind::AdminOrHigher)
-        .map_err(|_| "link fails validate_apply")?;
+    let self_rebind = sc::compute_public_meta_hash(&current.public_meta())
+        == commit.public_meta_hash
+        && crate::groups::cert_rebind::is_self_rebind_link(
+            &sc::roster_projection(&current.members_v2),
+            &link.roster,
+            &commit.committed_by,
+        );
+    let action = if self_rebind {
+        sc::ActionKind::MemberSelf
+    } else {
+        sc::ActionKind::AdminOrHigher
+    };
+    sc::validate_apply(&ctx, commit, action).map_err(|_| "link fails validate_apply")?;
     if commit.policy_hash != crate::groups::compute_policy_hash(&current.policy) {
         return Err("link changes the policy hash");
     }
@@ -2869,6 +2885,91 @@ mod tests {
             links[0].commit.revision,
             &links[0].commit.state_hash
         ));
+    }
+
+    /// #1533 rc13 (Codex P2 @c226d28e and @c4467dfc), S3 × S4: a served
+    /// chain that holds an ordinary member's certificate self-rebind (ADR
+    /// 0110 §4, D129) walks with `validate_alternate_chain`, so a
+    /// pre-Welcome joiner applies it state-only too. Before the fix the
+    /// state-only apply asked for an admin and refused the link that the
+    /// walk had accepted. A member's link that changes anything else still
+    /// needs an admin.
+    #[test]
+    fn a_self_rebind_link_applies_state_only_as_the_walk_accepts_it() {
+        use crate::groups::state_commit as sc;
+        let admin = keypair();
+        let member = keypair();
+        let member_hex = hex::encode(member.agent_id().as_bytes());
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            "d".to_string(),
+            admin.agent_id(),
+            "ac".repeat(16),
+        );
+        info.add_member(
+            member_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        let set_digest = |info: &mut GroupInfo, digest: &str| {
+            if let Some(seat) = info.members_v2.get_mut(&member_hex) {
+                seat.certificate_digest = Some(digest.repeat(32));
+            }
+        };
+        set_digest(&mut info, "c1");
+        info.seal_commit(&admin, 1_000).expect("seal base");
+        let base = info.clone();
+        // The member renews its own certificate (S4 self-rebind) ...
+        set_digest(&mut info, "c2");
+        info.seal_commit(&member, 2_000).expect("seal self-rebind");
+        // ... then an admin seals the terminal (the walk takes a terminal
+        // with the reconstruction's metadata: a roster change).
+        info.add_member(
+            "m3".repeat(32),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        info.seal_commit(&admin, 3_000).expect("seal terminal");
+        let links: Vec<_> = info
+            .commit_log
+            .iter()
+            .filter(|entry| entry.commit.revision > base.state_revision)
+            .cloned()
+            .collect();
+        assert_eq!(links.len(), 2);
+        let walk_base = sc::AlternateChainBase {
+            group_id: base.stable_group_id(),
+            base_revision: base.state_revision,
+            base_state_hash: &base.state_hash,
+            roster: &sc::roster_projection(&base.members_v2),
+            meta: &base.public_meta(),
+            policy_hash: &crate::groups::compute_policy_hash(&base.policy),
+        };
+        let walked = sc::validate_alternate_chain(&walk_base, &links[..1], &links[1].commit);
+        assert!(walked.is_ok(), "{:?}", walked.err());
+        let rebound = apply_link_state_only(&base, &links[0]).expect("self-rebind link");
+        assert_eq!(rebound.state_hash, links[0].commit.state_hash);
+        let terminal = apply_link_state_only(&rebound, &links[1]).expect("terminal link");
+        assert_eq!(terminal.state_hash, info.state_hash);
+
+        // The member's link that renames the group is not a self-rebind.
+        let mut other = base.clone();
+        other.name = "member rename".to_string();
+        other
+            .seal_commit(&member, 2_000)
+            .expect("seal member rename");
+        let link = other
+            .commit_log
+            .iter()
+            .find(|entry| entry.commit.revision == other.state_revision)
+            .cloned()
+            .expect("link");
+        assert_eq!(
+            apply_link_state_only(&base, &link).map(|_| ()),
+            Err("link fails validate_apply")
+        );
     }
 
     #[test]
