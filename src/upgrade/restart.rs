@@ -196,7 +196,7 @@ pub const fn supervised_exit_code() -> i32 {
 /// been restored, the upgrade is marked failed, and the service manager
 /// restarts the daemon on the old version instead of finding a live process
 /// with no API and no network.
-pub const fn flush_failure_exit_code() -> i32 {
+pub(crate) const fn flush_failure_exit_code() -> i32 {
     75
 }
 

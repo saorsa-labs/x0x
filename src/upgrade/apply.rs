@@ -1681,23 +1681,6 @@ impl AutoApplyUpgrader {
                         // restore every binary this transaction swapped, and
                         // exit EX_TEMPFAIL so the service manager restarts
                         // the daemon on the old version.
-                        let restore_set: Vec<(PathBuf, PathBuf)> =
-                            self.swapped_artifacts.clone().unwrap_or_else(|| {
-                                vec![(
-                                    plan.executable.clone(),
-                                    plan.executable.with_extension("backup"),
-                                )]
-                            });
-                        error!(
-                            error = %failure,
-                            installed_bytes = true,
-                            restored_bytes = true,
-                            restart = "not_started",
-                            recovery = "exited_tempfail",
-                            "supervised shutdown flush failed after the daemon stopped; \
-                             the binaries this transaction swapped are restored and the \
-                             process exits EX_TEMPFAIL for a supervisor restart"
-                        );
                         if let Err(hold_error) = super::shutdown_flush::hold_failed_release(
                             &plan.data_root,
                             target_version,
@@ -1709,16 +1692,45 @@ impl AutoApplyUpgrader {
                                  automatic check may retry this release once more"
                             );
                         }
-                        if let Err(restore_error) = super::restore_swapped_binaries(&restore_set) {
-                            error!(
-                                error = %restore_error,
-                                restore_set = ?restore_set
-                                    .iter()
-                                    .map(|(target, _)| target.display().to_string())
-                                    .collect::<Vec<_>>(),
-                                "cannot restore the swapped binaries; manual recovery applies"
-                            );
-                        }
+                        // No swap manifest means no fresh backup this
+                        // transaction owns. Restoring `<exe>.backup` could
+                        // install a backup an earlier upgrade left (engineer
+                        // call, 23 Oct 2026), so refuse the restore and log
+                        // it; manual recovery applies.
+                        let restored_bytes = match self.swapped_artifacts.as_deref() {
+                            Some(swapped) => match super::restore_swapped_binaries(swapped) {
+                                Ok(()) => true,
+                                Err(restore_error) => {
+                                    error!(
+                                        error = %restore_error,
+                                        restore_set = ?swapped
+                                            .iter()
+                                            .map(|(target, _)| target.display().to_string())
+                                            .collect::<Vec<_>>(),
+                                        "cannot restore the swapped binaries; \
+                                         manual recovery applies"
+                                    );
+                                    false
+                                }
+                            },
+                            None => {
+                                error!(
+                                    "no swapped-artifact manifest for this transaction; \
+                                     no backup is restored because none is known to be \
+                                     fresh; manual recovery applies"
+                                );
+                                false
+                            }
+                        };
+                        error!(
+                            error = %failure,
+                            installed_bytes = true,
+                            restored_bytes = restored_bytes,
+                            restart = "not_started",
+                            recovery = "exited_tempfail",
+                            "supervised shutdown flush failed after the daemon stopped; \
+                             the process exits EX_TEMPFAIL for a supervisor restart"
+                        );
                         exit(restart::flush_failure_exit_code());
                         #[allow(unreachable_code)]
                         return Err(UpgradeError::Other(format!(

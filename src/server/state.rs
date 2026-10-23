@@ -356,7 +356,7 @@ pub struct DaemonConfig {
 
     /// Update configuration.
     #[serde(default)]
-    pub update: DaemonUpdateConfig,
+    pub(super) update: DaemonUpdateConfig,
 
     /// ADR-0023 durable local history (TOML `[history]`). Default-on in the
     /// daemon; `history.enabled = false` is the escape hatch. The database
@@ -611,7 +611,7 @@ fn default_log_format() -> String {
 
 /// Update configuration for x0xd daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonUpdateConfig {
+pub(super) struct DaemonUpdateConfig {
     /// Enable listening for release manifests via gossip and the GitHub fallback poll.
     #[serde(default = "default_true")]
     pub(super) enabled: bool,
@@ -664,12 +664,6 @@ impl Default for DaemonUpdateConfig {
             include_prereleases: false,
             gossip_updates: true,
         }
-    }
-}
-
-impl DaemonUpdateConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        Ok(())
     }
 }
 
