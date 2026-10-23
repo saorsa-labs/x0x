@@ -79,6 +79,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::owner_recovery::LaterAdminKey;
 use crate as x0x;
 use crate::server::state::AppState;
 use x0x::groups::crypto_exclusion as ce;
@@ -2010,7 +2011,9 @@ pub(in crate::server) async fn receive(
 /// actor promoted on this frame's result and that this node does not know
 /// as an admin yet ([`super::owner_recovery::promoted_admin_secret`]). The
 /// frame then installs with that secret, and the held promotion and the
-/// parked share replay after it.
+/// parked share replay after it. #1508 rc15: when that admin's held
+/// rotation moved the group past this frame's epoch, the frame installs as
+/// an intermediate head ([`LaterAdminKey::Superseded`]).
 async fn install_gss(
     state: &Arc<AppState>,
     group_key: &str,
@@ -2046,6 +2049,7 @@ async fn install_gss(
         }
         None => None,
     };
+    let superseded = promoted == Some(LaterAdminKey::Superseded);
     if waiting && promoted.is_none() {
         tracing::info!(
             group_id = %LogHexId::group(group_key),
@@ -2073,8 +2077,14 @@ async fn install_gss(
             // The secret and its epoch came with the share (checked above),
             // or from a later admin's share.
             next.roster_revision = ng::adopt_roster_revision(next.roster_revision, roster_revision);
-            if let Some(secret) = promoted {
-                next.shared_secret = Some(secret.to_vec());
+            // #1508 rc15: a superseded frame installs as an intermediate
+            // head with no secret; the held chain replays on it and
+            // installs the later secret.
+            if let Some(key) = promoted {
+                next.shared_secret = match key {
+                    LaterAdminKey::Exact(secret) => Some(secret.to_vec()),
+                    LaterAdminKey::Superseded => None,
+                };
                 next.secret_epoch = next_secret_epoch;
             }
             next.security_binding = Some(ce::gss_binding(next_secret_epoch));
@@ -2103,9 +2113,14 @@ async fn install_gss(
         group_id = %LogHexId::group(group_key),
         secret_epoch = next_secret_epoch,
         from_later_admin = promoted.is_some(),
-        "ADR 0110 S4: GSS crypto-only exclusion installed with its new secret"
+        superseded,
+        "ADR 0110 S4: GSS crypto-only exclusion installed"
     );
-    ng::gss_share_hold::release_exclusions(state, group_key, next_secret_epoch).await;
+    // An intermediate head holds no secret of this epoch: its hold stays
+    // until the later secret installs ([`ng::gss_share_hold::holds`]).
+    if !superseded {
+        ng::gss_share_hold::release_exclusions(state, group_key, next_secret_epoch).await;
+    }
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
 }

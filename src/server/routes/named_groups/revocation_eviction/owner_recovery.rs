@@ -1769,6 +1769,25 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
     Some((*secret_epoch, secret))
 }
 
+/// What [`promoted_admin_secret`] found for a waiting GSS transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum LaterAdminKey {
+    /// The secret of the transition's epoch: the transition installs with
+    /// it.
+    Exact([u8; 32]),
+    /// #1508 rc15 (Codex P1): the checked held chain rotates past the
+    /// transition's epoch, and a share of the chain's later epoch opens.
+    /// No holder seals the transition's own secret any more, so the
+    /// transition installs as an intermediate head with no secret (the old
+    /// secret is dropped, so nothing is sealed under it). The held chain
+    /// then replays on it, and its last rotation installs the later secret
+    /// through the ordinary apply. The only delivery that this keyless head
+    /// can end is that of the transition's own secret, which the later
+    /// secret supersedes; the later rotation's delivery stays open until
+    /// this node's head reaches it, with its key.
+    Superseded,
+}
+
 /// #1508 rc13/rc14 (Codex P1): the secret of `epoch` for a GSS removal,
 /// ban or crypto-only exclusion whose verified, keyless result is
 /// `result`, from a later admin. The transition's actor can promote an
@@ -1789,11 +1808,17 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
 /// head still means that the key is installed: a keyless head could end a
 /// key delivery that later same-epoch commits keep open. The ordinary
 /// apply checks the held commits again when they replay.
+///
+/// #1508 rc15 (Codex P1): the walk also follows a held GSS removal or ban
+/// that an admin of the walked roster signed, which rotates to a later
+/// epoch. Catch-up seals the current secret only, so after such a rotation
+/// no holder seals `epoch`'s secret any more. A share of the later epoch
+/// from an admin of that later roster gives [`LaterAdminKey::Superseded`].
 pub(in crate::server) async fn promoted_admin_secret(
     state: &AppState,
     result: &GroupInfo,
     epoch: u64,
-) -> Option<[u8; 32]> {
+) -> Option<LaterAdminKey> {
     let stable_group_id = result.stable_group_id().to_string();
     let now = Instant::now();
     let (held, parked): (Vec<HeldEvent>, Vec<ParkedShare>) = {
@@ -1839,6 +1864,7 @@ pub(in crate::server) async fn promoted_admin_secret(
                 .collect::<Vec<_>>(),
         )
     };
+    // A share of the roster's own epoch from an admin of that roster.
     let admin_share = |roster: &GroupInfo| {
         parked
             .iter()
@@ -1848,7 +1874,7 @@ pub(in crate::server) async fn promoted_admin_secret(
                     .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
             })
             .find_map(|share| match open_parked_share(state, share) {
-                Some((at, secret)) if at == epoch => Some(secret),
+                Some((at, secret)) if at == roster.secret_epoch => Some(secret),
                 _ => None,
             })
     };
@@ -1857,7 +1883,11 @@ pub(in crate::server) async fn promoted_admin_secret(
     // to the held set.
     for _ in 0..=held.len() {
         if let Some(secret) = admin_share(&cursor) {
-            return Some(secret);
+            return Some(if cursor.secret_epoch == epoch {
+                LaterAdminKey::Exact(secret)
+            } else {
+                LaterAdminKey::Superseded
+            });
         }
         match held.iter().find_map(|held| next_held_state(&cursor, held)) {
             Some(next) => cursor = next,
@@ -1869,7 +1899,8 @@ pub(in crate::server) async fn promoted_admin_secret(
 
 /// The state after the held commit `held` on `cursor`, checked as the
 /// ordinary apply checks it, or `None`. Only same-epoch roster and
-/// metadata steps are walked (a role update or a rename); any other event,
+/// metadata steps (a role update or a rename) and an admin's GSS removal
+/// or ban to a later epoch (#1508 rc15) are walked; any other event,
 /// or one that fails a check, ends the walk, and the transition keeps
 /// waiting for its share.
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
@@ -1939,10 +1970,78 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 },
             )
         }
+        // #1508 rc15 (Codex P1): a later admin's GSS rotation, checked as
+        // the ordinary removal and ban apply checks it.
+        Event::MemberRemoved {
+            revision,
+            actor,
+            agent_id,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(to),
+            ..
+        } => {
+            let target = cursor.members_v2.get(agent_id)?;
+            if !admin(actor) || target.is_removed() || target.is_banned() {
+                return None;
+            }
+            return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                next.remove_member(agent_id, Some(actor.clone()));
+            });
+        }
+        Event::MemberBanned {
+            revision,
+            actor,
+            agent_id,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(to),
+            ..
+        } => {
+            if !admin(actor)
+                || cursor
+                    .members_v2
+                    .get(agent_id)
+                    .is_some_and(|m| m.is_banned())
+            {
+                return None;
+            }
+            return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                next.ban_member(agent_id, Some(actor.clone()));
+            });
+        }
         _ => return None,
     }
     .ok()?;
     (next.secret_epoch == cursor.secret_epoch).then_some(next)
+}
+
+/// The state after a held GSS removal or ban that rotates `cursor` to the
+/// later epoch `to`, with no secret ([`next_held_state`]).
+fn gss_rotation_step(
+    cursor: &GroupInfo,
+    commit: &x0x::groups::GroupStateCommit,
+    revision: u64,
+    to: u64,
+    seat: impl FnOnce(&mut GroupInfo),
+) -> Option<GroupInfo> {
+    if cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem || to <= cursor.secret_epoch {
+        return None;
+    }
+    super::super::apply_stateful_event_to_group(
+        cursor,
+        commit,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.roster_revision =
+                super::super::adopt_roster_revision(next.roster_revision, revision);
+            seat(next);
+            next.secret_epoch = to;
+            next.security_binding = Some(orc::gss_binding(to));
+            next.shared_secret = None;
+        },
+    )
+    .ok()
 }
 
 /// #1508 rc12 (Codex P1): hold a verified commit of a GSS group that does
@@ -1956,27 +2055,28 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
 /// applies the held commits after the install, each as its verified
 /// signer (the catch-up rule for a relayed removal), so the ordinary apply
 /// checks every signer's authority on the chain. Nothing is applied here.
-/// Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`].
+/// Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`]. Returns whether
+/// the event was held now (not held before).
 pub(in crate::server) async fn hold_unchained_event(
     state: &AppState,
     event: &super::super::NamedGroupMetadataEvent,
-) {
+) -> bool {
     let Some(commit) = super::super::named_group_metadata_event_commit(event) else {
-        return;
+        return false;
     };
     let group_id = super::super::named_group_metadata_event_group_id(event);
     let Some(info) = ({
         let groups = state.named_groups.read().await;
         crate::server::resolve_group_entry_locked(&groups, group_id).map(|(_, info)| info.clone())
     }) else {
-        return;
+        return false;
     };
     if info.withdrawn
         || orc::crypto_kind(&info) != orc::RecoveryCryptoKind::Gss
         || commit.revision <= info.state_revision
         || commit.prev_state_hash.as_deref() == Some(info.state_hash.as_str())
     {
-        return;
+        return false;
     }
     let now = Instant::now();
     {
@@ -1990,14 +2090,14 @@ pub(in crate::server) async fn hold_unchained_event(
             .iter()
             .any(|held| held.event == *event)
         {
-            return;
+            return false;
         }
     }
     if commit.verify_structure().is_err() {
-        return;
+        return false;
     }
     let Ok(author) = super::super::parse_agent_id_hex(&commit.committed_by) else {
-        return;
+        return false;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
     let kept = &mut inner.orc.held_events;
@@ -2015,6 +2115,7 @@ pub(in crate::server) async fn hold_unchained_event(
     drop(inner);
     // A stashed frame can wait for this commit (#1508 rc13).
     state.agent.s4_revocation_intake().request_reconcile();
+    true
 }
 
 /// Whether this node holds a verified commit that `actor` signed on the

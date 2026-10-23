@@ -675,6 +675,24 @@ impl ObligationStore {
         }
     }
 
+    /// Reopen a completed row whose completion proof is gone: this node's
+    /// tree holds the target's leaf again (#1508 rc15). Returns whether the
+    /// row changed.
+    pub fn reopen_complete(
+        &mut self,
+        key: &EvictionKey,
+        now_unix_ms: u64,
+        boot_id: [u8; 16],
+    ) -> bool {
+        match self.rows.get_mut(key) {
+            Some(row) if row.phase == Phase::Complete => {
+                row.reopen(now_unix_ms, boot_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Mark a row complete with the verified exclusion's head and epoch.
     /// Returns whether the row changed.
     pub fn complete(
