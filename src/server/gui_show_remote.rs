@@ -48,10 +48,19 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
     };
 
     let remote_enabled = state.gui_show.config().remote_enabled;
-    let blocked = state.gui_show.is_blocked(&typed.sender);
-    let preview = receive_action(&ingress, remote_enabled, blocked, false);
-    let rate_limited = if matches!(preview, ReceiveAction::Display { .. }) {
-        !state.gui_show.try_rate_limit(&typed.sender, Instant::now())
+    let control = show_control(state, &typed.sender, &ingress);
+    let blocked = match &control {
+        Some(agent) => state.gui_show.is_blocked(agent),
+        None => false,
+    };
+    let mut preview = receive_action(&ingress, remote_enabled, blocked, false);
+    // A rider subject that names this daemon, or is empty, must not display.
+    // Replay and stale_request keep their own results.
+    if control.is_none() && matches!(preview, ReceiveAction::Display { .. }) {
+        preview = ReceiveAction::Reply(crate::gui::GuiShowOutcome::Refused);
+    }
+    let rate_limited = if let (Some(agent), ReceiveAction::Display { .. }) = (&control, &preview) {
+        !state.gui_show.try_rate_limit(agent, Instant::now())
     } else {
         false
     };
@@ -80,10 +89,14 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
                 finish(typed, DmTypedPayloadCompletion::Inserted);
                 return;
             };
+            let Some(sender) = control else {
+                finish(typed, DmTypedPayloadCompletion::Inserted);
+                return;
+            };
             let request_id_hex = hex::encode(request_id);
             let outcome = deliver_remote_show(
                 state,
-                typed.sender,
+                sender,
                 typed.machine_id,
                 &route,
                 via_rider,
@@ -111,7 +124,10 @@ async fn handle_show_result(state: &Arc<AppState>, typed: DmTypedPayload) {
         return;
     }
     if let Some(result) = decode_show_result(&typed.payload) {
-        state.gui_show.remote_hub().complete_show(result);
+        state
+            .gui_show
+            .remote_hub()
+            .complete_show(&typed.sender, &typed.machine_id, result);
     }
     finish(typed, DmTypedPayloadCompletion::Inserted);
 }
@@ -126,16 +142,16 @@ async fn handle_activity(state: &Arc<AppState>, typed: DmTypedPayload) {
         ActivityIngress::Ignore => finish(typed, DmTypedPayloadCompletion::Inserted),
         ActivityIngress::Query { request_id } => {
             let remote_enabled = state.gui_show.config().remote_enabled;
-            let body = activity_reply(
-                request_id,
-                remote_enabled,
-                state.gui_show.last_gui_visible_at(),
-            );
+            let visible = crate::server::routes::gui_show::fresh_gui_visible_at(state).await;
+            let body = activity_reply(request_id, remote_enabled, visible);
             send_activity(state, typed.sender, body).await;
             finish(typed, DmTypedPayloadCompletion::Inserted);
         }
         ActivityIngress::Reply(body) => {
-            state.gui_show.remote_hub().complete_activity(body);
+            state
+                .gui_show
+                .remote_hub()
+                .complete_activity(&typed.sender, &typed.machine_id, body);
             finish(typed, DmTypedPayloadCompletion::Inserted);
         }
     }
@@ -159,6 +175,22 @@ async fn deliver_remote_show(
         request_id_hex,
     )
     .await
+}
+
+/// Agent id the target blocks, rate-limits and names on the banner.
+///
+/// `None` for an untrusted ingress, or a rider subject this daemon must
+/// refuse. The envelope signer stays the daemon that holds the rider token.
+fn show_control(state: &AppState, envelope: &AgentId, ingress: &ShowIngress) -> Option<AgentId> {
+    let ShowIngress::Trusted(show) = ingress else {
+        return None;
+    };
+    let bytes = crate::gui::remote::show_subject(
+        envelope.as_bytes(),
+        &show.request,
+        state.agent.agent_id().as_bytes(),
+    )?;
+    Some(AgentId(bytes))
 }
 
 fn request_id_of(ingress: &ShowIngress) -> Option<[u8; 16]> {
@@ -371,6 +403,7 @@ mod adr_remote {
             view: "people".into(),
             issued_at: now,
             via_rider: false,
+            subject: [0; 32],
         }
         .to_dm_payload()
         .expect("encode");
@@ -531,6 +564,7 @@ mod adr_remote {
             view: "people".into(),
             issued_at: now,
             via_rider: false,
+            subject: [0; 32],
         }
         .to_dm_payload()
         .expect("encode");
@@ -549,5 +583,46 @@ mod adr_remote {
         assert!(cap.urls.lock().expect("urls").is_empty());
         let done = rx.await.expect("completion");
         assert!(done.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stop_on_one_remote_rider_does_not_block_the_other_or_the_daemon() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let daemon = AgentId([0x11; 32]);
+        let rider_a = AgentId([0x22; 32]);
+        let rider_b = AgentId([0x33; 32]);
+        state.gui_show.block_agent(&rider_a);
+        let now = unix_now_secs();
+        let ingress = |subject: AgentId, via_rider: bool| {
+            let payload = GuiShowDmRequest {
+                request_id: [4; 16],
+                view: "people".into(),
+                issued_at: now,
+                via_rider,
+                subject: *subject.as_bytes(),
+            }
+            .to_dm_payload()
+            .expect("encode");
+            let mut cache = crate::gui::remote::ReplayCache::new();
+            ingress_show(true, &payload, daemon.as_bytes(), now, &mut cache).expect("ingress")
+        };
+        let rider_a_ingress = ingress(rider_a, true);
+        let rider_b_ingress = ingress(rider_b, true);
+        let owner_ingress = ingress(daemon, false);
+        let rider_a_control =
+            super::show_control(&state, &daemon, &rider_a_ingress).expect("rider a");
+        let rider_b_control =
+            super::show_control(&state, &daemon, &rider_b_ingress).expect("rider b");
+        assert!(state.gui_show.is_blocked(&rider_a_control));
+        assert!(!state.gui_show.is_blocked(&rider_b_control));
+        assert_ne!(rider_a_control, rider_b_control);
+        let owner = super::show_control(&state, &daemon, &owner_ingress).expect("owner");
+        assert_eq!(owner, daemon);
+        assert!(!state.gui_show.is_blocked(&owner));
+        assert!(!state.gui_show.is_blocked(&state.agent.agent_id()));
+        assert_ne!(rider_a_control, state.agent.agent_id());
     }
 }

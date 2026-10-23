@@ -132,6 +132,8 @@ pub enum GuiShowOutcome {
     NoActiveMachine,
     /// Human has not confirmed (reserved).
     Unconfirmed,
+    /// `issued_at` is outside ±120 s. Replay stays a drop, with no result.
+    StaleRequest,
 }
 
 /// Request body for `POST /gui/show`.

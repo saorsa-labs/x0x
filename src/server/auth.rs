@@ -303,6 +303,12 @@ pub(super) async fn refresh_session(
             // follow the new token, or the view opens with no origin banner.
             state.gui_show.rebind_pending_session(&bearer, &token);
             super::ws::rebind_gui_ws_tokens(&state, &bearer, &token).await;
+            // ADR 0083 §3: the refresh tick runs only while the page is visible.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            state.gui_show.note_gui_visible(now);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({

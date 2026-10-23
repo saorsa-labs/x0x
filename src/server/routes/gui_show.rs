@@ -18,9 +18,10 @@
 //!
 //! After admission, a rider show uses that token's `sub_agent_id` for the
 //! block list, the rate limit, the origin banner, and the outgoing
-//! `agent_id`. The daemon's own agent stays the sender for a durable owner
-//! token. Stop then blocks that rider, or turns local show off only when
-//! the sender is this daemon. A rider banner names `gui_show_blocked.json`
+//! `subject`. The ADR 0050 envelope stays signed by this daemon, because
+//! the daemon does not hold the sub-agent secret. The target attributes
+//! that subject. Stop then blocks that rider, or turns local show off only
+//! when the sender is this daemon. A rider banner names `gui_show_blocked.json`
 //! and a daemon restart. A local banner names `gui_show_local_disabled`.
 
 use std::collections::HashMap;
@@ -412,8 +413,41 @@ async fn remote_show(
         }
     };
     let route = parsed.as_route();
-    let local_machine = state.agent.machine_id();
     let kind = classify_target(target);
+    let response_machine = match kind {
+        TargetKind::Explicit(id) => hex::encode(id),
+        _ => local_hex.clone(),
+    };
+    // A Stopped or blocked originator does not send. `local_enabled` is
+    // the daemon Stop marker. A rider Stop is that sub-agent on the block list.
+    let Some(sender) = show_sender(state, actor) else {
+        return remote_json(
+            GuiShowOutcome::Refused,
+            response_machine,
+            request_id,
+            None,
+            None,
+        );
+    };
+    if !state.gui_show.config().local_enabled {
+        return remote_json(
+            GuiShowOutcome::Disabled,
+            response_machine,
+            request_id,
+            None,
+            None,
+        );
+    }
+    if state.gui_show.is_blocked(&sender) {
+        return remote_json(
+            GuiShowOutcome::Refused,
+            response_machine,
+            request_id,
+            None,
+            None,
+        );
+    }
+    let local_machine = state.agent.machine_id();
     let owner = state.agent.owner_trust().local_owner();
     let decision = match kind {
         TargetKind::Explicit(id) => {
@@ -439,10 +473,10 @@ async fn remote_show(
             remote_json(GuiShowOutcome::Refused, machine_hex, request_id, None, None)
         }
         RemoteTargetDecision::QueryActive => {
-            show_active(state, actor, rider, route, local_hex, request_id).await
+            show_active(state, actor, rider, sender, route, local_hex, request_id).await
         }
         RemoteTargetDecision::Remote(id) => {
-            show_explicit(state, MachineId(id), route, rider, request_id).await
+            show_explicit(state, MachineId(id), route, rider, sender, request_id).await
         }
     }
 }
@@ -481,6 +515,7 @@ async fn show_explicit(
     machine: MachineId,
     route: String,
     rider: bool,
+    subject: AgentId,
     request_id: String,
 ) -> Response {
     let target_hex = hex::encode(machine.as_bytes());
@@ -493,13 +528,14 @@ async fn show_explicit(
             None,
         );
     };
-    send_show_and_wait(state, agent, target_hex, route, rider, request_id).await
+    send_show_and_wait(state, agent, machine, route, rider, subject, request_id).await
 }
 
 async fn show_active(
     state: &AppState,
     actor: &ActorContext,
     rider: bool,
+    subject: AgentId,
     route: String,
     local_hex: String,
     request_id: String,
@@ -511,12 +547,12 @@ async fn show_active(
     let local_machine = state.agent.machine_id();
     let mut candidates = vec![ActivityCandidate {
         machine_id: local_machine.0,
-        last_gui_visible_at: state.gui_show.last_gui_visible_at(),
+        last_gui_visible_at: fresh_gui_visible_at(state).await,
         remote_enabled: true,
     }];
     let mut peers = HashMap::new();
-    let mut waits = Vec::new();
     let deadline = tokio::time::Instant::now() + RESULT_WAIT;
+    let mut prepared = Vec::new();
     for machine in enrolled_remote_machines(state, &local_machine).await {
         let Some(agent) = activity_peer(state, &machine).await else {
             candidates.push(quiet_candidate(machine.0));
@@ -531,22 +567,36 @@ async fn show_active(
             candidates.push(quiet_candidate(machine.0));
             continue;
         };
-        // Register before send so a fast reply is not lost.
-        let rx = state.gui_show.remote_hub().wait_activity(qid);
-        if send_gui_dm(state, &agent, payload, qid).await.is_err() {
+        // Register before send so a fast reply is not lost. Dropping the
+        // guard on send failure, timeout, or a cancelled request removes it.
+        let Some(wait) = state
+            .gui_show
+            .remote_hub()
+            .begin_activity(qid, agent, machine)
+        else {
             candidates.push(quiet_candidate(machine.0));
             continue;
-        }
-        peers.insert(machine.0, agent);
-        waits.push((machine.0, rx));
-    }
-    let replies = futures::future::join_all(waits.into_iter().map(|(machine, rx)| async move {
-        let body = match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(body)) => Some(body),
-            _ => None,
         };
-        (machine, body)
-    }))
+        peers.insert(machine.0, agent);
+        prepared.push((machine.0, agent, payload, qid, wait));
+    }
+    // One shared 10 s budget covers every send and every reply. The sends
+    // run together: three sequential default ACK waits already pass 10 s.
+    let replies = futures::future::join_all(prepared.into_iter().map(
+        |(machine, agent, payload, qid, wait)| async move {
+            let sent =
+                tokio::time::timeout_at(deadline, send_gui_dm(state, &agent, payload, qid)).await;
+            let body = if matches!(sent, Ok(Ok(()))) {
+                match tokio::time::timeout_at(deadline, wait.recv()).await {
+                    Ok(Ok(body)) => Some(body),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            (machine, body)
+        },
+    ))
     .await;
     for (machine, body) in replies {
         let (last_gui_visible_at, remote_enabled) = match body {
@@ -586,7 +636,16 @@ async fn show_active(
                     None,
                 );
             };
-            send_show_and_wait(state, agent, target_hex, route, rider, request_id).await
+            send_show_and_wait(
+                state,
+                agent,
+                MachineId(id),
+                route,
+                rider,
+                subject,
+                request_id,
+            )
+            .await
         }
     }
 }
@@ -632,18 +691,26 @@ async fn agents_on_machine(state: &AppState, machine: &MachineId) -> Vec<AgentId
         .collect()
 }
 
-/// Online enrolled machine that advertises `gui_show_v1`.
+/// Enrolled machine in the identity cache that advertises `gui_show_v1`.
 ///
-/// No address, an offline agent, or a missing bit leaves the machine in
-/// the candidate list with no timestamp.
+/// A direct QUIC connection is not required. ADR 0050 delivers the query
+/// over gossip. A missing bit leaves the machine in the candidate list
+/// with no timestamp. A connected agent is preferred when several qualify.
 async fn activity_peer(state: &AppState, machine: &MachineId) -> Option<AgentId> {
     let agents = agents_on_machine(state, machine).await;
+    let mut offline = None;
     for agent in agents {
-        if state.agent.is_agent_connected(&agent).await && agent_can_show(state, &agent) {
+        if !agent_can_show(state, &agent) {
+            continue;
+        }
+        if state.agent.is_agent_connected(&agent).await {
             return Some(agent);
         }
+        if offline.is_none() {
+            offline = Some(agent);
+        }
     }
-    None
+    offline
 }
 
 /// Agent on `machine` whose verified advert allows a show.
@@ -678,12 +745,15 @@ fn agent_can_show(state: &AppState, agent: &AgentId) -> bool {
 async fn send_show_and_wait(
     state: &AppState,
     agent: AgentId,
-    target_hex: String,
+    machine: MachineId,
     route: String,
     via_rider: bool,
+    subject: AgentId,
     request_id: String,
 ) -> Response {
-    use crate::gui::remote::{GuiShowDmRequest, RESULT_WAIT};
+    use crate::gui::remote::RESULT_WAIT;
+
+    let target_hex = hex::encode(machine.as_bytes());
 
     if !agent_can_show(state, &agent) {
         return remote_json(
@@ -703,12 +773,7 @@ async fn send_show_and_wait(
             None,
         );
     };
-    let body = GuiShowDmRequest {
-        request_id: bytes,
-        view: route,
-        issued_at: unix_secs(),
-        via_rider,
-    };
+    let body = show_dm_request(bytes, route, unix_secs(), via_rider, &subject);
     let Some(payload) = body.to_dm_payload() else {
         return remote_json(
             GuiShowOutcome::Unconfirmed,
@@ -719,8 +784,21 @@ async fn send_show_and_wait(
         );
     };
     let deadline = tokio::time::Instant::now() + RESULT_WAIT;
-    // Register before send so a fast result is not lost.
-    let rx = state.gui_show.remote_hub().wait_show(bytes);
+    // Register before send so a fast result is not lost. The guard removes
+    // the waiter when send fails, the wait times out, or this task is dropped.
+    let Some(wait) = state
+        .gui_show
+        .remote_hub()
+        .begin_show(bytes, agent, machine)
+    else {
+        return remote_json(
+            GuiShowOutcome::Unconfirmed,
+            target_hex,
+            request_id,
+            None,
+            None,
+        );
+    };
     if send_gui_dm(state, &agent, payload, bytes).await.is_err() {
         return remote_json(
             GuiShowOutcome::Unconfirmed,
@@ -730,7 +808,7 @@ async fn send_show_and_wait(
             None,
         );
     }
-    match tokio::time::timeout_at(deadline, rx).await {
+    match tokio::time::timeout_at(deadline, wait.recv()).await {
         Ok(Ok(result)) => remote_json(result.outcome, target_hex, request_id, None, None),
         _ => remote_json(
             GuiShowOutcome::Unconfirmed,
@@ -740,6 +818,43 @@ async fn send_show_and_wait(
             None,
         ),
     }
+}
+
+/// Show request the daemon sends. `subject` is the agent the target attributes.
+fn show_dm_request(
+    request_id: [u8; 16],
+    view: String,
+    issued_at: u64,
+    via_rider: bool,
+    subject: &AgentId,
+) -> crate::gui::remote::GuiShowDmRequest {
+    crate::gui::remote::GuiShowDmRequest {
+        request_id,
+        view,
+        issued_at,
+        via_rider,
+        subject: *subject.as_bytes(),
+    }
+}
+
+/// Visibility stamp for active selection and activity replies.
+///
+/// A tab that is visible now counts as now, including when the stored
+/// stamp is older than [`crate::gui::ACTIVE_WINDOW_SECS`]. Hiding the tab
+/// leaves the stored stamp. The session refresh tick also writes it.
+pub(crate) async fn fresh_gui_visible_at(state: &AppState) -> Option<u64> {
+    let live = state
+        .ws_sessions
+        .read()
+        .await
+        .values()
+        .any(|session| session.is_visible_gui());
+    if live {
+        let now = unix_secs();
+        state.gui_show.note_gui_visible(now);
+        return Some(now);
+    }
+    state.gui_show.last_gui_visible_at()
 }
 
 async fn send_gui_dm(
@@ -1992,6 +2107,104 @@ mod tests {
         Ok(())
     }
 
+    /// A tab that stays visible past the active window still counts.
+    /// An old stamp with no visible session does not.
+    #[tokio::test]
+    async fn visible_session_older_than_the_window_stays_active() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        let now = unix_secs();
+        state
+            .gui_show
+            .note_gui_visible(now.saturating_sub(crate::gui::ACTIVE_WINDOW_SECS + 60));
+        {
+            let mut sessions = state.ws_sessions.write().await;
+            sessions.insert(
+                "hidden".to_string(),
+                crate::server::ws::test_ws_session("hidden"),
+            );
+        }
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(
+            &app,
+            json!({ "view": "people", "target_machine": "active" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "no_active_machine", "{body}");
+        assert!(cap.urls.lock().unwrap().is_empty());
+
+        state.ws_sessions.write().await.insert(
+            "visible".to_string(),
+            crate::server::ws::test_gui_ws_session("visible"),
+        );
+        let (status, body) = post_show(
+            &app,
+            json!({ "view": "people", "target_machine": "active" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let outcome = body["outcome"].as_str().unwrap_or("");
+        assert!(
+            outcome == "opened" || outcome == "navigated",
+            "a visible tab older than the window still counts: {body}"
+        );
+        Ok(())
+    }
+
+    /// Stop and the block list apply before a remote send.
+    #[tokio::test]
+    async fn originator_stop_and_block_refuse_remote_sends() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let cap = install_capturing_opener(&state);
+        state.gui_show.set_config(GuiShowConfig {
+            local_enabled: false,
+            remote_enabled: true,
+        });
+        let app = router(Arc::clone(&state));
+        let (status, body) = post_show(
+            &app,
+            json!({ "view": "people", "target_machine": "active" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "disabled", "{body}");
+        assert!(cap.urls.lock().unwrap().is_empty());
+
+        state.gui_show.set_config(GuiShowConfig {
+            local_enabled: true,
+            remote_enabled: true,
+        });
+        state.gui_show.block_agent(&state.agent.agent_id());
+        let (status, body) = post_show(
+            &app,
+            json!({ "view": "people", "target_machine": "active" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outcome"], "refused", "{body}");
+        assert!(cap.urls.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rider_show_request_names_the_sub_agent() {
+        let daemon = AgentId([1; 32]);
+        let rider = AgentId([2; 32]);
+        let request = show_dm_request([9; 16], "people".to_string(), 1, true, &rider);
+        assert!(request.via_rider);
+        assert_eq!(request.subject, *rider.as_bytes());
+        assert_ne!(request.subject, *daemon.as_bytes());
+        let owner = show_dm_request([9; 16], "people".to_string(), 1, false, &daemon);
+        assert!(!owner.via_rider);
+        assert_eq!(owner.subject, *daemon.as_bytes());
+        assert!(
+            crate::dm::dm_attempt_timeout(None) * 3 > crate::gui::remote::RESULT_WAIT,
+            "sequential activity sends exceed the 10 s budget"
+        );
+        assert!(crate::dm::dm_attempt_timeout(None) <= crate::gui::remote::RESULT_WAIT);
+    }
+
     /// Missing, negative, and positive `gui_show_v1` adverts. Removing the
     /// bit test in `agent_can_show` makes the first two asserts fail.
     #[tokio::test]
@@ -2030,6 +2243,40 @@ mod tests {
         assert!(
             agent_can_show(&state, &agent),
             "a current advert with the bit may be sent"
+        );
+
+        let now = unix_secs();
+        state
+            .agent
+            .insert_discovered_agent_for_testing(crate::DiscoveredAgent {
+                agent_id: agent,
+                machine_id: machine,
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: now,
+                last_seen: now,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+                self_name: None,
+            })
+            .await;
+        assert!(
+            !state.agent.is_agent_connected(&agent).await,
+            "this test has no QUIC connection"
+        );
+        assert_eq!(
+            activity_peer(&state, &machine).await,
+            Some(agent),
+            "a gossip-cached enrolled machine is queried without a direct connection"
         );
         Ok(())
     }

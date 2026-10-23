@@ -4,6 +4,7 @@
 //! prefix must not allocate past the body cap.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use tokio::sync::oneshot;
 
 use super::show::GuiShowOutcome;
 use super::view_route;
+use crate::identity::{AgentId, MachineId};
 
 /// Show-request typed DM prefix. The NUL stops a user DM from matching.
 pub const SHOW_REQUEST_PREFIX: &[u8] = b"x0x-gui-show-v1\0";
@@ -33,8 +35,10 @@ pub const MAX_VIEW_BYTES: usize = 256;
 /// ADR 0050 replay cache window.
 pub const REPLAY_SECS: u64 = 630;
 
-/// `16 + 8 + MAX_VIEW_BYTES + 8 + 1`, rounded up. Bounds bincode allocation.
-const SHOW_BODY_MAX: usize = 320;
+/// `16 + 8 + MAX_VIEW_BYTES + 8 + 1 + 32`, rounded up. Bounds bincode allocation.
+const SHOW_BODY_MAX: usize = 384;
+/// In-flight show or activity waiters. A full map refuses a new id.
+const WAITER_CAP: usize = 64;
 /// Activity bodies are a request id plus a small reply. No view string.
 const ACTIVITY_BODY_MAX: usize = 64;
 /// Bound on remembered `(sender, request_id)` pairs.
@@ -47,6 +51,12 @@ pub struct GuiShowDmRequest {
     pub view: String,
     pub issued_at: u64,
     pub via_rider: bool,
+    /// Agent the target attributes, rate-limits, blocks and Stops.
+    ///
+    /// A durable owner sets the daemon agent id. A rider sets the
+    /// registered sub-agent id. The ADR 0050 envelope stays signed by
+    /// this daemon: ADR 0039 keeps the sub-agent secret on the harness.
+    pub subject: [u8; 32],
 }
 
 /// Result returned to the requester. Names stay on the target.
@@ -188,13 +198,54 @@ impl ReplayCache {
     }
 }
 
+/// Agent the target attributes for one show.
+///
+/// `via_rider` false keeps the envelope signer. A rider uses `subject`.
+/// A rider subject of all zeroes, or the target's own agent, is refused
+/// so Stop cannot turn off local show on the target.
+#[must_use]
+pub fn show_subject(
+    envelope: &[u8; 32],
+    request: &GuiShowDmRequest,
+    local: &[u8; 32],
+) -> Option<[u8; 32]> {
+    if !request.via_rider {
+        return Some(*envelope);
+    }
+    if request.subject == [0; 32] || request.subject == *local {
+        return None;
+    }
+    Some(request.subject)
+}
+
+#[derive(Debug)]
+struct WaitSlot<T> {
+    epoch: u64,
+    agent: AgentId,
+    machine: MachineId,
+    tx: oneshot::Sender<T>,
+}
+
 /// Waiters for in-flight show results and activity replies.
 ///
 /// A second waiter for the same id drops the first sender. That does not panic.
+/// Each waiter names the agent and machine that may complete it. Send
+/// failure, timeout and a dropped request remove the entry. Each map
+/// holds at most [`WAITER_CAP`] ids.
 #[derive(Debug, Default)]
 pub struct RemoteHub {
-    show: Mutex<HashMap<[u8; 16], oneshot::Sender<GuiShowDmResult>>>,
-    activity: Mutex<HashMap<[u8; 16], oneshot::Sender<GuiActivityBody>>>,
+    epoch: AtomicU64,
+    show: Mutex<HashMap<[u8; 16], WaitSlot<GuiShowDmResult>>>,
+    activity: Mutex<HashMap<[u8; 16], WaitSlot<GuiActivityBody>>>,
+}
+
+/// One registered waiter. Drop removes it when the epoch still matches.
+pub struct PartyWait<'a, T> {
+    hub: &'a RemoteHub,
+    show: bool,
+    id: [u8; 16],
+    epoch: u64,
+    rx: Option<oneshot::Receiver<T>>,
 }
 
 impl RemoteHub {
@@ -202,54 +253,182 @@ impl RemoteHub {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            epoch: AtomicU64::new(0),
             show: Mutex::new(HashMap::new()),
             activity: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Register a waiter. Replaces any waiter already bound to `request_id`.
-    pub fn wait_show(&self, request_id: [u8; 16]) -> oneshot::Receiver<GuiShowDmResult> {
-        let (tx, rx) = oneshot::channel();
+    /// Register a show waiter bound to `agent` on `machine`.
+    ///
+    /// `None` when this id is new and the map is already at [`WAITER_CAP`].
+    /// Replacing an existing id does not grow the map.
+    pub fn begin_show(
+        &self,
+        request_id: [u8; 16],
+        agent: AgentId,
+        machine: MachineId,
+    ) -> Option<PartyWait<'_, GuiShowDmResult>> {
+        let (epoch, rx) = insert_wait(&self.show, &self.epoch, request_id, agent, machine)?;
+        Some(PartyWait {
+            hub: self,
+            show: true,
+            id: request_id,
+            epoch,
+            rx: Some(rx),
+        })
+    }
+
+    /// Register an activity waiter bound to `agent` on `machine`.
+    ///
+    /// `None` when this id is new and the map is already at [`WAITER_CAP`].
+    pub fn begin_activity(
+        &self,
+        request_id: [u8; 16],
+        agent: AgentId,
+        machine: MachineId,
+    ) -> Option<PartyWait<'_, GuiActivityBody>> {
+        let (epoch, rx) = insert_wait(&self.activity, &self.epoch, request_id, agent, machine)?;
+        Some(PartyWait {
+            hub: self,
+            show: false,
+            id: request_id,
+            epoch,
+            rx: Some(rx),
+        })
+    }
+
+    /// Deliver a result from `from` on `from_machine`.
+    ///
+    /// A different agent or machine leaves the waiter in place.
+    pub fn complete_show(&self, from: &AgentId, from_machine: &MachineId, result: GuiShowDmResult) {
+        complete_slot(&self.show, from, from_machine, result.request_id, result);
+    }
+
+    /// Deliver an activity reply from `from` on `from_machine`.
+    ///
+    /// A query body and a different agent or machine leave the waiter in place.
+    pub fn complete_activity(
+        &self,
+        from: &AgentId,
+        from_machine: &MachineId,
+        body: GuiActivityBody,
+    ) {
+        if !matches!(body, GuiActivityBody::Reply { .. }) {
+            return;
+        }
+        let request_id = activity_request_id(&body);
+        complete_slot(&self.activity, from, from_machine, request_id, body);
+    }
+
+    /// Show waiters still registered.
+    #[must_use]
+    pub fn show_waiters(&self) -> usize {
         self.show
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .insert(request_id, tx);
-        rx
+            .len()
     }
 
-    /// Deliver a result. No waiter means no work.
-    pub fn complete_show(&self, result: GuiShowDmResult) {
-        if let Some(tx) = self
-            .show
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .remove(&result.request_id)
-        {
-            let _ = tx.send(result);
-        }
-    }
-
-    /// Register a waiter for an activity reply.
-    pub fn wait_activity(&self, request_id: [u8; 16]) -> oneshot::Receiver<GuiActivityBody> {
-        let (tx, rx) = oneshot::channel();
+    /// Activity waiters still registered.
+    #[must_use]
+    pub fn activity_waiters(&self) -> usize {
         self.activity
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .insert(request_id, tx);
-        rx
+            .len()
     }
 
-    /// Deliver an activity body. No waiter means no work.
-    pub fn complete_activity(&self, body: GuiActivityBody) {
-        let request_id = activity_request_id(&body);
-        if let Some(tx) = self
-            .activity
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .remove(&request_id)
-        {
-            let _ = tx.send(body);
+    fn cancel_show(&self, id: [u8; 16], epoch: u64) {
+        cancel_slot(&self.show, id, epoch);
+    }
+
+    fn cancel_activity(&self, id: [u8; 16], epoch: u64) {
+        cancel_slot(&self.activity, id, epoch);
+    }
+}
+
+impl<T> PartyWait<'_, T> {
+    /// Wait for the matching reply.
+    pub async fn recv(mut self) -> Result<T, oneshot::error::RecvError> {
+        let rx = match self.rx.take() {
+            Some(rx) => rx,
+            None => {
+                let (_tx, rx) = oneshot::channel();
+                rx
+            }
+        };
+        rx.await
+    }
+
+    /// Non-blocking poll. `Closed` means this waiter was replaced.
+    pub fn try_recv(&mut self) -> Result<T, oneshot::error::TryRecvError> {
+        let Some(rx) = self.rx.as_mut() else {
+            return Err(oneshot::error::TryRecvError::Closed);
+        };
+        rx.try_recv()
+    }
+}
+
+impl<T> Drop for PartyWait<'_, T> {
+    fn drop(&mut self) {
+        if self.show {
+            self.hub.cancel_show(self.id, self.epoch);
+        } else {
+            self.hub.cancel_activity(self.id, self.epoch);
         }
+    }
+}
+
+fn insert_wait<T>(
+    map: &Mutex<HashMap<[u8; 16], WaitSlot<T>>>,
+    epochs: &AtomicU64,
+    request_id: [u8; 16],
+    agent: AgentId,
+    machine: MachineId,
+) -> Option<(u64, oneshot::Receiver<T>)> {
+    let mut guard = map.lock().unwrap_or_else(|err| err.into_inner());
+    let replacing = guard.contains_key(&request_id);
+    if !replacing && guard.len() >= WAITER_CAP {
+        return None;
+    }
+    let (tx, rx) = oneshot::channel();
+    let epoch = epochs.fetch_add(1, Ordering::Relaxed);
+    guard.insert(
+        request_id,
+        WaitSlot {
+            epoch,
+            agent,
+            machine,
+            tx,
+        },
+    );
+    Some((epoch, rx))
+}
+
+fn complete_slot<T>(
+    map: &Mutex<HashMap<[u8; 16], WaitSlot<T>>>,
+    from: &AgentId,
+    from_machine: &MachineId,
+    id: [u8; 16],
+    value: T,
+) {
+    let mut guard = map.lock().unwrap_or_else(|err| err.into_inner());
+    let Some(slot) = guard.get(&id) else {
+        return;
+    };
+    if slot.agent != *from || slot.machine != *from_machine {
+        return;
+    }
+    if let Some(slot) = guard.remove(&id) {
+        let _ = slot.tx.send(value);
+    }
+}
+
+fn cancel_slot<T>(map: &Mutex<HashMap<[u8; 16], WaitSlot<T>>>, id: [u8; 16], epoch: u64) {
+    let mut guard = map.lock().unwrap_or_else(|err| err.into_inner());
+    if guard.get(&id).is_some_and(|slot| slot.epoch == epoch) {
+        guard.remove(&id);
     }
 }
 
@@ -365,7 +544,7 @@ fn action_for_trusted(
         return ReceiveAction::Drop;
     }
     if !show.fresh {
-        return ReceiveAction::Reply(GuiShowOutcome::Refused);
+        return ReceiveAction::Reply(GuiShowOutcome::StaleRequest);
     }
     if !remote_enabled {
         return ReceiveAction::Reply(GuiShowOutcome::Disabled);
@@ -582,6 +761,7 @@ mod tests {
             view: view.to_string(),
             issued_at,
             via_rider: false,
+            subject: [0; 32],
         }
         .to_dm_payload()
         .unwrap()
@@ -654,18 +834,18 @@ mod tests {
     }
 
     #[test]
-    fn stale_issued_at_is_refused() {
+    fn stale_issued_at_is_stale_request() {
         let now = 10_000u64;
         let payload = request("people", now + 1_000, [3; 16]);
         let mut cache = ReplayCache::new();
         let ingress = trusted_ingress(&payload, now, &mut cache);
         let action = receive_action(&ingress, true, false, false);
-        assert_eq!(action, ReceiveAction::Reply(GuiShowOutcome::Refused));
+        assert_eq!(action, ReceiveAction::Reply(GuiShowOutcome::StaleRequest));
         assert!(!matches!(action, ReceiveAction::Display { .. }));
-        // Freshness is before remote enable, so a stale request is Refused.
+        // Freshness is before remote enable, so a stale request is not Disabled.
         assert_eq!(
             receive_action(&ingress, false, false, false),
-            ReceiveAction::Reply(GuiShowOutcome::Refused)
+            ReceiveAction::Reply(GuiShowOutcome::StaleRequest)
         );
     }
 
@@ -788,6 +968,7 @@ mod tests {
             view: "people".to_string(),
             issued_at: 42,
             via_rider: true,
+            subject: [9; 32],
         };
         let bytes = req.to_dm_payload().unwrap();
         assert_eq!(classify_prefix(&bytes), Some(DmClass::ShowRequest));
@@ -894,18 +1075,148 @@ mod tests {
     fn second_show_waiter_replaces_the_first() {
         let hub = RemoteHub::new();
         let id = [1u8; 16];
-        let mut first = hub.wait_show(id);
-        let mut second = hub.wait_show(id);
+        let agent = AgentId([4; 32]);
+        let machine = MachineId([5; 32]);
+        let mut first = hub.begin_show(id, agent, machine).expect("first");
+        let mut second = hub.begin_show(id, agent, machine).expect("second");
         assert_eq!(first.try_recv().unwrap_err(), TryRecvError::Closed);
-        hub.complete_show(GuiShowDmResult {
-            request_id: id,
-            outcome: GuiShowOutcome::Navigated,
-        });
+        hub.complete_show(
+            &agent,
+            &machine,
+            GuiShowDmResult {
+                request_id: id,
+                outcome: GuiShowOutcome::Navigated,
+            },
+        );
         let got = second.try_recv().unwrap();
         assert_eq!(got.outcome, GuiShowOutcome::Navigated);
-        hub.complete_show(GuiShowDmResult {
-            request_id: id,
-            outcome: GuiShowOutcome::Opened,
-        });
+        hub.complete_show(
+            &agent,
+            &machine,
+            GuiShowDmResult {
+                request_id: id,
+                outcome: GuiShowOutcome::Opened,
+            },
+        );
+        assert_eq!(second.try_recv().unwrap_err(), TryRecvError::Closed);
+    }
+
+    #[test]
+    fn reply_from_another_owner_agent_does_not_complete_the_waiter() {
+        let hub = RemoteHub::new();
+        let id = [2u8; 16];
+        let agent = AgentId([4; 32]);
+        let machine = MachineId([5; 32]);
+        let mut wait = hub.begin_show(id, agent, machine).expect("wait");
+        hub.complete_show(
+            &AgentId([8; 32]),
+            &machine,
+            GuiShowDmResult {
+                request_id: id,
+                outcome: GuiShowOutcome::Opened,
+            },
+        );
+        hub.complete_show(
+            &agent,
+            &MachineId([9; 32]),
+            GuiShowDmResult {
+                request_id: id,
+                outcome: GuiShowOutcome::Navigated,
+            },
+        );
+        assert_eq!(wait.try_recv().unwrap_err(), TryRecvError::Empty);
+        assert_eq!(hub.show_waiters(), 1);
+        hub.complete_activity(
+            &AgentId([8; 32]),
+            &machine,
+            GuiActivityBody::Reply {
+                request_id: id,
+                last_gui_visible_at: Some(1),
+                remote_enabled: true,
+            },
+        );
+        let mut activity = hub.begin_activity(id, agent, machine).expect("activity");
+        hub.complete_activity(
+            &AgentId([8; 32]),
+            &machine,
+            GuiActivityBody::Reply {
+                request_id: id,
+                last_gui_visible_at: Some(1),
+                remote_enabled: true,
+            },
+        );
+        assert_eq!(activity.try_recv().unwrap_err(), TryRecvError::Empty);
+        hub.complete_activity(
+            &agent,
+            &machine,
+            GuiActivityBody::Reply {
+                request_id: id,
+                last_gui_visible_at: Some(4),
+                remote_enabled: true,
+            },
+        );
+        match activity.try_recv().unwrap() {
+            GuiActivityBody::Reply {
+                last_gui_visible_at: Some(4),
+                ..
+            } => {}
+            other => panic!("expected the bound reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropped_waiter_is_removed_and_the_map_is_bounded() {
+        let hub = RemoteHub::new();
+        let agent = AgentId([1; 32]);
+        let machine = MachineId([2; 32]);
+        {
+            let _wait = hub.begin_show([1; 16], agent, machine).expect("wait");
+            assert_eq!(hub.show_waiters(), 1);
+        }
+        assert_eq!(hub.show_waiters(), 0);
+        let mut held = Vec::new();
+        for n in 0..WAITER_CAP {
+            let id = [n as u8; 16];
+            held.push(hub.begin_show(id, agent, machine).expect("under the cap"));
+        }
+        assert!(hub.begin_show([0xFF; 16], agent, machine).is_none());
+        assert_eq!(hub.show_waiters(), WAITER_CAP);
+        drop(held);
+        assert_eq!(hub.show_waiters(), 0);
+    }
+
+    #[test]
+    fn rider_subject_is_independent_of_the_daemon() {
+        let daemon = [1u8; 32];
+        let rider_a = [2u8; 32];
+        let rider_b = [3u8; 32];
+        let local = [9u8; 32];
+        let rider = GuiShowDmRequest {
+            request_id: [1; 16],
+            view: "people".to_string(),
+            issued_at: 1,
+            via_rider: true,
+            subject: rider_a,
+        };
+        assert_eq!(show_subject(&daemon, &rider, &local), Some(rider_a));
+        let other = GuiShowDmRequest {
+            subject: rider_b,
+            ..rider.clone()
+        };
+        assert_eq!(show_subject(&daemon, &other, &local), Some(rider_b));
+        let owner = GuiShowDmRequest {
+            via_rider: false,
+            subject: rider_a,
+            ..rider
+        };
+        assert_eq!(show_subject(&daemon, &owner, &local), Some(daemon));
+        let claims_local = GuiShowDmRequest {
+            request_id: [1; 16],
+            view: "people".to_string(),
+            issued_at: 1,
+            via_rider: true,
+            subject: local,
+        };
+        assert!(show_subject(&daemon, &claims_local, &local).is_none());
     }
 }
