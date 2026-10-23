@@ -63,7 +63,7 @@ macro_rules! flush_receipt_regression_tests {
                 let owner = register(
                     root.clone(),
                     Arc::new(move |deadline| {
-                        log_flush::flush_captured(&hook_callback, deadline)?;
+                        log_flush::flush_captured(&hook_callback, deadline.instant)?;
                         observed.store(true, Ordering::SeqCst);
                         match failure {
                             AfterHookFailure::ReceiptWrite => {
@@ -74,7 +74,7 @@ macro_rules! flush_receipt_regression_tests {
                             }
                             AfterHookFailure::Deadline => {
                                 std::thread::sleep(
-                                    deadline.saturating_duration_since(Instant::now())
+                                    deadline.instant.saturating_duration_since(Instant::now())
                                         + Duration::from_millis(20),
                                 );
                                 Ok(())
@@ -142,6 +142,16 @@ macro_rules! flush_receipt_regression_tests {
                 owner.join_workers();
                 assert!(!called.load(Ordering::SeqCst));
                 assert!(!root.join(RECORD).exists());
+                drop(owner);
+                let owner = register(root.clone(), Arc::new(|_| Ok(()))).unwrap();
+                let reservation = reserve(&root).unwrap();
+                reservation.activate().unwrap();
+                drop(owner);
+                assert!(
+                    register(root, Arc::new(|_| Ok(()))).is_err(),
+                    "dropping an armed owner must not admit a second shutdown owner"
+                );
+                drop(reservation);
             }
 
             #[test]

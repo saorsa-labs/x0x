@@ -1414,6 +1414,30 @@ pub async fn serve_with_options(
         .await);
     }
 
+    // The control listener survives the HTTP drain, so a peer can receive
+    // its durable receipt after every normal request and producer has stopped.
+    #[cfg(unix)]
+    let upgrade_flush = if self_update_enabled {
+        let setup = async {
+            let identity_root = match identity_dir.clone() {
+                Some(root) => root,
+                None => crate::storage::x0x_dir().await?,
+            };
+            upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root)
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        match setup {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                tracing::warn!(%error, "Acknowledged flush unavailable; supervised apply disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let port_file = config.data_dir.join("api.port");
 
     // Fix C (Issue #110 Phase 2): collect every server-owned background-task
@@ -3218,7 +3242,7 @@ pub async fn serve_with_options(
         //    returns a `JoinError`; that is expected, never unwrap it. Draining
         //    here (after begin_shutdown, before Agent shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
-        drain_server_tasks(&state, bg_tasks).await;
+        let _server_tasks_finished = drain_server_tasks(&state, bg_tasks).await;
         let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
         // 3. Now that join_network is stopped (and the token cancelled so any
         //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
@@ -3286,7 +3310,14 @@ pub async fn serve_with_options(
         } else {
             server_result
         };
-        combine_server_shutdown_results(server_result, agent_shutdown_result)
+        let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
+        #[cfg(unix)]
+        if let Some(owner) = &upgrade_flush {
+            owner
+                .finish(&result, _server_tasks_finished, &supervisor_cancel)
+                .await;
+        }
+        result
     });
 
     Ok(ServerHandle {
@@ -3318,7 +3349,11 @@ const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
 /// maps, the REST `/subscribe` forwarders, the detached registry, the
 /// join-attempt registry and, in place, the join-artifact egress registry),
 /// then await, never abort, the shielded group-state applies.
-async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
+async fn drain_server_tasks(
+    state: &AppState,
+    mut bg_tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> bool {
+    let mut complete = true;
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
@@ -3420,13 +3455,16 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     let grace_end = tokio::time::Instant::now() + SERVER_TASK_GRACE;
     let mut join = futures::future::join_all(bg_tasks);
     tokio::select! {
-        _results = &mut join => {}
+        results = &mut join => {
+            complete &= results.iter().all(|r| r.as_ref().err().is_none_or(|e| e.is_cancelled()));
+        }
         _ = tokio::time::sleep_until(grace_end) => {
             tracing::warn!("background tasks did not stop within grace; aborting stragglers");
             for handle in &abort_handles {
                 handle.abort();
             }
-            let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            let results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            complete &= results.iter().all(|r| r.as_ref().err().is_none_or(|e| e.is_cancelled()));
         }
     }
     // #1288: history backfills outlive the session that started them. The
@@ -3466,6 +3504,7 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         .await
         .is_err()
         {
+            complete = false;
             tracing::warn!(
                 bound_secs = JOIN_ARTIFACT_EGRESS_ABORT_BOUND.as_secs(),
                 "a join-artifact egress task did not end after its abort"
@@ -3483,14 +3522,15 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // aborted), and the AppState it holds then outlives this supervisor.
     if !shielded.is_empty() {
         let applies = futures::future::join_all(shielded);
-        if tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
-                "a group-state apply is still running at shutdown; it is left to finish, not aborted"
-            );
+        match tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies).await {
+            Ok(results) => complete &= results.iter().all(Result::is_ok),
+            Err(_) => {
+                complete = false;
+                tracing::warn!(
+                    bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
+                    "a group-state apply is still running at shutdown; it is left to finish, not aborted"
+                );
+            }
         }
     }
     // #1545: the owner-sync store runs each durable write in its own task,
@@ -3503,6 +3543,7 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         sync.store().release_write_custody().await;
     }
     crate::profile::IssuedCertRecord::wait_for_writes().await;
+    complete
 }
 
 /// Whether two directory paths refer to the same directory, tolerating

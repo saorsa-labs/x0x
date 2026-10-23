@@ -1,5 +1,5 @@
 // Expanded in server::upgrade_flush. Exercises the real authenticated handler
-// with offline state and owned producers; no socket, supervisor, or binary replacement.
+// with offline state and owned producers. The socket case requires Linux isolation.
 #[allow(unused_macros)]
 macro_rules! arm_flush_regression_tests {
     () => {
@@ -51,8 +51,11 @@ macro_rules! arm_flush_regression_tests {
 
             #[test]
             fn arm_flush_auth_and_frozen_binding_precede_the_actual_flush() {
-                let (dir, journal, request, state) = fixture();
+                let (dir, mut journal, mut request, state) = fixture();
                 let root = dir.path().canonicalize().unwrap();
+                journal["plan"]["participants"][0]["restart"]["mode"] = json!("TransactionalHandoff");
+                request["plan"] = journal["plan"].clone();
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let counted = Arc::clone(&calls);
                 let owner = shutdown_flush::register(root.clone(), Arc::new(move |_| {
@@ -69,6 +72,15 @@ macro_rules! arm_flush_regression_tests {
                 }
                 let mut changed = request.clone(); changed["plan"]["candidate_version"] = json!("3.0.0");
                 assert!(arm(&state, &root, &serde_json::to_vec(&changed).unwrap()).is_err());
+                let mut unsupported = journal.clone();
+                unsupported["plan"]["participants"][0]["restart"]["mode"] = json!("LauncherChild");
+                unsupported["plan"]["participants"][0]["restart"]["launcher"] = json!({
+                    "executable": root.join("launcher"), "argv": ["launcher"], "pid": null,
+                    "process_start": null, "boot_id": "fixture-boot", "manager_exit_code": 0 });
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &unsupported).unwrap();
+                let mut unsupported_request = request.clone(); unsupported_request["plan"] = unsupported["plan"].clone();
+                assert_eq!(arm(&state, &root, &serde_json::to_vec(&unsupported_request).unwrap()).unwrap_err().kind(), io::ErrorKind::Unsupported);
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 assert!(!root.join(shutdown_flush::RECORD).exists());
                 assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
@@ -81,7 +93,8 @@ macro_rules! arm_flush_regression_tests {
                 receipt.authorize(&binding).unwrap();
                 let other = shutdown_flush::Binding::new(binding.transaction_id.clone(), 3, &("other", plan)).unwrap();
                 assert!(receipt.authorize(&other).is_err());
-                assert!(matches!(journal::read_boot_records(&root).handoff, journal::RecordRead::Handoff(_)));
+                let journal::RecordRead::Handoff(handoff) = journal::read_boot_records(&root).handoff else { panic!("missing handoff") };
+                assert_eq!(handoff.legacy["mode"], json!("TransactionalHandoff"));
                 let saved: Value = serde_json::from_slice(&std::fs::read(root.join(shutdown_flush::RECORD)).unwrap()).unwrap();
                 assert!(saved["receipt_id"].as_str().is_some());
                 assert_eq!(saved["binding"], serde_json::to_value(binding).unwrap());
@@ -114,15 +127,167 @@ macro_rules! arm_flush_regression_tests {
                 let (dir, _, _, _) = fixture();
                 std::fs::create_dir(dir.path().join("store")).unwrap();
                 std::fs::write(dir.path().join("store/state"), b"accepted state").unwrap();
-                sync_tree(dir.path()).unwrap();
+                let deadline = shutdown_flush::Deadline::for_test(Duration::from_secs(5)).unwrap();
+                sync_tree(dir.path(), &deadline).unwrap();
                 let target = dir.path().join("absent-target");
                 std::os::unix::fs::symlink(&target, dir.path().join("store/link")).unwrap();
-                assert!(sync_tree(dir.path()).is_err());
+                assert!(sync_tree(dir.path(), &deadline).is_err());
                 assert!(!target.exists());
                 assert_eq!(std::fs::read(dir.path().join("store/state")).unwrap(), b"accepted state");
             }
 
+            #[test]
+            fn shutdown_state_barrier_stops_after_a_sync_returns_past_the_deadline() {
+                let (dir, _, _, _) = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let store = root.join("store");
+                std::fs::create_dir(&store).unwrap();
+                for name in ["first", "second"] { std::fs::write(store.join(name), b"state").unwrap(); }
+                let deadline = shutdown_flush::Deadline::for_test(Duration::from_secs(5)).unwrap();
+                let mut control = 0;
+                sync_tree_with(&store, &deadline, &mut |_| { control += 1; Ok(()) }).unwrap();
+                assert_eq!(control, 3);
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let counted = Arc::clone(&calls);
+                let (entered, entering) = mpsc::channel();
+                let (release, released) = mpsc::channel();
+                let released = Mutex::new(released);
+                let owner = shutdown_flush::register_with_limit(root.clone(), Arc::new(move |deadline| {
+                    sync_tree_with(&store, &deadline, &mut |_| {
+                        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let _ = entered.send(());
+                            released.lock().unwrap().recv_timeout(Duration::from_secs(5)).map_err(io::Error::other)?;
+                        }
+                        Ok(())
+                    })
+                }), Duration::from_secs(2)).unwrap();
+                let binding = shutdown_flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+                let (returned, result) = mpsc::channel();
+                let caller = std::thread::spawn(move || {
+                    let _ = returned.send(shutdown_flush::acknowledge(&root, binding, || Ok(())));
+                });
+                let did_enter = entering.recv_timeout(Duration::from_secs(5));
+                let outcome = result.recv_timeout(Duration::from_secs(5));
+                let _ = release.send(());
+                caller.join().unwrap();
+                owner.join_workers();
+                did_enter.unwrap();
+                assert_eq!(outcome.unwrap().unwrap_err().kind(), io::ErrorKind::TimedOut);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "no new sync after expiry");
+            }
 
+            // Socket execution belongs to the isolated Linux CI runner.
+            #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
+            #[tokio::test]
+            async fn arm_flush_unix_transport_receipts_only_after_the_real_shutdown_hook() {
+                use std::io::Write;
+                use tracing_subscriber::prelude::*;
+                struct Sink { bytes: Arc<Mutex<Vec<u8>>>, fail: bool }
+                impl Write for Sink {
+                    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                        self.bytes.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> io::Result<()> {
+                        if self.fail { Err(io::Error::other("injected log barrier failure")) } else { Ok(()) }
+                    }
+                }
+                for fail in [false, true] {
+                    let (dir, _, mut request, _) = fixture();
+                    let root = dir.path().canonicalize().unwrap();
+                    let agent = Arc::new(crate::Agent::builder()
+                        .with_identity_dir(&root).with_user_key_path(root.join("user.key"))
+                        .with_machine_key(root.join("machine.key"))
+                        .with_agent_key_path(root.join("agent.key"))
+                        .with_agent_cert_path(root.join("agent.cert"))
+                        .with_contact_store_path(root.join("contacts.json"))
+                        .with_peer_cache_disabled().build().await.unwrap());
+                    assert!(agent.network().is_none());
+                    let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+                        &root, Arc::clone(&agent)).await.unwrap();
+                    let mut notified = state.shutdown_notify.subscribe();
+                    request["token"] = json!(state.api_token);
+                    let bytes = Arc::new(Mutex::new(Vec::new()));
+                    let (mut writer, mut guard) = log_flush::acknowledged(Sink { bytes: Arc::clone(&bytes), fail }).unwrap();
+                    writer.write_all(b"accepted shutdown log").unwrap();
+                    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry()
+                        .with(log_flush::FlushLayer::new(vec![writer]).unwrap()));
+                    let mut owner = tracing::dispatcher::with_default(&dispatch,
+                        || FlushOwner::start(&state, &root, &root)).unwrap();
+                    let mut stream = tokio::net::UnixStream::connect(root.join(SOCKET)).await.unwrap();
+                    let mut encoded = serde_json::to_vec(&request).unwrap(); encoded.push(b'\n');
+                    stream.write_all(&encoded).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), notified.changed()).await.unwrap().unwrap();
+                    assert!(*notified.borrow());
+                    let pending: Value = serde_json::from_slice(&std::fs::read(root.join(shutdown_flush::RECORD)).unwrap()).unwrap();
+                    assert!(pending["receipt_id"].is_null());
+                    state.exec_service.shutdown().await;
+                    let producers = crate::server::drain_server_tasks(&state, Vec::new()).await;
+                    let shutdown = agent.try_shutdown().await.map_err(anyhow::Error::from);
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let reply = async {
+                        let mut response = String::new();
+                        let read = tokio::time::timeout(Duration::from_secs(5),
+                            tokio::io::BufReader::new(stream).read_line(&mut response)).await;
+                        cancel.cancel();
+                        read.unwrap().unwrap();
+                        serde_json::from_str::<Value>(&response).unwrap()
+                    };
+                    let (response, ()) = tokio::join!(reply, owner.finish(&shutdown, producers, &cancel));
+                    owner._registration.join_workers();
+                    owner.control.abort(); let _ = (&mut owner.control).await;
+                    let saved: Value = serde_json::from_slice(&std::fs::read(root.join(shutdown_flush::RECORD)).unwrap()).unwrap();
+                    assert_eq!(*bytes.lock().unwrap(), b"accepted shutdown log");
+                    if fail {
+                        assert!(response.get("receipt").is_none()); assert!(response["error"].is_string());
+                        assert!(saved["receipt_id"].is_null());
+                    } else {
+                        assert_eq!(response["receipt"]["receipt_id"], saved["receipt_id"]);
+                        assert!(saved["receipt_id"].is_string());
+                        assert_eq!(response["receipt"]["binding"], saved["binding"]);
+                        assert_eq!(saved["binding"]["transaction_id"], request["transaction_id"]);
+                        assert_eq!(saved["binding"]["generation"], request["generation"]);
+                    }
+                    let _ = guard.shutdown_until(Instant::now() + Duration::from_secs(1));
+                }
+            }
+
+            #[tokio::test(start_paused = true)]
+            async fn shutdown_flush_requires_the_real_server_producer_drain_to_finish() {
+                use futures::FutureExt;
+                for blocked in [true, false] {
+                    let (dir, _, _, _) = fixture();
+                    let agent = Arc::new(crate::Agent::builder()
+                        .with_identity_dir(dir.path())
+                        .with_user_key_path(dir.path().join("user.key"))
+                        .with_machine_key(dir.path().join("machine.key"))
+                        .with_agent_key_path(dir.path().join("agent.key"))
+                        .with_agent_cert_path(dir.path().join("agent.cert"))
+                        .with_contact_store_path(dir.path().join("contacts.json"))
+                        .with_peer_cache_disabled().build().await.unwrap());
+                    assert!(agent.network().is_none());
+                    let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+                        dir.path(), Arc::clone(&agent)).await.unwrap();
+                    state.exec_service.shutdown().await;
+                    let (release, released) = tokio::sync::oneshot::channel::<()>();
+                    let producer = tokio::spawn(async move { let _ = released.await; })
+                        .map(|result| result.map_err(|error| error.to_string())).shared();
+                    let tracked = producer.clone();
+                    assert!(state.spawn_shielded(async move { tracked.await.unwrap(); }));
+                    let task = state.shielded_tasks.lock().unwrap().as_ref().unwrap()
+                        .last().unwrap().abort_handle();
+                    let mut release = Some(release);
+                    if !blocked { release.take().unwrap().send(()).unwrap(); }
+                    let start = tokio::time::Instant::now();
+                    let complete = crate::server::drain_server_tasks(&state, Vec::new()).await;
+                    if let Some(release) = release { release.send(()).unwrap(); }
+                    // Join the owned work and observe the exact registered task end.
+                    producer.await.unwrap();
+                    while !task.is_finished() { tokio::task::yield_now().await; }
+                    agent.try_shutdown().await.unwrap();
+                    assert_eq!(complete, !blocked);
+                    if blocked { assert!(start.elapsed() >= Duration::from_secs(10)); }
+                }
+            }
         }
     };
 }

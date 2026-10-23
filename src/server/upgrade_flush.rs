@@ -1,6 +1,5 @@
 //! The approved local arm-and-flush control plane stays alive while HTTP drains.
 #![cfg(unix)]
-#![allow(dead_code)] // The next stack slice installs the lifecycle owner.
 
 use super::state::AppState;
 use crate::upgrade::{journal, log_flush, shutdown_flush};
@@ -58,16 +57,18 @@ impl FlushOwner {
         let registration = shutdown_flush::register(
             root.clone(),
             Arc::new(move |deadline| {
+                deadline.check()?;
                 stop();
                 receive
                     .lock()
                     .map_err(|_| io::Error::other("shutdown acknowledgement poisoned"))?
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .recv_timeout(deadline.instant.saturating_duration_since(Instant::now()))
                     .map_err(io::Error::other)??;
                 for root in &roots {
-                    sync_tree(root)?;
+                    sync_tree(root, &deadline)?;
                 }
-                log_flush::flush_captured(&logs, deadline)
+                deadline.check()?;
+                log_flush::flush_captured(&logs, deadline.instant)
             }),
         )?;
         let state = Arc::new(ControlContext {
@@ -206,12 +207,18 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<shutdown
             "arm request names a different old participant",
         ));
     }
+    if participant.restart.mode == journal::RestartOwner::LauncherChild {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "launcher-child handoff ownership is not implemented",
+        ));
+    }
     let legacy = serde_json::json!({
         "from_version": request.plan.previous_version, "to_version": request.plan.candidate_version,
         "target_path": request.plan.daemon.target_path, "backup_path": request.plan.daemon.backup_path,
         "argv": participant.argv, "cwd": participant.cwd, "env": participant.env,
         "old_pid": participant.old_pid, "api_addr": state.api_address.to_string(), "started_at": 0,
-        "mode": "SupervisedExit", "launchd_verified": participant.restart.launchd_verified,
+        "mode": participant.restart.mode, "launchd_verified": participant.restart.launchd_verified,
         "systemd_verified": participant.restart.systemd_verified,
     });
     let handoff = journal::M2HandoffRecord {
@@ -235,18 +242,38 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<shutdown
 
 // All producers are drained before this barrier. A symlink is not a verified
 // store root; refuse it rather than silently omit storage from the receipt.
-fn sync_tree(path: &Path) -> io::Result<()> {
+fn sync_tree(path: &Path, deadline: &shutdown_flush::Deadline) -> io::Result<()> {
+    sync_tree_with(path, deadline, &mut std::fs::File::sync_all)
+}
+
+fn sync_tree_with(
+    path: &Path,
+    deadline: &shutdown_flush::Deadline,
+    sync: &mut impl FnMut(&std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    deadline.check()?;
     let meta = std::fs::symlink_metadata(path)?;
+    deadline.check()?;
     if meta.file_type().is_symlink() {
         return Err(io::Error::other("unverified symlink in shutdown state"));
     }
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            sync_tree(&entry?.path())?;
+        deadline.check()?;
+        let mut entries = std::fs::read_dir(path)?;
+        loop {
+            deadline.check()?;
+            let entry = entries.next();
+            deadline.check()?;
+            let Some(entry) = entry else { break };
+            sync_tree_with(&entry?.path(), deadline, sync)?;
         }
     }
     if meta.is_dir() || meta.is_file() {
-        std::fs::File::open(path)?.sync_all()?;
+        deadline.check()?;
+        let file = std::fs::File::open(path)?;
+        deadline.check()?;
+        sync(&file)?;
+        deadline.check()?;
     } else {
         use std::os::unix::fs::FileTypeExt;
         if !meta.file_type().is_socket() {

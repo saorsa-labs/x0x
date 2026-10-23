@@ -18,7 +18,29 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const LIMIT: Duration = Duration::from_secs(30);
 pub(crate) const RECORD: &str = "upgrade-flush.json";
-type Hook = Arc<dyn Fn(Instant) -> io::Result<()> + Send + Sync>;
+type Hook = Arc<dyn Fn(Deadline) -> io::Result<()> + Send + Sync>;
+
+/// The original transaction budget, including time spent suspended.
+pub(crate) struct Deadline {
+    pub(crate) instant: Instant,
+    boot_id: String,
+    deadline_ms: u64,
+}
+impl Deadline {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        check_clock(&self.boot_id, self.deadline_ms, self.instant)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(limit: Duration) -> io::Result<Self> {
+        let (boot_id, now) = clock()?;
+        Ok(Self {
+            instant: Instant::now() + limit,
+            boot_id,
+            deadline_ms: now.saturating_add(limit.as_millis() as u64),
+        })
+    }
+}
 static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Entry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -468,7 +490,11 @@ fn acknowledge_inner(
                 super::journal::write_auxiliary_record(&path, &record, validate)?;
                 prepare()?;
                 check_deadline(&record, deadline)?;
-                hook(deadline)?;
+                hook(Deadline {
+                    instant: deadline,
+                    boot_id: record.boot_id.clone(),
+                    deadline_ms: record.deadline_ms,
+                })?;
                 check_deadline(&record, deadline)?;
                 let receipt_id = uuid::Uuid::new_v4().to_string();
                 record.receipt_id = Some(receipt_id.clone());

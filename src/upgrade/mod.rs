@@ -19,7 +19,7 @@ pub(crate) mod probe;
 pub(crate) mod probe_retry;
 pub mod restart;
 pub mod rollout;
-#[allow(dead_code)] // The final stack slice installs the lifecycle owner.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) mod shutdown_flush;
 pub mod signature;
 pub(crate) mod staging;
