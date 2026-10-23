@@ -5558,8 +5558,8 @@ fn cached_row_fully_pinned_mismatch(
 
 /// Compute coordinator / relay hint lists for an announcement.
 ///
-/// Delegates the choice to [`select_capability_hints`] (#1112): two
-/// eligibility tiers over the connected set, and never the announcer
+/// Delegates the choice to [`select_capability_hints`] (#1112): one
+/// eligibility tier over the connected set, and never the announcer
 /// itself.
 ///
 /// Used to populate `reachable_via` / `relay_candidates` on outgoing
@@ -5597,28 +5597,25 @@ async fn collect_coordinator_hints(
 
 /// #1112: the coordinator / relay hint selection, as a pure function.
 ///
-/// Two eligibility tiers:
+/// One eligibility tier:
 ///
-/// - **Operator tier (new, #1112):** the peer is connected over a DIRECT
-///   path whose OBSERVED remote address (v4-mapped forms normalized) IS
-///   a compiled-in seed listener address — the full socket address —
-///   and the identity is inside that address's pin set when pinned. The operator fleet runs coordinator and relay
-///   roles by deployment, and a completed QUIC handshake with that source
-///   is deployment-derived evidence no announcement can forge. No
-///   capability flag is consulted for these peers, and a pin-mismatched
-///   identity never qualifies.
-/// - **Community tier (ADR 0071, unchanged):** the pre-#1112 rule — the
-///   announcement's `is_coordinator`/`is_relay`, which ADR 0071 records
-///   as the shipped eligibility mechanism (the bootstrap fleet, `--relay`
-///   opt-in nodes, and nodes whose #398 `AnnouncementAssistSnapshot`
-///   gating proved public reachability). Removing this tier would change
-///   network behaviour against an Accepted ADR; whether David's 20 Oct
-///   2026 "ignore self-asserted flags" ruling should supersede it is an
-///   open decision recorded with David (see the PR and
-///   `docs/trust-and-connectivity.md`) — until he decides, the ADR stands.
+/// - **Operator tier:** the peer is connected over a DIRECT path whose
+///   OBSERVED remote address (v4-mapped forms normalized) IS a
+///   compiled-in seed listener address — the full socket address — and
+///   the identity is inside that address's pin set when pinned. The
+///   operator fleet runs coordinator and relay roles by deployment, and
+///   a completed QUIC handshake with that source is deployment-derived
+///   evidence no announcement can forge. No capability flag is
+///   consulted, and a pin-mismatched identity never qualifies.
 ///
-/// Identities rejected by a seed-pin mismatch are excluded from both
-/// tiers PAIR-SCOPED (review round 7): only the origin whose observed
+///   David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026) REPLACES
+///   ADR 0071's community flag tiers: the announcement's self-asserted
+///   `is_coordinator`/`is_relay` is informational wire data only and
+///   never grants a hint, on any selection path. The flags stay in the
+///   wire structs (compatibility) but no decision reads them.
+///
+/// Identities rejected by a seed-pin mismatch are excluded from the
+/// tier PAIR-SCOPED (review round 7): only the origin whose observed
 /// address mismatched its pin set is skipped — a mismatch at one seed
 /// address never suppresses the same identity's valid, pinned origin at
 /// another address, and no dial completion order changes that. Hints are
@@ -5648,11 +5645,10 @@ fn select_capability_hints(
         // observed address (whatever the path: ant-quic reports
         // hole-punched paths as non-direct while still naming the
         // peer's remote address, round 18) is a pinned seed address and
-        // the identity is OUTSIDE its pin set, the pair skips BOTH
-        // tiers: the community flags must not rescue it. Inbound
-        // connections and `connect_peer_with_addrs` bypass the dial
-        // seam, so the selector cannot assume the seam already rejected
-        // a mismatched identity.
+        // the identity is OUTSIDE its pin set, the pair never qualifies.
+        // Inbound connections and `connect_peer_with_addrs` bypass the
+        // dial seam, so the selector cannot assume the seam already
+        // rejected a mismatched identity.
         let observed_addr = origin.remote_addr.map(network::normalize_v4_mapped_addr);
         let pin_mismatch_at_seed = observed_addr.is_some_and(|observed| {
             matches!(
@@ -5677,9 +5673,9 @@ fn select_capability_hints(
             .flatten()
             .filter(|observed| seed_addrs.contains(observed));
         let on_operator_host = observed_seed_addr.is_some();
-        let Some(entry) = cache.get(&mid) else {
+        if !cache.contains_key(&mid) {
             // No announcement seen: only the operator tier can qualify,
-            // under the same deduplication and cap as the tiers below
+            // under the same deduplication and cap as the announced case
             // (review round 3).
             if on_operator_host
                 && !reachable_via.contains(&mid)
@@ -5696,18 +5692,20 @@ fn select_capability_hints(
                 relay_candidates.push(mid);
             }
             continue;
-        };
-        // Community tier (ADR 0071): the announcement flags, unchanged.
-        let coordinator = on_operator_host || entry.is_coordinator == Some(true);
-        let relay = on_operator_host || entry.is_relay == Some(true);
-        if coordinator
+        }
+        // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+        // replaces ADR 0071's community flag tiers: the announcement's
+        // self-asserted `is_coordinator`/`is_relay` grants nothing — the
+        // flags are informational wire data only. Only the operator tier
+        // qualifies an announced peer.
+        if on_operator_host
             && !reachable_via.contains(&mid)
             && reachable_via.len() < MAX_COORDINATOR_HINTS
         {
             selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             reachable_via.push(mid);
         }
-        if relay
+        if on_operator_host
             && !relay_candidates.contains(&mid)
             && relay_candidates.len() < MAX_COORDINATOR_HINTS
         {
@@ -7933,8 +7931,10 @@ impl Agent {
                 if advert_peer_id == target_peer_id {
                     continue;
                 }
-                // ADR 0071 (review round 3): the advert's roles are the
-                // Accepted eligibility mechanism — restored unchanged.
+                // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct
+                // 2026) replaces ADR 0071's community flag tiers: the
+                // advert's self-asserted roles mark nothing — it only
+                // contributes address hints.
                 merge_helper_hint(
                     &mut helper_hints,
                     advert_peer_id,
@@ -7944,8 +7944,8 @@ impl Agent {
                         .into_iter()
                         .map(|hint| hint.addr)
                         .filter(|addr| is_publicly_advertisable(*addr)),
-                    advert.roles.coordinator || advert.roles.rendezvous,
-                    advert.roles.relay,
+                    false,
+                    false,
                 );
             }
         }
@@ -7958,15 +7958,19 @@ impl Agent {
             if candidate.machine_id == target.machine_id || candidate.machine_id.0 == [0u8; 32] {
                 continue;
             }
-            // ADR 0071 (review round 3): the machine cache's flag fields
-            // are the Accepted eligibility mechanism — restored unchanged.
+            // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+            // replaces ADR 0071's community flag tiers: the machine
+            // cache's self-asserted flag fields mark nothing — the
+            // candidate only contributes address hints. Coordinator and
+            // relay capability reaches ant-quic through its own
+            // deployment-configured bootstrap cache (the loop above).
             merge_helper_hint(
                 &mut helper_hints,
                 ant_quic::PeerId(candidate.machine_id.0),
                 "machine_discovery_cache",
                 candidate.addresses.iter().copied(),
-                candidate.is_coordinator == Some(true),
-                candidate.is_relay == Some(true),
+                false,
+                false,
             );
         }
 
@@ -40851,11 +40855,10 @@ mod peer_connected_handler_integration_tests {
         #[test]
         fn issue1112_forged_seed_address_grants_no_operator_tier() {
             // Review rounds 1-3: an announcement's address list is a claim,
-            // not evidence. A peer that lists operator seed IPs but asserts
-            // no capability flags, observed from its own address, gains
-            // nothing: the operator tier keys on the OBSERVED address, and
-            // the community tier (ADR 0071) still needs the peer's own
-            // flag claim.
+            // not evidence. A peer that lists operator seed IPs but is
+            // observed from its own address gains nothing: the operator
+            // tier keys on the OBSERVED address. Self-asserted flags
+            // grant nothing either (David's 20 Oct 2026 ruling).
             let mut cache = std::collections::HashMap::new();
             let forger = identity::MachineId([0x11; 32]);
             cache.insert(
@@ -40886,18 +40889,19 @@ mod peer_connected_handler_integration_tests {
         }
 
         #[test]
-        fn issue1112_community_flag_eligibility_is_adr_0071_unchanged() {
-            // Review round 3: ADR 0071 (Accepted) records the announcement
-            // flags as the shipped community eligibility mechanism
-            // (bootstrap fleet, --relay opt-in, #398-gated public
-            // reachability). This PR must not narrow that behaviour —
-            // whether the ruling should supersede the ADR is with David.
+        fn issue1112_self_asserted_flags_alone_grant_no_hint() {
+            // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+            // REPLACES ADR 0071's community flag tiers: a peer that only
+            // self-asserts `is_relay`/`is_coordinator` gets NO hint. The
+            // flags stay in the wire structs as informational data, but
+            // no selection path reads them. Runtime-RED before the
+            // removal: this peer was hinted by its flags alone.
             let mut cache = std::collections::HashMap::new();
-            let community = identity::MachineId([0x11; 32]);
+            let flagged = identity::MachineId([0x11; 32]);
             cache.insert(
-                community,
+                flagged,
                 issue1112_machine(
-                    community,
+                    flagged,
                     &["203.0.113.10:5483".parse().unwrap()],
                     Some(true),
                     Some(true),
@@ -40912,8 +40916,10 @@ mod peer_connected_handler_integration_tests {
                 &bootstrap_seed_addrs(),
                 &skew,
             );
-            assert_eq!(coordinators, vec![community]);
-            assert_eq!(relays, vec![community]);
+            assert!(
+                coordinators.is_empty() && relays.is_empty(),
+                "self-asserted capability flags alone must not grant a hint"
+            );
         }
 
         #[test]
@@ -41184,8 +41190,9 @@ mod peer_connected_handler_integration_tests {
         fn issue1112_relayed_origin_grants_no_operator_tier() {
             // A relayed path's observed address names the relay, not the
             // peer — it is never OPERATOR-tier evidence, whatever the peer
-            // announces. The community tier (ADR 0071) still applies on
-            // its own flags, exactly as before #1112.
+            // announces. The peer self-asserts both capability flags and
+            // still gets no hint: self-asserted flags grant nothing
+            // (David's 20 Oct 2026 ruling, confirmed 22 Oct 2026).
             let mut cache = std::collections::HashMap::new();
             let relayed = identity::MachineId([0x44; 32]);
             cache.insert(
@@ -41193,8 +41200,8 @@ mod peer_connected_handler_integration_tests {
                 issue1112_machine(
                     relayed,
                     &["142.93.199.50:5483".parse().unwrap()],
-                    None,
-                    None,
+                    Some(true),
+                    Some(true),
                 ),
             );
             let skew = SelectionSkew::default();

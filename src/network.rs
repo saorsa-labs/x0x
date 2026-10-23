@@ -2514,12 +2514,6 @@ pub struct NetworkNode {
     /// closed before dispatch. Capped per peer (generations are never
     /// reused); a leaf mutex never held across an await or another lock.
     session_addr_ledger: Arc<Mutex<SessionAddrLedger>>,
-    /// #1112 (round 19): identities with seed-address session history,
-    /// decoupled from the ledger's detail rows so GLOBAL EVICTION of a
-    /// row (the 512-peer bound) cannot re-admit a pin-mismatched peer's
-    /// queued frames of unknown generations. Entries expire with the
-    /// same TTL as ledger rows; bounded, pruned on read.
-    session_implications: Arc<Mutex<std::collections::HashMap<AntPeerId, Instant>>>,
     /// Test-only per-node override of the rejection TTL, so the expiry
     /// path is testable without real-time waits (`#[cfg(test)]`).
     #[cfg(test)]
@@ -2995,7 +2989,6 @@ impl NetworkNode {
                 std::collections::HashMap::new(),
             )),
             session_addr_ledger: Arc::new(Mutex::new(HashMap::new())),
-            session_implications: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_seed_pin_rejection_ttl: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -5095,13 +5088,7 @@ impl NetworkNode {
     /// evaluate the pin for a frame's OWN source session after that
     /// session closes, with no rejection entry needed.
     fn note_session_address(&self, peer: AntPeerId, generation: u64, addr: SocketAddr) {
-        note_session_address_in(
-            &self.session_addr_ledger,
-            &self.session_implications,
-            peer,
-            generation,
-            addr,
-        );
+        note_session_address_in(&self.session_addr_ledger, peer, generation, addr);
     }
 
     /// The address `generation` of `peer` was observed on, if any
@@ -5160,12 +5147,12 @@ impl NetworkNode {
     ///    never pass the address-dial seam;
     /// 3. the frame rides the peer's CURRENT session: its address
     ///    decides, and an unpinned address admits (TOFU);
-    /// 4. unknown provenance, SCOPED (round 14): only a peer the pins
-    ///    already implicate — a rejection entry, or seed-address session
-    ///    history in the ledger — is held to the fail-closed rule
-    ///    (evidence evicted by the ledger's bounds, or a session no x0x
-    ///    observation ever caught). Peers with no seed-address history
-    ///    are outside the pins' threat model and keep flowing.
+    /// 4. unknown provenance: ONLY a peer with a live rejection entry is
+    ///    held to the fail-closed rule. Seed-address history alone never
+    ///    refuses a frame of unknown provenance (Engineer ruling, 23 Oct
+    ///    2026): the ledger makes provenance KNOWN where it can (clause
+    ///    2), and a pin-matching seed's frames of an unobserved
+    ///    generation keep flowing instead of being guessed at.
     fn seed_pin_rejects_frame(
         &self,
         node: &LinkNode,
@@ -5199,56 +5186,7 @@ impl NetworkNode {
                 .and_then(|conn| conn.remote_address())
                 .is_some_and(|addr| seed_pin_mismatch_at(addr, peer_id.0));
         }
-        self.any_live_seed_pin_rejection_for(peer_id.0) || self.peer_has_session_evidence(peer_id)
-    }
-
-    /// Whether the ledger holds any UNEXPIRED session evidence for
-    /// `peer` (#1112, rounds 14-16). The ledger records seed-address
-    /// sessions only, so this is "the pins already implicate this peer";
-    /// an idle peer's evidence lapses on [`SESSION_ADDR_LEDGER_TTL`] at
-    /// read time, so implication cannot outlive the bound.
-    fn peer_has_session_evidence(&self, peer_id: &AntPeerId) -> bool {
-        let now = Instant::now();
-        let mut ledger = self
-            .session_addr_ledger
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let row_live = match ledger.get_mut(peer_id) {
-            Some(entries) => {
-                entries.retain(|(_, _, at)| now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL);
-                let live = !entries.is_empty();
-                if !live {
-                    ledger.remove(peer_id);
-                }
-                live
-            }
-            None => false,
-        };
-        if row_live {
-            return true;
-        }
-        // Round 19: the implication outlives the detail row — global
-        // eviction (the peer bound) removed it, but the identity stays
-        // implicated until its own TTL horizon, so its queued frames of
-        // unknown generations cannot be re-admitted by overflow.
-        let mut implications = self
-            .session_implications
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        implications.retain(|_, until| *until > now);
-        if implications.len() > 2 * SESSION_ADDR_LEDGER_MAX_PEERS {
-            // Overflow policy: bound memory by dropping the
-            // earliest-expiring implication (bounded re-admission window,
-            // at most the TTL of the dropped entry).
-            if let Some(earliest) = implications
-                .iter()
-                .min_by_key(|(_, until)| **until)
-                .map(|(k, _)| *k)
-            {
-                implications.remove(&earliest);
-            }
-        }
-        implications.contains_key(peer_id)
+        self.any_live_seed_pin_rejection_for(peer_id.0)
     }
 
     /// [`Self::seed_pin_rejects_current_session`] for callers that hold
@@ -5277,13 +5215,13 @@ impl NetworkNode {
         if self.seed_pin_rejects_current_session(node, peer_id) {
             return true;
         }
-        // The any-connection walk is confined to peers the pins already
-        // implicate — a rejection entry or seed-address session history
-        // (round 14): ordinary peers never pay the connection-list scan
-        // on the receive path.
-        if !self.any_live_seed_pin_rejection_for(peer_id.0)
-            && !self.peer_has_session_evidence(peer_id)
-        {
+        // The any-connection walk is confined to identities with a LIVE
+        // REJECTION entry (Engineer ruling, 23 Oct 2026): a pin mismatch
+        // refuses at every seam and records one, so entry-less identities
+        // — including every pin-matching seed, whatever its ledger
+        // history — never pay the connection-list scan on the receive
+        // path.
+        if !self.any_live_seed_pin_rejection_for(peer_id.0) {
             return false;
         }
         let rejected_addrs: Vec<SocketAddr> = self
@@ -6996,7 +6934,6 @@ impl NetworkNode {
     fn spawn_session_ledger_watcher(&self) -> tokio::task::JoinHandle<()> {
         let node = Arc::clone(&self.node);
         let ledger = Arc::clone(&self.session_addr_ledger);
-        let implications = Arc::clone(&self.session_implications);
         tokio::spawn(async move {
             let mut lifecycle = {
                 let guard = node.read().await;
@@ -7057,7 +6994,7 @@ impl NetworkNode {
                 if link.current_connection_generation(&peer) != Some(generation) {
                     continue;
                 }
-                note_session_address_in(&ledger, &implications, peer, generation, addr);
+                note_session_address_in(&ledger, peer, generation, addr);
             }
         })
     }
@@ -7076,7 +7013,6 @@ impl NetworkNode {
         let connection_pool = Arc::clone(&self.connection_pool);
         let inbound_allowlist = self.config.inbound_allowlist.clone();
         let session_addr_ledger = Arc::clone(&self.session_addr_ledger);
-        let session_implications = Arc::clone(&self.session_implications);
         let seed_pin_rejections = Arc::clone(&self.seed_pin_rejections);
         #[cfg(test)]
         let test_seed_pin_rejection_ttl = Arc::clone(&self.test_seed_pin_rejection_ttl);
@@ -7198,7 +7134,6 @@ impl NetworkNode {
                             if still_on_accepted && before.is_some() && before == after {
                                 note_session_address_in(
                                     &session_addr_ledger,
-                                    &session_implications,
                                     peer_conn.peer_id,
                                     before.unwrap_or_default(),
                                     addr,
@@ -8195,18 +8130,19 @@ const SESSION_ADDR_LEDGER_MAX_PEERS: usize = 512;
 /// address a connection generation of a peer lives on. SCOPED TO PINNED
 /// ADDRESSES (round 14): evidence for an unpinned address can never
 /// refuse a frame — the pair verdict is TOFU there — so only
-/// seed-address sessions enter the ledger. That keeps it tiny, keeps the
-/// pump's per-frame write work off every ordinary peer, and confines the
-/// fail-closed provenance rule to peers with seed-address history.
-/// Entries keep the most recent few generations per peer (a RECONNECT at
-/// the same address never deletes an earlier generation's evidence —
-/// queued frames of the old generation still need it), expire on
+/// seed-address sessions enter the ledger. That keeps it tiny and keeps
+/// the pump's per-frame write work off every ordinary peer. Entries keep
+/// the most recent few generations per peer (a RECONNECT at the same
+/// address never deletes an earlier generation's evidence — queued
+/// frames of the old generation still need it), expire on
 /// [`SESSION_ADDR_LEDGER_TTL`], and the identity count is bounded by
 /// [`SESSION_ADDR_LEDGER_MAX_PEERS`]. A no-op while the pin table is
-/// empty.
+/// empty. The ledger records matching and mismatching identities alike:
+/// it is the KNOWN-provenance source the frame guard's pair verdict
+/// reads, never a refusal trigger on its own (Engineer ruling, 23 Oct
+/// 2026).
 fn note_session_address_in(
     ledger: &Arc<Mutex<SessionAddrLedger>>,
-    implications: &Arc<Mutex<std::collections::HashMap<AntPeerId, Instant>>>,
     peer: AntPeerId,
     generation: u64,
     addr: SocketAddr,
@@ -8220,31 +8156,6 @@ fn note_session_address_in(
         return;
     }
     let now = Instant::now();
-    // Round 19: the peer is implicated for the TTL horizon, decoupled
-    // from its detail row — global eviction of the row (the peer bound)
-    // cannot re-admit its queued frames of unknown generations. Round
-    // 20: expiry and the cap are enforced AT INSERTION — identity churn
-    // between reads cannot grow the map (prune expired, then drop the
-    // earliest-expiring until inside the cap).
-    {
-        let mut implications = implications
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        implications.retain(|_, until| *until > now);
-        implications.insert(peer, now + SESSION_ADDR_LEDGER_TTL);
-        while implications.len() > 2 * SESSION_ADDR_LEDGER_MAX_PEERS {
-            let earliest = implications
-                .iter()
-                .min_by_key(|(_, until)| **until)
-                .map(|(k, _)| *k);
-            match earliest {
-                Some(id) if id != peer => {
-                    implications.remove(&id);
-                }
-                _ => break,
-            }
-        }
-    }
     let mut ledger = ledger
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -12307,17 +12218,16 @@ mod tests {
         seed.try_shutdown().await.unwrap();
     }
 
-    /// Rounds 13-14 (Codex P2: eviction restores the bypass; Claude: the
-    /// fail-closed rule must not swallow ordinary peers): with pins in
-    /// force, a frame of unknown provenance is refused ONLY for a peer
-    /// the pins already implicate — seed-address session history or a
-    /// rejection entry. Evidence evicted by the ledger's bounds is
-    /// refused again; a peer with NO seed-address history is outside the
-    /// pins' threat model and keeps flowing. Runtime-RED before the
-    /// scoped stance: implicated peers' missing-evidence frames passed,
-    /// and (before scoping) ordinary peers' frames were refused.
+    /// Rounds 13-14, reworked 23 Oct 2026 (Engineer ruling on Claude's
+    /// review: the fail-closed rule must not swallow VALID seeds): with
+    /// pins in force, a frame of unknown provenance is refused ONLY for
+    /// a peer with a LIVE REJECTION entry — never on seed-address
+    /// history alone. Known provenance (a ledgered generation, the
+    /// current session) still decides by the pair verdict. Runtime-RED
+    /// before the rework: a pin-matching seed's frames of an unobserved
+    /// or evicted generation were refused by history alone.
     #[tokio::test]
-    async fn issue1112_unknown_provenance_scoped_to_implicated_peers() {
+    async fn issue1112_unknown_provenance_flows_without_a_live_rejection() {
         const NOT_THE_SEED: [u8; 32] = [0xB4; 32];
         const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
             addr: "198.18.0.2:5483",
@@ -12340,15 +12250,31 @@ mod tests {
             !node.seed_pin_rejects_frame(&link, &ordinary, 42),
             "a peer with no seed-address history keeps flowing under pins"
         );
-        // An implicated peer with NO evidence for the frame's generation
-        // (never observed): fail-closed.
+        // A PIN-MATCHING seed (Claude review of bd831aa, risk 2): the
+        // ledger records its sessions at the pinned address like anyone
+        // else's, and BOTH its ledgered generations (pair verdict: Match)
+        // and its unknown-provenance generations must keep flowing.
+        let matching = NOT_THE_SEED;
+        node.note_session_address(ant_quic::PeerId(matching), 7, pinned_addr);
+        assert!(!node.seed_pin_rejects_frame(&link, &ant_quic::PeerId(matching), 7));
+        assert!(
+            !node.seed_pin_rejects_frame(&link, &ant_quic::PeerId(matching), 42),
+            "a pin-matching seed's unknown-provenance frames keep flowing"
+        );
+        // Seed-address history ALONE (Engineer ruling, 23 Oct 2026) never
+        // refuses unknown provenance — this is what keeps a PIN-MATCHING
+        // seed's frames flowing when the ledger bounds evicted their
+        // generation's row, and what keeps the mismatched identity out of
+        // the receive path's fail-closed guesswork: provenance is decided
+        // by KNOWN evidence (below) or a live rejection (further below),
+        // never by history alone.
         node.note_session_address(implicated, 100, pinned_addr);
         assert!(
-            node.seed_pin_rejects_frame(&link, &implicated, 42),
-            "an implicated peer's frame with no source evidence is refused"
+            !node.seed_pin_rejects_frame(&link, &implicated, 42),
+            "seed-address history alone must not refuse unknown provenance"
         );
         // Evidence evicted by the per-peer bound: nine generations push
-        // the first out (cap 8), and its frames are refused again.
+        // the first out (cap 8), and its unknown provenance flows too.
         for generation in 0..9u64 {
             node.note_session_address(implicated, generation, pinned_addr);
         }
@@ -12356,18 +12282,30 @@ mod tests {
             node.session_addr_for(&implicated, 0).is_none(),
             "the first generation's evidence was evicted by the bound"
         );
-        assert!(node.seed_pin_rejects_frame(&link, &implicated, 0));
+        assert!(!node.seed_pin_rejects_frame(&link, &implicated, 0));
         // A generation WITH evidence at the mismatching address: refused
-        // by the pair verdict.
+        // by the pair verdict — known provenance still decides.
         assert!(node.seed_pin_rejects_frame(&link, &implicated, 8));
+        // A LIVE REJECTION entry restores the fail-closed rule for
+        // unknown generations: a seam refused this identity, so nothing
+        // of unknown provenance may flow until the entry expires.
+        node.record_seed_pin_rejection(pinned_addr, implicated.0, None);
+        assert!(node.seed_pin_rejects_frame(&link, &implicated, 42));
+        node.clear_seed_pin_rejection(pinned_addr);
+        assert!(!node.seed_pin_rejects_frame(&link, &implicated, 42));
+        // History alone also never triggers the any-connection scan.
+        assert!(
+            !node.seed_pin_rejected_session(&implicated).await,
+            "the connection scan needs a live rejection, not history"
+        );
 
         node.try_shutdown().await.unwrap();
     }
 
     /// Round 16 (Codex P2: ledger expiry was not enforced on reads): a
-    /// peer that moves off seed addresses stops being implicated once
-    /// its evidence passes [`SESSION_ADDR_LEDGER_TTL`] — the reads
-    /// enforce the bound even when no later write pruned the entries.
+    /// peer's KNOWN source-session evidence stops refusing its frames
+    /// once it passes [`SESSION_ADDR_LEDGER_TTL`] — the reads enforce
+    /// the bound even when no later write pruned the entries.
     #[tokio::test]
     async fn issue1112_idle_peer_evidence_expires_on_read() {
         const NOT_THE_SEED: [u8; 32] = [0xB6; 32];
@@ -12383,13 +12321,12 @@ mod tests {
         let peer = test_ant_peer(0xC);
         let _pins = TestPinTableGuard::set(&PINS);
 
-        // Fresh evidence implicates the peer.
+        // Fresh evidence: the frame's OWN generation is ledgered at the
+        // pinned address, and the pair verdict refuses it.
         node.note_session_address(peer, 1, pinned_addr);
-        assert!(node.peer_has_session_evidence(&peer));
-        assert!(node.seed_pin_rejects_frame(&link, &peer, 99));
+        assert!(node.seed_pin_rejects_frame(&link, &peer, 1));
 
-        // Age every entry past the TTL (as an idle period would) — the
-        // detail rows AND the implication horizons.
+        // Age every entry past the TTL (as an idle period would).
         {
             let past = Instant::now() - SESSION_ADDR_LEDGER_TTL - Duration::from_secs(1);
             let mut ledger = node
@@ -12401,19 +12338,12 @@ mod tests {
                     *at = past;
                 }
             }
-            let mut implications = node
-                .session_implications
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for until in implications.values_mut() {
-                *until = past;
-            }
         }
-        // The reads enforce the bound: no evidence, no implication, and
-        // the idle peer's unknown-provenance frames flow again.
+        // The reads enforce the bound: the known evidence is gone, so
+        // the frame's provenance is unknown — and unknown provenance
+        // alone never refuses.
         assert!(node.session_addr_for(&peer, 1).is_none());
-        assert!(!node.peer_has_session_evidence(&peer));
-        assert!(!node.seed_pin_rejects_frame(&link, &peer, 99));
+        assert!(!node.seed_pin_rejects_frame(&link, &peer, 1));
 
         node.try_shutdown().await.unwrap();
     }
@@ -12423,10 +12353,10 @@ mod tests {
     /// is still current, so a late event can never mis-attribute the
     /// replacement connection's address to the old generation. The old
     /// generation keeps its own evidence and its queued frames stay
-    /// refused; an implicated peer's frames ride the CURRENT session
-    /// clause (an unpinned address admits — the pins govern pinned
-    /// addresses only), and its other unknown generations stay
-    /// fail-closed.
+    /// refused; the peer's frames of generations with NO evidence ride
+    /// the CURRENT session clause (an unpinned address admits — the pins
+    /// govern pinned addresses only), and unknown provenance never
+    /// refuses without a live rejection (23 Oct 2026 ruling).
     #[tokio::test]
     async fn issue1112_late_lifecycle_event_across_addresses_keeps_evidence_true() {
         const NOT_THE_SEED: [u8; 32] = [0xB5; 32];
@@ -12447,98 +12377,16 @@ mod tests {
         // The pinned generation's frames stay refused by their own
         // evidence — a late watcher event cannot rewrite it.
         assert!(node.seed_pin_rejects_frame(&link, &peer, 1));
-        // Another generation of the same implicated peer, no evidence:
-        // fail-closed (its live traffic flows via the current-session
-        // clause, whose unpinned address admits).
+        // Another generation of the same peer, no evidence for it:
+        // history alone never refuses (Engineer ruling, 23 Oct 2026) —
+        // its live traffic flows via the current-session clause, and a
+        // generation the ledger never observed is not guessed at.
         assert!(
-            node.seed_pin_rejects_frame(&link, &peer, 2),
-            "an implicated peer's unknown generations stay fail-closed"
+            !node.seed_pin_rejects_frame(&link, &peer, 2),
+            "unknown provenance without a live rejection keeps flowing"
         );
 
         node.try_shutdown().await.unwrap();
-    }
-
-    /// Round 19 (Codex P2: global ledger eviction re-admits
-    /// pin-mismatched frames): the detail row's eviction under the
-    /// global peer bound does NOT clear the identity's implication — the
-    /// implication map (TTL-bounded, same horizon) survives, so the
-    /// peer's queued frames of unknown generations stay refused. Runtime
-    /// RED before the implication map: after eviction both receive
-    /// guards returned false.
-    #[tokio::test]
-    async fn issue1112_implication_survives_global_ledger_eviction() {
-        const NOT_THE_SEED: [u8; 32] = [0xB8; 32];
-        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
-            addr: "198.51.100.7:5483",
-            expected_peer_ids: &[&NOT_THE_SEED],
-        }];
-        let pinned_addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
-        let node = NetworkNode::new(test_network_config(), None, None)
-            .await
-            .unwrap();
-        let link = node.node.read().await.clone().expect("live link");
-        let peer = test_ant_peer(0xD);
-        let _pins = TestPinTableGuard::set(&PINS);
-
-        // The peer has seed-address history...
-        node.note_session_address(peer, 1, pinned_addr);
-        // ...and the global bound then evicts its detail row.
-        let distinct = |n: u32| {
-            let mut id = [0u8; 32];
-            id[0..4].copy_from_slice(&n.to_le_bytes());
-            ant_quic::PeerId(id)
-        };
-        for n in 0..(SESSION_ADDR_LEDGER_MAX_PEERS as u32 + 64) {
-            node.note_session_address(distinct(n), 1, pinned_addr);
-        }
-        assert!(
-            node.session_addr_for(&peer, 1).is_none(),
-            "the detail row was evicted by the global bound"
-        );
-        // The unknown-generation frame is still refused: the implication
-        // survived the eviction.
-        assert!(
-            node.seed_pin_rejects_frame(&link, &peer, 99),
-            "the evicted peer stays implicated until its TTL horizon"
-        );
-
-        node.try_shutdown().await.unwrap();
-    }
-
-    /// Round 20 (Codex P2: `session_implications` was only bounded on
-    /// reads): expiry and the cap are enforced AT INSERTION — identity
-    /// churn at a pinned address between reads cannot grow the map.
-    /// Runtime-RED before the insertion bound: 1_100 inserts with no
-    /// intervening read left 1_100 entries.
-    #[test]
-    fn issue1112_implication_map_is_bounded_at_insertion() {
-        const NOT_IT: [u8; 32] = [0xB9; 32];
-        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
-            addr: "198.51.100.7:5483",
-            expected_peer_ids: &[&NOT_IT],
-        }];
-        let addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
-        let ledger = Arc::new(Mutex::new(SessionAddrLedger::new()));
-        let implications = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let _pins = TestPinTableGuard::set(&PINS);
-        let distinct = |n: u32| {
-            let mut id = [0u8; 32];
-            id[0..4].copy_from_slice(&n.to_le_bytes());
-            ant_quic::PeerId(id)
-        };
-        // No reads in between: the insertion path alone must hold the
-        // bound.
-        for n in 0..1_100u32 {
-            note_session_address_in(&ledger, &implications, distinct(n), 1, addr);
-        }
-        assert!(
-            implications
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len()
-                <= 2 * SESSION_ADDR_LEDGER_MAX_PEERS,
-            "the implication map stays inside its cap without reads"
-        );
     }
 
     /// Round 12 (Codex P2 + Claude: the session ledger grows without a
@@ -12549,9 +12397,8 @@ mod tests {
     fn issue1112_session_ledger_is_bounded_and_dormant_without_pins() {
         let addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
         let ledger = Arc::new(Mutex::new(SessionAddrLedger::new()));
-        let implications = Arc::new(Mutex::new(std::collections::HashMap::new()));
         // No pin table: writes no-op.
-        note_session_address_in(&ledger, &implications, test_ant_peer(1), 1, addr);
+        note_session_address_in(&ledger, test_ant_peer(1), 1, addr);
         assert!(
             ledger
                 .lock()
@@ -12569,7 +12416,7 @@ mod tests {
         // Per-peer generation cap (checked before the global loop can
         // evict this peer as oldest-touched).
         for generation in 0..20u64 {
-            note_session_address_in(&ledger, &implications, test_ant_peer(1), generation, addr);
+            note_session_address_in(&ledger, test_ant_peer(1), generation, addr);
         }
         assert!(
             ledger
@@ -12586,7 +12433,7 @@ mod tests {
             ant_quic::PeerId(id)
         };
         for n in 0..(SESSION_ADDR_LEDGER_MAX_PEERS as u32 + 64) {
-            note_session_address_in(&ledger, &implications, distinct(n), 1, addr);
+            note_session_address_in(&ledger, distinct(n), 1, addr);
         }
         let ledger = ledger
             .lock()

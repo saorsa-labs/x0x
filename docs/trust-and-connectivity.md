@@ -160,10 +160,12 @@ erases an earlier generation's entry. The ledger records SEED-ADDRESS
 sessions only — evidence for an unpinned address can never refuse a
 frame — is bounded (a few generations per peer, an hour per entry, a
 global identity cap), and is dormant while the pin table is empty.
-Frames of unknown provenance (no entry, no evidence — never observed, or
-evicted by the bounds) are refused only for peers the pins already
-implicate (seed-address session history or a rejection entry); ordinary
-peers are outside the pins' threat model and keep flowing. Ordinary
+Frames of unknown provenance (never observed, or evicted by the bounds)
+are refused only for peers with a LIVE rejection entry — never on
+seed-address session history alone, so a pin-matching seed's frames of
+an unobserved generation keep flowing (Engineer ruling, 23 Oct 2026).
+Known provenance always decides by the pair verdict: the session ledger
+maps a frame's own generation to the address it lived on. Ordinary
 gossip sends are bound to the connection generation they examined — but
 only while any address is pinned: with nothing pinned the pre-#1112
 plain send stands, so the binding (a replacement between check and write
@@ -195,42 +197,37 @@ crate-private (`pub(crate)`): pinning is an operator-compiled behaviour,
 not a public API. Rejection entries expire on their own TTL, so the set
 cannot grow unbounded with dial rate against pinned addresses.
 
-### Capability hints: an observed operator tier, plus the ADR-0071 tiers (#1112)
+### Capability hints: one observed operator tier (#1112)
 
 The coordinator/relay hint lists on outgoing machine announcements
-(`select_capability_hints`, `src/lib.rs`) keep ADR 0071's Accepted
-community eligibility unchanged — the announcement's `is_relay`/
-`is_coordinator` flags, which the ADR records as the shipped mechanism
-(the bootstrap fleet, `--relay` opt-in nodes, and nodes whose #398
-`AnnouncementAssistSnapshot` gating proved public reachability) — and add
-one verified tier:
+(`select_capability_hints`, `src/lib.rs`) admit exactly one tier:
 
-- **Operator tier (new, #1112):** a peer connected over a DIRECT path
-  whose OBSERVED remote address (v4-mapped forms normalized) IS a
-  compiled-in seed listener address — the full socket address, never the
-  IP alone, so a NATed peer with a relay slot on a seed (which advertises
-  the seed IP on an allocated port) does not qualify — and, when that
-  address is pinned, whose identity is inside its pin set, is a
-  coordinator and relay hint with no capability flag consulted at all. A
-  completed QUIC handshake with that source is deployment-derived
-  evidence no announcement can forge: listing a seed address in an
-  announcement buys nothing.
+- **Operator tier:** a peer connected over a DIRECT path whose OBSERVED
+  remote address (v4-mapped forms normalized) IS a compiled-in seed
+  listener address — the full socket address, never the IP alone, so a
+  NATed peer with a relay slot on a seed (which advertises the seed IP on
+  an allocated port) does not qualify — and, when that address is pinned,
+  whose identity is inside its pin set, is a coordinator and relay hint
+  with no capability flag consulted at all. A completed QUIC handshake
+  with that source is deployment-derived evidence no announcement can
+  forge: listing a seed address in an announcement buys nothing.
 
-A pin-mismatched (observed address, identity) PAIR is excluded from every
-tier — pair-scoped, never identity-wide, so a mismatch at one seed address
-does not cost the same identity its valid, pinned origin at another. A
-relayed connection's observed address names the relay, not the peer, so
-it is never operator-tier evidence.
+**Decided (David, 20 Oct 2026; confirmed 22 Oct 2026).** David's #1112
+ruling to ignore self-asserted relay/coordinator flags REPLACES ADR
+0071's community flag tiers. The announcement's `is_relay`/
+`is_coordinator` fields stay in the wire structs as informational data,
+but no hint, join or selection path reads them: a peer that only
+self-asserts the flags gets no hint. The same applies to the transport
+helper hints (`seed_transport_peer_hints_for_target`, `src/lib.rs`):
+gossip-advert roles and machine-cache flags contribute address hints
+only, never coordinator/relay capability marks — the seeds keep theirs
+through ant-quic's deployment-configured bootstrap cache.
 
-**Open decision (recorded with David).** David's 20 Oct 2026 #1112
-ruling says to ignore self-asserted relay/coordinator flags; ADR 0071
-(Accepted) records those same flags as the shipped community eligibility.
-Superseding the ADR is David's call, not this PR's: until he decides, the
-ADR's community tiers stand and the ruling is implemented where it adds
-verification without removing Accepted behaviour (the observed operator
-tier, and the seed pins). Two independent evidence mechanisms would let
-the flags retire without narrowing — observed relay-success weighting, or
-an attestation signed by a seed (both named by #1112 itself).
+A pin-mismatched (observed address, identity) PAIR is excluded from the
+tier — pair-scoped, never identity-wide, so a mismatch at one seed
+address does not cost the same identity its valid, pinned origin at
+another. A relayed connection's observed address names the relay, not the
+peer, so it is never operator-tier evidence.
 
 ### Seed key rotation policy
 
@@ -257,8 +254,8 @@ A seed rotates its machine key as follows:
 `IdentityAnnouncement` and `DiscoveredAgent` carry four optional NAT fields:
 - `nat_type: Option<String>` — e.g. "FullCone", "Symmetric", "None"
 - `can_receive_direct: Option<bool>` — whether inbound connections are accepted
-- `is_relay: Option<bool>` — whether the node is relaying for others
-- `is_coordinator: Option<bool>` — whether the node is coordinating NAT punch timing
+- `is_relay: Option<bool>` — whether the node claims it is relaying for others (informational: no hint, join or selection path reads it — David's 20 Oct 2026 #1112 ruling)
+- `is_coordinator: Option<bool>` — whether the node claims it is coordinating NAT punch timing (informational, same ruling)
 
 The sync `build_announcement()` leaves these as `None` (no network access). The async heartbeat queries `NetworkNode::node_status()` to populate them.
 
