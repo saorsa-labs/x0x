@@ -3538,16 +3538,8 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
     let Some(info) = state.named_groups.read().await.get(&group_key).cloned() else {
         return;
     };
-    // §4 (D81): Home activation ships off. A Home-policy group takes no
-    // answer, asked for or not: no ATA arms it and no re-seat starts, as
-    // on the issuing and requesting paths (`answer_request`, `subject_tick`).
-    if is_home_policy_group(&info) {
-        tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: answer for a Home-policy group ignored (Home activation is off)");
-        return;
-    }
-    let stable = info.stable_group_id().to_string();
-    let sender_hex = hex::encode(sender.as_bytes());
-    let answer_name = response.answer.name().to_string();
+    // A manual re-seat is not Home activation (§4): it runs before the
+    // Home gate (see `consume_reseat`).
     if let AttestAnswer::Reseat {
         authorisation,
         invite,
@@ -3556,6 +3548,16 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
         consume_reseat(state, &group_key, *authorisation, invite).await;
         return;
     }
+    // §4 (D81): Home activation ships off. A Home-policy group takes no
+    // other answer, asked for or not: no ATA arms it, as on the issuing and
+    // requesting paths (`answer_request`, `subject_tick`).
+    if is_home_policy_group(&info) {
+        tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: answer for a Home-policy group ignored (Home activation is off)");
+        return;
+    }
+    let stable = info.stable_group_id().to_string();
+    let sender_hex = hex::encode(sender.as_bytes());
+    let answer_name = response.answer.name().to_string();
     // Every other answer is for this node's current head only.
     if response.for_head_state_hash != info.state_hash {
         return;
@@ -5009,11 +5011,9 @@ async fn consume_reseat(
     let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
         return;
     };
-    // §4 (D81): no re-seat for a Home-policy group while Home activation
-    // is off; its live record and legacy views stay as they are.
-    if is_home_policy_group(&info) {
-        return;
-    }
+    // No Home gate here: a manual re-seat is not Home activation (§4). The
+    // open journal keeps the original in every legacy file
+    // ([`reseat_overlay`]), and a Home-policy staged join pins its owner.
     let stable = info.stable_group_id().to_string();
     if sidecar_snapshot(state, &stable)
         .await
@@ -9239,14 +9239,59 @@ mod tests {
         original_kept(&state, &key, &info).await
     }
 
+    /// #1533 (Codex P2 @70ac6f3f), ADR 0109 §3 and §4: a manual re-seat is
+    /// not Home activation, so an active admin's offer for a Home-policy
+    /// group passes every check and reaches the staged join while Home
+    /// activation is off. Before the fix the Home gate dropped the offer
+    /// unchecked. The join cannot finish offline, so the rollback restores
+    /// the original. Inert (offline agent).
+    #[tokio::test]
+    async fn a_home_policy_group_still_takes_a_manual_reseat() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let member = x0x::identity::AgentKeypair::generate()?;
+        let (key, mut info) = authority_fixture(&state, &admin, &member, None).await?;
+        info.home = Some(x0x::groups::HomeMetadata {
+            primary_agent: hex::encode(admin.agent_id().as_bytes()),
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 1,
+        });
+        anyhow::ensure!(is_home_policy_group(&info));
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let (basis, revision, hash) = unseen_removal(&info);
+        let offer = reseat_offer(
+            &info,
+            &admin,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        let refusal = deliver_offer(&state, &info, &admin, offer).await;
+        assert!(
+            refusal
+                .as_deref()
+                .is_some_and(|why| why.starts_with("join_")),
+            "the staged join ran: {refusal:?}"
+        );
+        original_kept(&state, &key, &info).await
+    }
+
     /// #1533 rc13 (Codex P1 @c226d28e, ZCode MAJOR 1), ADR 0109 §4 (D81):
-    /// Home activation ships off, so an answer for a Home-policy group
-    /// changes nothing on disk or in memory, even when it carries a valid
+    /// Home activation ships off, so an attestation for a Home-policy group
+    /// changes nothing on disk or in memory, even when it is a valid
     /// ATA from an active admin, asked for or not. Before the fix the
     /// unsolicited ATA reached `arm_in_place`: it wrote the sidecar and
     /// placeheld the group (the §4 legacy placeholder).
     #[tokio::test]
-    async fn a_home_policy_group_takes_no_answer() -> anyhow::Result<()> {
+    async fn a_home_policy_group_takes_no_attestation() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
         let local = local_hex(&state);
         let admin = x0x::identity::AgentKeypair::generate()?;
@@ -9315,17 +9360,6 @@ mod tests {
         arm_from_response(&state, &key, &info, ata.clone()).await;
         assert!(!arm_in_place(&state, &key, &info, ata).await);
         ensure_placeholders(&state).await;
-        // A re-seat offer for the Home group starts nothing either: it is
-        // not even checked, so no refusal is recorded.
-        let (basis, revision, hash) = unseen_removal(&info);
-        let offer = reseat_offer(
-            &info,
-            &admin,
-            state.agent.agent_id(),
-            basis,
-            (revision, &hash),
-        )?;
-        assert_eq!(deliver_offer(&state, &info, &admin, offer).await, None);
 
         assert!(sidecar_snapshot(&state, &stable).await.is_none());
         assert!(!is_placeheld(&state, &stable));
