@@ -33,7 +33,9 @@ pub struct DmLifecycleHint {
 }
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
-const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
+/// Sleep between publish-only attempts; a stage of an ordinary send's
+/// absolute budget ([`crate::dm_evidence::ordinary_send_budget`]).
+pub(crate) const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
 const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 
 /// Stable per-sender context for [`send_via_gossip`].

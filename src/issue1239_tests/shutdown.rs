@@ -25,7 +25,7 @@ async fn read(agent: &Agent, lookup: bool, deadline: tokio::time::Instant) -> Re
     if lookup {
         agent
             .peer_evidence()
-            .lookup_before(recipient, deadline)
+            .lookup_before(recipient, None, deadline)
             .await
     } else {
         agent
