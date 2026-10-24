@@ -530,17 +530,28 @@ impl StoreState {
     }
 }
 
+/// #1239: bounded concurrent readers for `candidates_before`. The cap
+/// keeps readers queued behind a held store writer from growing the
+/// blocking pool without bound; it matches the evidence runtime's reader
+/// cap.
+pub(crate) const SHARE_GRANT_READ_PERMITS: usize = 16;
+
 /// Persistent store of issued and received share grants.
 ///
 /// All in-memory access is under a short synchronous lock never held across
 /// an await; writes are serialised by an async lock so snapshots reach disk
-/// in order.
+/// in order. #1239: async callers take candidate snapshots through the
+/// crate-private `candidates_before`, a bounded blocking worker, so a held
+/// state lock never stalls their Tokio worker.
 #[derive(Debug)]
 pub struct ShareGrantStore {
     path: Option<PathBuf>,
     local_agent: AgentId,
     local_owner: Option<UserId>,
-    state: std::sync::RwLock<StoreState>,
+    state: Arc<std::sync::RwLock<StoreState>>,
+    /// Admission cap for `candidates_before`'s bounded blocking readers
+    /// (#1239), reserved before each spawn.
+    reads: Arc<tokio::sync::Semaphore>,
     write_lock: tokio::sync::Mutex<()>,
     /// Set when the file on disk could not be read: the store then holds
     /// nothing and refuses writes so the file is never silently replaced.
@@ -561,7 +572,8 @@ impl ShareGrantStore {
             path: None,
             local_agent,
             local_owner,
-            state: std::sync::RwLock::new(StoreState::default()),
+            state: Arc::new(std::sync::RwLock::new(StoreState::default())),
+            reads: Arc::new(tokio::sync::Semaphore::new(SHARE_GRANT_READ_PERMITS)),
             write_lock: tokio::sync::Mutex::new(()),
             load_error: None,
             poisoned: std::sync::Mutex::new(None),
@@ -604,7 +616,7 @@ impl ShareGrantStore {
                         state.role_mut(role).insert(grant.grant_id, grant);
                     }
                 }
-                store.state = std::sync::RwLock::new(state);
+                store.state = Arc::new(std::sync::RwLock::new(state));
             }
             Err(e) => {
                 tracing::warn!("share-grant store unreadable, holding no grants: {e}");
@@ -772,18 +784,69 @@ impl ShareGrantStore {
     /// Filters under the read lock and clones only the candidates.
     #[must_use]
     pub fn candidates_for_local_agent(&self, now_unix: u64) -> Vec<ShareGrant> {
-        let Some(owner) = self.local_owner else {
-            return Vec::new();
-        };
-        let state = self.read_state();
-        state
-            .issued
-            .values()
-            .filter(|g| {
-                g.owner == owner && g.agents.contains(&self.local_agent) && g.is_active_at(now_unix)
-            })
-            .cloned()
-            .collect()
+        candidates_in(&self.state, self.local_owner, self.local_agent, now_unix)
+    }
+
+    /// #1239: [`Self::candidates_for_local_agent`] off the caller's Tokio
+    /// worker. The state lock's synchronous read runs on a blocking worker;
+    /// admission, the read and the result share `deadline`. A read still
+    /// waiting at `deadline` fails closed (`Err(())`, so gates report Busy)
+    /// and the next evaluation retries, while its worker stays queued behind
+    /// the writer: once the lock frees it reads a snapshot, drops it and
+    /// returns its permit. Admission is reserved before spawning, so readers
+    /// stuck behind a store writer cannot grow the blocking pool without
+    /// bound.
+    pub(crate) async fn candidates_before(
+        &self,
+        now_unix: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<ShareGrant>, ()> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        // Admission waits inside the same deadline: a writer held past the
+        // budget pins every permit (a running read keeps its until the lock
+        // frees), so an evaluation queued for admission must still fail
+        // closed at the budget, not wait unbounded.
+        let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.reads).acquire_owned())
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        let state = Arc::clone(&self.state);
+        let owner = self.local_owner;
+        let agent = self.local_agent;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            let _ = send.send(candidates_in(&state, owner, agent, now_unix));
+        });
+        let read = tokio::time::timeout_at(deadline, receive).await;
+        if read.is_err() {
+            // Dropping a queued worker aborts it. A running synchronous read
+            // cannot be aborted; it completes when the lock frees, drops the
+            // snapshot and returns its permit.
+            worker.abort();
+        }
+        let candidates = read.map_err(|_| ())?.map_err(|_| ())?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(());
+        }
+        Ok(candidates)
+    }
+
+    /// Test seam (#1239): whether every bounded reader permit is free — no
+    /// candidate read queued or running. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn reads_idle_for_testing(&self) -> bool {
+        self.reads
+            .try_acquire_many(SHARE_GRANT_READ_PERMITS as u32)
+            .is_ok()
     }
 
     /// Verify, classify and durably store a grant.
@@ -944,6 +1007,28 @@ impl ShareGrantStore {
     }
 }
 
+/// [`ShareGrantStore::candidates_for_local_agent`]'s filter, over a shared
+/// state lock, so the bounded reader can run it on a blocking worker (#1239).
+fn candidates_in(
+    state: &std::sync::RwLock<StoreState>,
+    owner: Option<UserId>,
+    local_agent: AgentId,
+    now_unix: u64,
+) -> Vec<ShareGrant> {
+    let Some(owner) = owner else {
+        return Vec::new();
+    };
+    let state = state
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+        .issued
+        .values()
+        .filter(|g| g.owner == owner && g.agents.contains(&local_agent) && g.is_active_at(now_unix))
+        .cloned()
+        .collect()
+}
+
 /// Bincode decode matching `bincode::serialize`'s encoding (fixint, little
 /// endian) but STRICT: trailing bytes are an error and reads are bounded by
 /// `limit` (which also bounds preallocation).
@@ -1078,25 +1163,28 @@ pub async fn evaluate_grant_access(
         true,
     )
     .await
-    // Blocking path never returns Busy.
+    // Contention past the read budget fails closed to empty access
+    // (`Err(())` collapses here); the next evaluation retries.
     .unwrap_or_default()
     .access
 }
 
-/// #1239: one budget for this evaluation's EvidenceRuntime reads — the
-/// Lookup and the local usable views. Five seconds matches the load barrier
-/// and the ADR-0074 reauth bound; it is an internal budget, not a wire,
-/// storage or API constant. A read still waiting at the deadline fails
-/// closed (`Err(())`, so gates report Busy) and the next evaluation retries.
-const EVIDENCE_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// #1239: one budget for this evaluation's synchronous authority reads —
+/// the grant-store candidates snapshot, the Lookup and the local usable
+/// views. Five seconds matches the load barrier and the ADR-0074 reauth
+/// bound; it is an internal budget, not a wire, storage or API constant. A
+/// read still waiting at the deadline fails closed (`Err(())`, so gates
+/// report Busy) and the next evaluation retries.
+pub(crate) const EVIDENCE_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// With `allow_network_lookup = false`, skip EvidenceV1 wait/lookup but still
 /// read local usable evidence (`try_usable`) so a reauth pass keeps
 /// authenticated bindings without network I/O.
 ///
-/// Returns `Err(())` when `allow_network_lookup` is false and a `try_usable`
-/// evidence read is contended — callers that need Busy (gates / reauth) must
-/// not collapse this to empty access.
+/// Returns `Err(())` when a bounded synchronous authority read (the grant
+/// store's candidates snapshot, or an evidence read) is still contended at
+/// the budget — callers that need Busy (gates / reauth) must not collapse
+/// this to empty access.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn evaluate_grant_access_with_evidence(
     store: &ShareGrantStore,
@@ -1116,15 +1204,15 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     if now_unix == 0 {
         return Ok(access);
     }
-    let candidates = store.candidates_for_local_agent(now_unix);
+    // #1239: the candidates snapshot, the Lookup and the usable views below
+    // run their synchronous store reads on bounded blocking workers under
+    // one budget, so a held store can no longer stall this evaluation's
+    // Tokio worker. Sources are re-read after the Lookup exactly as before.
+    let deadline = tokio::time::Instant::now() + EVIDENCE_READ_BUDGET;
+    let candidates = store.candidates_before(now_unix, deadline).await?;
     if candidates.is_empty() {
         return Ok(access);
     }
-    // #1239: the Lookup and the usable views below run their synchronous
-    // evidence reads on the runtime's bounded blocking workers, so a held
-    // store can no longer stall this evaluation's Tokio worker. Sources are
-    // re-read after the Lookup exactly as before.
-    let deadline = tokio::time::Instant::now() + EVIDENCE_READ_BUDGET;
     if allow_network_lookup
         && crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
             .await
