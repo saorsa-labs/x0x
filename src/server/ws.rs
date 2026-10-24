@@ -122,6 +122,14 @@ pub(super) fn test_gui_ws_session(id: &str) -> WsSession {
     test_ws_session_kind(id, true)
 }
 
+/// Visible GUI socket whose session token the store can accept.
+#[cfg(test)]
+pub(super) fn test_live_gui_ws_session(id: &str, token: &str) -> WsSession {
+    let mut session = test_gui_ws_session(id);
+    session.gui_session_token = Some(token.to_string());
+    session
+}
+
 #[cfg(test)]
 fn test_ws_session_kind(id: &str, visible_gui: bool) -> WsSession {
     WsSession {
@@ -146,6 +154,18 @@ impl WsSession {
     /// Live visible GUI tab. A hidden tab and an agent socket are not.
     pub(super) fn is_visible_gui(&self) -> bool {
         self.visible_gui.load(Ordering::Acquire)
+    }
+
+    /// Visible tab whose session token `session_live` still accepts.
+    ///
+    /// A visible flag with no token, or with an expired token, is not a
+    /// live GUI. Activity selection uses this.
+    pub(super) fn visible_with_live_session(&self, session_live: impl Fn(&str) -> bool) -> bool {
+        self.is_visible_gui()
+            && matches!(
+                self.gui_session_token.as_deref(),
+                Some(token) if !token.is_empty() && session_live(token)
+            )
     }
 
     /// The GUI tab reports `document.visibilityState`.
@@ -1108,7 +1128,10 @@ async fn abandon_ws_session(
     for child in children {
         child.abort();
     }
-    state.ws_sessions.write().await.remove(session_id);
+    let removed = state.ws_sessions.write().await.remove(session_id);
+    if let Some(session) = removed {
+        note_if_live_visible_ended(state, &session);
+    }
 }
 
 /// #1229: a topic backfill row is refused when its author is revoked or
@@ -1467,6 +1490,14 @@ async fn handle_ws_connection(
         return;
     };
     let call_forwarder = armed.forwarder;
+    // `gui=1` means the tab wants to be visible at connect. Stamp that
+    // only when this socket holds a live GUI session, the same gate as
+    // reveal and hide. An agent socket with `gui=1` and no session does
+    // not count. A later hide records that instant. It does not clear
+    // `last_gui_visible_at`.
+    if visible_gui.load(Ordering::Acquire) {
+        note_connected_gui_visibility(&state, &session_id).await;
+    }
 
     tracing::info!(session_id = %session_id, direct_mode, "WebSocket session opened");
 
@@ -1678,18 +1709,20 @@ async fn handle_ws_connection(
         }
     }
 
-    // Cleanup: remove session, abort per-session forwarders
-    let subscribed_topics =
-        if let Some(session) = state.ws_sessions.write().await.remove(&session_id) {
-            let mut subscribed_topics = session.subscribed_topics;
-            for (topic, handle) in session.topic_forwarders {
-                subscribed_topics.insert(topic);
-                handle.abort();
-            }
-            subscribed_topics
-        } else {
-            HashSet::new()
-        };
+    // Cleanup: remove session, abort per-session forwarders.
+    // A live visible tab records this instant before the row is dropped.
+    let removed = state.ws_sessions.write().await.remove(&session_id);
+    let subscribed_topics = if let Some(session) = removed {
+        note_if_live_visible_ended(&state, &session);
+        let mut subscribed_topics = session.subscribed_topics;
+        for (topic, handle) in session.topic_forwarders {
+            subscribed_topics.insert(topic);
+            handle.abort();
+        }
+        subscribed_topics
+    } else {
+        HashSet::new()
+    };
 
     // Clean up shared subscriptions for topics where this was the last WS subscriber
     for topic in &subscribed_topics {
@@ -2217,6 +2250,20 @@ async fn handle_ws_command(
                 }
             };
 
+            // Gui-show frames are signed by this daemon on `POST /gui/show`
+            // only. A session connection and a durable-owner connection are
+            // both refused, matching REST `/direct/send`.
+            if crate::gui::remote::classify_prefix(&bytes).is_some() {
+                feed_droppable(
+                    tx,
+                    WsOutbound::Error {
+                        message: crate::gui::remote::GENERIC_SEND_REFUSAL.to_string(),
+                    },
+                    stats,
+                );
+                return;
+            }
+
             // Issue #446 (review round 2): reserved exec frames must not
             // be craftable over a session-authenticated WS connection —
             // same egress fence as REST /direct/send. The connection's
@@ -2258,20 +2305,13 @@ async fn handle_ws_command(
                     return;
                 }
             };
-            if aid == state.agent.agent_id() {
-                // Local Stop writes the data-dir marker and turns show off
-                // in memory. There is no success frame. A marker write
-                // failure uses the existing error frame. Show stays off.
-                if let Err(message) = state.gui_show.disable_local_show() {
-                    feed_droppable(tx, WsOutbound::Error { message }, stats);
-                }
-                return;
+            if let Err(message) = super::routes::gui_show::apply_gui_block(state, aid) {
+                feed_droppable(tx, WsOutbound::Error { message }, stats);
             }
-            state.gui_show.block_agent(&aid);
         }
 
         WsInbound::GuiVisible { visible } => {
-            let reveal = {
+            let (reveal, ended_visible) = {
                 let sessions = state.ws_sessions.read().await;
                 let Some(session) = sessions.get(session_id) else {
                     return;
@@ -2281,8 +2321,16 @@ async fn handle_ws_command(
                 // view this tab was opened for. Store every request. The
                 // reveal that is waiting for a slot applies the latest one
                 // when the frame fits, so a later show or hide wins.
-                begin_gui_visibility_request(session, visible)
+                let now = std::time::Instant::now();
+                let ended_visible = !visible
+                    && session
+                        .visible_with_live_session(|token| state.sessions.is_valid(token, now));
+                let reveal = begin_gui_visibility_request(session, visible);
+                (reveal, ended_visible)
             };
+            if ended_visible {
+                record_live_visibility_end(state);
+            }
             if let Some(token) = reveal {
                 if let Some(pending) = state
                     .gui_show
@@ -2378,26 +2426,92 @@ fn restore_requested_visibility(session: &WsSession) {
 }
 
 async fn apply_requested_gui_visibility(state: &AppState, session_id: &str) {
-    if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+    let record = if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+        let was_visible = session.is_visible_gui();
         restore_requested_visibility(session);
+        !was_visible && live_gui_session(state, session)
+    } else {
+        false
+    };
+    if record {
+        note_gui_tab_visible(state);
     }
 }
 
 /// The queued frame has left the wait. Apply the latest visibility request
 /// when the send was accepted and this was the last waiting reveal.
 async fn finish_queued_reveal(state: &AppState, session_id: &str, sent: bool) {
-    let sessions = state.ws_sessions.read().await;
-    let Some(session) = sessions.get(session_id) else {
-        return;
+    let became_visible = {
+        let sessions = state.ws_sessions.read().await;
+        let Some(session) = sessions.get(session_id) else {
+            return;
+        };
+        let _guard = visibility_lock(session);
+        let was_visible = session.is_visible_gui();
+        session.reveal_inflight.fetch_sub(1, Ordering::AcqRel);
+        if sent
+            && session.reveal_inflight.load(Ordering::Acquire) == 0
+            && session.requested_visible.load(Ordering::Acquire)
+        {
+            session.set_visible_gui(true);
+        }
+        !was_visible && live_gui_session(state, session)
     };
-    let _guard = visibility_lock(session);
-    session.reveal_inflight.fetch_sub(1, Ordering::AcqRel);
-    if sent
-        && session.reveal_inflight.load(Ordering::Acquire) == 0
-        && session.requested_visible.load(Ordering::Acquire)
-    {
-        session.set_visible_gui(true);
+    if became_visible {
+        note_gui_tab_visible(state);
     }
+}
+
+/// A tab that just became visible still holds a live session token.
+fn live_gui_session(state: &AppState, session: &WsSession) -> bool {
+    let now = std::time::Instant::now();
+    session.visible_with_live_session(|token| state.sessions.is_valid(token, now))
+}
+
+/// Stamp visibility for a `gui=1` connect when that socket is a live GUI.
+///
+/// [`handle_ws_connection`] calls this after the session is inserted.
+/// The session must be visible and hold a token the store still accepts.
+async fn note_connected_gui_visibility(state: &AppState, session_id: &str) {
+    let live = state
+        .ws_sessions
+        .read()
+        .await
+        .get(session_id)
+        .is_some_and(|session| live_gui_session(state, session));
+    if live {
+        note_gui_tab_visible(state);
+    }
+}
+
+/// Record the last time a GUI tab became visible.
+///
+/// Hiding a live tab and disconnecting its socket store that later instant
+/// through `record_live_visibility_end`. Neither path clears the stamp.
+fn note_gui_tab_visible(state: &AppState) {
+    state.gui_show.note_gui_visible(unix_secs_now());
+}
+
+/// A live visible tab hid or its socket disconnected.
+///
+/// The stamp becomes this instant when it is later than the stored
+/// become-visible time. A hidden tab and an expired session do not move it.
+fn note_if_live_visible_ended(state: &AppState, session: &WsSession) {
+    let now = std::time::Instant::now();
+    if session.visible_with_live_session(|token| state.sessions.is_valid(token, now)) {
+        record_live_visibility_end(state);
+    }
+}
+
+/// Store the current unix time as the last moment a live tab was visible.
+fn record_live_visibility_end(state: &AppState) {
+    super::routes::gui_show::record_visibility_end(state, unix_secs_now());
+}
+
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// A full outbound queue with one pending origin banner. The receiver stays
@@ -2628,6 +2742,66 @@ mod tests {
                 assert_eq!(
                     message, "send failed",
                     "past the gate, ordinary send failure"
+                );
+            }
+            other => panic!("expected send-failure frame, got {other:?}"),
+        }
+    }
+
+    /// Gui-show prefixes are refused on `send_direct` for a session
+    /// connection and for a durable-owner connection.
+    #[tokio::test]
+    async fn ws_send_direct_refuses_gui_show_prefixes() {
+        use base64::Engine as _;
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let prefixes = [
+            crate::gui::remote::SHOW_REQUEST_PREFIX,
+            crate::gui::remote::SHOW_RESULT_PREFIX,
+            crate::gui::remote::ACTIVITY_PREFIX,
+        ];
+        for (durable, label) in [(false, "session"), (true, "durable")] {
+            for prefix in prefixes {
+                let mut payload = prefix.to_vec();
+                payload.extend_from_slice(b"body");
+                let cmd = serde_json::json!({
+                    "type": "send_direct",
+                    "agent_id": hex::encode([0xab; 32]),
+                    "payload": base64::engine::general_purpose::STANDARD.encode(payload),
+                })
+                .to_string();
+                let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+                let stats = WsOutboundStats::default();
+                handle_ws_command(&state, label, &cmd, &tx, &stats, durable).await;
+                let refused = rx.recv().await.expect("error frame");
+                match refused {
+                    WsOutbound::Error { message } => {
+                        assert_eq!(
+                            message,
+                            crate::gui::remote::GENERIC_SEND_REFUSAL,
+                            "{label} must not emit a gui-show frame"
+                        );
+                    }
+                    other => panic!("expected error frame, got {other:?}"),
+                }
+            }
+        }
+        let plain = serde_json::json!({
+            "type": "send_direct",
+            "agent_id": hex::encode([0xab; 32]),
+            "payload": base64::engine::general_purpose::STANDARD.encode(b"hello"),
+        })
+        .to_string();
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "plain", &plain, &tx, &stats, false).await;
+        match rx.recv().await.expect("outcome frame") {
+            WsOutbound::Error { message } => {
+                assert_eq!(
+                    message, "send failed",
+                    "an ordinary DM passes the prefix gate"
                 );
             }
             other => panic!("expected send-failure frame, got {other:?}"),
@@ -3005,6 +3179,223 @@ mod tests {
         assert!(!state.gui_show.has_pending_session(token));
     }
 
+    /// Hiding a live tab stores the hide instant. A second hide does not
+    /// move that stamp, and neither does disconnecting a hidden tab.
+    #[tokio::test]
+    async fn hiding_a_live_tab_records_the_hide_instant() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        state.gui_show.note_gui_visible(0);
+        let token = state.sessions.issue(std::time::Instant::now());
+        state.ws_sessions.write().await.insert(
+            "live-tab".to_string(),
+            test_live_gui_ws_session("live-tab", &token),
+        );
+        let (tx, _rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        let before = unix_secs_now();
+        handle_ws_command(
+            &state,
+            "live-tab",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        let stamp = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("hide records a stamp");
+        let after = unix_secs_now();
+        assert!(
+            (before..=after).contains(&stamp),
+            "hiding a live tab must store the hide instant, got {stamp} (window {before}..={after})"
+        );
+
+        state.gui_show.note_gui_visible(0);
+        handle_ws_command(
+            &state,
+            "live-tab",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "a tab that is already hidden must not refresh the stamp"
+        );
+
+        let hidden = test_live_gui_ws_session("hidden-tab", &token);
+        hidden.set_visible_gui(false);
+        note_if_live_visible_ended(&state, &hidden);
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "disconnecting a hidden tab must not refresh the stamp"
+        );
+
+        let live = test_live_gui_ws_session("closing-tab", &token);
+        let disconnect_at = unix_secs_now();
+        note_if_live_visible_ended(&state, &live);
+        let closed = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("disconnect records a stamp");
+        let disconnect_end = unix_secs_now();
+        assert!(
+            (disconnect_at..=disconnect_end).contains(&closed),
+            "disconnecting a live tab must store that instant, got {closed}"
+        );
+    }
+
+    /// `/ws?gui=1` stamps visibility only for a live GUI session.
+    ///
+    /// An agent socket can connect with `gui=1` and no session token.
+    /// That socket uses the same gate as reveal and hide.
+    #[tokio::test]
+    async fn gui_connect_without_a_live_session_does_not_stamp_visibility() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        assert!(state.gui_show.last_gui_visible_at().is_none());
+        state
+            .ws_sessions
+            .write()
+            .await
+            .insert("agent-gui".to_string(), test_gui_ws_session("agent-gui"));
+        note_connected_gui_visibility(&state, "agent-gui").await;
+        assert!(
+            state.gui_show.last_gui_visible_at().is_none(),
+            "an agent socket with gui=1 and no session must not count as active"
+        );
+
+        let expired = state.sessions.issue(std::time::Instant::now());
+        state.sessions.expire_for_test(&expired);
+        state.ws_sessions.write().await.insert(
+            "expired-gui".to_string(),
+            test_live_gui_ws_session("expired-gui", &expired),
+        );
+        note_connected_gui_visibility(&state, "expired-gui").await;
+        assert!(
+            state.gui_show.last_gui_visible_at().is_none(),
+            "an expired GUI session must not stamp visibility at connect"
+        );
+
+        let token = state.sessions.issue(std::time::Instant::now());
+        state.ws_sessions.write().await.insert(
+            "live-gui".to_string(),
+            test_live_gui_ws_session("live-gui", &token),
+        );
+        let before = unix_secs_now();
+        note_connected_gui_visibility(&state, "live-gui").await;
+        let stamp = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("a live GUI session stamps visibility at connect");
+        let after = unix_secs_now();
+        assert!(
+            (before..=after).contains(&stamp),
+            "connect stamp {stamp} outside {before}..={after}"
+        );
+    }
+
+    /// An expired socket must not move `last_gui_visible_at`.
+    ///
+    /// A hide followed by a show, and a queued reveal, both stay on the
+    /// old stamp. A later live token still records a new stamp.
+    #[tokio::test]
+    async fn expired_session_does_not_refresh_visibility_stamp() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        state.gui_show.note_gui_visible(0);
+        let expired = state.sessions.issue(std::time::Instant::now());
+        state.sessions.expire_for_test(&expired);
+        state.ws_sessions.write().await.insert(
+            "expired-tab".to_string(),
+            test_live_gui_ws_session("expired-tab", &expired),
+        );
+        state
+            .ws_sessions
+            .read()
+            .await
+            .get("expired-tab")
+            .expect("session")
+            .set_visible_gui(false);
+        let (tx, _rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(
+            &state,
+            "expired-tab",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        handle_ws_command(
+            &state,
+            "expired-tab",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "an expired reveal must not refresh the activity stamp"
+        );
+        {
+            let sessions = state.ws_sessions.read().await;
+            let session = sessions.get("expired-tab").expect("session");
+            session.set_visible_gui(false);
+            begin_queued_reveal(session);
+        }
+        finish_queued_reveal(&state, "expired-tab", true).await;
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "a queued reveal on an expired session must not refresh the stamp"
+        );
+
+        let live = state.sessions.issue(std::time::Instant::now());
+        {
+            let mut sessions = state.ws_sessions.write().await;
+            let session = sessions.get_mut("expired-tab").expect("session");
+            session.gui_session_token = Some(live);
+            session.set_visible_gui(false);
+        }
+        let before = unix_secs_now();
+        handle_ws_command(
+            &state,
+            "expired-tab",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        let stamp = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("a live reveal records a stamp");
+        let after = unix_secs_now();
+        assert!(
+            (before..=after).contains(&stamp),
+            "a live session must still refresh the stamp, got {stamp}"
+        );
+    }
+
     /// A hidden tab refreshes its session before the WebSocket reconnects.
     /// The banner was minted for the original token. The new connection
     /// must still receive it (ADR 0083 §5).
@@ -3046,6 +3437,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state.gui_show.last_gui_visible_at().is_none(),
+            "a session refresh is not a visible GUI tab"
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .expect("refresh body");

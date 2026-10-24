@@ -367,6 +367,19 @@ pub(in crate::server) async fn direct_send(
     // owner HERE too. The legitimate exec client path
     // (`ExecService::send_frame`) calls the Agent API directly and is
     // unaffected.
+    // The three gui-show prefixes are signed by this daemon on
+    // `POST /gui/show` only. A session bearer, a rider, and the durable
+    // owner token are all refused here.
+    if x0x::gui::remote::classify_prefix(&payload).is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": x0x::gui::remote::GENERIC_SEND_REFUSAL
+            })),
+        );
+    }
+
     if payload.starts_with(x0x::exec::EXEC_DM_PREFIX) && !actor.is_durable_owner() {
         return (
             StatusCode::FORBIDDEN,

@@ -921,6 +921,12 @@ pub struct Agent {
     /// (revocation, contacts, ACL reload, placement, device set, discovery
     /// cert). Shared with the stores that raise those events.
     stream_reauth: std::sync::Arc<tokio::sync::Notify>,
+    /// Set when a machine-bound send enters `send_direct_all_stages`.
+    ///
+    /// Tests hold the discovery cache and wait for this flag. The binding
+    /// change then happens while that read is still awaiting.
+    #[cfg(test)]
+    show_stage_entered: std::sync::atomic::AtomicBool,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -9980,6 +9986,26 @@ impl Agent {
             .map(|(receipt, _ingress)| receipt)
     }
 
+    /// Send to `to` only while the capability binding still names `machine`.
+    ///
+    /// GUI show admits one machine. The check runs inside
+    /// [`Self::send_direct_all_stages`], after that stage resolves the
+    /// binding, and again after each later await in the same stage. A
+    /// binding that names a different machine is not a destination. The
+    /// gossip address stays the admitted machine. The whole stage stays
+    /// inside the one absolute send deadline.
+    pub(crate) async fn send_direct_bound_to_machine(
+        &self,
+        to: &identity::AgentId,
+        machine: identity::MachineId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_history(to, payload, config, None, Some(machine))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
     /// #461: provenance variant for the direct-send HTTP route — identical
     /// behavior to the public method INCLUDING the ADR-0023 §4 outbound
     /// history wiring (this is the single common path; the public method
@@ -9992,7 +10018,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
-        self.send_direct_with_history(to, payload, config, None)
+        self.send_direct_with_history(to, payload, config, None, None)
             .await
     }
 
@@ -10007,7 +10033,7 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)))
+        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)), None)
             .await
             .map(|(receipt, _ingress)| receipt)
     }
@@ -10021,6 +10047,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
@@ -10036,7 +10063,13 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config, cold_wait)
+            .send_direct_with_config_inner_with_provenance(
+                to,
+                payload,
+                config,
+                cold_wait,
+                bound_machine,
+            )
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -10090,6 +10123,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // #1239: ONE absolute deadline across the entire send. The stages
         // below keep their own budgets (the evidence budget, the transport
@@ -10109,7 +10143,14 @@ impl Agent {
         let failure_accounted = std::sync::atomic::AtomicBool::new(false);
         match tokio::time::timeout_at(
             deadline,
-            self.send_direct_all_stages(to, payload, config, cold_wait, &failure_accounted),
+            self.send_direct_all_stages(
+                to,
+                payload,
+                config,
+                cold_wait,
+                bound_machine,
+                &failure_accounted,
+            ),
         )
         .await
         {
@@ -10142,14 +10183,61 @@ impl Agent {
         }
     }
 
+    /// Fail closed when a GUI-show send's admitted machine is no longer the
+    /// capability binding. `None` is every other caller.
+    ///
+    /// Call this after the binding and capability resolution, and again
+    /// after each later await that can still choose a destination. The
+    /// gossip address becomes the admitted machine.
+    fn pin_show_machine(
+        &self,
+        to: &identity::AgentId,
+        bound_machine: Option<identity::MachineId>,
+        cap_machine: &mut Option<identity::MachineId>,
+    ) -> Result<(), dm::DmError> {
+        let Some(bound) = bound_machine else {
+            return Ok(());
+        };
+        let resolved = self
+            .capability_store
+            .lookup_binding(to)
+            .map(|binding| binding.machine_id);
+        if resolved != Some(bound) || cap_machine.is_some_and(|current| current != bound) {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::RecipientUndiscovered(
+                "selected machine changed before the show send".to_string(),
+            ));
+        }
+        *cap_machine = Some(bound);
+        Ok(())
+    }
+
+    /// True after a machine-bound send has entered [`Self::send_direct_all_stages`].
+    #[cfg(test)]
+    pub(crate) fn show_stage_entered_for_test(&self) -> bool {
+        self.show_stage_entered
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn mark_show_stage_entered(&self) {
+        self.show_stage_entered
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     async fn send_direct_all_stages(
         &self,
         to: &identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
         failure_accounted: &std::sync::atomic::AtomicBool,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        #[cfg(test)]
+        if bound_machine.is_some() {
+            self.mark_show_stage_entered();
+        }
         let mut evidence = dm_evidence::SendEvidence::new(
             self,
             *to,
@@ -10421,6 +10509,11 @@ impl Agent {
             }
         }
 
+        // The binding and capability resolution above has awaited. Read the
+        // admitted machine again here, still inside this stage. A move during
+        // any of those awaits is not a destination.
+        self.pin_show_machine(to, bound_machine, &mut cap_machine)?;
+
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
         // key clone when the engine is enabled AND we have a key to seal
         // a fresh envelope with. With the default disabled policy this
@@ -10478,6 +10571,12 @@ impl Agent {
             None
         };
 
+        // The preferred raw-QUIC attempt is one later await. A show that
+        // still has to choose a destination reads the binding again.
+        if preferred_raw_receipt.is_none() {
+            self.pin_show_machine(to, bound_machine, &mut cap_machine)?;
+        }
+
         let result = if let Some(receipt) = preferred_raw_receipt {
             Ok((receipt, None))
         } else if preferred_raw_err.as_ref().is_some_and(|err| {
@@ -10504,6 +10603,7 @@ impl Agent {
                     // `Replaced` for that machine_id rather than serving out
                     // the full backoff window.
                     let lifecycle_hint = self.dm_lifecycle_hint(to).await;
+                    self.pin_show_machine(to, bound_machine, &mut cap_machine)?;
                     dm_send::send_via_gossip_with_provenance(
                         dm_send::DmSendContext {
                             pubsub: std::sync::Arc::clone(runtime.pubsub()),
@@ -23039,6 +23139,8 @@ impl AgentBuilder {
                 connect::ConnectPolicy::default(),
             ))),
             owner_trust,
+            #[cfg(test)]
+            show_stage_entered: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -27445,6 +27547,9 @@ mod tests {
             crate::exec::EXEC_DM_PREFIX,
             b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),
             b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n".as_slice(),
+            crate::gui::remote::SHOW_REQUEST_PREFIX,
+            crate::gui::remote::SHOW_RESULT_PREFIX,
+            crate::gui::remote::ACTIVITY_PREFIX,
         ] {
             let mut payload = prefix.to_vec();
             payload.extend_from_slice(b"unverified-startup-window-frame");

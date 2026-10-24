@@ -4,7 +4,11 @@
 //! the platform opener behind a test seam.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::future::Future;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,6 +18,37 @@ use serde::{Deserialize, Serialize};
 use crate::identity::AgentId;
 
 use super::rate_limit::GuiShowRateLimit;
+
+/// Signers kept for a later rider Stop. One entry is one displayed show.
+const RIDER_PRESENTED_SIGNERS: usize = 64;
+/// Subjects kept for one signer.
+const RIDER_PRESENTED_SUBJECTS: usize = 32;
+
+/// Replaces one remote show send. Tests are the only callers.
+#[cfg(test)]
+type ShowSendHook = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>> + Send + Sync,
+>;
+
+/// Runs after admission and before the real send. Tests are the only callers.
+#[cfg(test)]
+type ShowSendPrelude = Arc<dyn Fn() + Send + Sync>;
+
+/// Reply sends that may be in flight together.
+const REPLY_SEND_SLOTS: usize = 4;
+
+/// Refusals to a sender that is not owner-trusted, inside one minute.
+const UNTRUSTED_REFUSAL_LIMIT: u32 = 1;
+
+/// Window for [`UNTRUSTED_REFUSAL_LIMIT`].
+const UNTRUSTED_REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+
+/// Refusals already sent to untrusted show senders.
+#[derive(Debug, Default)]
+struct UntrustedRefusalWindow {
+    start: Option<Instant>,
+    sent: u32,
+}
 
 /// How long a pending banner waits for its GUI window to connect.
 ///
@@ -111,8 +146,12 @@ impl Default for GuiShowConfig {
 }
 
 /// Wire outcome for `POST /gui/show` (ADR 0083 §1).
+///
+/// `#[non_exhaustive]` is the 24 Oct 2026 03:34 BST rule for wire enums.
+/// A new outcome is appended. Existing variant indexes stay put.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GuiShowOutcome {
     /// Platform opener launched a new GUI window.
     Opened,
@@ -132,6 +171,10 @@ pub enum GuiShowOutcome {
     NoActiveMachine,
     /// Human has not confirmed (reserved).
     Unconfirmed,
+    /// `issued_at` is outside ±120 s. Replay stays a drop, with no result.
+    StaleRequest,
+    /// The signed target machine is not this machine. No view opens.
+    WrongMachine,
 }
 
 /// Request body for `POST /gui/show`.
@@ -382,6 +425,47 @@ pub struct GuiShowRuntime {
     /// token the socket no longer searches. A socket already in the roster
     /// is updated after this map. Registration consults the map too.
     session_successors: Mutex<HashMap<String, (String, Instant)>>,
+    /// Waiters shared by the remote show sender and the receive handler.
+    remote_hub: crate::gui::remote::RemoteHub,
+    /// Unix seconds when a GUI window was last visible.
+    last_gui_visible_at: Mutex<Option<u64>>,
+    /// Show request ids already seen, for the ADR 0050 replay window.
+    replay: Mutex<crate::gui::remote::ReplayCache>,
+    /// In-flight result and activity reply sends.
+    reply_permits: Arc<tokio::sync::Semaphore>,
+    /// Refusals sent to senders that are not owner-trusted.
+    untrusted_refusals: Mutex<UntrustedRefusalWindow>,
+    /// Rider subjects presented by each envelope signer.
+    ///
+    /// Stop records `(signer, subject)` from this map and blocks the signer.
+    /// It does not add the subject to [`Self::blocked`]. The map drops the
+    /// signer on Stop and evicts the lowest id past the caps below.
+    rider_presented: Mutex<HashMap<[u8; 32], HashSet<[u8; 32]>>>,
+    /// Rider shows refused for one `(envelope signer, subject)` pair.
+    rider_pairs: Mutex<HashSet<([u8; 32], [u8; 32])>>,
+    /// Senders a test treats as owner-trusted.
+    ///
+    /// The AppState test agent has no user key. Installing one starts
+    /// owner sync, and that constructor dials.
+    #[cfg(test)]
+    trusted_senders: Mutex<HashSet<AgentId>>,
+    /// Replaces the remote show send when a test installs it.
+    #[cfg(test)]
+    send_hook: Mutex<Option<ShowSendHook>>,
+    /// Runs after the selected machine is admitted and before the send.
+    ///
+    /// A test uses it to move the capability binding in that gap.
+    #[cfg(test)]
+    send_prelude: Mutex<Option<ShowSendPrelude>>,
+    /// Test seam: milliseconds `send_show_result` waits before it returns.
+    ///
+    /// Zero uses the real send. The receive tests arm this so one slow
+    /// reply is visible without a network attempt.
+    #[cfg(test)]
+    reply_delay_ms: std::sync::atomic::AtomicU64,
+    /// How many test reply sends ran while `reply_delay_ms` was set.
+    #[cfg(test)]
+    reply_sends: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for GuiShowRuntime {
@@ -418,6 +502,23 @@ impl GuiShowRuntime {
             open_stop: Arc::new(AtomicBool::new(false)),
             pending: Mutex::new(VecDeque::new()),
             session_successors: Mutex::new(HashMap::new()),
+            remote_hub: crate::gui::remote::RemoteHub::new(),
+            last_gui_visible_at: Mutex::new(None),
+            replay: Mutex::new(crate::gui::remote::ReplayCache::new()),
+            reply_permits: Arc::new(tokio::sync::Semaphore::new(REPLY_SEND_SLOTS)),
+            untrusted_refusals: Mutex::new(UntrustedRefusalWindow::default()),
+            rider_presented: Mutex::new(HashMap::new()),
+            rider_pairs: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            trusted_senders: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            send_hook: Mutex::new(None),
+            #[cfg(test)]
+            send_prelude: Mutex::new(None),
+            #[cfg(test)]
+            reply_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            reply_sends: std::sync::atomic::AtomicU32::new(0),
         };
         // Honour a stop recorded before this process. The marker wins over
         // a config that already says `local_enabled = true`, because Stop
@@ -442,6 +543,163 @@ impl GuiShowRuntime {
             config.local_enabled = false;
         }
         config
+    }
+
+    /// Hub the requester waits on and the receive handler completes.
+    pub fn remote_hub(&self) -> &crate::gui::remote::RemoteHub {
+        &self.remote_hub
+    }
+
+    /// Arm a per-state reply delay and clear the send counter.
+    #[cfg(test)]
+    pub fn arm_reply_delay_for_test(&self, delay_ms: u64) {
+        self.reply_sends
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reply_delay_ms
+            .store(delay_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reply sends observed while the test delay is armed.
+    #[cfg(test)]
+    pub fn reply_sends_for_test(&self) -> u32 {
+        self.reply_sends.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Milliseconds the test reply path waits. Zero means use the real send.
+    #[cfg(test)]
+    pub(crate) fn reply_delay_ms_for_test(&self) -> u64 {
+        self.reply_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one delayed test reply.
+    #[cfg(test)]
+    pub(crate) fn count_reply_send_for_test(&self) {
+        self.reply_sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make the remote show send wait past the 10 s deadline.
+    ///
+    /// The wait lives in this hook. `send_gui_dm` only calls the hook.
+    #[cfg(test)]
+    pub fn arm_send_stall_for_test(&self) {
+        let hook: ShowSendHook = Arc::new(|| {
+            Box::pin(async {
+                tokio::time::sleep(super::remote::RESULT_WAIT + std::time::Duration::from_secs(30))
+                    .await;
+                Err(crate::dm::DmError::RecipientUndiscovered(
+                    "gui show test stall".to_string(),
+                ))
+            }) as Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>>
+        });
+        if let Ok(mut guard) = self.send_hook.lock() {
+            *guard = Some(hook);
+        }
+    }
+
+    /// Move state after admission, then let the real send run.
+    #[cfg(test)]
+    pub fn arm_send_prelude_for_test(&self, prelude: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut guard) = self.send_prelude.lock() {
+            *guard = Some(Arc::new(prelude));
+        }
+    }
+
+    /// Deliver a reply, then fail the gossip ACK.
+    ///
+    /// The waiter is already registered when this hook runs.
+    #[cfg(test)]
+    pub fn arm_send_ack_timeout_for_test(&self, deliver: impl Fn() + Send + Sync + 'static) {
+        let deliver = Arc::new(deliver);
+        let hook: ShowSendHook = Arc::new(move || {
+            deliver();
+            Box::pin(async {
+                Err(crate::dm::DmError::Timeout {
+                    retries: 0,
+                    elapsed: std::time::Duration::from_secs(10),
+                })
+            }) as Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>>
+        });
+        if let Ok(mut guard) = self.send_hook.lock() {
+            *guard = Some(hook);
+        }
+    }
+
+    /// Treat `agent` as owner-trusted on the receive path.
+    #[cfg(test)]
+    pub fn trust_sender_for_test(&self, agent: &AgentId) {
+        if let Ok(mut guard) = self.trusted_senders.lock() {
+            guard.insert(*agent);
+        }
+    }
+
+    /// One slot for a detached reply send. `None` when every slot is in use.
+    pub(crate) fn try_reply_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.reply_permits.clone().try_acquire_owned().ok()
+    }
+
+    /// Whether this process may send one more refusal to an untrusted sender.
+    ///
+    /// The window is one minute. A full window skips the send. The caller
+    /// does not wait.
+    pub(crate) fn allow_untrusted_refusal(&self, now: Instant) -> bool {
+        let Ok(mut window) = self.untrusted_refusals.lock() else {
+            return false;
+        };
+        match window.start {
+            Some(start) if now.saturating_duration_since(start) < UNTRUSTED_REFUSAL_WINDOW => {}
+            _ => {
+                window.start = Some(now);
+                window.sent = 0;
+            }
+        }
+        if window.sent >= UNTRUSTED_REFUSAL_LIMIT {
+            return false;
+        }
+        window.sent = window.sent.saturating_add(1);
+        true
+    }
+
+    /// Record that a GUI window was visible at `unix_secs`.
+    ///
+    /// Active-machine selection reads this stamp. A poisoned lock is recovered.
+    pub fn note_gui_visible(&self, unix_secs: u64) {
+        *self
+            .last_gui_visible_at
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(unix_secs);
+    }
+
+    /// Last unix time a GUI window was visible, if one has been seen.
+    pub fn last_gui_visible_at(&self) -> Option<u64> {
+        *self
+            .last_gui_visible_at
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Remember a show request. True when that id is still inside the replay window.
+    pub fn observe_show_replay(
+        &self,
+        sender: &[u8; 32],
+        request_id: [u8; 16],
+        now_unix: u64,
+    ) -> bool {
+        self.with_replay_cache(|cache| cache.observe(sender, request_id, now_unix))
+    }
+
+    /// Run `body` against the show replay cache.
+    ///
+    /// The receive handler passes this cache into ingress_show. The lock
+    /// ends when `body` returns, so it is not held across an await. A
+    /// poisoned lock is recovered.
+    pub(crate) fn with_replay_cache<R>(
+        &self,
+        body: impl FnOnce(&mut crate::gui::remote::ReplayCache) -> R,
+    ) -> R {
+        let mut cache = self.replay.lock().unwrap_or_else(|err| err.into_inner());
+        body(&mut cache)
     }
 
     fn config_snapshot(&self) -> GuiShowConfig {
@@ -655,10 +913,120 @@ impl GuiShowRuntime {
 
     /// Rate-limit gate; `true` means the show may proceed.
     pub fn try_rate_limit(&self, agent: &AgentId, now: Instant) -> bool {
+        self.try_rate_limit_agents(std::slice::from_ref(agent), now)
+    }
+
+    /// Rate-limit gate for every distinct agent on one show.
+    ///
+    /// One hourly slot is spent when every agent still has a token.
+    pub fn try_rate_limit_agents(&self, agents: &[AgentId], now: Instant) -> bool {
         self.rate_limit
             .lock()
-            .map(|mut g| g.try_acquire(agent, now))
+            .map(|mut guard| guard.try_acquire_all(agents, now))
             .unwrap_or(false)
+    }
+
+    /// Remember that `signer` displayed a rider show naming `subject`.
+    ///
+    /// A signer or subject past the cap replaces the lowest id. Stop still
+    /// blocks the signer when that signer's row was evicted.
+    pub fn note_rider_presentation(&self, signer: &AgentId, subject: &AgentId) {
+        let Ok(mut presented) = self.rider_presented.lock() else {
+            return;
+        };
+        let signer_key = *signer.as_bytes();
+        let subject_key = *subject.as_bytes();
+        if !presented.contains_key(&signer_key) && presented.len() >= RIDER_PRESENTED_SIGNERS {
+            if let Some(evict) = presented.keys().copied().min() {
+                presented.remove(&evict);
+            }
+        }
+        let subjects = presented.entry(signer_key).or_default();
+        if !subjects.contains(&subject_key) && subjects.len() >= RIDER_PRESENTED_SUBJECTS {
+            if let Some(evict) = subjects.iter().copied().min() {
+                subjects.remove(&evict);
+            }
+        }
+        subjects.insert(subject_key);
+    }
+
+    /// Record `(signer, subject)` for every subject this signer presented.
+    ///
+    /// Does not add those subjects to the block list. The signer row is
+    /// removed, so a later show starts a new set.
+    pub fn record_rider_stop(&self, signer: &AgentId) {
+        let subjects = self
+            .rider_presented
+            .lock()
+            .ok()
+            .and_then(|mut presented| presented.remove(signer.as_bytes()))
+            .unwrap_or_default();
+        let Ok(mut pairs) = self.rider_pairs.lock() else {
+            return;
+        };
+        for subject in subjects {
+            pairs.insert((*signer.as_bytes(), subject));
+        }
+    }
+
+    /// Whether Stop on a rider show from `signer` named `subject`.
+    pub fn rider_pair_blocked(&self, signer: &AgentId, subject: &AgentId) -> bool {
+        self.rider_pairs
+            .lock()
+            .map(|pairs| pairs.contains(&(*signer.as_bytes(), *subject.as_bytes())))
+            .unwrap_or(false)
+    }
+
+    /// Whether a test opted this sender in as owner-trusted.
+    ///
+    /// Production stays false. The set exists only in tests.
+    pub(crate) fn trust_hook_allows(&self, agent: &AgentId) -> bool {
+        #[cfg(test)]
+        {
+            self.trusted_senders
+                .lock()
+                .map(|guard| guard.contains(agent))
+                .unwrap_or(false)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = agent;
+            false
+        }
+    }
+
+    /// Run a test send replacement. `None` means use the real send.
+    pub(crate) async fn invoke_send_hook(&self) -> Option<Result<(), crate::dm::DmError>> {
+        #[cfg(test)]
+        {
+            let hook = self.send_hook.lock().ok().and_then(|guard| guard.clone())?;
+            Some(hook().await)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+            None
+        }
+    }
+
+    /// Run the post-admission test step. Production does nothing.
+    pub(crate) fn invoke_send_prelude(&self) {
+        #[cfg(test)]
+        {
+            let Some(hook) = self
+                .send_prelude
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            else {
+                return;
+            };
+            hook();
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+        }
     }
 
     /// Opener for one launch.
@@ -2027,9 +2395,61 @@ exit 1
         );
         let src = fn_source(html, "function showGuiShowBanner", "function navigate");
         assert!(
-            src.contains("block.textContent=rider?'Stop shows from this rider':'Stop local shows'"),
-            "a rider Stop control must not say Stop local shows: {src}"
+            src.contains("Stop shows from this rider"),
+            "a local rider Stop names that rider: {src}"
         );
+        assert!(
+            src.contains("Stop shows from this machine"),
+            "a remote rider Stop blocks shows from that machine: {src}"
+        );
+        assert!(
+            src.contains("from that machine"),
+            "the remote banner sentence selects the machine Stop control: {src}"
+        );
+        assert!(
+            src.contains("gui_show_blocked.json") && src.contains("&&!rider"),
+            "an ordinary remote show uses the machine Stop label: {src}"
+        );
+        assert!(
+            !src.contains("!rider?'Stop local shows'"),
+            "an ordinary remote show must not say Stop local shows: {src}"
+        );
+    }
+
+    /// The presentation map stays bounded. Stop still blocks a signer whose
+    /// row was evicted, and a kept subject is still recorded.
+    #[test]
+    fn rider_presented_evicts_the_lowest_id_past_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(dir.path(), None);
+        let subject = AgentId([0x7F; 32]);
+        for n in 0..super::RIDER_PRESENTED_SIGNERS {
+            let mut id = [0u8; 32];
+            id[31] = u8::try_from(n).expect("signer index fits");
+            rt.note_rider_presentation(&AgentId(id), &subject);
+        }
+        let newest = AgentId([0xFF; 32]);
+        rt.note_rider_presentation(&newest, &subject);
+        let oldest = AgentId([0u8; 32]);
+        rt.record_rider_stop(&oldest);
+        assert!(
+            !rt.rider_pair_blocked(&oldest, &subject),
+            "the lowest signer id is evicted when the map is full"
+        );
+        rt.record_rider_stop(&newest);
+        assert!(rt.rider_pair_blocked(&newest, &subject));
+
+        let signer = AgentId([0x11; 32]);
+        for n in 0..super::RIDER_PRESENTED_SUBJECTS {
+            let mut id = [0u8; 32];
+            id[31] = u8::try_from(n).expect("subject index fits");
+            rt.note_rider_presentation(&signer, &AgentId(id));
+        }
+        let newest_subject = AgentId([0xEE; 32]);
+        rt.note_rider_presentation(&signer, &newest_subject);
+        rt.record_rider_stop(&signer);
+        assert!(!rt.rider_pair_blocked(&signer, &AgentId([0u8; 32])));
+        assert!(rt.rider_pair_blocked(&signer, &newest_subject));
     }
 
     #[test]

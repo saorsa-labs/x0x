@@ -95,6 +95,12 @@ impl CapabilityRegistry {
     /// ADR 0110 §4b(1): understands `OwnerRecoveryMandateV1` and
     /// `OwnerRecoveryV1` (`X0XORC1`). Bit 7.
     pub const OWNER_RECOVERY_V1: u64 = 1 << 7;
+    /// Understands remote GUI show typed DMs (ADR 0083 slice 3).
+    ///
+    /// Bit 10. The canonical registry in `docs/adr/README.md` already
+    /// gives bits 4–9 to ADR 0110 and ADR 0109. Bit 4 is
+    /// `eviction_handoff_v1`.
+    pub const GUI_SHOW_V1: u64 = 1 << 10;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
@@ -107,7 +113,8 @@ impl CapabilityRegistry {
                 | Self::EVICTION_HANDOFF_V1
                 | Self::CRYPTO_EXCLUSION_V1
                 | Self::CERTIFICATE_REBIND_V1
-                | Self::OWNER_RECOVERY_V1,
+                | Self::OWNER_RECOVERY_V1
+                | Self::GUI_SHOW_V1,
         }
     }
 
@@ -134,6 +141,11 @@ impl CapabilityRegistry {
             Some((Self::CERTIFICATE_REBIND_V1, "certificate_rebind_v1"))
         } else if payload.starts_with(crate::groups::owner_recovery::OWNER_RECOVERY_PREFIX) {
             Some((Self::OWNER_RECOVERY_V1, "owner_recovery_v1"))
+        } else if payload.starts_with(crate::gui::remote::SHOW_REQUEST_PREFIX)
+            || payload.starts_with(crate::gui::remote::SHOW_RESULT_PREFIX)
+            || payload.starts_with(crate::gui::remote::ACTIVITY_PREFIX)
+        {
+            Some((Self::GUI_SHOW_V1, "gui_show_v1"))
         } else {
             None
         }
