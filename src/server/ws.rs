@@ -2423,14 +2423,14 @@ fn restore_requested_visibility(session: &WsSession) {
 }
 
 async fn apply_requested_gui_visibility(state: &AppState, session_id: &str) {
-    let became_visible = if let Some(session) = state.ws_sessions.read().await.get(session_id) {
+    let record = if let Some(session) = state.ws_sessions.read().await.get(session_id) {
         let was_visible = session.is_visible_gui();
         restore_requested_visibility(session);
-        !was_visible && session.is_visible_gui()
+        !was_visible && live_gui_session(state, session)
     } else {
         false
     };
-    if became_visible {
+    if record {
         note_gui_tab_visible(state);
     }
 }
@@ -2452,11 +2452,17 @@ async fn finish_queued_reveal(state: &AppState, session_id: &str, sent: bool) {
         {
             session.set_visible_gui(true);
         }
-        !was_visible && session.is_visible_gui()
+        !was_visible && live_gui_session(state, session)
     };
     if became_visible {
         note_gui_tab_visible(state);
     }
+}
+
+/// A tab that just became visible still holds a live session token.
+fn live_gui_session(state: &AppState, session: &WsSession) -> bool {
+    let now = std::time::Instant::now();
+    session.visible_with_live_session(|token| state.sessions.is_valid(token, now))
 }
 
 /// Record the last time a GUI tab became visible.
@@ -3226,6 +3232,96 @@ mod tests {
         assert!(
             (disconnect_at..=disconnect_end).contains(&closed),
             "disconnecting a live tab must store that instant, got {closed}"
+        );
+    }
+
+    /// An expired socket must not move `last_gui_visible_at`.
+    ///
+    /// A hide followed by a show, and a queued reveal, both stay on the
+    /// old stamp. A later live token still records a new stamp.
+    #[tokio::test]
+    async fn expired_session_does_not_refresh_visibility_stamp() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        state.gui_show.note_gui_visible(0);
+        let expired = state.sessions.issue(std::time::Instant::now());
+        state.sessions.expire_for_test(&expired);
+        state.ws_sessions.write().await.insert(
+            "expired-tab".to_string(),
+            test_live_gui_ws_session("expired-tab", &expired),
+        );
+        state
+            .ws_sessions
+            .read()
+            .await
+            .get("expired-tab")
+            .expect("session")
+            .set_visible_gui(false);
+        let (tx, _rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(
+            &state,
+            "expired-tab",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        handle_ws_command(
+            &state,
+            "expired-tab",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "an expired reveal must not refresh the activity stamp"
+        );
+        {
+            let sessions = state.ws_sessions.read().await;
+            let session = sessions.get("expired-tab").expect("session");
+            session.set_visible_gui(false);
+            begin_queued_reveal(session);
+        }
+        finish_queued_reveal(&state, "expired-tab", true).await;
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "a queued reveal on an expired session must not refresh the stamp"
+        );
+
+        let live = state.sessions.issue(std::time::Instant::now());
+        {
+            let mut sessions = state.ws_sessions.write().await;
+            let session = sessions.get_mut("expired-tab").expect("session");
+            session.gui_session_token = Some(live);
+            session.set_visible_gui(false);
+        }
+        let before = unix_secs_now();
+        handle_ws_command(
+            &state,
+            "expired-tab",
+            r#"{"type":"gui.visible","visible":true}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        let stamp = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("a live reveal records a stamp");
+        let after = unix_secs_now();
+        assert!(
+            (before..=after).contains(&stamp),
+            "a live session must still refresh the stamp, got {stamp}"
         );
     }
 

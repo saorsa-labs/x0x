@@ -50,6 +50,7 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
     };
 
     let remote_enabled = state.gui_show.config().remote_enabled;
+    let local_machine = *state.agent.machine_id().as_bytes();
     let control = show_control(state, &typed.sender, &ingress);
     let via_rider = matches!(
         &ingress,
@@ -66,7 +67,7 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
         }
         None => state.gui_show.is_blocked(&typed.sender),
     };
-    let mut preview = receive_action(&ingress, remote_enabled, blocked, false);
+    let mut preview = receive_action(&ingress, remote_enabled, blocked, false, &local_machine);
     // A rider subject that names this daemon, or is empty, must not display.
     // Replay and stale_request keep their own results.
     if control.is_none() && matches!(preview, ReceiveAction::Display { .. }) {
@@ -84,7 +85,7 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
         false
     };
     let action = if rate_limited {
-        receive_action(&ingress, remote_enabled, blocked, true)
+        receive_action(&ingress, remote_enabled, blocked, true, &local_machine)
     } else {
         preview
     };
@@ -523,19 +524,21 @@ mod adr_remote {
 
     fn action_for(trusted_sender: bool) -> ReceiveAction {
         let now = unix_now_secs();
+        let local = [9u8; 32];
         let payload = GuiShowDmRequest {
             request_id: [9; 16],
             view: "people".into(),
             issued_at: now,
             via_rider: false,
             subject: [0; 32],
+            target: MachineId(local),
         }
         .to_dm_payload()
         .expect("encode");
         let mut cache = crate::gui::remote::ReplayCache::new();
         let ingress =
             ingress_show(trusted_sender, &payload, &[4; 32], now, &mut cache).expect("ingress");
-        receive_action(&ingress, true, false, false)
+        receive_action(&ingress, true, false, false, &local)
     }
 
     #[tokio::test]
@@ -690,6 +693,7 @@ mod adr_remote {
             issued_at: now,
             via_rider: false,
             subject: [0; 32],
+            target: state.agent.machine_id(),
         }
         .to_dm_payload()
         .expect("encode");
@@ -728,6 +732,7 @@ mod adr_remote {
                 issued_at: now,
                 via_rider,
                 subject: *subject.as_bytes(),
+                target: state.agent.machine_id(),
             }
             .to_dm_payload()
             .expect("encode");
@@ -757,6 +762,7 @@ mod adr_remote {
         request_id: [u8; 16],
         subject: AgentId,
         via_rider: bool,
+        target: MachineId,
     ) -> DmTypedPayload {
         let now = unix_now_secs();
         let payload = GuiShowDmRequest {
@@ -765,6 +771,7 @@ mod adr_remote {
             issued_at: now,
             via_rider,
             subject: *subject.as_bytes(),
+            target,
         }
         .to_dm_payload()
         .expect("encode");
@@ -808,7 +815,14 @@ mod adr_remote {
             id[0] = n;
             handle_gui_show_typed(
                 &state,
-                show_typed(stranger, MachineId([0xE0; 32]), id, stranger, false),
+                show_typed(
+                    stranger,
+                    MachineId([0xE0; 32]),
+                    id,
+                    stranger,
+                    false,
+                    state.agent.machine_id(),
+                ),
             )
             .await;
         }
@@ -861,7 +875,14 @@ mod adr_remote {
         let stranger = AgentId([0x71; 32]);
         handle_gui_show_typed(
             &state,
-            show_typed(stranger, MachineId([0x72; 32]), [0x73; 16], stranger, false),
+            show_typed(
+                stranger,
+                MachineId([0x72; 32]),
+                [0x73; 16],
+                stranger,
+                false,
+                state.agent.machine_id(),
+            ),
         )
         .await;
         let tasks = state
@@ -928,13 +949,46 @@ mod adr_remote {
             .verify_and_insert(record, None)
             .expect("insert revocation");
 
-        handle_gui_show_typed(&state, show_typed(daemon, machine, [1; 16], blocked, true)).await;
-        handle_gui_show_typed(&state, show_typed(daemon, machine, [2; 16], revoked, true)).await;
+        handle_gui_show_typed(
+            &state,
+            show_typed(
+                daemon,
+                machine,
+                [1; 16],
+                blocked,
+                true,
+                state.agent.machine_id(),
+            ),
+        )
+        .await;
+        handle_gui_show_typed(
+            &state,
+            show_typed(
+                daemon,
+                machine,
+                [2; 16],
+                revoked,
+                true,
+                state.agent.machine_id(),
+            ),
+        )
+        .await;
         assert!(
             cap.urls.lock().expect("urls").is_empty(),
             "a blocked or revoked rider must not open a window"
         );
-        handle_gui_show_typed(&state, show_typed(daemon, machine, [3; 16], allowed, true)).await;
+        handle_gui_show_typed(
+            &state,
+            show_typed(
+                daemon,
+                machine,
+                [3; 16],
+                allowed,
+                true,
+                state.agent.machine_id(),
+            ),
+        )
+        .await;
         assert!(
             !cap.urls.lock().expect("urls").is_empty(),
             "another rider on the same daemon still displays"
@@ -958,7 +1012,14 @@ mod adr_remote {
         state.gui_show.block_agent(&signer);
         handle_gui_show_typed(
             &state,
-            show_typed(signer, MachineId([0x44; 32]), [9; 16], subject, true),
+            show_typed(
+                signer,
+                MachineId([0x44; 32]),
+                [9; 16],
+                subject,
+                true,
+                state.agent.machine_id(),
+            ),
         )
         .await;
         assert!(
@@ -988,7 +1049,14 @@ mod adr_remote {
             request_id[0] = n;
             handle_gui_show_typed(
                 &state,
-                show_typed(signer, machine, request_id, AgentId(subject), true),
+                show_typed(
+                    signer,
+                    machine,
+                    request_id,
+                    AgentId(subject),
+                    true,
+                    state.agent.machine_id(),
+                ),
             )
             .await;
         }
@@ -999,7 +1067,14 @@ mod adr_remote {
         );
         handle_gui_show_typed(
             &state,
-            show_typed(signer, machine, [0xB4; 16], AgentId([0xA4; 32]), true),
+            show_typed(
+                signer,
+                machine,
+                [0xB4; 16],
+                AgentId([0xA4; 32]),
+                true,
+                state.agent.machine_id(),
+            ),
         )
         .await;
         assert_eq!(
@@ -1025,7 +1100,18 @@ mod adr_remote {
         let machine = MachineId([0x44; 32]);
         state.gui_show.trust_sender_for_test(&signer);
         state.gui_show.trust_sender_for_test(&victim);
-        handle_gui_show_typed(&state, show_typed(signer, machine, [1; 16], victim, true)).await;
+        handle_gui_show_typed(
+            &state,
+            show_typed(
+                signer,
+                machine,
+                [1; 16],
+                victim,
+                true,
+                state.agent.machine_id(),
+            ),
+        )
+        .await;
         let token = {
             let urls = cap.urls.lock().expect("urls");
             assert_eq!(urls.len(), 1, "the forged rider show displayed");
@@ -1060,7 +1146,18 @@ mod adr_remote {
             state.gui_show.rider_pair_blocked(&signer, &victim),
             "Stop records the (signer, subject) pair"
         );
-        handle_gui_show_typed(&state, show_typed(victim, machine, [2; 16], victim, false)).await;
+        handle_gui_show_typed(
+            &state,
+            show_typed(
+                victim,
+                machine,
+                [2; 16],
+                victim,
+                false,
+                state.agent.machine_id(),
+            ),
+        )
+        .await;
         assert_eq!(
             cap.urls.lock().expect("urls").len(),
             2,
@@ -1068,13 +1165,69 @@ mod adr_remote {
         );
         handle_gui_show_typed(
             &state,
-            show_typed(signer, machine, [3; 16], AgentId([0x55; 32]), true),
+            show_typed(
+                signer,
+                machine,
+                [3; 16],
+                AgentId([0x55; 32]),
+                true,
+                state.agent.machine_id(),
+            ),
         )
         .await;
         assert_eq!(
             cap.urls.lock().expect("urls").len(),
             2,
             "that signer's later rider shows stay refused"
+        );
+    }
+
+    /// The signed target is this machine, or the opener does not run.
+    #[tokio::test]
+    async fn signed_target_opens_only_on_this_machine() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let cap = CapturingOpener::new();
+        state
+            .gui_show
+            .replace_opener_for_test(Arc::new(cap.clone()));
+        let sender = AgentId([0x44; 32]);
+        state.gui_show.trust_sender_for_test(&sender);
+        let machine = MachineId([0x55; 32]);
+        handle_gui_show_typed(
+            &state,
+            show_typed(
+                sender,
+                machine,
+                [1; 16],
+                sender,
+                false,
+                MachineId([0x99; 32]),
+            ),
+        )
+        .await;
+        assert!(
+            cap.urls.lock().expect("urls").is_empty(),
+            "a show signed for another machine must not open a view"
+        );
+        handle_gui_show_typed(
+            &state,
+            show_typed(
+                sender,
+                machine,
+                [2; 16],
+                sender,
+                false,
+                state.agent.machine_id(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            cap.urls.lock().expect("urls").len(),
+            1,
+            "a show signed for this machine opens"
         );
     }
 }

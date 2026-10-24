@@ -877,7 +877,7 @@ async fn send_show_and_wait(
             None,
         );
     };
-    let body = show_dm_request(bytes, route, unix_secs(), via_rider, &subject);
+    let body = show_dm_request(bytes, route, unix_secs(), via_rider, &subject, &machine);
     let Some(payload) = body.to_dm_payload() else {
         return remote_json(
             GuiShowOutcome::Unconfirmed,
@@ -988,6 +988,7 @@ fn show_dm_request(
     issued_at: u64,
     via_rider: bool,
     subject: &AgentId,
+    target: &MachineId,
 ) -> crate::gui::remote::GuiShowDmRequest {
     crate::gui::remote::GuiShowDmRequest {
         request_id,
@@ -995,6 +996,7 @@ fn show_dm_request(
         issued_at,
         via_rider,
         subject: *subject.as_bytes(),
+        target: *target,
     }
 }
 
@@ -2396,11 +2398,13 @@ mod tests {
     fn rider_show_request_names_the_sub_agent() {
         let daemon = AgentId([1; 32]);
         let rider = AgentId([2; 32]);
-        let request = show_dm_request([9; 16], "people".to_string(), 1, true, &rider);
+        let target = MachineId([4; 32]);
+        let request = show_dm_request([9; 16], "people".to_string(), 1, true, &rider, &target);
         assert!(request.via_rider);
         assert_eq!(request.subject, *rider.as_bytes());
         assert_ne!(request.subject, *daemon.as_bytes());
-        let owner = show_dm_request([9; 16], "people".to_string(), 1, false, &daemon);
+        assert_eq!(request.target, target);
+        let owner = show_dm_request([9; 16], "people".to_string(), 1, false, &daemon, &target);
         assert!(!owner.via_rider);
         assert_eq!(owner.subject, *daemon.as_bytes());
         assert!(

@@ -142,8 +142,12 @@ impl Default for GuiShowConfig {
 }
 
 /// Wire outcome for `POST /gui/show` (ADR 0083 §1).
+///
+/// `#[non_exhaustive]` is the 24 Oct 2026 03:34 BST rule for wire enums.
+/// A new outcome is appended. Existing variant indexes stay put.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GuiShowOutcome {
     /// Platform opener launched a new GUI window.
     Opened,
@@ -165,6 +169,8 @@ pub enum GuiShowOutcome {
     Unconfirmed,
     /// `issued_at` is outside ±120 s. Replay stays a drop, with no result.
     StaleRequest,
+    /// The signed target machine is not this machine. No view opens.
+    WrongMachine,
 }
 
 /// Request body for `POST /gui/show`.

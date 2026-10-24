@@ -41,7 +41,8 @@ pub const MAX_VIEW_BYTES: usize = 256;
 /// ADR 0050 replay cache window.
 pub const REPLAY_SECS: u64 = 630;
 
-/// `16 + 8 + MAX_VIEW_BYTES + 8 + 1 + 32`, rounded up. Bounds bincode allocation.
+/// `16 + 8 + MAX_VIEW_BYTES + 8 + 1 + 32 + 32`, rounded up.
+/// The last 32 bytes are the signed target machine.
 const SHOW_BODY_MAX: usize = 384;
 /// In-flight show or activity waiters. A full map refuses a new id.
 const WAITER_CAP: usize = 64;
@@ -63,6 +64,12 @@ pub struct GuiShowDmRequest {
     /// registered sub-agent id. The ADR 0050 envelope stays signed by
     /// this daemon: ADR 0039 keeps the sub-agent secret on the harness.
     pub subject: [u8; 32],
+    /// Machine that may display this request.
+    ///
+    /// The originating daemon writes the selected `MachineId`. The
+    /// receiver refuses any other id before it opens a view. Appended
+    /// after `subject` (David, 24 Oct 2026 03:07 BST).
+    pub target: MachineId,
 }
 
 /// Result returned to the requester. Names stay on the target.
@@ -73,8 +80,10 @@ pub struct GuiShowDmResult {
 }
 
 /// One prefix, two bodies, as the ADR's `|` alternation. Bincode variant
-/// index is the discriminant. Do not add other fields.
+/// index is the discriminant. Do not insert a variant ahead of these two.
+/// An unknown index fails decode and the receiver ignores the message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum GuiActivityBody {
     Query {
         request_id: [u8; 16],
@@ -524,13 +533,14 @@ pub fn ingress_show(
 ///
 /// Untrusted senders are refused before `remote_enabled` is read.
 /// After trust the order is replay, freshness, remote enable, view,
-/// block, rate limit, then display.
+/// block, rate limit, destination machine, then display.
 #[must_use]
 pub fn receive_action(
     ingress: &ShowIngress,
     remote_enabled: bool,
     blocked: bool,
     rate_limited: bool,
+    local_machine: &[u8; 32],
 ) -> ReceiveAction {
     match ingress {
         ShowIngress::Untrusted { request_id: None } => ReceiveAction::Drop,
@@ -538,7 +548,7 @@ pub fn receive_action(
             request_id: Some(_),
         } => ReceiveAction::Reply(GuiShowOutcome::Refused),
         ShowIngress::Trusted(show) => {
-            action_for_trusted(show, remote_enabled, blocked, rate_limited)
+            action_for_trusted(show, remote_enabled, blocked, rate_limited, local_machine)
         }
     }
 }
@@ -548,6 +558,7 @@ fn action_for_trusted(
     remote_enabled: bool,
     blocked: bool,
     rate_limited: bool,
+    local_machine: &[u8; 32],
 ) -> ReceiveAction {
     if show.replay {
         return ReceiveAction::Drop;
@@ -569,6 +580,9 @@ fn action_for_trusted(
     }
     if rate_limited {
         return ReceiveAction::Reply(GuiShowOutcome::RateLimited);
+    }
+    if show.request.target.as_bytes() != local_machine {
+        return ReceiveAction::Reply(GuiShowOutcome::WrongMachine);
     }
     let route = show.route.clone().unwrap_or_default();
     ReceiveAction::Display {
@@ -764,16 +778,50 @@ mod tests {
     use super::*;
     use tokio::sync::oneshot::error::TryRecvError;
 
+    const LOCAL_MACHINE: [u8; 32] = [9; 32];
+
     fn request(view: &str, issued_at: u64, id: [u8; 16]) -> Vec<u8> {
+        show_request(view, issued_at, id, MachineId(LOCAL_MACHINE))
+    }
+
+    fn show_request(view: &str, issued_at: u64, id: [u8; 16], target: MachineId) -> Vec<u8> {
         GuiShowDmRequest {
             request_id: id,
             view: view.to_string(),
             issued_at,
             via_rider: false,
             subject: [0; 32],
+            target,
         }
         .to_dm_payload()
         .unwrap()
+    }
+
+    /// Opened and navigated are the only results that count as a display.
+    /// An unknown outcome index does not decode, so it is not a success.
+    fn show_result_succeeded(payload: &[u8]) -> bool {
+        matches!(
+            decode_show_result(payload),
+            Some(GuiShowDmResult {
+                outcome: GuiShowOutcome::Opened | GuiShowOutcome::Navigated,
+                ..
+            })
+        )
+    }
+
+    fn act(
+        ingress: &ShowIngress,
+        remote_enabled: bool,
+        blocked: bool,
+        rate_limited: bool,
+    ) -> ReceiveAction {
+        receive_action(
+            ingress,
+            remote_enabled,
+            blocked,
+            rate_limited,
+            &LOCAL_MACHINE,
+        )
     }
 
     fn trusted_ingress(payload: &[u8], now: u64, cache: &mut ReplayCache) -> ShowIngress {
@@ -794,7 +842,7 @@ mod tests {
             } if id == [9; 16]
         ));
         assert_eq!(
-            receive_action(&ingress, false, false, false),
+            act(&ingress, false, false, false),
             ReceiveAction::Reply(GuiShowOutcome::Refused)
         );
         assert!(ingress_show(true, &bomb, &[1; 32], 1_000, &mut cache).is_none());
@@ -803,7 +851,7 @@ mod tests {
         let ingress = ingress_show(false, &url, &[1; 32], 1_000, &mut cache).unwrap();
         assert!(matches!(ingress, ShowIngress::Untrusted { .. }));
         assert_eq!(
-            receive_action(&ingress, false, false, false),
+            act(&ingress, false, false, false),
             ReceiveAction::Reply(GuiShowOutcome::Refused)
         );
 
@@ -813,10 +861,7 @@ mod tests {
             ingress,
             ShowIngress::Untrusted { request_id: None }
         ));
-        assert_eq!(
-            receive_action(&ingress, true, false, false),
-            ReceiveAction::Drop
-        );
+        assert_eq!(act(&ingress, true, false, false), ReceiveAction::Drop);
     }
 
     #[test]
@@ -827,17 +872,14 @@ mod tests {
         let mut cache = ReplayCache::new();
         let first = ingress_show(true, &payload, &sender, now, &mut cache).unwrap();
         assert!(matches!(
-            receive_action(&first, true, false, false),
+            act(&first, true, false, false),
             ReceiveAction::Display { .. }
         ));
         let second = ingress_show(true, &payload, &sender, now + 200, &mut cache).unwrap();
-        assert_eq!(
-            receive_action(&second, true, false, false),
-            ReceiveAction::Drop
-        );
+        assert_eq!(act(&second, true, false, false), ReceiveAction::Drop);
         let other = ingress_show(true, &payload, &[8; 32], now, &mut cache).unwrap();
         assert!(matches!(
-            receive_action(&other, true, false, false),
+            act(&other, true, false, false),
             ReceiveAction::Display { .. }
         ));
     }
@@ -848,12 +890,12 @@ mod tests {
         let payload = request("people", now + 1_000, [3; 16]);
         let mut cache = ReplayCache::new();
         let ingress = trusted_ingress(&payload, now, &mut cache);
-        let action = receive_action(&ingress, true, false, false);
+        let action = act(&ingress, true, false, false);
         assert_eq!(action, ReceiveAction::Reply(GuiShowOutcome::StaleRequest));
         assert!(!matches!(action, ReceiveAction::Display { .. }));
         // Freshness is before remote enable, so a stale request is not Disabled.
         assert_eq!(
-            receive_action(&ingress, false, false, false),
+            act(&ingress, false, false, false),
             ReceiveAction::Reply(GuiShowOutcome::StaleRequest)
         );
     }
@@ -865,12 +907,12 @@ mod tests {
         let mut cache = ReplayCache::new();
         let ingress = trusted_ingress(&payload, now, &mut cache);
         assert_eq!(
-            receive_action(&ingress, true, false, false),
+            act(&ingress, true, false, false),
             ReceiveAction::Reply(GuiShowOutcome::InvalidView)
         );
         // View is checked before the block list.
         assert_eq!(
-            receive_action(&ingress, true, true, false),
+            act(&ingress, true, true, false),
             ReceiveAction::Reply(GuiShowOutcome::InvalidView)
         );
 
@@ -880,7 +922,7 @@ mod tests {
         let payload = request(&long, now, [6; 16]);
         let ingress = trusted_ingress(&payload, now, &mut cache);
         assert_eq!(
-            receive_action(&ingress, true, false, false),
+            act(&ingress, true, false, false),
             ReceiveAction::Reply(GuiShowOutcome::InvalidView)
         );
     }
@@ -892,7 +934,7 @@ mod tests {
         let mut cache = ReplayCache::new();
         let ingress = trusted_ingress(&payload, now, &mut cache);
         assert_eq!(
-            receive_action(&ingress, false, false, false),
+            act(&ingress, false, false, false),
             ReceiveAction::Reply(GuiShowOutcome::Disabled)
         );
 
@@ -900,7 +942,7 @@ mod tests {
         let url = request("https://evil.example", now, [2; 16]);
         let ingress = trusted_ingress(&url, now, &mut cache);
         assert_eq!(
-            receive_action(&ingress, false, false, false),
+            act(&ingress, false, false, false),
             ReceiveAction::Reply(GuiShowOutcome::Disabled)
         );
 
@@ -978,6 +1020,7 @@ mod tests {
             issued_at: 42,
             via_rider: true,
             subject: [9; 32],
+            target: MachineId(LOCAL_MACHINE),
         };
         let bytes = req.to_dm_payload().unwrap();
         assert_eq!(classify_prefix(&bytes), Some(DmClass::ShowRequest));
@@ -1046,19 +1089,19 @@ mod tests {
         let mut cache = ReplayCache::new();
         let ingress = ingress_show(true, &payload, &[7; 32], now, &mut cache).unwrap();
         assert_eq!(
-            receive_action(&ingress, true, true, false),
+            act(&ingress, true, true, false),
             ReceiveAction::Reply(GuiShowOutcome::Refused)
         );
         assert_eq!(
-            receive_action(&ingress, true, false, true),
+            act(&ingress, true, false, true),
             ReceiveAction::Reply(GuiShowOutcome::RateLimited)
         );
         assert_eq!(
-            receive_action(&ingress, true, true, true),
+            act(&ingress, true, true, true),
             ReceiveAction::Reply(GuiShowOutcome::Refused)
         );
         assert!(matches!(
-            receive_action(&ingress, true, false, false),
+            act(&ingress, true, false, false),
             ReceiveAction::Display { route, via_rider: false } if route == "people"
         ));
     }
@@ -1200,6 +1243,146 @@ mod tests {
     }
 
     #[test]
+    fn request_for_this_machine_may_display() {
+        let mut cache = ReplayCache::new();
+        let now = 1_700_000_000;
+        let payload = request("people", now, [1; 16]);
+        let ingress = trusted_ingress(&payload, now, &mut cache);
+        assert!(matches!(
+            act(&ingress, true, false, false),
+            ReceiveAction::Display { route, .. } if route == "people"
+        ));
+    }
+
+    #[test]
+    fn request_signed_for_another_machine_does_not_display() {
+        let mut cache = ReplayCache::new();
+        let now = 1_700_000_000;
+        let payload = show_request("people", now, [1; 16], MachineId([8; 32]));
+        let ingress = trusted_ingress(&payload, now, &mut cache);
+        let action = act(&ingress, true, false, false);
+        assert_eq!(action, ReceiveAction::Reply(GuiShowOutcome::WrongMachine));
+        assert!(!matches!(action, ReceiveAction::Display { .. }));
+    }
+
+    #[test]
+    fn target_field_is_appended_after_subject() {
+        let now = 1_700_000_000;
+        let here = show_request("people", now, [1; 16], MachineId(LOCAL_MACHINE));
+        let there = show_request("people", now, [1; 16], MachineId([8; 32]));
+        let split = here.len() - 32;
+        assert_eq!(&here[..split], &there[..split]);
+        assert_ne!(&here[split..], &there[split..]);
+        assert_eq!(&here[split..], &LOCAL_MACHINE);
+    }
+
+    #[test]
+    fn tampered_target_fails_envelope_signature() {
+        use crate::dm::{decrypt_payload, EnvelopeBuilder};
+        use crate::dm_inbox::verify_envelope_signature;
+        use crate::gossip::SigningContext;
+        use crate::groups::kem_envelope::AgentKemKeypair;
+        use crate::identity::{AgentKeypair, MachineKeypair};
+
+        let agent_kp = AgentKeypair::generate().expect("agent key");
+        let machine_kp = MachineKeypair::generate().expect("machine key");
+        let recipient_kem = AgentKemKeypair::generate().expect("kem");
+        let signing = SigningContext::from_keypair(&agent_kp);
+        let sender = agent_kp.agent_id();
+        let recipient = AgentKeypair::generate().expect("recipient").agent_id();
+        let now = 1_700_000_000_000;
+        let good = show_request("people", 1_700_000_000, [3; 16], MachineId(LOCAL_MACHINE));
+        let other = show_request("people", 1_700_000_000, [3; 16], MachineId([8; 32]));
+        let target_at = good.len() - 32;
+        assert_eq!(&good[..target_at], &other[..target_at]);
+        let envelope = EnvelopeBuilder::build_payload_envelope(
+            [3; 16],
+            &sender,
+            &machine_kp.machine_id(),
+            &machine_kp,
+            &recipient,
+            &recipient_kem.public_bytes,
+            now,
+            now + 60_000,
+            good.clone(),
+            |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+        )
+        .expect("sign show");
+        assert!(
+            verify_envelope_signature(&envelope, agent_kp.public_key().as_bytes()),
+            "the signed target verifies"
+        );
+        let mut flipped = good;
+        flipped[target_at] ^= 0x01;
+        let tampered_body = EnvelopeBuilder::build_payload_body(
+            &envelope.request_id,
+            &envelope.sender_agent_id,
+            &envelope.recipient_agent_id,
+            envelope.created_at_unix_ms,
+            flipped,
+            None,
+            &recipient_kem.public_bytes,
+        )
+        .expect("seal tampered target");
+        let plain = match &envelope.body {
+            crate::dm::DmBody::Payload(payload) => {
+                decrypt_payload(&recipient_kem, payload, &envelope.aead_aad()).expect("decrypt")
+            }
+            crate::dm::DmBody::Ack(_) => panic!("show payload is not an ack"),
+        };
+        assert_eq!(&plain.payload[plain.payload.len() - 32..], &LOCAL_MACHINE);
+        let mut tampered = envelope;
+        tampered.body = tampered_body;
+        assert!(
+            !verify_envelope_signature(&tampered, agent_kp.public_key().as_bytes()),
+            "a changed target must fail the signature"
+        );
+    }
+
+    #[test]
+    fn unknown_wire_variant_is_refused() {
+        let opened = GuiShowDmResult {
+            request_id: [1; 16],
+            outcome: GuiShowOutcome::Opened,
+        }
+        .to_dm_payload()
+        .expect("opened");
+        assert!(show_result_succeeded(&opened));
+        let stale = GuiShowDmResult {
+            request_id: [1; 16],
+            outcome: GuiShowOutcome::StaleRequest,
+        }
+        .to_dm_payload()
+        .expect("stale");
+        let wrong = GuiShowDmResult {
+            request_id: [1; 16],
+            outcome: GuiShowOutcome::WrongMachine,
+        }
+        .to_dm_payload()
+        .expect("wrong machine");
+        let stale_body = stale.strip_prefix(SHOW_RESULT_PREFIX).expect("prefix");
+        let wrong_body = wrong.strip_prefix(SHOW_RESULT_PREFIX).expect("prefix");
+        assert_eq!(&stale_body[16..20], &9u32.to_le_bytes());
+        assert_eq!(&wrong_body[16..20], &10u32.to_le_bytes());
+        assert!(!show_result_succeeded(&stale));
+        assert!(!show_result_succeeded(&wrong));
+
+        let mut unknown_result = SHOW_RESULT_PREFIX.to_vec();
+        unknown_result.extend_from_slice(&[1; 16]);
+        unknown_result.extend_from_slice(&11u32.to_le_bytes());
+        assert!(decode_show_result(&unknown_result).is_none());
+        assert!(!show_result_succeeded(&unknown_result));
+
+        let mut unknown_activity = ACTIVITY_PREFIX.to_vec();
+        unknown_activity.extend_from_slice(&2u32.to_le_bytes());
+        unknown_activity.extend_from_slice(&[4; 16]);
+        assert_eq!(
+            ingress_activity(true, &unknown_activity),
+            ActivityIngress::Ignore
+        );
+    }
+
+    #[test]
     fn rider_subject_is_independent_of_the_daemon() {
         let daemon = [1u8; 32];
         let rider_a = [2u8; 32];
@@ -1211,6 +1394,7 @@ mod tests {
             issued_at: 1,
             via_rider: true,
             subject: rider_a,
+            target: MachineId(LOCAL_MACHINE),
         };
         assert_eq!(show_subject(&daemon, &rider, &local), Some(rider_a));
         let other = GuiShowDmRequest {
@@ -1230,6 +1414,7 @@ mod tests {
             issued_at: 1,
             via_rider: true,
             subject: local,
+            target: MachineId(LOCAL_MACHINE),
         };
         assert!(show_subject(&daemon, &claims_local, &local).is_none());
     }
