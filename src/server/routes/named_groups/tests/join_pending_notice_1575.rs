@@ -451,6 +451,110 @@ async fn owner_cert_pending_notice_survives_a_poll_with_an_eligible_admin() -> R
     Ok(())
 }
 
+/// §8 Q3 bound (PR #1628 review item 1): the staged-notice map keeps the
+/// staged refusals' 1024-entry cap, evicting the oldest notice first, so a
+/// joiner-chosen attempt id cannot grow it without limit.
+#[tokio::test]
+async fn staged_notices_are_capped_like_the_staged_refusals() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let joiner_hex = "aa".repeat(32);
+    let group_key = "7a".repeat(32);
+    let first_attempt = "attempt-00000";
+    let last_attempt = format!("attempt-{:05}", JOIN_REFUSAL_MAX_ENTRIES as u64);
+    for i in 0..=(JOIN_REFUSAL_MAX_ENTRIES as u64) {
+        stage_join_pending_notice(
+            &state,
+            &group_key,
+            &joiner_hex,
+            &format!("attempt-{i:05}"),
+            JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+            JoinPendingNoticeDetail::default(),
+        )
+        .await;
+    }
+    let notices = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(notices.len(), JOIN_REFUSAL_MAX_ENTRIES, "the cap holds");
+    assert!(
+        !notices.contains_key(&join_refusal_refusal_key(
+            &group_key,
+            &joiner_hex,
+            first_attempt
+        )),
+        "the oldest notice was evicted"
+    );
+    assert!(
+        notices.contains_key(&join_refusal_refusal_key(
+            &group_key,
+            &joiner_hex,
+            &last_attempt
+        )),
+        "the newest notice was kept"
+    );
+    Ok(())
+}
+
+/// §8 selection order at the poll (PR #1628 review item 2): a staged
+/// Refused for the attempt forbids staging a notice over it, even when the
+/// fetch cannot be served the refusal (`accepts_refusal` false). The
+/// re-check also covers the re-acquired critical section after the refusal
+/// probe consumed the caller's guard.
+#[tokio::test]
+async fn a_poll_stages_no_notice_over_a_staged_refusal() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let admin = AgentKeypair::generate()?;
+    let joiner = AgentKeypair::generate()?;
+    let joiner_id = joiner.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_key = "7b".repeat(32);
+    let (_, _, _, joined_event) = signed_member_joined_event_for_test(
+        &joiner,
+        &group_key,
+        &inviter_hex,
+        "1575-secret",
+        x0x::groups::GroupRole::Member,
+    )?;
+    let attempt = member_joined_event_attempt_id(&joined_event).expect("attempt id");
+    seed_group_with_local_member(&state, &group_key, &admin).await;
+    // The D154 cover holds, so the poll would stage a notice without the
+    // staged refusal.
+    revoke_agent(&state, &admin).await;
+    stage_join_refusal(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &joined_event,
+        JoinRefusalReason::InviteExpired,
+    )
+    .await;
+
+    // A fetch that cannot be served the refusal still must not stage a
+    // notice over it: §8's order is Result, then Refused, then notice.
+    handle_join_result_message(
+        &state,
+        &joiner_id,
+        true,
+        JoinResultMessage::FetchRequest {
+            group_id: group_key.clone(),
+            member_agent_id: joiner_hex.clone(),
+            from_revision: None,
+            base_state_hash: None,
+            accepts_refusal: false,
+            accepts_control_blob_ref: false,
+            attempt_id: Some(attempt.clone()),
+        },
+    )
+    .await;
+    assert!(
+        staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_none(),
+        "no notice is staged over a staged Refused"
+    );
+    Ok(())
+}
+
 /// §8: a cause name is 1 to 64 bytes of `[a-z0-9_]`.
 #[test]
 fn join_pending_cause_names_keep_the_registry_shape() {

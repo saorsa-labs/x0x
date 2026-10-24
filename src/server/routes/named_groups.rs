@@ -1597,6 +1597,19 @@ async fn stage_join_pending_notice(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     notices.retain(|_, notice| notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    // §8 Q3 bound: the same 1024-entry cap as the staged refusals beside
+    // this map, evicting the oldest. The poll path stages under a
+    // joiner-chosen attempt id, so without this a single verified agent
+    // could grow the map without limit.
+    if notices.len() >= JOIN_REFUSAL_MAX_ENTRIES {
+        if let Some(oldest) = notices
+            .iter()
+            .min_by_key(|(_, notice)| notice.created_at)
+            .map(|(k, _)| k.clone())
+        {
+            notices.remove(&oldest);
+        }
+    }
     notices.insert(
         key,
         PendingJoinNotice {
@@ -1660,11 +1673,16 @@ fn drop_staged_join_pending_notice(
 /// dropped (§8: a notice is dropped when its cause clears). A cause the
 /// poll cannot re-evaluate — S2's `owner_certificate_pending`, whose exit
 /// is the seal succeeding or the attempt ending — keeps its staged notice
-/// here; the Result and Refused staging hooks clear it. The caller holds
-/// the group's membership critical
-/// section, the same linearized selection a staged Result or Refused is
-/// served under. The notice grants nothing: it carries no key, Welcome,
-/// roster or certificate bytes.
+/// here; the Result and Refused staging hooks clear it. §8's selection
+/// order (Result, then Refused, then notice) is re-checked at entry: the
+/// caller holds the group's membership critical section when it still has
+/// it, and stays correct when it must re-acquire the section after the
+/// refusal probe consumed the guard — a terminal answer staged in that gap
+/// forbids staging and drops any staged notice. The wire half adds D154's
+/// full attempt binding (`attempt_evidence`); on today's wire any verified
+/// sender that names `member_agent_id` as itself reaches this evaluation,
+/// and the §8 Q3 cap bounds what it can stage. The notice grants nothing:
+/// it carries no key, Welcome, roster or certificate bytes.
 async fn evaluate_polled_join_pending_notice(
     state: &AppState,
     group_id: &str,
@@ -1678,6 +1696,31 @@ async fn evaluate_polled_join_pending_notice(
     };
     let drop_notice =
         || drop_staged_join_pending_notice(state, group_id, member_agent_id, attempt_id);
+    // §8 selection order: a staged Result or Refused for this member's
+    // attempt replaces any notice, so neither may be staged over.
+    {
+        let results = state.pending_join_results.read().await;
+        if results
+            .get(&join_result_key(group_id, member_agent_id))
+            .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+        {
+            drop_notice();
+            return;
+        }
+    }
+    if state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+    {
+        drop_notice();
+        return;
+    }
     // §8 extra conditions for a notice: the joiner holds no revoked agent.
     // A revocation resync gap fails closed — nothing is staged over
     // unverifiable revocation state.
@@ -44211,7 +44254,7 @@ async fn handle_join_result_message_bound(
             // during the seat-to-result interval wakes and re-reads the
             // newly staged result (T4(b)).
             let membership_arc = group_membership_lock_for_known_group(state, &group_id).await;
-            let selection_guard = match &membership_arc {
+            let mut selection_guard = match &membership_arc {
                 Some(arc) => Some(arc.lock().await),
                 None => None,
             };
@@ -44240,7 +44283,7 @@ async fn handle_join_result_message_bound(
                     if let Some(attempt_id) = attempt_id.as_deref() {
                         // Results take precedence: a successful staging
                         // for this triple removed the refusal already.
-                        let refusal_response = match selection_guard {
+                        let refusal_response = match selection_guard.take() {
                             Some(guard) => {
                                 serve_staged_join_refusal(
                                     state,
@@ -44276,7 +44319,19 @@ async fn handle_join_result_message_bound(
                 // re-evaluates the notice causes this member may sign and
                 // stages the typed local cause; the signed `Pending` serve
                 // itself waits on the wire ruling, so nothing is sent here.
+                // The refusal probe above may have consumed the caller's
+                // guard; re-acquire the critical section so §8's Result →
+                // Refused → notice selection stays linearized (the entry
+                // re-check inside covers a terminal answer staged in the
+                // gap).
                 if verified {
+                    let notice_section = match selection_guard.take() {
+                        Some(guard) => Some(guard),
+                        None => match &membership_arc {
+                            Some(arc) => Some(arc.lock().await),
+                            None => None,
+                        },
+                    };
                     evaluate_polled_join_pending_notice(
                         state,
                         &group_id,
@@ -44284,6 +44339,7 @@ async fn handle_join_result_message_bound(
                         attempt_id.as_deref(),
                     )
                     .await;
+                    drop(notice_section);
                 }
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
