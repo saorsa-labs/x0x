@@ -1735,7 +1735,7 @@ impl AutoApplyUpgrader {
                             "supervised shutdown flush failed after the daemon stopped; \
                              the process exits EX_TEMPFAIL for a supervisor restart"
                         );
-                        super::log_flush::flush_before_tempfail_exit();
+                        super::log_flush::flush_before_exit(None);
                         exit(restart::flush_failure_exit_code());
                         #[allow(unreachable_code)]
                         return Err(UpgradeError::Other(format!(
@@ -1833,7 +1833,7 @@ fn authorize_receipt_after_stop(
             "flush receipt failed authorization after the daemon stopped; \
              the process exits EX_TEMPFAIL for a supervisor restart"
         );
-        super::log_flush::flush_before_tempfail_exit();
+        super::log_flush::flush_before_exit(None);
         exit(restart::flush_failure_exit_code());
         #[allow(unreachable_code)]
         return Err(UpgradeError::Other(error.to_string()));

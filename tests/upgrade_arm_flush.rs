@@ -294,6 +294,83 @@ macro_rules! arm_flush_regression_tests {
             }
 
             #[test]
+            fn arm_started_failure_archives_restored_journal_and_allows_newer_release() {
+                let (dir, original, request, state, cli, backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|deadline, stopped| {
+                    deadline.commit_stop(stopped)?;
+                    Err(io::Error::other("injected started flush failure"))
+                })).unwrap();
+                assert!(matches!(arm(&state, &root, &serde_json::to_vec(&request).unwrap()),
+                    Err(ArmFailure::FlushFailed(_))));
+                owner.join_workers();
+                assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                assert!(!backup.exists());
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists(), "resolved handoff must be removed");
+                assert!(!journal::read_boot_records(&root).blocks_apply(), "resolved journal must not block newer releases");
+                let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
+                    .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("upgrade-failed-")).collect();
+                assert_eq!(archives.len(), 1);
+                let saved: Value = serde_json::from_slice(&std::fs::read(&archives[0]).unwrap()).unwrap();
+                assert_eq!(saved["sequence"], original["sequence"].as_u64().unwrap() + 2);
+                assert_eq!(saved["phase"], "restored");
+                assert_eq!(saved["cause"]["class"], "failed");
+                assert!(saved["cause"]["reason"].as_str().unwrap().contains("flush failure"));
+                assert_eq!(saved["cli_progress"]["swapped"], false);
+                assert_eq!(saved["cli_progress"]["restored"], true);
+                assert!(saved["cli_progress"]["observed_sha256"].is_null());
+                assert_eq!(saved["daemon_progress"], original["daemon_progress"]);
+                assert!(shutdown_flush::release_is_held(&root, &semver::Version::new(2, 0, 0)).unwrap().is_some());
+                assert!(shutdown_flush::release_is_held(&root, &semver::Version::new(1, 0, 0)).unwrap().is_some());
+                // Model the exit-75 restart: stale receipt-less flush records
+                // clear, the per-release hold stays, and new admission opens.
+                let restarted_root = root.join("restart-records");
+                std::fs::create_dir(&restarted_root).unwrap();
+                for name in [shutdown_flush::RECORD, shutdown_flush::ROLLBACK_RECORD, shutdown_flush::HOLD_RECORD] {
+                    std::fs::copy(root.join(name), restarted_root.join(name)).unwrap();
+                }
+                shutdown_flush::clear_stale_records(&restarted_root);
+                let _restarted = shutdown_flush::register(restarted_root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+                assert!(restarted_root.join(shutdown_flush::HOLD_RECORD).is_file());
+                assert!(!journal::read_boot_records(&root).blocks_apply());
+                assert!(shutdown_flush::release_is_held(&restarted_root, &semver::Version::new(2, 0, 1)).unwrap().is_none());
+                shutdown_flush::ensure_ready(&restarted_root).unwrap();
+                shutdown_flush::reserve(&restarted_root).unwrap().activate().unwrap();
+            }
+
+            #[test]
+            fn arm_started_partial_restore_keeps_rolling_back_and_blocks_apply() {
+                let (dir, mut record, request, state, cli, backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let handoff = admit(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap().handoff;
+                let daemon = root.join("owned-daemon");
+                let daemon_backup = root.join("daemon.backup");
+                std::fs::write(&daemon, b"candidate daemon").unwrap();
+                std::fs::write(&daemon_backup, b"previous daemon").unwrap();
+                record["daemon_progress"]["swapped"] = json!(true);
+                record["plan"]["daemon"]["target_path"] = json!(daemon);
+                record["plan"]["participants"][0]["executable"] = json!(daemon);
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+                // Both backups are valid. The second rename fails after the
+                // daemon rename succeeded, leaving a mixed pair for recovery.
+                std::fs::remove_file(&cli).unwrap();
+                std::fs::create_dir(&cli).unwrap();
+                journal::write_record(&root.join(journal::HANDOFF_FILE_NAME), &handoff).unwrap();
+                let restore = vec![(daemon.clone(), daemon_backup), (cli, backup)];
+                let outcome = restore_arm(&root, serde_json::from_value(record).unwrap(),
+                    &handoff, true, &restore, journal::Cause {
+                        class: journal::CauseClass::Failed, reason: "shutdown flush failure".into(),
+                    });
+                assert!(outcome.is_err());
+                assert_eq!(std::fs::read(&daemon).unwrap(), b"previous daemon");
+                let saved: Value = serde_json::from_slice(&std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap()).unwrap();
+                assert_eq!(saved["phase"], "rolling_back");
+                assert_eq!(saved["cause"]["class"], "failed");
+                assert!(root.join(journal::HANDOFF_FILE_NAME).exists());
+                assert!(journal::read_boot_records(&root).blocks_apply());
+            }
+
+            #[test]
             fn arm_duplicate_after_receipt_preserves_installed_bytes_and_receipt() {
                 let (dir, _, request, state, cli, backup) = swapped_cli_fixture();
                 let root = dir.path().canonicalize().unwrap();

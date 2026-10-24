@@ -558,16 +558,25 @@ pub(crate) fn flush_captured(callback: &FlushCallback, deadline: Instant) -> io:
     failure.map_or(Ok(()), Err)
 }
 
-/// Best-effort flush of the acknowledged log sinks so the error lines that
-/// justify an immediate `EX_TEMPFAIL` exit reach their appenders before the
-/// process ends. The hook's own barrier ran before those lines were emitted;
-/// without this second flush `std::process::exit` can cut them. Failures and
-/// a missing flush bridge (for example in the CLI) are ignored: a logging
-/// fault must not delay or skip the exit.
-pub(crate) fn flush_before_tempfail_exit() {
-    let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    if let Ok(callback) = capture(&dispatch) {
-        let _ = flush_captured(&callback, Instant::now() + Duration::from_secs(2));
+/// Drain failure diagnostics before process::exit skips the worker guard.
+/// This has a fresh, short budget because the upgrade deadline may have passed.
+pub(crate) fn flush_before_exit(captured: Option<&FlushCallback>) {
+    let current;
+    let callback = match captured {
+        Some(callback) => callback,
+        None => {
+            current = capture(&tracing::dispatcher::get_default(Clone::clone));
+            match &current {
+                Ok(callback) => callback,
+                Err(error) => {
+                    eprintln!("cannot flush upgrade failure logs before exit: {error}");
+                    return;
+                }
+            }
+        }
+    };
+    if let Err(error) = flush_captured(callback, Instant::now() + Duration::from_secs(1)) {
+        eprintln!("cannot flush upgrade failure logs before exit: {error}");
     }
 }
 
