@@ -20,6 +20,8 @@ mod crdt_subscriptions;
 mod delegations;
 mod delivery_gate;
 mod group_access;
+#[cfg(test)]
+mod gui_show_pair;
 mod gui_show_remote;
 /// M1 structured `/health` verdict (#1380). `pub` because the `x0xd`
 /// binary installs [`health_verdict::ErrorCountLayer`] in its tracing
