@@ -513,7 +513,7 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn validate_autostart_value(value: &str) -> Result<()> {
     if value.chars().any(|c| c.is_control() && !matches!(c, '\t')) {
         anyhow::bail!("autostart arguments and paths must not contain control characters");
@@ -630,6 +630,65 @@ fn render_launchd_plist(executable: &str, args: &[String], log_path: &Path) -> R
     ))
 }
 
+/// The versioned Windows supervision wrapper template (#621, ADR-0061 §3):
+/// a PowerShell script that restarts x0xd after exit 100 (the supervised
+/// upgrade request) and propagates every other exit status. The daemon
+/// verifies the generated script at upgrade time through
+/// [`crate::upgrade::restart::readback_windows_wrapper_script`], so the
+/// template's marker lines must stay exactly what that readback parses.
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_WRAPPER_TEMPLATE: &str = include_str!("windows-wrapper.ps1");
+
+/// File name of the generated wrapper inside the config directory. Only the
+/// Windows autostart/remove drivers use it; tests render the template
+/// directly.
+#[cfg(any(test, target_os = "windows"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WINDOWS_WRAPPER_FILE_NAME: &str = "x0xd-wrapper.ps1";
+
+/// Scheduled-task name the Windows autostart registers.
+#[cfg(target_os = "windows")]
+const WINDOWS_AUTOSTART_TASK: &str = "x0xd";
+
+/// Escape one value for a PowerShell single-quoted string: a literal
+/// apostrophe is doubled (`''`) — inside single quotes PowerShell expands
+/// nothing else.
+#[cfg(any(test, target_os = "windows"))]
+fn ps_single_quote_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Render the Windows supervision wrapper script for one instance (#621):
+/// the tested wrapper version, the restart-on-exit-100 policy, and the
+/// executable/arguments binding the upgrade-time readback verifies. ASCII
+/// only — Windows PowerShell 5.1 reads a no-BOM file as ANSI, so a non-ASCII
+/// path or `--name` would corrupt the binding silently.
+#[cfg(any(test, target_os = "windows"))]
+fn render_windows_wrapper(executable: &str, args: &[String]) -> Result<String> {
+    validate_autostart_value(executable)?;
+    for arg in args {
+        validate_autostart_value(arg)?;
+    }
+    if !executable.is_ascii() || args.iter().any(|arg| !arg.is_ascii()) {
+        anyhow::bail!(
+            "autostart on Windows needs ASCII paths and arguments (Windows PowerShell 5.1 \
+             reads a no-BOM script as ANSI)"
+        );
+    }
+    let arguments = args
+        .iter()
+        .map(|arg| format!("'{}'", ps_single_quote_escape(arg)))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(WINDOWS_WRAPPER_TEMPLATE
+        .replace(
+            "__X0X_WRAPPER_VERSION__",
+            &crate::upgrade::restart::WINDOWS_WRAPPER_TESTED_VERSION.to_string(),
+        )
+        .replace("__X0X_EXECUTABLE__", &ps_single_quote_escape(executable))
+        .replace("__X0X_ARGUMENTS__", &arguments))
+}
+
 /// `x0x autostart` — configure daemon to start on boot.
 pub async fn autostart(name: Option<&str>) -> Result<()> {
     let x0xd_path = find_x0xd()?;
@@ -728,7 +787,70 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
         println!("  Remove: x0x autostart --remove");
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        let mut args = Vec::new();
+        if let Some(n) = name {
+            args.push("--name".to_string());
+            args.push(n.to_string());
+        }
+        // #621 / ADR-0061 §3: the supported Windows deployment is this
+        // versioned wrapper (restart after exit 100 only), which the daemon
+        // verifies at upgrade time before accepting a supervised exit.
+        let config_dir = dirs::config_dir()
+            .context("cannot determine config directory")?
+            .join("x0x");
+        std::fs::create_dir_all(&config_dir)?;
+        let wrapper_path = config_dir.join(WINDOWS_WRAPPER_FILE_NAME);
+        let wrapper = render_windows_wrapper(&x0xd, &args)?;
+        std::fs::write(&wrapper_path, &wrapper)?;
+
+        // Verify through the same readback the upgrade path uses, never
+        // trusting the write.
+        let written = std::fs::read_to_string(&wrapper_path)
+            .with_context(|| format!("failed to read back {}", wrapper_path.display()))?;
+        let mut wrapper_argv = vec![x0xd.to_string()];
+        wrapper_argv.extend(args.iter().cloned());
+        if !matches!(
+            crate::upgrade::restart::readback_windows_wrapper_script(&written, &wrapper_argv),
+            crate::upgrade::restart::WindowsWrapperReadback::Verified { .. }
+        ) {
+            anyhow::bail!(
+                "the generated wrapper {} did not verify against the upgrade-time \
+                 readback; nothing was registered",
+                wrapper_path.display()
+            );
+        }
+
+        // Register a per-user logon task (best effort — no admin needed).
+        // `\"` is schtasks' escaping for a literal quote inside /TR.
+        let task_run = format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \\\"{}\\\"",
+            wrapper_path.display()
+        );
+        let registered = std::process::Command::new("schtasks")
+            .args(["/Create", "/TN", WINDOWS_AUTOSTART_TASK, "/SC", "ONLOGON"])
+            .arg("/TR")
+            .arg(&task_run)
+            .arg("/F")
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if registered {
+            println!("Autostart enabled (Windows wrapper + logon task)");
+        } else {
+            println!("Autostart wrapper written, but the logon task could not be registered.");
+            println!("  Register it manually, or run the wrapper from your own service manager:");
+            println!(
+                "    schtasks /Create /TN {WINDOWS_AUTOSTART_TASK} /SC ONLOGON /TR \"{task_run}\""
+            );
+        }
+        println!("  Wrapper: {}", wrapper_path.display());
+        println!("  Policy:  restart after exit 100 (upgrade); every other exit stops.");
+        println!("  Remove:  x0x autostart --remove");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         println!("Autostart not supported on this platform.");
         println!("Run x0xd manually or configure your OS service manager.");
@@ -941,6 +1063,11 @@ pub async fn autostart_repair() -> Result<()> {
         println!("`x0x autostart --repair` currently migrates macOS launchd jobs only.");
         println!("systemd units generated by `x0x autostart` already set Restart=always,");
         println!("and INVOCATION_ID makes them supervised without a marker.");
+        #[cfg(target_os = "windows")]
+        println!(
+            "On Windows, `x0x autostart` (re)generates the supervised wrapper — run it \
+             instead of --repair."
+        );
     }
 
     Ok(())
@@ -1021,7 +1148,22 @@ pub async fn autostart_remove() -> Result<()> {
         println!("Autostart removed (launchd)");
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", WINDOWS_AUTOSTART_TASK, "/F"])
+            .status();
+        let wrapper_path = dirs::config_dir()
+            .context("cannot determine config directory")?
+            .join("x0x")
+            .join(WINDOWS_WRAPPER_FILE_NAME);
+        if wrapper_path.exists() {
+            std::fs::remove_file(&wrapper_path)?;
+        }
+        println!("Autostart removed (Windows wrapper)");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     println!("Autostart not supported on this platform.");
 
     Ok(())
@@ -1054,20 +1196,34 @@ fn port_file_path(name: Option<&str>) -> Result<std::path::PathBuf> {
 }
 
 /// Find the x0xd binary.
+/// Candidate file names for the daemon binary: `x0xd.exe` on Windows
+/// (releases ship `x0xd.exe`), bare `x0xd` everywhere else.
+fn x0xd_binary_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["x0xd.exe", "x0xd"]
+    } else {
+        &["x0xd"]
+    }
+}
+
 fn find_x0xd() -> Result<std::path::PathBuf> {
     // Same directory as x0x binary.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("x0xd");
-            if candidate.exists() {
-                return Ok(candidate);
+            for name in x0xd_binary_names() {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
             }
         }
     }
 
     // Search PATH.
-    if let Ok(path) = which::which("x0xd") {
-        return Ok(path);
+    for name in x0xd_binary_names() {
+        if let Ok(path) = which::which(name) {
+            return Ok(path);
+        }
     }
 
     anyhow::bail!("x0xd not found. Install it or ensure it's in the same directory as x0x.")
@@ -1581,6 +1737,80 @@ mod tests {
             "/opt/x0xd",
             &["--name\rforged".to_string()],
             Path::new("/tmp/x0xd.log")
+        )
+        .is_err());
+    }
+
+    // ===================================================================
+    // #621: Windows supervision wrapper template (ADR-0061 §3)
+    // ===================================================================
+
+    /// Render the wrapper for one instance and build the argv a daemon
+    /// started by that wrapper would report.
+    fn windows_wrapper_fixture(executable: &str, args: &[String]) -> (String, Vec<String>) {
+        let script = render_windows_wrapper(executable, args).expect("render production wrapper");
+        let mut argv = vec![executable.to_string()];
+        argv.extend(args.iter().cloned());
+        (script, argv)
+    }
+
+    #[test]
+    fn windows_wrapper_renders_versioned_and_readback_verified() {
+        let (script, argv) = windows_wrapper_fixture(
+            "C:\\Program Files\\x0x\\x0xd.exe",
+            &["--name".to_string(), "alice".to_string()],
+        );
+        assert!(script.lines().any(|line| {
+            line == format!(
+                "$x0xWrapperVersion = {}",
+                crate::upgrade::restart::WINDOWS_WRAPPER_TESTED_VERSION
+            )
+        }));
+        assert!(script.lines().any(|l| l == "$x0xRestartOnExit100 = $true"));
+        // The cross-pin that keeps the renderer and the verifier honest: the
+        // generated template is exactly what the upgrade-time readback
+        // accepts for the instance it was rendered for.
+        assert_eq!(
+            crate::upgrade::restart::readback_windows_wrapper_script(&script, &argv),
+            crate::upgrade::restart::WindowsWrapperReadback::Verified {
+                wrapper_version: crate::upgrade::restart::WINDOWS_WRAPPER_TESTED_VERSION
+            }
+        );
+    }
+
+    #[test]
+    fn windows_wrapper_escapes_and_still_verifies() {
+        // An apostrophe doubles inside the single-quoted string; a comma
+        // inside quotes is data, not a separator.
+        let (script, argv) = windows_wrapper_fixture(
+            "C:\\Tools\\x0xd.exe",
+            &["--name".to_string(), "a'b,c d".to_string()],
+        );
+        assert!(script.contains("'--name','a''b,c d'"));
+        assert_eq!(
+            crate::upgrade::restart::readback_windows_wrapper_script(&script, &argv),
+            crate::upgrade::restart::WindowsWrapperReadback::Verified {
+                wrapper_version: crate::upgrade::restart::WINDOWS_WRAPPER_TESTED_VERSION
+            }
+        );
+        // Empty argument list renders the empty array literal and verifies.
+        let (empty, argv) = windows_wrapper_fixture("C:\\Tools\\x0xd.exe", &[]);
+        assert!(empty.contains("$x0xArguments = @()"));
+        assert!(matches!(
+            crate::upgrade::restart::readback_windows_wrapper_script(&empty, &argv),
+            crate::upgrade::restart::WindowsWrapperReadback::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn windows_wrapper_rejects_raw_controls_and_non_ascii() {
+        // Controls would forge marker lines; non-ASCII would be corrupted by
+        // Windows PowerShell 5.1's ANSI read of a no-BOM script.
+        assert!(render_windows_wrapper("C:\\x0xd.exe", &["--name\nforged".to_string()]).is_err());
+        assert!(render_windows_wrapper("C:\\J\u{fc}rgen\\x0xd.exe", &[]).is_err());
+        assert!(render_windows_wrapper(
+            "C:\\x0xd.exe",
+            &["--name".to_string(), "\u{fc}".to_string()]
         )
         .is_err());
     }
