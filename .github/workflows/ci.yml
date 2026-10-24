@@ -393,6 +393,19 @@ jobs:
           mkdir -m 700 "${artifact}"
           test ! -e "${artifact}/proof.json"
 
+      # The x0x lib test unit at opt-level 3 peaked at 15.7 of 16 GB RAM
+      # and 2.9 of 3 GB swap (run 40002832571). A larger lib went past
+      # that, and the runner stopped with exit 143 before a test ran
+      # (#1533 runs 40003771420, 39995270646).
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
       - name: Sample signing-path build resources
         shell: bash
         run: |
@@ -684,7 +697,7 @@ jobs:
           --require w3h_1471_forged_card_import_invite
           --expect w3h_1471_forged_card_import_invite=GREEN
           --require w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined
-          --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=RED
+          --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=GREEN
           --require w3h_818_control_ownerless_invite_after_the_removal_joins
           --expect w3h_818_control_ownerless_invite_after_the_removal_joins=GREEN
           --require w3h_1357_red_s4_idle_revocation_one_admin
@@ -721,6 +734,16 @@ jobs:
           --expect w3h_1023_control_holders_never_return_fail_closed=GREEN
           --require w3h_1023_control_holder_returns_recovers
           --expect w3h_1023_control_holder_returns_recovers=GREEN
+          --require w3h_1356_red_s3_aligned_stale_joiner_catches_up
+          --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=GREEN
+          --require w3h_1356_control_s3_attestation_touches_only_the_subject
+          --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
+          --require w3h_1356_red_s3_forked_node_shows_reseat_required
+          --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
+          --require w3h_1356_control_s3_forked_node_not_auto_recovered
+          --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
+          --require w3h_1356_red_s3_manual_reseat_recovers_forked_node
+          --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=GREEN
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer

@@ -1547,6 +1547,8 @@ token. A session token is refused before the body is read.
 | POST | `/groups/:id/members/:agent_id/certificate/rebind` | `x0x group rebind-certificate <group_id> <agent_id> [--certificate <b64>]` | Self-rebind this agent's renewed certificate into its own seat (ADR 0110 §4a). See [Certificate rebind](#certificate-rebind-adr-0110-4a) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
+| POST | `/groups/:id/members/:agent_id/reseat` | `x0x group reseat <group_id> <agent_id> --reason <text> --basis <json>` | **ADR 0109 §3**: re-seat a forked or removed node by hand. See [Ownerless attestation and re-seat](#ownerless-attestation-and-re-seat-adr-0109-s3) |
+| GET | `/groups/:id/recovery` | `x0x group recovery <group_id>` | **ADR 0109 §8**: this node's `recovery` object, the sidecar file, and on an admin the pending requesters and issued re-seats |
 | GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires a local admin seat. Token class: [join-request admin](#authentication-and-token-classes) (#1347). A session token is accepted, except on a Home or an `OwnerCertified` group, which needs the durable API token |
 | POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
 | POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored). Same token class as the list (#1347) |
@@ -1839,6 +1841,113 @@ not on the metadata topic and not in a legacy-decoded container:
 
 DM history does not record these frames: they are protocol traffic. A user
 message that only starts with the same letters stays history.
+
+### Ownerless attestation and re-seat (ADR 0109, S3)
+
+A node can hold a stale base or a fork with no exit. S3 gives each case a
+typed exit. An admin signs an attestation for one node only (D41). Nothing
+here marks, evicts or clears another member.
+
+**`GET /groups/:id` → `recovery`.** The object is `null` when this node
+holds no S3 state for the group. Otherwise `state` is one of these, with
+the fields shown:
+
+| `state` | Fields | Meaning |
+|---|---|---|
+| `catching_up` | `attested_by`, `verified`, `cursor`, `segment_terminal` | An admin's attestation (ATA) covers this node's gap. The node applies the attested links. |
+| `awaiting_attestation` | `reason`, `asked`, `next_retry_at_ms` | The node asks capable admins, then members. `reason` is `no_capable_peer`, `no_reply`, `segment_exhausted`, `renewal_due`, `provisional_unverified`, or the last refusal reason. |
+| `readmission_required` | `cause`, `asked`, `exit` | `cause` is `base_beyond_retention` or `local_state_lost`. `exit` is `manual_remove_and_reinvite` until ADR 0114's repair is in effect. |
+| `manual_clear_required` | `ref` | The head is on the admin's chain, but the marker names a sibling. Use `POST /groups/:id/quarantine/clear`. |
+| `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. |
+| `reseat_in_progress` | `authorised_by`, `phase`, `expires_at_ms` | A valid authorisation arrived. The staged join runs. |
+| `recovery_deferred` | `cause` | `home_gate_closed` (Home activation is off) or `host_commit_pending`. |
+| `recovery_refused` | `reason` | `banned_or_revoked`. Final. |
+| `sidecar_unavailable`, `sidecar_newer_format`, `sidecar_quarantine_failed` | `file` and `cause`, `version` or `step` | ADR 0108 §5a. S3 makes no transition for the group. |
+
+After an ADR 0108 §5a rebuild the object also has
+`recovery_sidecar_rebuilt: {file, txid, lost}`. A `ref` is
+`{"kind": "marker", "revision", "state_hash", "committed_by", "observed_at_ms", "no_anchor"}`
+or `{"kind": "gap", "reason", "head_state_hash", "terminal_revision", "terminal_state_hash"}`.
+
+**`POST /groups/:id/members/:agent_id/reseat`.** Admin only. Body:
+
+```json
+{"reason": "forked while partitioned",
+ "basis": {"kind": "removal", "revision": 7, "state_hash": "<hex>"}}
+```
+
+`basis` is a `Removal` (the subject's removal commit on this admin's own
+chain) or a `ref` object from a request this admin answered with
+`not_on_chain`, or that the subject reported as `attestation_conflict`. The
+route checks in this order and refuses with the first failure:
+
+| Status | `reason` | Check |
+|---|---|---|
+| 400 | `reason_required` | `reason` is empty. |
+| 400 | `basis_unknown` | `basis` does not parse. |
+| 409 | `admin_contained` | This admin's own record has a marker or an armed gap. |
+| 409 | `subject_active` | The subject is Active. Remove it first with `DELETE /groups/:id/members/:agent_id`. |
+| 409 | `subject_banned_or_revoked` | The subject is banned or its agent is revoked. |
+| 409 | `basis_unknown` | The basis is not a removal of the subject on this chain, and not a known `ref`. |
+| 409 | `reseat_removal_not_own` | Owner-axis group, this admin does not hold the owner's USER key, and the `Removal` basis is not this admin's own removal (§3a, D170). |
+| 409 | `reseat_receiver_upgrade_required` | Same promoted-admin path: `detail.members` names each Active member without a current verified `group_reseat_mandate_v1` advert (the capability floor). |
+| 409 | `subject_certificate_unavailable`, `subject_certificate_invalid` | Same path: this admin does not hold the subject's owner certificate, or it does not verify against the owner. |
+
+On success (200) the route mints an invite addressed to the subject and
+signs a `ReseatAuthorisation` (domain `x0x.reseat-authorisation.v1`). An
+admin that holds the owner's USER key mints an ordinary owner-countersigned
+InviteV4. A promoted admin mints a re-seat invite signed by its agent key
+alone; at seal it embeds a `ReseatMandateV1` (domain
+`x0x/owner-axis/reseat-mandate-admin/v1`) in the `MemberAdded` field
+`reseat_mandate`, in place of the owner mandate. A receiver refuses a bad
+one with `reseat_mandate_invalid` and one cause of `signature`,
+`signer_not_admin`, `policy_mismatch`, `not_previously_seated`,
+`removal_mismatch`, `certificate_invalid`, `role_raised` or
+`binding_mismatch`, and keeps its state unchanged. The
+answer is `{"ok": true, "group_id", "subject", "basis", "authorisation": {"signer", "expires_at_ms", "digest"}}`.
+The admin keeps the authorisation in its sidecar and sends it to the
+subject. The subject needs no operator step (D79). It journals, joins
+with the invite, and swaps the new record in when it is Active with
+keys. On failure it restores its contained record and shows
+`reseat_required` with `cause: reseat_failed`.
+
+**`GET /groups/:id/recovery`.** Answers `{"group_id", "recovery", "requesters", "issued_reseats", "retired_records", "sidecar": {"file", "rebuilt_from"}}`.
+`requesters` and `issued_reseats` are filled only while this daemon holds
+an Active admin seat. `issued_reseats_lost` is `true` on an admin whose
+sidecar was rebuilt (§4): its unconsumed authorisations are gone, so it
+calls the route again. `sidecar.copies` lists each quarantined copy with
+`file`, `txid`, `state` (`pending` or `history`) and `size`; S3 never
+deletes them. Each requester row has `requester`, `head_revision`,
+`head_state_hash`, `refs`, `answer` and `at_ms`. The list keeps 32 rows per
+group for 24 hours.
+
+**Join carry.** `JoinResultMessage::Result` has an optional
+`admin_attestation` key. The authority adds it only for a joiner whose
+current verified advert sets `group_terminal_attest_v1`, and only when no
+owner v2 attestation is served. The joiner verifies it, applies the
+attested links state-only, then applies its own `MemberAdded`. A join poll
+that ends on an attempt S3 holds keeps the stub, and `join-status`
+reports the `recovery` state (`catching_up`, `awaiting_attestation`, …) in
+`last_join_outcome.outcome` with reason `adr0109_recovery_held`, never a
+bare `timed_out`.
+
+**Home.** Home activation is off (§4, D81). For a Home-policy group S3
+issues, requests and arms no ATA, and the node shows `recovery_deferred`
+with `cause: home_gate_closed`. The manual re-seat still works.
+
+**Wire and capabilities.** The daemon advertises
+`group_terminal_attest_v1` (bit 8) and `group_reseat_mandate_v1` (bit 9). `group_attest_request` and
+`group_attest_response` ride the direct-message carrier on the typed prefix
+`X0XGRC1` with an exact-consumed postcard body. A response answers
+`attested`, `on_chain`, `not_on_chain`, `reseat` or `refused` with one of
+`attester_quarantined`, `attester_behind`, `not_an_admin`, `not_a_member`,
+`banned_or_revoked`, `base_beyond_retention`, `rate_limited`. The ATA is
+signed in domain `x0x.admin-terminal-attest.v1\0`. DM history does not
+record these frames.
+
+**Sidecar.** S3 state lives in `<data_dir>/group-recovery/<stable_group_id>.grecov`
+(header `X0GRCV1\0`, postcard body). `named_groups.json` and
+`home-suite-groups.json` do not change format.
 
 ### Certificate rebind (ADR 0110 §4a)
 

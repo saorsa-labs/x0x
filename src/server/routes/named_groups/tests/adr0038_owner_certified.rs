@@ -930,6 +930,7 @@ async fn receiver_rejects_member_added_without_committed_certificate() -> Result
         certificate_b64: None,
         owner_mandate: None,
         commit: None,
+        reseat_mandate: None,
     };
     let should_exit = apply_named_group_metadata_event_inner(
         &state,
@@ -1007,6 +1008,7 @@ async fn receiver_rejects_member_added_for_revoked_target() -> Result<()> {
         certificate_b64: Some(BASE64.encode(bincode::serialize(&cert)?)),
         owner_mandate: None,
         commit: None,
+        reseat_mandate: None,
     };
     let should_exit = apply_named_group_metadata_event_inner(
         &state,
