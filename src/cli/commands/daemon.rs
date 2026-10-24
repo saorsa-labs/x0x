@@ -823,9 +823,16 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
         }
 
         // Register a per-user logon task (best effort — no admin needed).
-        // `\"` is schtasks' escaping for a literal quote inside /TR.
+        // The /TR value is passed as one argv element, so the quotes around
+        // the script path are plain `"` characters: std::process::Command
+        // performs the Windows argument escaping itself, and a literal `\`
+        // would survive into the stored task and break PowerShell's -File
+        // parsing (review round 1 of #1612). -WindowStyle Hidden keeps the
+        // logon task from leaving a console window open (a brief flash can
+        // still appear; verified behaviour is VM-acceptance work).
         let task_run = format!(
-            "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \\\"{}\\\"",
+            "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \
+             \"{}\"",
             wrapper_path.display()
         );
         let registered = std::process::Command::new("schtasks")
@@ -838,6 +845,7 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
             .unwrap_or(false);
         if registered {
             println!("Autostart enabled (Windows wrapper + logon task)");
+            println!("  Verify: schtasks /Query /TN {WINDOWS_AUTOSTART_TASK} /V /FO LIST");
         } else {
             println!("Autostart wrapper written, but the logon task could not be registered.");
             println!("  Register it manually, or run the wrapper from your own service manager:");
