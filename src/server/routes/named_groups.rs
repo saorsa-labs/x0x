@@ -1314,6 +1314,7 @@ pub(in crate::server) struct PublicGroupBootstrap {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub(in crate::server) enum JoinResultMessage {
     FetchRequest {
         group_id: String,
@@ -1405,6 +1406,7 @@ pub(in crate::server) enum JoinResultMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // the shared Invite prefix IS the taxonomy
+#[non_exhaustive]
 pub(in crate::server) enum JoinRefusalReason {
     InviteSecretUnknown,
     InviteSecretConsumed,
@@ -1648,6 +1650,7 @@ fn live_group_allows_metadata_withdrawal_commit(event: &NamedGroupMetadataEvent)
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub(in crate::server) enum WelcomeBlobMessage {
     FetchRequest {
         group_id: String,
@@ -1683,6 +1686,7 @@ pub(in crate::server) enum WelcomeBlobMessage {
 // to the gossip plumbing cost.
 #[allow(clippy::large_enum_variant)]
 #[derive(PartialEq)]
+#[non_exhaustive]
 pub(in crate::server) enum NamedGroupMetadataEvent {
     MemberAdded {
         group_id: String,

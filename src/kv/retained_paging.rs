@@ -409,6 +409,7 @@ impl RetainedPagePool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub(crate) enum RetainedPageV1 {
     Manifest {
         image_id: [u8; 32],

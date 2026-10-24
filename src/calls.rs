@@ -69,6 +69,7 @@ pub struct MediaKinds {
 /// future frames still decode (additive contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum CallFrame {
     /// Caller → callee: ring.
     #[serde(rename = "x0x_call_invite")]

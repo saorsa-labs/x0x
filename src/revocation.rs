@@ -110,6 +110,7 @@ pub struct AgentMachineBinding {
 
 /// The identity a revocation record targets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum RevokedSubject {
     /// A portable agent identity.
     Agent(AgentId),

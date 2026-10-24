@@ -76,6 +76,7 @@ pub const GENESIS_PREV: [u8; 32] = [0u8; 32];
 /// exactly the derived tombstone set; `Pinned(MachineId)` carries the pin
 /// compared at enforcement gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum Placement {
     /// The agent's key lives on exactly this machine.
     Pinned(MachineId),
@@ -360,6 +361,7 @@ impl MoveAuthorization {
 /// (same call as `named_groups.rs`'s variant allow).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum MoveRecord {
     /// Genesis: owner-signed epoch-0 placement + initial custodian (§8.2).
     PlacementMint {

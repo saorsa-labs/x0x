@@ -76,6 +76,7 @@ pub fn public_topic_for(group_id: &str) -> String {
 /// notice variant used by `public_announce` groups.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupPublicMessageKind {
     /// Normal chat message.
     Chat,

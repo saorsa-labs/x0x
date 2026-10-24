@@ -70,6 +70,7 @@ pub const SIG_ALGORITHM_ML_DSA65: u8 = 0;
 /// What the sealed payload carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum KvMutationKind {
     /// An incremental [`KvStoreDelta`](crate::kv::KvStoreDelta) (a regular
     /// put/remove/update).

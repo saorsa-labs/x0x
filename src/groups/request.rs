@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Current state of a join request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum JoinRequestStatus {
     Pending,
     Approved,

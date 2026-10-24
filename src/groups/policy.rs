@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Controls whether a group is visible to non-members.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupDiscoverability {
     /// Not listed anywhere; only members know the group exists.
     #[default]
@@ -24,6 +25,7 @@ pub enum GroupDiscoverability {
 /// Controls how new members are admitted.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupAdmission {
     /// Admin must issue an invite link.
     #[default]
@@ -67,6 +69,7 @@ impl GroupAdmission {
 /// Controls how group content is cryptographically protected.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupConfidentiality {
     /// MLS end-to-end encryption; only members decrypt.
     #[default]
@@ -78,6 +81,7 @@ pub enum GroupConfidentiality {
 /// Controls who can read group content.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupReadAccess {
     /// Only active members can read.
     #[default]
@@ -89,6 +93,7 @@ pub enum GroupReadAccess {
 /// Controls who can write content to the group.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupWriteAccess {
     /// Only active members can write.
     #[default]

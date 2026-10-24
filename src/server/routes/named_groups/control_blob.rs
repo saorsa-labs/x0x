@@ -24,6 +24,7 @@ const CHUNK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub(in crate::server) enum ControlBlobKind {
     NamedGroupEvent,
     JoinResult,
@@ -57,6 +58,7 @@ impl ControlBlobRef {
 /// a control chunk as their own. Legacy small event/result JSON is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub(in crate::server) enum ControlBlobMessage {
     #[serde(rename = "control_blob_ref")]
     Reference { reference: ControlBlobRef },

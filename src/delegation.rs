@@ -57,6 +57,7 @@ pub const MAX_DELEGATION_DEPTH: u8 = 2;
 /// (ADR-0040 Decision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AuthorityScope {
     /// Execute task work on the referenced task (claim/complete).
     TaskExecute,
@@ -69,6 +70,7 @@ pub enum AuthorityScope {
 /// only under `send_as`. Cross-scope verbs are rejected at validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DelegationVerb {
     /// Claim the referenced task (`task_execute` only).
     Claim,

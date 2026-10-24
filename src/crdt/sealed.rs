@@ -50,6 +50,7 @@ const TASK_RECORD_ID_DOMAIN: &[u8] = b"x0x.tasks.group-list-record.v1";
 
 /// The sealed body, one variant per group secure plane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SealedTaskRecordBody {
     /// Sealed under the group's current GSS shared-secret epoch.
     Gss(EncryptedKvStoreRecordV1),

@@ -66,6 +66,7 @@ pub const MAX_NAME_WORDS: usize = 8;
 /// Kind of directory shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ShardKind {
     Tag,
     Name,
@@ -236,6 +237,7 @@ impl DigestEntry {
 /// Messages carried on `x0x.directory.{kind}.{shard}` topics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "m", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DirectoryMessage {
     /// Signed card — data plane.
     Card {

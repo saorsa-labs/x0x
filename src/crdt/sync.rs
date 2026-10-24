@@ -82,6 +82,7 @@ fn jittered_secs(secs: u64) -> std::time::Duration {
 
 /// Message exchanged on the state-sync side topic.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 enum TaskListSyncMessage {
     /// A peer with no local state for the list asks holders to republish
     /// their full state (as a regular delta) on the main topic.

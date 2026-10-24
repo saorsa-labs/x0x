@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 /// because it is the neutral discriminator *between* them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SecureGroupPlane {
     /// Legacy Group-Shared-Secret plane (`group`). No FS/PCS.
     Gss,

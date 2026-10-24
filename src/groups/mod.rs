@@ -186,6 +186,7 @@ pub struct ForkEvidence {
 /// subsequent card reads (their exact `signed_link` is stored so the
 /// identical token is returned); explicit mints are never republished.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum InviteOrigin {
     /// `POST /groups/:id/invite` — never appears on cards. Also the
     /// serde default for pre-#469 records.
@@ -249,6 +250,7 @@ fn default_invite_max_role() -> GroupRole {
 /// contain at least one Roaming agent) is observable now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MemberPlacement {
     /// Bound to this machine (default).
     Pinned,

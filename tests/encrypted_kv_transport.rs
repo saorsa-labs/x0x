@@ -516,6 +516,7 @@ fn mutation_contains_key(kind: KvMutationKind, payload: &[u8], key: &str) -> Res
         KvMutationKind::RetainedState | KvMutationKind::Control => Ok(payload
             .windows(key.len())
             .any(|window| window == key.as_bytes())),
+        other => Err(format!("unsupported KV mutation kind {other:?}")),
     }
 }
 

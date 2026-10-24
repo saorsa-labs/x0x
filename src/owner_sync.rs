@@ -177,6 +177,7 @@ const SYNC_DIR: &str = "sync";
 /// carrying any other kind tag is undecodable and rejected whole.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SyncKind {
     /// Owner profile (`{ human_name }`) — one record, key `"owner"`.
     OwnerProfile = 0x01,
@@ -230,6 +231,7 @@ pub struct HomeRosterEntry {
 /// [`SyncKind`] with NO catch-all. Compiling a new variant forces every
 /// exhaustive match (including [`SyncValue::kind`]) to handle it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SyncValue {
     /// Owner profile: the owner's human-facing name.
     OwnerProfile {
@@ -731,6 +733,7 @@ pub struct KindVersions {
 /// [`MAX_RECORDS_PER_SESSION`]) so a large state set never produces a frame
 /// over [`MAX_FRAME_BYTES`] (review R2 finding 5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SyncFrame {
     /// Handshake: protocol version, sender machine, sender owner, and a
     /// fresh random nonce for the possession proof.

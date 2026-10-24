@@ -689,6 +689,7 @@ fn state_request_wait(attempt: usize) -> std::time::Duration {
 /// (their receive loop tolerates undecodable payloads), so the addition is
 /// purely additive.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 enum KvSyncMessage {
     /// A peer with no local state for the store asks holders to republish
     /// their full state (as a regular delta) on the main topic.

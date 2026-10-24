@@ -160,6 +160,7 @@ impl MlsMemberInfo {
 
 /// Type of operation in an MLS commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CommitOperation {
     /// Add a new member to the group.
     AddMember(AgentId),

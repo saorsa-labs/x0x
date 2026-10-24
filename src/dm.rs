@@ -362,6 +362,7 @@ pub struct DmEnvelope {
 
 /// Envelope body — either a payload DM or an acknowledgement of a prior one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DmBody {
     /// Encrypted user payload.
     Payload(DmPayload),
@@ -413,6 +414,7 @@ pub struct DmAckBody {
 /// Per-design-doc ACK semantics — "recipient agent accepted" or policy
 /// rejection. Never implies durable storage or user read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DmAckOutcome {
     /// Envelope decrypted, signature verified, trust-policy passed, and
     /// enqueued to the recipient's DM handler / inbox.

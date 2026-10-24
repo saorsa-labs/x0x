@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// legacy evaluation and hashing: Owner > Admin > Moderator > Member > Guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupRole {
     Owner,
     Admin,
@@ -110,6 +111,7 @@ impl GroupRole {
 /// Membership state for a `GroupMember` record.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupMemberState {
     #[default]
     Active,

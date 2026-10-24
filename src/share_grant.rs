@@ -89,6 +89,7 @@ pub const MAX_STORED_GRANTS: usize = 1024;
 /// Who a grant is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Grantee {
     /// Every agent whose `AgentCertificate` chains to this user.
     User(UserId),
@@ -99,6 +100,7 @@ pub enum Grantee {
 /// One capability a grant confers on the covered agents.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ShareCap {
     /// DMs to a shared agent are accepted (`Unknown` → `Accept`).
     Dm,
