@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::IdentityError;
 use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
+use crate::wire_compat::{self, WireDecodeError};
 
 /// Domain-separation prefix for the bytes a revocation signs over.
 const REVOCATION_MSG_PREFIX: &[u8] = b"x0x-revocation-v1";
@@ -689,17 +690,16 @@ pub(crate) fn encode_revocation_batch(
 /// [`crate::wire_compat::WireDecodeError`].
 pub(crate) fn decode_revocation_batch(
     payload: &[u8],
-) -> Result<Vec<RevocationRecord>, crate::wire_compat::WireDecodeError> {
+) -> Result<Vec<RevocationRecord>, WireDecodeError> {
     let Some(framed) = payload.strip_prefix(REVOCATION_BATCH_FRAMED_MAGIC.as_slice()) else {
-        return crate::wire_compat::decode_bincode("RevocationBatch", payload);
+        return wire_compat::decode_bincode("RevocationBatch", payload);
     };
-    let elements: Vec<Vec<u8>> =
-        crate::wire_compat::decode_bincode("RevocationBatchFramed", framed)?;
+    let elements: Vec<Vec<u8>> = wire_compat::decode_bincode("RevocationBatchFramed", framed)?;
     let mut records = Vec::with_capacity(elements.len());
     for element in &elements {
-        match crate::wire_compat::decode_bincode::<RevocationRecord>("RevocationRecord", element) {
+        match wire_compat::decode_bincode::<RevocationRecord>("RevocationRecord", element) {
             Ok(record) => records.push(record),
-            Err(crate::wire_compat::WireDecodeError::UnknownVariant { .. }) => {}
+            Err(WireDecodeError::UnknownVariant { .. }) => {}
             Err(malformed) => return Err(malformed),
         }
     }

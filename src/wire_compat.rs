@@ -41,6 +41,11 @@ pub(crate) enum WireDecodeError {
     },
 }
 
+/// Part of serde's error for a `skip_serializing` variant ("the enum
+/// variant X::Unknown cannot be serialized"). [`reject_unknown`] depends on
+/// this text; a test pins it.
+const SKIPPED_UNKNOWN_MESSAGE: &str = "::Unknown cannot be serialized";
+
 static UNKNOWN_VARIANTS: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
 
 /// Count and log one unknown variant of `wire_type`. Returns the typed
@@ -91,8 +96,10 @@ pub(crate) fn unknown_variant_count(wire_type: &str) -> u64 {
 ///
 /// The `Unknown` variants are `skip_serializing`, so a value that holds one
 /// cannot be encoded. A trial encode into [`Probe`], which accepts every
-/// serde shape and writes nothing, finds it without a per-type walk. Call this before any signature or hash check: a value
-/// with an `Unknown` can never re-encode to the bytes that were signed.
+/// serde shape and writes nothing, finds it without a per-type walk.
+///
+/// Call this before any signature or hash check: a value with an `Unknown`
+/// can never re-encode to the bytes that were signed.
 ///
 /// # Errors
 /// [`WireDecodeError::UnknownVariant`] (counted and logged) if the value
@@ -105,7 +112,7 @@ pub(crate) fn reject_unknown<T: Serialize>(
     match value.serialize(Probe) {
         Ok(()) => Ok(value),
         Err(ProbeError(detail)) => {
-            if detail.contains("::Unknown cannot be serialized") {
+            if detail.contains(SKIPPED_UNKNOWN_MESSAGE) {
                 Err(note_unknown(wire_type, detail))
             } else {
                 Err(WireDecodeError::Malformed { wire_type, detail })
@@ -433,9 +440,6 @@ pub(crate) fn dm_envelope_unknown_variant(bytes: &[u8]) -> Option<WireDecodeErro
     let mut pos = 0usize;
     read_varint(bytes, &mut pos)?;
     pos = pos.checked_add(16 + 32 * 3)?;
-    if pos > bytes.len() {
-        return None;
-    }
     read_varint(bytes, &mut pos)?;
     read_varint(bytes, &mut pos)?;
     let body = read_varint(bytes, &mut pos)?;
@@ -446,9 +450,6 @@ pub(crate) fn dm_envelope_unknown_variant(bytes: &[u8]) -> Option<WireDecodeErro
         return None;
     }
     pos = pos.checked_add(16)?;
-    if pos > bytes.len() {
-        return None;
-    }
     let outcome = read_varint(bytes, &mut pos)?;
     (outcome >= DM_ACK_OUTCOME_VARIANTS)
         .then(|| note_unknown("DmAckOutcome", format!("variant index {outcome}")))
