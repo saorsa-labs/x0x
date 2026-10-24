@@ -2248,51 +2248,59 @@ fn seat_left_the_roster(info: &GroupInfo, target: &[u8; 32]) -> bool {
 /// carried the removal (a restored received frame at the head is kept for
 /// serving only). The worker's stash pass reruns the removal from the
 /// loaded roster instead: idempotent, and a no-op while the fresh process
-/// holds no view yet. Each seat is re-read under the MLS write lock at
-/// the moment of the removal, so a member the roster re-seated Active a
-/// moment earlier stays (rc2 review, race).
+/// holds no view yet.
+///
+/// A group's removal runs under that group's membership lock, and each
+/// seat is re-read at the moment of the removal (lock order membership,
+/// MLS, named groups — the order the apply paths use). The GSS
+/// `MemberAdded` arm adds the view entry before it persists the roster
+/// under the same lock, so this pass can never run inside that window and
+/// drop the seat the re-add is about to seat (rc3 review, race).
 pub(super) async fn converge_legacy_mls_views_with_rosters(state: &AppState) {
     use super::super as ng;
-    // Only the view keys and their listed agents are copied here; the
-    // seat states are read under the write lock below. Lock order is MLS
-    // then named groups, the order the join paths use.
-    let listed: Vec<(String, Vec<AgentId>)> = {
+    // A read-only pass first: only a group whose view lists a seat the
+    // roster holds Removed or Banned takes any write lock.
+    let stale: Vec<String> = {
         let views = state.mls_groups.read().await;
+        let groups = state.named_groups.read().await;
         views
             .iter()
-            .map(|(key, view)| {
-                (
-                    key.clone(),
-                    view.members().keys().copied().collect::<Vec<_>>(),
-                )
+            .filter(|(key, view)| {
+                let Some(info) = groups.get(key.as_str()) else {
+                    return false;
+                };
+                info.secure_plane == x0x::mls::SecureGroupPlane::Gss
+                    && view
+                        .members()
+                        .keys()
+                        .any(|agent| seat_left_the_roster(info, agent.as_bytes()))
             })
+            .map(|(key, _)| key.clone())
             .collect()
     };
-    for (key, agents) in listed {
-        if agents.is_empty() {
-            continue;
-        }
+    for key in stale {
+        let membership_lock = ng::group_membership_lock(state, &key).await;
+        let _membership_guard = membership_lock.lock().await;
         let mut removed_any = false;
-        let mut views = state.mls_groups.write().await;
-        let Some(view) = views.get_mut(&key) else {
-            continue;
-        };
         {
+            let mut views = state.mls_groups.write().await;
+            let Some(view) = views.get_mut(&key) else {
+                continue;
+            };
             let groups = state.named_groups.read().await;
             let Some(info) = groups.get(&key) else {
                 continue;
             };
-            if info.secure_plane != x0x::mls::SecureGroupPlane::Gss {
-                continue;
-            }
+            let agents: Vec<AgentId> = view.members().keys().copied().collect();
             for agent in agents {
-                if seat_left_the_roster(info, agent.as_bytes()) && view.is_member(&agent) {
-                    let _ = view.remove_member(agent).await;
+                if seat_left_the_roster(info, agent.as_bytes())
+                    && view.is_member(&agent)
+                    && view.remove_member(agent).await.is_ok()
+                {
                     removed_any = true;
                 }
             }
         }
-        drop(views);
         if removed_any {
             ng::save_mls_groups(state).await;
             tracing::info!(
@@ -5114,6 +5122,59 @@ mod daemon_tests {
             view.is_member(&fx.replica.agent.agent_id()),
             "an Active member the roster still seats never leaves the view"
         );
+        Ok(())
+    }
+
+    /// #1580 rc3 (review, race): the GSS `MemberAdded` arm adds the view
+    /// entry before it persists the roster, both under the group's
+    /// membership lock. The convergence pass takes the same lock per
+    /// group, so it can never run inside that window and drop the seat
+    /// the re-add is about to seat: while the lock is held the pass
+    /// removes nothing, and it converges once the lock frees.
+    #[tokio::test]
+    async fn the_legacy_mls_convergence_waits_for_the_group_membership_lock() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        let (_frame, _result_head, _parent) = authored_frame_and_parent(&fx).await?;
+        // The author's roster holds the leaver Removed; its view lists it
+        // — the mid-re-add shape the apply path builds under the lock.
+        seeded_legacy_mls_view(&fx, &fx.state).await?;
+        {
+            let views = fx.state.mls_groups.read().await;
+            assert!(views
+                .get(&fx.group_id)
+                .context("the view")?
+                .is_member(&fx.leaver));
+        }
+
+        let holder = ng::group_membership_lock(&fx.state, &fx.group_id).await;
+        let held = holder.lock().await;
+        let pass_state = Arc::clone(&fx.state);
+        let pass =
+            tokio::spawn(async move { converge_legacy_mls_views_with_rosters(&pass_state).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let views = fx.state.mls_groups.read().await;
+            assert!(
+                views
+                    .get(&fx.group_id)
+                    .context("the view")?
+                    .is_member(&fx.leaver),
+                "the pass removes nothing while the group's membership lock is held"
+            );
+        }
+        drop(held);
+        pass.await.expect("the pass runs");
+        {
+            let views = fx.state.mls_groups.read().await;
+            assert!(
+                !views
+                    .get(&fx.group_id)
+                    .context("the view")?
+                    .is_member(&fx.leaver),
+                "the pass converges the view once the lock frees"
+            );
+        }
         Ok(())
     }
 
