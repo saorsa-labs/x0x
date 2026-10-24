@@ -1,0 +1,121 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "Request": {
+          "argv": [
+            "ls",
+            "-l"
+          ],
+          "cwd": "/tmp",
+          "request_id": "@b16:1",
+          "stdin": [
+            1
+          ],
+          "timeout_ms": 5
+        }
+      },
+      "variant": "Request",
+      "wire": {
+        "bincode": "0000000001010101010101010101010101010101020000000000000002000000000000006c7302000000000000002d6c01010000000000000001050000000104000000000000002f746d70"
+      }
+    },
+    {
+      "input": {
+        "LeaseRenew": {
+          "request_id": "@b16:1"
+        }
+      },
+      "variant": "LeaseRenew",
+      "wire": {
+        "bincode": "0100000001010101010101010101010101010101"
+      }
+    },
+    {
+      "input": {
+        "Started": {
+          "pid": 42,
+          "request_id": "@b16:1"
+        }
+      },
+      "variant": "Started",
+      "wire": {
+        "bincode": "02000000010101010101010101010101010101012a000000"
+      }
+    },
+    {
+      "input": {
+        "Stdout": {
+          "data": [
+            2
+          ],
+          "request_id": "@b16:1",
+          "seq": 1
+        }
+      },
+      "variant": "Stdout",
+      "wire": {
+        "bincode": "030000000101010101010101010101010101010101000000010000000000000002"
+      }
+    },
+    {
+      "input": {
+        "Stderr": {
+          "data": [
+            4
+          ],
+          "request_id": "@b16:1",
+          "seq": 3
+        }
+      },
+      "variant": "Stderr",
+      "wire": {
+        "bincode": "040000000101010101010101010101010101010103000000010000000000000004"
+      }
+    },
+    {
+      "input": {
+        "Warning": {
+          "kind": "Cancelled",
+          "message": "m",
+          "request_id": "@b16:1"
+        }
+      },
+      "variant": "Warning",
+      "wire": {
+        "bincode": "05000000010101010101010101010101010101010700000001000000000000006d"
+      }
+    },
+    {
+      "input": {
+        "Exit": {
+          "code": 0,
+          "denial_reason": "ArgvNotAllowed",
+          "duration_ms": 1,
+          "request_id": "@b16:1",
+          "signal": null,
+          "stderr_bytes_total": 3,
+          "stdout_bytes_total": 2,
+          "truncated": false
+        }
+      },
+      "variant": "Exit",
+      "wire": {
+        "bincode": "0600000001010101010101010101010101010101010000000000010000000000000002000000000000000300000000000000000104000000"
+      }
+    },
+    {
+      "input": {
+        "Cancel": {
+          "request_id": "@b16:1"
+        }
+      },
+      "variant": "Cancel",
+      "wire": {
+        "bincode": "0700000001010101010101010101010101010101"
+      }
+    }
+  ],
+  "type": "ExecFrame"
+}

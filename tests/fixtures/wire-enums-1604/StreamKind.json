@@ -1,0 +1,22 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "Stdout",
+      "variant": "Stdout",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"Stdout\""
+      }
+    },
+    {
+      "input": "Stderr",
+      "variant": "Stderr",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"Stderr\""
+      }
+    }
+  ],
+  "type": "StreamKind"
+}

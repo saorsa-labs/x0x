@@ -362,6 +362,10 @@ impl InviteSignedViewV4 {
     /// [`InviteRefusal::Malformed`] when a duplicated-meta equality rule
     /// fails.
     pub fn from_invite(invite: &SignedInvite) -> Result<Self, InviteRefusal> {
+        // #1604 G5: a variant this node does not know can never re-encode
+        // to the signed bytes. Refuse it before any signature work.
+        crate::wire_compat::reject_unknown("SignedInvite", invite)
+            .map_err(|_| InviteRefusal::Malformed)?;
         // E1: exhaustive destructure — no `..`. The three signature
         // outputs and the legacy fat roster are consumed by name into
         // explicit refusals; everything else lands in the view.
@@ -1063,7 +1067,12 @@ impl SignedInvite {
 
         let json_str = String::from_utf8(json_bytes).map_err(|e| format!("invalid UTF-8: {e}"))?;
 
-        serde_json::from_str(&json_str).map_err(|e| format!("invalid invite JSON: {e}"))
+        let invite: Self =
+            serde_json::from_str(&json_str).map_err(|e| format!("invalid invite JSON: {e}"))?;
+        // #1604: an invite with a variant this node does not know (policy,
+        // role, placement or plane) is not acted on.
+        crate::wire_compat::reject_unknown("SignedInvite", invite)
+            .map_err(|e| format!("invalid invite: {e}"))
     }
 }
 

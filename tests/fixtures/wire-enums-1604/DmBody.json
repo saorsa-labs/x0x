@@ -1,0 +1,38 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "Payload": {
+          "body_ciphertext": [
+            4,
+            5,
+            6
+          ],
+          "body_nonce": "@b12:3",
+          "kem_ciphertext": [
+            1,
+            2
+          ]
+        }
+      },
+      "variant": "Payload",
+      "wire": {
+        "postcard": "0002010203030303030303030303030303040506"
+      }
+    },
+    {
+      "input": {
+        "Ack": {
+          "acks_request_id": "@b16:7",
+          "outcome": "Accepted"
+        }
+      },
+      "variant": "Ack",
+      "wire": {
+        "postcard": "010707070707070707070707070707070700"
+      }
+    }
+  ],
+  "type": "DmBody"
+}

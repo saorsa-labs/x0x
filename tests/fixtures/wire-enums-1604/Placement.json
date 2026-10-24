@@ -1,0 +1,22 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "Pinned": "@b32:1"
+      },
+      "variant": "Pinned",
+      "wire": {
+        "bincode": "000000000101010101010101010101010101010101010101010101010101010101010101"
+      }
+    },
+    {
+      "input": "Roaming",
+      "variant": "Roaming",
+      "wire": {
+        "bincode": "01000000"
+      }
+    }
+  ],
+  "type": "Placement"
+}

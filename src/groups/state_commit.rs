@@ -339,6 +339,8 @@ fn role_byte(role: GroupRole) -> u8 {
         GroupRole::Moderator => 2,
         GroupRole::Member => 1,
         GroupRole::Guest => 0,
+        // #1604: never committed; decoders refuse an unknown role first.
+        GroupRole::Unknown => u8::MAX,
     }
 }
 
@@ -348,6 +350,8 @@ fn state_byte(state: GroupMemberState) -> u8 {
         GroupMemberState::Banned => 2,
         GroupMemberState::Removed => 3,
         GroupMemberState::Pending => 4,
+        // #1604: never committed; decoders refuse an unknown state first.
+        GroupMemberState::Unknown => u8::MAX,
     }
 }
 

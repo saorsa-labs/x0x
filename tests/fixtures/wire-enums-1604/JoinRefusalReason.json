@@ -1,0 +1,55 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "invite_secret_unknown",
+      "variant": "InviteSecretUnknown",
+      "wire": {
+        "json": "\"invite_secret_unknown\""
+      }
+    },
+    {
+      "input": "invite_secret_consumed",
+      "variant": "InviteSecretConsumed",
+      "wire": {
+        "json": "\"invite_secret_consumed\""
+      }
+    },
+    {
+      "input": "certificate_evidence_unavailable",
+      "variant": "CertificateEvidenceUnavailable",
+      "wire": {
+        "json": "\"certificate_evidence_unavailable\""
+      }
+    },
+    {
+      "input": "invite_role_exceeds_cap",
+      "variant": "InviteRoleExceedsCap",
+      "wire": {
+        "json": "\"invite_role_exceeds_cap\""
+      }
+    },
+    {
+      "input": "invite_event_before_creation",
+      "variant": "InviteEventBeforeCreation",
+      "wire": {
+        "json": "\"invite_event_before_creation\""
+      }
+    },
+    {
+      "input": "invite_expired",
+      "variant": "InviteExpired",
+      "wire": {
+        "json": "\"invite_expired\""
+      }
+    },
+    {
+      "input": "invite_not_addressed",
+      "variant": "InviteNotAddressed",
+      "wire": {
+        "json": "\"invite_not_addressed\""
+      }
+    }
+  ],
+  "type": "JoinRefusalReason"
+}

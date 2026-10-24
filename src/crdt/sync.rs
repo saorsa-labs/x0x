@@ -82,6 +82,7 @@ fn jittered_secs(secs: u64) -> std::time::Duration {
 
 /// Message exchanged on the state-sync side topic.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 enum TaskListSyncMessage {
     /// A peer with no local state for the list asks holders to republish
     /// their full state (as a regular delta) on the main topic.
@@ -135,6 +136,21 @@ enum TaskListSyncMessage {
         /// verified full-replace adopt path (and useful in logs).
         entry_count: u32,
     },
+}
+
+/// #1604: main-era wire bytes of every `TaskListSyncMessage` variant still
+/// match.
+#[cfg(test)]
+#[test]
+fn task_list_sync_message_wire_matches_main() {
+    crate::wire_golden_tests::check::<TaskListSyncMessage>(
+        "TaskListSyncMessage",
+        &[(
+            crate::wire_golden_tests::Codec::Bincode,
+            crate::wire_golden_tests::Mode::RoundTrip,
+        )],
+        &["StateRequest", "StateServed", "StateServedV2"],
+    );
 }
 
 /// One responder's latest v2 digest declaration.
@@ -963,8 +979,11 @@ async fn open_held_sealed(
             Ok(opened) if writer.is_some_and(|w| w != opened.author) => {
                 Err(TaskSealRejection::SenderMismatch)
             }
-            Ok(opened) => decode_delta::<TaskListDelta>(&opened.payload)
-                .map_err(|_| TaskSealRejection::OpenFailed),
+            Ok(opened) => decode_delta::<TaskListDelta>(&opened.payload).map_err(|e| {
+                // #1604: an unknown variant is counted and logged.
+                let _ = crate::wire_compat::classify_bincode("TaskListDelta", &e);
+                TaskSealRejection::OpenFailed
+            }),
             Err(e) => {
                 if let Some(gate) = gate {
                     if gate.suspended().await {
@@ -1876,6 +1895,9 @@ impl TaskListSync {
                         }
                     }
                     Err(e) => {
+                        // #1604: an unknown variant (for example a newer
+                        // `CheckboxState`) is counted as well as logged.
+                        let e = crate::wire_compat::classify_bincode("TaskListDelta", &e);
                         tracing::warn!("Failed to deserialize delta from topic: {}", e);
                     }
                 }
@@ -1927,7 +1949,11 @@ impl TaskListSync {
                     responder_cancel.cancel();
                     return;
                 };
-                let Ok(sync_msg) = bincode::deserialize::<TaskListSyncMessage>(&msg.payload) else {
+                // #1604: an unknown variant is counted and logged.
+                let Ok(sync_msg) = crate::wire_compat::decode_bincode::<TaskListSyncMessage>(
+                    "TaskListSyncMessage",
+                    &msg.payload,
+                ) else {
                     continue;
                 };
                 match sync_msg {

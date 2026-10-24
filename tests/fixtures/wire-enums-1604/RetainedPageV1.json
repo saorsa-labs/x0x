@@ -1,0 +1,35 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "Manifest": {
+          "image_id": "@b32:1",
+          "page_count": 3,
+          "total_len": 2
+        }
+      },
+      "variant": "Manifest",
+      "wire": {
+        "bincode": "000000000101010101010101010101010101010101010101010101010101010101010101020000000000000003000000"
+      }
+    },
+    {
+      "input": {
+        "Page": {
+          "bytes": [
+            5,
+            6
+          ],
+          "image_id": "@b32:1",
+          "index": 4
+        }
+      },
+      "variant": "Page",
+      "wire": {
+        "bincode": "0100000001010101010101010101010101010101010101010101010101010101010101010400000002000000000000000506"
+      }
+    }
+  ],
+  "type": "RetainedPageV1"
+}

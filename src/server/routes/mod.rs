@@ -35,6 +35,8 @@ mod sync;
 pub(in crate::server) mod tasks;
 mod trust;
 mod upgrade;
+#[cfg(test)]
+mod wire_golden_tests;
 
 pub(super) use acl::{
     acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add, acl_exec_list,

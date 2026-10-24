@@ -1,0 +1,68 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "StateRequest": {
+          "requester": "@b32:1"
+        }
+      },
+      "variant": "StateRequest",
+      "wire": {
+        "bincode": "000000000101010101010101010101010101010101010101010101010101010101010101"
+      }
+    },
+    {
+      "input": {
+        "OwnerAnnounce": {
+          "owner": "@b32:2",
+          "policy": "Signed",
+          "policy_version": 3
+        }
+      },
+      "variant": "OwnerAnnounce",
+      "wire": {
+        "bincode": "010000000202020202020202020202020202020202020202020202020202020202020202000000000300000000000000"
+      }
+    },
+    {
+      "input": {
+        "StateServed": {
+          "checkpoint_seq": 7,
+          "empty": false,
+          "responder": "@b32:4"
+        }
+      },
+      "variant": "StateServed",
+      "wire": {
+        "bincode": "02000000040404040404040404040404040404040404040404040404040404040404040400010700000000000000"
+      }
+    },
+    {
+      "input": {
+        "StateServedV2": {
+          "digest": "@b32:6",
+          "entry_count": 8,
+          "responder": "@b32:5"
+        }
+      },
+      "variant": "StateServedV2",
+      "wire": {
+        "bincode": "030000000505050505050505050505050505050505050505050505050505050505050505060606060606060606060606060606060606060606060606060606060606060608000000"
+      }
+    },
+    {
+      "input": {
+        "StateDigestBeacon": {
+          "digest": "@b32:7",
+          "entry_count": 9
+        }
+      },
+      "variant": "StateDigestBeacon",
+      "wire": {
+        "bincode": "04000000070707070707070707070707070707070707070707070707070707070707070709000000"
+      }
+    }
+  ],
+  "type": "KvSyncMessage"
+}

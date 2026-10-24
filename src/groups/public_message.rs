@@ -76,6 +76,7 @@ pub fn public_topic_for(group_id: &str) -> String {
 /// notice variant used by `public_announce` groups.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupPublicMessageKind {
     /// Normal chat message.
     Chat,
@@ -1062,7 +1063,7 @@ fn validate_public_message_inner(
     let author_role = ctx
         .members_v2
         .get(acting_agent)
-        .filter(|m| m.state == GroupMemberState::Active)
+        .filter(|m| m.is_active())
         .map(|m| m.role);
 
     match ctx.policy.write_access {
@@ -1085,6 +1086,12 @@ fn validate_public_message_inner(
                 });
             }
         },
+        // #1604: an unknown write policy admits no author.
+        GroupWriteAccess::Unknown => {
+            return Err(IngestError::WritePolicyViolation {
+                policy: ctx.policy.write_access,
+            });
+        }
     }
 
     Ok(())

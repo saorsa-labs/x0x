@@ -235,6 +235,9 @@ pub mod gui;
 /// HTTP/WebSocket server: axum router, handlers, and the daemon serving entrypoint.
 pub mod server;
 
+/// Forward compatibility for wire-format enums (#1604).
+pub(crate) mod wire_compat;
+
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,
@@ -6523,7 +6526,7 @@ impl HeartbeatContext {
             // gating as the v1 arm.
             let binding_records = self.revocation_set.read().await.binding_records();
             if !binding_records.is_empty() {
-                if let Ok(bytes) = bincode::serialize(&binding_records) {
+                if let Ok(bytes) = revocation::encode_revocation_batch(&binding_records) {
                     let _ = self
                         .runtime
                         .pubsub()
@@ -6534,7 +6537,7 @@ impl HeartbeatContext {
             // ADR-0070: share-grant revocations ride v3 only, same gating.
             let share_grant_records = self.revocation_set.read().await.share_grant_records();
             if !share_grant_records.is_empty() {
-                if let Ok(bytes) = bincode::serialize(&share_grant_records) {
+                if let Ok(bytes) = revocation::encode_revocation_batch(&share_grant_records) {
                     let _ = self
                         .runtime
                         .pubsub()
@@ -6545,7 +6548,7 @@ impl HeartbeatContext {
 
             let records = self.revocation_set.read().await.all_records();
             if !records.is_empty() {
-                match bincode::serialize(&records) {
+                match revocation::encode_revocation_batch(&records) {
                     Ok(bytes) => {
                         if let Err(e) = self
                             .runtime
@@ -6756,7 +6759,7 @@ pub(crate) async fn ingest_share_grant_revocations(
     if payload.len() > MAX_V3_PAYLOAD_BYTES {
         return false;
     }
-    let Ok(records) = bincode::deserialize::<Vec<revocation::RevocationRecord>>(payload) else {
+    let Ok(records) = revocation::decode_revocation_batch(payload) else {
         return false;
     };
     let mut inserted = false;
@@ -14113,7 +14116,7 @@ impl Agent {
                             continue;
                         }
                         let records: Vec<revocation::RevocationRecord> =
-                            match bincode::deserialize(&msg.payload) {
+                            match revocation::decode_revocation_batch(&msg.payload) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     tracing::debug!("ignoring invalid revocation payload: {e}");
@@ -14234,11 +14237,7 @@ impl Agent {
                         if msg.payload.len() > MAX_V2_PAYLOAD_BYTES {
                             continue;
                         }
-                        let Ok(records) =
-                            bincode::deserialize::<Vec<revocation::RevocationRecord>>(
-                                &msg.payload,
-                            )
-                        else {
+                        let Ok(records) = revocation::decode_revocation_batch(&msg.payload) else {
                             continue;
                         };
                         let journal =
@@ -14310,9 +14309,10 @@ impl Agent {
                         if msg.payload.len() > MAX_BUNDLE_PAYLOAD_BYTES {
                             continue;
                         }
-                        let Ok(record) =
-                            bincode::deserialize::<key_move::ChainedRecord>(&msg.payload)
-                        else {
+                        let Ok(record) = wire_compat::decode_bincode::<key_move::ChainedRecord>(
+                            "ChainedRecord",
+                            &msg.payload,
+                        ) else {
                             continue;
                         };
                         let (agent, bundle_cert) = match &record.record {
@@ -16679,7 +16679,7 @@ impl Agent {
                     _ => (REVOCATION_TOPIC, set.all_records()),
                 }
             };
-            match bincode::serialize(&records) {
+            match revocation::encode_revocation_batch(&records) {
                 Ok(bytes) if !bytes.is_empty() => {
                     let _ = rt
                         .pubsub()
@@ -41988,6 +41988,9 @@ mod issue1239_tests;
 
 #[cfg(test)]
 mod issue1239_send_deadline_tests;
+
+#[cfg(test)]
+mod wire_golden_tests;
 
 #[cfg(test)]
 include!("../tests/upgrade_cache_flush.rs");

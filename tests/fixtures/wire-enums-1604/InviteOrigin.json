@@ -1,0 +1,22 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "Explicit",
+      "variant": "Explicit",
+      "wire": {
+        "json": "\"Explicit\"",
+        "postcard": "00"
+      }
+    },
+    {
+      "input": "Card",
+      "variant": "Card",
+      "wire": {
+        "json": "\"Card\"",
+        "postcard": "01"
+      }
+    }
+  ],
+  "type": "InviteOrigin"
+}

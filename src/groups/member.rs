@@ -11,12 +11,18 @@ use serde::{Deserialize, Serialize};
 /// legacy evaluation and hashing: Owner > Admin > Moderator > Member > Guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupRole {
     Owner,
     Admin,
     Moderator,
     Member,
     Guest,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl GroupRole {
@@ -24,14 +30,16 @@ impl GroupRole {
     pub const OWNER_ASSIGNMENT_ERROR: &'static str =
         "'owner' is a legacy role and cannot be assigned; valid roles: 'admin', 'member'";
 
-    /// Numeric rank: higher means more privileged.
+    /// Numeric rank: higher means more privileged. An unknown role (#1604)
+    /// ranks below `Guest`, so it satisfies no privilege check.
     fn rank(self) -> u8 {
         match self {
-            Self::Owner => 4,
-            Self::Admin => 3,
-            Self::Moderator => 2,
-            Self::Member => 1,
-            Self::Guest => 0,
+            Self::Owner => 5,
+            Self::Admin => 4,
+            Self::Moderator => 3,
+            Self::Member => 2,
+            Self::Guest => 1,
+            Self::Unknown => 0,
         }
     }
 
@@ -48,13 +56,16 @@ impl GroupRole {
             Self::Moderator => 2,
             Self::Member => 3,
             Self::Guest => 4,
+            // #1604: never signed. Decoders refuse an unknown role before
+            // any signature check.
+            Self::Unknown => u8::MAX,
         }
     }
 
     /// Returns true iff this role's privilege is at least `minimum`.
     #[must_use]
     pub fn at_least(self, minimum: Self) -> bool {
-        self.rank() >= minimum.rank()
+        self != Self::Unknown && self.rank() >= minimum.rank()
     }
 
     /// Returns true iff this role has strictly more privilege than `other`.
@@ -110,12 +121,18 @@ impl GroupRole {
 /// Membership state for a `GroupMember` record.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupMemberState {
     #[default]
     Active,
     Pending,
     Removed,
     Banned,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// A single member entry in a group roster.
@@ -258,9 +275,12 @@ impl GroupMember {
         }
     }
 
+    /// Active, with a role this node knows. #1604: a member whose role or
+    /// state is `Unknown` (only possible from a saved or newer record) is
+    /// never active, so it passes no membership or authorization check.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.state == GroupMemberState::Active
+        self.state == GroupMemberState::Active && self.role != GroupRole::Unknown
     }
 
     #[must_use]

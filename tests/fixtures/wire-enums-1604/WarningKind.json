@@ -1,0 +1,62 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "StdoutCapHit",
+      "variant": "StdoutCapHit",
+      "wire": {
+        "bincode": "00000000"
+      }
+    },
+    {
+      "input": "StderrCapHit",
+      "variant": "StderrCapHit",
+      "wire": {
+        "bincode": "01000000"
+      }
+    },
+    {
+      "input": "DurationApproachingCap",
+      "variant": "DurationApproachingCap",
+      "wire": {
+        "bincode": "02000000"
+      }
+    },
+    {
+      "input": "StdoutApproachingCap",
+      "variant": "StdoutApproachingCap",
+      "wire": {
+        "bincode": "03000000"
+      }
+    },
+    {
+      "input": "StderrApproachingCap",
+      "variant": "StderrApproachingCap",
+      "wire": {
+        "bincode": "04000000"
+      }
+    },
+    {
+      "input": "LeaseExpired",
+      "variant": "LeaseExpired",
+      "wire": {
+        "bincode": "05000000"
+      }
+    },
+    {
+      "input": "PeerDisconnected",
+      "variant": "PeerDisconnected",
+      "wire": {
+        "bincode": "06000000"
+      }
+    },
+    {
+      "input": "Cancelled",
+      "variant": "Cancelled",
+      "wire": {
+        "bincode": "07000000"
+      }
+    }
+  ],
+  "type": "WarningKind"
+}

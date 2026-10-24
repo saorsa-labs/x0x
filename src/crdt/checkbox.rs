@@ -46,6 +46,7 @@ pub enum CheckboxError {
 /// can both succeed. The state machine handles this through timestamp-based
 /// conflict resolution. The claim with the earliest timestamp wins.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CheckboxState {
     /// Task is not claimed by anyone.
     Empty,

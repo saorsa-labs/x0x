@@ -1,0 +1,77 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "reference": {
+          "byte_len": 1,
+          "digest": "d",
+          "group_id": "g",
+          "kind": "named_group_event",
+          "recipient": "r",
+          "source": "s"
+        },
+        "type": "control_blob_ref"
+      },
+      "variant": "Reference",
+      "wire": {
+        "json": "{\"type\":\"control_blob_ref\",\"reference\":{\"kind\":\"named_group_event\",\"group_id\":\"g\",\"source\":\"s\",\"recipient\":\"r\",\"digest\":\"d\",\"byte_len\":1}}"
+      }
+    },
+    {
+      "input": {
+        "reference": {
+          "byte_len": 1,
+          "digest": "d",
+          "group_id": "g",
+          "kind": "join_result",
+          "recipient": "r",
+          "source": "s"
+        },
+        "sequence": 1,
+        "type": "control_blob_fetch"
+      },
+      "variant": "Fetch",
+      "wire": {
+        "json": "{\"type\":\"control_blob_fetch\",\"reference\":{\"kind\":\"join_result\",\"group_id\":\"g\",\"source\":\"s\",\"recipient\":\"r\",\"digest\":\"d\",\"byte_len\":1},\"sequence\":1}"
+      }
+    },
+    {
+      "input": {
+        "data_b64": "ZA==",
+        "reference": {
+          "byte_len": 1,
+          "digest": "d",
+          "group_id": "g",
+          "kind": "named_group_event",
+          "recipient": "r",
+          "source": "s"
+        },
+        "sequence": 2,
+        "type": "control_blob_chunk"
+      },
+      "variant": "Chunk",
+      "wire": {
+        "json": "{\"type\":\"control_blob_chunk\",\"reference\":{\"kind\":\"named_group_event\",\"group_id\":\"g\",\"source\":\"s\",\"recipient\":\"r\",\"digest\":\"d\",\"byte_len\":1},\"sequence\":2,\"data_b64\":\"ZA==\"}"
+      }
+    },
+    {
+      "input": {
+        "reference": {
+          "byte_len": 1,
+          "digest": "d",
+          "group_id": "g",
+          "kind": "join_result",
+          "recipient": "r",
+          "source": "s"
+        },
+        "type": "control_blob_release"
+      },
+      "variant": "Release",
+      "wire": {
+        "json": "{\"type\":\"control_blob_release\",\"reference\":{\"kind\":\"join_result\",\"group_id\":\"g\",\"source\":\"s\",\"recipient\":\"r\",\"digest\":\"d\",\"byte_len\":1}}"
+      }
+    }
+  ],
+  "type": "ControlBlobMessage"
+}
