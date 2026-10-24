@@ -111,3 +111,80 @@ async fn uncontended_send_keeps_its_existing_typed_failure(
     agent.shutdown().await;
     Ok(())
 }
+
+/// #1239 review rc2: one failed send that reaches relay fallback and then
+/// hits the absolute deadline is one failure. The body records both counters
+/// before it reads `relay_candidates`. The deadline handler must not record
+/// them again.
+#[tokio::test]
+async fn relay_fallback_deadline_records_each_failure_once(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut agent = agent_in(dir.path()).await?;
+    assert!(agent.network.is_none());
+    let recipient = identity::AgentId([0x3a; 32]);
+    seed_discovered_recipient(&agent, recipient).await;
+    assert!(
+        agent.capability_store().insert(
+            recipient,
+            identity::MachineId([0x3b; 32]),
+            dm::DmCapabilities {
+                kem_public_key: vec![0x11; 32],
+                ..dm::DmCapabilities::pending()
+            },
+            dm::now_unix_ms(),
+        ),
+        "the recipient advert must be cached"
+    );
+    // Threshold 1: the body's single direct-failure sample is what opens
+    // the fallback. No network node — the candidate lock is the wait.
+    agent.peer_relay = std::sync::Arc::new(peer_relay::PeerRelay::with_policy(
+        peer_relay::RelayPolicy::enabled().with_failure_trigger(1, Duration::from_secs(60)),
+    ));
+    let config = dm::DmSendConfig {
+        timeout_per_attempt: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let candidates = std::sync::Arc::clone(&agent.relay_candidates);
+    let held = candidates.write().await;
+    tokio::time::pause();
+
+    let send = agent.send_direct_with_config(&recipient, vec![1], config);
+    tokio::pin!(send);
+    assert!(
+        futures::poll!(&mut send).is_pending(),
+        "the relay candidate read must keep the send open until the deadline"
+    );
+    let diagnostics = agent.direct_messaging.diagnostics_snapshot();
+    assert_eq!(
+        diagnostics.stats.outgoing_send_failed, 1,
+        "the body must record the outgoing failure before the relay wait"
+    );
+    assert_eq!(
+        diagnostics.per_peer[&hex::encode(recipient.0)].send_failed,
+        1
+    );
+    assert_eq!(agent.peer_relay().direct_failure_samples(&recipient), 1);
+
+    tokio::time::advance(TWO_SECOND_ATTEMPT_BUDGET - Duration::from_millis(1)).await;
+    assert!(
+        futures::poll!(&mut send).is_pending(),
+        "the absolute deadline fired before the send's budget elapsed"
+    );
+    tokio::time::advance(Duration::from_millis(2)).await;
+    let result = futures::poll!(&mut send);
+    assert!(
+        matches!(result, Poll::Ready(Err(dm::DmError::Timeout { .. }))),
+        "the relay wait must end at the absolute deadline: {result:?}"
+    );
+    let diagnostics = agent.direct_messaging.diagnostics_snapshot();
+    assert_eq!(diagnostics.stats.outgoing_send_failed, 1);
+    assert_eq!(
+        diagnostics.per_peer[&hex::encode(recipient.0)].send_failed,
+        1
+    );
+    assert_eq!(agent.peer_relay().direct_failure_samples(&recipient), 1);
+    drop(held);
+    agent.shutdown().await;
+    Ok(())
+}

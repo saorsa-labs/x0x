@@ -10084,21 +10084,28 @@ impl Agent {
         let strict = config.require_durable_app_ack;
         let deadline = tokio::time::Instant::now()
             + dm_evidence::ordinary_send_budget(&config, cold_wait.map(|ColdWait(wait)| wait));
+        // The body records both failure counters before it awaits relay
+        // fallback. This flag is that record. A deadline during the fallback
+        // must not record the same send again.
+        let failure_accounted = std::sync::atomic::AtomicBool::new(false);
         match tokio::time::timeout_at(
             deadline,
-            self.send_direct_all_stages(to, payload, config, cold_wait),
+            self.send_direct_all_stages(to, payload, config, cold_wait, &failure_accounted),
         )
         .await
         {
             Ok(result) => result,
             Err(_expired) => {
-                // Keep the body's failure accounting: a deadline-expired
-                // send is also a relay-engine direct-failure sample, and a
-                // strict send keeps a stage row (the named stages are
-                // unknown past the wrap, so the whole budget folds into
-                // publish, as the strict-gate fold does).
-                self.direct_messaging.record_outgoing_failed(*to);
-                self.peer_relay.record_direct_failure(to);
+                // A deadline before the body's own accounting is still one
+                // failed send. Once the body has recorded that pair, this
+                // handler must not record it again. A strict send keeps a
+                // stage row (the named stages are unknown past the wrap, so
+                // the whole budget folds into publish, as the strict-gate
+                // fold does). Strict sends do not attempt relay fallback.
+                if !failure_accounted.load(std::sync::atomic::Ordering::Acquire) {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    self.peer_relay.record_direct_failure(to);
+                }
                 if strict {
                     let elapsed = dm::millis_since(started);
                     self.direct_messaging
@@ -10122,6 +10129,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        failure_accounted: &std::sync::atomic::AtomicBool,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         let mut evidence = dm_evidence::SendEvidence::new(
             self,
@@ -10555,6 +10563,9 @@ impl Agent {
                 // returns `false` and the fallback below is skipped. With
                 // an opted-in policy this drives the relay decision.
                 self.peer_relay.record_direct_failure(to);
+                // #1239: one sample for this send. The deadline handler
+                // records the same pair only when this store has not run.
+                failure_accounted.store(true, std::sync::atomic::Ordering::Release);
                 // X0X-0070b: relay fallback. We only attempt it when the
                 // engine says the peer has now crossed `needs_relay`, and
                 // only when we have both a saved payload and a recipient
