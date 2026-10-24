@@ -556,26 +556,38 @@ cancellation or a port release is never proof of flush (ADR 0094 §4).
 The flush budget is fixed at 30 seconds (engineer ruling, 23 Oct 2026). It
 is an internal constant, not configuration; only tests override it. A
 follow-up issue proposes making it operator-configurable — the public
-config surface needs David's go.
+config surface needs David's go. When the budget expires, the daemon's
+`EX_TEMPFAIL` exit can cut the flush worker mid-write (inside a store's
+`sync_tree` or the log flush), so every durable store the flush walks must
+already be crash-safe: a torn or missing final write must recover to a
+consistent state at the next start.
 
-Failure behaviour (engineer ruling, 23 Oct 2026): a flush that started and
-then failed or overran its budget must not leave the daemon running with no
-API and no network. "Started" means the daemon actually stopped behind the
-hook — the recovery begins at the moment the hook commits the daemon to
-stopping, nothing earlier. The daemon persists a per-release failed-upgrade
-hold (`upgrade-flush-hold.json`, below), restores every binary the
-transaction swapped, logs the cause, and exits `EX_TEMPFAIL` (75). Every
-backup is verified before the first rename, and a missing backup restores
-nothing; a rename that fails after an earlier rename succeeded can still
-leave the daemon and the `x0x` CLI on mixed versions — that state is logged
-for manual recovery, not silently accepted. The service manager then
-restarts the daemon on the old version. An error after the flush completed
-(for example a receipt that fails authorization) also ends in
-`EX_TEMPFAIL`; nothing is restored because the new bytes are already
-durable. A refusal that happens before the daemon stops (a missing flush
-owner, an unresolved predecessor, a mismatched arm request, a failed intent
-write) never stops the daemon, restores nothing and returns an ordinary
-error instead.
+Failure behaviour (engineer ruling, 23 Oct 2026, refusal handling revised
+24 Oct 2026): a flush that started and then failed or overran its budget
+must not leave the daemon running with no API and no network. "Started"
+means the daemon actually stopped behind the hook — the recovery begins at
+the moment the hook commits the daemon to stopping, nothing earlier. The
+daemon persists a per-release failed-upgrade hold
+(`upgrade-flush-hold.json`, below), restores every binary the transaction
+swapped, logs the cause, and exits `EX_TEMPFAIL` (75). Every backup is
+verified before the first rename, and a missing backup restores nothing; a
+rename that fails after an earlier rename succeeded can still leave the
+daemon and the `x0x` CLI on mixed versions — that state is logged for
+manual recovery, not silently accepted. The service manager then restarts
+the daemon on the old version. An error after the flush completed (for
+example a receipt that fails authorization) also ends in `EX_TEMPFAIL`;
+nothing is restored because the new bytes are already durable.
+
+A refusal that happens before the daemon stops (a missing flush owner, an
+unresolved predecessor, a failed intent write, or the pre-hook deadline
+check) is not a failed start (engineer ruling, 24 Oct 2026). The daemon
+never stopped, so it keeps serving — but first it restores every binary
+this transaction swapped, with the same verified-backup rule as the started
+case, releases the flush admission so a later supervised apply can run,
+clears the receipt-less intent record of the refused attempt, and logs the
+refusal reason. No failed-release hold is written: the release may be
+retried on the next normal update cycle. An ordinary shutdown after a
+refusal exits with its normal code, never `EX_TEMPFAIL`.
 
 The flush walk refuses any symlink under the data root or the identity
 root (`~/.x0x` by default): a symlink is not a verified store root, and its

@@ -232,7 +232,8 @@ macro_rules! arm_flush_regression_tests {
                 std::fs::write(&cli, b"swapped candidate cli").unwrap();
                 // The hook fails before the daemon stops behind it: an
                 // ordinary refusal keeps the daemon serving (engineer ruling,
-                // 23 Oct 2026) — nothing restored, nothing held.
+                // 23 Oct 2026). The daemon's backup is absent, so the
+                // both-or-neither rule restores neither artifact.
                 let owner = shutdown_flush::register(root.clone(), Arc::new(|_, _| {
                     Err(io::Error::other("injected refusal before the stop"))
                 }))
@@ -243,6 +244,41 @@ macro_rules! arm_flush_regression_tests {
                 assert_eq!(std::fs::read(&cli).unwrap(), b"swapped candidate cli");
                 assert!(!root.join(shutdown_flush::HOLD_RECORD).exists());
                 assert!(!root.join(shutdown_flush::ROLLBACK_RECORD).exists());
+            }
+
+            #[test]
+            fn arm_flush_refusal_before_the_daemon_stops_restores_the_swapped_artifacts() {
+                // Engineer ruling, 24 Oct 2026: a refusal is not a failed
+                // start. The daemon keeps serving, so the artifacts this
+                // frozen transaction swapped go back from their verified
+                // backups. The journal here swapped only the CLI, so the
+                // daemon (the running test executable) stays untouched.
+                let (dir, mut journal, mut request, state) = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                journal["daemon_progress"]["swapped"] = json!(false);
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
+                request["plan"] = journal["plan"].clone();
+                let cli: PathBuf =
+                    serde_json::from_value(journal["plan"]["cli"]["target_path"].clone()).unwrap();
+                let cli_backup: PathBuf =
+                    serde_json::from_value(journal["plan"]["cli"]["backup_path"].clone()).unwrap();
+                std::fs::write(&cli, b"swapped candidate cli").unwrap();
+                std::fs::write(&cli_backup, b"previous cli").unwrap();
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|_, _| {
+                    Err(io::Error::other("injected refusal before the stop"))
+                }))
+                .unwrap();
+                let failure = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                owner.join_workers();
+                assert!(matches!(failure, ArmFailure::Refused(_)));
+                assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                assert!(!cli_backup.exists(), "the fresh backup is consumed by the restore");
+                assert!(!root.join(shutdown_flush::HOLD_RECORD).exists());
+                assert!(!root.join(shutdown_flush::ROLLBACK_RECORD).exists());
+                // Admission re-opens for a later supervised apply: the
+                // refused attempt cleared its own intent record.
+                assert!(!root.join(shutdown_flush::RECORD).exists());
+                shutdown_flush::ensure_ready(&root).unwrap();
             }
 
             // Socket execution belongs to the isolated Linux CI runner.

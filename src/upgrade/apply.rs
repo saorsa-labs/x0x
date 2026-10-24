@@ -151,16 +151,17 @@ fn arm_http_deferred_restart_owner(
                 .with_swapped_artifacts(swapped)
                 .with_restart_on_success(false);
             if let Err(e) = owner.trigger_restart(&restart_plan, &version) {
-                // Refusal before any flush started: the daemon keeps serving
-                // and the installed bytes stay in place.
+                // Refusal before any flush started (engineer ruling, 24 Oct
+                // 2026): the swapped binaries are restored inside the refusal
+                // and the daemon keeps serving; its log carries the restore
+                // outcome.
                 error!(
                     error = %e,
-                    installed_bytes = true,
                     restart = "not_started",
                     readiness_observed = false,
-                    recovery = "none",
                     "Deferred HTTP restart did not obtain authorization: {e}; \
-                     refused before any flush started, the daemon keeps serving"
+                     refused before any flush started, the swapped binaries \
+                     are restored and the daemon keeps serving"
                 );
             }
         }
@@ -1532,18 +1533,18 @@ impl AutoApplyUpgrader {
                     .with_restart_on_success(false);
                 if let Err(e) = owner.trigger_restart(&restart_plan_for_cont, &version_for_cont) {
                     // Only a refusal can return here: it happened before any
-                    // flush started, so the daemon keeps serving, the
-                    // installed bytes stay in place and nothing is restored.
-                    // A started flush that failed restores and exits
-                    // EX_TEMPFAIL inside trigger_restart instead.
+                    // flush started, so the swapped binaries are restored
+                    // inside the refusal and the daemon keeps serving; the
+                    // refusal log carries the restore outcome. A started
+                    // flush that failed restores and exits EX_TEMPFAIL inside
+                    // trigger_restart instead.
                     error!(
                         error = %e,
-                        installed_bytes = true,
                         restart = "not_started",
                         readiness_observed = false,
-                        recovery = "none",
                         "Restart did not obtain a flush receipt: {e}; refused \
-                         before any flush started, the daemon keeps serving"
+                         before any flush started, the swapped binaries are \
+                         restored and the daemon keeps serving"
                     );
                 }
             }))
@@ -1738,8 +1739,52 @@ impl AutoApplyUpgrader {
                         )));
                     }
                     Err(failure) => {
+                        // Engineer ruling, 24 Oct 2026: a flush refused
+                        // before the daemon stops is not a failed start. The
+                        // daemon keeps serving, so it must not keep serving
+                        // from bytes it can no longer restart into: restore
+                        // every binary this transaction swapped (fresh
+                        // backups only, never a stale `.backup`), log the
+                        // refusal reason and return. No failed-release hold:
+                        // the release may be retried on the next normal
+                        // update cycle.
+                        let restored_bytes = match self.swapped_artifacts.as_deref() {
+                            Some(swapped) => match super::restore_swapped_binaries(swapped) {
+                                Ok(()) => true,
+                                Err(restore_error) => {
+                                    error!(
+                                        error = %restore_error,
+                                        restore_set = ?swapped
+                                            .iter()
+                                            .map(|(target, _)| target.display().to_string())
+                                            .collect::<Vec<_>>(),
+                                        "cannot restore the swapped binaries; the daemon \
+                                         keeps serving but the install needs manual recovery"
+                                    );
+                                    false
+                                }
+                            },
+                            None => {
+                                error!(
+                                    "no swapped-artifact manifest for this transaction; \
+                                     no backup is restored because none is known to be \
+                                     fresh; the daemon keeps serving"
+                                );
+                                false
+                            }
+                        };
+                        error!(
+                            error = %failure,
+                            installed_bytes = true,
+                            restored_bytes,
+                            restart = "not_started",
+                            recovery = "kept_serving",
+                            "supervised shutdown flush refused before the daemon stopped; \
+                             the swapped binaries are restored and the daemon keeps serving \
+                             on the previous version"
+                        );
                         return Err(UpgradeError::Other(format!(
-                            "supervised shutdown flush failed: {failure}"
+                            "supervised shutdown flush refused: {failure}"
                         )));
                     }
                 };

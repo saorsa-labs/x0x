@@ -401,7 +401,38 @@ fn arm(
             );
             Err(ArmFailure::FlushFailed(failure))
         }
-        Err(failure) => Err(ArmFailure::Refused(failure.error)),
+        Err(failure) => {
+            // Engineer ruling, 24 Oct 2026: a flush refused before the daemon
+            // stops is not a failed start. Restore the binaries this frozen
+            // transaction swapped (the same verified-backup rule as the
+            // started case), keep serving, hold nothing; the refusal reason
+            // goes back to the launcher in the error reply.
+            let restored_bytes = match crate::upgrade::restore_swapped_binaries(&restore_set) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        restore_set = ?restore_set
+                            .iter()
+                            .map(|(target, _)| target.display().to_string())
+                            .collect::<Vec<_>>(),
+                        "cannot restore the swapped binaries; the daemon keeps serving \
+                         but the install needs manual recovery"
+                    );
+                    false
+                }
+            };
+            tracing::error!(
+                error = %failure,
+                installed_bytes = true,
+                restored_bytes,
+                restart = "not_started",
+                recovery = "kept_serving",
+                "acknowledged shutdown flush refused before the daemon stopped; \
+                 the swapped binaries are restored and the daemon keeps serving"
+            );
+            Err(ArmFailure::Refused(failure.error))
+        }
     }
 }
 
@@ -537,9 +568,18 @@ mod arm_flush_regressions_unused_reservation {
         (dir, root)
     }
 
+    /// What the fixture hook does: succeed, fail after committing the stop
+    /// (a started failure), or fail before it (an ordinary refusal).
+    #[derive(Clone, Copy, PartialEq)]
+    enum HookOutcome {
+        Ok,
+        StartedFailure,
+        PreStopRefusal,
+    }
+
     fn owner(
         root: &Path,
-        fail: bool,
+        outcome: HookOutcome,
     ) -> (
         FlushOwner,
         mpsc::Receiver<io::Result<()>>,
@@ -552,11 +592,15 @@ mod arm_flush_regressions_unused_reservation {
             root.to_path_buf(),
             Arc::new(move |_, stopped| {
                 observed.store(true, Ordering::SeqCst);
-                if fail {
-                    stopped.store(true, Ordering::SeqCst);
-                    Err(io::Error::other("injected started flush failure"))
-                } else {
-                    Ok(())
+                match outcome {
+                    HookOutcome::Ok => Ok(()),
+                    HookOutcome::StartedFailure => {
+                        stopped.store(true, Ordering::SeqCst);
+                        Err(io::Error::other("injected started flush failure"))
+                    }
+                    HookOutcome::PreStopRefusal => {
+                        Err(io::Error::other("injected pre-stop flush refusal"))
+                    }
                 }
             }),
         )
@@ -593,7 +637,7 @@ mod arm_flush_regressions_unused_reservation {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_wakes_when_unused_reservation_is_released() {
         let (_dir, root) = fixture();
-        let (owner, receive, _called, _exit_code) = owner(&root, false);
+        let (owner, receive, _called, _exit_code) = owner(&root, HookOutcome::Ok);
         let reservation = shutdown_flush::reserve(&root).unwrap();
         reservation.activate().unwrap();
         let cancel = CancellationToken::new();
@@ -622,7 +666,7 @@ mod arm_flush_regressions_unused_reservation {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_keeps_started_acknowledgment_custody_until_cancelled() {
         let (_dir, root) = fixture();
-        let (owner, receive, called, _exit_code) = owner(&root, true);
+        let (owner, receive, called, _exit_code) = owner(&root, HookOutcome::StartedFailure);
         let reservation = shutdown_flush::reserve(&root).unwrap();
         reservation.activate().unwrap();
         let binding =
@@ -686,7 +730,7 @@ mod arm_flush_regressions_unused_reservation {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_exits_tempfail_after_a_failed_started_flush() {
         let (_dir, root) = fixture();
-        let (owner, receive, _called, exit_code) = owner(&root, true);
+        let (owner, receive, _called, exit_code) = owner(&root, HookOutcome::StartedFailure);
         let reservation = shutdown_flush::reserve(&root).unwrap();
         reservation.activate().unwrap();
         let binding =
@@ -714,6 +758,48 @@ mod arm_flush_regressions_unused_reservation {
         assert_eq!(
             exit_code.load(Ordering::SeqCst),
             crate::upgrade::restart::flush_failure_exit_code()
+        );
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_finish_completes_promptly_after_a_refused_flush() {
+        // Engineer ruling, 24 Oct 2026: a flush refused before the daemon
+        // stopped is not a failed start. Once its unused reservation is
+        // released, an ordinary shutdown that yielded to the flush must
+        // resume on its own — without cancellation and without the
+        // EX_TEMPFAIL exit, which belongs only to a started failure.
+        let (_dir, root) = fixture();
+        let (owner, _receive, _called, exit_code) = owner(&root, HookOutcome::PreStopRefusal);
+        let reservation = shutdown_flush::reserve(&root).unwrap();
+        reservation.activate().unwrap();
+        let binding =
+            shutdown_flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+        let refused = tokio::task::spawn_blocking(move || {
+            let outcome =
+                shutdown_flush::acknowledge_reserved(&root, binding, || Ok(()), &reservation);
+            // The refused reservation's last owner releases admission here.
+            drop(reservation);
+            outcome
+        })
+        .await
+        .unwrap();
+        assert!(refused.is_err());
+        assert!(!refused.unwrap_err().started);
+        owner._registration.join_workers();
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let finish = tokio::spawn(async move {
+            owner.finish(&Ok(()), true, &worker_cancel).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), finish)
+            .await
+            .expect("finish must resume without cancellation after a refusal")
+            .unwrap();
+        assert_eq!(
+            exit_code.load(Ordering::SeqCst),
+            -1,
+            "a refusal must not exit EX_TEMPFAIL"
         );
         assert!(!cancel.is_cancelled());
     }
