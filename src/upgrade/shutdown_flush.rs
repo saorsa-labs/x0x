@@ -27,7 +27,7 @@ pub(crate) const HOLD_RECORD: &str = "upgrade-flush-hold.json";
 /// only refuses a zero budget and this ceiling.
 #[cfg(test)]
 pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
-/// The hook stores `true` in the marker as soon as the daemon is committed
+/// The hook calls `Deadline::commit_stop` as soon as the daemon is committed
 /// to stopping behind it. Only that point and beyond count as a started
 /// flush for recovery: earlier failures leave the daemon serving and are
 /// ordinary refusals (engineer ruling, 23 Oct 2026).
@@ -84,10 +84,33 @@ pub(crate) struct Deadline {
     pub(crate) instant: Instant,
     boot_id: String,
     deadline_ms: u64,
+    cancelled: Arc<Mutex<bool>>,
 }
 impl Deadline {
     pub(crate) fn check(&self) -> io::Result<()> {
         check_clock(&self.boot_id, self.deadline_ms, self.instant)
+    }
+
+    /// Serialize the stop commit with timeout cancellation. Once the waiter
+    /// classifies a refusal, even a hook paused after its deadline check cannot
+    /// stop the daemon. The same lock protects the initial intent publication.
+    pub(crate) fn commit_stop(&self, stopped: &AtomicBool) -> io::Result<()> {
+        self.before_stop(|| {
+            stopped.store(true, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    fn before_stop(&self, operation: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let cancelled = self
+            .cancelled
+            .lock()
+            .map_err(|_| io::Error::other("flush cancellation poisoned"))?;
+        if *cancelled {
+            return Err(io::Error::other("shutdown flush cancelled before stop"));
+        }
+        self.check()?;
+        operation()
     }
 
     #[cfg(test)]
@@ -97,6 +120,7 @@ impl Deadline {
             instant: Instant::now() + limit,
             boot_id,
             deadline_ms: now.saturating_add(limit.as_millis() as u64),
+            cancelled: Arc::new(Mutex::new(false)),
         })
     }
 }
@@ -717,29 +741,31 @@ fn acknowledge_inner(
     let rollback_deadline = record.deadline_ms;
     let (send, receive) = mpsc::channel();
     let hook = Arc::clone(&entry.hook);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let worker_stopped = Arc::clone(&stopped);
+    let cancelled = Arc::new(Mutex::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
     let spawn = std::thread::Builder::new()
         .name("x0x-upgrade-flush".into())
         .spawn(move || {
             let mut record = record;
-            // True only from the moment the daemon is committed to stopping
-            // behind the hook. The hook marks it via the `&AtomicBool`; a
-            // returned hook proves it retroactively.
-            let stopped = AtomicBool::new(false);
+            let stopped = worker_stopped;
+            let hook_deadline = Deadline {
+                instant: deadline,
+                boot_id: record.boot_id.clone(),
+                deadline_ms: record.deadline_ms,
+                cancelled: worker_cancelled,
+            };
             let outcome = (|| {
                 check_deadline(&record, deadline)?;
                 let path = root.join(RECORD);
-                check_previous(&root)?;
-                super::journal::write_auxiliary_record(&path, &record, validate)?;
+                hook_deadline.before_stop(|| {
+                    check_previous(&root)?;
+                    super::journal::write_auxiliary_record(&path, &record, validate)
+                })?;
                 prepare()?;
                 check_deadline(&record, deadline)?;
-                hook(
-                    Deadline {
-                        instant: deadline,
-                        boot_id: record.boot_id.clone(),
-                        deadline_ms: record.deadline_ms,
-                    },
-                    &stopped,
-                )?;
+                hook(hook_deadline, &stopped)?;
                 stopped.store(true, Ordering::Release);
                 check_deadline(&record, deadline)?;
                 let receipt_id = uuid::Uuid::new_v4().to_string();
@@ -763,11 +789,16 @@ fn acknowledge_inner(
             match wait_receipt(&receive, &rollback_boot, rollback_deadline, deadline) {
                 Ok((Ok(receipt), _)) => Ok(receipt),
                 Ok((Err(error), started)) => Err(FlushFailure::owned(error, started)),
-                // A wait-level failure means the fixed deadline passed or the
-                // worker died mid-flush. The daemon may already be stopped
-                // behind the hook, so recovery must assume it is (engineer
-                // ruling, 23 Oct 2026): never a parked, stop-less daemon.
-                Err(error) => Err(FlushFailure::Started(error)),
+                Err(error) => {
+                    // Cancel under the same lock used to publish intent and
+                    // commit the stop. Cleanup cannot run ahead of a late
+                    // intent write, and a late hook cannot stop after refusal.
+                    let mut cancelled = cancelled
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *cancelled = true;
+                    Err(FlushFailure::owned(error, stopped.load(Ordering::Acquire)))
+                }
             }
         }
         // The worker never ran, so the hook never stopped the daemon.
@@ -874,6 +905,74 @@ mod reservation_release_regressions {
             .prefix("reservation-")
             .tempdir_in(root)
             .unwrap()
+    }
+
+    #[test]
+    fn reservation_timeout_cancels_a_hook_paused_before_stop() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let did_stop = Arc::new(AtomicBool::new(false));
+        let observed = did_stop.clone();
+        let owner = register_with_limit(
+            root.clone(),
+            Arc::new(move |deadline, stopped| {
+                deadline.check()?;
+                entered.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                // The original check succeeded, but the waiter has since refused.
+                // This is the production stop commit, not a test-only marker.
+                deadline.commit_stop(stopped)?;
+                observed.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        let worker_root = root.clone();
+        let caller = std::thread::spawn(move || {
+            acknowledge(
+                &worker_root,
+                Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap(),
+                || Ok(()),
+            )
+        });
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        let result = caller.join().unwrap();
+        release.send(()).unwrap();
+        owner.join_workers();
+        assert!(matches!(result, Err(FlushFailure::Refused(_))));
+        assert!(
+            !did_stop.load(Ordering::Acquire),
+            "a timed-out refusal must not stop later"
+        );
+        assert!(!root.join(RECORD).exists());
+        assert!(!root.join(ROLLBACK_RECORD).exists());
+        ensure_ready(&root).unwrap();
+        reserve(&root).unwrap().activate().unwrap();
+    }
+
+    #[test]
+    fn reservation_cancelled_worker_cannot_publish_late_intent() {
+        let dir = fixture();
+        let deadline = Deadline::for_test(Duration::from_secs(5)).unwrap();
+        // The waiter cancelled while the worker was descheduled before its
+        // initial write. Use a future clock deadline to isolate cancellation.
+        *deadline.cancelled.lock().unwrap() = true;
+        let path = dir.path().join(RECORD);
+        assert!(deadline
+            .before_stop(|| std::fs::write(&path, b"late intent"))
+            .is_err());
+        assert!(!path.exists());
+        let stopped = AtomicBool::new(false);
+        assert!(deadline.commit_stop(&stopped).is_err());
+        assert!(!stopped.load(Ordering::Acquire));
     }
 
     #[test]

@@ -28,12 +28,13 @@ pub(super) struct FlushOwner {
     /// Set (with a stored permit) by the control loop after a started flush
     /// failed and its recovery finished; `finish` exits EX_TEMPFAIL on it.
     flush_failed: Arc<tokio::sync::Notify>,
+    logs: Option<log_flush::FlushCallback>,
 }
 
 /// Result of an arm-and-flush request. `FlushFailed` means the
 /// acknowledged flush started in this process and then failed or overran:
-/// the daemon is stopped behind the hook, the previous binary has been
-/// restored, and the process must exit EX_TEMPFAIL (engineer ruling
+/// the daemon is stopped behind the hook, recovery has been attempted,
+/// and the process must exit EX_TEMPFAIL (engineer ruling
 /// 23 Oct 2026) so the service manager restarts the old version.
 #[derive(Debug)]
 enum ArmFailure {
@@ -86,25 +87,22 @@ impl FlushOwner {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        // Create the socket with 0600 from the first byte: a umask-widened
-        // window between bind and chmod is closed at the source.
-        let previous_umask = unsafe { libc::umask(0o077) };
-        let bound = tokio::net::UnixListener::bind(&socket);
-        unsafe { libc::umask(previous_umask) };
-        let listener = bound?;
+        // Restrict this path before accepting requests. Authentication still
+        // checks the API token for a connection queued between bind and chmod.
+        // Do not change the process-wide umask while other threads create files.
+        let listener = tokio::net::UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         let logs = log_flush::capture(&tracing::dispatcher::get_default(Clone::clone))?;
+        let hook_logs = Arc::clone(&logs);
         let stop = super::routes::daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let (complete, receive) = mpsc::sync_channel(1);
         let receive = Mutex::new(receive);
         let registration = shutdown_flush::register(
             root.clone(),
             Arc::new(move |deadline, stopped| {
-                deadline.check()?;
-                // Commit before sending either stop signal. A deadline in
-                // stop() must never classify an already-stopping daemon as
-                // a refusal that can release admission and keep serving.
-                stopped.store(true, std::sync::atomic::Ordering::Release);
+                // The deadline decision and stop marker share the waiter's
+                // cancellation lock. A timed-out refusal cannot stop later.
+                deadline.commit_stop(stopped)?;
                 stop();
                 receive
                     .lock()
@@ -115,7 +113,7 @@ impl FlushOwner {
                     sync_tree(root, &deadline)?;
                 }
                 deadline.check()?;
-                log_flush::flush_captured(&logs, deadline.instant)
+                log_flush::flush_captured(&hook_logs, deadline.instant)
             }),
         )?;
         let state = Arc::new(ControlContext {
@@ -158,8 +156,8 @@ impl FlushOwner {
                         .await;
                 }
                 // Only after the reply is written does the failed flush end
-                // this process: the recovery inside `arm` has already
-                // restored the previous binary, and `finish` exits
+                // this process: `arm` has completed its recovery attempt,
+                // and `finish` exits
                 // EX_TEMPFAIL for a service-manager restart on it.
                 if started_flush_failed {
                     failure_signal.notify_one();
@@ -173,6 +171,7 @@ impl FlushOwner {
             socket,
             exit,
             flush_failed,
+            logs: Some(logs),
         })
     }
 
@@ -204,8 +203,8 @@ impl FlushOwner {
                 _ = self.flush_failed.notified() => {
                     // Engineer ruling 23 Oct 2026: a started flush that
                     // failed or overran must not leave this daemon running
-                    // with no API and no network. Recovery already restored
-                    // the previous binary and marked the upgrade failed;
+                    // with no API and no network. Recovery already attempted
+                    // the restore and marked the upgrade failed;
                     // exit EX_TEMPFAIL so the service manager restarts the
                     // daemon on the old version.
                     tracing::error!(
@@ -213,6 +212,7 @@ impl FlushOwner {
                         "acknowledged shutdown flush failed; exiting EX_TEMPFAIL \
                          for a service-manager restart on the previous binary"
                     );
+                    log_flush::flush_before_exit(self.logs.as_ref());
                     (self.exit)(crate::upgrade::restart::flush_failure_exit_code());
                 },
             }
@@ -426,7 +426,17 @@ fn arm(
                      check may retry this release once more"
                 );
             }
-            let restored_bytes = match crate::upgrade::restore_swapped_binaries(&restore_set) {
+            let recovery_complete = match restore_arm(
+                root,
+                *journal,
+                &handoff,
+                true,
+                &restore_set,
+                journal::Cause {
+                    class: journal::CauseClass::Failed,
+                    reason: format!("shutdown flush failure: {failure}"),
+                },
+            ) {
                 Ok(()) => true,
                 Err(error) => {
                     tracing::error!(
@@ -435,7 +445,7 @@ fn arm(
                             .iter()
                             .map(|(target, _)| target.display().to_string())
                             .collect::<Vec<_>>(),
-                        "cannot restore the swapped binaries; manual recovery applies"
+                        "cannot resolve the failed arm; active records retained, manual recovery applies"
                     );
                     false
                 }
@@ -443,7 +453,7 @@ fn arm(
             tracing::error!(
                 error = %failure,
                 installed_bytes = true,
-                restored_bytes = restored_bytes,
+                recovery_complete,
                 restart = "not_started",
                 recovery = "exited_tempfail",
                 "acknowledged shutdown flush failed after the daemon stopped; \
@@ -458,13 +468,16 @@ fn arm(
                     .lock()
                     .map_err(|_| io::Error::other("arm preparation poisoned"))?;
                 state.cancelled = true;
-                restore_refused_arm(
+                restore_arm(
                     root,
                     *journal,
                     &handoff,
                     state.wrote_handoff,
                     &restore_set,
-                    &error,
+                    journal::Cause {
+                        class: journal::CauseClass::Interrupted,
+                        reason: error.to_string(),
+                    },
                 )
             })();
             if let Err(recovery_error) = recovery {
@@ -481,30 +494,31 @@ fn arm(
 
 /// This call owns admission until recovery finishes. Mark rollback before
 /// touching installed bytes, so a partial restore can never admit a retry.
-fn restore_refused_arm(
+fn restore_arm(
     root: &Path,
     mut record: journal::JournalRecord,
     handoff: &journal::M2HandoffRecord,
     wrote_handoff: bool,
     restore_set: &[(PathBuf, PathBuf)],
-    refusal: &io::Error,
+    cause: journal::Cause,
 ) -> io::Result<()> {
     let journal_path = root.join(journal::JOURNAL_FILE_NAME);
     let journal::RecordRead::Journal(current) = journal::read_boot_records(root).journal else {
-        return Err(io::Error::other("refused arm journal unavailable"));
+        return Err(io::Error::other("arm recovery journal unavailable"));
     };
     if serde_json::to_vec(&current)? != serde_json::to_vec(&record)? {
-        return Err(io::Error::other("refused arm journal changed"));
+        return Err(io::Error::other("arm recovery journal changed"));
     }
     record.sequence = record
         .sequence
         .checked_add(1)
         .ok_or_else(|| io::Error::other("journal sequence exhausted"))?;
     record.phase = journal::Phase::RollingBack;
-    record.cause = Some(journal::Cause {
-        class: journal::CauseClass::Interrupted,
-        reason: refusal.to_string(),
-    });
+    let archive_kind = match cause.class {
+        journal::CauseClass::Failed => "failed",
+        journal::CauseClass::Interrupted => "refused",
+    };
+    record.cause = Some(cause);
     journal::write_record(&journal_path, &record)?;
     crate::upgrade::restore_swapped_binaries(restore_set).map_err(io::Error::other)?;
     for progress in [&mut record.daemon_progress, &mut record.cli_progress] {
@@ -530,12 +544,15 @@ fn restore_refused_arm(
                 std::fs::remove_file(root.join(journal::HANDOFF_FILE_NAME))?;
                 std::fs::File::open(root)?.sync_all()?;
             }
-            _ => return Err(io::Error::other("refused arm handoff changed; preserved")),
+            _ => return Err(io::Error::other("arm recovery handoff changed; preserved")),
         }
     }
     // Keep the resolved evidence without weakening blocks_apply's rule for
     // active M2 journals. A replay has no active swapped plan to acknowledge.
-    let archive = root.join(format!("upgrade-refused-{}.json", uuid::Uuid::new_v4()));
+    let archive = root.join(format!(
+        "upgrade-{archive_kind}-{}.json",
+        uuid::Uuid::new_v4()
+    ));
     std::fs::rename(&journal_path, &archive)?;
     std::fs::File::open(root)?.sync_all()
 }
@@ -616,7 +633,8 @@ fn process_start() -> io::Result<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: libproc writes exactly the owned, sized output buffer.
+        // SAFETY: proc_bsdinfo contains integer fields and fixed byte arrays;
+        // zero is a valid initial value for each field.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&info) as i32;
         // SAFETY: proc_pidinfo writes at most `size` bytes into the owned,
@@ -723,6 +741,7 @@ mod arm_flush_regressions_unused_reservation {
                     observed_exit.store(code, Ordering::SeqCst);
                 }),
                 flush_failed: Arc::new(tokio::sync::Notify::new()),
+                logs: None,
             },
             receive,
             called,
@@ -803,7 +822,23 @@ mod arm_flush_regressions_unused_reservation {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_exits_tempfail_after_a_failed_started_flush() {
         let (_dir, root) = fixture();
-        let (owner, receive, _called, exit_code) = owner(&root, HookOutcome::StartedFailure);
+        let (mut owner, receive, _called, exit_code) = owner(&root, HookOutcome::StartedFailure);
+        let flushed = Arc::new(AtomicBool::new(false));
+        let observed_flush = flushed.clone();
+        owner.logs = Some(Arc::new(move |_| {
+            observed_flush.store(true, Ordering::Release);
+            let (send, receive) = mpsc::channel();
+            send.send(Ok(())).unwrap();
+            vec![receive]
+        }));
+        let previous_exit = owner.exit.clone();
+        owner.exit = Arc::new(move |code| {
+            assert!(
+                flushed.load(Ordering::Acquire),
+                "finish exited before its log barrier"
+            );
+            previous_exit(code);
+        });
         let reservation = shutdown_flush::reserve(&root).unwrap();
         reservation.activate().unwrap();
         let binding =

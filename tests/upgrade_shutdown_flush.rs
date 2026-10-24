@@ -54,6 +54,89 @@ macro_rules! shutdown_flush_regression_tests {
             }
 
             #[test]
+            fn started_failure_and_authorization_failure_flush_logs_before_exit() {
+                use crate::upgrade::log_flush;
+                use tracing_subscriber::prelude::*;
+                struct Sink(
+                    Arc<std::sync::Mutex<Vec<u8>>>,
+                    Arc<std::sync::Mutex<Vec<u8>>>,
+                );
+                impl std::io::Write for Sink {
+                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                        self.0.lock().unwrap().extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        *self.1.lock().unwrap() = self.0.lock().unwrap().clone();
+                        Ok(())
+                    }
+                }
+                for authorization_failure in [false, true] {
+                    let (_dir, plan) = fixture();
+                    let flushed = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let (writer, _guard) =
+                        log_flush::acknowledged(Sink(Arc::default(), flushed.clone())).unwrap();
+                    let dispatch = tracing::Dispatch::new(
+                        tracing_subscriber::registry()
+                            .with(
+                                tracing_subscriber::fmt::layer()
+                                    .with_ansi(false)
+                                    .with_writer(writer.clone()),
+                            )
+                            .with(log_flush::FlushLayer::new(vec![writer]).unwrap()),
+                    );
+                    let owner = flush::register(
+                        plan.data_root.clone(),
+                        Arc::new(move |deadline, stopped| {
+                            deadline.commit_stop(stopped)?;
+                            if authorization_failure {
+                                Ok(())
+                            } else {
+                                Err(std::io::Error::other("injected started failure"))
+                            }
+                        }),
+                    )
+                    .unwrap();
+                    let mut exited = false;
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        let mut exit = |code| {
+                            assert_eq!(code, restart::flush_failure_exit_code());
+                            let text = String::from_utf8(flushed.lock().unwrap().clone()).unwrap();
+                            let expected = if authorization_failure {
+                                "flush receipt failed authorization"
+                            } else {
+                                "supervised shutdown flush failed after the daemon stopped"
+                            };
+                            assert!(
+                                text.contains(expected),
+                                "exit preceded the failure log flush: {text}"
+                            );
+                            exited = true;
+                        };
+                        if authorization_failure {
+                            let binding =
+                                flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan")
+                                    .unwrap();
+                            let receipt =
+                                flush::acknowledge(&plan.data_root, binding, || Ok(())).unwrap();
+                            let wrong =
+                                flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"wrong")
+                                    .unwrap();
+                            assert!(
+                                authorize_receipt_after_stop(&receipt, &wrong, &mut exit).is_err()
+                            );
+                        } else {
+                            assert!(AutoApplyUpgrader::new("x0xd")
+                                .trigger_restart_with_exit(&plan, "2.0.0", &mut exit)
+                                .is_err());
+                        }
+                    });
+                    owner.join_workers();
+                    assert!(exited);
+                }
+            }
+
+            #[test]
             fn supervised_exit_accepts_only_the_completed_transaction_receipt() {
                 let (_dir, plan) = fixture();
                 let observed = plan.clone();

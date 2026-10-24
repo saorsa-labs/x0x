@@ -523,10 +523,25 @@ swapped, logs the cause, and exits `EX_TEMPFAIL` (75). Every backup is
 verified before the first rename, and a missing backup restores nothing; a
 rename that fails after an earlier rename succeeded can still leave the
 daemon and the `x0x` CLI on mixed versions — that state is logged for
-manual recovery, not silently accepted. The service manager then restarts
-the daemon on the old version. An error after the flush completed (for
-example a receipt that fails authorization) also ends in `EX_TEMPFAIL`;
+manual recovery, not silently accepted. After a complete restore, the service
+manager restarts the daemon on the old version. A partial restore needs
+manual recovery. An error after the flush completed (for example a receipt
+that fails authorization) also ends in `EX_TEMPFAIL`;
 nothing is restored because the new bytes are already durable.
+
+For a started failure on the local arm-and-flush path, the host journal
+first records `rolling_back` with a flush-failure cause. Only then does the
+daemon restore bytes. A complete restore records `restored`, clears each
+restored artifact's `swapped` flag, sets its `restored` flag, removes
+`upgrade-handoff.json`, and archives the journal as `upgrade-failed-<uuid>.json`.
+After the exit-75 restart, the active journal no longer blocks apply. The
+failed-release hold stays: the same or older release is refused, but a newer
+release can apply (Engineer ruling, 24 Oct 2026 05:17/05:18 BST).
+If restore fails, including a part-way rename failure, the active journal
+stays at `rolling_back`; apply remains blocked for manual recovery. A
+cleanup failure also retains active recovery records and blocks apply.
+Failure exits allow up to one additional second to flush the log worker;
+a failed log barrier is reported to stderr before exit.
 
 A request that does not own flush admission never restores binaries, clears
 intent, or disarms another request. This includes a missing flush owner,
@@ -550,8 +565,9 @@ After an owned refusal, the flush clears its own receipt-less intent and
 releases admission. No failed-release hold is written: a resolved refusal
 permits retry on the next normal update cycle. An ordinary shutdown after a
 refusal uses its normal exit code. The production hook marks the stop commit
-point before sending either shutdown signal, so a deadline inside that send
-cannot turn a started shutdown into a refusal.
+point before sending either shutdown signal. The deadline check and stop
+commit share the waiter's cancellation lock. A timed-out refusal cannot
+stop later or publish a late receipt-less intent record.
 
 The flush walk refuses any symlink under the data root or the identity
 root (`~/.x0x` by default): a symlink is not a verified store root, and its
@@ -565,9 +581,11 @@ data directory, mode `0600`. It accepts one JSON request line carrying the
 API token, the transaction ID, generation, instance ID and frozen plan, and
 answers `{"receipt": …}` or `{"error": …}`. The daemon-side listener exists
 and is authenticated; the client that drives it belongs to later stack
-work, and the socket's API and framing are held for David's ruling — do not
-change or extend them. A very long data-directory path can exceed the Unix
-socket path limit (104 bytes on macOS); the bind then fails and supervised
+work. David approved this local control API on 23 Oct 2026 at 16:52 BST;
+its API and framing remain as approved. Permissions are set on the socket
+path before the listener accepts requests, without a process-wide umask
+change. The API token is checked even for a connection queued during bind.
+A very long data-directory path can exceed the Unix socket path limit (104 bytes on macOS); the bind then fails and supervised
 apply is disabled with a WARN in the log.
 
 #### Stale flush records
