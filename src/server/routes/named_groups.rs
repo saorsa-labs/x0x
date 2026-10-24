@@ -11377,6 +11377,23 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         return;
     }
     let sender_hex = hex::encode(sender.as_bytes());
+    // #1577 (ADR 0110 §3): a catch-up page carries membership events and
+    // TreeKEM epochs, so the serve is guarded egress. A revoked target
+    // keeps its Active seat until the S4 eviction commits, so the roster
+    // check below alone cannot refuse it. Drop the request on the same
+    // path the response handler uses for a revoked sender; no typed reply.
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
+            tracing::warn!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&sender_hex),
+                "rejecting TreeKEM catch-up request from a revoked requester"
+            );
+            return;
+        }
+    }
     if sender_hex != request.requester_agent_id {
         return;
     }
@@ -46300,6 +46317,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1577_revoked_catchup_request;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
