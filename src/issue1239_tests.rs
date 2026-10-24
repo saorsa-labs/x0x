@@ -511,6 +511,7 @@ async fn issue1239_lookup_worker_awaits_current_thread_driver() {
     for phase in ["complete", "deadline", "cancel"] {
         let mut lookup = Box::pin(runtime.lookup_before(
             identity::AgentId([0x39; 32]),
+            None,
             tokio::time::Instant::now() + Duration::from_secs(1),
         ));
         tokio::select! {
@@ -550,6 +551,7 @@ mod address_hints;
 mod connector;
 mod fallback;
 mod pinned_lookup;
+mod share_grant_lookup;
 mod shutdown;
 
 mod raw_resolution;

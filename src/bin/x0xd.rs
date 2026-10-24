@@ -20,7 +20,8 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing_appender::non_blocking::WorkerGuard;
+#[path = "../upgrade/log_flush.rs"]
+mod log_flush;
 
 #[cfg(feature = "profile-heap")]
 #[global_allocator]
@@ -118,7 +119,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             "    --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)"
         );
         println!(
-            "    --relay                         Be a relay node: Full participation + capability advertisement (ADR-0034)"
+            "    --relay                         Be a relay node: Full participation + capability advertisement (ADR-0034); the advert is informational only and grants no hint eligibility (#1112)"
         );
         println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
@@ -744,11 +745,8 @@ fn log_ansi_enabled(stdout_is_terminal: bool, no_color: bool) -> bool {
 /// The effective filter string is logged at startup so operators can verify
 /// what ended up active.
 ///
-/// Returns the [`tracing_appender::non_blocking::WorkerGuard`] for the stdout
-/// sink. **The caller must keep it alive for the process lifetime** — dropping
-/// it shuts the writer thread down and every subsequent log line is silently
-/// discarded (issue #600).
-fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
+/// Keep the returned guards alive until the process stops accepting logs.
+fn init_logging(level: &str, format: &str) -> Result<Vec<log_flush::LogGuard>> {
     use tracing_subscriber::EnvFilter;
 
     let fallback = level.to_lowercase();
@@ -780,35 +778,60 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         .map(std::path::PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
 
-    let file_writer = match log_dir.as_ref() {
-        Some(dir) => match std::fs::create_dir_all(dir) {
-            Ok(()) => {
-                let path = dir.join(format!("x0xd-{}.log", std::process::id()));
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    Ok(f) => Some((path, f)),
-                    Err(e) => {
+    let (stdout_writer, stdout_guard) = log_flush::acknowledged(std::io::stdout())?;
+    let mut writers = vec![stdout_writer.clone()];
+    let mut guards = vec![stdout_guard];
+    let file_writer = log_dir.as_ref().and_then(|dir| {
+        let open = || -> std::io::Result<_> {
+            #[cfg(unix)]
+            log_flush::prepare_log_dir(
+                dir,
+                |path| std::fs::File::open(path)?.sync_all(),
+                |path, error| {
+                    eprintln!(
+                        "x0xd: log directory {} sync warning: {error}",
+                        path.display()
+                    );
+                },
+            )?;
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(dir)?;
+            let path = dir.join(format!("x0xd-{}.log", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            #[cfg(unix)]
+            let (writer, guard) = {
+                let parent = match std::fs::File::open(dir) {
+                    Ok(parent) => Some(parent),
+                    Err(error) => {
                         eprintln!(
-                            "x0xd: X0X_LOG_DIR set but could not open {}: {e}",
-                            path.display()
+                            "x0xd: log directory {} open warning: {error}",
+                            dir.display()
                         );
                         None
                     }
-                }
+                };
+                log_flush::acknowledged_file(file, parent)?
+            };
+            #[cfg(not(unix))]
+            let (writer, guard) = log_flush::acknowledged_file(file, None)?;
+            Ok((path, writer, guard))
+        };
+        match open() {
+            Ok((path, writer, guard)) => {
+                writers.push(writer.clone());
+                guards.push(guard);
+                Some((path, writer))
             }
-            Err(e) => {
-                eprintln!(
-                    "x0xd: X0X_LOG_DIR set but mkdir -p {} failed: {e}",
-                    dir.display()
-                );
+            Err(error) => {
+                stdout_writer.record_setup_error(&error);
+                eprintln!("x0xd: X0X_LOG_DIR {} setup failed: {error}", dir.display());
                 None
             }
-        },
-        None => None,
-    };
+        }
+    });
 
     let file_path_for_log = file_writer.as_ref().map(|(p, _)| p.display().to_string());
 
@@ -824,7 +847,7 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
     // process-wide stdout lock — from tokio workers, and under a gossip storm
     // that is tens of thousands of serialised syscalls competing with the very
     // tasks that must stay responsive for the API watchdog's `/health` probe.
-    // `non_blocking` hands formatted lines to a dedicated writer thread instead.
+    // The acknowledged writer sends formatted lines to a dedicated thread.
     // #1036: ANSI colour codes only when stdout is an interactive terminal.
     // Under systemd/journald (and in log files) escape sequences are noise
     // that inflates syslog and breaks grep.
@@ -832,7 +855,6 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         std::io::IsTerminal::is_terminal(&std::io::stdout()),
         std::env::var_os("NO_COLOR").is_some(),
     );
-    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
     let stdout_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
         if format == "json" {
@@ -852,8 +874,7 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
 
     let file_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
         match file_writer {
-            Some((_, f)) => {
-                let writer = std::sync::Mutex::new(f);
+            Some((_, writer)) => {
                 if format == "json" {
                     Some(Box::new(
                         tracing_subscriber::fmt::layer()
@@ -879,7 +900,8 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         // the /health verdict's rolling error count. Cheapest possible
         // layer — no formatting, no I/O — so it keeps the #600 logging
         // path non-blocking.
-        .with(x0x::server::health_verdict::ErrorCountLayer);
+        .with(x0x::server::health_verdict::ErrorCountLayer)
+        .with(log_flush::FlushLayer::new(writers)?);
     if let Some(layer) = file_layer {
         registry.with(layer).init();
     } else {
@@ -901,7 +923,7 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         );
     }
 
-    Ok(stdout_guard)
+    Ok(guards)
 }
 
 #[cfg(test)]

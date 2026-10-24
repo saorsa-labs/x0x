@@ -350,6 +350,10 @@ impl EvidenceRuntime {
     }
     /// Pull missing relationship evidence over bounded connected-peer streams.
     /// Callers must re-read their authoritative sources after this await.
+    /// #1239: this inline variant blocks its caller's Tokio worker on the
+    /// synchronous store and policy reads; every production caller now uses
+    /// [`Self::lookup_before`]. Test-only, as a stand-in for an awaited sender.
+    #[cfg(test)]
     pub(crate) async fn lookup(&self, agent: AgentId, machine: Option<MachineId>) {
         let Some(permit) = self.lookup_permit() else {
             return;
@@ -364,9 +368,12 @@ impl EvidenceRuntime {
     /// current-thread runtime. The caller's absolute deadline also applies.
     /// Reserve the existing Lookup permit before spawning: even workers that
     /// cannot leave a synchronous read yet stay within the 16-Lookup cap.
+    /// `machine` is only the transport-observed routing hint recorded by
+    /// [`Self::lookup`]; it is never evidence authority.
     pub(crate) async fn lookup_before(
         self: &Arc<Self>,
         agent: AgentId,
+        machine: Option<MachineId>,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<(), ()> {
         if self.stopping.is_cancelled() || tokio::time::Instant::now() >= deadline {
@@ -412,7 +419,7 @@ impl EvidenceRuntime {
                         }
                         tokio::time::timeout_at(
                             deadline,
-                            runtime.lookup_with_permit(agent, None, permit, Some(deadline)),
+                            runtime.lookup_with_permit(agent, machine, permit, Some(deadline)),
                         )
                         .await
                         .map_err(|_| ())?;

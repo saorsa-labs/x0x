@@ -102,8 +102,10 @@ the success record, and the `PeerConnected` event — so every address dial
 (manual connects, join dials in every phase, HyParView bootstrap dials)
 refuses a mismatched answer instead of admitting it:
 
-- **No pin row**: trust-on-first-use, exactly as before #1112. No
-  production address is pinned today.
+- **No pin row**: trust-on-first-use, exactly as before #1112. Two
+  addresses are unpinned today — the Hetzner IPv4 rows
+  `65.21.157.229:443` and `116.203.101.172:5483`, whose PeerIds rest on
+  the local bootstrap cache only.
 - **Answer inside the pin set**: the dial proceeds, and a match at this
   address clears any live rejection recorded for THIS address.
 - **Answer outside the pin set**: the dial returns an error — the hint is
@@ -172,8 +174,8 @@ maps a frame's own generation to the address it lived on. Ordinary
 gossip sends are bound to the connection generation they examined — but
 only while any address is pinned: with nothing pinned the pre-#1112
 plain send stands, so the binding (a replacement between check and write
-fails the send instead of riding the unchecked connection) costs nothing
-today. A send with no live session fails with the structured
+fails the send instead of riding the unchecked connection) is dormant
+while nothing is pinned. A send with no live session fails with the structured
 PeerNotConnected (the #380 eviction contract), never a plain error that
 would only cool the peer. This is
 what catches an ant-quic-internal coordinator redial of a rejected seed,
@@ -189,13 +191,18 @@ listeners on one seed host are separate `x0xd` instances with separate
 machine keys (`.deployment/deploy-443.sh`), so each address needs its own
 pin. Pin lookups normalize v4-mapped forms on both sides.
 
-Why no production address is pinned yet: the repo holds PeerId captures
-for the six `:5483` seed listeners only (git history,
-`proofs/v0.19.0-validation-*` sustained-watch diagnostics of 2026-04-23,
-cross-confirmed by the May 2026 soak captures), and they are six months
-old. A pin that no longer matches a live seed key would refuse that seed
-for every client. Pinning is a deliberate operator change, made when the
-live fleet keys are verified. The pin table and its helpers are
+The table was filled on 23 Oct 2026 from live production keys: 22 of the
+24 seed addresses are pinned. Sixteen ids came from a fresh ephemeral
+handshake probe on 22 Oct (ant-quic 0.27.61, `peer_connected` PeerId);
+six from a live direct session on a production daemon at that exact
+address (22–23 Oct). The six `:5483` ids also match the repo's April
+2026 v0.19.0 sustained-watch captures (`proofs/v0.19.0-validation-*`):
+stable for six months. The two Hetzner IPv4 rows above stay unpinned
+until a handshake at that exact address verifies them — fresh probes to
+the Hetzner hosts time out from this network (three attempts, 22–23
+Oct) — because a pin that no longer matches a live seed key would
+refuse that seed for every client, which is why only verified rows are
+pinned. The pin table and its helpers are
 crate-private (`pub(crate)`): pinning is an operator-compiled behaviour,
 not a public API. Rejection entries expire on their own TTL, so the set
 cannot grow unbounded with dial rate against pinned addresses.
