@@ -48,6 +48,7 @@ use x0x::groups::eviction::{
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
+mod frame_stash;
 mod handoff_log;
 pub(super) mod owner_recovery;
 pub(super) mod rebind;
@@ -568,6 +569,9 @@ fn head_holders(
 /// #1508 rc17 (Codex P1): so is a retained S4 frame (a rebind, a
 /// crypto-only exclusion or an owner recovery) of a later revision, which
 /// waits for a missing predecessor. It is known higher-head evidence.
+/// #1508 rc18 (Codex P1): only a frame that passed every check this node
+/// can make on its latest head counts, and it counts until a retry
+/// resolves it, with no time limit ([`frame_stash`]).
 async fn unresolved_head_evidence(
     state: &AppState,
     group_key: &str,
@@ -580,10 +584,10 @@ async fn unresolved_head_evidence(
     }
     let stashed = {
         let inner = state.revocation_evictions.inner.lock().await;
-        let (stable, revision, now) = (info.stable_group_id(), info.state_revision, Instant::now());
-        inner.rebind.stash_ahead(stable, revision, now)
-            || inner.ce.stash_ahead(stable, revision, now)
-            || inner.orc.stash_ahead(stable, revision, now)
+        let (stable, revision) = (info.stable_group_id(), info.state_revision);
+        inner.rebind.stash_ahead(stable, revision)
+            || inner.ce.stash_ahead(stable, revision)
+            || inner.orc.stash_ahead(stable, revision)
     };
     if stashed {
         return true;

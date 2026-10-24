@@ -120,6 +120,7 @@ impl CommitHeaderV1 {
 /// The crypto transition of one exclusion (§4: "TreeKEM commit and next
 /// epoch or GSS next secret epoch").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CryptoExclusionCryptoV1 {
     /// A TreeKEM removal of the target's retained leaf.
     TreeKem {
@@ -179,6 +180,7 @@ pub struct SignedCryptoExclusionV1 {
 /// typed reasons in logs and status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CryptoExclusionRefusal {
     /// Not an `X0XCE1` payload.
     WrongPrefix,
@@ -533,6 +535,43 @@ fn gss_secret_hold(info: &GroupInfo, target_hex: &str) -> Option<bool> {
         .filter_map(|retained| gss_epoch_of(retained.commit.security_binding.as_deref()))
         .any(|epoch| epoch < current)
         .then_some(false)
+}
+
+/// ADR 0110 §2 (#1508 rc18): the checks this node can make on an
+/// exclusion that does not chain on its head `latest` yet, before the
+/// exclusion may count as known higher-head evidence. The caller verified
+/// both signatures ([`verify_signatures`]). The actor must have standing
+/// on `latest` (an Active admin that is not the target; the caller checks
+/// that the actor is not revoked), and
+/// the target must have a seat there. An exclusion that fails stays
+/// unverified: it is kept for a retry but holds nothing.
+///
+/// # Errors
+///
+/// The [`CryptoExclusionRefusal`] of the first check that fails.
+pub fn check_ahead(
+    body: &CryptoExclusionBodyV1,
+    latest: &GroupInfo,
+) -> Result<(), CryptoExclusionRefusal> {
+    if body.stable_group_id != latest.stable_group_id()
+        || body.commit.group_id != latest.stable_group_id()
+    {
+        return Err(CryptoExclusionRefusal::GroupMismatch);
+    }
+    if body.actor == body.target
+        || !latest
+            .members_v2
+            .get(&hex::encode(body.actor))
+            .is_some_and(|member| {
+                member.state == GroupMemberState::Active && member.role.at_least(GroupRole::Admin)
+            })
+    {
+        return Err(CryptoExclusionRefusal::ActorIneligible);
+    }
+    if !latest.members_v2.contains_key(&hex::encode(body.target)) {
+        return Err(CryptoExclusionRefusal::TargetNotRemoved);
+    }
+    Ok(())
 }
 
 /// The receiver's L4 checks against its current verified parent state

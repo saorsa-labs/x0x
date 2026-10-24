@@ -12706,6 +12706,24 @@ async fn gss_encrypt_after_key_probe(state: &AppState) {
 #[cfg(not(test))]
 async fn gss_encrypt_after_key_probe(_state: &AppState) {}
 
+/// #1508 rc18: a test pauses a GSS encrypt after its hold check under the
+/// publication permit, to try to park a removal before the response.
+#[cfg(test)]
+async fn gss_encrypt_after_hold_probe(state: &AppState) {
+    let pause = state
+        .named_group_test_recorders
+        .gss_encrypt_hold_pause
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some((reached, resume)) = pause {
+        reached.notify_one();
+        resume.notified().await;
+    }
+}
+#[cfg(not(test))]
+async fn gss_encrypt_after_hold_probe(_state: &AppState) {}
+
 /// #1573: whether a GSS removal or ban parked for `group_key`, or a GSS
 /// crypto-only exclusion held for it, still waits: this node holds no
 /// secret of its epoch. Only a transition whose signed commit the apply
@@ -33223,6 +33241,40 @@ pub(in crate::server) async fn secure_group_encrypt(
         );
     }
     gss_encrypt_after_key_probe(&state).await;
+    // #1508 rc18 (Codex P1): a verified GSS removal, ban or crypto-only
+    // exclusion parks under this gate held exclusively
+    // (`park_gss_removal_for_share`, `gss_share_hold::hold_exclusion`).
+    // This send holds a read permit from the hold check below until it
+    // returns the ciphertext, so no hold can start between the check and
+    // the response; the check runs again on a snapshot read under the
+    // permit. A parked removal leaves the head and the epoch at the
+    // parent, so the later quarantine and withdrawal checks do not see
+    // it. A key that moved since the first read refuses too: the send
+    // keeps the key it read.
+    let _publication = Arc::clone(&state.gss_publication_gate).read_owned().await;
+    let current = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, &id).map(|(group_key, live)| {
+            (
+                pending_gss_removal_withholds(&state, group_key, live),
+                live.secret_epoch == epoch && live.secure_message_key().as_ref() == Some(&key),
+            )
+        })
+    };
+    let (withheld, key_current) = current.unwrap_or((false, false));
+    if withheld {
+        return api_error(
+            StatusCode::CONFLICT,
+            GroupCiphertextHold::PendingGssRemoval.reason(),
+        );
+    }
+    if !key_current {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the group secret changed during the send; retry",
+        );
+    }
+    gss_encrypt_after_hold_probe(&state).await;
     // The group ciphertext boundary, as on the TreeKEM plane (#1573).
     if let Some(hold) = group_ciphertext_withheld(&state, &id, None).await {
         return revocation_eviction::s4_no_eligible_admin_refusal(&state, &id)
@@ -53890,6 +53942,7 @@ pub(in crate::server) mod tests {
         promotee_kp: crate::identity::AgentKeypair,
         /// A Member that a later admin can remove after the removal.
         bystander_hex: String,
+        bystander_kp: crate::identity::AgentKeypair,
         /// The committed post-removal state.
         committed: x0x::groups::GroupInfo,
     }
@@ -53926,11 +53979,8 @@ pub(in crate::server) mod tests {
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let promotee_kp = crate::identity::AgentKeypair::generate()?;
         let promotee = promotee_kp.agent_id();
-        let bystander_hex = hex::encode(
-            crate::identity::AgentKeypair::generate()?
-                .agent_id()
-                .as_bytes(),
-        );
+        let bystander_kp = crate::identity::AgentKeypair::generate()?;
+        let bystander_hex = hex::encode(bystander_kp.agent_id().as_bytes());
 
         let group_id = format!("f1-gss-{group_tag}-local");
         let stable_group_id = format!("f1-gss-{group_tag}-stable");
@@ -54052,6 +54102,7 @@ pub(in crate::server) mod tests {
             promotee,
             promotee_kp,
             bystander_hex,
+            bystander_kp,
             committed,
         })
     }
@@ -54350,6 +54401,70 @@ pub(in crate::server) mod tests {
         };
         assert_eq!(status, StatusCode::CONFLICT, "old key used: {body}");
         assert!(body.get("ciphertext_b64").is_none(), "{body}");
+        Ok(())
+    }
+
+    /// #1508 rc18 (Codex P1): a GSS removal cannot park between the send's
+    /// hold check and its response. The send holds a publication permit
+    /// over both, so the removal parks after the response. Before the fix
+    /// the removal parked while the send was past its check, and the send
+    /// returned ciphertext under the old secret, which the removed member
+    /// holds.
+    #[tokio::test]
+    async fn rc18_gss_removal_cannot_park_inside_a_rest_encrypt() -> Result<()> {
+        let f = f1_gss_rotation_fixture("hold-gate-race").await?;
+        let sender = f.admin_kp.agent_id();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *f.state
+            .named_group_test_recorders
+            .gss_encrypt_hold_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((Arc::clone(&reached), Arc::clone(&resume)));
+        let state = Arc::clone(&f.state);
+        let group_id = f.group_id.clone();
+        let mut send = tokio::spawn(async move {
+            let (status, Json(body)) = secure_group_encrypt(
+                State(state),
+                Path(group_id),
+                axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+                Json(SecureEncryptRequest {
+                    payload_b64: BASE64.encode(b"raced"),
+                }),
+            )
+            .await;
+            (status, body)
+        });
+        tokio::select! {
+            () = reached.notified() => {}
+            joined = &mut send => {
+                let (status, body) = joined?;
+                anyhow::bail!("the send ended before its hold check: {status} {body}");
+            }
+        }
+        let parking = {
+            let state = Arc::clone(&f.state);
+            let event = f.remove_event.clone();
+            tokio::spawn(async move {
+                apply_named_group_metadata_event(&state, event, sender, true, None).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let parked_inside_the_send = parking.is_finished();
+        resume.notify_one();
+        let (status, body) = send.await?;
+        let held = tokio::time::timeout(Duration::from_secs(10), parking)
+            .await
+            .context("the removal parks after the send")??;
+        assert!(!held.accepted);
+        assert!(
+            !parked_inside_the_send,
+            "the removal parked after the hold check, before the response: {status} {body}"
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_gss_removal_held(&f).await?;
+        assert_eq!(f1_encrypt(&f).await.0, StatusCode::CONFLICT);
         Ok(())
     }
 
@@ -54879,6 +54994,151 @@ pub(in crate::server) mod tests {
                 x0x::groups::GroupWriteAccess::AdminOnly,
                 "the policy update is applied"
             );
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
+    /// #1533 rc17 (Codex P1 at 8459714): A removes a member with a GSS
+    /// rotation, then C leaves by itself, then A promotes B and goes
+    /// offline. A lagging survivor must walk past C's self-leave, install
+    /// the removal with B's secret and reach A's last head. Before the fix
+    /// the walk stopped at the self-leave, so the removal stayed parked
+    /// although B was an admin.
+    #[tokio::test]
+    async fn rc17_gss_removal_catchup_past_a_self_leave_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("self-leave-then-promotion").await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let leaver = f.bystander_kp.agent_id();
+        let mut left = f.committed.clone();
+        left.remove_member(&f.bystander_hex, Some(f.bystander_hex.clone()));
+        left.roster_revision = left.roster_revision.saturating_add(1);
+        let leave_revision = left.roster_revision;
+        let leave_commit =
+            seal_commit_owner_certified(&f.state, &mut left, &f.bystander_kp, 2_000).await?;
+        let self_leave = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: leave_revision,
+            actor: f.bystander_hex.clone(),
+            agent_id: f.bystander_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(leave_commit),
+        };
+        let mut promoted = left.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 3_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: promotee_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(
+            &f.state,
+            rc14_promotee_share(&f),
+            f.promotee,
+            true,
+            None,
+        )
+        .await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, self_leave, leaver, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert!(!info.has_active_member(&f.bystander_hex), "C has left");
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
+    /// #1508 rc18 (Codex P1): A removes a member with a GSS rotation, then
+    /// removes C without a rotation (the ordinary apply accepts it), then
+    /// promotes B and goes offline. A lagging survivor walks past the
+    /// non-rotating removal, installs the first removal with B's secret
+    /// and reaches A's last head. Before the fix the walk followed only a
+    /// rotating admin removal, so the first removal stayed parked.
+    #[tokio::test]
+    async fn rc18_gss_removal_catchup_past_a_non_rotating_removal_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("plain-removal-then-promotion").await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let mut removed = f.committed.clone();
+        removed.remove_member(&f.bystander_hex, Some(admin_hex.clone()));
+        removed.roster_revision = removed.roster_revision.saturating_add(1);
+        let removal_revision = removed.roster_revision;
+        let removal_commit =
+            seal_commit_owner_certified(&f.state, &mut removed, &f.admin_kp, 2_000).await?;
+        let plain_removal = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: removal_revision,
+            actor: admin_hex.clone(),
+            agent_id: f.bystander_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(removal_commit),
+        };
+        let mut promoted = removed.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 3_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: promotee_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(
+            &f.state,
+            rc14_promotee_share(&f),
+            f.promotee,
+            true,
+            None,
+        )
+        .await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, plain_removal, admin, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert!(!info.has_active_member(&f.bystander_hex), "C is removed");
         }
         assert_eq!(
             group_ciphertext_withheld(&f.state, &f.group_id, None).await,

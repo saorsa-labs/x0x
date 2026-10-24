@@ -117,6 +117,7 @@ impl Default for S4Timing {
 /// names are the public status strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WaitingCause {
     /// The obligation or its evidence is not durable yet; retrying.
     WaitingForDurableIntake,
@@ -181,6 +182,7 @@ impl WaitingCause {
 /// Why a designated admin is waiting, for `waiting_for_designated_admin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DesignatedWaitDetail {
     /// The designated admin is compatible; this node waits for its rank.
     Rank,
@@ -191,6 +193,7 @@ pub enum DesignatedWaitDetail {
 /// The persisted phase of one obligation (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Phase {
     /// Work is known and not started, or was abandoned back to pending.
     Pending,
@@ -230,6 +233,7 @@ impl Phase {
 /// The cause recorded with [`Phase::Terminated`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TerminationCause {
     /// A signed group deletion ended the work (ADR 0088 §2 item 5).
     GroupDeleted,
@@ -1719,6 +1723,7 @@ pub fn decode_handoff(payload: &[u8]) -> Result<EvictionHandoffV1, HandoffDecode
 /// The S4 file states shown on status (ADR 0108 §5a generic states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SidecarState {
     /// The file is absent or decoded; writes are durable.
     Ok,

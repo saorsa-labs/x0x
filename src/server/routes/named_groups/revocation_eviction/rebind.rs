@@ -61,6 +61,7 @@ use super::crypto_exclusion::{
     all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
     next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
+use super::frame_stash::{FrameStash, StashedFrame};
 
 pub(super) mod replay_log;
 
@@ -70,10 +71,9 @@ const CRB_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 const CRB_DELIVERY_TTL: Duration = Duration::from_secs(600);
 /// Frames held per group for catch-up serving.
 const CRB_LOG_PER_GROUP: usize = 16;
-/// Frames that arrived ahead of this node's head, waiting for it.
+/// Frames that arrived ahead of this node's head, waiting for it
+/// ([`FrameStash`]).
 const CRB_STASH_CAP: usize = 64;
-/// A stashed frame is dropped after this long.
-const CRB_STASH_TTL: Duration = Duration::from_secs(600);
 /// The per-exchange bound of one frame write (live delivery and catch-up).
 const CRB_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -93,13 +93,6 @@ struct Delivery {
     /// A restart restored this delivery from the held log: each round
     /// waits for the group's §2 head sync first (#1508 review F3).
     resumed: bool,
-}
-
-#[derive(Debug, Clone)]
-struct StashedFrame {
-    sender: AgentId,
-    bytes: Vec<u8>,
-    at: Instant,
 }
 
 /// The seat agent's `waiting_for_admin_rebind` (§4a, D155).
@@ -139,7 +132,7 @@ pub(super) struct RebindState {
     /// Frames held for catch-up; the authored and the received frames are
     /// durable ([`replay_log`]).
     log: replay_log::HeldLog<CRB_LOG_PER_GROUP>,
-    stash: Vec<StashedFrame>,
+    stash: FrameStash<CRB_STASH_CAP>,
     /// Verified renewals an admin holds for a seat, from a hand-off.
     renewals: HashMap<EvictionKey, AgentCertificate>,
     /// Seat-agent side `waiting_for_admin_rebind`.
@@ -175,17 +168,12 @@ impl RebindState {
 
 impl RebindState {
     /// #1508 rc17 (Codex P1): whether a retained rebind frame of
-    /// `stable_group_id` commits a revision above `revision`. A frame is
-    /// retained only after its signatures and sender checks pass
-    /// ([`receive`]), or after a restart restored a frame that passed them.
-    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64, now: Instant) -> bool {
-        self.stash.iter().any(|frame| {
-            now.saturating_duration_since(frame.at) <= CRB_STASH_TTL
-                && cr::decode_frame(&frame.bytes).is_ok_and(|decoded| {
-                    decoded.body.stable_group_id == stable_group_id
-                        && decoded.body.next_revision > revision
-                })
-        })
+    /// `stable_group_id` commits a revision above `revision`. #1508 rc18
+    /// (Codex P1): only a frame that passed [`cr::check_ahead`] on this
+    /// node's latest head, or every receiver check, counts, with no time
+    /// limit ([`FrameStash`]).
+    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64) -> bool {
+        self.stash.ahead(stable_group_id, revision)
     }
 }
 
@@ -202,18 +190,19 @@ async fn ensure_restored(state: &AppState) {
     let local = *state.agent.agent_id().as_bytes();
     let mut inner = state.revocation_evictions.inner.lock().await;
     for bytes in restored.received {
-        // The frame is self-authenticating; its signer is the sender.
+        // The frame is self-authenticating; its signer is the sender. It
+        // passed every receiver check before it was written.
         let Ok(frame) = cr::decode_frame(&bytes) else {
             continue;
         };
-        if inner.rebind.stash.len() >= CRB_STASH_CAP {
-            inner.rebind.stash.remove(0);
-        }
-        inner.rebind.stash.push(StashedFrame {
-            sender: AgentId(frame.body.signer),
-            bytes: bytes.to_vec(),
-            at: Instant::now(),
-        });
+        let body = &frame.body;
+        let _kept = inner.rebind.stash.push(StashedFrame::new(
+            AgentId(body.signer),
+            bytes.to_vec(),
+            &body.stable_group_id,
+            body.next_revision,
+            true,
+        ));
     }
     for resume in restored.resumes {
         let key = (resume.stable_group_id, resume.result_head.clone());
@@ -1740,8 +1729,10 @@ pub(in crate::server) enum ReceiveOutcome {
     /// This node already holds the result.
     Duplicate,
     /// This node is behind the frame's parent, or lacks the committed
-    /// certificate bytes; the frame is stashed.
-    Behind,
+    /// certificate bytes; the frame is stashed. `verified`: the frame
+    /// passed every check this node can make on its latest head, so it is
+    /// known higher-head evidence (#1508 rc18, [`FrameStash`]).
+    Behind { verified: bool },
     /// The frame was refused.
     Refused(cr::CertificateRebindRefusal),
     /// A local persist fault; the frame is kept for retry.
@@ -1752,8 +1743,26 @@ pub(in crate::server) enum ReceiveOutcome {
 
 impl ReceiveOutcome {
     fn is_retained(self) -> bool {
-        matches!(self, Self::Behind | Self::LocalFailure)
+        matches!(self, Self::Behind { .. } | Self::LocalFailure)
     }
+
+    /// A retained frame that is known higher-head evidence (§2): it passed
+    /// [`cr::check_ahead`], or every receiver check before a local fault.
+    fn head_evidence(self) -> bool {
+        matches!(self, Self::Behind { verified: true } | Self::LocalFailure)
+    }
+}
+
+/// The stash entry of a rebind frame, or `None` when it does not decode.
+fn stashed(sender: AgentId, bytes: Vec<u8>, evidence: bool) -> Option<StashedFrame> {
+    let body = cr::decode_frame(&bytes).ok()?.body;
+    Some(StashedFrame::new(
+        sender,
+        bytes,
+        &body.stable_group_id,
+        body.next_revision,
+        evidence,
+    ))
 }
 
 /// The direct-message listener hands every `X0XCRB1` payload here.
@@ -1770,44 +1779,43 @@ pub(in crate::server) fn spawn_receipt(
     let _spawned = state.spawn_detached(async move {
         let outcome = receive(&task_state, sender, &payload).await;
         if outcome.is_retained() {
-            let mut inner = task_state.revocation_evictions.inner.lock().await;
-            if inner.rebind.stash.len() >= CRB_STASH_CAP {
-                inner.rebind.stash.remove(0);
+            if let Some(frame) = stashed(sender, payload, outcome.head_evidence()) {
+                let mut inner = task_state.revocation_evictions.inner.lock().await;
+                let _kept = inner.rebind.stash.push(frame);
             }
-            inner.rebind.stash.push(StashedFrame {
-                sender,
-                bytes: payload,
-                at: Instant::now(),
-            });
         }
     });
 }
 
+/// Retry every stashed frame. #1508 rc18 (Codex P1): the frames stay in
+/// the stash while the retry runs, so head evidence holds throughout, and
+/// each retained frame's evidence state is checked again on the new head.
 async fn retry_stash(state: &Arc<AppState>) {
-    let stash = std::mem::take(&mut state.revocation_evictions.inner.lock().await.rebind.stash);
-    if stash.is_empty() {
+    let frames = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .rebind
+        .stash
+        .retry_set(Instant::now());
+    if frames.is_empty() {
         return;
     }
-    let now = Instant::now();
-    let mut keep = Vec::new();
-    for frame in stash {
-        if now.saturating_duration_since(frame.at) > CRB_STASH_TTL {
-            continue;
-        }
-        if receive(state, frame.sender, &frame.bytes)
-            .await
-            .is_retained()
-        {
-            keep.push(frame);
-        }
+    let mut results = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let outcome = receive(state, frame.sender, &frame.bytes).await;
+        let kept = outcome.is_retained().then(|| outcome.head_evidence());
+        results.push((frame, kept));
     }
-    if !keep.is_empty() {
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        keep.append(&mut inner.rebind.stash);
-        let excess = keep.len().saturating_sub(CRB_STASH_CAP);
-        keep.drain(..excess);
-        inner.rebind.stash = keep;
-    }
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .rebind
+        .stash
+        .settle(results);
 }
 
 /// Verify and install one frame.
@@ -1843,12 +1851,23 @@ pub(in crate::server) async fn receive(
     if info.state_hash == body.commit.state_hash {
         return ReceiveOutcome::Duplicate;
     }
+    let now_unix = now_unix_ms() / 1000;
     if info.state_hash != body.prior_head
         && info.state_revision.saturating_add(1) < body.next_revision
     {
-        return ReceiveOutcome::Behind;
+        // #1508 rc18 (Codex P1): a frame of a later revision is head
+        // evidence only when its signer has standing on this node's latest
+        // head and its certificate verifies. A forged future frame is kept
+        // for a retry but holds nothing.
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        let verified = !set.is_agent_revoked(&sender)
+            && cr::check_ahead(&body, &info, now_unix, |id| {
+                set.is_agent_revoked(&AgentId(*id))
+            })
+            .is_ok();
+        return ReceiveOutcome::Behind { verified };
     }
-    let now_unix = now_unix_ms() / 1000;
     // Set when the frame is a valid rebind on a sibling branch.
     let mut sibling = None;
     let validated = {
@@ -1906,7 +1925,7 @@ pub(in crate::server) async fn receive(
                 cr::CertificateRebindRefusal::CertificateEvidenceMissing => {
                     // §1a: fetch the committed bytes, keep the frame.
                     ng::warranted_fetch_for_pending_seats(state, &info, &[hex::encode(body.seat)]);
-                    return ReceiveOutcome::Behind;
+                    return ReceiveOutcome::Behind { verified: true };
                 }
                 _ => {}
             }
@@ -2340,7 +2359,7 @@ mod tests {
 
     #[test]
     fn retained_outcomes_are_behind_and_local_failure_only() {
-        assert!(ReceiveOutcome::Behind.is_retained());
+        assert!(ReceiveOutcome::Behind { verified: false }.is_retained());
         assert!(ReceiveOutcome::LocalFailure.is_retained());
         assert!(!ReceiveOutcome::Applied.is_retained());
         assert!(!ReceiveOutcome::Duplicate.is_retained());
@@ -3207,25 +3226,105 @@ pub(super) mod restart_tests {
         );
         assert_eq!(
             receive(&state, admin.agent_id(), &frame).await,
-            ReceiveOutcome::Behind
+            ReceiveOutcome::Behind { verified: true }
         );
         // The worker keeps the frame, as `spawn_receipt` does.
-        state
+        let stashed = stashed(admin.agent_id(), frame, true).context("decode")?;
+        assert!(state
             .revocation_evictions
             .inner
             .lock()
             .await
             .rebind
             .stash
-            .push(StashedFrame {
-                sender: admin.agent_id(),
-                bytes: frame,
-                at: Instant::now(),
-            });
+            .push(stashed));
         assert!(
             !super::super::group_head_synced(&state, &stable).await,
             "a stashed later-revision frame is unresolved head evidence"
         );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1508 rc18 (Codex P1): a self-signed future rebind from a sender
+    /// with no standing on this node's head holds nothing. A stranger and
+    /// an ordinary member each fabricate an R+1 roster that makes them an
+    /// admin, and sign a rebind at R+2 on it. Before the fix each frame
+    /// was kept as head evidence, and the confirmed head stopped being
+    /// synced, which stops eviction and recovery.
+    #[tokio::test]
+    async fn a_forged_future_rebind_does_not_unsync_the_head() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        let stranger = AgentKeypair::generate()?;
+        let me = state.agent.identity().agent_keypair();
+        let base = certified_group(&owner, &admin, &[&member, me])?;
+        hold_persisted(&state, &base).await?;
+        let stable = base.stable_group_id().to_string();
+        let now_ms = now_unix_ms();
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, &admin, Some(now_ms / 1000 + 900))?;
+        let (parent, _) = cr::seal(
+            &base,
+            *admin.agent_id().as_bytes(),
+            &renewal,
+            &admin,
+            now_ms,
+        )
+        .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: base.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: true,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        assert!(super::super::group_head_synced(&state, &stable).await);
+        for (forger, seat) in [(&stranger, &member), (&member, &admin)] {
+            let mut forged = parent.clone();
+            forged.add_member(
+                hex::encode(forger.agent_id().as_bytes()),
+                GroupRole::Admin,
+                None,
+                None,
+            );
+            forged.set_member_role(&hex::encode(forger.agent_id().as_bytes()), GroupRole::Admin);
+            let (frame, _) = sibling_frame(&forged, &owner, seat, forger)?;
+            let outcome = receive(&state, forger.agent_id(), &frame).await;
+            assert_eq!(outcome, ReceiveOutcome::Behind { verified: false });
+            let stashed =
+                stashed(forger.agent_id(), frame, outcome.head_evidence()).context("decode")?;
+            assert!(state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .stash
+                .push(stashed));
+            assert!(
+                super::super::group_head_synced(&state, &stable).await,
+                "a forged future frame is not head evidence"
+            );
+        }
         state.agent.shutdown().await;
         Ok(())
     }

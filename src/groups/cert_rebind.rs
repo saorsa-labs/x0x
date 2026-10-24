@@ -89,6 +89,7 @@ pub struct SignedCertificateRebindV1 {
 /// reason in logs, status and API refusals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CertificateRebindRefusal {
     /// Not an `X0XCRB1` payload.
     WrongPrefix,
@@ -496,6 +497,56 @@ pub fn validate_against_parent(
         RebindSigner::SeatAgent
     };
     Ok((signer, new_cert))
+}
+
+/// ADR 0110 §2 (#1508 rc18): the checks this node can make on a rebind
+/// that does not chain on its head `latest` yet, before the rebind may
+/// count as known higher-head evidence. The caller verified both
+/// signatures ([`verify_signatures`]). The signer must have standing on
+/// `latest`: an Active, unrevoked admin, or the seat's own agent; and the
+/// new certificate must verify against the group owner for the seat. A
+/// rebind that fails stays unverified: it is kept for a retry but holds
+/// nothing.
+///
+/// # Errors
+///
+/// The [`CertificateRebindRefusal`] of the first check that fails.
+pub fn check_ahead(
+    body: &CertificateRebindBodyV1,
+    latest: &GroupInfo,
+    now_unix: u64,
+    is_revoked: impl Fn(&[u8; 32]) -> bool,
+) -> Result<(), CertificateRebindRefusal> {
+    if body.stable_group_id != latest.stable_group_id()
+        || body.commit.group_id != latest.stable_group_id()
+    {
+        return Err(CertificateRebindRefusal::GroupMismatch);
+    }
+    let signer = latest
+        .members_v2
+        .get(&hex::encode(body.signer))
+        .filter(|member| member.state == GroupMemberState::Active)
+        .ok_or(CertificateRebindRefusal::SignerIneligible)?;
+    if is_revoked(&body.signer)
+        || (body.signer != body.seat && !signer.role.at_least(GroupRole::Admin))
+    {
+        return Err(CertificateRebindRefusal::SignerIneligible);
+    }
+    let owner = latest
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .ok_or(CertificateRebindRefusal::CertificateInvalid)?;
+    let new_cert = decode_certificate(&body.new_certificate)
+        .ok_or(CertificateRebindRefusal::CertificateInvalid)?;
+    owner_cert::verify_cert_against_owner(
+        owner,
+        &hex::encode(body.seat),
+        &new_cert,
+        is_revoked(&body.seat),
+        now_unix,
+    )
+    .map_err(|_| CertificateRebindRefusal::CertificateInvalid)
 }
 
 /// ADR 0110 §2 fork containment and §4a "Receiver checks": whether
