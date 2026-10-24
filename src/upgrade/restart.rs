@@ -2352,13 +2352,17 @@ fn parse_ps_string_array(literal: &str) -> Option<Vec<String>> {
 /// policy, executable, arguments) in the script text the running wrapper
 /// bound this instance to. This is line recognition against the template's
 /// exact grammar, not a PowerShell parse — a script that smuggles extra
-/// statements past the marker lines still passes, which is why the supported
-/// deployment is the generated template, not a hand-edited script. Free of
-/// platform APIs so the refuse-vs-proceed table is unit-testable on any
-/// platform; the production sampler only supplies the script bytes. Every
-/// path that cannot confirm a tested version, a restart-on-exit-100 policy,
-/// and a binding to THIS executable and argv fails closed — a marker in
-/// isolation is not support (ADR-0061 §3).
+/// statements past the marker lines still passes, and the script on disk is
+/// what the wrapper runs from its NEXT start (PowerShell parsed its current
+/// copy at start-up), which is why the supported deployment is the
+/// generated template, not a hand-edited script. Each marker line must
+/// appear exactly once — the template never repeats one, so a duplicate is
+/// a hand edit and refuses. Free of platform APIs so the refuse-vs-proceed
+/// table is unit-testable on any platform; the production sampler only
+/// supplies the script bytes. Every path that cannot confirm a tested
+/// version, a restart-on-exit-100 policy, a restart loop, and a binding to
+/// THIS executable and argv fails closed — a marker in isolation is not
+/// support (ADR-0061 §3).
 #[cfg(any(test, target_os = "windows"))]
 pub(crate) fn readback_windows_wrapper_script(
     script: &str,
@@ -2375,22 +2379,58 @@ pub(crate) fn readback_windows_wrapper_script(
     let mut arguments: Option<Vec<String>> = None;
     let mut restart_on_100 = false;
     let mut loop_restarts_on_100 = false;
+    let mut restart_loop = false;
+    let mut duplicates: Vec<&'static str> = Vec::new();
     for line in script.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("$x0xWrapperVersion = ") {
-            version = rest.parse().ok();
+            if version.replace(rest.parse().unwrap_or(0)).is_some() {
+                duplicates.push("$x0xWrapperVersion");
+            }
         } else if let Some(rest) = line.strip_prefix("$x0xExecutable = ") {
-            wrapper_executable = rest
+            let parsed = rest
                 .strip_prefix('\'')
                 .and_then(|rest| rest.strip_suffix('\''))
-                .map(|inner| inner.replace("''", "'"));
+                .map(|inner| inner.replace("''", "'"))
+                .unwrap_or_default();
+            if wrapper_executable.replace(parsed).is_some() {
+                duplicates.push("$x0xExecutable");
+            }
         } else if let Some(rest) = line.strip_prefix("$x0xArguments = ") {
-            arguments = parse_ps_string_array(rest);
-        } else if line == "$x0xRestartOnExit100 = $true" {
+            let parsed = parse_ps_string_array(rest).unwrap_or_default();
+            if arguments.replace(parsed).is_some() {
+                duplicates.push("$x0xArguments");
+            }
+        } else if line.starts_with("$x0xRestartOnExit100 = ") {
+            if line != "$x0xRestartOnExit100 = $true" {
+                // The template's policy flag is exactly `$true`; any other
+                // value on the marker key is a hand edit that could shadow
+                // the template's line at run time.
+                duplicates.push("a conflicting $x0xRestartOnExit100 value");
+            } else if restart_on_100 {
+                duplicates.push("$x0xRestartOnExit100");
+            }
             restart_on_100 = true;
         } else if line == "if ($x0xExit -ne 100) { exit $x0xExit }" {
+            if loop_restarts_on_100 {
+                duplicates.push("the exit-propagation line");
+            }
             loop_restarts_on_100 = true;
+        } else if line == "while ($true) {" {
+            if restart_loop {
+                duplicates.push("the restart loop");
+            }
+            restart_loop = true;
         }
+    }
+    if !duplicates.is_empty() {
+        return NotGuaranteed {
+            detail: format!(
+                "the wrapper script repeats marker lines ({}), so it is not the generated \
+                 template; run `x0x autostart` to regenerate it",
+                duplicates.join(", ")
+            ),
+        };
     }
     let Some(version) = version else {
         return refused("name a wrapper version (`$x0xWrapperVersion`)");
@@ -2410,6 +2450,12 @@ pub(crate) fn readback_windows_wrapper_script(
         return refused(
             "propagate every exit status except 100 (`if ($x0xExit -ne 100) { exit $x0xExit }`)",
         );
+    }
+    if !restart_loop {
+        // A script without the loop restarts nothing after exit 100: the
+        // daemon would exit into a policy that simply ends — the exact
+        // silent-service-disappearance failure §3 exists to prevent.
+        return refused("keep the restart loop (`while ($true) {`)");
     }
     let Some(wrapper_executable) = wrapper_executable else {
         return refused("name the executable it runs (`$x0xExecutable`)");
@@ -2462,6 +2508,25 @@ fn sampled_windows_wrapper_readback(
     if signals.invocation_id || !signals.x0x_supervised {
         return WindowsWrapperReadback::NotApplicable;
     }
+    // #621 round 2: tests never sample the real environment (the
+    // `sampled_invocation_id` rule) — a Windows host running the suite with
+    // `X0X_WRAPPER` unset must not flip marker-scenario resolve tests into
+    // refusals. The gate's own tests inject verdicts through
+    // `resolve_restart_identity` directly.
+    #[cfg(test)]
+    {
+        let _ = argv;
+        return WindowsWrapperReadback::NotApplicable;
+    }
+    #[cfg(not(test))]
+    {
+        sample_windows_wrapper_from_env(argv)
+    }
+}
+
+/// The production half of [`sampled_windows_wrapper_readback`].
+#[cfg(all(target_os = "windows", not(test)))]
+fn sample_windows_wrapper_from_env(argv: &[String]) -> WindowsWrapperReadback {
     let Some(wrapper) = std::env::var_os(WINDOWS_WRAPPER_ENV_VAR).filter(|v| !v.is_empty()) else {
         return WindowsWrapperReadback::NotGuaranteed {
             detail: format!(
@@ -4178,15 +4243,17 @@ mod tests {
     // --------------------------------------------------------------------
     // #621 / ADR-0061 §3, Windows: the wrapper-script loaded-policy readback
     // and the marker gate behind it. The decision core is platform-free, so
-    // the fail-closed table runs on every platform (the Windows CI job runs
-    // it on the real target too).
+    // the fail-closed table runs on every platform (CI's Windows job
+    // compile-checks the whole suite for the real target; the resolver tests
+    // never sample the real environment — see
+    // `sampled_windows_wrapper_readback`).
     // --------------------------------------------------------------------
 
     /// A wrapper script in the exact shape `x0x autostart` generates, with
     /// the version / policy / executable / argument lines the readback
-    /// verifies (the template lives in `src/cli/commands/windows-wrapper.ps1`;
-    /// a daemon.rs test cross-pins the rendered template against this
-    /// readback).
+    /// verifies. The template lands in stacked PR #1612
+    /// (`src/cli/commands/windows-wrapper.ps1`), whose daemon-side test
+    /// cross-pins the rendered template against this readback.
     fn windows_wrapper_script(version: &str, executable: &str, arguments: &str) -> String {
         format!(
             "# x0xd supervision wrapper. Generated by `x0x autostart` -- do not edit.\n\
@@ -4272,6 +4339,14 @@ mod tests {
                     "if ($x0xExit -ne 100) { exit $x0xExit }",
                     "if ($x0xExit -eq 999) { exit $x0xExit }",
                 ),
+            ),
+            (
+                "no restart loop",
+                canonical.replacen("while ($true) {\n", "", 1),
+            ),
+            (
+                "duplicate/conflicting marker line",
+                format!("{canonical}$x0xRestartOnExit100 = $false\n"),
             ),
             (
                 "different executable",
