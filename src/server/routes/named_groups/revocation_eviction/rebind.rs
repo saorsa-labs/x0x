@@ -131,7 +131,7 @@ pub(super) struct RebindState {
     deliveries: HashMap<(String, String), Delivery>,
     /// Frames held for catch-up; the authored and the received frames are
     /// durable ([`replay_log`]).
-    log: replay_log::HeldLog<CRB_LOG_PER_GROUP>,
+    log: replay_log::HeldLog<CRB_LOG_PER_GROUP, true>,
     stash: FrameStash<CRB_STASH_CAP>,
     /// Verified renewals an admin holds for a seat, from a hand-off.
     renewals: HashMap<EvictionKey, AgentCertificate>,
@@ -177,7 +177,7 @@ impl RebindState {
     }
 }
 
-fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP> {
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP, true> {
     &mut inner.rebind.log
 }
 

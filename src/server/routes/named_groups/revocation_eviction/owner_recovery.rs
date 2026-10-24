@@ -145,7 +145,7 @@ pub(super) struct OrcState {
     held_events: Vec<HeldEvent>,
     /// Authored and installed recovery commits, for catch-up serving; the
     /// authored and the received frames are durable ([`replay_log`]).
-    log: replay_log::HeldLog<ORC_LOG_PER_GROUP>,
+    log: replay_log::HeldLog<ORC_LOG_PER_GROUP, true>,
 }
 
 impl OrcState {
@@ -282,7 +282,7 @@ impl OrcState {
     }
 }
 
-fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP> {
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP, true> {
     &mut inner.orc.log
 }
 

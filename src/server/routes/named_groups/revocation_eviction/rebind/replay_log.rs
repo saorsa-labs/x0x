@@ -21,31 +21,38 @@
 //! - **Write.** Temp write, fsync, atomic rename and directory fsync, as
 //!   for the `.evjournal`. If the write fails, the commit does not occur.
 //!   A file with a newer layout is never rewritten, so the commit does not
-//!   occur either (fail closed). The write starts from the frames the file
-//!   already holds, then memory's, then the new frame: a restart may have
-//!   left frames in the file that memory has not installed, and a new
-//!   write never displaces them (#1579). A frame at a revision the file
+//!   occur either (fail closed). Writes of one group's log serialize (one
+//!   writer at a time per file, #1579 fix round), and each starts from the
+//!   frames the file already holds, then memory's, then the new frame: a
+//!   restart may have left frames in the file that memory has not
+//!   installed, and no write displaces what the last write made durable.
+//!   In the rebind and owner-recovery logs a frame at a revision the file
 //!   already holds, with a different result head, is a competing commit:
 //!   both are kept, and the held frame is never replaced — the pair is the
-//!   fork evidence that two commits claimed one revision.
+//!   fork evidence that two commits claimed one revision (#1579). The
+//!   crypto-only exclusion log keeps the #1508 rule — a received frame
+//!   never replaces a held one, so one frame per revision — because its
+//!   catch-up round stops at the first frame the head rule refuses: a
+//!   competing pair would strand every frame after it.
 //! - **Load.** A damaged file is quarantined (ADR 0108 §5a: pending name,
 //!   then history name), and that group starts with an empty log: its
 //!   frames are lost, the load never panics and never uses the damaged
 //!   bytes. A newer layout stays on disk, not loaded. A frame that is not
 //!   on this node's loaded chain is not held (a crash between the write and
-//!   the commit). Of a competing pair at the head revision, the chain's
-//!   frame is held; the other stays in the file as evidence and is never
-//!   served (#1579). An authored frame that is still the group's head gets
-//!   its delivery again. A received frame above the loaded head (a crash
-//!   between the write and the install) is received again: the caller
-//!   puts it through the full receive checks.
+//!   the commit). In the rebind and owner-recovery logs, of a competing
+//!   pair at the head revision the chain's frame is held; the other stays
+//!   in the file as evidence and is never served (#1579). An authored
+//!   frame that is still the group's head gets its delivery again. A
+//!   received frame above the loaded head (a crash between the write and
+//!   the install) is received again: the caller puts it through the full
+//!   receive checks.
 //! - **Retire.** The file holds what the writes kept — memory's frames
 //!   and the frames only the file had — under the same bound, so a frame
 //!   leaves the file only when that bound drops it.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -112,9 +119,11 @@ pub(in super::super) struct Resume {
 }
 
 /// The frames held per group for catch-up serving, at most `CAP` per
-/// group, by revision, deduplicated.
+/// group, by revision, deduplicated. `KEEP_COMPETING` is the #1579 rule
+/// of the rebind and owner-recovery logs; without it the #1508 rule
+/// holds — one frame per revision — as for the crypto-only exclusion log.
 #[derive(Debug, Default)]
-pub(in super::super) struct HeldLog<const CAP: usize> {
+pub(in super::super) struct HeldLog<const CAP: usize, const KEEP_COMPETING: bool = false> {
     log: HashMap<String, VecDeque<HeldFrame>>,
     restored: bool,
 }
@@ -127,14 +136,21 @@ struct HeldFrame {
     bytes: Arc<Vec<u8>>,
 }
 
-impl<const CAP: usize> HeldLog<CAP> {
-    /// Keep a frame. A frame of the same commit (the revision and the
-    /// result head) replaces the held copy, so one commit is held once; an
-    /// authored copy replaces a received one, because it is the one on
-    /// this node's chain. A frame at a held revision with a different
-    /// result head is a competing commit: both are kept and neither
-    /// replaces the other (#1579) — the bytes are the fork evidence that
-    /// two commits claimed one revision.
+impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> {
+    /// Keep a frame. With `KEEP_COMPETING` (the rebind and owner-recovery
+    /// logs, #1579) a frame of the same commit (the revision and the
+    /// result head) replaces the held copy, so one commit is held once —
+    /// an authored copy replaces a received one — while a frame at a held
+    /// revision with a different result head is a competing commit: both
+    /// are kept and neither replaces the other. The bytes are the fork
+    /// evidence that two commits claimed one revision.
+    ///
+    /// Without it (the crypto-only exclusion log, #1508) the frame held
+    /// at a revision blocks a received frame and is replaced by an
+    /// authored one, so the log — memory, file and catch-up serving —
+    /// holds one frame per revision. That round stops at the first frame
+    /// the head rule refuses, so a competing pair in it would strand
+    /// every frame after the pair; it never meets one (#1579 fix round).
     pub(in super::super) fn remember(
         &mut self,
         stable_group_id: &str,
@@ -144,10 +160,15 @@ impl<const CAP: usize> HeldLog<CAP> {
         authored: bool,
     ) {
         let log = self.log.entry(stable_group_id.to_string()).or_default();
-        if let Some(at) = log
-            .iter()
-            .position(|e| e.next_revision == next_revision && e.result_head == result_head)
-        {
+        // The held frame this one lands on: with the keep-competing rule
+        // only a frame of the same commit; without it any frame at the
+        // same revision.
+        if let Some(at) = log.iter().position(|e| {
+            e.next_revision == next_revision && (!KEEP_COMPETING || e.result_head == result_head)
+        }) {
+            if !KEEP_COMPETING && !authored {
+                return;
+            }
             log.remove(at);
         }
         let at = log
@@ -368,6 +389,23 @@ fn log_path(state: &AppState, stable_group_id: &str, extension: &str) -> PathBuf
     super::super::evjournal_path(state, stable_group_id).with_extension(extension)
 }
 
+/// One writer at a time per log file path (#1579 fix round): the writes of
+/// one group's log serialize, so each write plans from the bytes the last
+/// write left. Keyed by the full path, so distinct data directories never
+/// share a lock.
+static FILE_WRITE_LOCKS: LazyLock<
+    tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+async fn lock_file_writes(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    FILE_WRITE_LOCKS
+        .lock()
+        .await
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Write `log` durably at `path`. A file with a newer layout is never
 /// rewritten. Returns whether `log` is durable.
 async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
@@ -435,10 +473,10 @@ async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<Replay
 
 /// Before the local commit: write the group's log with the authored frame
 /// durably. On `false` the caller must not commit.
-pub(in super::super) async fn write_planned<const CAP: usize>(
+pub(in super::super) async fn write_planned<const CAP: usize, const KEEP: bool>(
     state: &AppState,
     extension: &str,
-    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP, KEEP>,
     stable: &str,
     at: (u64, &str),
     bytes: &Arc<Vec<u8>>,
@@ -451,10 +489,10 @@ pub(in super::super) async fn write_planned<const CAP: usize>(
 /// authored frame (#1508 review F2). On `false` the caller must not
 /// install. If the install then fails for a local fault, the frame stays
 /// in the file; the next receipt or the restart receives it again.
-pub(in super::super) async fn write_received<const CAP: usize>(
+pub(in super::super) async fn write_received<const CAP: usize, const KEEP: bool>(
     state: &AppState,
     extension: &str,
-    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP, KEEP>,
     stable: &str,
     at: (u64, &str),
     bytes: &Arc<Vec<u8>>,
@@ -462,10 +500,10 @@ pub(in super::super) async fn write_received<const CAP: usize>(
     write_with(state, extension, held, stable, at, bytes, false).await
 }
 
-async fn write_with<const CAP: usize>(
+async fn write_with<const CAP: usize, const KEEP: bool>(
     state: &AppState,
     extension: &str,
-    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP, KEEP>,
     stable: &str,
     at: (u64, &str),
     bytes: &Arc<Vec<u8>>,
@@ -477,6 +515,13 @@ async fn write_with<const CAP: usize>(
         return false;
     }
     let path = log_path(state, stable, extension);
+    // #1579 fix round: one writer at a time per log file. Two writes of
+    // one group at once planned from the same file bytes, and the second
+    // rename dropped the first write's frame — the only durable copy in a
+    // crash window. Under the per-file lock the second write reads and
+    // plans from the file the first write left.
+    let write_lock = lock_file_writes(&path).await;
+    let _serialized = write_lock.lock().await;
     // #1579: the file may hold frames memory does not (a crash between a
     // write and its commit or install). A frame that cannot be decoded is
     // not merged; a newer layout still fails the write below (fail
@@ -499,26 +544,29 @@ async fn write_with<const CAP: usize>(
 /// After a failed local commit: write the group's log as memory holds it,
 /// so the file does not keep the frame. Best effort: a restart drops such
 /// a frame too.
-pub(in super::super) async fn rewrite_from_memory<const CAP: usize>(
+pub(in super::super) async fn rewrite_from_memory<const CAP: usize, const KEEP: bool>(
     state: &AppState,
     extension: &str,
-    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP, KEEP>,
     stable: &str,
 ) {
     if !host_commit_gate_open(state) {
         return;
     }
+    let path = log_path(state, stable, extension);
+    let write_lock = lock_file_writes(&path).await;
+    let _serialized = write_lock.lock().await;
     let log = held(&mut *state.revocation_evictions.inner.lock().await).file(stable);
-    let _durable = write_at(&log_path(state, stable, extension), &log).await;
+    let _durable = write_at(&path, &log).await;
 }
 
 /// Load the files once per process, before this node serves catch-up,
 /// delivers, receives or authors a frame of this kind. Returns the frames
 /// to deliver or receive again (empty when another call did the load).
-pub(in super::super) async fn ensure_restored<const CAP: usize>(
+pub(in super::super) async fn ensure_restored<const CAP: usize, const KEEP: bool>(
     state: &AppState,
     extension: &str,
-    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP, KEEP>,
 ) -> Restored {
     if held(&mut *state.revocation_evictions.inner.lock().await).restored {
         return Restored::default();
@@ -586,7 +634,7 @@ pub(in super::super) mod tests {
     ) -> Vec<Resume> {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(format!("g.{extension}"));
-        let mut before = HeldLog::<CAP>::default();
+        let mut before = HeldLog::<CAP, true>::default();
         before.remember(stable, 4, "h4", Arc::new(vec![4]), false);
         let existing = file_frames_of(&path).await;
         assert!(
@@ -598,7 +646,7 @@ pub(in super::super) mod tests {
         );
         // The commit lands, then the process dies: `before` is lost.
         drop(before);
-        let mut after = HeldLog::<CAP>::default();
+        let mut after = HeldLog::<CAP, true>::default();
         let resumes = after
             .restore(read_all_in(dir.path(), extension, true).await, groups)
             .resumes;
@@ -613,7 +661,7 @@ pub(in super::super) mod tests {
         let existing = file_frames_of(&path).await;
         let planned = after.planned(&existing, stable, (6, "h6"), &Arc::new(vec![6]), true);
         assert!(write_at(&path, &planned).await);
-        let mut again = HeldLog::<CAP>::default();
+        let mut again = HeldLog::<CAP, true>::default();
         let _ = again.restore(read_all_in(dir.path(), extension, true).await, groups);
         assert!(again.catchup_frames(&[stable.to_string()], 5).is_empty());
         resumes
@@ -638,7 +686,7 @@ pub(in super::super) mod tests {
     /// (the revision and the head) is held once.
     #[test]
     fn a_competing_frame_at_a_held_revision_is_kept_not_substituted() {
-        let mut log = HeldLog::<16>::default();
+        let mut log = HeldLog::<16, true>::default();
         log.remember("g", 5, "h5a", Arc::new(vec![1]), false);
         log.remember("g", 5, "h5b", Arc::new(vec![2]), false);
         log.remember("g", 5, "h5c", Arc::new(vec![3]), true);
@@ -683,7 +731,7 @@ pub(in super::super) mod tests {
         };
         assert!(write_at(&path, &held).await);
         // The crash window: memory lost the frame before its install.
-        let memory = HeldLog::<16>::default();
+        let memory = HeldLog::<16, true>::default();
         let existing = file_frames_of(&path).await;
         let planned = memory.planned(&existing, "g", (5, "h5b"), &Arc::new(vec![2]), false);
         assert!(write_at(&path, &planned).await);
@@ -740,14 +788,16 @@ pub(in super::super) mod tests {
             frame: vec![2],
         };
 
-        let mut at_head = HeldLog::<16>::default();
+        let mut at_head = HeldLog::<16, true>::default();
         let restored = at_head.restore(vec![log_of(vec![winner.clone(), loser.clone()])], &groups);
         assert!(
             restored.received.is_empty(),
             "the head frame is not re-received"
         );
         assert_eq!(
-            at_head.catchup_frames(std::slice::from_ref(&stable), 4).len(),
+            at_head
+                .catchup_frames(std::slice::from_ref(&stable), 4)
+                .len(),
             1,
             "only the chain's frame is held at the head revision"
         );
@@ -755,10 +805,157 @@ pub(in super::super) mod tests {
         let info = groups.get_mut(&stable).expect("group");
         info.state_revision = 4;
         info.state_hash = "h4".to_string();
-        let mut above = HeldLog::<16>::default();
+        let mut above = HeldLog::<16, true>::default();
         let restored = above.restore(vec![log_of(vec![winner, loser])], &groups);
         assert_eq!(restored.received.len(), 2, "both frames are received again");
         assert!(above.catchup_frames(&[stable], 4).is_empty());
+    }
+
+    /// #1579 fix round: the crypto-only exclusion log keeps the #1508
+    /// rule — one frame per revision, in memory, in its file and after a
+    /// restore — because its catch-up round stops at the first frame the
+    /// head rule refuses, so a competing pair would strand every frame
+    /// after the pair. The rebind and owner-recovery logs, whose rounds
+    /// skip an off-chain frame, keep a competing pair instead. A received
+    /// frame at a held revision is dropped; an authored frame replaces
+    /// the held one.
+    #[tokio::test]
+    async fn the_celog_rule_holds_one_frame_per_revision() {
+        // Memory: the second frame of a pair is dropped, not held beside.
+        let mut log = HeldLog::<16, false>::default();
+        log.remember("g", 5, "h5a", Arc::new(vec![1]), false);
+        log.remember("g", 5, "h5b", Arc::new(vec![2]), false);
+        let held = |log: &HeldLog<16, false>| {
+            log.catchup_frames(&["g".to_string()], 4)
+                .into_iter()
+                .map(|(_, head, bytes)| (head, bytes.to_vec()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(held(&log), vec![("h5a".to_string(), vec![1])]);
+        log.remember("g", 5, "h5c", Arc::new(vec![3]), true);
+        assert_eq!(
+            held(&log),
+            vec![("h5c".to_string(), vec![3])],
+            "an authored frame replaces the held one, as before"
+        );
+
+        // The file: a competing received frame is not written beside the
+        // crash-window frame the file already holds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("g.celog");
+        let file = ReplayLogV1 {
+            stable_group_id: "g".to_string(),
+            frames: vec![ReplayFrameV1 {
+                next_revision: 5,
+                result_head: "h5a".to_string(),
+                authored: false,
+                frame: vec![1],
+            }],
+        };
+        assert!(write_at(&path, &file).await);
+        let existing = file_frames_of(&path).await;
+        let planned = HeldLog::<16, false>::default().planned(
+            &existing,
+            "g",
+            (5, "h5b"),
+            &Arc::new(vec![2]),
+            false,
+        );
+        assert!(write_at(&path, &planned).await);
+        let on_disk = file_frames_of(&path).await;
+        assert_eq!(on_disk.len(), 1, "the competing frame is not kept");
+        assert_eq!(
+            (
+                on_disk[0].next_revision,
+                on_disk[0].result_head.as_str(),
+                on_disk[0].frame.as_slice()
+            ),
+            (5, "h5a", &[1][..]),
+            "the held frame is never replaced"
+        );
+
+        // The load: even a pair a foreign file holds below the head —
+        // this code writes no pair — restores as one held frame, so that
+        // round never serves, and never stops at, a competing frame.
+        let (local, survivor) = (crate::identity::AgentId([1; 32]), [2u8; 32]);
+        let (stable, mut groups) = committed_group(local, survivor);
+        let info = groups.get_mut(&stable).expect("group");
+        info.state_revision = 6;
+        info.state_hash = "h6".to_string();
+        let pair = ReplayLogV1 {
+            stable_group_id: stable.clone(),
+            frames: vec![
+                ReplayFrameV1 {
+                    next_revision: 5,
+                    result_head: "h5a".to_string(),
+                    authored: false,
+                    frame: vec![1],
+                },
+                ReplayFrameV1 {
+                    next_revision: 5,
+                    result_head: "h5b".to_string(),
+                    authored: false,
+                    frame: vec![2],
+                },
+            ],
+        };
+        let mut restored_log = HeldLog::<16, false>::default();
+        let restored = restored_log.restore(vec![pair], &groups);
+        assert!(restored.received.is_empty());
+        assert_eq!(
+            restored_log
+                .catchup_frames(std::slice::from_ref(&stable), 4)
+                .len(),
+            1,
+            "the second frame of the pair is not held after the restore"
+        );
+    }
+
+    /// #1579 fix round: two writes of one group's log at the same time.
+    /// Each write must plan from the file the last write left; before the
+    /// writes serialized, both planned from the same earlier bytes and the
+    /// second rename dropped the first write's frame — the only durable
+    /// copy in a crash window.
+    #[tokio::test]
+    async fn concurrent_writes_of_one_log_keep_both_frames() {
+        use crate::server::routes::named_groups as ng;
+        fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
+            &mut inner.rebind.log
+        }
+        let (state, _dir) = ng::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let first_frame = Arc::new(b"one".to_vec());
+        let second_frame = Arc::new(b"two".to_vec());
+        let (first, second) = tokio::join!(
+            write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (5, "h5"),
+                &first_frame,
+            ),
+            write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (6, "h6"),
+                &second_frame,
+            ),
+        );
+        assert!(first && second, "both writes are durable");
+        let on_disk = frames_on_disk(&state, REBIND_EXTENSION, "g").await;
+        let held: Vec<(u64, &str)> = on_disk
+            .iter()
+            .map(|frame| (frame.next_revision, frame.result_head.as_str()))
+            .collect();
+        assert_eq!(
+            held,
+            vec![(5, "h5"), (6, "h6")],
+            "a concurrent write displaces nothing the other made durable"
+        );
     }
 
     #[test]
