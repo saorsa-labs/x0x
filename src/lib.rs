@@ -10072,6 +10072,41 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        // #1239: ONE absolute deadline across the entire send. The stages
+        // below keep their own budgets (the evidence budget, the transport
+        // ACK caps, the cold-repair bound); this deadline is their sum, so a
+        // send that fits its configured stages is never cut short, while a
+        // later wait no stage bounds — a held revocation, registry or
+        // contact lock, a stacked slow stage, a stuck fallback — ends the
+        // whole send here with the typed timeout instead of staying open.
+        let started = std::time::Instant::now();
+        let retries = config.max_retries;
+        let deadline = tokio::time::Instant::now()
+            + dm_evidence::ordinary_send_budget(&config, cold_wait.map(|ColdWait(wait)| wait));
+        match tokio::time::timeout_at(
+            deadline,
+            self.send_direct_all_stages(to, payload, config, cold_wait),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_expired) => {
+                self.direct_messaging.record_outgoing_failed(*to);
+                Err(dm::DmError::Timeout {
+                    retries,
+                    elapsed: started.elapsed(),
+                })
+            }
+        }
+    }
+
+    async fn send_direct_all_stages(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         let mut evidence = dm_evidence::SendEvidence::new(
             self,
             *to,
@@ -41818,6 +41853,9 @@ mod issue1099_tests;
 
 #[cfg(test)]
 mod issue1239_tests;
+
+#[cfg(test)]
+mod issue1239_send_deadline_tests;
 
 #[cfg(test)]
 include!("../tests/upgrade_cache_flush.rs");
