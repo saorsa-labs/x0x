@@ -3,6 +3,8 @@
 //! The opener is the test seam. Nothing is sent to a browser. Bootstrap
 //! lists only the other daemon. mDNS and port mapping stay off.
 
+#![cfg(test)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
