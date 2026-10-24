@@ -1918,10 +1918,11 @@ pub(in crate::server) async fn promoted_admin_secret(
 /// any other event, or one that fails a check, ends the walk, and the
 /// transition keeps waiting for its share.
 ///
-/// #1508 rc18 (Codex P1): every removal and ban that the ordinary GSS
-/// apply accepts is walked: an admin's with or without a rotation, and a
-/// member's own leave. The join-request steps are not walked yet: they
-/// end the walk, which only makes the transition wait longer.
+/// #1508 rc18 / #1533 rc19 (Codex P1): the rule is that every valid
+/// intervening commit that the ordinary GSS apply accepts is walked: an
+/// admin's removal or ban with or without a rotation, a member's own
+/// leave, and the request-based admission steps (a request, its approval,
+/// rejection or cancellation).
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
     use super::super::NamedGroupMetadataEvent as Event;
     let commit = super::super::named_group_metadata_event_commit(&held.event)?;
@@ -2217,6 +2218,143 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             return gss_rotation_step(cursor, commit, *revision, *to, |next| {
                 next.ban_member(agent_id, Some(actor.clone()));
             });
+        }
+        // #1533 rc19 (Codex P1): the request-based admission steps, checked
+        // as the ordinary GSS apply checks them. A requester's own request
+        // or cancellation, and an admin's approval or rejection of a
+        // pending request. None changes the epoch.
+        Event::JoinRequestCreated {
+            group_id,
+            request_id,
+            requester_agent_id,
+            message,
+            ts,
+            requester_kem_public_key_b64,
+            treekem_key_package_b64,
+            ..
+        } => {
+            if *requester_agent_id != author
+                || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                || cursor.policy.admission != x0x::groups::GroupAdmission::RequestAccess
+                || cursor.has_active_member(requester_agent_id)
+                || cursor.is_banned(requester_agent_id)
+                || cursor.join_requests.contains_key(request_id)
+                || cursor.join_requests.values().any(|request| {
+                    request.requester_agent_id == *requester_agent_id && request.is_pending()
+                })
+            {
+                return None;
+            }
+            let request = x0x::groups::JoinRequest {
+                request_id: request_id.clone(),
+                group_id: group_id.clone(),
+                requester_agent_id: requester_agent_id.clone(),
+                requester_user_id: None,
+                requested_role: x0x::groups::GroupRole::Member,
+                message: message.clone(),
+                treekem_key_package_b64: treekem_key_package_b64.clone(),
+                created_at: *ts,
+                reviewed_at: None,
+                reviewed_by: None,
+                status: x0x::groups::JoinRequestStatus::Pending,
+                predecessor_envelope_digest: None,
+                predecessor_first_seen_ms: None,
+            };
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::NonMemberRequest,
+                |next| {
+                    super::super::set_join_request_created(
+                        next,
+                        request,
+                        requester_kem_public_key_b64.clone(),
+                    )
+                },
+            )
+        }
+        Event::JoinRequestApproved {
+            request_id,
+            revision,
+            actor,
+            requester_agent_id,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_key_package_hash: None,
+            treekem_epoch: None,
+            ..
+        } => {
+            if !admin(actor)
+                || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                || cursor.is_banned(requester_agent_id)
+                || !cursor.join_requests.get(request_id).is_some_and(|request| {
+                    request.is_pending() && request.requester_agent_id == *requester_agent_id
+                })
+            {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    super::super::set_join_request_approved(
+                        next,
+                        request_id,
+                        actor,
+                        requester_agent_id,
+                        *revision,
+                        commit.committed_at,
+                    )
+                },
+            )
+        }
+        Event::JoinRequestRejected {
+            request_id, actor, ..
+        } => {
+            if !admin(actor)
+                || !cursor
+                    .join_requests
+                    .get(request_id)
+                    .is_some_and(|request| request.is_pending())
+            {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    super::super::set_join_request_rejected(
+                        next,
+                        request_id,
+                        actor,
+                        commit.committed_at,
+                    )
+                },
+            )
+        }
+        Event::JoinRequestCancelled {
+            request_id,
+            requester_agent_id,
+            ..
+        } => {
+            if *requester_agent_id != author
+                || !cursor.join_requests.get(request_id).is_some_and(|request| {
+                    request.is_pending() && request.requester_agent_id == *requester_agent_id
+                })
+            {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::NonMemberRequest,
+                |next| {
+                    super::super::set_join_request_cancelled(next, request_id, requester_agent_id)
+                },
+            )
         }
         _ => return None,
     }

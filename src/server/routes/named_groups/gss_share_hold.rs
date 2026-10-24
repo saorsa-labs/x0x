@@ -67,6 +67,11 @@ struct ExclusionHold {
     parent_state_hash: String,
     /// The secret epoch the exclusion rotates to.
     secret_epoch: u64,
+    /// #1533 rc19: the members that an evicted held removal or ban of this
+    /// epoch, or of an earlier epoch that the cap dropped, removes
+    /// ([`removes_share_actor`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +105,59 @@ pub(super) fn removal_epoch(event: &NamedGroupMetadataEvent) -> Option<u64> {
         | NamedGroupMetadataEvent::MemberBanned { secret_epoch, .. } => *secret_epoch,
         _ => None,
     }
+}
+
+/// The member that a held removal or ban takes off the roster.
+fn removal_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
+    match event {
+        NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+        | NamedGroupMetadataEvent::MemberBanned { agent_id, .. } => Some(agent_id),
+        _ => None,
+    }
+}
+
+/// #1533 rc19 (Codex P1): whether a held removal or ban of `group_key` at
+/// `share_epoch` or earlier removes `actor_hex`. The head stays at the
+/// parent while the removal waits, so the parent roster still lists the
+/// removed admin. Its share is not authorized: the verified removal's
+/// result does not list it, and a key it chose must not end the hold. A
+/// share of an earlier epoch is still checked on the parent roster. Call
+/// [`ensure_loaded`] first.
+pub(super) fn removes_share_actor(
+    state: &AppState,
+    group_key: &str,
+    actor_hex: &str,
+    share_epoch: u64,
+) -> bool {
+    let at_or_before = |epoch: Option<u64>| epoch.is_some_and(|epoch| epoch <= share_epoch);
+    let parked = state
+        .parked_gss_removals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .is_some_and(|list| {
+            list.iter().any(|entry| {
+                at_or_before(removal_epoch(&entry.event))
+                    && removal_target(&entry.event)
+                        .is_some_and(|target| target.eq_ignore_ascii_case(actor_hex))
+            })
+        });
+    parked
+        || state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_key)
+            .is_some_and(|list| {
+                list.iter().any(|hold| {
+                    hold.secret_epoch <= share_epoch
+                        && hold
+                            .removed
+                            .iter()
+                            .any(|member| member.eq_ignore_ascii_case(actor_hex))
+                })
+            })
 }
 
 /// Whether a held transition to `epoch` still holds `info`: this node
@@ -280,8 +338,12 @@ fn absorb(state: &AppState, file: HoldFile) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let list = lot.entry(file.group_key).or_default();
         for hold in file.exclusions {
-            if !list.contains(&hold) {
-                list.push(hold);
+            match list.iter_mut().find(|kept| {
+                kept.parent_state_hash == hold.parent_state_hash
+                    && kept.secret_epoch == hold.secret_epoch
+            }) {
+                Some(kept) => merge_removed(kept, hold.removed),
+                None => list.push(hold),
             }
         }
     }
@@ -397,8 +459,13 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let list = lot.entry(group_key.to_string()).or_default();
-    if list.contains(&hold) {
-        return false;
+    // One hold per parent and epoch; a second one adds its removed members.
+    if let Some(kept) = list.iter_mut().find(|kept| {
+        kept.parent_state_hash == hold.parent_state_hash && kept.secret_epoch == hold.secret_epoch
+    }) {
+        let before = kept.removed.len();
+        merge_removed(kept, hold.removed);
+        return kept.removed.len() != before;
     }
     list.push(hold);
     while list.len() > super::PARKED_ROLE_UPDATE_CAP {
@@ -409,12 +476,27 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
             .map(|(at, _)| at);
         match lowest {
             Some(at) => {
-                list.remove(at);
+                let dropped = list.remove(at);
+                // #1533 rc19: the removed members move to the next lowest
+                // hold. Its epoch is later, so it still ends no hold when
+                // they seal a share.
+                if let Some(next) = list.iter_mut().min_by_key(|kept| kept.secret_epoch) {
+                    merge_removed(next, dropped.removed);
+                }
             }
             None => break,
         }
     }
     true
+}
+
+/// Add `members` to `hold`'s removed members, once each.
+fn merge_removed(hold: &mut ExclusionHold, members: Vec<String>) {
+    for member in members {
+        if !hold.removed.contains(&member) {
+            hold.removed.push(member);
+        }
+    }
 }
 
 /// A parked removal or ban left the full parked list: keep its hold as an
@@ -435,6 +517,10 @@ pub(super) fn keep_evicted_removal(
             ExclusionHold {
                 parent_state_hash: parent,
                 secret_epoch,
+                removed: removal_target(event)
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect(),
             },
         );
     }
@@ -458,6 +544,7 @@ pub(super) async fn hold_exclusion(
         ExclusionHold {
             parent_state_hash: parent_state_hash.to_string(),
             secret_epoch,
+            removed: Vec::new(),
         },
     );
     drop(gss_gate);
