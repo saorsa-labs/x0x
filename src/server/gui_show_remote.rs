@@ -125,11 +125,16 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
                 return;
             };
             let request_id_hex = hex::encode(request_id);
+            let envelope = typed.sender;
+            let sender_machine = typed.machine_id;
+            // Release the serial inbox before the opener. The display wait
+            // is up to 2 s and must not hold the next DM.
+            finish(typed, DmTypedPayloadCompletion::Inserted);
             let outcome = deliver_remote_show(
                 state,
                 sender,
-                typed.sender,
-                typed.machine_id,
+                envelope,
+                sender_machine,
                 &route,
                 via_rider,
                 &request_id_hex,
@@ -142,11 +147,10 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
             detach_reply(
                 state,
                 ReplyJob::Result {
-                    to: typed.sender,
+                    to: envelope,
                     result,
                 },
             );
-            finish(typed, DmTypedPayloadCompletion::Inserted);
         }
     }
 }
@@ -712,6 +716,85 @@ mod adr_remote {
         assert!(cap.urls.lock().expect("urls").is_empty());
         let done = rx.await.expect("completion");
         assert!(done.is_ok());
+    }
+
+    /// A remote show releases the inbox before the opener returns.
+    ///
+    /// The opener blocks. The completion channel is the inbox release.
+    /// It must fire while the opener is still blocked.
+    #[tokio::test]
+    async fn remote_show_releases_the_inbox_before_the_opener_returns() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct HoldingOpener {
+            entered: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+
+        impl crate::gui::ShowOpener for HoldingOpener {
+            fn open(&self, _url: &str) -> bool {
+                self.entered.store(true, Ordering::Release);
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                true
+            }
+        }
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        state
+            .gui_show
+            .replace_opener_for_test(Arc::new(HoldingOpener {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }));
+        let sender = AgentId([0x46; 32]);
+        state.gui_show.trust_sender_for_test(&sender);
+        let now = unix_now_secs();
+        let payload = GuiShowDmRequest {
+            request_id: [8; 16],
+            view: "people".into(),
+            issued_at: now,
+            via_rider: false,
+            subject: [0; 32],
+            target: state.agent.machine_id(),
+        }
+        .to_dm_payload()
+        .expect("encode");
+        let (tx, rx) = oneshot::channel();
+        let typed = DmTypedPayload {
+            sender,
+            machine_id: MachineId([0x56; 32]),
+            payload,
+            verified: true,
+            trust_decision: None,
+            received_at_unix_ms: now.saturating_mul(1000),
+            request_id: [8; 16],
+            completion: Some(tx),
+        };
+        let task_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            handle_gui_show_typed(&task_state, typed).await;
+        });
+        let started = std::time::Instant::now();
+        while !entered.load(Ordering::Acquire) {
+            if started.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the opener did not start");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let done = tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+            .await
+            .expect("the inbox must be released while the opener is still blocked")
+            .expect("completion");
+        assert!(done.is_ok());
+        release.store(true, Ordering::Release);
+        task.await.expect("handler");
     }
 
     #[tokio::test]

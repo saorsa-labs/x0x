@@ -2750,6 +2750,84 @@ mod tests {
         Ok(())
     }
 
+    /// The stage has entered and is awaiting. A different machine then
+    /// replaces the admitted binding. The send refuses that machine.
+    #[tokio::test]
+    async fn show_for_a_machine_moved_during_stage_awaits_is_refused() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x91; 32]);
+        let selected = MachineId([0x92; 32]);
+        let moved = MachineId([0x93; 32]);
+        let stamp = unix_secs().saturating_mul(1000);
+        let caps = show_caps();
+        assert!(state
+            .agent
+            .capability_store()
+            .insert(agent, selected, caps.clone(), stamp));
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, selected, unix_secs())
+            .await;
+        assert!(
+            dispatch_names_machine(&state, &agent, &selected).await,
+            "admission must accept the selected machine"
+        );
+        let cache = state.agent.identity_discovery_cache();
+        let hold = cache.write().await;
+        let send_state = Arc::clone(&state);
+        let send = tokio::spawn(async move {
+            send_gui_dm(
+                &send_state,
+                &agent,
+                &selected,
+                b"show-during-await".to_vec(),
+                [0x94; 16],
+            )
+            .await
+        });
+        let started = std::time::Instant::now();
+        while !state.agent.show_stage_entered_for_test() {
+            if started.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the bound send did not enter the stage");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !send.is_finished(),
+            "the stage must still be awaiting when the binding moves"
+        );
+        assert!(
+            state
+                .agent
+                .capability_store()
+                .insert(agent, moved, caps, stamp.saturating_add(1),),
+            "the different machine must replace the admitted binding"
+        );
+        drop(hold);
+        let err = send
+            .await
+            .expect("send task")
+            .expect_err("a machine that moved during the stage awaits is not a destination");
+        match err {
+            crate::dm::DmError::RecipientUndiscovered(message) => {
+                assert!(
+                    message.contains("selected machine changed before the show send"),
+                    "{message}"
+                );
+            }
+            other => panic!("a moved machine must fail closed, got {other}"),
+        }
+        assert_eq!(
+            state
+                .agent
+                .capability_store()
+                .lookup_binding(&agent)
+                .map(|binding| binding.machine_id),
+            Some(moved)
+        );
+        Ok(())
+    }
+
     /// A result that is already waiting is kept when the gossip ACK times out.
     #[tokio::test]
     async fn show_result_arrives_when_the_ack_times_out() -> anyhow::Result<()> {

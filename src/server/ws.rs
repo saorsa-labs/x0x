@@ -1490,10 +1490,13 @@ async fn handle_ws_connection(
         return;
     };
     let call_forwarder = armed.forwarder;
-    // `gui=1` means the tab is visible at connect. A later hide records
-    // that instant. It does not clear `last_gui_visible_at`.
+    // `gui=1` means the tab wants to be visible at connect. Stamp that
+    // only when this socket holds a live GUI session, the same gate as
+    // reveal and hide. An agent socket with `gui=1` and no session does
+    // not count. A later hide records that instant. It does not clear
+    // `last_gui_visible_at`.
     if visible_gui.load(Ordering::Acquire) {
-        note_gui_tab_visible(&state);
+        note_connected_gui_visibility(&state, &session_id).await;
     }
 
     tracing::info!(session_id = %session_id, direct_mode, "WebSocket session opened");
@@ -2465,6 +2468,22 @@ fn live_gui_session(state: &AppState, session: &WsSession) -> bool {
     session.visible_with_live_session(|token| state.sessions.is_valid(token, now))
 }
 
+/// Stamp visibility for a `gui=1` connect when that socket is a live GUI.
+///
+/// [`handle_ws_connection`] calls this after the session is inserted.
+/// The session must be visible and hold a token the store still accepts.
+async fn note_connected_gui_visibility(state: &AppState, session_id: &str) {
+    let live = state
+        .ws_sessions
+        .read()
+        .await
+        .get(session_id)
+        .is_some_and(|session| live_gui_session(state, session));
+    if live {
+        note_gui_tab_visible(state);
+    }
+}
+
 /// Record the last time a GUI tab became visible.
 ///
 /// Hiding a live tab and disconnecting its socket store that later instant
@@ -3232,6 +3251,58 @@ mod tests {
         assert!(
             (disconnect_at..=disconnect_end).contains(&closed),
             "disconnecting a live tab must store that instant, got {closed}"
+        );
+    }
+
+    /// `/ws?gui=1` stamps visibility only for a live GUI session.
+    ///
+    /// An agent socket can connect with `gui=1` and no session token.
+    /// That socket uses the same gate as reveal and hide.
+    #[tokio::test]
+    async fn gui_connect_without_a_live_session_does_not_stamp_visibility() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        assert!(state.gui_show.last_gui_visible_at().is_none());
+        state
+            .ws_sessions
+            .write()
+            .await
+            .insert("agent-gui".to_string(), test_gui_ws_session("agent-gui"));
+        note_connected_gui_visibility(&state, "agent-gui").await;
+        assert!(
+            state.gui_show.last_gui_visible_at().is_none(),
+            "an agent socket with gui=1 and no session must not count as active"
+        );
+
+        let expired = state.sessions.issue(std::time::Instant::now());
+        state.sessions.expire_for_test(&expired);
+        state.ws_sessions.write().await.insert(
+            "expired-gui".to_string(),
+            test_live_gui_ws_session("expired-gui", &expired),
+        );
+        note_connected_gui_visibility(&state, "expired-gui").await;
+        assert!(
+            state.gui_show.last_gui_visible_at().is_none(),
+            "an expired GUI session must not stamp visibility at connect"
+        );
+
+        let token = state.sessions.issue(std::time::Instant::now());
+        state.ws_sessions.write().await.insert(
+            "live-gui".to_string(),
+            test_live_gui_ws_session("live-gui", &token),
+        );
+        let before = unix_secs_now();
+        note_connected_gui_visibility(&state, "live-gui").await;
+        let stamp = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("a live GUI session stamps visibility at connect");
+        let after = unix_secs_now();
+        assert!(
+            (before..=after).contains(&stamp),
+            "connect stamp {stamp} outside {before}..={after}"
         );
     }
 

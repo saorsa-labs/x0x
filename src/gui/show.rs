@@ -4,8 +4,10 @@
 //! the platform opener behind a test seam.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
 use std::future::Future;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,12 +24,14 @@ const RIDER_PRESENTED_SIGNERS: usize = 64;
 /// Subjects kept for one signer.
 const RIDER_PRESENTED_SUBJECTS: usize = 32;
 
-/// Replaces one remote show send. Production leaves the slot empty.
+/// Replaces one remote show send. Tests are the only callers.
+#[cfg(test)]
 type ShowSendHook = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>> + Send + Sync,
 >;
 
-/// Runs after admission and before the real send. Production leaves it empty.
+/// Runs after admission and before the real send. Tests are the only callers.
+#[cfg(test)]
 type ShowSendPrelude = Arc<dyn Fn() + Send + Sync>;
 
 /// Reply sends that may be in flight together.
@@ -439,20 +443,19 @@ pub struct GuiShowRuntime {
     rider_presented: Mutex<HashMap<[u8; 32], HashSet<[u8; 32]>>>,
     /// Rider shows refused for one `(envelope signer, subject)` pair.
     rider_pairs: Mutex<HashSet<([u8; 32], [u8; 32])>>,
-    /// Senders a test treats as owner-trusted. Production leaves this empty.
+    /// Senders a test treats as owner-trusted.
     ///
     /// The AppState test agent has no user key. Installing one starts
     /// owner sync, and that constructor dials.
+    #[cfg(test)]
     trusted_senders: Mutex<HashSet<AgentId>>,
     /// Replaces the remote show send when a test installs it.
-    ///
-    /// Production leaves this empty. The send function calls it and does
-    /// not branch on `cfg(test)`.
+    #[cfg(test)]
     send_hook: Mutex<Option<ShowSendHook>>,
     /// Runs after the selected machine is admitted and before the send.
     ///
-    /// Production leaves this empty. A test uses it to move the capability
-    /// binding in that gap.
+    /// A test uses it to move the capability binding in that gap.
+    #[cfg(test)]
     send_prelude: Mutex<Option<ShowSendPrelude>>,
     /// Test seam: milliseconds `send_show_result` waits before it returns.
     ///
@@ -506,8 +509,11 @@ impl GuiShowRuntime {
             untrusted_refusals: Mutex::new(UntrustedRefusalWindow::default()),
             rider_presented: Mutex::new(HashMap::new()),
             rider_pairs: Mutex::new(HashSet::new()),
+            #[cfg(test)]
             trusted_senders: Mutex::new(HashSet::new()),
+            #[cfg(test)]
             send_hook: Mutex::new(None),
+            #[cfg(test)]
             send_prelude: Mutex::new(None),
             #[cfg(test)]
             reply_delay_ms: std::sync::atomic::AtomicU64::new(0),
@@ -973,32 +979,54 @@ impl GuiShowRuntime {
 
     /// Whether a test opted this sender in as owner-trusted.
     ///
-    /// Production stays false. The receive path calls this instead of a
-    /// `cfg(test)` branch.
+    /// Production stays false. The set exists only in tests.
     pub(crate) fn trust_hook_allows(&self, agent: &AgentId) -> bool {
-        self.trusted_senders
-            .lock()
-            .map(|guard| guard.contains(agent))
-            .unwrap_or(false)
+        #[cfg(test)]
+        {
+            self.trusted_senders
+                .lock()
+                .map(|guard| guard.contains(agent))
+                .unwrap_or(false)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = agent;
+            false
+        }
     }
 
     /// Run a test send replacement. `None` means use the real send.
     pub(crate) async fn invoke_send_hook(&self) -> Option<Result<(), crate::dm::DmError>> {
-        let hook = self.send_hook.lock().ok().and_then(|guard| guard.clone())?;
-        Some(hook().await)
+        #[cfg(test)]
+        {
+            let hook = self.send_hook.lock().ok().and_then(|guard| guard.clone())?;
+            Some(hook().await)
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+            None
+        }
     }
 
     /// Run the post-admission test step. Production does nothing.
     pub(crate) fn invoke_send_prelude(&self) {
-        let Some(hook) = self
-            .send_prelude
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-        else {
-            return;
-        };
-        hook();
+        #[cfg(test)]
+        {
+            let Some(hook) = self
+                .send_prelude
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            else {
+                return;
+            };
+            hook();
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+        }
     }
 
     /// Opener for one launch.
