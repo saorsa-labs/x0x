@@ -1095,6 +1095,25 @@ impl PeerRelay {
         entry.recent_failures.push(now);
     }
 
+    /// Direct-DM failure samples for `peer` that are still inside
+    /// `fail_window`.
+    #[cfg(test)]
+    pub(crate) fn direct_failure_samples(&self, peer: &AgentId) -> usize {
+        let now = Instant::now();
+        let window = self.policy.fail_window;
+        let guard = self.lock();
+        guard
+            .get(&peer.0)
+            .map(|entry| {
+                entry
+                    .recent_failures
+                    .iter()
+                    .filter(|t| now.saturating_duration_since(**t) < window)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Record that a direct DM to `peer` succeeded. Clears the failure
     /// history; if the peer had crossed into relay mode, increments
     /// `direct_recovered_after_relay` — proving the fallback was
