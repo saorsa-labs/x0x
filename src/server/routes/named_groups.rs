@@ -16200,7 +16200,7 @@ pub(in crate::server) async fn create_named_group(
         }
         // #1604: a policy value this daemon does not know is refused.
         let Ok(explicit) = crate::wire_compat::reject_unknown("GroupPolicy", explicit) else {
-            return bad_request("unknown policy value");
+            return api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown policy value");
         };
         // ADR-0038 review fix 2: an explicit OwnerCertified(owner) claim is
         // only honored when THIS daemon's agent certificate actually chains
@@ -28940,7 +28940,7 @@ pub(in crate::server) async fn update_group_policy(
     }
     // #1604: a policy value this daemon does not know is refused.
     let Ok(new_policy) = crate::wire_compat::reject_unknown("GroupPolicy", new_policy) else {
-        return bad_request("unknown policy value");
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown policy value");
     };
 
     // ADR-0038 review B2: the OwnerCertified axis is IMMUTABLE once set —
@@ -36212,6 +36212,50 @@ pub(in crate::server) fn merge_home_suite_groups(
 /// Startup load for the durable group store: `named_groups.json` (the
 /// legacy-safe view every binary can parse) merged with the Home-Suite
 /// sidecar (the authoritative owner-certified state; issue #451).
+/// #1604: a saved group that holds a variant this build does not know (a
+/// role, state, policy or plane written by a newer build, read after a
+/// downgrade) is never loaded. Every live ingress already refuses such
+/// values, so this keeps the invariant "no in-memory group holds an
+/// `Unknown`", and no equality check on a policy or plane can fail open.
+/// The saved files are first copied to `*.unsupported-1604.bak` (once),
+/// so a later upgrade can restore the group. If the copy fails, startup
+/// fails loudly rather than lose the data.
+async fn quarantine_unsupported_saved_groups(
+    groups: &mut HashMap<String, x0x::groups::GroupInfo>,
+    named_groups_path: &FsPath,
+    sidecar_path: &FsPath,
+) -> Result<()> {
+    let unsupported: Vec<String> = groups
+        .iter()
+        .filter(|(_, info)| crate::wire_compat::reject_unknown("SavedGroupInfo", *info).is_err())
+        .map(|(id, _)| id.clone())
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    for path in [named_groups_path, sidecar_path] {
+        let backup = path.with_extension("unsupported-1604.bak");
+        if tokio::fs::try_exists(path).await.unwrap_or(false)
+            && !tokio::fs::try_exists(&backup).await.unwrap_or(false)
+        {
+            tokio::fs::copy(path, &backup).await.with_context(|| {
+                format!(
+                    "failed to preserve {} before quarantining unsupported groups",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    for group_id in unsupported {
+        groups.remove(&group_id);
+        tracing::warn!(
+            group_id = %group_id,
+            "startup: quarantined a saved named group that holds a variant this build does not know; the saved bytes are kept in *.unsupported-1604.bak"
+        );
+    }
+    Ok(())
+}
+
 pub(in crate::server) async fn load_named_groups_merged(
     named_groups_path: &FsPath,
     sidecar_path: &FsPath,
@@ -36229,6 +36273,7 @@ pub(in crate::server) async fn load_named_groups_merged(
         // process stopped, or the corrective re-save failed) — it is
         // excluded here so a restart can never resurrect it. The marker
         // stays until the next durable roster save clears it.
+        quarantine_unsupported_saved_groups(&mut merged, named_groups_path, sidecar_path).await?;
         for group_id in read_join_install_pending_markers(named_groups_path).await? {
             if merged.remove(&group_id).is_some() {
                 tracing::warn!(

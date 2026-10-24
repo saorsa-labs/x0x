@@ -1960,3 +1960,97 @@ async fn issue1103_all_clean_seal_does_not_publish_a_failed_clear() -> Result<()
 async fn issue1103_eviction_seal_does_not_publish_a_failed_clear() -> Result<()> {
     issue1103_seal_clear_failure(true).await
 }
+
+#[tokio::test]
+async fn unknown_policy_values_keep_http_422_on_both_policy_routes() -> Result<()> {
+    // WHY (#1604, Engineer ruling): an unknown policy string now decodes as
+    // `Unknown`, but the REST contract stays 422 and nothing changes.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "78".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let before = state.named_groups.read().await[&group_id].policy.clone();
+    let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
+        "read_access": "guests_with_cake"
+    }))?;
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        state.named_groups.read().await[&group_id].policy,
+        before,
+        "policy unchanged"
+    );
+
+    let req: CreateGroupRequest = serde_json::from_value(serde_json::json!({
+        "name": "g",
+        "policy": {
+            "discoverability": "hidden",
+            "admission": "invite_only",
+            "confidentiality": "quantum_sealed",
+            "read_access": "members_only",
+            "write_access": "members_only"
+        }
+    }))?;
+    let groups_before = state.named_groups.read().await.len();
+    let response = create_named_group(State(Arc::clone(&state)), Json(req))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(state.named_groups.read().await.len(), groups_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Result<()> {
+    // WHY (#1604, Codex P1): a saved group with an unknown read policy or
+    // secure plane (a newer build's state, read after a downgrade) must not
+    // load; equality checks on those fields would fail open. The saved
+    // bytes are preserved for a later upgrade.
+    let dir = tempfile::tempdir()?;
+    let named = dir.path().join("named_groups.json");
+    let sidecar = dir.path().join("home_suite_groups.json");
+    let creator = AgentKeypair::generate()?.agent_id();
+    let good = x0x::groups::GroupInfo::new("ok".into(), String::new(), creator, "aa".repeat(16));
+    let mut odd_policy = serde_json::to_value(&good)?;
+    odd_policy["policy"]["read_access"] = "guests_with_cake".into();
+    let mut odd_plane = serde_json::to_value(&good)?;
+    odd_plane["secure_plane"] = "quantum_plane".into();
+    let saved = serde_json::json!({
+        "good": serde_json::to_value(&good)?,
+        "odd_policy": odd_policy,
+        "odd_plane": odd_plane,
+    });
+    tokio::fs::write(&named, serde_json::to_vec(&saved)?).await?;
+
+    let loaded = load_named_groups_merged(&named, &sidecar).await?;
+    assert!(loaded.contains_key("good"));
+    assert!(
+        !loaded.contains_key("odd_policy"),
+        "unknown read access quarantined"
+    );
+    assert!(
+        !loaded.contains_key("odd_plane"),
+        "unknown plane quarantined"
+    );
+    let backup = tokio::fs::read(named.with_extension("unsupported-1604.bak")).await?;
+    assert_eq!(
+        backup,
+        tokio::fs::read(&named).await?,
+        "saved bytes preserved"
+    );
+    Ok(())
+}
