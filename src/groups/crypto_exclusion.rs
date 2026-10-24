@@ -120,6 +120,7 @@ impl CommitHeaderV1 {
 /// The crypto transition of one exclusion (§4: "TreeKEM commit and next
 /// epoch or GSS next secret epoch").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CryptoExclusionCryptoV1 {
     /// A TreeKEM removal of the target's retained leaf.
     TreeKem {
@@ -179,6 +180,7 @@ pub struct SignedCryptoExclusionV1 {
 /// typed reasons in logs and status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CryptoExclusionRefusal {
     /// Not an `X0XCE1` payload.
     WrongPrefix,

@@ -89,6 +89,7 @@ pub struct SignedCertificateRebindV1 {
 /// reason in logs, status and API refusals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CertificateRebindRefusal {
     /// Not an `X0XCRB1` payload.
     WrongPrefix,

@@ -97,6 +97,7 @@ pub fn request_backoff(attempts: u32) -> Duration {
 /// names are the typed reasons in logs and status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RecoveryRefusal {
     /// Not an `X0XGRC1` payload.
     WrongPrefix,
@@ -605,6 +606,7 @@ pub fn chain_position(
 
 /// A node's live containment (§3 "Recovery token and basis").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum RecoveryRef {
     /// A fork-quarantine marker, by its ADR 0067 identity fields.
     Marker {
@@ -740,6 +742,7 @@ impl RecoveryRef {
 
 /// What an admin's re-seat authorisation acts on (§3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ReseatBasis {
     /// One `RecoveryRef` the admin was told about.
     Ref(RecoveryRef),
@@ -1041,6 +1044,7 @@ pub struct AdminHead {
 /// Why a responder refuses (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AttestRefusalReason {
     /// The responder's own record is contained.
     AttesterQuarantined,
@@ -1076,6 +1080,7 @@ impl AttestRefusalReason {
 
 /// `group_attest_response` answers (§5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AttestAnswer {
     /// An ATA for the requester's head.
     Attested(Box<AdminTerminalAttestation>),
@@ -1123,6 +1128,7 @@ pub struct GroupAttestResponseV1 {
 
 /// One S3 direct message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum GroupRecoveryMessageV1 {
     /// `group_attest_request`.
     Request(GroupAttestRequestV1),
@@ -1509,6 +1515,7 @@ impl std::error::Error for GroupRecoveryDecodeError {}
 
 /// The phase of a subject's re-seat (§3 steps 1 to 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ReseatPhase {
     /// The journal is durable and the original record is still live (or
     /// its move aside is not yet durable). No staged join runs. A resume
@@ -2115,6 +2122,19 @@ pub fn promotion_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1533 rc18 (#1604 ruling): `GroupRecoveryMessageV1` and the enums it
+    /// carries are `#[non_exhaustive]`. The codec is postcard, which has no
+    /// catch-all variant, so a variant this node does not know is a typed
+    /// [`RecoveryRefusal::Malformed`], never a panic or a silent default.
+    #[test]
+    fn an_unknown_message_variant_is_a_typed_refusal() {
+        for variant in [0x40_u8, 0x7f] {
+            let mut payload = GROUP_RECOVERY_PREFIX.to_vec();
+            payload.extend([variant, 0, 0, 0]);
+            assert_eq!(decode_message(&payload), Err(RecoveryRefusal::Malformed));
+        }
+    }
 
     fn keypair() -> AgentKeypair {
         AgentKeypair::generate().expect("keypair")

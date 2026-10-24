@@ -55294,6 +55294,125 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// #1533 rc18 (Codex P1 at 7ca5841): A removes a member with a GSS
+    /// rotation, adds J, promotes J and goes offline. J's share reaches a
+    /// lagging survivor first; J is not on its roster. The survivor must
+    /// keep the share as a candidate, walk the add and the promotion,
+    /// install the removal with J's secret and reach A's last head. Before
+    /// the fix the share was dropped because J was not an Active member,
+    /// so the removal stayed parked.
+    #[tokio::test]
+    async fn rc18_gss_removal_catchup_with_a_new_admins_share_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("new-admin-share").await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let joiner_kp = crate::identity::AgentKeypair::generate()?;
+        let joiner = joiner_kp.agent_id();
+        let joiner_hex = hex::encode(joiner.as_bytes());
+        let mut added = f.committed.clone();
+        added.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        added.roster_revision = added.roster_revision.saturating_add(1);
+        let add_revision = added.roster_revision;
+        let add_commit =
+            seal_commit_owner_certified(&f.state, &mut added, &f.admin_kp, 2_000).await?;
+        let addition = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: add_revision,
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(add_commit),
+            reseat_mandate: None,
+        };
+        let mut promoted = added.clone();
+        promoted.set_member_role(&joiner_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 3_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: joiner_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+        let mut share = f.envelope_event.clone();
+        if let NamedGroupMetadataEvent::SecureShareDelivered { actor, .. } = &mut share {
+            *actor = joiner_hex.clone();
+        }
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(&f.state, share, joiner, true, None).await;
+        assert!(!refused.accepted, "J is not on this roster");
+        let _ = apply_named_group_metadata_event(&f.state, addition, admin, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert!(info.has_active_member(&joiner_hex), "J is seated");
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
+    /// #1533 rc18: a share from a sender that no held commit makes an
+    /// admin installs nothing. The candidate is kept, but the walk finds no
+    /// roster on which its sender is an admin, so the removal keeps
+    /// waiting and sends stay held.
+    #[tokio::test]
+    async fn rc18_gss_candidate_share_from_an_unseated_sender_installs_nothing() -> Result<()> {
+        let f = f1_gss_rotation_fixture("unseated-candidate").await?;
+        let admin = f.admin_kp.agent_id();
+        let stranger = crate::identity::AgentKeypair::generate()?.agent_id();
+        let mut share = f.envelope_event.clone();
+        if let NamedGroupMetadataEvent::SecureShareDelivered { actor, .. } = &mut share {
+            *actor = hex::encode(stranger.as_bytes());
+        }
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(&f.state, share, stranger, true, None).await;
+        assert!(!refused.accepted);
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_ne!(info.state_hash, f.committed_state_hash, "still parked");
+        }
+        assert!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None)
+                .await
+                .is_some(),
+            "sends stay held"
+        );
+        Ok(())
+    }
+
     /// #1533 rc17 (Codex P1 at 8459714): A removes a member with a GSS
     /// rotation, then C leaves by itself, then A promotes B and goes
     /// offline. A lagging survivor must walk past C's self-leave, install

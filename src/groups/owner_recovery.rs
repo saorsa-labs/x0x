@@ -100,6 +100,7 @@ pub struct RemovedSeatV1 {
 
 /// The crypto transition of the commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum OwnerRecoveryCryptoV1 {
     /// One TreeKEM removal commit per removed leaf, in [`OwnerRecoveryBodyV1::removed`]
     /// order; each advances the epoch by one.
@@ -158,6 +159,7 @@ pub struct SignedOwnerRecoveryV1 {
 
 /// One `X0XORC1` frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum OwnerRecoveryFrameV1 {
     /// The owner's mandate, sent to the promoted member.
     Mandate(SignedOwnerRecoveryMandateV1),
@@ -169,6 +171,7 @@ pub enum OwnerRecoveryFrameV1 {
 /// are the typed reasons; the last six are the §4b(1) refusals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum OwnerRecoveryRefusal {
     /// Not an `X0XORC1` payload.
     WrongPrefix,
@@ -932,6 +935,16 @@ pub fn receiver_upgrade_holders(
 mod tests {
     use super::*;
     use crate::groups::member::GroupMember;
+
+    /// #1533 rc18 (#1604 ruling): `OwnerRecoveryFrameV1` is
+    /// `#[non_exhaustive]`; on postcard an unknown variant is a typed
+    /// [`OwnerRecoveryRefusal::Malformed`].
+    #[test]
+    fn an_unknown_frame_variant_is_a_typed_refusal() {
+        let mut payload = OWNER_RECOVERY_PREFIX.to_vec();
+        payload.extend([0x7f_u8, 0, 0, 0]);
+        assert_eq!(decode_frame(&payload), Err(OwnerRecoveryRefusal::Malformed));
+    }
     use crate::groups::policy::GroupAdmission;
     use crate::identity::UserKeypair;
 
