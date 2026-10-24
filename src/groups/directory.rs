@@ -213,6 +213,10 @@ impl GroupCard {
     /// against the local roster view, and by
     /// [`GroupCard::replacement_verdict`] for cached cards.
     pub fn verify_signature(&self) -> Result<(), ApplyError> {
+        // #1604 G5: a policy variant this node does not know can never
+        // re-encode to the signed bytes. Refuse it before any signature work.
+        crate::wire_compat::reject_unknown("GroupCard", self)
+            .map_err(|e| ApplyError::InvalidSignature(e.to_string()))?;
         if self.signature.is_empty() || self.authority_public_key.is_empty() {
             return Err(ApplyError::InvalidSignature("missing signature".into()));
         }

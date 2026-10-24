@@ -793,6 +793,7 @@ pub(in crate::server) async fn delegate_group_authority(
         x0x::delegation::AuthorityScope::SendAs => {
             vec![x0x::delegation::DelegationVerb::SendPublicMessage]
         }
+        x0x::delegation::AuthorityScope::Unknown => return bad_request("unknown scope"),
     };
     let verbs = match &req.verbs {
         None => all_verbs,
@@ -861,6 +862,8 @@ pub(in crate::server) async fn delegate_group_authority(
             x0x::groups::GroupWriteAccess::AdminOnly => {
                 role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
             }
+            // #1604: an unknown write policy permits nothing.
+            x0x::groups::GroupWriteAccess::Unknown => false,
         };
         if !write_ok {
             return forbidden("write policy denies issuing delegations");

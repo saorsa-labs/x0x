@@ -435,7 +435,11 @@ pub(crate) fn decode_page(payload: &[u8]) -> Result<Option<RetainedPageV1>> {
     let Some(body) = payload.strip_prefix(PAGED_RETAINED_MAGIC) else {
         return Ok(None);
     };
-    bincode::deserialize(body).map(Some).map_err(KvError::from)
+    bincode::deserialize(body).map(Some).map_err(|e| {
+        // #1604: an unknown page variant is counted and logged.
+        let _ = crate::wire_compat::classify_bincode("RetainedPageV1", &e);
+        KvError::from(e)
+    })
 }
 
 pub(crate) fn split_image(image: &[u8], max_payload: usize) -> Result<Vec<Vec<u8>>> {

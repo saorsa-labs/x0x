@@ -1086,6 +1086,12 @@ fn validate_public_message_inner(
                 });
             }
         },
+        // #1604: an unknown write policy admits no author.
+        GroupWriteAccess::Unknown => {
+            return Err(IngestError::WritePolicyViolation {
+                policy: ctx.policy.write_access,
+            });
+        }
     }
 
     Ok(())

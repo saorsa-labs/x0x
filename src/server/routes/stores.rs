@@ -1010,7 +1010,9 @@ impl TreeKemGroupStoreProtector {
             x0x::groups::GroupWriteAccess::AdminOnly => {
                 member.role.at_least(x0x::groups::GroupRole::Admin)
             }
-            x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+            // #1604: an unknown write policy authorizes no writer.
+            x0x::groups::GroupWriteAccess::ModeratedPublic
+            | x0x::groups::GroupWriteAccess::Unknown => false,
         }
     }
 
@@ -1026,11 +1028,13 @@ impl TreeKemGroupStoreProtector {
         hasher.update(&[match info.policy.read_access {
             x0x::groups::GroupReadAccess::Public => 0,
             x0x::groups::GroupReadAccess::MembersOnly => 1,
+            x0x::groups::GroupReadAccess::Unknown => u8::MAX,
         }]);
         hasher.update(&[match info.policy.write_access {
             x0x::groups::GroupWriteAccess::MembersOnly => 0,
             x0x::groups::GroupWriteAccess::ModeratedPublic => 1,
             x0x::groups::GroupWriteAccess::AdminOnly => 2,
+            x0x::groups::GroupWriteAccess::Unknown => u8::MAX,
         }]);
         *hasher.finalize().as_bytes()
     }

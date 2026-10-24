@@ -20,6 +20,11 @@ pub enum GroupDiscoverability {
     ListedToContacts,
     /// Published to the public directory / gossip index.
     PublicDirectory,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Controls how new members are admitted.
@@ -52,6 +57,11 @@ pub enum GroupAdmission {
         #[serde(with = "crate::identity::user_id_hex")]
         UserId,
     ),
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl GroupAdmission {
@@ -76,6 +86,11 @@ pub enum GroupConfidentiality {
     MlsEncrypted,
     /// Signed but readable plaintext; anyone can read.
     SignedPublic,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Controls who can read group content.
@@ -88,6 +103,11 @@ pub enum GroupReadAccess {
     MembersOnly,
     /// Anyone can read.
     Public,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Controls who can write content to the group.
@@ -102,6 +122,11 @@ pub enum GroupWriteAccess {
     ModeratedPublic,
     /// Only admins/owner can write (announcement channel).
     AdminOnly,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Complete policy for a named group.

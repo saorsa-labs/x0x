@@ -979,8 +979,11 @@ async fn open_held_sealed(
             Ok(opened) if writer.is_some_and(|w| w != opened.author) => {
                 Err(TaskSealRejection::SenderMismatch)
             }
-            Ok(opened) => decode_delta::<TaskListDelta>(&opened.payload)
-                .map_err(|_| TaskSealRejection::OpenFailed),
+            Ok(opened) => decode_delta::<TaskListDelta>(&opened.payload).map_err(|e| {
+                // #1604: an unknown variant is counted and logged.
+                let _ = crate::wire_compat::classify_bincode("TaskListDelta", &e);
+                TaskSealRejection::OpenFailed
+            }),
             Err(e) => {
                 if let Some(gate) = gate {
                     if gate.suspended().await {
@@ -1892,6 +1895,9 @@ impl TaskListSync {
                         }
                     }
                     Err(e) => {
+                        // #1604: an unknown variant (for example a newer
+                        // `CheckboxState`) is counted as well as logged.
+                        let e = crate::wire_compat::classify_bincode("TaskListDelta", &e);
                         tracing::warn!("Failed to deserialize delta from topic: {}", e);
                     }
                 }
@@ -1943,7 +1949,11 @@ impl TaskListSync {
                     responder_cancel.cancel();
                     return;
                 };
-                let Ok(sync_msg) = bincode::deserialize::<TaskListSyncMessage>(&msg.payload) else {
+                // #1604: an unknown variant is counted and logged.
+                let Ok(sync_msg) = crate::wire_compat::decode_bincode::<TaskListSyncMessage>(
+                    "TaskListSyncMessage",
+                    &msg.payload,
+                ) else {
                     continue;
                 };
                 match sync_msg {

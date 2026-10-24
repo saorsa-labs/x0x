@@ -18,6 +18,11 @@ pub enum GroupRole {
     Moderator,
     Member,
     Guest,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl GroupRole {
@@ -25,14 +30,16 @@ impl GroupRole {
     pub const OWNER_ASSIGNMENT_ERROR: &'static str =
         "'owner' is a legacy role and cannot be assigned; valid roles: 'admin', 'member'";
 
-    /// Numeric rank: higher means more privileged.
+    /// Numeric rank: higher means more privileged. An unknown role (#1604)
+    /// ranks below `Guest`, so it satisfies no privilege check.
     fn rank(self) -> u8 {
         match self {
-            Self::Owner => 4,
-            Self::Admin => 3,
-            Self::Moderator => 2,
-            Self::Member => 1,
-            Self::Guest => 0,
+            Self::Owner => 5,
+            Self::Admin => 4,
+            Self::Moderator => 3,
+            Self::Member => 2,
+            Self::Guest => 1,
+            Self::Unknown => 0,
         }
     }
 
@@ -49,13 +56,16 @@ impl GroupRole {
             Self::Moderator => 2,
             Self::Member => 3,
             Self::Guest => 4,
+            // #1604: never signed. Decoders refuse an unknown role before
+            // any signature check.
+            Self::Unknown => u8::MAX,
         }
     }
 
     /// Returns true iff this role's privilege is at least `minimum`.
     #[must_use]
     pub fn at_least(self, minimum: Self) -> bool {
-        self.rank() >= minimum.rank()
+        self != Self::Unknown && self.rank() >= minimum.rank()
     }
 
     /// Returns true iff this role has strictly more privilege than `other`.
@@ -118,6 +128,11 @@ pub enum GroupMemberState {
     Pending,
     Removed,
     Banned,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// A single member entry in a group roster.

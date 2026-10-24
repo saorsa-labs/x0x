@@ -794,7 +794,9 @@ pub(in crate::server) fn decode_file_message(
         }
         return None;
     }
-    let payload = serde_json::from_slice(&message.payload).ok()?;
+    // #1604: an unknown `file-*` frame is counted and logged; other direct
+    // messages stay quiet.
+    let payload = crate::wire_compat::decode_json("FileMessage", "file-", &message.payload).ok()?;
     Some((&message.sender, payload))
 }
 

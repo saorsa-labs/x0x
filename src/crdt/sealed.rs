@@ -238,7 +238,20 @@ pub fn encode_sealed_task_record(
 /// plaintext delta, or garbage).
 #[must_use]
 pub fn decode_sealed_task_record(payload: &[u8]) -> Option<(PeerId, SealedTaskRecordBody)> {
-    let (peer, record) = crate::gossip::wire::decode_delta::<SealedTaskRecord>(payload).ok()?;
+    let (peer, record) = match crate::gossip::wire::decode_delta::<SealedTaskRecord>(payload) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            // #1604: a sealed record whose body variant this node does not
+            // know is counted and logged. Other payloads are not sealed
+            // records at all (the domain does not match), so they stay quiet.
+            let sealed = crate::gossip::wire::decode_delta::<Vec<u8>>(payload)
+                .is_ok_and(|(_, domain)| domain == SEALED_TASK_RECORD_DOMAIN);
+            if sealed {
+                let _ = crate::wire_compat::classify_bincode("SealedTaskRecordBody", &e);
+            }
+            return None;
+        }
+    };
     (record.domain == SEALED_TASK_RECORD_DOMAIN).then_some((peer, record.body))
 }
 

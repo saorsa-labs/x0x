@@ -1420,6 +1420,11 @@ pub(in crate::server) enum JoinRefusalReason {
     InviteEventBeforeCreation,
     InviteExpired,
     InviteNotAddressed,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl JoinRefusalReason {
@@ -1446,6 +1451,8 @@ impl JoinRefusalReason {
             Self::InviteEventBeforeCreation => "invite_event_before_creation",
             Self::InviteExpired => "invite_expired",
             Self::InviteNotAddressed => "invite_not_addressed",
+            // #1604: never signed; decoders refuse an unknown reason first.
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -2675,7 +2682,11 @@ pub(in crate::server) fn unsigned_group_cards_refused() -> u64 {
 /// One payload from the global discovery topic. The listener task calls
 /// this; tests call it directly.
 pub(in crate::server) async fn apply_global_discovery_payload(state: &AppState, payload: &[u8]) {
-    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(payload) else {
+    let Ok(event) = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>(
+        "NamedGroupMetadataEvent",
+        "",
+        payload,
+    ) else {
         return;
     };
     let NamedGroupMetadataEvent::GroupCardPublished { card, .. } = event else {
@@ -3212,7 +3223,8 @@ pub(in crate::server) async fn apply_listed_to_contacts_frame(
         return;
     }
     let json = &payload[LTC_CARD_FRAME_PREFIX.len()..];
-    let card: x0x::groups::GroupCard = match serde_json::from_slice(json) {
+    let card: x0x::groups::GroupCard = match crate::wire_compat::decode_json("GroupCard", "", json)
+    {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("C.2/LTC: malformed card JSON: {e}");
@@ -10178,8 +10190,12 @@ pub(in crate::server) fn decode_and_verify_v2(
     if !msg.verified {
         return Err("v2_signature_invalid");
     }
-    let decoded_event = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
-        .map_err(|_| "payload_deserialize_failed")?;
+    let decoded_event = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>(
+        "NamedGroupMetadataEvent",
+        "",
+        &msg.payload,
+    )
+    .map_err(|_| "payload_deserialize_failed")?;
     let signer = msg.sender.ok_or("no_v2_sender")?;
     let topic = msg.topic.clone();
     Ok((decoded_event, signer, topic))
@@ -16048,7 +16064,7 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         }
                         continue;
                     }
-                    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
+                    let Ok(event) = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>("NamedGroupMetadataEvent", "", &msg.payload) else { continue; };
                     let Some(apply_result) = apply_listener_metadata_event(
                         &state_for_task,
                         event,
@@ -16182,6 +16198,10 @@ pub(in crate::server) async fn create_named_group(
         if req.preset.is_some() {
             return bad_request("pass either `preset` or `policy`, not both");
         }
+        // #1604: a policy value this daemon does not know is refused.
+        let Ok(explicit) = crate::wire_compat::reject_unknown("GroupPolicy", explicit) else {
+            return bad_request("unknown policy value");
+        };
         // ADR-0038 review fix 2: an explicit OwnerCertified(owner) claim is
         // only honored when THIS daemon's agent certificate actually chains
         // to that owner — otherwise any token holder could mint and
@@ -17641,6 +17661,10 @@ pub(in crate::server) async fn send_group_public_message(
                 if !ok {
                     return forbidden("admin-only write policy");
                 }
+            }
+            // #1604: an unknown write policy permits no send.
+            x0x::groups::GroupWriteAccess::Unknown => {
+                return forbidden("unknown write policy");
             }
         }
         let direct_recipients = info
@@ -19106,7 +19130,11 @@ pub(in crate::server) async fn spawn_global_public_message_listener(
                 maybe = sub.recv() => {
                     let Some(gossip_msg) = maybe else { break; };
                     let msg: x0x::groups::GroupPublicMessage =
-                        match serde_json::from_slice(&gossip_msg.payload) {
+                        match crate::wire_compat::decode_json(
+                            "GroupPublicMessage",
+                            "",
+                            &gossip_msg.payload,
+                        ) {
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::debug!("E: dropped malformed global public msg: {e}");
@@ -19176,7 +19204,11 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                 maybe = sub.recv() => {
                     let Some(gossip_msg) = maybe else { break; };
                     let msg: x0x::groups::GroupPublicMessage =
-                        match serde_json::from_slice(&gossip_msg.payload) {
+                        match crate::wire_compat::decode_json(
+                            "GroupPublicMessage",
+                            "",
+                            &gossip_msg.payload,
+                        ) {
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::debug!("E: dropped malformed public msg: {e}");
@@ -19387,7 +19419,7 @@ pub(in crate::server) async fn mint_invite_transaction(
     // joiner rides the record and is compared at consumption.
     let signed_link = match origin {
         x0x::groups::InviteOrigin::Card => Some(link.clone()),
-        x0x::groups::InviteOrigin::Explicit => None,
+        x0x::groups::InviteOrigin::Explicit | x0x::groups::InviteOrigin::Unknown => None,
     };
     next.record_issued_invite_v2(
         invite.invite_secret.clone(),
@@ -28906,6 +28938,10 @@ pub(in crate::server) async fn update_group_policy(
     if let Some(w) = req.write_access {
         new_policy.write_access = w;
     }
+    // #1604: a policy value this daemon does not know is refused.
+    let Ok(new_policy) = crate::wire_compat::reject_unknown("GroupPolicy", new_policy) else {
+        return bad_request("unknown policy value");
+    };
 
     // ADR-0038 review B2: the OwnerCertified axis is IMMUTABLE once set —
     // an admin (even a compromised one) must not be able to swap the group
@@ -31156,6 +31192,9 @@ pub(in crate::server) async fn create_discovery_subscription(
                 x0x::groups::ShardKind::Tag => x0x::groups::normalize_tag(k),
                 x0x::groups::ShardKind::Name => k.trim().to_lowercase(),
                 x0x::groups::ShardKind::Id => k.to_string(),
+                x0x::groups::ShardKind::Unknown => {
+                    return bad_request("kind must be 'tag', 'name', or 'id'");
+                }
             };
             (x0x::groups::shard_of(kind, &normalised), Some(normalised))
         }
@@ -32017,6 +32056,8 @@ pub(in crate::server) async fn secure_group_encrypt(
                 .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
                 .unwrap_or(false),
             x0x::groups::GroupWriteAccess::ModeratedPublic => true,
+            // #1604: an unknown write policy permits nothing.
+            x0x::groups::GroupWriteAccess::Unknown => false,
         };
         if !role_ok {
             return forbidden("sub-agent lacks the required roster role in this group");

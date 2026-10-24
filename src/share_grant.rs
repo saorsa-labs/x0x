@@ -449,8 +449,14 @@ impl ShareGrant {
         if body.len() > MAX_SHARE_GRANT_BYTES {
             return Err(ShareGrantError::Malformed("oversized".into()));
         }
-        let grant: Self = strict_decode(body, MAX_SHARE_GRANT_BYTES as u64)
-            .map_err(|e| ShareGrantError::Malformed(format!("decode: {e}")))?;
+        // #1604: an unknown `Grantee` or `ShareCap` variant is counted and
+        // logged by `wire_compat`; the grant is refused.
+        let grant: Self = strict_decode(body, MAX_SHARE_GRANT_BYTES as u64).map_err(|e| {
+            ShareGrantError::Malformed(format!(
+                "decode: {}",
+                crate::wire_compat::classify_bincode("ShareGrant", &e)
+            ))
+        })?;
         let canonical = bincode::serialize(&grant)
             .map_err(|e| ShareGrantError::Malformed(format!("re-encode: {e}")))?;
         if canonical != body {
@@ -1946,7 +1952,7 @@ impl crate::Agent {
         // still gets the error (a 5xx), and a retry rewrites both files.
         if let Some(rt) = &self.gossip_runtime {
             let records = self.revocation_set.read().await.share_grant_records();
-            if let Ok(bytes) = bincode::serialize(&records) {
+            if let Ok(bytes) = crate::revocation::encode_revocation_batch(&records) {
                 let _ = rt
                     .pubsub()
                     .publish(

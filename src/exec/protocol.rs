@@ -224,7 +224,11 @@ pub fn decode_frame_payload(payload: &[u8]) -> Result<ExecFrame, ProtocolError> 
     let Some(frame_bytes) = payload.strip_prefix(EXEC_DM_PREFIX) else {
         return Err(ProtocolError::MissingPrefix);
     };
-    bincode::deserialize(frame_bytes).map_err(|e| ProtocolError::Decode(e.to_string()))
+    // #1604: an unknown frame, warning or denial variant is counted and
+    // logged. No refusal is sent: the request id of a frame this node
+    // cannot decode is not known.
+    crate::wire_compat::decode_bincode("ExecFrame", frame_bytes)
+        .map_err(|e| ProtocolError::Decode(e.to_string()))
 }
 
 #[cfg(test)]

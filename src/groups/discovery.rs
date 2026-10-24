@@ -71,6 +71,11 @@ pub enum ShardKind {
     Tag,
     Name,
     Id,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl ShardKind {
@@ -81,6 +86,9 @@ impl ShardKind {
             Self::Tag => TAG_DOMAIN,
             Self::Name => NAME_DOMAIN,
             Self::Id => ID_DOMAIN,
+            // #1604: matches no real shard. Directory decoders refuse an
+            // unknown kind before it is used.
+            Self::Unknown => b"x0x-group-unknown",
         }
     }
 
@@ -91,6 +99,7 @@ impl ShardKind {
             Self::Tag => "tag",
             Self::Name => "name",
             Self::Id => "id",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -269,8 +278,13 @@ impl DirectoryMessage {
     }
 
     /// Parse an incoming payload.
+    ///
+    /// #1604: a message with a variant this node does not know (top level
+    /// or nested, such as a card's policy) is an error, counted and logged
+    /// by `wire_compat`, before any signature check.
     pub fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        crate::wire_compat::decode_json("DirectoryMessage", "", bytes)
+            .map_err(<serde_json::Error as serde::de::Error>::custom)
     }
 }
 

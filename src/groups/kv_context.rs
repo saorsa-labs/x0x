@@ -84,7 +84,8 @@ impl GssState {
                 .member_roles
                 .get(agent)
                 .is_some_and(|role| role.at_least(GroupRole::Admin)),
-            GroupWriteAccess::ModeratedPublic => false,
+            // #1604: an unknown write policy authorizes no writer.
+            GroupWriteAccess::ModeratedPublic | GroupWriteAccess::Unknown => false,
         }
     }
 
@@ -144,7 +145,8 @@ impl PublicState {
                 .writers
                 .get(agent)
                 .is_some_and(|role| role.at_least(GroupRole::Admin)),
-            GroupWriteAccess::ModeratedPublic => false,
+            // #1604: an unknown write policy authorizes no writer.
+            GroupWriteAccess::ModeratedPublic | GroupWriteAccess::Unknown => false,
         }
     }
 
@@ -153,6 +155,8 @@ impl PublicState {
             && match self.read_access {
                 GroupReadAccess::Public => true,
                 GroupReadAccess::MembersOnly => self.writers.contains_key(agent),
+                // #1604: an unknown read policy authorizes no reader.
+                GroupReadAccess::Unknown => false,
             }
     }
 
@@ -166,11 +170,13 @@ impl PublicState {
         hasher.update(&[match self.read_access {
             GroupReadAccess::Public => 0,
             GroupReadAccess::MembersOnly => 1,
+            GroupReadAccess::Unknown => u8::MAX,
         }]);
         hasher.update(&[match self.write_access {
             GroupWriteAccess::MembersOnly => 0,
             GroupWriteAccess::ModeratedPublic => 1,
             GroupWriteAccess::AdminOnly => 2,
+            GroupWriteAccess::Unknown => u8::MAX,
         }]);
         *hasher.finalize().as_bytes()
     }

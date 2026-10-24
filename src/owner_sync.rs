@@ -408,6 +408,11 @@ impl VersionedRecord {
     /// variant disagree; [`SyncError::MalformedFrame`] when the key exceeds
     /// [`MAX_KEY_BYTES`].
     pub fn verify(&self) -> Result<(), SyncError> {
+        // #1604 G5: a value holding a variant this node does not know (for
+        // example a Home policy) can never re-encode to the signed bytes.
+        // Refuse it before any signature work.
+        crate::wire_compat::reject_unknown("SyncValue", &self.value)
+            .map_err(|e| SyncError::UnsupportedVariant(e.to_string()))?;
         if self.value.kind() != self.kind {
             return Err(SyncError::KindMismatch);
         }
@@ -601,6 +606,10 @@ pub enum SyncError {
     UnknownKind {
         tag: u8,
     },
+    /// A frame or record value with a variant this node does not know
+    /// (#1604). Refused before any signature check; the session answers
+    /// with an `Abort` frame.
+    UnsupportedVariant(String),
     /// Store cardinality limit exceeded ([`MAX_STORED_RECORDS`]).
     StoreLimit(String),
     /// Inbound batch/vector exceeded its session cap.
@@ -628,6 +637,7 @@ impl SyncError {
             Self::BadSignature(_) => "bad_signature",
             Self::KindMismatch => "kind_mismatch",
             Self::UnknownKind { .. } => "unknown_kind",
+            Self::UnsupportedVariant(_) => "unsupported_variant",
             Self::StoreLimit(_) => "store_limit",
             Self::TooManyRecords(_) => "too_many_records",
             Self::Poisoned(_) => "poisoned",
@@ -672,6 +682,7 @@ impl std::fmt::Display for SyncError {
             Self::UnknownKind { tag } => {
                 write!(f, "unknown sync kind tag 0x{tag:02x} (Tier-3 allowlist)")
             }
+            Self::UnsupportedVariant(e) => write!(f, "unsupported sync variant: {e}"),
             Self::Poisoned(e) => write!(
                 f,
                 "sync store poisoned (state replaced but not durable): {e}"
@@ -778,6 +789,9 @@ fn proof_message(
     msg
 }
 
+/// Time allowed to send the `Abort` refusal for an unsupported variant.
+const ABORT_SEND_BUDGET: Duration = Duration::from_secs(2);
+
 /// Write one frame: `u32` big-endian length + bincode body.
 ///
 /// # Errors
@@ -822,7 +836,14 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<SyncFrame,
     }
     let mut body = vec![0u8; len as usize];
     recv.read_exact(&mut body).await?;
-    bincode::deserialize(&body).map_err(|e| SyncError::MalformedFrame(format!("decode: {e}")))
+    crate::wire_compat::decode_bincode("SyncFrame", &body).map_err(|e| match e {
+        crate::wire_compat::WireDecodeError::UnknownVariant { .. } => {
+            SyncError::UnsupportedVariant(e.to_string())
+        }
+        crate::wire_compat::WireDecodeError::Malformed { detail, .. } => {
+            SyncError::MalformedFrame(format!("decode: {detail}"))
+        }
+    })
 }
 
 /// Outcome of one sync session, for surfaces and tests.
@@ -3160,7 +3181,7 @@ where
     // OUTSIDE it, after the timeout future has completed. Cancelling at the
     // budget can therefore never rip a persistence await out from under
     // commit_batch's rollback paths (review R3 finding 4).
-    let pending = tokio::time::timeout(
+    let negotiated = tokio::time::timeout(
         budget,
         negotiate_sync_session(
             send,
@@ -3173,7 +3194,20 @@ where
         ),
     )
     .await
-    .map_err(|_| SyncError::SessionTimeout)??;
+    .map_err(|_| SyncError::SessionTimeout)?;
+    let pending = match negotiated {
+        Ok(pending) => pending,
+        Err(err @ SyncError::UnsupportedVariant(_)) => {
+            // #1604: the typed refusal rides the existing `Abort` frame,
+            // best effort and bounded, so the peer learns why.
+            let abort = SyncFrame::Abort {
+                reason: err.class().to_string(),
+            };
+            let _ = tokio::time::timeout(ABORT_SEND_BUDGET, write_frame(send, &abort)).await;
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
     let owner_id = owner.user_id();
     // #1055 RC1: the commit re-validates the peer's admission AFTER the
     // commit locks are held — the pre-commit boundary inside

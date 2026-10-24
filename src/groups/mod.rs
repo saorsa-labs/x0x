@@ -194,6 +194,11 @@ pub enum InviteOrigin {
     Explicit,
     /// Auto-minted by `GET /agent/card?include_groups=true`.
     Card,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// #469 E3: hard cap on unconsumed + unexpired issued-invite records per
@@ -256,6 +261,11 @@ pub enum MemberPlacement {
     Pinned,
     /// Intended to follow the owner across machines (ADR-0037 roaming).
     Roaming,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// ADR-0038 Home metadata — carried by the auto-provisioned personal
@@ -1064,7 +1074,11 @@ impl GroupInfo {
             state_hash: String::new(),
             prev_state_hash: None,
             security_binding: match confidentiality {
-                GroupConfidentiality::MlsEncrypted => Some("gss:epoch=0".into()),
+                // #1604: an unknown confidentiality is treated as the most
+                // restrictive (encrypted) plane.
+                GroupConfidentiality::MlsEncrypted | GroupConfidentiality::Unknown => {
+                    Some("gss:epoch=0".into())
+                }
                 GroupConfidentiality::SignedPublic => None,
             },
             tags: Vec::new(),

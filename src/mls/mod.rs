@@ -40,6 +40,11 @@ pub enum SecureGroupPlane {
     /// Real RFC-9420 TreeKEM plane (`treekem`). FS + PCS.
     #[default]
     TreeKem,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Deterministic legacy-GSS bridge from an x0x [`AgentId`] (32 bytes) to a

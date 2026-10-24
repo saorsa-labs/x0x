@@ -28,6 +28,11 @@ const CHUNK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(in crate::server) enum ControlBlobKind {
     NamedGroupEvent,
     JoinResult,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -820,6 +825,8 @@ fn basic_reference_valid(reference: &ControlBlobRef) -> bool {
         && match reference.kind {
             ControlBlobKind::NamedGroupEvent => reference.join_attempt_id.is_none(),
             ControlBlobKind::JoinResult => reference.join_attempt_id.is_some(),
+            // #1604: a blob kind this node does not know is never fetched.
+            ControlBlobKind::Unknown => false,
         }
 }
 
@@ -1340,7 +1347,8 @@ async fn apply_fetched_blob(
     match reference.kind {
         ControlBlobKind::NamedGroupEvent => {
             let event: NamedGroupMetadataEvent =
-                serde_json::from_slice(&bytes).map_err(|_| "invalid named-group event")?;
+                crate::wire_compat::decode_json("NamedGroupMetadataEvent", "", &bytes)
+                    .map_err(|_| "invalid named-group event")?;
             if named_group_metadata_event_group_id(&event) != reference.group_id {
                 return Err("control blob event group mismatch");
             }
@@ -1349,7 +1357,8 @@ async fn apply_fetched_blob(
         }
         ControlBlobKind::JoinResult => {
             let result: JoinResultMessage =
-                serde_json::from_slice(&bytes).map_err(|_| "invalid join result")?;
+                crate::wire_compat::decode_json("JoinResultMessage", "", &bytes)
+                    .map_err(|_| "invalid join result")?;
             let JoinResultMessage::Result {
                 event,
                 chain,
@@ -1384,6 +1393,8 @@ async fn apply_fetched_blob(
             )
             .await;
         }
+        // #1604: `basic_reference_valid` refuses an unknown kind first.
+        ControlBlobKind::Unknown => return Err("unsupported control blob kind"),
     }
     Ok(())
 }

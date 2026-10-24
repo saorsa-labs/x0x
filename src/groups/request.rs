@@ -12,6 +12,11 @@ pub enum JoinRequestStatus {
     Approved,
     Rejected,
     Cancelled,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// A single join request submitted by an agent.

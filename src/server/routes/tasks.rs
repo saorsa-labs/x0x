@@ -385,7 +385,14 @@ impl GroupTaskDeltaProtector {
                             .ok_or_else(|| unavailable("TreeKEM group is not eligible"))?;
                     TaskListPlane::TreeKem(protector, stable)
                 }
+                x0x::mls::SecureGroupPlane::Unknown => {
+                    return Err(unavailable("group uses an unknown secure plane"));
+                }
             },
+            // #1604: no plane is chosen for an unknown confidentiality.
+            x0x::groups::GroupConfidentiality::Unknown => {
+                return Err(unavailable("group uses an unknown confidentiality"));
+            }
         };
         Ok((state, plane))
     }
@@ -1194,7 +1201,10 @@ fn may_write_group(info: &x0x::groups::GroupInfo, agent: &x0x::identity::AgentId
         x0x::groups::GroupWriteAccess::AdminOnly => {
             member.role.at_least(x0x::groups::GroupRole::Admin)
         }
-        x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+        // #1604: an unknown write policy authorizes no writer.
+        x0x::groups::GroupWriteAccess::ModeratedPublic | x0x::groups::GroupWriteAccess::Unknown => {
+            false
+        }
     }
 }
 

@@ -1707,8 +1707,14 @@ impl DmEnvelope {
                 MAX_ENVELOPE_BYTES
             )));
         }
-        postcard::from_bytes(bytes)
-            .map_err(|e| IdentityError::Serialization(format!("DM envelope decode: {e}")))
+        postcard::from_bytes(bytes).map_err(|e| {
+            // #1604: an unknown body or ACK-outcome variant is counted and
+            // logged, not dropped silently.
+            match crate::wire_compat::dm_envelope_unknown_variant(bytes) {
+                Some(unknown) => IdentityError::Serialization(format!("DM envelope: {unknown}")),
+                None => IdentityError::Serialization(format!("DM envelope decode: {e}")),
+            }
+        })
     }
 
     /// Dedupe key for this envelope.

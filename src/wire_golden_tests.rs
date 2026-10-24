@@ -468,3 +468,493 @@ fn stream_protocol_prefix_bytes_match_main() {
         assert_eq!(protocol as u8, byte, "{protocol:?}");
     }
 }
+
+// ───────── Unknown variants: typed, counted, never a panic (#1604) ─────────
+
+use crate::wire_compat::{
+    decode_bincode, decode_json, reject_unknown, unknown_variant_count, WireDecodeError,
+};
+
+/// A bincode enum value whose variant index no build has assigned.
+fn bincode_unknown_index() -> Vec<u8> {
+    let mut bytes = 0xfeed_u32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[0u8; 64]);
+    bytes
+}
+
+fn assert_unknown_bincode<T: DeserializeOwned + std::fmt::Debug>(wire_type: &'static str) {
+    let before = unknown_variant_count(wire_type);
+    let err = decode_bincode::<T>(wire_type, &bincode_unknown_index()).unwrap_err();
+    assert!(
+        matches!(err, WireDecodeError::UnknownVariant { .. }),
+        "{wire_type}: {err}"
+    );
+    assert_eq!(unknown_variant_count(wire_type), before + 1, "{wire_type}");
+}
+
+/// G1: every bincode/postcard message enum refuses an unknown variant index
+/// with a typed, counted error. None has a catch-all that could accept it.
+#[test]
+fn bincode_enums_refuse_unknown_variant_index() {
+    assert_unknown_bincode::<crate::owner_sync::SyncFrame>("u.SyncFrame");
+    assert_unknown_bincode::<crate::owner_sync::SyncValue>("u.SyncValue");
+    assert_unknown_bincode::<crate::owner_sync::SyncKind>("u.SyncKind");
+    assert_unknown_bincode::<crate::share_grant::Grantee>("u.Grantee");
+    assert_unknown_bincode::<crate::share_grant::ShareCap>("u.ShareCap");
+    assert_unknown_bincode::<crate::key_move::Placement>("u.Placement");
+    assert_unknown_bincode::<crate::key_move::MoveRecord>("u.MoveRecord");
+    assert_unknown_bincode::<crate::revocation::RevokedSubject>("u.RevokedSubject");
+    assert_unknown_bincode::<crate::crdt::sealed::SealedTaskRecordBody>("u.SealedTaskRecordBody");
+    assert_unknown_bincode::<crate::crdt::CheckboxState>("u.CheckboxState");
+    assert_unknown_bincode::<crate::crdt::provenance::OpKind>("u.OpKind");
+    assert_unknown_bincode::<crate::kv::encrypted::KvMutationKind>("u.KvMutationKind");
+    assert_unknown_bincode::<crate::kv::AccessPolicy>("u.AccessPolicy");
+    assert_unknown_bincode::<crate::kv::retained_paging::RetainedPageV1>("u.RetainedPageV1");
+    assert_unknown_bincode::<crate::exec::protocol::ExecFrame>("u.ExecFrame");
+    assert_unknown_bincode::<crate::exec::protocol::StreamKind>("u.StreamKind");
+    assert_unknown_bincode::<crate::exec::protocol::WarningKind>("u.WarningKind");
+    assert_unknown_bincode::<crate::exec::protocol::DenialReason>("u.DenialReason");
+    assert_unknown_bincode::<crate::mls::CommitOperation>("u.CommitOperation");
+}
+
+/// G3: a JSON unit enum decodes an unknown string as `Unknown`, which can
+/// never be encoded, and `reject_unknown` refuses it with a counted error.
+#[test]
+fn json_unit_enums_decode_unknown_and_refuse_it() {
+    fn check_unit<T>(wire_type: &'static str, unknown: T)
+    where
+        T: DeserializeOwned + Serialize + PartialEq + std::fmt::Debug,
+    {
+        let decoded: T = serde_json::from_str("\"brand_new_variant\"")
+            .unwrap_or_else(|e| panic!("{wire_type}: unknown string must decode: {e}"));
+        assert_eq!(decoded, unknown, "{wire_type}");
+        assert!(
+            serde_json::to_vec(&decoded).is_err(),
+            "{wire_type}: never encoded"
+        );
+        assert!(
+            bincode::serialize(&decoded).is_err(),
+            "{wire_type}: never encoded"
+        );
+        let before = unknown_variant_count(wire_type);
+        assert!(matches!(
+            reject_unknown(wire_type, decoded),
+            Err(WireDecodeError::UnknownVariant { .. })
+        ));
+        assert_eq!(unknown_variant_count(wire_type), before + 1, "{wire_type}");
+    }
+    use crate::groups::{
+        GroupAdmission, GroupConfidentiality, GroupDiscoverability, GroupMemberState,
+        GroupReadAccess, GroupRole, GroupWriteAccess, InviteOrigin, JoinRequestStatus,
+        MemberPlacement,
+    };
+    check_unit("u.GroupRole", GroupRole::Unknown);
+    check_unit("u.GroupMemberState", GroupMemberState::Unknown);
+    check_unit("u.GroupDiscoverability", GroupDiscoverability::Unknown);
+    check_unit("u.GroupAdmission", GroupAdmission::Unknown);
+    check_unit("u.GroupConfidentiality", GroupConfidentiality::Unknown);
+    check_unit("u.GroupReadAccess", GroupReadAccess::Unknown);
+    check_unit("u.GroupWriteAccess", GroupWriteAccess::Unknown);
+    check_unit("u.JoinRequestStatus", JoinRequestStatus::Unknown);
+    check_unit("u.ShardKind", crate::groups::discovery::ShardKind::Unknown);
+    check_unit("u.InviteOrigin", InviteOrigin::Unknown);
+    check_unit("u.MemberPlacement", MemberPlacement::Unknown);
+    check_unit("u.SecureGroupPlane", crate::mls::SecureGroupPlane::Unknown);
+    check_unit(
+        "u.AuthorityScope",
+        crate::delegation::AuthorityScope::Unknown,
+    );
+    check_unit(
+        "u.DelegationVerb",
+        crate::delegation::DelegationVerb::Unknown,
+    );
+}
+
+/// G3 over bincode: the unit enums that also travel in bincode records
+/// (Home roster, policy) map an unknown index to `Unknown` without reading
+/// a payload; `reject_unknown` then refuses the record.
+#[test]
+fn json_unit_enums_map_unknown_bincode_index_to_unknown() {
+    let role: crate::groups::GroupRole =
+        bincode::deserialize(&0xfeed_u32.to_le_bytes()).expect("unit Unknown");
+    assert_eq!(role, crate::groups::GroupRole::Unknown);
+    let policy = crate::groups::GroupPolicy::default();
+    let mut bytes = bincode::serialize(&policy).expect("policy");
+    bytes[..4].copy_from_slice(&0xfeed_u32.to_le_bytes());
+    let decoded: crate::groups::GroupPolicy =
+        bincode::deserialize(&bytes).expect("unit Unknown keeps the rest aligned");
+    assert_eq!(
+        decoded.discoverability,
+        crate::groups::GroupDiscoverability::Unknown
+    );
+    assert_eq!(decoded.admission, policy.admission);
+    assert!(reject_unknown("u.GroupPolicy", decoded).is_err());
+}
+
+/// Fail-closed consumers: an unknown role satisfies no privilege check.
+#[test]
+fn unknown_role_has_no_privilege() {
+    use crate::groups::GroupRole;
+    for minimum in [
+        GroupRole::Guest,
+        GroupRole::Member,
+        GroupRole::Moderator,
+        GroupRole::Admin,
+        GroupRole::Owner,
+    ] {
+        assert!(!GroupRole::Unknown.at_least(minimum), "{minimum:?}");
+        assert!(!GroupRole::Unknown.outranks(minimum), "{minimum:?}");
+    }
+    assert!(GroupRole::Guest.at_least(GroupRole::Guest));
+}
+
+/// G5: a delegation with an unknown scope or verb is refused before any
+/// signature check, with a typed error.
+#[test]
+fn delegation_with_unknown_verb_is_refused_before_signature() {
+    let json = serde_json::json!({
+        "delegation_id": "@b16:1",
+        "issued_at_ms": 1,
+        "task_ref": "@b32:2",
+        "from_agent": "@b32:3",
+        "to_agent": "@b32:4",
+        "authority_scope": "task_execute",
+        "verbs": ["claim", "teleport"],
+        "expiry_ms": 9,
+        "parent_delegation": null,
+        "depth": 1,
+        "group_id": "g",
+    });
+    let delegation: crate::delegation::Delegation =
+        serde_json::from_value(expand(&json)).expect("unknown verb decodes as Unknown");
+    let err = crate::delegation::validate_policy(&delegation).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported variant"),
+        "typed refusal, got {err}"
+    );
+}
+
+/// G4: JSON tagged message enums refuse an unknown tag with a typed,
+/// counted error.
+#[test]
+fn json_tagged_messages_refuse_unknown_tag() {
+    let before = unknown_variant_count("DirectoryMessage");
+    assert!(crate::groups::DirectoryMessage::decode(br#"{"m":"gossip_v9","x":1}"#).is_err());
+    assert!(
+        unknown_variant_count("DirectoryMessage") > before,
+        "DirectoryMessage counted"
+    );
+
+    let before = unknown_variant_count("u.GroupPublicMessageKind");
+    let err = decode_json::<crate::groups::public_message::GroupPublicMessageKind>(
+        "u.GroupPublicMessageKind",
+        "",
+        br#"{"kind":"poll"}"#,
+    )
+    .unwrap_err();
+    assert!(matches!(err, WireDecodeError::UnknownVariant { .. }));
+    assert_eq!(
+        unknown_variant_count("u.GroupPublicMessageKind"),
+        before + 1
+    );
+
+    // CallFrame: only the `x0x_call_*` family is counted.
+    let frame = crate::calls::CallFrame::Invite {
+        call_id: "ab".repeat(16),
+        media: crate::calls::MediaKinds {
+            audio: true,
+            video: false,
+        },
+    };
+    let encoded = frame.encode().expect("encode");
+    let text = String::from_utf8_lossy(&encoded).replace("x0x_call_invite", "x0x_call_teleport");
+    let before = unknown_variant_count("CallFrame");
+    assert!(crate::calls::CallFrame::decode(text.as_bytes()).is_none());
+    assert!(
+        unknown_variant_count("CallFrame") > before,
+        "CallFrame counted"
+    );
+
+    // FileMessage: only the `file-*` family is counted.
+    let before = unknown_variant_count("FileMessage");
+    assert!(decode_json::<crate::files::FileMessage>(
+        "FileMessage",
+        "file-",
+        br#"{"type":"file-teleport","transfer_id":"t"}"#
+    )
+    .is_err());
+    let counted = unknown_variant_count("FileMessage");
+    assert!(counted > before, "FileMessage counted");
+    assert!(decode_json::<crate::files::FileMessage>(
+        "FileMessage",
+        "file-",
+        br#"{"type":"something-else"}"#
+    )
+    .is_err());
+    assert_eq!(
+        unknown_variant_count("FileMessage"),
+        counted,
+        "another family is not counted"
+    );
+}
+
+/// A nested unknown (a card's policy) refuses the whole directory message
+/// before the card signature is checked.
+#[test]
+fn directory_card_with_unknown_policy_is_refused() {
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture_path("DirectoryMessage")).expect("fixture"),
+    )
+    .expect("json");
+    let mut card_msg = fixture["cases"][0]["input"].clone();
+    card_msg["card"]["policy_summary"]["read_access"] = Value::from("guests_with_cake");
+    let bytes = serde_json::to_vec(&card_msg).expect("bytes");
+    assert!(crate::groups::DirectoryMessage::decode(&bytes).is_err());
+    let before = unknown_variant_count("u.DirectoryCard");
+    assert!(matches!(
+        decode_json::<crate::groups::DirectoryMessage>("u.DirectoryCard", "", &bytes),
+        Err(WireDecodeError::UnknownVariant { .. })
+    ));
+    assert_eq!(unknown_variant_count("u.DirectoryCard"), before + 1);
+}
+
+/// G1: a DM envelope whose body or ACK outcome variant is unknown is a
+/// counted, logged decode error, not a silent drop.
+#[test]
+fn dm_envelope_with_unknown_body_or_outcome_is_counted() {
+    let envelope = crate::dm::DmEnvelope {
+        protocol_version: 1,
+        request_id: [1; 16],
+        sender_agent_id: [2; 32],
+        sender_machine_id: [3; 32],
+        recipient_agent_id: [4; 32],
+        created_at_unix_ms: 300,
+        expires_at_unix_ms: 70_000,
+        body: crate::dm::DmBody::Ack(crate::dm::DmAckBody {
+            acks_request_id: [5; 16],
+            outcome: crate::dm::DmAckOutcome::Accepted,
+        }),
+        signature: vec![6],
+        origin_attestation: None,
+    };
+    let wire = envelope.to_wire_bytes().expect("encode");
+    assert!(crate::dm::DmEnvelope::from_wire_bytes(&wire).is_ok());
+    // Layout: version(1) + 16 + 96 + varint 300 (2) + varint 70000 (3).
+    let body_tag = 1 + 16 + 96 + 2 + 3;
+    assert_eq!(wire[body_tag], 1, "Ack body index");
+    let outcome_tag = body_tag + 1 + 16;
+    assert_eq!(wire[outcome_tag], 0, "Accepted outcome index");
+
+    let mut unknown_body = wire.clone();
+    unknown_body[body_tag] = 7;
+    let before = unknown_variant_count("DmBody");
+    let err = crate::dm::DmEnvelope::from_wire_bytes(&unknown_body).unwrap_err();
+    assert!(err.to_string().contains("unsupported variant"), "{err}");
+    assert!(unknown_variant_count("DmBody") > before, "DmBody counted");
+
+    let mut unknown_outcome = wire;
+    unknown_outcome[outcome_tag] = 9;
+    let before = unknown_variant_count("DmAckOutcome");
+    let err = crate::dm::DmEnvelope::from_wire_bytes(&unknown_outcome).unwrap_err();
+    assert!(err.to_string().contains("unsupported variant"), "{err}");
+    assert!(
+        unknown_variant_count("DmAckOutcome") > before,
+        "DmAckOutcome counted"
+    );
+}
+
+/// G1: a share grant with an unknown grantee variant is refused with a
+/// counted error.
+#[test]
+fn share_grant_with_unknown_grantee_is_refused() {
+    let grant = crate::share_grant::ShareGrant {
+        grant_id: [1; 32],
+        owner: crate::identity::UserId([2; 32]),
+        owner_public_key: Vec::new(),
+        grantee: crate::share_grant::Grantee::User(crate::identity::UserId([3; 32])),
+        agents: vec![crate::identity::AgentId([4; 32])],
+        caps: [crate::share_grant::ShareCap::Dm].into_iter().collect(),
+        not_before: 1,
+        expiry: 2,
+        signature: Vec::new(),
+    };
+    let mut payload = grant.to_dm_payload().expect("encode");
+    assert!(crate::share_grant::ShareGrant::from_dm_payload(&payload).is_ok());
+    let grantee_tag = crate::share_grant::SHARE_GRANT_DM_PREFIX.len() + 32 + 32 + 8;
+    payload[grantee_tag..grantee_tag + 4].copy_from_slice(&0xfeed_u32.to_le_bytes());
+    let before = unknown_variant_count("ShareGrant");
+    let err = crate::share_grant::ShareGrant::from_dm_payload(&payload).unwrap_err();
+    assert!(err.to_string().contains("unsupported variant"), "{err}");
+    assert!(
+        unknown_variant_count("ShareGrant") > before,
+        "ShareGrant counted"
+    );
+}
+
+/// G1 + reply path: an unknown `SyncFrame` is the typed
+/// `SyncError::UnsupportedVariant`, not `MalformedFrame`.
+#[tokio::test]
+async fn sync_frame_with_unknown_variant_is_typed() {
+    let body = bincode_unknown_index();
+    let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+    wire.extend_from_slice(&body);
+    let mut cursor = std::io::Cursor::new(wire);
+    let err = crate::owner_sync::read_frame(&mut cursor)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::owner_sync::SyncError::UnsupportedVariant(_)),
+        "{err}"
+    );
+}
+
+/// G5: an owner-signed Home record whose policy holds an unknown variant
+/// is refused before the signature check, with the typed error.
+#[test]
+fn owner_record_with_unknown_policy_is_refused_before_signature() {
+    let record = crate::owner_sync::VersionedRecord {
+        kind: crate::owner_sync::SyncKind::HomePointer,
+        key: "home".into(),
+        value: crate::owner_sync::SyncValue::HomePointer {
+            group_id: "g".into(),
+            policy: crate::groups::GroupPolicy {
+                read_access: crate::groups::GroupReadAccess::Unknown,
+                ..crate::groups::GroupPolicy::default()
+            },
+            roster: Vec::new(),
+            primary_agent: "p".into(),
+            provisioned_at_ms: 1,
+        },
+        clock: crate::owner_sync::RecordClock {
+            version: 1,
+            signed_at_ms: 2,
+            writer_machine: [3; 32],
+        },
+        owner_public_key: Vec::new(),
+        signature: Vec::new(),
+    };
+    let err = record.verify().unwrap_err();
+    assert!(
+        matches!(err, crate::owner_sync::SyncError::UnsupportedVariant(_)),
+        "{err}"
+    );
+}
+
+fn revocation(subject: crate::revocation::RevokedSubject) -> crate::revocation::RevocationRecord {
+    crate::revocation::RevocationRecord {
+        subject,
+        issuer_public_key: vec![7],
+        revoked_at: 8,
+        reason: None,
+        signature: vec![9],
+    }
+}
+
+/// G2: today's batches keep the legacy bytes exactly.
+#[test]
+fn revocation_batch_keeps_legacy_bytes_for_known_subjects() {
+    let records = vec![
+        revocation(crate::revocation::RevokedSubject::Agent(
+            crate::identity::AgentId([1; 32]),
+        )),
+        revocation(crate::revocation::RevokedSubject::Machine(
+            crate::identity::MachineId([2; 32]),
+        )),
+    ];
+    let encoded = crate::revocation::encode_revocation_batch(&records).expect("encode");
+    assert_eq!(encoded, bincode::serialize(&records).expect("legacy"));
+    assert_eq!(
+        crate::revocation::decode_revocation_batch(&encoded).expect("decode"),
+        records
+    );
+}
+
+/// G2: in a framed batch, one record with an unknown subject is skipped
+/// and counted; every other record is kept.
+#[test]
+fn framed_revocation_batch_skips_only_the_unknown_record() {
+    let first = revocation(crate::revocation::RevokedSubject::Agent(
+        crate::identity::AgentId([1; 32]),
+    ));
+    let last = revocation(crate::revocation::RevokedSubject::Machine(
+        crate::identity::MachineId([2; 32]),
+    ));
+    let mut unknown = bincode::serialize(&first).expect("record");
+    unknown[..4].copy_from_slice(&0xfeed_u32.to_le_bytes());
+    let elements = vec![
+        bincode::serialize(&first).expect("first"),
+        unknown,
+        bincode::serialize(&last).expect("last"),
+    ];
+    let mut framed = crate::revocation::REVOCATION_BATCH_FRAMED_MAGIC.to_vec();
+    framed.extend_from_slice(&bincode::serialize(&elements).expect("frame"));
+
+    let before = unknown_variant_count("RevocationRecord");
+    let decoded = crate::revocation::decode_revocation_batch(&framed).expect("decode");
+    assert_eq!(decoded, vec![first.clone(), last]);
+    assert!(
+        unknown_variant_count("RevocationRecord") > before,
+        "RevocationRecord counted"
+    );
+
+    // The same unknown record in a legacy batch fails the whole batch, as
+    // it always did, but now with a counted, typed error.
+    let mut legacy = bincode::serialize(&vec![first]).expect("legacy");
+    legacy[8..12].copy_from_slice(&0xfeed_u32.to_le_bytes());
+    let before = unknown_variant_count("RevocationBatch");
+    assert!(matches!(
+        crate::revocation::decode_revocation_batch(&legacy),
+        Err(WireDecodeError::UnknownVariant { .. })
+    ));
+    assert!(
+        unknown_variant_count("RevocationBatch") > before,
+        "RevocationBatch counted"
+    );
+
+    // A malformed element refuses the whole framed batch (fail closed).
+    let mut bad = crate::revocation::REVOCATION_BATCH_FRAMED_MAGIC.to_vec();
+    bad.extend_from_slice(&bincode::serialize(&vec![vec![1u8, 2, 3]]).expect("frame"));
+    assert!(matches!(
+        crate::revocation::decode_revocation_batch(&bad),
+        Err(WireDecodeError::Malformed { .. })
+    ));
+}
+
+/// G7: the closed sets keep their typed rejection and have no catch-all.
+#[test]
+fn closed_sets_stay_closed() {
+    for byte in [0x00u8, 0x07, 0xff] {
+        assert_eq!(
+            crate::streams::StreamProtocol::from_u8(byte),
+            None,
+            "{byte:#x}"
+        );
+    }
+    for byte in [0x00u8, 0x05, 0xff] {
+        assert_eq!(
+            crate::owner_sync::SyncKind::from_u8(byte),
+            None,
+            "{byte:#x}"
+        );
+    }
+}
+
+/// G8: `KvMutationKind` is `repr(u8)` with explicit discriminants, but serde
+/// encodes the variant index. Pin both, so a reorder cannot change bytes.
+#[test]
+fn kv_mutation_kind_index_and_discriminant_are_pinned() {
+    use crate::kv::encrypted::KvMutationKind;
+    for (kind, value) in [
+        (KvMutationKind::Delta, 0u8),
+        (KvMutationKind::FullState, 1),
+        (KvMutationKind::Control, 2),
+        (KvMutationKind::RetainedState, 3),
+    ] {
+        assert_eq!(kind as u8, value, "{kind:?} discriminant");
+        assert_eq!(
+            bincode::serialize(&kind).expect("encode"),
+            u32::from(value).to_le_bytes().to_vec(),
+            "{kind:?} variant index"
+        );
+    }
+}
