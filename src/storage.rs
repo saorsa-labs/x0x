@@ -1896,6 +1896,11 @@ pub async fn save_agent_certificate(cert: &AgentCertificate) -> Result<()> {
     write_private_file(&path, bytes).await
 }
 
+/// The default `agent.cert` path (`~/.x0x/agent.cert`).
+pub(crate) async fn default_agent_certificate_path() -> Result<std::path::PathBuf> {
+    Ok(x0x_dir().await?.join(AGENT_CERT_FILE))
+}
+
 /// Load an AgentCertificate from the default storage location (`~/.x0x/agent.cert`).
 pub async fn load_agent_certificate() -> Result<AgentCertificate> {
     let path = x0x_dir().await?.join(AGENT_CERT_FILE);

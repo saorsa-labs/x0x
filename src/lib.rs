@@ -620,6 +620,17 @@ fn pinned_standin_is_strict(agent: &identity::AgentId) -> bool {
         .is_ok_and(|agents| agents.contains(agent))
 }
 
+/// The result of [`Agent::adopt_own_certificate_renewal`]. Local only;
+/// never on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CertificateRenewalAdoption {
+    /// The renewal is on disk as `agent.cert` and is the certificate in use.
+    Adopted,
+    /// The renewal was refused; nothing changed.
+    Refused(identity::CertificateRenewalRefusal),
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -672,6 +683,13 @@ pub struct Agent {
     /// `None` when no user identity is configured. Written at cert-issue
     /// time; read by `GET /owner/agents` as the authoritative base roster.
     cert_journal_path: Option<std::path::PathBuf>,
+    /// Where this daemon's `agent.cert` lives; `None` without a user
+    /// identity. [`Agent::adopt_own_certificate_renewal`] writes an adopted
+    /// renewal here so a restart keeps it.
+    agent_cert_path: Option<std::path::PathBuf>,
+    /// Serializes [`Agent::adopt_own_certificate_renewal`]: the check, the
+    /// `agent.cert` write and the in-memory switch run as one step.
+    cert_adoption_lock: tokio::sync::Mutex<()>,
     /// Bootstrap peer cache for quality-based peer selection across restarts.
     bootstrap_cache: Option<std::sync::Arc<ant_quic::BootstrapCache>>,
     /// Gossip cache adapter wrapping bootstrap_cache with coordinator advert storage.
@@ -7604,6 +7622,95 @@ impl Agent {
     #[must_use]
     pub fn agent_certificate(&self) -> Option<&identity::AgentCertificate> {
         self.identity.agent_certificate()
+    }
+
+    /// Adopt a verified renewal of this daemon's OWN agent certificate
+    /// (#1357, ADR 0110 §4a run (6)).
+    ///
+    /// The renewal must pass
+    /// [`identity::Identity::check_agent_certificate_renewal`]: it binds
+    /// this agent, its owner signature verifies, the user in use issued
+    /// it, it has not expired, and it expires strictly later than the
+    /// certificate in use (never a downgrade). On a pass it is written
+    /// atomically to `agent.cert`, then it becomes the certificate in use
+    /// for every later announce, user announcement and cert-blob fetch.
+    /// The caller re-announces ([`Self::reannounce_identity_if_consented`]).
+    ///
+    /// Without this, a daemon never leaves a certificate that it loaded at
+    /// startup: after that certificate expires, every peer's pinned send
+    /// to this agent resolves no machine (ADR 0107/0115), even when an
+    /// owner has issued a renewal and an admin has committed it into the
+    /// agent's group seat.
+    ///
+    /// # Errors
+    /// The `agent.cert` write failed before its rename; the certificate in
+    /// use does not change. A failure after the rename (the directory
+    /// sync) still adopts, because the new bytes are on disk.
+    pub async fn adopt_own_certificate_renewal(
+        &self,
+        renewal: &identity::AgentCertificate,
+    ) -> error::Result<CertificateRenewalAdoption> {
+        // No path means no user identity, so no certificate to renew.
+        let Some(path) = self.agent_cert_path.as_deref() else {
+            return Ok(CertificateRenewalAdoption::Refused(
+                identity::CertificateRenewalRefusal::NoCurrentCertificate,
+            ));
+        };
+        let _guard = self.cert_adoption_lock.lock().await;
+        let now_unix = unix_now_secs_for_gc();
+        if let Err(refused) = self
+            .identity
+            .check_agent_certificate_renewal(renewal, now_unix)
+        {
+            return Ok(CertificateRenewalAdoption::Refused(refused));
+        }
+        let bytes = renewal.to_storage_bytes()?;
+        match storage::write_private_bytes_durable_typed(path, bytes).await {
+            Ok(()) => {}
+            Err(storage::DurableWriteError::AfterRename(e)) => {
+                tracing::warn!(
+                    "adopted agent certificate renewal is on disk without a directory sync: {e}"
+                );
+            }
+            Err(storage::DurableWriteError::BeforeRename(e)) => {
+                return Err(error::IdentityError::Storage(e));
+            }
+        }
+        if let Err(refused) = self
+            .identity
+            .adopt_agent_certificate_renewal(renewal.clone(), now_unix)
+        {
+            return Ok(CertificateRenewalAdoption::Refused(refused));
+        }
+        *self
+            .own_cert_pair
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (self.identity.user_id(), Some(renewal.clone()));
+        tracing::info!(
+            agent_id = %hex::encode(self.agent_id().as_bytes()),
+            not_after = ?renewal.not_after(),
+            "adopted a renewal of this agent's own certificate"
+        );
+        Ok(CertificateRenewalAdoption::Adopted)
+    }
+
+    /// Publish a fresh identity announcement with the certificate in use,
+    /// but only when the user has already consented to user-identity
+    /// disclosure ([`Self::announce_identity`] with consent). Without that
+    /// consent the heartbeat carries no certificate, so there is nothing
+    /// to refresh.
+    ///
+    /// # Errors
+    /// As [`Self::announce_identity`].
+    pub async fn reannounce_identity_if_consented(&self) -> error::Result<()> {
+        if !self
+            .user_identity_consented
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.announce_identity(true, true).await
     }
 
     /// Get the agent self-name (ADR-0036 `display_name`), if set.
@@ -22461,8 +22568,13 @@ impl AgentBuilder {
         // the agent certificate — written at issue time, read by
         // `GET /owner/agents` as the authoritative issuance record.
         let mut cert_journal_path: Option<std::path::PathBuf> = None;
+        let mut agent_cert_path: Option<std::path::PathBuf> = None;
         let identity = if let Some(user_kp) = user_keypair {
             let cert_path = self.agent_cert_path.clone();
+            agent_cert_path = match cert_path.as_ref() {
+                Some(p) => Some(p.clone()),
+                None => storage::default_agent_certificate_path().await.ok(),
+            };
             let existing_cert = if let Some(ref p) = cert_path {
                 if tokio::fs::try_exists(p).await.unwrap_or(false) {
                     storage::load_agent_certificate_from(p).await.ok()
@@ -23059,6 +23171,8 @@ impl AgentBuilder {
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
             self_name_ever_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cert_journal_path,
+            agent_cert_path,
+            cert_adoption_lock: tokio::sync::Mutex::new(()),
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,

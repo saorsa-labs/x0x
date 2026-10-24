@@ -1854,7 +1854,7 @@ self-rebind. `:agent_id` must be this daemon's own agent. Body (optional):
 {"certificate": "<base64 storage encoding, the certificate.storage_b64 of POST /owner/agents/issue>"}
 ```
 
-Without a body the daemon uses its loaded agent certificate. The
+Without a body the daemon uses the agent certificate it uses now. The
 **cutoff** is `not_after − τ` (τ = 300 s) of the seat's committed
 certificate, on this daemon's clock.
 
@@ -1875,6 +1875,35 @@ certificate, on this daemon's clock.
 Receivers refuse a frame with the same typed reasons, plus
 `rebind_digest_mismatch` when the seat's committed digest is not the old
 digest in the frame. Receivers do not enforce the cutoff.
+
+**Effect on this daemon's own certificate (#1357).** When the renewal
+passes the checks above (the `422` rows do not apply), the daemon also
+starts to use it as its own agent certificate. This occurs whatever the
+seat outcome is: `200`, `rebind_window_closed`, or a held rebind. It also
+occurs when this daemon receives a committed rebind of its own seat. The
+daemon adopts the renewal only if all of these are true:
+
+- it binds this daemon's own agent;
+- its owner signature verifies;
+- the user that issued the certificate in use issued it;
+- it is not expired;
+- its `not_after` is strictly later than the `not_after` of the
+  certificate in use. A certificate with no expiry counts as latest, so
+  the daemon never downgrades.
+
+The daemon writes the renewal atomically to `agent.cert`, so a restart
+keeps it. Its later announcements carry the renewal. If you consented to
+user-identity disclosure (`POST /announce` with both flags), the daemon
+re-announces at once. If a check fails, the daemon keeps its certificate,
+and the route response does not change.
+
+This is necessary for an expiring certificate. Before this change, the
+daemon used the certificate that it loaded at startup until a restart.
+After that certificate expired, the daemon announced an expired binding.
+Thus no peer's pinned send reached the daemon (ADR 0107/0115), and the
+designated admin's post-cutoff rebind never arrived. There is no change
+to the wire format, and there is no new route or field. The Engineer made
+this decision on 24 Oct 2026, and it is pending ZCode's concurrence.
 
 `GET /groups/:id` adds:
 

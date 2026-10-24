@@ -500,6 +500,9 @@ async fn commit_locked(
         "ADR 0110 S4: certificate rebind committed"
     );
     state.agent.s4_revocation_intake().request_reconcile();
+    if seat == local {
+        adopt_own_renewal(state, certificate).await;
+    }
     let task_state = Arc::clone(state);
     let card_key = group_key.to_string();
     let _spawned = state.spawn_detached(async move {
@@ -507,6 +510,36 @@ async fn commit_locked(
         drive_deliveries(&task_state).await;
     });
     Ok(next)
+}
+
+/// #1357 (ADR 0110 §4a run (6); Engineer call 24 Oct 2026, pending
+/// ZCode's concurrence): a verified renewal of this daemon's OWN
+/// certificate (the self-rebind route's body, or a committed rebind of its
+/// own seat) becomes the certificate in use when it expires strictly later
+/// ([`x0x::Agent::adopt_own_certificate_renewal`]), and the daemon
+/// re-announces it. Otherwise the daemon keeps announcing the certificate
+/// it loaded at startup; after that one expires, no peer's pinned send
+/// reaches it, so the admin's post-cutoff rebind frame never arrives.
+async fn adopt_own_renewal(state: &Arc<AppState>, certificate: &AgentCertificate) {
+    match state.agent.adopt_own_certificate_renewal(certificate).await {
+        Ok(x0x::CertificateRenewalAdoption::Adopted) => {
+            let task_state = Arc::clone(state);
+            let _spawned = state.spawn_detached(async move {
+                if let Err(error) = task_state.agent.reannounce_identity_if_consented().await {
+                    tracing::warn!("re-announce after certificate renewal failed: {error}");
+                }
+            });
+        }
+        Ok(x0x::CertificateRenewalAdoption::Refused(refused)) => {
+            tracing::debug!(
+                reason = refused.as_str(),
+                "own certificate renewal not adopted"
+            );
+        }
+        Err(error) => {
+            tracing::warn!("own certificate renewal not persisted: {error}");
+        }
+    }
 }
 
 // ─── Self-rebind route (§4a, §4b(2)) ───────────────────────────────────────
@@ -693,6 +726,9 @@ pub(in crate::server) async fn rebind_member_certificate(
             serde_json::json!({ "group_id": stable }),
         );
     }
+    // The renewal passed the receiver's owner-chain checks, so this daemon
+    // uses it from now on, whatever happens to the seat commit below.
+    adopt_own_renewal(&state, &certificate).await;
     let rule = self_rebind_rule(&info, &local, &seat, old_not_after, now_unix);
     let key = EvictionKey::new(stable.clone(), local);
     if rule == SelfRebindRule::HandOff {
@@ -1951,6 +1987,8 @@ pub(in crate::server) async fn receive(
         return ReceiveOutcome::LocalFailure;
     }
     let seat_hex = hex::encode(body.seat);
+    let own_renewal =
+        (body.seat == *state.agent.agent_id().as_bytes()).then(|| certificate.clone());
     let next = match ng::apply_stateful_event_with_evidence(
         state,
         &group_key,
@@ -1998,6 +2036,9 @@ pub(in crate::server) async fn receive(
         "ADR 0110 S4: certificate rebind installed"
     );
     drop(membership_guard);
+    if let Some(renewal) = own_renewal {
+        adopt_own_renewal(state, &renewal).await;
+    }
     // Later commits that queued behind this link can now chain.
     if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         ng::replay_pending_treekem_events(state, &group_key).await;
