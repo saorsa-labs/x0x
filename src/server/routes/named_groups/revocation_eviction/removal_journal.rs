@@ -179,7 +179,15 @@ impl RemovalBarrier {
 }
 
 /// Whether the live roster of `info`'s group is `info`'s sealed head.
+/// #1574 item 4: the read holds `named_groups_persistence_lock`, because
+/// `persist_named_group_info` shows its candidate in the map before the
+/// write and restores the map when the write fails. An unlocked read can
+/// decide on that candidate — a removal whose transaction rolls back would
+/// be recorded as committed and delivered. Under the lock the read sees
+/// only roster states a write already committed to (`Durable` or kept
+/// `ReplacedNotDurable`) or restored.
 async fn live_head_is(state: &AppState, info: &GroupInfo) -> bool {
+    let _committed = state.named_groups_persistence_lock.lock().await;
     state.named_groups.read().await.values().any(|group| {
         group.stable_group_id() == info.stable_group_id() && group.state_hash == info.state_hash
     })
@@ -1065,6 +1073,7 @@ mod tests {
                 &super::super::RetainedLeaves::default(),
                 &delivering,
                 super::super::now_unix_ms(),
+                true,
             );
             assert_eq!(
                 inner.store.get(&key).expect("row").phase,
@@ -1208,6 +1217,67 @@ mod tests {
             super::super::ManualRequestKind::Ban,
         )
         .await
+    }
+
+    /// #1574 item 4: the live-head read of the not-durable barrier must
+    /// not decide on a roster candidate that a failing write later rolls
+    /// back. `persist_named_group_info` shows its candidate in the map
+    /// before the write and restores the map when the write fails, so the
+    /// read holds the persistence lock and can never observe that window.
+    /// Before the fix the unlocked read saw the mid-write after-image, and
+    /// the barrier kept and delivered an event whose transaction rolled
+    /// back everywhere.
+    #[tokio::test]
+    async fn the_live_head_read_waits_out_a_candidate_that_rolls_back() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "b7".repeat(16);
+        let mut info = GroupInfo::new(
+            "s4-live-head".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        let mut candidate = info.clone();
+        candidate.state_hash = format!("{}-candidate", info.state_hash);
+        // The persist window: the candidate is visible in the map while
+        // the writer still holds the persistence lock.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate.clone());
+        let reader = {
+            let state = Arc::clone(&state);
+            let probe = candidate.clone();
+            tokio::spawn(async move { live_head_is(&state, &probe).await })
+        };
+        // An unlocked read would finish inside this window and see the
+        // candidate as the live head.
+        for _ in 0..60 {
+            if reader.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !reader.is_finished(),
+            "the live-head read must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state.named_groups.write().await.insert(group_id, info);
+        drop(guard);
+        assert!(
+            !reader.await.expect("the read finishes after the rollback"),
+            "a rolled-back candidate is not the live head"
+        );
+        Ok(())
     }
 
     #[tokio::test]

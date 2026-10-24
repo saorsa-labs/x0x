@@ -896,6 +896,15 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
 /// One worker pass: intake, scan, reconcile, evaluate. It never commits.
 pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     let groups = snapshot_groups(state).await;
+    // #1574 item 2: read AFTER the snapshot. A `ReplacedNotDurable`
+    // roster rename leaves a visible state a power loss can revert, so
+    // while this flag is set the pass must not end a group's local
+    // retention on that snapshot. Read after the snapshot it is safe in
+    // both orders: a clear means the confirming save made the visible
+    // roster (any absence in it) durable.
+    let roster_durability_confirmed = !state
+        .named_groups_requires_durability_confirmation
+        .load(std::sync::atomic::Ordering::Acquire);
     let leaves = snapshot_retained_leaves(state, &groups).await;
     let revocations =
         collect_verified_agent_revocations(state, revocation_seats(&groups, &leaves)).await;
@@ -982,6 +991,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         &delivering,
         now_unix_ms,
         memory_only,
+        roster_durability_confirmed,
     );
     // Rows loaded from an earlier boot resume their saved budget.
     let rows: Vec<(EvictionKey, u64)> = inner
@@ -1673,6 +1683,7 @@ fn reconcile_and_retain(
     delivering: &BTreeSet<EvictionKey>,
     now_unix_ms: u64,
     memory_only: bool,
+    roster_durability_confirmed: bool,
 ) {
     let open_before: Vec<EvictionKey> = inner
         .store
@@ -1680,7 +1691,14 @@ fn reconcile_and_retain(
         .filter(|row| row.phase.is_open())
         .map(ObligationRow::key)
         .collect();
-    if reconcile_completion(&mut inner.store, groups, leaves, delivering, now_unix_ms) {
+    if reconcile_completion(
+        &mut inner.store,
+        groups,
+        leaves,
+        delivering,
+        now_unix_ms,
+        roster_durability_confirmed,
+    ) {
         inner.dirty = true;
     }
     for key in open_before {
@@ -1756,13 +1774,16 @@ fn completed_with_retained_leaf(
 /// the retained commits prove a rotation after its departure
 /// ([`ce::gss_secret_excluded`]). A withdrawn group terminates its rows
 /// (`group_deleted`); a group this node no longer holds ends local
-/// retention. Returns whether the store changed.
+/// retention — only when `roster_durability_confirmed` says the snapshot
+/// reflects a durable roster (see [`revocation_eviction_pass`]). Returns
+/// whether the store changed.
 fn reconcile_completion(
     store: &mut ObligationStore,
     groups: &[(String, GroupInfo)],
     leaves: &RetainedLeaves,
     delivering: &BTreeSet<EvictionKey>,
     now_unix_ms: u64,
+    roster_durability_confirmed: bool,
 ) -> bool {
     let by_stable: HashMap<&str, &GroupInfo> = groups
         .iter()
@@ -1843,8 +1864,18 @@ fn reconcile_completion(
     for stable in withdrawn_groups {
         changed |= store.terminate_group(&stable) > 0;
     }
-    for stable in gone_groups {
-        changed |= store.forget_group(&stable) > 0;
+    // #1574 item 2: `forget_group` ends a group's local retention on the
+    // snapshot's absence, but a `ReplacedNotDurable` roster rename leaves
+    // a visible absence a power loss can revert, and the `.evs` rewrite
+    // that drops these rows is an independent write. While the flag is
+    // set the rows stay; a later pass forgets them. No tombstone is
+    // needed: the drop is re-derivable, so a crash between the durable
+    // absence and the `.evs` rewrite only resurrects rows the next pass
+    // forgets again.
+    if roster_durability_confirmed {
+        for stable in gone_groups {
+            changed |= store.forget_group(&stable) > 0;
+        }
     }
     changed
 }
@@ -3709,17 +3740,21 @@ async fn resume_crypto_exclusions(
         let Some(row) = store.get_mut(&key) else {
             continue;
         };
+        // The recipients of a resumed delivery: the Active members other
+        // than this node and the excluded target.
+        let recipients_of = |info: &GroupInfo| -> Vec<[u8; 32]> {
+            info.active_members()
+                .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
+                .map(|agent| *agent.as_bytes())
+                .filter(|id| *id != local && *id != key.target)
+                .collect()
+        };
         match classified {
             crypto_exclusion::SavedFrameState::CurrentHead => {
                 row.phase = Phase::CommittedDeliveryPending;
                 row.result_head = Some(result_head.clone());
                 row.outgoing_event = Some(frame.clone());
-                let recipients = info
-                    .active_members()
-                    .filter_map(|member| super::parse_agent_id_hex(&member.agent_id).ok())
-                    .map(|agent| *agent.as_bytes())
-                    .filter(|id| *id != local && *id != key.target)
-                    .collect();
+                let recipients = recipients_of(info);
                 crypto_exclusion::new_delivery(
                     ce_state,
                     &key,
@@ -3731,12 +3766,44 @@ async fn resume_crypto_exclusions(
                 );
             }
             crypto_exclusion::SavedFrameState::Superseded => {
-                // Completion is re-derived from the chain by the next
-                // pass; the obsolete delivery is discarded. The frame stays
-                // as §4 catch-up replay evidence (never resent live).
-                row.phase = Phase::CommittedDeliveryPending;
-                row.result_head = Some(result_head);
-                row.outgoing_event = Some(frame);
+                // #1574 item 3: a later commit that kept the rotated
+                // secret did not end this delivery in the live rule
+                // (`drive_deliveries` keeps it while the secret is
+                // current, because a GSS survivor installs the frame only
+                // with its sealed share). Restart the delivery the same
+                // way: its first synced round seals the share again, and
+                // the row completes on survivor convergence like every
+                // committed exclusion, not on the chain proof alone.
+                if crypto_exclusion::superseded_gss_delivery_kept(
+                    info,
+                    crypto_exclusion::frame_gss_epoch(&frame),
+                ) {
+                    row.phase = Phase::CommittedDeliveryPending;
+                    row.result_head = Some(result_head.clone());
+                    row.outgoing_event = Some(frame.clone());
+                    let recipients = recipients_of(info);
+                    crypto_exclusion::new_delivery(
+                        ce_state,
+                        &key,
+                        &result_head,
+                        next_revision,
+                        Arc::new(frame),
+                        recipients,
+                        true,
+                    );
+                } else {
+                    // A later epoch change ended it (the live rule drops
+                    // the delivery on the same condition): the frame is
+                    // old crypto material, never resent. The evidence is
+                    // enough — the result commit is on the verified chain,
+                    // the frame stays in the row as §4 catch-up evidence
+                    // (a catch-up ask serves it and re-seals the current
+                    // secret), and completion still needs the verified
+                    // rotation proof. The next pass re-derives it.
+                    row.phase = Phase::CommittedDeliveryPending;
+                    row.result_head = Some(result_head);
+                    row.outgoing_event = Some(frame);
+                }
             }
             crypto_exclusion::SavedFrameState::Abandoned => {
                 row.phase = Phase::Pending;
@@ -4904,7 +4971,8 @@ mod tests {
             &groups,
             &leaves,
             &BTreeSet::new(),
-            1
+            1,
+            true
         ));
         info.remove_member(&hex::encode(member), Some(hex::encode(admin)));
         // A GSS admin removal rotates the secret in its own commit: that
@@ -4919,7 +4987,8 @@ mod tests {
             &removed,
             &leaves,
             &delivering,
-            2
+            2,
+            true
         ));
         assert_eq!(store.get(&key).expect("row").phase, Phase::Pending);
         assert!(reconcile_completion(
@@ -4927,7 +4996,8 @@ mod tests {
             &removed,
             &leaves,
             &BTreeSet::new(),
-            2
+            2,
+            true
         ));
         assert_eq!(store.get(&key).expect("row").phase, Phase::Complete);
     }
@@ -4976,11 +5046,272 @@ mod tests {
             &groups,
             &RetainedLeaves::default(),
             &BTreeSet::new(),
-            1
+            1,
+            true
         ));
         let row = store.get(&key).expect("row");
         assert_eq!(row.phase, Phase::Terminated);
         assert_eq!(row.termination, Some(TerminationCause::GroupDeleted));
+    }
+
+    /// #1574 item 2: a group missing from the committed snapshot ends its
+    /// rows' local retention only when the roster durability is confirmed.
+    /// A `ReplacedNotDurable` absence can be reverted by power loss, and
+    /// the `.evs` rewrite that drops the rows is an independent write, so
+    /// before the fix the rows were dropped on absence evidence a power
+    /// loss could undo, with no tombstone to recover them.
+    #[test]
+    fn a_gone_group_keeps_its_rows_while_the_roster_durability_is_unconfirmed() {
+        let (admin, member) = ([1; 32], [2; 32]);
+        let info = group_with(admin, member);
+        let key = EvictionKey::new(info.stable_group_id(), member);
+        let mut store = ObligationStore::new();
+        store.intake(
+            &key,
+            EvictionTrigger::AgentRevocation {
+                record_hash: [7; 32],
+                record_bytes: vec![7],
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        // The snapshot holds no group: this node no longer belongs to it,
+        // but the roster write that removed it has not confirmed durability.
+        let groups: Vec<(String, GroupInfo)> = Vec::new();
+        assert!(
+            !reconcile_completion(
+                &mut store,
+                &groups,
+                &RetainedLeaves::default(),
+                &BTreeSet::new(),
+                1,
+                false
+            ),
+            "an unconfirmed roster ends no retention"
+        );
+        assert!(
+            store.get(&key).is_some_and(|row| row.phase.is_open()),
+            "the rows survive until the roster absence is durable"
+        );
+        // The confirming save landed: the absence is durable, the rows go.
+        assert!(reconcile_completion(
+            &mut store,
+            &groups,
+            &RetainedLeaves::default(),
+            &BTreeSet::new(),
+            2,
+            true
+        ));
+        assert!(
+            store.get(&key).is_none(),
+            "the durable absence forgets the rows"
+        );
+    }
+
+    // ─── #1574 item 3: restart of a superseded crypto-only exclusion ─────
+
+    /// One GSS `MlsEncrypted` group whose verified chain superseded a
+    /// saved crypto-only exclusion of `target` (parent `p`, result `r`):
+    /// a seated parent commit binding epoch 1, the exclusion's result
+    /// commit binding `result_epoch`, and a later head `c` binding
+    /// `head_epoch`. Returns the info and the saved exclusion frame.
+    fn gss_group_past_exclusion(
+        admin: x0x::identity::AgentId,
+        target: [u8; 32],
+        result_epoch: u64,
+        head_epoch: u64,
+    ) -> anyhow::Result<(GroupInfo, Vec<u8>)> {
+        let target_hex = hex::encode(target);
+        let admin_hex = hex::encode(admin.as_bytes());
+        let mut info = GroupInfo::new(
+            "s4-resume-gss".into(),
+            String::new(),
+            admin,
+            "e1".repeat(16),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.policy.confidentiality = x0x::groups::GroupConfidentiality::MlsEncrypted;
+        info.add_member(admin_hex.clone(), GroupRole::Admin, None, None);
+        info.add_member("f".repeat(32), GroupRole::Member, None, None);
+        info.add_member(target_hex.clone(), GroupRole::Member, None, None);
+        info.remove_member(&target_hex, Some(admin_hex));
+        let seated = |epoch: u64| {
+            let mut roster = BTreeMap::new();
+            roster.insert(
+                target_hex.clone(),
+                x0x::groups::state_commit::RosterMemberSnapshot {
+                    role: GroupRole::Member,
+                    state: x0x::groups::GroupMemberState::Active,
+                    treekem_key_package_hash: None,
+                    certificate_digest: None,
+                },
+            );
+            (roster, epoch)
+        };
+        let empty = |epoch: u64| (BTreeMap::new(), epoch);
+        let stable = info.stable_group_id().to_string();
+        let state_commit = |prev: &str, hash: &str, epoch: u64, revision: u64| {
+            x0x::groups::state_commit::GroupStateCommit {
+                group_id: stable.clone(),
+                revision,
+                prev_state_hash: Some(prev.to_string()),
+                roster_root: String::new(),
+                policy_hash: String::new(),
+                public_meta_hash: String::new(),
+                security_binding: Some(ce::gss_binding(epoch)),
+                state_hash: hash.to_string(),
+                withdrawn: false,
+                committed_by: String::new(),
+                committed_at: 0,
+                signer_public_key: String::new(),
+                signature: String::new(),
+            }
+        };
+        for (prev, hash, (roster, epoch)) in [
+            ("q", "p", seated(1)),
+            ("p", "r", empty(result_epoch)),
+            ("r", "c", empty(head_epoch)),
+        ] {
+            info.commit_log
+                .push(x0x::groups::state_commit::RetainedCommit {
+                    commit: state_commit(prev, hash, epoch, 1),
+                    roster,
+                    meta: None,
+                });
+        }
+        info.state_hash = "c".to_string();
+        info.security_binding = Some(ce::gss_binding(head_epoch));
+        info.secret_epoch = head_epoch;
+        // The saved exclusion frame `p` → `r` rotating to `result_epoch`.
+        // The resume only decodes it; the signature needs no standing.
+        let kp = x0x::identity::AgentKeypair::generate()?;
+        let body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: stable.clone(),
+            actor: *kp.agent_id().as_bytes(),
+            target,
+            prior_head: "p".to_string(),
+            prior_revision: 4,
+            next_revision: 5,
+            roster_revision: 5,
+            removal_proof_hash: [3; 32],
+            crypto: ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: result_epoch,
+            },
+            commit: ce::CommitHeaderV1::from(&state_commit("p", "r", result_epoch, 5)),
+        };
+        let frame = ce::sign(body, &kp).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok((
+            info,
+            ce::encode_frame(&frame).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ))
+    }
+
+    /// The `.evs` row of a saved exclusion this restart classifies.
+    fn row_past_exclusion(info: &GroupInfo, frame: Vec<u8>) -> (EvictionKey, ObligationStore) {
+        let key = EvictionKey::new(info.stable_group_id().to_string(), [0x6e; 32]);
+        let mut store = ObligationStore::new();
+        store.intake(
+            &key,
+            EvictionTrigger::SelfLeave {
+                commit_hash: "p".to_string(),
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        let row = store.get_mut(&key).expect("row");
+        row.phase = Phase::CommittedDeliveryPending;
+        row.outgoing_event = Some(frame);
+        (key, store)
+    }
+
+    /// #1574 item 3: the exclusion's result is on the chain and a later
+    /// roster-only commit superseded it, but the rotated secret is still
+    /// the current committed one. The live rule keeps that delivery (a GSS
+    /// survivor installs the frame only with its sealed share), so the
+    /// restart resumes it; the row then completes on survivor
+    /// convergence, not on the chain proof alone. Before the fix the row
+    /// had no delivery and the next pass completed it with no survivor
+    /// converged and no share re-sealed.
+    #[tokio::test]
+    async fn a_superseded_exclusion_of_the_current_secret_resumes_its_delivery(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let (info, frame) = gss_group_past_exclusion(state.agent.agent_id(), [0x6e; 32], 2, 2)?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("e1".repeat(16), info.clone());
+        let (key, mut store) = row_past_exclusion(&info, frame);
+        let mut ce_state = crypto_exclusion::CeState::default();
+        resume_crypto_exclusions(&state, &mut store, &HashMap::new(), &mut ce_state).await;
+        assert!(
+            ce_state.delivering().contains(&key),
+            "the superseded frame of the current secret resumes its delivery"
+        );
+        assert_eq!(
+            store.get(&key).expect("row").phase,
+            Phase::CommittedDeliveryPending
+        );
+        // The resumed delivery holds the completion: the rotation proof
+        // alone must not complete the row while no survivor converged.
+        let groups = snapshot_groups(&state).await;
+        let delivering = ce_state.delivering();
+        reconcile_completion(
+            &mut store,
+            &groups,
+            &RetainedLeaves::default(),
+            &delivering,
+            now_unix_ms(),
+            true,
+        );
+        assert_eq!(
+            store.get(&key).expect("row").phase,
+            Phase::CommittedDeliveryPending,
+            "no completion while the delivery runs"
+        );
+        // Without the delivery (the pre-fix shape) the same proof did
+        // complete the row — the failure this fix closes.
+        reconcile_completion(
+            &mut store,
+            &groups,
+            &RetainedLeaves::default(),
+            &BTreeSet::new(),
+            now_unix_ms(),
+            true,
+        );
+        assert_eq!(
+            store.get(&key).expect("row").phase,
+            Phase::Complete,
+            "the pre-fix shape completed on the chain proof alone"
+        );
+        // The control: a later rekey moved the committed epoch past the
+        // frame's rotation. The frame is old crypto material, so the
+        // restart keeps no delivery; the row keeps the frame as §4
+        // catch-up evidence.
+        let (info, frame) = gss_group_past_exclusion(state.agent.agent_id(), [0x6e; 32], 2, 3)?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("e1".repeat(16), info.clone());
+        let (key, mut store) = row_past_exclusion(&info, frame);
+        let mut ce_state = crypto_exclusion::CeState::default();
+        resume_crypto_exclusions(&state, &mut store, &HashMap::new(), &mut ce_state).await;
+        assert!(
+            ce_state.delivering().is_empty(),
+            "old crypto material is never delivered again"
+        );
+        let row = store.get(&key).expect("row");
+        assert_eq!(row.phase, Phase::CommittedDeliveryPending);
+        assert!(
+            row.outgoing_event.is_some(),
+            "the frame stays as catch-up evidence"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -5124,17 +5455,41 @@ mod tests {
         };
         let mut inner = fresh();
         let at = now * 1000;
-        reconcile_and_retain(&mut inner, &groups, &leaves, &BTreeSet::new(), at, false);
+        reconcile_and_retain(
+            &mut inner,
+            &groups,
+            &leaves,
+            &BTreeSet::new(),
+            at,
+            false,
+            true,
+        );
         let row = inner.store.get(&key).expect("the ended row is kept");
         assert_eq!(row.phase, Phase::Terminated);
         assert_eq!(row.termination, Some(TerminationCause::CertificateValid));
         assert!(inner.not_durable.contains_key(&key));
         // A later pass before the `.evs` write still keeps it.
-        reconcile_and_retain(&mut inner, &groups, &leaves, &BTreeSet::new(), at, false);
+        reconcile_and_retain(
+            &mut inner,
+            &groups,
+            &leaves,
+            &BTreeSet::new(),
+            at,
+            false,
+            true,
+        );
         assert!(inner.store.get(&key).is_some());
         // The `.evs` write covered it: the next pass drops it.
         inner.not_durable.clear();
-        reconcile_and_retain(&mut inner, &groups, &leaves, &BTreeSet::new(), at, false);
+        reconcile_and_retain(
+            &mut inner,
+            &groups,
+            &leaves,
+            &BTreeSet::new(),
+            at,
+            false,
+            true,
+        );
         assert!(inner.store.get(&key).is_none());
         // A memory-only sidecar never becomes durable: no hold.
         let mut memory_only = fresh();
@@ -5144,6 +5499,7 @@ mod tests {
             &leaves,
             &BTreeSet::new(),
             at,
+            true,
             true,
         );
         assert!(memory_only.store.get(&key).is_none());
@@ -6462,7 +6818,14 @@ mod tests {
         // No tree in `treekem_groups`.
         let leaves = snapshot_retained_leaves(&state, &groups).await;
         assert!(!leaves.known(&stable), "a missing tree is unknown");
-        reconcile_completion(&mut inner.store, &groups, &leaves, &BTreeSet::new(), 1);
+        reconcile_completion(
+            &mut inner.store,
+            &groups,
+            &leaves,
+            &BTreeSet::new(),
+            1,
+            true,
+        );
         assert!(
             inner.store.get(&key).is_some_and(|row| row.phase.is_open()),
             "no completion without the tree"
@@ -6480,7 +6843,14 @@ mod tests {
         assert!(inner.store.get(&key).is_some_and(|row| row.phase.is_open()));
         assert!(inner.not_durable.contains_key(&key));
         // The reopened row does not complete while the leaf is retained.
-        reconcile_completion(&mut inner.store, &groups, &restored, &BTreeSet::new(), 3);
+        reconcile_completion(
+            &mut inner.store,
+            &groups,
+            &restored,
+            &BTreeSet::new(),
+            3,
+            true,
+        );
         assert!(inner.store.get(&key).is_some_and(|row| row.phase.is_open()));
         Ok(())
     }
