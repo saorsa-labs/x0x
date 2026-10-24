@@ -459,7 +459,9 @@ pub fn next_gate_hash<'a>(
 /// §2 "Conflict" for one commit that advances the head to
 /// `link_state_hash`: under a recorded conflict it applies only when it is
 /// the next hash of the common prefix ([`conflict_gate_sequence`]). With
-/// the head off the active ATA's chain the conflict does not bound it.
+/// the head off the active ATA's chain there is no common prefix to
+/// extend, so nothing applies until a re-seat clears the conflict (fail
+/// closed, #1533 rc18).
 #[must_use]
 pub fn conflict_admits_link(
     active: &AdminTerminalAttestation,
@@ -467,7 +469,7 @@ pub fn conflict_admits_link(
     head_state_hash: &str,
     link_state_hash: &str,
 ) -> bool {
-    conflict_gate_sequence(active, conflict, head_state_hash).is_none_or(|prefix| {
+    conflict_gate_sequence(active, conflict, head_state_hash).is_some_and(|prefix| {
         next_gate_hash(&active.fields.from_state_hash, &prefix, head_state_hash)
             .is_some_and(|hash| hash == link_state_hash)
     })
@@ -2269,6 +2271,15 @@ mod tests {
         );
         // Off the chain (another record, e.g. after a re-seat): not armed.
         assert_eq!(conflict_gate_sequence(&active, &other, "z9"), None);
+        // #1533 rc18: an off-chain head under a recorded conflict admits
+        // nothing. Before the fix every next commit applied.
+        for link in ["h5", "h6", "x6", "z10"] {
+            assert!(
+                !conflict_admits_link(&active, &other, "z9", link),
+                "off-chain head admitted {link}"
+            );
+        }
+        assert!(conflict_admits_link(&active, &other, "h4", "h5"));
         // A recorded pair that agrees still stops at the head.
         let mut prefix = fields(&admin);
         prefix.sequence = vec!["h5".into()];

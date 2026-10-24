@@ -1302,19 +1302,14 @@ pub(super) async fn splice_authoritative_records(
 }
 
 /// The group's admin-armed state needs the placeholder: an armed admin ATA,
-/// an exhausted segment (the gate stays armed), or a recorded conflict on
-/// the active ATA's chain.
+/// an exhausted segment (the gate stays armed), or a recorded conflict. A
+/// conflict holds the gate closed past its common prefix wherever the head
+/// is, off the active ATA's chain included, until a re-seat clears it
+/// (#1533 rc18).
 async fn needs_placeholder(state: &AppState, info: &GroupInfo, body: &GroupRecoveryV1) -> bool {
-    if armed_admin_ata(state, info).await.is_some()
+    body.attestation_conflict.is_some()
+        || armed_admin_ata(state, info).await.is_some()
         || exhausted_segment(state, info).await.is_some()
-    {
-        return true;
-    }
-    matches!(
-        (body.active_ata.as_ref(), body.attestation_conflict.as_ref()),
-        (Some(active), Some(conflict))
-            if s3::conflict_gate_sequence(active, conflict, &info.state_hash).is_some()
-    )
 }
 
 /// Register `info`'s group as placeheld before the legacy write of an
@@ -8799,6 +8794,49 @@ mod tests {
         assert!(
             !conflict_admits_commit(&state, &info, &commit).await,
             "a conflict without its ATA admits nothing past the head"
+        );
+        Ok(())
+    }
+
+    /// #1533 rc18 Codex P1 (ADR 0109 §2 "Conflict"): with the head off the
+    /// active ATA's chain, a recorded conflict admits no commit past the
+    /// head, and the record stays placeheld. Before the fix the gate failed
+    /// open: every next commit applied. Inert.
+    #[tokio::test]
+    async fn a_conflict_admits_nothing_from_an_off_chain_head() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, ata) = marker_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let conflict = diverging(&ata);
+        let active = ata.clone();
+        assert!(
+            update_sidecar(&state, &stable, move |body| {
+                body.active_ata = Some(active);
+                body.attestation_conflict = Some(conflict);
+            })
+            .await
+        );
+        let mut off = info.clone();
+        off.state_hash = "off-chain-head".to_string();
+        let mut commit = off.terminal_commit_header();
+        commit.revision = off.state_revision + 1;
+        commit.prev_state_hash = Some(off.state_hash.clone());
+        for next in [
+            ata.fields.sequence.first().cloned().unwrap_or_default(),
+            "any-other-hash".to_string(),
+        ] {
+            commit.state_hash = next.clone();
+            assert!(
+                !conflict_admits_commit(&state, &off, &commit).await,
+                "an off-chain head admitted {next}"
+            );
+        }
+        let body = sidecar_snapshot(&state, &stable)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("sidecar"))?;
+        assert!(
+            needs_placeholder(&state, &off, &body).await,
+            "the conflict keeps the record placeheld"
         );
         Ok(())
     }
