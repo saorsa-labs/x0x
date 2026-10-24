@@ -57,11 +57,17 @@ pub const MAX_DELEGATION_DEPTH: u8 = 2;
 /// (ADR-0040 Decision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AuthorityScope {
     /// Execute task work on the referenced task (claim/complete).
     TaskExecute,
     /// Send group messages that carry the delegator's attribution.
     SendAs,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// A concrete verb the delegate may exercise. Bounded by [`AuthorityScope`]:
@@ -69,6 +75,7 @@ pub enum AuthorityScope {
 /// only under `send_as`. Cross-scope verbs are rejected at validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DelegationVerb {
     /// Claim the referenced task (`task_execute` only).
     Claim,
@@ -77,6 +84,11 @@ pub enum DelegationVerb {
     /// Publish a group public message attributed to the delegator
     /// (`send_as` only).
     SendPublicMessage,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl DelegationVerb {
@@ -86,6 +98,9 @@ impl DelegationVerb {
         match self {
             DelegationVerb::Claim | DelegationVerb::Complete => AuthorityScope::TaskExecute,
             DelegationVerb::SendPublicMessage => AuthorityScope::SendAs,
+            // #1604: an unknown verb has no known scope; `validate_policy`
+            // refuses it before any signature check.
+            DelegationVerb::Unknown => AuthorityScope::Unknown,
         }
     }
 }
@@ -182,6 +197,8 @@ pub fn canonical_delegation_bytes(d: &Delegation) -> Vec<u8> {
     out.push(match d.authority_scope {
         AuthorityScope::TaskExecute => 0,
         AuthorityScope::SendAs => 1,
+        // #1604: never signed; `validate_policy` refuses it first.
+        AuthorityScope::Unknown => u8::MAX,
     });
     out.push(d.verbs.len() as u8);
     for verb in &d.verbs {
@@ -189,6 +206,8 @@ pub fn canonical_delegation_bytes(d: &Delegation) -> Vec<u8> {
             DelegationVerb::Claim => 0,
             DelegationVerb::Complete => 1,
             DelegationVerb::SendPublicMessage => 2,
+            // #1604: never signed; `validate_policy` refuses it first.
+            DelegationVerb::Unknown => u8::MAX,
         });
     }
     out.extend_from_slice(&d.expiry_ms.to_be_bytes());
@@ -231,6 +250,13 @@ pub fn signed_delegation_digest(sd: &SignedDelegation) -> [u8; 32] {
 ///
 /// Returns [`DelegationError::Invalid`] on any structural policy violation.
 pub fn validate_policy(d: &Delegation) -> Result<(), DelegationError> {
+    // #1604 G5: a scope or verb from a newer peer is refused before the
+    // signature check. It can never re-encode to the signed bytes, and it
+    // grants nothing.
+    if d.authority_scope == AuthorityScope::Unknown || d.verbs.contains(&DelegationVerb::Unknown) {
+        let err = crate::wire_compat::note_unknown("Delegation", "authority scope or verb");
+        return Err(DelegationError::Invalid(err.to_string()));
+    }
     if d.depth == 0 {
         return Err(DelegationError::Invalid("depth must be >= 1".into()));
     }

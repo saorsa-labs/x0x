@@ -1,0 +1,34 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "Delta",
+      "variant": "Delta",
+      "wire": {
+        "bincode": "00000000"
+      }
+    },
+    {
+      "input": "FullState",
+      "variant": "FullState",
+      "wire": {
+        "bincode": "01000000"
+      }
+    },
+    {
+      "input": "Control",
+      "variant": "Control",
+      "wire": {
+        "bincode": "02000000"
+      }
+    },
+    {
+      "input": "RetainedState",
+      "variant": "RetainedState",
+      "wire": {
+        "bincode": "03000000"
+      }
+    }
+  ],
+  "type": "KvMutationKind"
+}

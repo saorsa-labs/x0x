@@ -1618,9 +1618,13 @@ impl ReseatJournalV1 {
         match live.secure_plane {
             crate::mls::SecureGroupPlane::TreeKem => has_tree,
             crate::mls::SecureGroupPlane::Gss => {
-                live.policy.confidentiality != crate::groups::GroupConfidentiality::MlsEncrypted
+                // #1604 G3: only a known `SignedPublic` group has no key to
+                // wait for; an unknown confidentiality needs one.
+                live.policy.confidentiality == crate::groups::GroupConfidentiality::SignedPublic
                     || live.shared_secret.is_some()
             }
+            // #1604 G3: an unknown plane seats nothing (fail closed).
+            crate::mls::SecureGroupPlane::Unknown => false,
         }
     }
 }

@@ -1,0 +1,22 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "mls_encrypted",
+      "variant": "MlsEncrypted",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"mls_encrypted\""
+      }
+    },
+    {
+      "input": "signed_public",
+      "variant": "SignedPublic",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"signed_public\""
+      }
+    }
+  ],
+  "type": "GroupConfidentiality"
+}

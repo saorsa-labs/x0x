@@ -123,7 +123,7 @@ pub(in crate::server) async fn ensure_task_list_access(
         return Err(forbidden("not a member of task-list group"));
     };
     let member = info.members_v2.get(&local_agent_hex);
-    let allowed = member.is_some_and(|m| matches!(m.state, x0x::groups::GroupMemberState::Active));
+    let allowed = member.is_some_and(x0x::groups::GroupMember::is_active);
     if allowed {
         Ok(())
     } else {
@@ -272,7 +272,7 @@ fn active_members_of(
 ) -> std::collections::HashSet<x0x::identity::AgentId> {
     let mut agents = std::collections::HashSet::new();
     for (agent_hex, member) in &info.members_v2 {
-        if matches!(member.state, x0x::groups::GroupMemberState::Active) {
+        if member.is_active() {
             if let Ok(bytes) = hex::decode(agent_hex) {
                 if bytes.len() == x0x::identity::PEER_ID_LENGTH {
                     let mut arr = [0u8; x0x::identity::PEER_ID_LENGTH];
@@ -385,7 +385,14 @@ impl GroupTaskDeltaProtector {
                             .ok_or_else(|| unavailable("TreeKEM group is not eligible"))?;
                     TaskListPlane::TreeKem(protector, stable)
                 }
+                x0x::mls::SecureGroupPlane::Unknown => {
+                    return Err(unavailable("group uses an unknown secure plane"));
+                }
             },
+            // #1604: no plane is chosen for an unknown confidentiality.
+            x0x::groups::GroupConfidentiality::Unknown => {
+                return Err(unavailable("group uses an unknown confidentiality"));
+            }
         };
         Ok((state, plane))
     }
@@ -1221,7 +1228,10 @@ fn may_write_group(info: &x0x::groups::GroupInfo, agent: &x0x::identity::AgentId
         x0x::groups::GroupWriteAccess::AdminOnly => {
             member.role.at_least(x0x::groups::GroupRole::Admin)
         }
-        x0x::groups::GroupWriteAccess::ModeratedPublic => false,
+        // #1604: an unknown write policy authorizes no writer.
+        x0x::groups::GroupWriteAccess::ModeratedPublic | x0x::groups::GroupWriteAccess::Unknown => {
+            false
+        }
     }
 }
 

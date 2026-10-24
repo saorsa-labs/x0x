@@ -69,6 +69,7 @@ pub struct MediaKinds {
 /// future frames still decode (additive contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum CallFrame {
     /// Caller → callee: ring.
     #[serde(rename = "x0x_call_invite")]
@@ -138,7 +139,9 @@ impl CallFrame {
     #[must_use]
     pub fn decode(payload: &[u8]) -> Option<Self> {
         let body = payload.strip_prefix(CALL_FRAME_PREFIX)?;
-        let frame: Self = serde_json::from_slice(body).ok()?;
+        // #1604: an unknown `x0x_call_*` frame is counted and logged; other
+        // signalling under the same prefix stays quiet.
+        let frame: Self = crate::wire_compat::decode_json("CallFrame", "x0x_call_", body).ok()?;
         is_valid_call_id(frame.call_id()).then_some(frame)
     }
 }

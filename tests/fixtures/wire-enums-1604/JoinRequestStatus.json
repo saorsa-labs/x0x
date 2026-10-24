@@ -1,0 +1,34 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "pending",
+      "variant": "Pending",
+      "wire": {
+        "json": "\"pending\""
+      }
+    },
+    {
+      "input": "approved",
+      "variant": "Approved",
+      "wire": {
+        "json": "\"approved\""
+      }
+    },
+    {
+      "input": "rejected",
+      "variant": "Rejected",
+      "wire": {
+        "json": "\"rejected\""
+      }
+    },
+    {
+      "input": "cancelled",
+      "variant": "Cancelled",
+      "wire": {
+        "json": "\"cancelled\""
+      }
+    }
+  ],
+  "type": "JoinRequestStatus"
+}

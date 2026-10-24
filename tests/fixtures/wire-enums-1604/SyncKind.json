@@ -1,0 +1,34 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "OwnerProfile",
+      "variant": "OwnerProfile",
+      "wire": {
+        "bincode": "00000000"
+      }
+    },
+    {
+      "input": "MachineNames",
+      "variant": "MachineNames",
+      "wire": {
+        "bincode": "01000000"
+      }
+    },
+    {
+      "input": "HomePointer",
+      "variant": "HomePointer",
+      "wire": {
+        "bincode": "02000000"
+      }
+    },
+    {
+      "input": "IssuanceJournal",
+      "variant": "IssuanceJournal",
+      "wire": {
+        "bincode": "03000000"
+      }
+    }
+  ],
+  "type": "SyncKind"
+}

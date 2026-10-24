@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::IdentityError;
 use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
+use crate::wire_compat::{self, WireDecodeError};
 
 /// Domain-separation prefix for the bytes a revocation signs over.
 const REVOCATION_MSG_PREFIX: &[u8] = b"x0x-revocation-v1";
@@ -110,6 +111,7 @@ pub struct AgentMachineBinding {
 
 /// The identity a revocation record targets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum RevokedSubject {
     /// A portable agent identity.
     Agent(AgentId),
@@ -627,6 +629,83 @@ fn subject_carrier(subject: &RevokedSubject) -> Option<u8> {
     })
 }
 
+/// Magic prefix of the per-record revocation batch framing (#1604 G2).
+///
+/// A legacy batch is `bincode(Vec<RevocationRecord>)`: a `u64` LE count,
+/// then the records back to back. One record with a subject variant that a
+/// receiver does not know makes the whole legacy batch undecodable. The
+/// framed batch is `MAGIC ‖ bincode(Vec<Vec<u8>>)`, one bincode record per
+/// element, so a receiver skips (and counts) only the record it cannot
+/// decode. Read as a legacy count, the magic is far above any legal batch
+/// size, so the two framings cannot be confused.
+pub(crate) const REVOCATION_BATCH_FRAMED_MAGIC: &[u8; 8] = b"x0xRVB02";
+
+/// `true` when every daemon since `origin/main` @ `545b781` decodes this
+/// subject. Deliberately exhaustive: a new subject variant must decide
+/// here, and it gets the framed batch.
+fn subject_in_legacy_batches(subject: &RevokedSubject) -> bool {
+    match subject {
+        RevokedSubject::Agent(_)
+        | RevokedSubject::Machine(_)
+        | RevokedSubject::AgentMachineBinding(_)
+        | RevokedSubject::ShareGrant(_) => true,
+    }
+}
+
+/// Encode a revocation batch for a carrier topic.
+///
+/// A batch whose subjects all predate #1604 keeps the legacy encoding,
+/// byte for byte, so older daemons still decode it. A batch with a newer
+/// subject uses the framed encoding ([`REVOCATION_BATCH_FRAMED_MAGIC`]).
+///
+/// # Errors
+/// The bincode encode error.
+pub(crate) fn encode_revocation_batch(
+    records: &[RevocationRecord],
+) -> Result<Vec<u8>, bincode::Error> {
+    if records
+        .iter()
+        .all(|record| subject_in_legacy_batches(&record.subject))
+    {
+        return bincode::serialize(records);
+    }
+    let framed = records
+        .iter()
+        .map(bincode::serialize)
+        .collect::<Result<Vec<Vec<u8>>, _>>()?;
+    let mut out = REVOCATION_BATCH_FRAMED_MAGIC.to_vec();
+    out.extend_from_slice(&bincode::serialize(&framed)?);
+    Ok(out)
+}
+
+/// Decode a revocation batch in either framing.
+///
+/// In a framed batch, a record with a subject variant this node does not
+/// know is skipped, counted and logged; every other record is kept, so
+/// revocation stays fail-closed for the subjects this node knows. A
+/// malformed record refuses the whole batch. A legacy batch decodes as a
+/// whole, as before; an unknown variant in it is counted and logged.
+///
+/// # Errors
+/// [`crate::wire_compat::WireDecodeError`].
+pub(crate) fn decode_revocation_batch(
+    payload: &[u8],
+) -> Result<Vec<RevocationRecord>, WireDecodeError> {
+    let Some(framed) = payload.strip_prefix(REVOCATION_BATCH_FRAMED_MAGIC.as_slice()) else {
+        return wire_compat::decode_bincode("RevocationBatch", payload);
+    };
+    let elements: Vec<Vec<u8>> = wire_compat::decode_bincode("RevocationBatchFramed", framed)?;
+    let mut records = Vec::with_capacity(elements.len());
+    for element in &elements {
+        match wire_compat::decode_bincode::<RevocationRecord>("RevocationRecord", element) {
+            Ok(record) => records.push(record),
+            Err(WireDecodeError::UnknownVariant { .. }) => {}
+            Err(malformed) => return Err(malformed),
+        }
+    }
+    Ok(records)
+}
+
 /// Record one remote carrier snapshot (#1116).
 ///
 /// A topic that is not a revocation carrier is ignored. A carrier that is
@@ -657,7 +736,7 @@ pub(crate) async fn arm_incoming_revocation_snapshot(
     if !set.read().await.carrier_resync_pending(carrier) {
         return;
     }
-    let Ok(records) = bincode::deserialize::<Vec<RevocationRecord>>(payload) else {
+    let Ok(records) = decode_revocation_batch(payload) else {
         return;
     };
     let trusted = {

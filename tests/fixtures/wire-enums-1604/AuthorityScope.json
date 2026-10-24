@@ -1,0 +1,20 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "task_execute",
+      "variant": "TaskExecute",
+      "wire": {
+        "json": "\"task_execute\""
+      }
+    },
+    {
+      "input": "send_as",
+      "variant": "SendAs",
+      "wire": {
+        "json": "\"send_as\""
+      }
+    }
+  ],
+  "type": "AuthorityScope"
+}

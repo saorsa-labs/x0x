@@ -192,6 +192,10 @@ pub(in crate::server) async fn run_direct_metadata_listener(
         let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
             continue; // not a named-group metadata event
         };
+        // #1604 G5: refuse a held unknown variant before any check.
+        let Ok(event) = crate::wire_compat::reject_unknown("NamedGroupMetadataEvent", event) else {
+            continue;
+        };
         tracing::debug!(
             target: "treekem.trace",
             stage = "direct_classified_metadata_event",

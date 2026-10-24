@@ -1,0 +1,48 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "dm",
+      "variant": "Dm",
+      "wire": {
+        "bincode": "00000000"
+      }
+    },
+    {
+      "input": "exec",
+      "variant": "Exec",
+      "wire": {
+        "bincode": "01000000"
+      }
+    },
+    {
+      "input": {
+        "connect": {
+          "ports": [
+            22,
+            8080
+          ]
+        }
+      },
+      "variant": "Connect",
+      "wire": {
+        "bincode": "0200000002000000000000001600901f"
+      }
+    },
+    {
+      "input": "group_invite",
+      "variant": "GroupInvite",
+      "wire": {
+        "bincode": "03000000"
+      }
+    },
+    {
+      "input": "call",
+      "variant": "Call",
+      "wire": {
+        "bincode": "04000000"
+      }
+    }
+  ],
+  "type": "ShareCap"
+}

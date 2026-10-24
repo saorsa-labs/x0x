@@ -1,0 +1,22 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "members_only",
+      "variant": "MembersOnly",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"members_only\""
+      }
+    },
+    {
+      "input": "public",
+      "variant": "Public",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"public\""
+      }
+    }
+  ],
+  "type": "GroupReadAccess"
+}

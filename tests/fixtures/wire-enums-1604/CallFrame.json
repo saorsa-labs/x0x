@@ -1,0 +1,63 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "call_id": "c1",
+        "media": {
+          "audio": true,
+          "video": false
+        },
+        "type": "x0x_call_invite"
+      },
+      "variant": "Invite",
+      "wire": {
+        "json": "{\"type\":\"x0x_call_invite\",\"call_id\":\"c1\",\"media\":{\"audio\":true,\"video\":false}}"
+      }
+    },
+    {
+      "input": {
+        "call_id": "c1",
+        "media": {
+          "audio": true,
+          "video": true
+        },
+        "type": "x0x_call_accept"
+      },
+      "variant": "Accept",
+      "wire": {
+        "json": "{\"type\":\"x0x_call_accept\",\"call_id\":\"c1\",\"media\":{\"audio\":true,\"video\":true}}"
+      }
+    },
+    {
+      "input": {
+        "call_id": "c1",
+        "media": {
+          "audio": false,
+          "video": false
+        },
+        "type": "x0x_call_reject"
+      },
+      "variant": "Reject",
+      "wire": {
+        "json": "{\"type\":\"x0x_call_reject\",\"call_id\":\"c1\",\"media\":{\"audio\":false,\"video\":false}}"
+      }
+    },
+    {
+      "input": {
+        "call_id": "c1",
+        "media": {
+          "audio": true,
+          "video": false
+        },
+        "reason": "busy",
+        "type": "x0x_call_hangup"
+      },
+      "variant": "Hangup",
+      "wire": {
+        "json": "{\"type\":\"x0x_call_hangup\",\"call_id\":\"c1\",\"media\":{\"audio\":true,\"video\":false},\"reason\":\"busy\"}"
+      }
+    }
+  ],
+  "type": "CallFrame"
+}

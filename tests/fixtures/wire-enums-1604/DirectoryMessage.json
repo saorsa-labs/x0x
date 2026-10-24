@@ -1,0 +1,66 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "card": {
+          "admin_count": 1,
+          "created_at": 3,
+          "description": "d",
+          "group_id": "g1",
+          "member_count": 2,
+          "name": "n",
+          "owner_agent_id": "o",
+          "policy_summary": {
+            "admission": "invite_only",
+            "confidentiality": "mls_encrypted",
+            "discoverability": "hidden",
+            "read_access": "members_only",
+            "write_access": "members_only"
+          },
+          "request_access_enabled": false,
+          "updated_at": 4
+        },
+        "m": "card"
+      },
+      "variant": "Card",
+      "wire": {
+        "json": "{\"m\":\"card\",\"card\":{\"group_id\":\"g1\",\"name\":\"n\",\"description\":\"d\",\"avatar_url\":null,\"banner_url\":null,\"tags\":[],\"policy_summary\":{\"discoverability\":\"hidden\",\"admission\":\"invite_only\",\"confidentiality\":\"mls_encrypted\",\"read_access\":\"members_only\",\"write_access\":\"members_only\"},\"owner_agent_id\":\"o\",\"admin_count\":1,\"member_count\":2,\"created_at\":3,\"updated_at\":4,\"request_access_enabled\":false,\"metadata_topic\":null,\"revision\":0,\"state_hash\":\"\",\"prev_state_hash\":null,\"issued_at\":0,\"expires_at\":0,\"authority_agent_id\":\"\",\"authority_public_key\":\"\",\"withdrawn\":false,\"signature\":\"\"}}"
+      }
+    },
+    {
+      "input": {
+        "entries": [
+          {
+            "expires_at": 3,
+            "group_id": "g",
+            "revision": 2,
+            "state_hash": "h"
+          }
+        ],
+        "kind": "tag",
+        "m": "digest",
+        "shard": 1
+      },
+      "variant": "Digest",
+      "wire": {
+        "json": "{\"m\":\"digest\",\"shard\":1,\"kind\":\"tag\",\"entries\":[{\"group_id\":\"g\",\"revision\":2,\"state_hash\":\"h\",\"expires_at\":3}]}"
+      }
+    },
+    {
+      "input": {
+        "group_ids": [
+          "g"
+        ],
+        "kind": "id",
+        "m": "pull",
+        "shard": 2
+      },
+      "variant": "Pull",
+      "wire": {
+        "json": "{\"m\":\"pull\",\"shard\":2,\"kind\":\"id\",\"group_ids\":[\"g\"]}"
+      }
+    }
+  ],
+  "type": "DirectoryMessage"
+}

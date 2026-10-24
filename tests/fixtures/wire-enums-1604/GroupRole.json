@@ -1,0 +1,46 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "owner",
+      "variant": "Owner",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"owner\""
+      }
+    },
+    {
+      "input": "admin",
+      "variant": "Admin",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"admin\""
+      }
+    },
+    {
+      "input": "moderator",
+      "variant": "Moderator",
+      "wire": {
+        "bincode": "02000000",
+        "json": "\"moderator\""
+      }
+    },
+    {
+      "input": "member",
+      "variant": "Member",
+      "wire": {
+        "bincode": "03000000",
+        "json": "\"member\""
+      }
+    },
+    {
+      "input": "guest",
+      "variant": "Guest",
+      "wire": {
+        "bincode": "04000000",
+        "json": "\"guest\""
+      }
+    }
+  ],
+  "type": "GroupRole"
+}

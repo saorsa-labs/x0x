@@ -1,0 +1,65 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "group_id": "g",
+        "type": "fetch_request",
+        "welcome_id": "w"
+      },
+      "variant": "FetchRequest",
+      "wire": {
+        "json": "{\"type\":\"fetch_request\",\"group_id\":\"g\",\"welcome_id\":\"w\"}"
+      }
+    },
+    {
+      "input": {
+        "blake3_hex": "b",
+        "byte_len": 1,
+        "chunk_size": 2,
+        "group_id": "g",
+        "total_chunks": 3,
+        "type": "offer",
+        "welcome_id": "w"
+      },
+      "variant": "Offer",
+      "wire": {
+        "json": "{\"type\":\"offer\",\"group_id\":\"g\",\"welcome_id\":\"w\",\"byte_len\":1,\"chunk_size\":2,\"total_chunks\":3,\"blake3_hex\":\"b\"}"
+      }
+    },
+    {
+      "input": {
+        "data": "ZA==",
+        "sequence": 1,
+        "type": "chunk",
+        "welcome_id": "w"
+      },
+      "variant": "Chunk",
+      "wire": {
+        "json": "{\"type\":\"chunk\",\"welcome_id\":\"w\",\"sequence\":1,\"data\":\"ZA==\"}"
+      }
+    },
+    {
+      "input": {
+        "sequence": 1,
+        "type": "chunk_ack",
+        "welcome_id": "w"
+      },
+      "variant": "ChunkAck",
+      "wire": {
+        "json": "{\"type\":\"chunk_ack\",\"welcome_id\":\"w\",\"sequence\":1}"
+      }
+    },
+    {
+      "input": {
+        "type": "complete",
+        "welcome_id": "w"
+      },
+      "variant": "Complete",
+      "wire": {
+        "json": "{\"type\":\"complete\",\"welcome_id\":\"w\"}"
+      }
+    }
+  ],
+  "type": "WelcomeBlobMessage"
+}

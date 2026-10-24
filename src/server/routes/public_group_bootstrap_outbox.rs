@@ -229,8 +229,11 @@ pub(in crate::server) fn public_group_bootstrap_obligation_for_add(
 pub(in crate::server) fn decode_public_group_bootstrap(
     encoded: &[u8],
 ) -> Result<PublicGroupBootstrap, String> {
-    let bootstrap: PublicGroupBootstrap = serde_json::from_slice(encoded)
-        .map_err(|error| format!("bootstrap payload decode failed: {error}"))?;
+    // #1604: a snapshot holding a variant this node does not know (role,
+    // state or policy) is refused before it is validated or installed.
+    let bootstrap: PublicGroupBootstrap =
+        crate::wire_compat::decode_json("PublicGroupBootstrap", "", encoded)
+            .map_err(|error| format!("bootstrap payload decode failed: {error}"))?;
     if bootstrap.message_type != PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE {
         return Err("unsupported public-group bootstrap message type".to_string());
     }
