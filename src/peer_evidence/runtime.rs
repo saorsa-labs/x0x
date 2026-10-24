@@ -26,6 +26,35 @@ struct EvidenceWorkers {
 
 struct AbortWorkerOnDrop(tokio::task::AbortHandle);
 
+#[cfg(test)]
+thread_local! {
+    static W3H_INLINE_LOOKUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// W3-H (test builds only, #1357): run Lookup work as tasks on the
+/// simulation's current-thread runtime, not on blocking workers, for the
+/// calling thread. A blocking task inhibits paused tokio's auto-advance, so
+/// a Lookup that waits on a virtual-time deadline (or on a peer that never
+/// answers) would freeze virtual time and stall the case in real time.
+/// The simulation's in-memory reads cannot block the executor.
+#[cfg(test)]
+pub(crate) fn set_w3h_inline_lookups(on: bool) {
+    W3H_INLINE_LOOKUPS.with(|flag| flag.set(on));
+}
+
+/// Whether [`set_w3h_inline_lookups`] is on for this thread. Always false
+/// outside test builds.
+fn w3h_inline_lookups() -> bool {
+    #[cfg(test)]
+    {
+        W3H_INLINE_LOOKUPS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 impl Drop for AbortWorkerOnDrop {
     fn drop(&mut self) {
         self.0.abort();
@@ -247,8 +276,25 @@ impl EvidenceRuntime {
         // Lookup on a tracked blocking worker, as for lookup_before. Both
         // callers reserve a Lookup permit before this call; a running read
         // retains that permit and its join handle through shutdown's grace.
-        let executor = tokio::runtime::Handle::current();
         let stopping = self.stopping.clone();
+        if w3h_inline_lookups() {
+            // Test builds under W3-H only: the same tracked worker, as a
+            // task on the runtime ([`set_w3h_inline_lookups`]).
+            let mut workers = self.workers();
+            if workers.closed {
+                return;
+            }
+            while workers.tasks.try_join_next().is_some() {}
+            workers.tasks.spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => {},
+                    _ = work => {},
+                }
+            });
+            return;
+        }
+        let executor = tokio::runtime::Handle::current();
         let _ = self.spawn_blocking_worker(move || {
             executor.block_on(async move {
                 tokio::select! {
@@ -336,6 +382,26 @@ impl EvidenceRuntime {
         let Some(permit) = self.lookup_permit() else {
             return Ok(());
         };
+        if w3h_inline_lookups() {
+            // Test builds under W3-H only ([`set_w3h_inline_lookups`]):
+            // the same bounded Lookup, inline on the runtime.
+            return tokio::select! {
+                biased;
+                _ = self.stopping.cancelled() => Err(()),
+                result = async {
+                    tokio::time::timeout_at(
+                        deadline,
+                        self.lookup_with_permit(agent, None, permit, Some(deadline)),
+                    )
+                    .await
+                    .map_err(|_| ())?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(());
+                    }
+                    Ok(())
+                } => result,
+            };
+        }
         let runtime = Arc::clone(self);
         let executor = tokio::runtime::Handle::current();
         let cancelled = tokio_util::sync::CancellationToken::new();
@@ -901,5 +967,67 @@ mod tests {
         assert_eq!(runtime.evidence_barrier_timeout.load(Ordering::Relaxed), 1);
         runtime.ready.cancel();
         assert!(runtime.wait(0).await, "retry after load succeeds");
+    }
+}
+
+#[cfg(test)]
+mod w3h_inline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Race `fut` against a real-time bound, so a stall in paused virtual
+    /// time fails the test instead of hanging it.
+    async fn within_real_time<F: std::future::Future>(fut: F) -> Option<F::Output> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            let _ = tx.send(());
+        });
+        tokio::select! {
+            biased;
+            out = fut => Some(out),
+            _ = rx => None,
+        }
+    }
+
+    /// #1357 W3-H: a background Lookup that waits on virtual time must not
+    /// freeze paused tokio. On a blocking worker it inhibits auto-advance
+    /// and the wait never ends; under W3-H it runs as a task and finishes
+    /// in virtual time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_inline_lookup_worker_lets_paused_time_advance() {
+        set_w3h_inline_lookups(true);
+        let runtime = Arc::new(EvidenceRuntime::default());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        runtime.spawn_lookup_worker(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let _ = tx.send(());
+        });
+        let finished = within_real_time(tokio::time::timeout(Duration::from_secs(60), rx)).await;
+        set_w3h_inline_lookups(false);
+        assert!(
+            matches!(finished, Some(Ok(Ok(())))),
+            "the Lookup worker must finish in virtual time: {finished:?}"
+        );
+    }
+
+    /// #1357 W3-H: a pinned send's bounded Lookup (`lookup_before`) whose
+    /// responder waits on virtual time finishes within its deadline instead
+    /// of freezing paused tokio.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_inline_lookup_before_lets_paused_time_advance() {
+        set_w3h_inline_lookups(true);
+        let runtime = Arc::new(EvidenceRuntime::default());
+        let responder: Arc<LookupResponder> = Arc::new(|_agent| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            })
+        });
+        assert!(runtime.lookup_responder.set(responder).is_ok());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let finished =
+            within_real_time(runtime.lookup_before(AgentId([7; 32]), None, deadline)).await;
+        set_w3h_inline_lookups(false);
+        assert_eq!(finished, Some(Ok(())), "the bounded Lookup must finish");
     }
 }

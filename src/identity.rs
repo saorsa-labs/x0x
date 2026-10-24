@@ -890,6 +890,55 @@ pub struct Identity {
     agent_keypair: AgentKeypair,
     user_keypair: Option<UserKeypair>,
     agent_certificate: Option<AgentCertificate>,
+    /// Renewals of the agent certificate adopted at runtime
+    /// ([`Identity::adopt_agent_certificate_renewal`]), oldest first. The
+    /// last one is the certificate in use. Each link is set once and is
+    /// never replaced, so [`Identity::agent_certificate`] can keep
+    /// returning a borrow without a lock. A renewal must expire strictly
+    /// later than the one in use, so the chain grows only when an owner
+    /// issues a new certificate for this agent.
+    renewals: std::sync::OnceLock<Box<CertificateRenewal>>,
+}
+
+/// One link of [`Identity`]'s runtime renewal chain.
+struct CertificateRenewal {
+    certificate: AgentCertificate,
+    next: std::sync::OnceLock<Box<CertificateRenewal>>,
+}
+
+/// Why [`Identity::check_agent_certificate_renewal`] refused a renewal of
+/// this agent's own certificate. Local only; never on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CertificateRenewalRefusal {
+    /// This identity holds no agent certificate, so there is nothing to
+    /// renew.
+    NoCurrentCertificate,
+    /// The certificate binds a different agent.
+    ForeignAgent,
+    /// The certificate's owner signature does not verify.
+    InvalidSignature,
+    /// The certificate was issued by a different user than the one in use.
+    ForeignUser,
+    /// The certificate does not expire strictly later than the one in use.
+    NotLater,
+    /// The certificate has already expired.
+    Expired,
+}
+
+impl CertificateRenewalRefusal {
+    /// A stable snake-case label for logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCurrentCertificate => "no_current_certificate",
+            Self::ForeignAgent => "foreign_agent",
+            Self::InvalidSignature => "invalid_signature",
+            Self::ForeignUser => "foreign_user",
+            Self::NotLater => "not_later",
+            Self::Expired => "expired",
+        }
+    }
 }
 
 impl std::fmt::Debug for Identity {
@@ -898,7 +947,7 @@ impl std::fmt::Debug for Identity {
             .field("machine_keypair", &self.machine_keypair)
             .field("agent_keypair", &self.agent_keypair)
             .field("user_keypair", &self.user_keypair)
-            .field("agent_certificate", &self.agent_certificate)
+            .field("agent_certificate", &self.agent_certificate())
             .finish()
     }
 }
@@ -912,6 +961,7 @@ impl Identity {
             agent_keypair,
             user_keypair: None,
             agent_certificate: None,
+            renewals: std::sync::OnceLock::new(),
         }
     }
     /// Create a new Identity with all three layers.
@@ -927,6 +977,7 @@ impl Identity {
             agent_keypair,
             user_keypair: Some(user_keypair),
             agent_certificate: Some(agent_certificate),
+            renewals: std::sync::OnceLock::new(),
         }
     }
     /// Generate a new Identity with fresh machine and agent keypairs.
@@ -939,6 +990,7 @@ impl Identity {
             agent_keypair: AgentKeypair::generate()?,
             user_keypair: None,
             agent_certificate: None,
+            renewals: std::sync::OnceLock::new(),
         })
     }
     /// Get the machine ID.
@@ -977,11 +1029,102 @@ impl Identity {
     pub fn user_keypair(&self) -> Option<&UserKeypair> {
         self.user_keypair.as_ref()
     }
-    /// Get a reference to the agent certificate, if present.
-    #[inline]
+    /// Get a reference to the agent certificate in use, if present: the
+    /// newest renewal adopted at runtime, else the certificate loaded at
+    /// startup.
     #[must_use]
     pub fn agent_certificate(&self) -> Option<&AgentCertificate> {
-        self.agent_certificate.as_ref()
+        let mut latest = self.agent_certificate.as_ref();
+        let mut link = &self.renewals;
+        while let Some(renewal) = link.get() {
+            latest = Some(&renewal.certificate);
+            link = &renewal.next;
+        }
+        latest
+    }
+
+    /// The first unset link of the renewal chain.
+    fn renewal_tail(&self) -> &std::sync::OnceLock<Box<CertificateRenewal>> {
+        let mut link = &self.renewals;
+        while let Some(renewal) = link.get() {
+            link = &renewal.next;
+        }
+        link
+    }
+
+    /// Check `renewal` as a replacement for this agent's own certificate:
+    /// it binds this identity's agent, its owner signature verifies, the
+    /// same user issued it as the certificate in use, it has not expired
+    /// at `now_unix`, and it expires strictly later than the certificate in
+    /// use (no expiry counts as latest, as in ADR 0110 §4a). A renewal
+    /// never replaces a non-expiring certificate, so a certificate is
+    /// never downgraded.
+    ///
+    /// # Errors
+    /// The first [`CertificateRenewalRefusal`] that applies.
+    pub fn check_agent_certificate_renewal(
+        &self,
+        renewal: &AgentCertificate,
+        now_unix: u64,
+    ) -> Result<(), CertificateRenewalRefusal> {
+        let current = self
+            .agent_certificate()
+            .ok_or(CertificateRenewalRefusal::NoCurrentCertificate)?;
+        if renewal.agent_id().ok() != Some(self.agent_id()) {
+            return Err(CertificateRenewalRefusal::ForeignAgent);
+        }
+        renewal
+            .verify()
+            .map_err(|_| CertificateRenewalRefusal::InvalidSignature)?;
+        let same_user = matches!(
+            (renewal.user_id(), current.user_id()),
+            (Ok(new), Ok(old)) if new == old
+        );
+        if !same_user {
+            return Err(CertificateRenewalRefusal::ForeignUser);
+        }
+        if renewal.is_expired(now_unix) {
+            return Err(CertificateRenewalRefusal::Expired);
+        }
+        let later = match (renewal.not_after(), current.not_after()) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(new), Some(old)) => new > old,
+        };
+        if !later {
+            return Err(CertificateRenewalRefusal::NotLater);
+        }
+        Ok(())
+    }
+
+    /// Make `renewal` the certificate in use, after
+    /// [`Self::check_agent_certificate_renewal`] passes at `now_unix`.
+    /// The caller persists it first and serializes adoptions, so two
+    /// renewals never race for the same link.
+    ///
+    /// # Errors
+    /// The refusal from [`Self::check_agent_certificate_renewal`].
+    pub fn adopt_agent_certificate_renewal(
+        &self,
+        renewal: AgentCertificate,
+        now_unix: u64,
+    ) -> Result<(), CertificateRenewalRefusal> {
+        self.check_agent_certificate_renewal(&renewal, now_unix)?;
+        let mut pending = Box::new(CertificateRenewal {
+            certificate: renewal,
+            next: std::sync::OnceLock::new(),
+        });
+        // A concurrent adoption that set the tail first wins; re-check
+        // against it, so the chain stays strictly later at each link.
+        loop {
+            match self.renewal_tail().set(pending) {
+                Ok(()) => return Ok(()),
+                Err(back) => {
+                    pending = back;
+                    self.check_agent_certificate_renewal(&pending.certificate, now_unix)?;
+                }
+            }
+        }
     }
 }
 

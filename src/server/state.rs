@@ -1082,6 +1082,17 @@ pub(super) struct AppState {
     /// never dropped; replayed after the group's next accepted
     /// `MemberAdded`. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
     pub(super) parked_role_updates: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
+    /// #1573 (ADR 0110 §3): signed GSS `MemberRemoved`/`MemberBanned`
+    /// events that rotate the secret epoch and arrived before this
+    /// survivor holds the new epoch's secret. The head stays at the parent
+    /// until the `SecureShareDelivered` share installs; the share replays
+    /// them. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
+    pub(super) parked_gss_removals: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
+    /// #1573 (#1508/#1533 rc13): the durable side of the GSS share hold.
+    /// Parked removals above and held crypto-only exclusions are written to
+    /// `gss-share-holds/` and loaded again at restart, so no time limit or
+    /// restart resumes sealing under the removed member's secret.
+    pub(in crate::server) gss_share_holds: crate::server::routes::named_groups::GssShareHolds,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by
@@ -1225,6 +1236,11 @@ pub(super) struct AppState {
     /// Anti-spam throttle for outbound catch-up requests. It runs on the
     /// runtime clock, as the catch-up rounds do (#1427).
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, tokio::time::Instant>>,
+    /// #1357 (ADR 0110 §2): the catch-up pages this daemon is sending now.
+    /// Each served request sends its page on its own task, so a slow or
+    /// unreachable requester never holds the catch-up listener (and the
+    /// head-round answers queued behind it). The permits bound those tasks.
+    pub(super) treekem_catchup_serve_slots: Arc<tokio::sync::Semaphore>,
     /// #1427: per group key, the epoch-ahead traffic seen while an
     /// epoch-ahead catch-up task runs for that group. An entry means one
     /// task runs; each later observation updates the entry.
@@ -1253,6 +1269,8 @@ pub(super) struct AppState {
     /// Directory holding `<group_id>.snap` snapshots and `<group_id>.journal`
     /// TreeKEM persistence journals (mode 0600).
     pub(super) treekem_dir: PathBuf,
+    /// ADR 0110 S4: revocation-eviction obligations and budgets.
+    pub(super) revocation_evictions: super::routes::named_groups::S4Runtime,
     /// Active WebSocket sessions.
     pub(super) ws_sessions: RwLock<HashMap<String, WsSession>>,
     /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).
@@ -1547,6 +1565,20 @@ pub(super) struct NamedGroupTestRecorders {
     /// #1113 startup catch-up: tests that want a page send to count as
     /// delivered set this. Production builds omit the recorders.
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
+    /// #1573: install a GSS removal head before its share, as a released
+    /// receiver does (`legacy_gss_removal_receiver`).
+    pub(super) legacy_gss_removal_receiver: std::sync::atomic::AtomicBool,
+    /// #1508 rc14: whether the group's sends were held at each step of a
+    /// parked GSS removal replay (`gss_replay_probe`).
+    pub(super) gss_replay_holds: StdMutex<Vec<bool>>,
+    /// #1508 rc16: a one-shot pause after a GSS encrypt reads its key
+    /// (`gss_encrypt_after_key_probe`): `(reached, resume)`.
+    pub(super) gss_encrypt_pause:
+        StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// #1508 rc18: a one-shot pause after a GSS encrypt checks the hold
+    /// under its publication permit (`gss_encrypt_after_hold_probe`).
+    pub(super) gss_encrypt_hold_pause:
+        StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }

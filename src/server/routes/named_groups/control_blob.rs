@@ -93,6 +93,18 @@ struct StagedBlob {
     /// ORIGINAL artifact: it expires no later than the original's deadline,
     /// and a re-stage never extends that bound.
     bound: Option<StagedOrigin>,
+    /// ADR 0110 §3 (#1357): a copy of an S4 saved removal event. Each chunk
+    /// serve passes the guarded removal admission first.
+    guard: Option<ServeGuard>,
+}
+
+/// ADR 0110 §3 (#1357): the guarded-egress inputs of an S4 saved removal
+/// blob: every chunk is served only while the recipient is still eligible
+/// in the group and the removal's result is still the head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::server) struct ServeGuard {
+    pub(in crate::server) stable_group_id: String,
+    pub(in crate::server) result_head: String,
 }
 
 /// ADR 0107 (review r2 P2-4): the original staged artifact a blob copies.
@@ -199,12 +211,27 @@ impl ControlBlobState {
 
     /// [`Self::stage`] for a copy of an original artifact: the entry expires
     /// with the original (`origin.deadline`), and re-staging the identical
-    /// copy never moves that bound later.
+    /// copy never moves that bound later. Production stages through
+    /// [`stage_reference`]; this form serves the tests.
+    #[cfg(test)]
     pub(super) fn stage_with_origin(
         &self,
         reference: ControlBlobRef,
         bytes: Vec<u8>,
         origin: Option<StagedOrigin>,
+    ) -> Result<(), &'static str> {
+        self.stage_entry(reference, bytes, origin, None)
+    }
+
+    /// The common stage. A `guard` binds every chunk serve to the guarded
+    /// removal admission; a later stage of the identical blob never drops
+    /// it.
+    fn stage_entry(
+        &self,
+        reference: ControlBlobRef,
+        bytes: Vec<u8>,
+        origin: Option<StagedOrigin>,
+        guard: Option<ServeGuard>,
     ) -> Result<(), &'static str> {
         if origin.is_some_and(|origin| Instant::now() >= origin.deadline) {
             return Err("the original artifact has expired");
@@ -229,6 +256,9 @@ impl ControlBlobState {
                     }),
                     (old, new) => new.or(old),
                 };
+                if guard.is_some() {
+                    existing.guard = guard;
+                }
                 return Ok(());
             }
             let peer_count = registry
@@ -257,6 +287,7 @@ impl ControlBlobState {
                     bytes: Arc::new(bytes),
                     created_at: Instant::now(),
                     bound: origin,
+                    guard,
                 },
             );
             Ok(())
@@ -308,6 +339,16 @@ impl ControlBlobState {
             std::thread::sleep(hold);
         });
         rx
+    }
+
+    /// ADR 0110 §3 (#1357): the serve guard of a staged blob, if any.
+    pub(super) fn staged_serve_guard(&self, reference: &ControlBlobRef) -> Option<ServeGuard> {
+        self.with_registry(|registry| {
+            registry
+                .staged
+                .get(reference)
+                .and_then(|entry| entry.guard.clone())
+        })
     }
 
     pub(super) fn staged_chunk(
@@ -715,13 +756,41 @@ pub(super) async fn send_reference(
     bytes: Vec<u8>,
     cold_removal: bool,
 ) -> std::result::Result<(), String> {
+    send_reference_guarded(
+        store,
+        agent,
+        recipient,
+        kind,
+        group_id,
+        join_attempt_id,
+        bytes,
+        cold_removal,
+        None,
+    )
+    .await
+}
+
+/// [`send_reference`] for a blob whose chunk serves pass `guard`
+/// (ADR 0110 §3, #1357). `None` is [`send_reference`].
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_reference_guarded(
+    store: &ControlBlobState,
+    agent: &Agent,
+    recipient: &AgentId,
+    kind: ControlBlobKind,
+    group_id: &str,
+    join_attempt_id: Option<&str>,
+    bytes: Vec<u8>,
+    cold_removal: bool,
+    guard: Option<ServeGuard>,
+) -> std::result::Result<(), String> {
     // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
     // recipients release their completed pulls — retry it briefly before
     // giving up, instead of dropping the event on the floor. Any other
     // refusal (invalid blob, digest conflict) returns immediately.
     let mut attempt = 0;
     let reference = loop {
-        match stage_reference(
+        match stage_reference_entry(
             store,
             agent,
             recipient,
@@ -730,6 +799,7 @@ pub(super) async fn send_reference(
             join_attempt_id,
             bytes.clone(),
             None,
+            guard.clone(),
         ) {
             Ok(reference) => break reference,
             Err(STAGING_BUDGET_EXHAUSTED) if attempt < STAGING_BUDGET_RETRIES => {
@@ -787,6 +857,32 @@ pub(super) fn stage_reference(
     bytes: Vec<u8>,
     origin: Option<StagedOrigin>,
 ) -> std::result::Result<ControlBlobRef, &'static str> {
+    stage_reference_entry(
+        store,
+        agent,
+        recipient,
+        kind,
+        group_id,
+        join_attempt_id,
+        bytes,
+        origin,
+        None,
+    )
+}
+
+/// [`stage_reference`] with an optional serve `guard` (ADR 0110 §3).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stage_reference_entry(
+    store: &ControlBlobState,
+    agent: &Agent,
+    recipient: &AgentId,
+    kind: ControlBlobKind,
+    group_id: &str,
+    join_attempt_id: Option<&str>,
+    bytes: Vec<u8>,
+    origin: Option<StagedOrigin>,
+    guard: Option<ServeGuard>,
+) -> std::result::Result<ControlBlobRef, &'static str> {
     let reference = ControlBlobRef {
         kind,
         group_id: group_id.to_string(),
@@ -796,7 +892,7 @@ pub(super) fn stage_reference(
         byte_len: bytes.len() as u64,
         join_attempt_id: join_attempt_id.map(str::to_string),
     };
-    store.stage_with_origin(reference.clone(), bytes, origin)?;
+    store.stage_entry(reference.clone(), bytes, origin, guard)?;
     Ok(reference)
 }
 
@@ -1078,17 +1174,33 @@ pub(in crate::server) async fn handle_control_blob_message(
                 tracing::warn!("control blob chunk send slots exhausted");
                 return;
             };
-            let agent = Arc::clone(&state.agent);
+            let guard = state.control_blobs.staged_serve_guard(&reference);
+            let task_state = Arc::clone(state);
             let recipient = *sender;
             // #1269: shutdown-owned; the send holds the Agent.
             state.spawn_detached(async move {
                 let _permit = permit;
+                // ADR 0110 §3 (#1357): a chunk of an S4 saved removal is
+                // served only while the guarded removal admission passes.
+                if let Some(guard) = guard {
+                    if let Err(reason) = super::revocation_eviction::removal_blob_serve_admitted(
+                        &task_state,
+                        &guard,
+                        &recipient,
+                    )
+                    .await
+                    {
+                        tracing::debug!(reason, "ADR 0110 S4: removal blob chunk withheld");
+                        return;
+                    }
+                }
+                let agent = &task_state.agent;
                 let message = ControlBlobMessage::Chunk {
                     reference,
                     sequence,
                     data_b64: BASE64.encode(chunk),
                 };
-                if let Err(reason) = send_message(&agent, &recipient, &message).await {
+                if let Err(reason) = send_message(agent, &recipient, &message).await {
                     tracing::warn!(reason, "control blob chunk send failed");
                 }
             });
@@ -1536,6 +1648,39 @@ mod tests {
             byte_len: bytes.len() as u64,
             join_attempt_id: None,
         }
+    }
+
+    /// ADR 0110 §3 (#1357): an S4 saved-removal blob carries its serve
+    /// guard; an ordinary blob has none; a later unguarded stage of the
+    /// identical blob (the legacy volley) never drops the guard.
+    #[test]
+    fn a_removal_blob_keeps_its_serve_guard() {
+        let store = ControlBlobState::default();
+        let guarded_bytes = vec![5u8; x0x::dm::MAX_PAYLOAD_BYTES + 64];
+        let plain_bytes = vec![6u8; x0x::dm::MAX_PAYLOAD_BYTES + 64];
+        let guarded = reference(&guarded_bytes);
+        let plain = reference(&plain_bytes);
+        let guard = ServeGuard {
+            stable_group_id: "g".to_string(),
+            result_head: "r".to_string(),
+        };
+        store
+            .stage_entry(
+                guarded.clone(),
+                guarded_bytes.clone(),
+                None,
+                Some(guard.clone()),
+            )
+            .expect("guarded stage");
+        store
+            .stage_entry(plain.clone(), plain_bytes, None, None)
+            .expect("plain stage");
+        assert_eq!(store.staged_serve_guard(&guarded), Some(guard.clone()));
+        assert_eq!(store.staged_serve_guard(&plain), None);
+        store
+            .stage_entry(guarded.clone(), guarded_bytes, None, None)
+            .expect("re-stage");
+        assert_eq!(store.staged_serve_guard(&guarded), Some(guard));
     }
 
     /// ADR 0107 (r6 boundary): the seam's non-blocking staged-copy lookup
