@@ -958,3 +958,45 @@ fn kv_mutation_kind_index_and_discriminant_are_pinned() {
         );
     }
 }
+
+/// Approved wire changes (#1604): pinned old and new byte fixtures. They
+/// are the fixtures in the PR body.
+const REVOCATION_LEGACY_HEX: &str = "0100000000000000000000000101010101010101010101010101010101010101010101010101010101010101010000000000000007080000000000000000010000000000000009";
+const REVOCATION_FRAMED_HEX: &str = "783078525642303201000000000000003f00000000000000000000000101010101010101010101010101010101010101010101010101010101010101010000000000000007080000000000000000010000000000000009";
+const SYNC_ABORT_UNSUPPORTED_HEX: &str =
+    "0000001f060000001300000000000000756e737570706f727465645f76617269616e74";
+
+#[test]
+fn approved_wire_change_fixtures_are_pinned() {
+    let record = revocation(crate::revocation::RevokedSubject::Agent(
+        crate::identity::AgentId([1; 32]),
+    ));
+    let legacy =
+        crate::revocation::encode_revocation_batch(std::slice::from_ref(&record)).expect("encode");
+    assert_eq!(
+        hex::encode(&legacy),
+        REVOCATION_LEGACY_HEX,
+        "sent bytes unchanged"
+    );
+    for fixture in [REVOCATION_LEGACY_HEX, REVOCATION_FRAMED_HEX] {
+        let bytes = hex::decode(fixture).expect("hex");
+        assert_eq!(
+            crate::revocation::decode_revocation_batch(&bytes).expect("decode"),
+            vec![record.clone()]
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_abort_refusal_frame_is_pinned() {
+    let mut out = Vec::new();
+    crate::owner_sync::write_frame(
+        &mut out,
+        &crate::owner_sync::SyncFrame::Abort {
+            reason: "unsupported_variant".into(),
+        },
+    )
+    .await
+    .expect("write");
+    assert_eq!(hex::encode(out), SYNC_ABORT_UNSUPPORTED_HEX);
+}
