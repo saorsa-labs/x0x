@@ -700,7 +700,7 @@ async fn active_member_hex(state: &AppState, group_id: &str) -> std::collections
         .map(|info| {
             info.members_v2
                 .values()
-                .filter(|m| m.state == x0x::groups::GroupMemberState::Active)
+                .filter(|m| m.is_active())
                 .map(|m| m.agent_id.to_lowercase())
                 .collect()
         })
@@ -1120,7 +1120,7 @@ pub(in crate::server) async fn list_group_delegations(
     let committed = committed_delegations(&state, &stable_id).await;
     let active_hex: std::collections::HashSet<String> = members
         .values()
-        .filter(|m| m.state == x0x::groups::GroupMemberState::Active)
+        .filter(|m| m.is_active())
         .map(|m| m.agent_id.to_lowercase())
         .collect();
     let mut out: Vec<serde_json::Value> = committed

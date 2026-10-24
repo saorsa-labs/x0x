@@ -123,7 +123,7 @@ pub(in crate::server) async fn ensure_task_list_access(
         return Err(forbidden("not a member of task-list group"));
     };
     let member = info.members_v2.get(&local_agent_hex);
-    let allowed = member.is_some_and(|m| matches!(m.state, x0x::groups::GroupMemberState::Active));
+    let allowed = member.is_some_and(x0x::groups::GroupMember::is_active);
     if allowed {
         Ok(())
     } else {
@@ -272,7 +272,7 @@ fn active_members_of(
 ) -> std::collections::HashSet<x0x::identity::AgentId> {
     let mut agents = std::collections::HashSet::new();
     for (agent_hex, member) in &info.members_v2 {
-        if matches!(member.state, x0x::groups::GroupMemberState::Active) {
+        if member.is_active() {
             if let Ok(bytes) = hex::decode(agent_hex) {
                 if bytes.len() == x0x::identity::PEER_ID_LENGTH {
                     let mut arr = [0u8; x0x::identity::PEER_ID_LENGTH];

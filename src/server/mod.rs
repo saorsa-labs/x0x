@@ -4625,10 +4625,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 .map(|info| {
                     info.members_v2
                         .iter()
-                        .filter(|(id, m)| {
-                            m.state == x0x::groups::GroupMemberState::Active
-                                && **id != local_agent_hex
-                        })
+                        .filter(|(id, m)| m.is_active() && **id != local_agent_hex)
                         .map(|(id, _)| id.clone())
                         .collect::<Vec<_>>()
                 })

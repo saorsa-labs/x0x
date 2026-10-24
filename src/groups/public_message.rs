@@ -1063,7 +1063,7 @@ fn validate_public_message_inner(
     let author_role = ctx
         .members_v2
         .get(acting_agent)
-        .filter(|m| m.state == GroupMemberState::Active)
+        .filter(|m| m.is_active())
         .map(|m| m.role);
 
     match ctx.policy.write_access {

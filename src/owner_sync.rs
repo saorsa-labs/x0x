@@ -792,6 +792,22 @@ fn proof_message(
 /// Time allowed to send the `Abort` refusal for an unsupported variant.
 const ABORT_SEND_BUDGET: Duration = Duration::from_secs(2);
 
+/// #1604: answer an unsupported frame variant with the existing `Abort`
+/// frame (best effort, bounded), then return the typed error. Use it only
+/// while this side's send half is still open (before `Done` and FIN).
+async fn refuse_unsupported<S: AsyncWrite + Unpin, T>(
+    send: &mut S,
+    result: Result<T, SyncError>,
+) -> Result<T, SyncError> {
+    if let Err(err @ SyncError::UnsupportedVariant(_)) = &result {
+        let abort = SyncFrame::Abort {
+            reason: err.class().to_string(),
+        };
+        let _ = tokio::time::timeout(ABORT_SEND_BUDGET, write_frame(send, &abort)).await;
+    }
+    result
+}
+
 /// Write one frame: `u32` big-endian length + bincode body.
 ///
 /// # Errors
@@ -3195,19 +3211,7 @@ where
     )
     .await
     .map_err(|_| SyncError::SessionTimeout)?;
-    let pending = match negotiated {
-        Ok(pending) => pending,
-        Err(err @ SyncError::UnsupportedVariant(_)) => {
-            // #1604: the typed refusal rides the existing `Abort` frame,
-            // best effort and bounded, so the peer learns why.
-            let abort = SyncFrame::Abort {
-                reason: err.class().to_string(),
-            };
-            let _ = tokio::time::timeout(ABORT_SEND_BUDGET, write_frame(send, &abort)).await;
-            return Err(err);
-        }
-        Err(err) => return Err(err),
-    };
+    let pending = negotiated?;
     let owner_id = owner.user_id();
     // #1055 RC1: the commit re-validates the peer's admission AFTER the
     // commit locks are held — the pre-commit boundary inside
@@ -3309,7 +3313,7 @@ where
         nonce: local_nonce,
     };
     write_frame(send, &hello).await?;
-    let peer_nonce = match read_frame(recv).await? {
+    let peer_nonce = match refuse_unsupported(send, read_frame(recv).await).await? {
         SyncFrame::Hello {
             protocol_version,
             machine_id,
@@ -3355,7 +3359,7 @@ where
         },
     )
     .await?;
-    match read_frame(recv).await? {
+    match refuse_unsupported(send, read_frame(recv).await).await? {
         SyncFrame::Proof { signature } => {
             let expected_msg =
                 proof_message(&local_nonce, &peer_machine.0, &local_machine.0, &owner_id.0);
@@ -3380,7 +3384,7 @@ where
     // the rest of the stage, version-vector pages included.
     let local_vector = store.version_vector().await;
     write_paged_vector(send, &local_vector, &admission).await?;
-    let peer_vector = read_paged_vector(recv, &admission).await?;
+    let peer_vector = refuse_unsupported(send, read_paged_vector(recv, &admission).await).await?;
     // Phase boundary (pre-ship): nothing leaves this machine after the
     // admission that justified shipping it has lapsed.
     admission.still_admissible().await?;
@@ -3403,7 +3407,9 @@ where
     send.shutdown().await?;
 
     // Receive the peer's paged records (terminated by their Done or an
-    // Abort); verify EVERY record before returning — one forgery aborts
+    // Abort). #1604: the send half is closed from here, so an unsupported
+    // record variant is a local typed error only (no `Abort` reply).
+    // Verify EVERY record before returning — one forgery aborts
     // with nothing stored (review R2 finding 4). The caller commits the
     // verified batch atomically, outside the session's time budget.
     let inbound = read_paged_records(recv, &admission).await?;
@@ -5697,6 +5703,57 @@ mod tests {
         assert!(
             victim_store.records_snapshot().await.is_empty(),
             "victim shipped nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_answers_unsupported_frame_with_abort() {
+        // WHY (#1604 G1): an enrolled peer that sends a frame variant this
+        // node does not know gets the typed `Abort` refusal on the live
+        // session, and the local side fails with `UnsupportedVariant`.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let newer_peer = tokio::spawn(async move {
+            // A frame whose variant index no build has assigned.
+            let mut body = 0xfeed_u32.to_le_bytes().to_vec();
+            body.extend_from_slice(&[0u8; 8]);
+            c_send
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .await
+                .expect("len");
+            c_send.write_all(&body).await.expect("body");
+            let hello = read_frame(&mut c_recv).await.expect("local hello");
+            assert!(matches!(hello, SyncFrame::Hello { .. }), "{hello:?}");
+            read_frame(&mut c_recv).await.expect("refusal frame")
+        });
+        let err = run_sync_session(
+            &mut s_send,
+            &mut s_recv,
+            &store,
+            &owner,
+            &local,
+            &peer,
+            |_| {},
+        )
+        .await
+        .expect_err("unsupported frame is refused");
+        assert!(matches!(err, SyncError::UnsupportedVariant(_)), "{err:?}");
+        let refusal = newer_peer.await.expect("peer task");
+        assert_eq!(
+            refusal,
+            SyncFrame::Abort {
+                reason: "unsupported_variant".into()
+            }
         );
     }
 

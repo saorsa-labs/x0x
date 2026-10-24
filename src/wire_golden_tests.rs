@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Golden wire fixtures for the wire-format enums (#1604).
 //!
 //! Each file in `tests/fixtures/wire-enums-1604/` holds, for one enum, a
@@ -999,4 +1001,29 @@ async fn sync_abort_refusal_frame_is_pinned() {
     .await
     .expect("write");
     assert_eq!(hex::encode(out), SYNC_ABORT_UNSUPPORTED_HEX);
+}
+
+/// #1604 (Codex P1): a saved group whose member holds a role this node does
+/// not know (written by a newer build) loads after a restart, but that
+/// member is not active: no membership, no role, no write authority.
+#[test]
+fn saved_member_with_unknown_role_has_no_authority_after_restart() {
+    let creator = crate::identity::AgentId([7; 32]);
+    let creator_hex = hex::encode(creator.as_bytes());
+    let info = crate::groups::GroupInfo::new("g".into(), "d".into(), creator, "aa".repeat(16));
+    assert!(
+        info.has_active_member(&creator_hex),
+        "baseline: creator active"
+    );
+    let mut saved = serde_json::to_value(&info).expect("save");
+    saved["members_v2"][&creator_hex]["role"] = Value::from("overlord");
+    let restored: crate::groups::GroupInfo =
+        serde_json::from_value(saved).expect("restart load keeps the group");
+    assert_eq!(
+        restored.members_v2[&creator_hex].role,
+        crate::groups::GroupRole::Unknown
+    );
+    assert!(!restored.has_active_member(&creator_hex));
+    assert_eq!(restored.caller_role(&creator_hex), None);
+    assert_eq!(restored.active_members().count(), 0);
 }

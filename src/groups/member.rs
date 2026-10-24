@@ -275,9 +275,12 @@ impl GroupMember {
         }
     }
 
+    /// Active, with a role this node knows. #1604: a member whose role or
+    /// state is `Unknown` (only possible from a saved or newer record) is
+    /// never active, so it passes no membership or authorization check.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.state == GroupMemberState::Active
+        self.state == GroupMemberState::Active && self.role != GroupRole::Unknown
     }
 
     #[must_use]

@@ -12002,7 +12002,7 @@ async fn request_member_key_package_catchup(
         for (aid, m) in &info.members_v2 {
             if !aid.eq_ignore_ascii_case(&local_agent_hex)
                 && !candidate_hexes.iter().any(|c| c.eq_ignore_ascii_case(aid))
-                && m.state == x0x::groups::GroupMemberState::Active
+                && m.is_active()
             {
                 candidate_hexes.push(aid.clone());
             }
@@ -30231,10 +30231,7 @@ pub(in crate::server) async fn approve_join_request(
                 .map(|info| {
                     info.members_v2
                         .iter()
-                        .filter(|(mid, m)| {
-                            m.state == x0x::groups::GroupMemberState::Active
-                                && **mid != local_agent_hex
-                        })
+                        .filter(|(mid, m)| m.is_active() && **mid != local_agent_hex)
                         .map(|(mid, _)| mid.clone())
                         .collect()
                 })
@@ -37148,8 +37145,7 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> R
                     // B7: bind stored sender (carrier) to an active admin role.
                     let sender_hex = hex::encode(entry.sender.as_bytes());
                     let is_admin = info.members_v2.get(&sender_hex).is_some_and(|m| {
-                        m.state == x0x::groups::GroupMemberState::Active
-                            && m.role.at_least(x0x::groups::GroupRole::Admin)
+                        m.is_active() && m.role.at_least(x0x::groups::GroupRole::Admin)
                     });
                     if !is_admin {
                         tracing::warn!(
@@ -37337,9 +37333,7 @@ fn validate_relay_obligation_for_restart(
     let relay_targets = info
         .members_v2
         .iter()
-        .filter(|(id, member)| {
-            member.state == x0x::groups::GroupMemberState::Active && **id != local_agent_hex
-        })
+        .filter(|(id, member)| member.is_active() && **id != local_agent_hex)
         .map(|(id, _)| id.clone())
         .collect();
     let mut validated = entry.clone();
@@ -37931,9 +37925,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             let active_witnesses: std::collections::HashSet<String> = info
                 .members_v2
                 .iter()
-                .filter(|(id, m)| {
-                    m.state == x0x::groups::GroupMemberState::Active && **id != local_agent_hex
-                })
+                .filter(|(id, m)| m.is_active() && **id != local_agent_hex)
                 .map(|(id, _)| id.clone())
                 .collect();
             // Union: every active witness is a valid target. The stored

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! #1604: main-era wire fixtures for the `x0xd` named-group enums. These
 //! types are `pub(in crate::server)`, so their checks live here. The
 //! harness is `crate::wire_golden_tests`. `ControlBlobKind` is private to
