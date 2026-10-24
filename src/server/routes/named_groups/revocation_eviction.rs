@@ -558,12 +558,22 @@ fn head_holders(
 /// predecessor or replay, epoch-ahead traffic the epoch-ahead catch-up is
 /// still chasing (#1427), or an open catch-up page stream or replay fence
 /// (#1113).
+///
+/// #1508 rc15 (Codex P1): a verified GSS removal, ban or crypto-only
+/// exclusion that waits for its share is open evidence too. It leaves the
+/// local head at its parent, so a round confirmed on that head would let
+/// this node seal another S4 commit from it: a sibling of the verified
+/// transition, and a quarantine.
 async fn unresolved_head_evidence(
     state: &AppState,
     group_key: &str,
     info: &GroupInfo,
     local_epoch: u64,
 ) -> bool {
+    super::gss_share_hold::ensure_loaded(state).await;
+    if super::gss_share_hold::withholds(state, group_key, info) {
+        return true;
+    }
     let ids = [
         group_key.to_string(),
         info.stable_group_id().to_string(),
@@ -870,7 +880,8 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     let restart_wait_elapsed = runtime.restart_wait_elapsed(now);
     let mut inner = runtime.inner.lock().await;
     let boot_id = runtime.boot_id;
-    let mut created = Vec::new();
+    let mut created =
+        reopen_unproven_completions(&mut inner, &groups, &leaves, now_unix_ms, boot_id);
     for (key, trigger, incarnation) in derive_triggers(&groups, &leaves, &revocations, now_unix) {
         let outcome =
             inner
@@ -1373,7 +1384,8 @@ type TrackedLeaves = (Vec<[u8; 32]>, u64);
 
 /// Retained TreeKEM leaves per stable group ID: the agent IDs whose leaf
 /// is still in this node's ratchet tree, with the tree epoch. A group whose
-/// tree is busy is skipped for this pass (`None`), never read as empty.
+/// tree is busy, or not here, is skipped for this pass (`None`), never read
+/// as empty.
 ///
 /// A GSS `MlsEncrypted` group has no tree. Its entry holds the Removed
 /// members that still hold the current secret
@@ -1459,7 +1471,11 @@ async fn snapshot_retained_leaves(
             .or_else(|| trees.get(&info.mls_group_id))
             .or_else(|| trees.get(&stable))
             .cloned();
+        // #1508 rc15 (Codex P2): a TreeKEM group with no tree here is
+        // unknown, as a busy tree is, never known-empty: absence proves
+        // nothing about a target's leaf.
         let Some(tree) = tree else {
+            leaves.by_group.insert(stable, None);
             continue;
         };
         let entry = match tree.try_lock() {
@@ -1640,6 +1656,55 @@ fn reconcile_and_retain(
     if !end_not_durable && inner.store.apply_retention(now_unix_ms) {
         inner.dirty = true;
     }
+}
+
+/// #1508 rc15 (Codex P2): reopen each completed TreeKEM row whose target
+/// this node's tree retains again (a restored tree): it has lost its
+/// proof ([`completed_with_retained_leaf`]). Returns the reopened rows.
+fn reopen_unproven_completions(
+    inner: &mut S4Inner,
+    groups: &[(String, GroupInfo)],
+    leaves: &RetainedLeaves,
+    now_unix_ms: u64,
+    boot_id: [u8; 16],
+) -> Vec<EvictionKey> {
+    let mut reopened = Vec::new();
+    for key in completed_with_retained_leaf(&inner.store, groups, leaves) {
+        if inner.store.reopen_complete(&key, now_unix_ms, boot_id) {
+            inner.mark_not_durable(&key);
+            reopened.push(key);
+        }
+    }
+    reopened
+}
+
+/// The completed rows of TreeKEM groups whose target's leaf this node's
+/// tree holds. A TreeKEM row completes only when
+/// the tree is known and does not hold the leaf
+/// ([`reconcile_completion`]), so these rows have lost their proof, such as
+/// after a tree that was missing is restored. The two conditions exclude
+/// each other, so a row does not swing between them.
+fn completed_with_retained_leaf(
+    store: &ObligationStore,
+    groups: &[(String, GroupInfo)],
+    leaves: &RetainedLeaves,
+) -> Vec<EvictionKey> {
+    let treekem: BTreeSet<&str> = groups
+        .iter()
+        .filter(|(_, info)| {
+            !info.withdrawn && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        })
+        .map(|(_, info)| info.stable_group_id())
+        .collect();
+    store
+        .rows()
+        .filter(|row| row.phase == Phase::Complete)
+        .map(ObligationRow::key)
+        .filter(|key| {
+            treekem.contains(key.stable_group_id.as_str())
+                && leaves.tracks(&key.stable_group_id, &key.target) == Some(true)
+        })
+        .collect()
 }
 
 /// Re-derive completion from the verified roster and crypto state (§1,
@@ -6020,6 +6085,124 @@ mod tests {
         assert_eq!(code, StatusCode::ACCEPTED);
         assert_eq!(body["status"].as_str(), Some("waiting_for_head_sync"));
         assert_eq!(body["request"].as_str(), Some("seal"));
+        Ok(())
+    }
+
+    /// #1508 rc15 (Codex P1): a verified GSS removal that waits for its
+    /// share leaves the head at its parent. A round that already confirmed
+    /// that parent must not let this node seal another S4 commit from it
+    /// (a sibling, then a quarantine). Before the fix the parked removal
+    /// was not head evidence, so the head stayed synced.
+    #[tokio::test]
+    async fn rc15_a_parked_gss_removal_unsyncs_a_confirmed_head() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "b5".repeat(16);
+        let mut info = GroupInfo::new(
+            "rc15-parked".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = 3;
+        info.shared_secret = Some(vec![7; 32]);
+        info.security_binding = Some("gss:epoch=3".to_string());
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait).await;
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                info.stable_group_id().to_string(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: true,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        assert!(group_head_synced(&state, &group_id).await, "no false hold");
+        super::super::park_pending_gss_removal_for_test(&state, &group_id, &info);
+        assert!(
+            !group_head_synced(&state, &group_id).await,
+            "a removal waiting for its share is unresolved head evidence"
+        );
+        Ok(())
+    }
+
+    /// #1508 rc15 (Codex P2): a TreeKEM group with no tree here proves
+    /// nothing about a target's leaf. A removed target's row stays open,
+    /// and a row that completed while the tree was missing reopens once
+    /// the restored tree shows the leaf. Before the fix the missing tree
+    /// read as known-empty, the row completed, and a restored tree never
+    /// reopened it.
+    #[tokio::test]
+    async fn rc15_a_missing_tree_never_completes_and_a_restored_leaf_reopens() -> anyhow::Result<()>
+    {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let creator = state.agent.agent_id();
+        let target = [0x5a; 32];
+        let target_hex = hex::encode(target);
+        let group_id = "c6".repeat(16);
+        let mut info = GroupInfo::new("rc15-tree".into(), String::new(), creator, group_id.clone());
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.add_member(
+            target_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(creator.as_bytes())),
+            None,
+        );
+        info.remove_member(&target_hex, Some(hex::encode(creator.as_bytes())));
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), target);
+        let groups = vec![(group_id, info)];
+        let mut inner = S4Inner::default();
+        inner.store.intake(
+            &key,
+            EvictionTrigger::AgentRevocation {
+                record_hash: [1; 32],
+                record_bytes: Vec::new(),
+            },
+            None,
+            0,
+            [0; 16],
+        );
+
+        // No tree in `treekem_groups`.
+        let leaves = snapshot_retained_leaves(&state, &groups).await;
+        assert!(!leaves.known(&stable), "a missing tree is unknown");
+        reconcile_completion(&mut inner.store, &groups, &leaves, &BTreeSet::new(), 1);
+        assert!(
+            inner.store.get(&key).is_some_and(|row| row.phase.is_open()),
+            "no completion without the tree"
+        );
+
+        // A completion made without proof, then the tree is back with the
+        // target's leaf.
+        inner.store.complete(&key, None, None, 1);
+        let mut restored = RetainedLeaves::default();
+        restored
+            .by_group
+            .insert(stable.clone(), Some((vec![target], 4)));
+        let reopened = reopen_unproven_completions(&mut inner, &groups, &restored, 2, [0; 16]);
+        assert_eq!(reopened, vec![key.clone()]);
+        assert!(inner.store.get(&key).is_some_and(|row| row.phase.is_open()));
+        assert!(inner.not_durable.contains_key(&key));
+        // The reopened row does not complete while the leaf is retained.
+        reconcile_completion(&mut inner.store, &groups, &restored, &BTreeSet::new(), 3);
+        assert!(inner.store.get(&key).is_some_and(|row| row.phase.is_open()));
         Ok(())
     }
 }

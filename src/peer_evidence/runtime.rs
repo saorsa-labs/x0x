@@ -968,7 +968,8 @@ mod w3h_inline_tests {
         });
         assert!(runtime.lookup_responder.set(responder).is_ok());
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        let finished = within_real_time(runtime.lookup_before(AgentId([7; 32]), deadline)).await;
+        let finished =
+            within_real_time(runtime.lookup_before(AgentId([7; 32]), None, deadline)).await;
         set_w3h_inline_lookups(false);
         assert_eq!(finished, Some(Ok(())), "the bounded Lookup must finish");
     }

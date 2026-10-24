@@ -72,6 +72,7 @@ use axum::Extension;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use revocation_eviction::owner_recovery::LaterAdminKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
@@ -170,13 +171,6 @@ static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
 #[cfg(test)]
 static RECOVERED_KP_BEFORE_MEMBERSHIP_LOCK_NOTIFY: StdMutex<
     Option<(String, Arc<tokio::sync::Notify>)>,
-> = StdMutex::new(None);
-
-/// Entered after the GSS encrypt path copies its key and drops the group
-/// guard (#1533 rc15 test seam).
-#[cfg(test)]
-static GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY: StdMutex<
-    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
 
 #[cfg(test)]
@@ -12535,10 +12529,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
 ) -> ApplyMetadataResult {
     // ADR 0110 S4 (#1508 rc12): a commit that chains on a GSS owner
     // recovery not yet installed here waits for it.
-    if verified {
-        revocation_eviction::owner_recovery::hold_unchained_event(state, &event).await;
-    }
-    apply_named_group_metadata_event_with_binding(
+    let newly_held =
+        verified && revocation_eviction::owner_recovery::hold_unchained_event(state, &event).await;
+    let held_group = newly_held.then(|| named_group_metadata_event_group_id(&event).to_string());
+    let applied = apply_named_group_metadata_event_with_binding(
         state,
         event,
         sender,
@@ -12546,7 +12540,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         envelope_bytes,
         None,
     )
-    .await
+    .await;
+    // #1508 rc15 (Codex P1): a newly held commit can complete the chain
+    // that a parked GSS removal or ban reads for a later admin's key (a
+    // later admin's rotation that arrives last). Each event is held once
+    // while retained, so this replay does not repeat for ever.
+    if let Some(group_id) = held_group {
+        if let Some(group_key) = local_group_key_for_parking(state, &group_id).await {
+            Box::pin(replay_parked_gss_removals(state, &group_key)).await;
+        }
+    }
+    applied
 }
 
 async fn apply_named_group_metadata_event_with_binding(
@@ -12830,6 +12834,24 @@ async fn gss_replay_probe(state: &AppState, group_key: &str) {
 #[cfg(not(test))]
 async fn gss_replay_probe(_state: &AppState, _group_key: &str) {}
 
+/// #1508 rc16: a test pauses a GSS encrypt after its key read, to install
+/// a share between that read and the boundary check.
+#[cfg(test)]
+async fn gss_encrypt_after_key_probe(state: &AppState) {
+    let pause = state
+        .named_group_test_recorders
+        .gss_encrypt_pause
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some((reached, resume)) = pause {
+        reached.notify_one();
+        resume.notified().await;
+    }
+}
+#[cfg(not(test))]
+async fn gss_encrypt_after_key_probe(_state: &AppState) {}
+
 /// #1573: whether a GSS removal or ban parked for `group_key`, or a GSS
 /// crypto-only exclusion held for it, still waits: this node holds no
 /// secret of its epoch. Only a transition whose signed commit the apply
@@ -12899,7 +12921,7 @@ async fn later_admin_removal_secret(
     state: &AppState,
     result: &x0x::groups::GroupInfo,
     secret_epoch: Option<u64>,
-) -> Option<[u8; 32]> {
+) -> Option<LaterAdminKey> {
     revocation_eviction::owner_recovery::promoted_admin_secret(state, result, secret_epoch?).await
 }
 
@@ -14548,7 +14570,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // #1508 rc13: or a later admin's share, with the actor's
                 // signed promotion of it held.
                 match later_admin_removal_secret(state, &next, secret_epoch).await {
-                    Some(secret) => next.shared_secret = Some(secret.to_vec()),
+                    Some(LaterAdminKey::Exact(secret)) => {
+                        next.shared_secret = Some(secret.to_vec());
+                    }
+                    // #1508 rc15: an intermediate head; the held chain
+                    // replays after this commit and installs the later
+                    // secret.
+                    Some(LaterAdminKey::Superseded) => {}
                     None => {
                         park_gss_removal_for_share(
                             state,
@@ -15064,7 +15092,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // #1508 rc13: or a later admin's share, with the actor's
                 // signed promotion of it held.
                 match later_admin_removal_secret(state, &next, secret_epoch).await {
-                    Some(secret) => next.shared_secret = Some(secret.to_vec()),
+                    Some(LaterAdminKey::Exact(secret)) => {
+                        next.shared_secret = Some(secret.to_vec());
+                    }
+                    // #1508 rc15: an intermediate head; the held chain
+                    // replays after this commit and installs the later
+                    // secret.
+                    Some(LaterAdminKey::Superseded) => {}
                     None => {
                         park_gss_removal_for_share(
                             state,
@@ -33374,7 +33408,7 @@ pub(in crate::server) async fn secure_group_encrypt(
         return resp;
     }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
-    // The GSS share hold is read under the group guard below (#1533 rc15).
+    // The GSS key read checks the durable share holds (#1508 rc16).
     gss_share_hold::ensure_loaded(&state).await;
     let groups = state.named_groups.read().await;
     // #1166 S2: the entry admission (raw-id lookup 404 with the
@@ -33508,19 +33542,6 @@ pub(in crate::server) async fn secure_group_encrypt(
         .await;
     }
 
-    // The GSS share hold and the key are read under one guard (#1533
-    // rc15). A replacement share installs the next key and ends the hold
-    // under the write lock. Before the fix the key was read here and the
-    // hold only in `group_ciphertext_withheld` after the guard dropped, so
-    // a share installed between the two let the old key through.
-    if crate::server::resolve_group_entry_locked(&groups, &id)
-        .is_none_or(|(group_key, entry)| pending_gss_removal_withholds(&state, group_key, entry))
-    {
-        return api_error(
-            StatusCode::CONFLICT,
-            GroupCiphertextHold::PendingGssRemoval.reason(),
-        );
-    }
     let Some(key) = info.secure_message_key() else {
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
@@ -33529,17 +33550,19 @@ pub(in crate::server) async fn secure_group_encrypt(
     };
     let epoch = info.secret_epoch;
     let group_id_clone = info.stable_group_id().to_string();
+    // #1508 rc16 (Codex P1): the share hold is checked on the snapshot the
+    // key came from. A share that installs after this read ends the hold,
+    // but this send still uses the old key, which the removed member holds.
+    let key_held = crate::server::resolve_group_entry_locked(&groups, &id)
+        .is_some_and(|(group_key, info)| pending_gss_removal_withholds(&state, group_key, info));
     drop(groups);
-    #[cfg(test)]
-    let key_selected_hook = GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    #[cfg(test)]
-    if let Some((entered, release)) = key_selected_hook {
-        entered.notify_one();
-        release.notified().await;
+    if key_held {
+        return api_error(
+            StatusCode::CONFLICT,
+            GroupCiphertextHold::PendingGssRemoval.reason(),
+        );
     }
+    gss_encrypt_after_key_probe(&state).await;
     // The group ciphertext boundary, as on the TreeKEM plane (#1573).
     if let Some(hold) = group_ciphertext_withheld(&state, &id, None).await {
         return revocation_eviction::s4_no_eligible_admin_refusal(&state, &id)
@@ -54334,6 +54357,9 @@ pub(in crate::server) mod tests {
         envelope_event: NamedGroupMetadataEvent,
         /// A Member that the admin can promote after the removal.
         promotee: AgentId,
+        promotee_kp: crate::identity::AgentKeypair,
+        /// A Member that a later admin can remove after the removal.
+        bystander_hex: String,
         /// The committed post-removal state.
         committed: x0x::groups::GroupInfo,
     }
@@ -54368,7 +54394,13 @@ pub(in crate::server) mod tests {
                 .as_bytes(),
         );
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-        let promotee = crate::identity::AgentKeypair::generate()?.agent_id();
+        let promotee_kp = crate::identity::AgentKeypair::generate()?;
+        let promotee = promotee_kp.agent_id();
+        let bystander_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
 
         let group_id = format!("f1-gss-{group_tag}-local");
         let stable_group_id = format!("f1-gss-{group_tag}-stable");
@@ -54405,6 +54437,12 @@ pub(in crate::server) mod tests {
         );
         parent.add_member(
             hex::encode(promotee.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        parent.add_member(
+            bystander_hex.clone(),
             x0x::groups::GroupRole::Member,
             Some(admin_hex.clone()),
             None,
@@ -54482,6 +54520,8 @@ pub(in crate::server) mod tests {
             remove_event,
             envelope_event,
             promotee,
+            promotee_kp,
+            bystander_hex,
             committed,
         })
     }
@@ -54723,30 +54763,49 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
-    /// #1533 rc15 (Codex P1): the encrypt path reads the key and the GSS
-    /// share hold under one guard. Here the replacement share installs
-    /// after the key is read but before the boundary check. Before the fix
-    /// the check saw the new key, ended the hold, and the survivor sealed
-    /// with the old key, which the removed member holds.
+    /// #1508 rc16 (Codex P1): an encrypt that read the old key while a
+    /// removal waits makes no ciphertext, even when the share installs
+    /// before the boundary check and so ends the hold. Before the fix the
+    /// hold was checked on a later snapshot than the key, and the send
+    /// sealed under the old secret, which the removed member holds.
     #[tokio::test]
-    async fn rc15_gss_encrypt_never_seals_with_the_key_read_under_a_hold() -> Result<()> {
-        let f = f1_gss_rotation_fixture("pending-race").await?;
+    async fn rc16_gss_share_between_key_read_and_hold_check_seals_nothing() -> Result<()> {
+        let f = f1_gss_rotation_fixture("key-hold-race").await?;
         let sender = f.admin_kp.agent_id();
         let held =
             apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
                 .await;
         assert!(!held.accepted);
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *f.state
+            .named_group_test_recorders
+            .gss_encrypt_pause
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((Arc::clone(&entered), Arc::clone(&release)));
-        let encrypt = f1_encrypt(&f);
-        tokio::pin!(encrypt);
-        let (status, body) = tokio::select! {
-            result = &mut encrypt => result,
-            () = entered.notified() => {
+            Some((Arc::clone(&reached), Arc::clone(&resume)));
+        let state = Arc::clone(&f.state);
+        let group_id = f.group_id.clone();
+        let mut send = tokio::spawn(async move {
+            let (status, Json(body)) = secure_group_encrypt(
+                State(state),
+                Path(group_id),
+                axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+                Json(SecureEncryptRequest {
+                    payload_b64: BASE64.encode(b"raced"),
+                }),
+            )
+            .await;
+            (status, body)
+        });
+        // The send either refuses at its key read or pauses after it.
+        let finished = tokio::select! {
+            () = reached.notified() => None,
+            joined = &mut send => Some(joined?),
+        };
+        let (status, body) = match finished {
+            Some(outcome) => outcome,
+            None => {
                 let _ = apply_named_group_metadata_event(
                     &f.state,
                     f.envelope_event.clone(),
@@ -54755,28 +54814,12 @@ pub(in crate::server) mod tests {
                     None,
                 )
                 .await;
-                release.notify_one();
-                encrypt.await
+                resume.notify_one();
+                send.await?
             }
         };
-        GSS_ENCRYPT_AFTER_KEY_SELECTED_NOTIFY
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if status == StatusCode::OK {
-            assert_eq!(
-                body["secret_epoch"].as_u64(),
-                Some(f.new_epoch),
-                "sealed with the removed member's key: {body}"
-            );
-        } else {
-            assert_eq!(status, StatusCode::CONFLICT, "{body}");
-            assert_eq!(
-                body["error"],
-                GroupCiphertextHold::PendingGssRemoval.reason(),
-                "{body}"
-            );
-        }
+        assert_eq!(status, StatusCode::CONFLICT, "old key used: {body}");
+        assert!(body.get("ciphertext_b64").is_none(), "{body}");
         Ok(())
     }
 
@@ -55147,6 +55190,247 @@ pub(in crate::server) mod tests {
         assert_eq!(
             group_ciphertext_withheld(&f.state, &f.group_id, None).await,
             None
+        );
+        Ok(())
+    }
+
+    /// #1508 rc16 (Codex P1): A removes a member with a GSS rotation, adds
+    /// J, promotes B and goes offline. A lagging survivor must walk past
+    /// J's addition, install the removal with B's secret and reach A's last
+    /// head. Before the fix the walk stopped at the addition, so the
+    /// removal stayed parked although B was an admin.
+    #[tokio::test]
+    async fn rc16_gss_removal_catchup_past_a_member_addition_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("add-then-promotion").await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let joiner_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let mut added = f.committed.clone();
+        added.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        added.roster_revision = added.roster_revision.saturating_add(1);
+        let add_revision = added.roster_revision;
+        let add_commit =
+            seal_commit_owner_certified(&f.state, &mut added, &f.admin_kp, 2_000).await?;
+        let addition = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: add_revision,
+            actor: admin_hex.clone(),
+            agent_id: joiner_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(add_commit),
+            reseat_mandate: None,
+        };
+        let mut promoted = added.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 3_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: promotee_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(
+            &f.state,
+            rc14_promotee_share(&f),
+            f.promotee,
+            true,
+            None,
+        )
+        .await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, addition, admin, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert!(info.has_active_member(&joiner_hex), "J is seated");
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
+    /// #1508 rc15 (Codex P1): A removes a member with a GSS rotation,
+    /// promotes B and goes offline; B then removes another member and
+    /// rotates again. A lagging survivor gets A's removal, B's share of
+    /// B's epoch, A's promotion and B's removal. No holder seals A's epoch
+    /// any more. The survivor must reach B's head with B's secret, and
+    /// sending must work again. Before the fix the walk needed a share of
+    /// A's exact epoch, so all four waited for ever.
+    #[tokio::test]
+    async fn rc15_gss_removal_catchup_past_a_later_rotation_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("later-rotation").await?;
+        let admin = f.admin_kp.agent_id();
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let stable = f.committed.stable_group_id().to_string();
+        let mut promoted = f.committed.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let revision = promoted.roster_revision;
+        let commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 2_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: stable.clone(),
+            revision,
+            actor: hex::encode(admin.as_bytes()),
+            agent_id: promotee_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit),
+        };
+        // B removes the bystander and rotates to the next epoch.
+        let mut rotated = promoted.clone();
+        rotated.roster_revision = rotated.roster_revision.saturating_add(1);
+        let b_revision = rotated.roster_revision;
+        rotated.remove_member(&f.bystander_hex, Some(promotee_hex.clone()));
+        let (b_secret, b_epoch) = rotated.rotate_shared_secret();
+        let b_secret: [u8; 32] = b_secret
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("secret length"))?;
+        let b_commit =
+            seal_commit_owner_certified(&f.state, &mut rotated, &f.promotee_kp, 3_000).await?;
+        let b_removal = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: stable.clone(),
+            revision: b_revision,
+            actor: promotee_hex.clone(),
+            agent_id: f.bystander_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(b_epoch),
+            commit: Some(b_commit),
+        };
+        let aad = secure_share_aad(&stable, &local_hex, b_epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &f.state.agent_kem_keypair.public_bytes,
+                &aad,
+                &b_secret,
+            )?;
+        let b_share = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: stable,
+            recipient: local_hex,
+            secret_epoch: b_epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: promotee_hex.clone(),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused =
+            apply_named_group_metadata_event(&f.state, b_share, f.promotee, true, None).await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, b_removal, f.promotee, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, rotated.state_hash, "B's head");
+            assert_eq!(info.secret_epoch, b_epoch);
+            assert_eq!(info.shared_secret.as_deref(), Some(b_secret.as_slice()));
+            assert!(!info.has_active_member(&f.victim_hex));
+            assert!(!info.has_active_member(&f.bystander_hex));
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
+    /// #1508 rc15: a held rotation that a Member signs does not supersede
+    /// the transition. The removal keeps waiting and sends stay held.
+    #[tokio::test]
+    async fn rc15_gss_later_rotation_by_a_member_supersedes_nothing() -> Result<()> {
+        let f = f1_gss_rotation_fixture("member-rotation").await?;
+        let admin = f.admin_kp.agent_id();
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let stable = f.committed.stable_group_id().to_string();
+        // No promotion: B is a Member on the removal's result.
+        let mut rotated = f.committed.clone();
+        rotated.roster_revision = rotated.roster_revision.saturating_add(1);
+        let b_revision = rotated.roster_revision;
+        rotated.remove_member(&f.bystander_hex, Some(promotee_hex.clone()));
+        let (b_secret, b_epoch) = rotated.rotate_shared_secret();
+        let b_secret: [u8; 32] = b_secret
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("secret length"))?;
+        let b_commit =
+            seal_commit_owner_certified(&f.state, &mut rotated, &f.promotee_kp, 3_000).await?;
+        let b_removal = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: stable.clone(),
+            revision: b_revision,
+            actor: promotee_hex.clone(),
+            agent_id: f.bystander_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(b_epoch),
+            commit: Some(b_commit),
+        };
+        let aad = secure_share_aad(&stable, &local_hex, b_epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &f.state.agent_kem_keypair.public_bytes,
+                &aad,
+                &b_secret,
+            )?;
+        let b_share = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: stable,
+            recipient: local_hex,
+            secret_epoch: b_epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: promotee_hex,
+        };
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let _ = apply_named_group_metadata_event(&f.state, b_share, f.promotee, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, b_removal, f.promotee, true, None).await;
+        assert_gss_removal_held(&f).await?;
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            Some(GroupCiphertextHold::PendingGssRemoval)
         );
         Ok(())
     }

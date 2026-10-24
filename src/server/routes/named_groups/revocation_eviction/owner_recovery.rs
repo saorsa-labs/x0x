@@ -50,7 +50,8 @@ pub(in crate::server) const WAITING_FOR_RECOVERY_MEMBER: &str = "waiting_for_rec
 
 /// A send round runs no more often than this per mandate or commit.
 const ORC_RESEND_INTERVAL: Duration = Duration::from_secs(5);
-/// A retained mandate or stashed frame is dropped after this long.
+/// A stashed frame, held commit or parked share is dropped after this
+/// long. A held mandate is not (#1508 rc16).
 const ORC_RETAIN_TTL: Duration = Duration::from_secs(600);
 /// Frames held for a later retry.
 const ORC_STASH_CAP: usize = 32;
@@ -82,7 +83,6 @@ struct PendingMandate {
     /// The last typed wait of a commit attempt, with the named members.
     wait: Option<(&'static str, Vec<[u8; 32]>)>,
     next_at: Instant,
-    received_at: Instant,
 }
 
 /// The promoted member's delivery of one committed recovery.
@@ -554,10 +554,10 @@ pub(super) async fn drive(state: &Arc<AppState>) {
     drive_mandates(state).await;
     let due: Vec<String> = {
         let now = Instant::now();
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        inner.orc.pending.retain(|_, pending| {
-            now.saturating_duration_since(pending.received_at) <= ORC_RETAIN_TTL
-        });
+        // #1508 rc16 (Codex P2): a held mandate has no time limit. It ends
+        // when it commits or a check refuses it ([`try_commit`]); an
+        // upgrade wait keeps it (ADR 0110 §4, D76).
+        let inner = state.revocation_evictions.inner.lock().await;
         inner
             .orc
             .pending
@@ -772,7 +772,6 @@ async fn accept_mandate(state: &Arc<AppState>, mandate: orc::SignedOwnerRecovery
                 mandate,
                 wait: None,
                 next_at: now,
-                received_at: now,
             },
         );
     state.agent.s4_revocation_intake().request_reconcile();
@@ -837,7 +836,7 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
     ) {
         match refusal {
             // The revocation records may still be arriving, or this node
-            // is behind the mandate's head: keep it until its TTL.
+            // is behind the mandate's head: keep it.
             orc::OwnerRecoveryRefusal::RecoveryNotNeeded => {
                 set_wait(state, stable, Some((refusal.as_str(), Vec::new()))).await;
             }
@@ -1769,6 +1768,25 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
     Some((*secret_epoch, secret))
 }
 
+/// What [`promoted_admin_secret`] found for a waiting GSS transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum LaterAdminKey {
+    /// The secret of the transition's epoch: the transition installs with
+    /// it.
+    Exact([u8; 32]),
+    /// #1508 rc15 (Codex P1): the checked held chain rotates past the
+    /// transition's epoch, and a share of the chain's later epoch opens.
+    /// No holder seals the transition's own secret any more, so the
+    /// transition installs as an intermediate head with no secret (the old
+    /// secret is dropped, so nothing is sealed under it). The held chain
+    /// then replays on it, and its last rotation installs the later secret
+    /// through the ordinary apply. The only delivery that this keyless head
+    /// can end is that of the transition's own secret, which the later
+    /// secret supersedes; the later rotation's delivery stays open until
+    /// this node's head reaches it, with its key.
+    Superseded,
+}
+
 /// #1508 rc13/rc14 (Codex P1): the secret of `epoch` for a GSS removal,
 /// ban or crypto-only exclusion whose verified, keyless result is
 /// `result`, from a later admin. The transition's actor can promote an
@@ -1789,11 +1807,17 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
 /// head still means that the key is installed: a keyless head could end a
 /// key delivery that later same-epoch commits keep open. The ordinary
 /// apply checks the held commits again when they replay.
+///
+/// #1508 rc15 (Codex P1): the walk also follows a held GSS removal or ban
+/// that an admin of the walked roster signed, which rotates to a later
+/// epoch. Catch-up seals the current secret only, so after such a rotation
+/// no holder seals `epoch`'s secret any more. A share of the later epoch
+/// from an admin of that later roster gives [`LaterAdminKey::Superseded`].
 pub(in crate::server) async fn promoted_admin_secret(
     state: &AppState,
     result: &GroupInfo,
     epoch: u64,
-) -> Option<[u8; 32]> {
+) -> Option<LaterAdminKey> {
     let stable_group_id = result.stable_group_id().to_string();
     let now = Instant::now();
     let (held, parked): (Vec<HeldEvent>, Vec<ParkedShare>) = {
@@ -1825,13 +1849,23 @@ pub(in crate::server) async fn promoted_admin_secret(
         return None;
     }
     // A revoked agent signs no step and sends no trusted share, as in the
-    // ordinary apply's revocation gate.
+    // ordinary apply's revocation gate. A revoked agent is not added either
+    // (the OwnerCertified add check).
     let (held, parked) = {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
         (
             held.into_iter()
-                .filter(|held| !revoked.is_agent_revoked(&held.author))
+                .filter(|held| {
+                    !revoked.is_agent_revoked(&held.author)
+                        && match &held.event {
+                            super::super::NamedGroupMetadataEvent::MemberAdded {
+                                agent_id, ..
+                            } => super::super::parse_agent_id_hex(agent_id)
+                                .is_ok_and(|agent| !revoked.is_agent_revoked(&agent)),
+                            _ => true,
+                        }
+                })
                 .collect::<Vec<_>>(),
             parked
                 .into_iter()
@@ -1839,6 +1873,7 @@ pub(in crate::server) async fn promoted_admin_secret(
                 .collect::<Vec<_>>(),
         )
     };
+    // A share of the roster's own epoch from an admin of that roster.
     let admin_share = |roster: &GroupInfo| {
         parked
             .iter()
@@ -1848,7 +1883,7 @@ pub(in crate::server) async fn promoted_admin_secret(
                     .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
             })
             .find_map(|share| match open_parked_share(state, share) {
-                Some((at, secret)) if at == epoch => Some(secret),
+                Some((at, secret)) if at == roster.secret_epoch => Some(secret),
                 _ => None,
             })
     };
@@ -1857,7 +1892,11 @@ pub(in crate::server) async fn promoted_admin_secret(
     // to the held set.
     for _ in 0..=held.len() {
         if let Some(secret) = admin_share(&cursor) {
-            return Some(secret);
+            return Some(if cursor.secret_epoch == epoch {
+                LaterAdminKey::Exact(secret)
+            } else {
+                LaterAdminKey::Superseded
+            });
         }
         match held.iter().find_map(|held| next_held_state(&cursor, held)) {
             Some(next) => cursor = next,
@@ -1869,9 +1908,10 @@ pub(in crate::server) async fn promoted_admin_secret(
 
 /// The state after the held commit `held` on `cursor`, checked as the
 /// ordinary apply checks it, or `None`. Only same-epoch roster and
-/// metadata steps are walked (a role update or a rename); any other event,
-/// or one that fails a check, ends the walk, and the transition keeps
-/// waiting for its share.
+/// metadata steps (a role update, a rename or a GSS add, #1508 rc16) and
+/// an admin's GSS removal or ban to a later epoch (#1508 rc15) are walked;
+/// any other event, or one that fails a check, ends the walk, and the
+/// transition keeps waiting for its share.
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
     use super::super::NamedGroupMetadataEvent as Event;
     let commit = super::super::named_group_metadata_event_commit(&held.event)?;
@@ -1939,10 +1979,145 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 },
             )
         }
+        // #1508 rc16 (Codex P1): an admin's GSS add between the removal
+        // and a promotion. It seats a Member only and keeps the epoch.
+        // An OwnerCertified add carries a certificate that verifies
+        // against the owner, as in the ordinary apply; the caller drops an
+        // add whose target is revoked.
+        Event::MemberAdded {
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            certificate_b64,
+            ..
+        } => {
+            if !admin(actor)
+                || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                || cursor
+                    .members_v2
+                    .get(agent_id)
+                    .is_some_and(|m| m.is_active() || m.is_banned())
+            {
+                return None;
+            }
+            let certificate = match cursor.policy.admission.owner_certified_user_id() {
+                Some(owner) => {
+                    use base64::Engine as _;
+                    let bytes = super::super::BASE64
+                        .decode(certificate_b64.as_deref()?)
+                        .ok()?;
+                    let cert: x0x::identity::AgentCertificate =
+                        bincode::deserialize(&bytes).ok()?;
+                    x0x::groups::owner_cert::verify_cert_against_owner(
+                        owner,
+                        agent_id,
+                        &cert,
+                        false,
+                        x0x::groups::owner_cert::restore_clock_now(),
+                    )
+                    .ok()?;
+                    Some(cert)
+                }
+                None => None,
+            };
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision =
+                        super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    next.add_member(
+                        agent_id.clone(),
+                        x0x::groups::GroupRole::Member,
+                        Some(actor.clone()),
+                        display_name.clone(),
+                    );
+                    if let Some(cert) = certificate {
+                        // A mismatched digest fails the result hash check.
+                        let _ = next.set_member_certificate(agent_id, cert);
+                    }
+                    if let Some(name) = display_name.clone() {
+                        next.set_display_name(agent_id, name);
+                    }
+                },
+            )
+        }
+        // #1508 rc15 (Codex P1): a later admin's GSS rotation, checked as
+        // the ordinary removal and ban apply checks it.
+        Event::MemberRemoved {
+            revision,
+            actor,
+            agent_id,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(to),
+            ..
+        } => {
+            let target = cursor.members_v2.get(agent_id)?;
+            if !admin(actor) || target.is_removed() || target.is_banned() {
+                return None;
+            }
+            return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                next.remove_member(agent_id, Some(actor.clone()));
+            });
+        }
+        Event::MemberBanned {
+            revision,
+            actor,
+            agent_id,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(to),
+            ..
+        } => {
+            if !admin(actor)
+                || cursor
+                    .members_v2
+                    .get(agent_id)
+                    .is_some_and(|m| m.is_banned())
+            {
+                return None;
+            }
+            return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                next.ban_member(agent_id, Some(actor.clone()));
+            });
+        }
         _ => return None,
     }
     .ok()?;
     (next.secret_epoch == cursor.secret_epoch).then_some(next)
+}
+
+/// The state after a held GSS removal or ban that rotates `cursor` to the
+/// later epoch `to`, with no secret ([`next_held_state`]).
+fn gss_rotation_step(
+    cursor: &GroupInfo,
+    commit: &x0x::groups::GroupStateCommit,
+    revision: u64,
+    to: u64,
+    seat: impl FnOnce(&mut GroupInfo),
+) -> Option<GroupInfo> {
+    if cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem || to <= cursor.secret_epoch {
+        return None;
+    }
+    super::super::apply_stateful_event_to_group(
+        cursor,
+        commit,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            next.roster_revision =
+                super::super::adopt_roster_revision(next.roster_revision, revision);
+            seat(next);
+            next.secret_epoch = to;
+            next.security_binding = Some(orc::gss_binding(to));
+            next.shared_secret = None;
+        },
+    )
+    .ok()
 }
 
 /// #1508 rc12 (Codex P1): hold a verified commit of a GSS group that does
@@ -1956,27 +2131,28 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
 /// applies the held commits after the install, each as its verified
 /// signer (the catch-up rule for a relayed removal), so the ordinary apply
 /// checks every signer's authority on the chain. Nothing is applied here.
-/// Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`].
+/// Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`]. Returns whether
+/// the event was held now (not held before).
 pub(in crate::server) async fn hold_unchained_event(
     state: &AppState,
     event: &super::super::NamedGroupMetadataEvent,
-) {
+) -> bool {
     let Some(commit) = super::super::named_group_metadata_event_commit(event) else {
-        return;
+        return false;
     };
     let group_id = super::super::named_group_metadata_event_group_id(event);
     let Some(info) = ({
         let groups = state.named_groups.read().await;
         crate::server::resolve_group_entry_locked(&groups, group_id).map(|(_, info)| info.clone())
     }) else {
-        return;
+        return false;
     };
     if info.withdrawn
         || orc::crypto_kind(&info) != orc::RecoveryCryptoKind::Gss
         || commit.revision <= info.state_revision
         || commit.prev_state_hash.as_deref() == Some(info.state_hash.as_str())
     {
-        return;
+        return false;
     }
     let now = Instant::now();
     {
@@ -1990,14 +2166,14 @@ pub(in crate::server) async fn hold_unchained_event(
             .iter()
             .any(|held| held.event == *event)
         {
-            return;
+            return false;
         }
     }
     if commit.verify_structure().is_err() {
-        return;
+        return false;
     }
     let Ok(author) = super::super::parse_agent_id_hex(&commit.committed_by) else {
-        return;
+        return false;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
     let kept = &mut inner.orc.held_events;
@@ -2015,6 +2191,7 @@ pub(in crate::server) async fn hold_unchained_event(
     drop(inner);
     // A stashed frame can wait for this commit (#1508 rc13).
     state.agent.s4_revocation_intake().request_reconcile();
+    true
 }
 
 /// Whether this node holds a verified commit that `actor` signed on the
@@ -3035,7 +3212,6 @@ mod tests {
                 mandate,
                 wait: None,
                 next_at: Instant::now(),
-                received_at: Instant::now(),
             },
         );
         let rounds = orc.head_round_groups();
@@ -3530,6 +3706,64 @@ mod tests {
             .unwrap());
         let admin_hex = hex::encode(admin.agent_id().as_bytes());
         (dir, state, info, admin_hex)
+    }
+
+    /// #1508 rc16 (Codex P2): the owner promotes its own agent, and a known
+    /// Active member L's advert lacks `owner_recovery_v1`. The mandate
+    /// waits for L's upgrade (D76) for longer than the retain TTL, and no
+    /// outbound mandate replaces it. It must stay held, with the wait
+    /// visible. Before the fix it was dropped after 600 s, so L's upgrade
+    /// did not resume the recovery.
+    #[tokio::test]
+    async fn an_upgrade_wait_keeps_the_held_mandate_past_the_retain_ttl() {
+        let (_dir, state, mut info, _admin_hex) = recovery_fixture().await;
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let legacy = x0x::identity::AgentKeypair::generate().unwrap();
+        let legacy_hex = hex::encode(legacy.agent_id().as_bytes());
+        let cert = x0x::identity::AgentCertificate::issue(owner, &legacy).unwrap();
+        let mut member = x0x::groups::GroupMember::new_member(legacy_hex.clone(), None, None, 1);
+        member.certificate_digest = Some(x0x::groups::owner_cert::certificate_digest_hex(&cert));
+        member.certificate = Some(cert);
+        info.members_v2.insert(legacy_hex, member);
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(stable.clone(), info.clone());
+        advertise(&state, legacy.agent_id(), 0, x0x::dm::now_unix_ms());
+
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        sync_head(&state, &info).await;
+        let upgrade = x0x::groups::eviction::WaitingCause::WaitingForReceiverUpgrade.as_str();
+        let wait = |state: Arc<AppState>, stable: String| async move {
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .pending
+                .get(&stable)
+                .map(|pending| pending.wait.as_ref().map(|(cause, _)| *cause))
+        };
+        try_commit(&state, &stable).await;
+        assert_eq!(
+            wait(Arc::clone(&state), stable.clone()).await,
+            Some(Some(upgrade))
+        );
+
+        tokio::time::advance(ORC_RETAIN_TTL + Duration::from_secs(1)).await;
+        drive(&state).await;
+        assert_eq!(
+            wait(Arc::clone(&state), stable.clone()).await,
+            Some(Some(upgrade)),
+            "the mandate is held until L upgrades"
+        );
+        state.agent.shutdown().await;
     }
 
     /// #1357 CI (493c2a6): a commit attempt that waited on the membership
