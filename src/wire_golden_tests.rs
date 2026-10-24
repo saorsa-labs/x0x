@@ -1027,3 +1027,27 @@ fn saved_member_with_unknown_role_has_no_authority_after_restart() {
     assert_eq!(restored.caller_role(&creator_hex), None);
     assert_eq!(restored.active_members().count(), 0);
 }
+
+/// #1604 G5 (Codex): a group state holding an `Unknown` is never sealed
+/// (signed) or accepted at the commit-apply boundary.
+#[test]
+fn group_state_with_unknown_is_never_sealed_or_applied() {
+    let keypair = crate::identity::AgentKeypair::generate().expect("keypair");
+    let mut clean =
+        crate::groups::GroupInfo::new("g".into(), "d".into(), keypair.agent_id(), "ab".repeat(16));
+    let mut dirty = clean.clone();
+    let commit = clean
+        .seal_commit(&keypair, 1_000)
+        .expect("clean state seals");
+    dirty.policy.read_access = crate::groups::GroupReadAccess::Unknown;
+    let err = dirty.clone().seal_commit(&keypair, 2_000).unwrap_err();
+    assert!(
+        matches!(err, crate::groups::state_commit::ApplyError::Invariant(_)),
+        "{err}"
+    );
+    let err = dirty.finalize_applied_commit(&commit).unwrap_err();
+    assert!(
+        matches!(err, crate::groups::state_commit::ApplyError::Invariant(_)),
+        "{err}"
+    );
+}

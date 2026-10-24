@@ -1397,6 +1397,9 @@ impl GroupInfo {
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        // #1604 G5: never sign a state that holds a variant this node does
+        // not know (its policy and roster hashes cannot be computed).
+        self.refuse_unknown_variants()?;
         // ADR-0016 R2: never author a commit whose post-mutation,
         // non-withdrawn state has zero active admins. `self` already holds
         // the caller's domain mutations, so this evaluates the proposed
@@ -2032,6 +2035,9 @@ impl GroupInfo {
         commit: &state_commit::GroupStateCommit,
         allow_live_withdrawal: bool,
     ) -> Result<(), state_commit::ApplyError> {
+        // #1604 G5: never accept a state that holds a variant this node does
+        // not know.
+        self.refuse_unknown_variants()?;
         if self.withdrawn && !commit.withdrawn {
             return Err(state_commit::ApplyError::Withdrawn);
         }
@@ -2079,6 +2085,15 @@ impl GroupInfo {
     /// finalizer deliberately rejects live -> withdrawn commits; use
     /// [`GroupInfo::finalize_applied_terminal_commit`] only from explicit
     /// terminal event handling.
+    /// #1604 G5: refuse a state that holds an `Unknown` variant before it is
+    /// hashed, signed or applied. `Unknown` is never encoded, so its policy
+    /// and roster hashes cannot be computed.
+    fn refuse_unknown_variants(&self) -> Result<(), state_commit::ApplyError> {
+        crate::wire_compat::reject_unknown("GroupInfo", self)
+            .map(|_| ())
+            .map_err(|e| state_commit::ApplyError::Invariant(e.to_string()))
+    }
+
     pub fn finalize_applied_commit(
         &mut self,
         commit: &state_commit::GroupStateCommit,

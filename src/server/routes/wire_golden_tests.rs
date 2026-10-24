@@ -147,3 +147,20 @@ fn unknown_join_refusal_reason_is_never_encoded() {
     assert_eq!(reason, JoinRefusalReason::Unknown);
     assert!(serde_json::to_vec(&reason).is_err());
 }
+
+/// #1604 G5 (Codex): a TreeKEM catch-up response carrying an event with an
+/// unknown role is refused before any apply.
+#[test]
+fn treekem_catchup_response_with_unknown_is_refused() {
+    let mut event = fixture_input("NamedGroupMetadataEvent", 4);
+    event["role"] = "overlord".into();
+    let response = serde_json::json!({
+        "message_type": "treekem_catchup_response",
+        "group_id": "g",
+        "events": [event],
+        "truncated": false,
+    });
+    let decoded: super::named_groups::TreeKemCatchupResponse =
+        serde_json::from_value(response).expect("decodes with Unknown");
+    assert!(crate::wire_compat::reject_unknown("s.TreeKemCatchupResponse", decoded).is_err());
+}

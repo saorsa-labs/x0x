@@ -36286,9 +36286,29 @@ async fn preserve_unsupported_saved_bytes(path: &FsPath) -> Result<()> {
         .await
         .is_ok_and(|held| held == bytes)
     {
-        return Ok(());
+        // Reused: make sure the earlier copy itself is on stable storage.
+        let file = tokio::fs::File::open(&backup)
+            .await
+            .with_context(|| format!("failed to open {}", backup.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to sync {}", backup.display()))?;
+        return sync_parent_dir(&backup).await;
     }
     write_durably(&backup, &bytes).await
+}
+
+/// Sync the directory that holds `path`, so a rename into it is durable.
+async fn sync_parent_dir(path: &FsPath) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = tokio::fs::File::open(parent)
+        .await
+        .with_context(|| format!("failed to open directory {}", parent.display()))?;
+    dir.sync_all()
+        .await
+        .with_context(|| format!("failed to sync directory {}", parent.display()))
 }
 
 /// Write `bytes` to `path` through a synced temporary file and a rename.
@@ -36308,12 +36328,7 @@ async fn write_durably(path: &FsPath, bytes: &[u8]) -> Result<()> {
     tokio::fs::rename(&tmp, path)
         .await
         .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-    Ok(())
+    sync_parent_dir(path).await
 }
 
 pub(in crate::server) async fn load_named_groups_merged(

@@ -2340,6 +2340,12 @@ pub async fn serve_with_options(
                 }
                 if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
                 {
+                    // #1604 G5: refuse held unknown variants before any apply.
+                    let Ok(response) =
+                        crate::wire_compat::reject_unknown("TreeKemCatchupResponse", response)
+                    else {
+                        continue;
+                    };
                     if response.message_type == "treekem_catchup_response" {
                         // #1275: the response's events are applied and
                         // persisted, so the apply runs shielded; awaiting it
