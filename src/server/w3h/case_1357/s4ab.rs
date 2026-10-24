@@ -30,7 +30,7 @@
 //!   before the one now committed; the route refuses with
 //!   `rebind_not_later` and nothing changes. This arm does not depend on
 //!   the wall clock moving, so it also runs without the shim.
-//! - `slow_w3h_1357_s4_certificate_rebind_post_cutoff`, run (6) with A
+//! - `w3h_1357_s4_certificate_rebind_post_cutoff`, run (6) with A
 //!   reachable. B's first certificate has `not_after` N = issue time +
 //!   [`LATE_NOT_AFTER`]. At B's clock N − τ/2 (after the cutoff N − τ),
 //!   U issues the renewal and B calls the route. Desired: the route
@@ -46,9 +46,9 @@
 //!   B and C still decrypt. The cutoff and the expiry follow the daemons'
 //!   wall clock, so this arm needs the shim (wall clock = base + virtual
 //!   time). It runs about 800 virtual seconds (τ = 300 s fixes the span
-//!   from the cutoff to A's trigger), so it is named outside the `w3h_`
-//!   filter and `#[ignore]`d: it is not in the 20-rerun W3-H gate. Run it
-//!   on demand with the `w3h` nextest profile and `--run-ignored only`.
+//!   from the cutoff to A's trigger). It is `#[ignore]`d outside the shim,
+//!   and the 20-rerun W3-H gate runs it (`--run-ignored all`) and requires
+//!   GREEN in every rerun, as for the other `s4_` arms.
 //!
 //! Not in this case yet (ADR rows (2), (3), (5), (7)–(10) and the
 //! D-fallback form of (6)): (2) needs B offline with the renewal reaching
@@ -1641,11 +1641,11 @@ async fn w3h_1357_s4_certificate_rebind_pre_cutoff() -> Result<()> {
 }
 
 /// ADR 0110 `s4_certificate_rebind` run (6), designated admin reachable:
-/// GREEN with S4. Needs the shim (wall clock = base + virtual time).
+/// GREEN with S4. Needs the shim (wall clock = base + virtual time), so
+/// it runs in the W3-H gate only.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "slow (about 800 virtual s) and needs the W3-H LD_PRELOAD shim: run on demand with \
-            the w3h profile, --run-ignored only -E 'test(slow_w3h_1357_)'"]
-async fn slow_w3h_1357_s4_certificate_rebind_post_cutoff() -> Result<()> {
+#[ignore = "needs the W3-H LD_PRELOAD shim: the W3-H gate runs it with --run-ignored all"]
+async fn w3h_1357_s4_certificate_rebind_post_cutoff() -> Result<()> {
     expect2(
         "w3h_1357_s4_certificate_rebind_post_cutoff",
         0x1357_000c,

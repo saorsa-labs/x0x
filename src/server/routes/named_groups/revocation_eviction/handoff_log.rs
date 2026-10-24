@@ -92,6 +92,10 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<EvictionKey, ExpiryHandoff>, SidecarD
 
 /// Write the kept hand-offs when they changed since the last write.
 pub(super) async fn persist(state: &AppState) {
+    // §5: no write inside an ADR 0094 trial; the set stays dirty.
+    if !super::host_commit_gate_open(state) {
+        return;
+    }
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
     let bytes = {
@@ -115,8 +119,10 @@ pub(super) async fn persist(state: &AppState) {
 }
 
 /// Load the kept hand-offs at startup. A damaged file is quarantined; a
-/// newer layout is kept on disk and never rewritten.
-pub(super) async fn load(state: &AppState) {
+/// newer layout is kept on disk and never rewritten. Inside an ADR 0094
+/// trial (`gate_open` false) a damaged file is left as it is; the load
+/// after host commit quarantines it (§5).
+pub(super) async fn load(state: &AppState, gate_open: bool) {
     let path = path(state);
     let Ok(bytes) = tokio::fs::read(&path).await else {
         return;
@@ -134,6 +140,10 @@ pub(super) async fn load(state: &AppState) {
                 .lock()
                 .await
                 .expiry_handoffs_newer_file = true;
+            return;
+        }
+        Err(SidecarDecodeError::Damaged(reason)) if !gate_open => {
+            tracing::warn!(reason, "ADR 0110 S4: damaged kept expiry hand-offs inside an ADR 0094 trial; quarantine waits for host commit");
             return;
         }
         Err(SidecarDecodeError::Damaged(reason)) => {

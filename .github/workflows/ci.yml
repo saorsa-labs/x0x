@@ -709,6 +709,8 @@ jobs:
           --expect w3h_1357_control_s4_designated_no_early_sibling=GREEN
           --require w3h_1357_s4_certificate_rebind_pre_cutoff
           --expect w3h_1357_s4_certificate_rebind_pre_cutoff=GREEN
+          --require w3h_1357_s4_certificate_rebind_post_cutoff
+          --expect w3h_1357_s4_certificate_rebind_post_cutoff=GREEN
           --require w3h_1357_s4_owner_recovery
           --expect w3h_1357_s4_owner_recovery=GREEN
           --require w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes
