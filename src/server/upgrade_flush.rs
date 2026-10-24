@@ -101,10 +101,11 @@ impl FlushOwner {
             root.clone(),
             Arc::new(move |deadline, stopped| {
                 deadline.check()?;
-                stop();
-                // The daemon is committed to stopping behind this hook from
-                // here: mark the point every later failure recovers from.
+                // Commit before sending either stop signal. A deadline in
+                // stop() must never classify an already-stopping daemon as
+                // a refusal that can release admission and keep serving.
                 stopped.store(true, std::sync::atomic::Ordering::Release);
+                stop();
                 receive
                     .lock()
                     .map_err(|_| io::Error::other("shutdown acknowledgement poisoned"))?
@@ -241,8 +242,9 @@ struct AdmittedArm {
     binding: shutdown_flush::Binding,
     handoff: journal::M2HandoffRecord,
     /// `(target, backup)` for exactly the artifacts the transaction swapped.
-    /// A failed flush restores these together or not at all.
+    /// Recovery verifies every backup before starting the restore.
     restore_set: Vec<(PathBuf, PathBuf)>,
+    journal: Box<journal::JournalRecord>,
 }
 
 fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<AdmittedArm> {
@@ -334,7 +336,14 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         binding,
         handoff,
         restore_set,
+        journal: record,
     })
+}
+
+#[derive(Default)]
+struct ArmPreparation {
+    cancelled: bool,
+    wrote_handoff: bool,
 }
 
 fn arm(
@@ -346,19 +355,61 @@ fn arm(
         Ok(admitted) => admitted,
         Err(error) => return Err(ArmFailure::Refused(error)),
     };
+    // Retain the reservation through refusal recovery. A competing socket
+    // arm or auto-apply cannot see the restored bytes with the old journal.
+    let reservation = shutdown_flush::reserve(root).map_err(ArmFailure::Refused)?;
+    reservation.activate().map_err(ArmFailure::Refused)?;
+    // Admission may have changed since authentication read the journal.
+    let current = admit(state, root, bytes).map_err(ArmFailure::Refused)?;
+    if serde_json::to_vec(&current.journal)
+        .map_err(io::Error::from)
+        .map_err(ArmFailure::Refused)?
+        != serde_json::to_vec(&admitted.journal)
+            .map_err(io::Error::from)
+            .map_err(ArmFailure::Refused)?
+    {
+        return Err(ArmFailure::Refused(io::Error::other(
+            "host transaction changed before admission",
+        )));
+    }
     let AdmittedArm {
         plan,
         binding,
         handoff,
         restore_set,
-    } = admitted;
+        journal,
+    } = current;
     let handoff_path = root.join(journal::HANDOFF_FILE_NAME);
-    let flush = shutdown_flush::acknowledge(root, binding, move || {
-        journal::write_record(&handoff_path, &handoff)
-    });
+    // Serialize a late prepare with refusal cleanup, including a timed-out
+    // worker. A cancelled prepare can never leave a handoff after cleanup.
+    let preparation = Arc::new(Mutex::new(ArmPreparation::default()));
+    let worker_preparation = Arc::clone(&preparation);
+    let worker_handoff = handoff.clone();
+    let flush = shutdown_flush::acknowledge_reserved(
+        root,
+        binding,
+        move || {
+            let mut state = worker_preparation
+                .lock()
+                .map_err(|_| io::Error::other("arm preparation poisoned"))?;
+            if state.cancelled {
+                return Err(io::Error::other("arm preparation cancelled"));
+            }
+            match std::fs::symlink_metadata(&handoff_path) {
+                Ok(_) => return Err(io::Error::other("handoff already exists")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            // A failed final directory sync can still leave the written record.
+            state.wrote_handoff = true;
+            journal::write_record(&handoff_path, &worker_handoff)
+        },
+        &reservation,
+    );
     match flush {
         Ok(receipt) => Ok(receipt),
-        Err(failure) if failure.started => {
+        Err(shutdown_flush::FlushFailure::NotOwned(error)) => Err(ArmFailure::Refused(error)),
+        Err(failure @ shutdown_flush::FlushFailure::Started(_)) => {
             // The flush started and the daemon stopped behind the hook. Hold
             // the failed release first (engineer ruling, 23 Oct 2026) so the
             // restart this exit creates cannot re-apply it, then restore
@@ -401,39 +452,92 @@ fn arm(
             );
             Err(ArmFailure::FlushFailed(failure))
         }
-        Err(failure) => {
-            // Engineer ruling, 24 Oct 2026: a flush refused before the daemon
-            // stops is not a failed start. Restore the binaries this frozen
-            // transaction swapped (the same verified-backup rule as the
-            // started case), keep serving, hold nothing; the refusal reason
-            // goes back to the launcher in the error reply.
-            let restored_bytes = match crate::upgrade::restore_swapped_binaries(&restore_set) {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        restore_set = ?restore_set
-                            .iter()
-                            .map(|(target, _)| target.display().to_string())
-                            .collect::<Vec<_>>(),
-                        "cannot restore the swapped binaries; the daemon keeps serving \
-                         but the install needs manual recovery"
-                    );
-                    false
-                }
-            };
-            tracing::error!(
-                error = %failure,
-                installed_bytes = true,
-                restored_bytes,
-                restart = "not_started",
-                recovery = "kept_serving",
-                "acknowledged shutdown flush refused before the daemon stopped; \
-                 the swapped binaries are restored and the daemon keeps serving"
-            );
-            Err(ArmFailure::Refused(failure.error))
+        Err(shutdown_flush::FlushFailure::Refused(error)) => {
+            let recovery = (|| {
+                let mut state = preparation
+                    .lock()
+                    .map_err(|_| io::Error::other("arm preparation poisoned"))?;
+                state.cancelled = true;
+                restore_refused_arm(
+                    root,
+                    *journal,
+                    &handoff,
+                    state.wrote_handoff,
+                    &restore_set,
+                    &error,
+                )
+            })();
+            if let Err(recovery_error) = recovery {
+                tracing::error!(%error, %recovery_error,
+                    "owned arm refused; recovery incomplete, active records retained for manual recovery");
+            } else {
+                tracing::warn!(%error,
+                    "owned arm refused; swapped bytes restored, journal archived, daemon keeps serving");
+            }
+            Err(ArmFailure::Refused(error))
         }
     }
+}
+
+/// This call owns admission until recovery finishes. Mark rollback before
+/// touching installed bytes, so a partial restore can never admit a retry.
+fn restore_refused_arm(
+    root: &Path,
+    mut record: journal::JournalRecord,
+    handoff: &journal::M2HandoffRecord,
+    wrote_handoff: bool,
+    restore_set: &[(PathBuf, PathBuf)],
+    refusal: &io::Error,
+) -> io::Result<()> {
+    let journal_path = root.join(journal::JOURNAL_FILE_NAME);
+    let journal::RecordRead::Journal(current) = journal::read_boot_records(root).journal else {
+        return Err(io::Error::other("refused arm journal unavailable"));
+    };
+    if serde_json::to_vec(&current)? != serde_json::to_vec(&record)? {
+        return Err(io::Error::other("refused arm journal changed"));
+    }
+    record.sequence = record
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("journal sequence exhausted"))?;
+    record.phase = journal::Phase::RollingBack;
+    record.cause = Some(journal::Cause {
+        class: journal::CauseClass::Interrupted,
+        reason: refusal.to_string(),
+    });
+    journal::write_record(&journal_path, &record)?;
+    crate::upgrade::restore_swapped_binaries(restore_set).map_err(io::Error::other)?;
+    for progress in [&mut record.daemon_progress, &mut record.cli_progress] {
+        if progress.swapped {
+            progress.swapped = false;
+            progress.restored = true;
+            // No hash was observed by the rename-based restore.
+            progress.observed_sha256 = None;
+        }
+    }
+    record.sequence = record
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("journal sequence exhausted"))?;
+    record.phase = journal::Phase::Restored;
+    journal::write_record(&journal_path, &record)?;
+    if wrote_handoff {
+        match journal::read_boot_records(root).handoff {
+            journal::RecordRead::Missing => {}
+            journal::RecordRead::Handoff(current)
+                if serde_json::to_vec(&current)? == serde_json::to_vec(handoff)? =>
+            {
+                std::fs::remove_file(root.join(journal::HANDOFF_FILE_NAME))?;
+                std::fs::File::open(root)?.sync_all()?;
+            }
+            _ => return Err(io::Error::other("refused arm handoff changed; preserved")),
+        }
+    }
+    // Keep the resolved evidence without weakening blocks_apply's rule for
+    // active M2 journals. A replay has no active swapped plan to acknowledge.
+    let archive = root.join(format!("upgrade-refused-{}.json", uuid::Uuid::new_v4()));
+    std::fs::rename(&journal_path, &archive)?;
+    std::fs::File::open(root)?.sync_all()
 }
 
 fn sync_tree(path: &Path, deadline: &shutdown_flush::Deadline) -> io::Result<()> {
@@ -754,7 +858,7 @@ mod arm_flush_regressions_unused_reservation {
         .await
         .unwrap();
         assert!(refused.is_err());
-        assert!(!refused.unwrap_err().started);
+        assert!(!refused.unwrap_err().started());
         owner._registration.join_workers();
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();

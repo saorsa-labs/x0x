@@ -281,6 +281,121 @@ macro_rules! arm_flush_regression_tests {
                 shutdown_flush::ensure_ready(&root).unwrap();
             }
 
+            // Only the CLI fixture is swapped: the daemon is this test executable.
+            fn swapped_cli_fixture() -> (tempfile::TempDir, Value, Value, ControlContext, PathBuf, PathBuf) {
+                let (dir, mut record, request, state) = fixture();
+                record["daemon_progress"]["swapped"] = json!(false);
+                journal::write_record(&dir.path().join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+                let cli: PathBuf = serde_json::from_value(record["plan"]["cli"]["target_path"].clone()).unwrap();
+                let backup: PathBuf = serde_json::from_value(record["plan"]["cli"]["backup_path"].clone()).unwrap();
+                std::fs::write(&cli, b"candidate cli").unwrap();
+                std::fs::write(&backup, b"previous cli").unwrap();
+                (dir, record, request, state, cli, backup)
+            }
+
+            #[test]
+            fn arm_duplicate_after_receipt_preserves_installed_bytes_and_receipt() {
+                let (dir, _, request, state, cli, backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|_, stopped| {
+                    stopped.store(true, Ordering::Release);
+                    Ok(())
+                })).unwrap();
+                let request = serde_json::to_vec(&request).unwrap();
+                arm(&state, &root, &request).unwrap();
+                owner.join_workers();
+                let paths = [shutdown_flush::RECORD, journal::HANDOFF_FILE_NAME, journal::JOURNAL_FILE_NAME];
+                let before: Vec<_> = paths.iter().map(|path| std::fs::read(root.join(path)).unwrap()).collect();
+                let failure = arm(&state, &root, &request).unwrap_err();
+                assert!(matches!(failure, ArmFailure::Refused(_)));
+                assert_eq!(std::fs::read(&cli).unwrap(), b"candidate cli");
+                assert_eq!(std::fs::read(&backup).unwrap(), b"previous cli");
+                for (path, bytes) in paths.iter().zip(before) {
+                    assert_eq!(std::fs::read(root.join(path)).unwrap(), bytes);
+                }
+                assert!(shutdown_flush::reserve(&root).is_err());
+            }
+
+            #[test]
+            fn arm_collision_with_auto_apply_reservation_preserves_the_winner() {
+                let (dir, _, request, state, cli, backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+                let reservation = shutdown_flush::reserve(&root).unwrap();
+                reservation.activate().unwrap();
+                let request = serde_json::to_vec(&request).unwrap();
+                let failure = arm(&state, &root, &request).unwrap_err();
+                assert!(matches!(failure, ArmFailure::Refused(_)));
+                assert_eq!(std::fs::read(&cli).unwrap(), b"candidate cli");
+                assert_eq!(std::fs::read(&backup).unwrap(), b"previous cli");
+                assert!(shutdown_flush::reserve(&root).is_err());
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
+                let binding = shutdown_flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"auto apply").unwrap();
+                shutdown_flush::acknowledge_reserved(&root, binding, || Ok(()), &reservation).unwrap();
+                owner.join_workers();
+            }
+
+            #[test]
+            fn arm_owned_refusal_rewinds_journal_and_cannot_receipt_restored_bytes() {
+                let (dir, _, request, state, cli, _) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let first = AtomicBool::new(true);
+                let owner = shutdown_flush::register(root.clone(), Arc::new(move |_, _| {
+                    if first.swap(false, Ordering::SeqCst) {
+                        Err(io::Error::other("injected refusal"))
+                    } else { Ok(()) }
+                })).unwrap();
+                let request = serde_json::to_vec(&request).unwrap();
+                assert!(matches!(arm(&state, &root, &request), Err(ArmFailure::Refused(_))));
+                owner.join_workers();
+                assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                assert!(arm(&state, &root, &request).is_err(), "the old plan must not receipt restored bytes");
+                owner.join_workers();
+                assert!(!root.join(shutdown_flush::RECORD).exists());
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
+                assert!(!journal::read_boot_records(&root).blocks_apply());
+                let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|entry| entry.unwrap().path())
+                    .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("upgrade-refused-")).collect();
+                assert_eq!(archives.len(), 1);
+                let saved: Value = serde_json::from_slice(&std::fs::read(&archives[0]).unwrap()).unwrap();
+                assert_eq!(saved["phase"], "restored");
+                assert_eq!(saved["cli_progress"]["swapped"], false);
+                assert_eq!(saved["cli_progress"]["restored"], true);
+                assert_eq!(saved["daemon_progress"]["swapped"], false);
+                shutdown_flush::ensure_ready(&root).unwrap();
+                let reservation = shutdown_flush::reserve(&root).unwrap();
+                reservation.activate().unwrap();
+            }
+
+            #[test]
+            fn arm_without_owner_preserves_swapped_bytes_and_journal() {
+                let (dir, _, request, state, cli, backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+                assert!(arm(&state, &root, &serde_json::to_vec(&request).unwrap()).is_err());
+                assert_eq!(std::fs::read(&cli).unwrap(), b"candidate cli");
+                assert_eq!(std::fs::read(&backup).unwrap(), b"previous cli");
+                assert_eq!(std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(), before);
+            }
+
+            #[test]
+            fn arm_owned_refusal_preserves_a_preexisting_handoff() {
+                let (dir, _, request, state, cli, _) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let request = serde_json::to_vec(&request).unwrap();
+                let handoff = admit(&state, &root, &request).unwrap().handoff;
+                let path = root.join(journal::HANDOFF_FILE_NAME);
+                journal::write_record(&path, &handoff).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let owner = shutdown_flush::register(root.clone(), Arc::new(|_, _| panic!("existing handoff refuses prepare"))).unwrap();
+                assert!(arm(&state, &root, &request).is_err());
+                owner.join_workers();
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                assert!(journal::read_boot_records(&root).blocks_apply());
+                assert!(arm(&state, &root, &request).is_err());
+            }
+
             // Socket execution belongs to the isolated Linux CI runner.
             #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
             #[tokio::test]
@@ -297,7 +412,7 @@ macro_rules! arm_flush_regression_tests {
                     }
                 }
                 for fail in [false, true] {
-                    let (dir, _, mut request, _) = fixture();
+                    let (dir, _, mut request, _, cli, backup) = swapped_cli_fixture();
                     let root = dir.path().canonicalize().unwrap();
                     let agent = Arc::new(crate::Agent::builder()
                         .with_identity_dir(&root).with_user_key_path(root.join("user.key"))
@@ -337,9 +452,23 @@ macro_rules! arm_flush_regression_tests {
                         let mut response = String::new();
                         let read = tokio::time::timeout(Duration::from_secs(5),
                             tokio::io::BufReader::new(stream).read_line(&mut response)).await;
-                        cancel.cancel();
                         read.unwrap().unwrap();
-                        serde_json::from_str::<Value>(&response).unwrap()
+                        let response = serde_json::from_str::<Value>(&response).unwrap();
+                        if !fail {
+                            let receipt = std::fs::read(root.join(shutdown_flush::RECORD)).unwrap();
+                            let mut retry = tokio::net::UnixStream::connect(root.join(SOCKET)).await.unwrap();
+                            retry.write_all(&encoded).await.unwrap();
+                            let mut duplicate = String::new();
+                            tokio::time::timeout(Duration::from_secs(5),
+                                tokio::io::BufReader::new(retry).read_line(&mut duplicate)).await.unwrap().unwrap();
+                            let duplicate: Value = serde_json::from_str(&duplicate).unwrap();
+                            assert!(duplicate["error"].is_string());
+                            assert_eq!(std::fs::read(&cli).unwrap(), b"candidate cli");
+                            assert_eq!(std::fs::read(&backup).unwrap(), b"previous cli");
+                            assert_eq!(std::fs::read(root.join(shutdown_flush::RECORD)).unwrap(), receipt);
+                        }
+                        cancel.cancel();
+                        response
                     };
                     let (response, ()) = tokio::join!(reply, owner.finish(&shutdown, producers, &cancel));
                     owner._registration.join_workers();

@@ -33,37 +33,49 @@ pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
 /// ordinary refusals (engineer ruling, 23 Oct 2026).
 type Hook = Arc<dyn Fn(Deadline, &AtomicBool) -> io::Result<()> + Send + Sync>;
 
-/// Why an `acknowledge` call failed, and whether this call had already
-/// started the flush when it failed. A caller whose failure is `started`
-/// has stopped the daemon behind the hook (no API, no network) and owns
-/// the recovery: restore the previous binary and exit `EX_TEMPFAIL`
-/// (engineer ruling 23 Oct 2026). A failure that is not `started` left
-/// the daemon serving; it is an ordinary refusal.
+/// Failures distinguish a request that never owned admission from an owned
+/// refusal before stop and an owned failure after the stop commit point.
 #[derive(Debug)]
-pub(crate) struct FlushFailure {
-    pub(crate) error: io::Error,
-    pub(crate) started: bool,
+pub(crate) enum FlushFailure {
+    NotOwned(io::Error),
+    Refused(io::Error),
+    Started(io::Error),
 }
 
 impl FlushFailure {
+    pub(crate) fn started(&self) -> bool {
+        matches!(self, Self::Started(_))
+    }
+
+    fn error(&self) -> &io::Error {
+        match self {
+            Self::NotOwned(error) | Self::Refused(error) | Self::Started(error) => error,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn kind(&self) -> io::ErrorKind {
-        self.error.kind()
+        self.error().kind()
+    }
+
+    fn owned(error: io::Error, started: bool) -> Self {
+        if started {
+            Self::Started(error)
+        } else {
+            Self::Refused(error)
+        }
     }
 }
 
 impl std::fmt::Display for FlushFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(formatter)
+        self.error().fmt(formatter)
     }
 }
 
 impl From<io::Error> for FlushFailure {
     fn from(error: io::Error) -> Self {
-        Self {
-            error,
-            started: false,
-        }
+        Self::NotOwned(error)
     }
 }
 
@@ -676,18 +688,18 @@ fn acknowledge_inner(
         {
             return Err(io::Error::other("shutdown reservation does not own admission").into());
         }
-    } else if entry.armed.swap(true, Ordering::AcqRel) {
+    } else if entry.armed.load(Ordering::Acquire) {
         return Err(io::Error::other("shutdown flush already armed").into());
     }
-    if entry.started.swap(true, Ordering::AcqRel) {
-        // Defensive only: `armed` guards `started`, so this cannot fire while
-        // the invariants hold. Should it ever fire, this call just took
-        // `armed`; give it back before refusing.
-        entry.armed.store(false, Ordering::Release);
+    if entry.started.load(Ordering::Acquire) {
+        // A repeated reserved call does not own this acknowledgement. It
+        // must not release the first caller's admission or clear its intent.
         return Err(io::Error::other("shutdown flush already started").into());
     }
-    // Past this gate this call owns the started flush: every later failure,
-    // including a deadline overrun, left the daemon stopped behind the hook.
+    entry.armed.store(true, Ordering::Release);
+    entry.started.store(true, Ordering::Release);
+    // This call now owns acknowledgement. Only the hook's stop marker
+    // distinguishes a pre-stop refusal from a started flush failure.
     drop(hooks);
     let root = entry.root.clone();
     let record = Record {
@@ -750,25 +762,19 @@ fn acknowledge_inner(
             drop(worker);
             match wait_receipt(&receive, &rollback_boot, rollback_deadline, deadline) {
                 Ok((Ok(receipt), _)) => Ok(receipt),
-                Ok((Err(error), started)) => Err(FlushFailure { error, started }),
+                Ok((Err(error), started)) => Err(FlushFailure::owned(error, started)),
                 // A wait-level failure means the fixed deadline passed or the
                 // worker died mid-flush. The daemon may already be stopped
                 // behind the hook, so recovery must assume it is (engineer
                 // ruling, 23 Oct 2026): never a parked, stop-less daemon.
-                Err(error) => Err(FlushFailure {
-                    error,
-                    started: true,
-                }),
+                Err(error) => Err(FlushFailure::Started(error)),
             }
         }
         // The worker never ran, so the hook never stopped the daemon.
-        Err(error) => Err(FlushFailure {
-            error,
-            started: false,
-        }),
+        Err(error) => Err(FlushFailure::Refused(error)),
     };
     if let Err(failure) = &result {
-        if failure.started {
+        if failure.started() {
             // Only a failure that stopped the daemon writes the rollback
             // mark: it is written on this calling thread so the caller's
             // immediate `EX_TEMPFAIL` exit cannot lose it. A refusal writes
@@ -780,7 +786,7 @@ fn acknowledge_inner(
                 boot_id: rollback_boot,
                 deadline_ms: rollback_deadline,
                 receipt_id: None,
-                rollback_reason: Some(failure.error.to_string()),
+                rollback_reason: Some(failure.error().to_string()),
             };
             if let Err(error) = super::journal::write_auxiliary_record(
                 &rollback_root.join(ROLLBACK_RECORD),
@@ -979,7 +985,7 @@ mod reservation_release_regressions {
                 Err(failure) => failure,
                 Ok(_) => panic!("{refusal:?} must refuse the flush"),
             };
-            assert!(!failure.started, "{refusal:?} never stopped the daemon");
+            assert!(!failure.started(), "{refusal:?} never stopped the daemon");
             owner.join_workers();
             assert!(
                 !owner.entry.started.load(Ordering::Acquire),
@@ -999,6 +1005,51 @@ mod reservation_release_regressions {
                 "an ordinary shutdown after a refusal must not wait"
             );
         }
+    }
+
+    #[test]
+    fn reserved_duplicate_acknowledgment_does_not_disarm_or_clear_intent() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+        let reservation = reserve(&root).unwrap();
+        reservation.activate().unwrap();
+        let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+        acknowledge_reserved(&root, binding.clone(), || Ok(()), &reservation).unwrap();
+        owner.join_workers();
+        let record = std::fs::read(root.join(RECORD)).unwrap();
+        let failure = acknowledge_reserved(
+            &root,
+            binding,
+            || panic!("duplicate cannot prepare"),
+            &reservation,
+        )
+        .unwrap_err();
+        assert!(matches!(failure, FlushFailure::NotOwned(_)));
+        assert!(owner.entry.armed.load(Ordering::Acquire));
+        assert!(owner.entry.started.load(Ordering::Acquire));
+        assert_eq!(std::fs::read(root.join(RECORD)).unwrap(), record);
+        drop(reservation);
+        assert!(owner.seal_admission());
+    }
+
+    #[test]
+    fn wrong_reservation_does_not_disarm_the_active_owner() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let owner = register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+        let winner = reserve(&root).unwrap();
+        let inactive = reserve(&root).unwrap();
+        winner.activate().unwrap();
+        let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+        let failure =
+            acknowledge_reserved(&root, binding.clone(), || panic!("not admitted"), &inactive)
+                .unwrap_err();
+        assert!(matches!(failure, FlushFailure::NotOwned(_)));
+        drop(inactive);
+        assert!(owner.entry.armed.load(Ordering::Acquire));
+        acknowledge_reserved(&root, binding, || Ok(()), &winner).unwrap();
+        owner.join_workers();
     }
 
     #[derive(Clone, Copy, Debug)]
