@@ -680,6 +680,10 @@ fn acknowledge_inner(
         return Err(io::Error::other("shutdown flush already armed").into());
     }
     if entry.started.swap(true, Ordering::AcqRel) {
+        // Defensive only: `armed` guards `started`, so this cannot fire while
+        // the invariants hold. Should it ever fire, this call just took
+        // `armed`; give it back before refusing.
+        entry.armed.store(false, Ordering::Release);
         return Err(io::Error::other("shutdown flush already started").into());
     }
     // Past this gate this call owns the started flush: every later failure,
@@ -764,45 +768,84 @@ fn acknowledge_inner(
         }),
     };
     if let Err(failure) = &result {
-        // Only a failure that stopped the daemon writes the rollback mark:
-        // a refusal leaves the daemon serving and records nothing beyond the
-        // receipt-less intent the worker already wrote.
         if failure.started {
-            let reason = failure.error.to_string();
-            // This separate marker cannot be overwritten by a late receipt
-            // worker. The old process must remain alive; blocked I/O never
-            // permits exit.
-            let rollback_worker = std::thread::Builder::new()
-                .name("x0x-flush-rollback".into())
-                .spawn(move || {
-                    let record = Record {
-                        schema_version: 1,
-                        record_kind: "shutdown_flush".into(),
-                        binding: rollback_binding,
-                        boot_id: rollback_boot,
-                        deadline_ms: rollback_deadline,
-                        receipt_id: None,
-                        rollback_reason: Some(reason),
-                    };
-                    if let Err(error) = super::journal::write_auxiliary_record(
-                        &rollback_root.join(ROLLBACK_RECORD),
-                        &record,
-                        validate,
-                    ) {
-                        tracing::error!(%error, "failed to persist shutdown flush rollback request");
-                    }
-                });
-            #[cfg(test)]
-            if let Ok(worker) = rollback_worker {
-                entry.workers.lock().expect("flush workers").push(worker);
+            // Only a failure that stopped the daemon writes the rollback
+            // mark: it is written on this calling thread so the caller's
+            // immediate `EX_TEMPFAIL` exit cannot lose it. A refusal writes
+            // no rollback mark; the daemon keeps serving.
+            let record = Record {
+                schema_version: 1,
+                record_kind: "shutdown_flush".into(),
+                binding: rollback_binding,
+                boot_id: rollback_boot,
+                deadline_ms: rollback_deadline,
+                receipt_id: None,
+                rollback_reason: Some(failure.error.to_string()),
+            };
+            if let Err(error) = super::journal::write_auxiliary_record(
+                &rollback_root.join(ROLLBACK_RECORD),
+                &record,
+                validate,
+            ) {
+                tracing::error!(%error, "failed to persist shutdown flush rollback request");
             }
-            #[cfg(not(test))]
-            if let Err(error) = rollback_worker {
-                tracing::error!(%error, "failed to start shutdown flush rollback writer");
+        } else {
+            // Engineer ruling, 24 Oct 2026: a flush refused before the daemon
+            // stops is not a failed start. Give the started marker back so
+            // this reservation's unused release can re-open admission,
+            // remove this call's own receipt-less intent so a later
+            // supervised apply is not refused by it, and — for a call that
+            // armed the entry itself — disarm admission here, because no
+            // reservation exists to release it later.
+            entry.started.store(false, Ordering::Release);
+            clear_refused_intent(&rollback_root, &rollback_binding);
+            if reservation.is_none() {
+                disarm_refused_admission(&entry);
             }
         }
     }
     result
+}
+
+/// Remove the receipt-less flush record this refused call wrote. The daemon
+/// never stopped behind the hook, so the record is not recovery state; left
+/// in place it would refuse every later supervised apply until the next
+/// restart. A record of another transaction, or one that carries a receipt,
+/// is not ours to remove and stays for the startup cleanup.
+fn clear_refused_intent(root: &Path, binding: &Binding) {
+    let path = root.join(RECORD);
+    let own_intent = super::journal::read_auxiliary_record(&path)
+        .ok()
+        .filter(|bytes| validate(bytes).is_ok())
+        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+        .is_some_and(|record| record.receipt_id.is_none() && record.binding == *binding);
+    if own_intent {
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::error!(
+                %error,
+                "cannot remove the refused flush intent record; supervised apply \
+                 stays refused until the next restart clears it"
+            );
+        }
+    }
+}
+
+/// Release a refused unreserved call's armed admission and wake an ordinary
+/// shutdown that yielded to it (engineer ruling, 24 Oct 2026). Mirrors
+/// `ReservationState::release_unused` without a reservation: the refusal
+/// never stopped the daemon, so nothing keeps shutdown parked.
+fn disarm_refused_admission(entry: &Arc<Entry>) {
+    let mut hooks = HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    entry.armed.store(false, Ordering::Release);
+    if entry.shutdown_pending.load(Ordering::Acquire) {
+        // Shutdown already yielded to this flush. Remove its admission
+        // before waking that waiter, without a retry gap.
+        hooks.retain(|_, other| !Arc::ptr_eq(other, entry));
+    }
+    drop(hooks);
+    entry.unused_released.notify_waiters();
 }
 
 #[cfg(test)]
@@ -901,5 +944,66 @@ mod reservation_release_regressions {
         );
         assert!(ensure_ready(&root).is_err());
         assert!(root.join("upgrade-flush-rollback.json").is_file());
+    }
+
+    /// Engineer ruling, 24 Oct 2026: a flush the worker refused before the
+    /// daemon stopped (prepare failure or a pre-stop hook failure) is not a
+    /// failed start. Its unused reservation must release admission so a
+    /// later supervised apply can run; the started marker and the refused
+    /// attempt's receipt-less intent must not survive it.
+    #[test]
+    fn refused_acknowledgment_releases_admission_for_the_next_apply() {
+        for refusal in [Refusal::Prepare, Refusal::Hook] {
+            let dir = fixture();
+            let root = dir.path().canonicalize().unwrap();
+            let owner = register(
+                root.clone(),
+                Arc::new(move |_, _| {
+                    Err(io::Error::other(match refusal {
+                        Refusal::Prepare => "unreachable: prepare refuses first",
+                        Refusal::Hook => "injected pre-stop hook refusal",
+                    }))
+                }),
+            )
+            .unwrap();
+            let reservation = reserve(&root).unwrap();
+            reservation.activate().unwrap();
+            let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+            let prepare = move || {
+                matches!(refusal, Refusal::Prepare)
+                    .then(|| Err(io::Error::other("injected handoff intent write refusal")))
+                    .unwrap_or(Ok(()))
+            };
+            let failure = match acknowledge_reserved(&root, binding.clone(), prepare, &reservation)
+            {
+                Err(failure) => failure,
+                Ok(_) => panic!("{refusal:?} must refuse the flush"),
+            };
+            assert!(!failure.started, "{refusal:?} never stopped the daemon");
+            owner.join_workers();
+            assert!(
+                !owner.entry.started.load(Ordering::Acquire),
+                "a refusal is not a failed start"
+            );
+            drop(reservation);
+            // A second supervised apply is accepted, and the refused
+            // attempt's receipt-less intent no longer refuses it.
+            assert!(
+                !root.join(RECORD).exists(),
+                "the refused attempt clears its own intent record"
+            );
+            ensure_ready(&root).unwrap();
+            reserve(&root).unwrap();
+            assert!(
+                !owner.seal_admission(),
+                "an ordinary shutdown after a refusal must not wait"
+            );
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Refusal {
+        Prepare,
+        Hook,
     }
 }

@@ -201,10 +201,12 @@ impl Upgrader {
     /// path) so public `perform_upgrade` matches main and auto-apply can
     /// still own restart. On a real swap the returned backup path is the
     /// fresh backup of the bytes that were serving; a failed flush restores
-    /// exactly the artifacts that report one, never a stale backup. On
-    /// Unix, Success still requires the installed target to be executable
-    /// (`0o755`), matching `atomic_replace`; a permission repair failure is
-    /// an error, never Success.
+    /// exactly the artifacts that report one, never a stale backup. A
+    /// [`UpgradeResult::RolledBack`] result reports no backup path: its
+    /// rollback already consumed the backup. On Unix, Success still
+    /// requires the installed target to be executable (`0o755`), matching
+    /// `atomic_replace`; a permission repair failure is an error, never
+    /// Success.
     pub(super) fn finish_upgrade_under_host_lock(
         &self,
         new_binary_path: &Path,
@@ -245,11 +247,14 @@ impl Upgrader {
             Err(replace_err) => {
                 warn!(error = %replace_err, "Binary replacement failed: {}", replace_err);
                 match self.restore_from_backup(&backup_path) {
+                    // No backup path on RolledBack: the restore above already
+                    // consumed it, so a caller must not be handed a path it
+                    // could try to restore again later.
                     Ok(()) => Ok((
                         UpgradeResult::RolledBack {
                             reason: format!("Replacement failed: {replace_err}"),
                         },
-                        Some(backup_path),
+                        None,
                     )),
                     Err(restore_err) => {
                         tracing::error!(

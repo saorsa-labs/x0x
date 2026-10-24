@@ -96,8 +96,9 @@ macro_rules! shutdown_flush_regression_tests {
                 let (_dir, plan) = fixture();
                 let original = std::fs::read(&plan.executable).unwrap();
                 // The hook fails before the daemon stops behind it. Engineer
-                // ruling 23 Oct 2026: an ordinary refusal — no exit, no
-                // restore, no hold.
+                // rulings 23/24 Oct 2026: an ordinary refusal — no exit, no
+                // restore without a swap manifest, no hold — and the refusal
+                // releases admission so a later supervised apply can run.
                 let owner = flush::register(
                     plan.data_root.clone(),
                     Arc::new(|_, _| Err(io::Error::other("injected pre-stop refusal"))),
@@ -115,9 +116,62 @@ macro_rules! shutdown_flush_regression_tests {
                 assert_eq!(std::fs::read(&plan.executable).unwrap(), original);
                 assert!(!plan.data_root.join(flush::ROLLBACK_RECORD).exists());
                 assert!(!plan.data_root.join(flush::HOLD_RECORD).exists());
-                // The receipt-less intent the worker wrote still refuses a
-                // re-arm until the startup cleanup clears it.
-                assert!(record(&plan)["receipt_id"].is_null());
+                // Engineer ruling 24 Oct 2026: the refused attempt's
+                // receipt-less intent is cleared, so a later supervised
+                // apply is admitted again instead of waiting for a restart.
+                assert!(!plan.data_root.join(flush::RECORD).exists());
+                flush::ensure_ready(&plan.data_root).unwrap();
+                flush::reserve(&plan.data_root).unwrap();
+            }
+
+            #[test]
+            fn supervised_exit_refusal_restores_the_swapped_pair_and_releases_admission() {
+                // Engineer ruling 24 Oct 2026: a flush refused before the
+                // daemon stops is not a failed start. The daemon keeps
+                // serving, so the binaries this transaction swapped must go
+                // back (verified fresh backups only) and admission must
+                // re-open for a later supervised apply.
+                let (_dir, plan) = fixture();
+                let cli = plan.data_root.join("x0x");
+                let daemon_backup = plan.executable.with_extension("backup");
+                let cli_backup = plan.data_root.join("x0x.backup");
+                std::fs::write(&plan.executable, b"swapped daemon").unwrap();
+                std::fs::write(&daemon_backup, b"previous daemon").unwrap();
+                std::fs::write(&cli, b"swapped cli").unwrap();
+                std::fs::write(&cli_backup, b"previous cli").unwrap();
+                let owner = flush::register(
+                    plan.data_root.clone(),
+                    Arc::new(|_, _| Err(io::Error::other("injected pre-stop refusal"))),
+                )
+                .unwrap();
+                let mut exit_code = None;
+                let result = AutoApplyUpgrader::new("x0xd")
+                    .with_swapped_artifacts(vec![
+                        (plan.executable.clone(), daemon_backup.clone()),
+                        (cli.clone(), cli_backup.clone()),
+                    ])
+                    .trigger_restart_with_exit(&plan, "2.0.0", |code| exit_code = Some(code));
+                owner.join_workers();
+                assert!(result.is_err());
+                assert_eq!(exit_code, None, "a refusal keeps the daemon serving");
+                // Both halves of the pair are restored; the fresh backups
+                // are consumed by the restore.
+                assert_eq!(std::fs::read(&plan.executable).unwrap(), b"previous daemon");
+                assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                assert!(!daemon_backup.exists());
+                assert!(!cli_backup.exists());
+                // No failed-release hold and no rollback record: the release
+                // may be retried on the next normal update cycle.
+                assert!(!plan.data_root.join(flush::HOLD_RECORD).exists());
+                assert!(!plan.data_root.join(flush::ROLLBACK_RECORD).exists());
+                // Admission re-opens: a second apply is accepted and an
+                // ordinary shutdown is not parked by the refusal.
+                flush::ensure_ready(&plan.data_root).unwrap();
+                flush::reserve(&plan.data_root).unwrap();
+                assert!(
+                    !owner.seal_admission(),
+                    "an ordinary shutdown after a refusal must not wait"
+                );
             }
 
             #[test]
