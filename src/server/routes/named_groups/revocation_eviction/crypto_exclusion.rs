@@ -1806,9 +1806,15 @@ pub(in crate::server) async fn receive(
         // #1580: the frame's result is this node's head, so it installed
         // here before (or a peer resent the exact durable frame). The
         // local legacy MLS removal is not durable, so this replay of the
-        // durable frame reruns it. Idempotent: a view without the target,
-        // including the empty view of a fresh process, changes nothing.
-        if matches!(body.crypto, ce::CryptoExclusionCryptoV1::Gss { .. }) {
+        // durable frame reruns it. The roster, not the frame, is
+        // authoritative: the removal runs only for a seat this node's
+        // roster already holds Removed or Banned (rc2 review, security) —
+        // a forged frame that names an Active member changes nothing.
+        // Idempotent: a view without the target, including the empty view
+        // of a fresh process, changes nothing.
+        if matches!(body.crypto, ce::CryptoExclusionCryptoV1::Gss { .. })
+            && seat_left_the_roster(&info, &body.target)
+        {
             remove_legacy_mls_member(state, &group_key, AgentId(body.target)).await;
         }
         return ReceiveOutcome::Duplicate;
@@ -2221,6 +2227,19 @@ async fn remove_legacy_mls_member(state: &AppState, group_key: &str, target: Age
     }
 }
 
+/// #1580: the durable roster is authoritative for the legacy MLS view. A
+/// rerun removes a member only when this node's roster holds its seat
+/// `Removed` or `Banned` — never because a frame names it (rc2 review,
+/// security).
+fn seat_left_the_roster(info: &GroupInfo, target: &[u8; 32]) -> bool {
+    matches!(
+        info.members_v2
+            .get(&hex::encode(target))
+            .map(|seat| seat.state),
+        Some(x0x::groups::GroupMemberState::Removed) | Some(x0x::groups::GroupMemberState::Banned)
+    )
+}
+
 /// #1580: the local legacy MLS view of a GSS group lists only seats the
 /// durable roster still holds Active. Every removal that keeps it (this
 /// module, the ban and removal arms) is an in-memory step after the
@@ -2229,57 +2248,58 @@ async fn remove_legacy_mls_member(state: &AppState, group_key: &str, target: Age
 /// carried the removal (a restored received frame at the head is kept for
 /// serving only). The worker's stash pass reruns the removal from the
 /// loaded roster instead: idempotent, and a no-op while the fresh process
-/// holds no view yet.
+/// holds no view yet. Each seat is re-read under the MLS write lock at
+/// the moment of the removal, so a member the roster re-seated Active a
+/// moment earlier stays (rc2 review, race).
 pub(super) async fn converge_legacy_mls_views_with_rosters(state: &AppState) {
     use super::super as ng;
-    use x0x::groups::GroupMemberState;
-    // The roster snapshot is taken and released before the MLS lock: the
-    // join paths hold the MLS writer across a named-groups write.
-    let rosters: Vec<(String, GroupInfo)> = {
-        let groups = state.named_groups.read().await;
-        groups
+    // Only the view keys and their listed agents are copied here; the
+    // seat states are read under the write lock below. Lock order is MLS
+    // then named groups, the order the join paths use.
+    let listed: Vec<(String, Vec<AgentId>)> = {
+        let views = state.mls_groups.read().await;
+        views
             .iter()
-            .filter(|(_, info)| info.secure_plane == x0x::mls::SecureGroupPlane::Gss)
-            .map(|(key, info)| (key.clone(), info.clone()))
+            .map(|(key, view)| {
+                (
+                    key.clone(),
+                    view.members().keys().copied().collect::<Vec<_>>(),
+                )
+            })
             .collect()
     };
-    for (key, info) in rosters {
-        let gone: Vec<AgentId> = {
-            let views = state.mls_groups.read().await;
-            let Some(view) = views.get(&key) else {
-                continue;
-            };
-            view.members()
-                .keys()
-                .filter(|agent| {
-                    matches!(
-                        info.members_v2
-                            .get(&hex::encode(agent.as_bytes()))
-                            .map(|seat| seat.state),
-                        Some(GroupMemberState::Removed) | Some(GroupMemberState::Banned)
-                    )
-                })
-                .copied()
-                .collect()
-        };
-        if gone.is_empty() {
+    for (key, agents) in listed {
+        if agents.is_empty() {
             continue;
         }
+        let mut removed_any = false;
         let mut views = state.mls_groups.write().await;
         let Some(view) = views.get_mut(&key) else {
             continue;
         };
-        for agent in gone {
-            if view.is_member(&agent) {
-                let _ = view.remove_member(agent).await;
+        {
+            let groups = state.named_groups.read().await;
+            let Some(info) = groups.get(&key) else {
+                continue;
+            };
+            if info.secure_plane != x0x::mls::SecureGroupPlane::Gss {
+                continue;
+            }
+            for agent in agents {
+                if seat_left_the_roster(info, agent.as_bytes()) && view.is_member(&agent) {
+                    let _ = view.remove_member(agent).await;
+                    removed_any = true;
+                }
             }
         }
         drop(views);
-        ng::save_mls_groups(state).await;
-        tracing::info!(
-            group_id = %LogHexId::group(&key),
-            "ADR 0110 S4: a removed seat left the legacy MLS view again (#1580)"
-        );
+        if removed_any {
+            ng::save_mls_groups(state).await;
+            tracing::info!(
+                group_id = %LogHexId::group(&key),
+                "ADR 0110 S4: a removed seat left the legacy MLS view again (#1580)"
+            );
+        }
     }
 }
 
@@ -5018,6 +5038,81 @@ mod daemon_tests {
         assert!(
             view.is_member(&fx.replica.agent.agent_id()),
             "the survivor keeps its seat"
+        );
+        Ok(())
+    }
+
+    /// #1580 rc2 (review, security): the Duplicate arm must not trust the
+    /// frame's target. A stranger signs a frame whose commit hash is this
+    /// node's head and whose target is an Active member. The replay is a
+    /// duplicate, but the roster — not the frame — is authoritative, so
+    /// the Active member stays in the legacy MLS view.
+    #[tokio::test]
+    async fn a_forged_duplicate_frame_never_drops_an_active_member() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        let (frame, _result_head, _parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        seeded_legacy_mls_view(&fx, &fx.replica).await?;
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        assert!(
+            fx.replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .is_some_and(|seat| seat.state == x0x::groups::GroupMemberState::Active),
+            "the forged frame's target is an Active member"
+        );
+
+        // The stranger's frame: the head's own state (every component the
+        // state hash commits to, copied from the installed commit), signed
+        // by the stranger itself, with the Active survivor as the target.
+        let stranger = x0x::identity::AgentKeypair::generate()?;
+        let real = ce::decode_frame(&frame)
+            .context("frame")?
+            .body
+            .commit
+            .to_commit();
+        let forged_commit = x0x::groups::state_commit::GroupStateCommit::sign(
+            real.group_id.clone(),
+            real.revision,
+            real.prev_state_hash.clone(),
+            real.roster_root.clone(),
+            real.policy_hash.clone(),
+            real.public_meta_hash.clone(),
+            real.security_binding.clone(),
+            real.withdrawn,
+            real.committed_at,
+            &stranger,
+        )
+        .context("the stranger signs the head's own state")?;
+        assert_eq!(
+            forged_commit.state_hash, real.state_hash,
+            "the forged commit carries the head's state hash"
+        );
+        let mut forged_body = ce::decode_frame(&frame).context("frame")?.body;
+        forged_body.actor = *stranger.agent_id().as_bytes();
+        forged_body.target = *fx.replica.agent.agent_id().as_bytes();
+        forged_body.commit = ce::CommitHeaderV1::from(&forged_commit);
+        let forged = ce::sign(forged_body, &stranger).context("sign")?;
+        let bytes = ce::encode_frame(&forged).context("encode")?;
+        assert_eq!(
+            receive(&fx.replica, stranger.agent_id(), &bytes).await,
+            ReceiveOutcome::Duplicate,
+            "the forged frame is a duplicate of the installed head"
+        );
+
+        let views = fx.replica.mls_groups.read().await;
+        let view = views.get(&fx.group_id).context("the view")?;
+        assert!(
+            view.is_member(&fx.replica.agent.agent_id()),
+            "an Active member the roster still seats never leaves the view"
         );
         Ok(())
     }
