@@ -827,6 +827,7 @@ mod participation_diagnostics_tests {
             keys,
             [
                 "digest_beacon_divergences",
+                "digest_beacon_wakes_deferred",
                 "digest_beacons_sent",
                 "incoming_record_merges",
                 "incomplete_retained_images_pruned",
