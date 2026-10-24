@@ -2307,12 +2307,6 @@ pub(crate) enum WindowsWrapperReadback {
     },
 }
 
-/// Basename of a Windows path-like string: Windows accepts both separators.
-#[cfg(any(test, target_os = "windows"))]
-fn windows_path_basename(s: &str) -> &str {
-    s.rsplit(['\\', '/']).next().unwrap_or(s)
-}
-
 /// Parse a PowerShell single-quoted string array literal (`@('a','b,c')`,
 /// `@()` for empty; `''` inside quotes is a literal apostrophe). `None` on
 /// anything that is not exactly that grammar — the readback fails closed.
@@ -2353,13 +2347,18 @@ fn parse_ps_string_array(literal: &str) -> Option<Vec<String>> {
     Some(items)
 }
 
-/// The decision core of the Windows wrapper readback: verify the script text
-/// the running wrapper bound this instance to. Free of platform APIs so the
-/// refuse-vs-proceed table is unit-testable on any platform; the production
-/// sampler only supplies the script bytes. Every path that cannot confirm a
-/// tested version, a restart-on-exit-100 policy, and a binding to THIS
-/// executable (by `argv[0]`, the instance's self-reported path) and argv
-/// fails closed — a marker in isolation is not support (ADR-0061 §3).
+/// The decision core of the Windows wrapper readback: recognize the marker
+/// lines the x0x-generated template stamps (version, restart-on-exit-100
+/// policy, executable, arguments) in the script text the running wrapper
+/// bound this instance to. This is line recognition against the template's
+/// exact grammar, not a PowerShell parse — a script that smuggles extra
+/// statements past the marker lines still passes, which is why the supported
+/// deployment is the generated template, not a hand-edited script. Free of
+/// platform APIs so the refuse-vs-proceed table is unit-testable on any
+/// platform; the production sampler only supplies the script bytes. Every
+/// path that cannot confirm a tested version, a restart-on-exit-100 policy,
+/// and a binding to THIS executable and argv fails closed — a marker in
+/// isolation is not support (ADR-0061 §3).
 #[cfg(any(test, target_os = "windows"))]
 pub(crate) fn readback_windows_wrapper_script(
     script: &str,
@@ -2422,13 +2421,12 @@ pub(crate) fn readback_windows_wrapper_script(
                 .to_string(),
         };
     };
-    // Windows paths are case-insensitive, and `& $x0xExecutable` may hand the
-    // child a forward- or backslash-separated path; basename comparison on
-    // both separators is the identity relation (the launchd readback's
-    // basename rule, Windows-adjusted).
-    if !windows_path_basename(&wrapper_executable)
-        .eq_ignore_ascii_case(windows_path_basename(argv0))
-    {
+    // Windows paths are case-insensitive and accept both separators; a
+    // same-named binary in a different directory must NOT pass (the wrapper
+    // would restart that file, not the upgraded one), so the whole path is
+    // compared, case- and separator-insensitively.
+    let normalize = |path: &str| path.replace('/', "\\").to_lowercase();
+    if normalize(&wrapper_executable) != normalize(argv0) {
         return NotGuaranteed {
             detail: format!(
                 "the wrapper script runs `{wrapper_executable}`, not this instance \
@@ -4210,8 +4208,8 @@ mod tests {
     #[test]
     fn windows_wrapper_readback_verifies_the_generated_script() {
         // The supported deployment: tested version, restart-on-exit-100
-        // policy, and a binding to this exact executable + argv (basename
-        // comparison is case-insensitive: Windows paths are).
+        // policy, and a binding to this exact executable + argv (path
+        // comparison is case- and separator-insensitive: Windows paths are).
         let argv = vec![
             "C:\\Program Files\\x0x\\X0XD.EXE".to_string(),
             "--name".to_string(),
@@ -4219,7 +4217,7 @@ mod tests {
         ];
         let script = windows_wrapper_script(
             &WINDOWS_WRAPPER_TESTED_VERSION.to_string(),
-            "c:\\program files\\x0x\\x0xd.exe",
+            "c:/program files/x0x/x0xd.exe",
             "'--name','alice'",
         );
         assert_eq!(
@@ -4278,6 +4276,10 @@ mod tests {
             (
                 "different executable",
                 canonical.replace("'C:\\Tools\\x0xd.exe'", "'C:\\Tools\\otherd.exe'"),
+            ),
+            (
+                "same-named binary in another directory",
+                canonical.replace("'C:\\Tools\\x0xd.exe'", "'D:\\Elsewhere\\x0xd.exe'"),
             ),
             (
                 "different arguments",
