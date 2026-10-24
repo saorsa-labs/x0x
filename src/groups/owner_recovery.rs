@@ -489,6 +489,64 @@ pub fn decode_certificate(bytes: &[u8]) -> Option<AgentCertificate> {
     bincode::deserialize(bytes).ok()
 }
 
+/// ADR 0110 §2 (#1508 rc18): the checks this node can make on a recovery
+/// commit that does not chain on its head `latest` yet, before the commit
+/// may count as known higher-head evidence. The caller verified the
+/// commit signatures ([`verify_commit_signatures`]). The mandate must
+/// verify against `latest`'s owner and name this group and the actor, and
+/// the actor must have standing on `latest` (an Active, unrevoked member)
+/// with a certificate that matches the mandate's digest and verifies
+/// against the owner. A commit that fails stays unverified: it is kept
+/// for a retry but holds nothing.
+///
+/// # Errors
+///
+/// The [`OwnerRecoveryRefusal`] of the first check that fails.
+pub fn check_ahead(
+    body: &OwnerRecoveryBodyV1,
+    latest: &GroupInfo,
+    revocations: &VerifiedAgentRevocations,
+    now_unix: u64,
+) -> Result<(), OwnerRecoveryRefusal> {
+    let mandate = &body.mandate.body;
+    if body.stable_group_id != latest.stable_group_id()
+        || body.commit.group_id != latest.stable_group_id()
+        || mandate.stable_group_id != latest.stable_group_id()
+    {
+        return Err(OwnerRecoveryRefusal::RecoveryHeadMismatch);
+    }
+    let owner = latest
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .ok_or(OwnerRecoveryRefusal::RecoverySignerNotOwner)?;
+    verify_mandate_signature(&body.mandate, owner)?;
+    let ineligible = OwnerRecoveryRefusal::RecoveryMemberIneligible;
+    let actor_hex = hex::encode(body.actor);
+    if body.actor != mandate.promoted
+        || revocations
+            .get(&body.actor)
+            .is_some_and(|set| !set.is_empty())
+        || !latest.has_active_member(&actor_hex)
+    {
+        return Err(ineligible);
+    }
+    let certificate = decode_certificate(&body.promoted_certificate).ok_or(ineligible)?;
+    if crate::groups::owner_cert::certificate_digest_hex(&certificate)
+        != mandate.promoted_certificate_digest
+    {
+        return Err(ineligible);
+    }
+    crate::groups::owner_cert::verify_cert_against_owner(
+        owner,
+        &actor_hex,
+        &certificate,
+        false,
+        now_unix,
+    )
+    .map_err(|_| ineligible)
+}
+
 /// The mandate checks against this node's current parent state (§4b(1)):
 /// containment, the owner signature against U, the parent head, that no
 /// eligible admin remains, that the named admins are exactly the revoked

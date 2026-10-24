@@ -43,6 +43,7 @@ use super::crypto_exclusion::{
     all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, next_attempt,
     note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
+use super::frame_stash::{FrameStash, StashedFrame};
 use super::rebind::replay_log;
 
 /// The owner node's typed state until the promoted member commits.
@@ -110,13 +111,6 @@ struct CommitDelivery {
     reshare_epoch: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
-struct StashedFrame {
-    sender: AgentId,
-    bytes: Vec<u8>,
-    at: Instant,
-}
-
 /// A GSS share that arrived before the recovery that makes its sender an
 /// admin ([`park_early_share`]).
 #[derive(Debug, Clone)]
@@ -151,7 +145,7 @@ pub(super) struct OrcState {
     mandates: HashMap<String, MandateDelivery>,
     pending: HashMap<String, PendingMandate>,
     deliveries: HashMap<String, CommitDelivery>,
-    stash: Vec<StashedFrame>,
+    stash: FrameStash<ORC_STASH_CAP>,
     /// Early GSS shares, held until their recovery installs.
     early_shares: Vec<ParkedShare>,
     /// Catch-up commits held until their recovery installs.
@@ -286,19 +280,12 @@ pub(super) fn note_survivor_head(
 
 impl OrcState {
     /// #1508 rc17 (Codex P1): whether a retained owner-recovery frame of
-    /// `stable_group_id` commits a revision above `revision`. A frame is
-    /// retained only after [`receive`] checked it, or after a restart
-    /// restored a frame that passed those checks.
-    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64, now: Instant) -> bool {
-        self.stash.iter().any(|frame| {
-            now.saturating_duration_since(frame.at) <= ORC_RETAIN_TTL
-                && matches!(
-                    orc::decode_frame(&frame.bytes),
-                    Ok(orc::OwnerRecoveryFrameV1::Commit(decoded))
-                        if decoded.body.stable_group_id == stable_group_id
-                            && decoded.body.next_revision > revision
-                )
-        })
+    /// `stable_group_id` commits a revision above `revision`. #1508 rc18
+    /// (Codex P1): only a frame that passed [`orc::check_ahead`] on this
+    /// node's latest head, or every receiver check, counts, with no time
+    /// limit ([`FrameStash`]).
+    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64) -> bool {
+        self.stash.ahead(stable_group_id, revision)
     }
 }
 
@@ -315,18 +302,17 @@ async fn ensure_restored(state: &AppState) {
     let local = *state.agent.agent_id().as_bytes();
     let mut inner = state.revocation_evictions.inner.lock().await;
     for bytes in restored.received {
-        // The frame is self-authenticating; its actor is the sender.
+        // The frame is self-authenticating; its actor is the sender. It
+        // passed every receiver check before it was written.
         let Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) = orc::decode_frame(&bytes) else {
             continue;
         };
-        if inner.orc.stash.len() >= ORC_STASH_CAP {
-            inner.orc.stash.remove(0);
-        }
-        inner.orc.stash.push(StashedFrame {
-            sender: AgentId(frame.body.actor),
-            bytes: bytes.to_vec(),
-            at: Instant::now(),
-        });
+        let _kept = inner.orc.stash.push(stashed(
+            AgentId(frame.body.actor),
+            bytes.to_vec(),
+            &frame.body,
+            true,
+        ));
     }
     for resume in restored.resumes {
         let recipients = survivors(&resume.info, &local, &BTreeSet::new());
@@ -1610,8 +1596,12 @@ enum ReceiveOutcome {
     Applied,
     Duplicate,
     /// Behind the parent, missing revocation evidence, or a local fault:
-    /// keep the frame for a retry.
-    Retained,
+    /// keep the frame for a retry. `verified`: the frame passed every
+    /// check this node can make on its latest head, so it is known
+    /// higher-head evidence (#1508 rc18, [`FrameStash`]).
+    Retained {
+        verified: bool,
+    },
     Refused(orc::OwnerRecoveryRefusal),
     NotApplicable,
 }
@@ -1633,18 +1623,13 @@ pub(in crate::server) fn spawn_receipt(
                 accept_mandate(&task_state, mandate).await;
             }
             Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) => {
-                if receive_commit(&task_state, sender, *frame, &payload).await
-                    == ReceiveOutcome::Retained
+                let body = frame.body.clone();
+                if let ReceiveOutcome::Retained { verified } =
+                    receive_commit(&task_state, sender, *frame, &payload).await
                 {
+                    let frame = stashed(sender, payload, &body, verified);
                     let mut inner = task_state.revocation_evictions.inner.lock().await;
-                    if inner.orc.stash.len() >= ORC_STASH_CAP {
-                        inner.orc.stash.remove(0);
-                    }
-                    inner.orc.stash.push(StashedFrame {
-                        sender,
-                        bytes: payload,
-                        at: Instant::now(),
-                    });
+                    let _kept = inner.orc.stash.push(frame);
                 }
             }
             Err(refusal) => {
@@ -2139,6 +2124,54 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 },
             )
         }
+        // #1508 rc17 (Codex P1): an admin's policy update, or an unban,
+        // between the removal and a promotion. Neither changes the epoch.
+        // A policy update keeps an OwnerCertified owner axis, as in the
+        // ordinary apply.
+        Event::PolicyUpdated {
+            revision,
+            actor,
+            policy,
+            ..
+        } => {
+            if !admin(actor)
+                || cursor
+                    .policy
+                    .admission
+                    .owner_certified_user_id()
+                    .is_some_and(|owner| policy.admission.owner_certified_user_id() != Some(owner))
+            {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    super::super::set_policy_update(next, *revision, policy, commit.committed_at)
+                },
+            )
+        }
+        Event::MemberUnbanned {
+            revision,
+            actor,
+            agent_id,
+            ..
+        } => {
+            if !admin(actor) || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision =
+                        super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    next.unban_member(agent_id);
+                },
+            )
+        }
         // #1533 rc17 (Codex P1): an active member's own GSS leave between
         // the removal and a promotion, checked as the ordinary self-leave
         // apply checks it: the leaver signs, names itself, and neither
@@ -2210,54 +2243,6 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                     } else {
                         next.remove_member(agent_id, Some(actor.clone()));
                     }
-                },
-            )
-        }
-        // #1508 rc17 (Codex P1): an admin's policy update, or an unban,
-        // between the removal and a promotion. Neither changes the epoch.
-        // A policy update keeps an OwnerCertified owner axis, as in the
-        // ordinary apply.
-        Event::PolicyUpdated {
-            revision,
-            actor,
-            policy,
-            ..
-        } => {
-            if !admin(actor)
-                || cursor
-                    .policy
-                    .admission
-                    .owner_certified_user_id()
-                    .is_some_and(|owner| policy.admission.owner_certified_user_id() != Some(owner))
-            {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    super::super::set_policy_update(next, *revision, policy, commit.committed_at)
-                },
-            )
-        }
-        Event::MemberUnbanned {
-            revision,
-            actor,
-            agent_id,
-            ..
-        } => {
-            if !admin(actor) || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision =
-                        super::super::adopt_roster_revision(next.roster_revision, *revision);
-                    next.unban_member(agent_id);
                 },
             )
         }
@@ -2657,30 +2642,58 @@ pub(in crate::server) async fn replay_after_commit(state: &Arc<AppState>, stable
     }
 }
 
+/// The stash entry of a recovery commit.
+fn stashed(
+    sender: AgentId,
+    bytes: Vec<u8>,
+    body: &orc::OwnerRecoveryBodyV1,
+    evidence: bool,
+) -> StashedFrame {
+    StashedFrame::new(
+        sender,
+        bytes,
+        &body.stable_group_id,
+        body.next_revision,
+        evidence,
+    )
+}
+
+/// Retry every stashed commit. #1508 rc18 (Codex P1): the frames stay in
+/// the stash while the retry runs, so head evidence holds throughout, and
+/// each retained frame's evidence state is checked again on the new head.
 async fn retry_stash(state: &Arc<AppState>) {
-    let stash = std::mem::take(&mut state.revocation_evictions.inner.lock().await.orc.stash);
-    let now = Instant::now();
-    let mut keep = Vec::new();
-    for frame in stash {
-        if now.saturating_duration_since(frame.at) > ORC_RETAIN_TTL {
-            continue;
-        }
-        let Ok(orc::OwnerRecoveryFrameV1::Commit(commit)) = orc::decode_frame(&frame.bytes) else {
-            continue;
+    let frames = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .stash
+        .retry_set(Instant::now());
+    if frames.is_empty() {
+        return;
+    }
+    let mut results = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let kept = match orc::decode_frame(&frame.bytes) {
+            Ok(orc::OwnerRecoveryFrameV1::Commit(commit)) => {
+                match receive_commit(state, frame.sender, *commit, &frame.bytes).await {
+                    ReceiveOutcome::Retained { verified } => Some(verified),
+                    _ => None,
+                }
+            }
+            _ => None,
         };
-        if receive_commit(state, frame.sender, *commit, &frame.bytes).await
-            == ReceiveOutcome::Retained
-        {
-            keep.push(frame);
-        }
+        results.push((frame, kept));
     }
-    if !keep.is_empty() {
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        keep.append(&mut inner.orc.stash);
-        let excess = keep.len().saturating_sub(ORC_STASH_CAP);
-        keep.drain(..excess);
-        inner.orc.stash = keep;
-    }
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .stash
+        .settle(results);
 }
 
 /// Verify and install one `OwnerRecoveryV1` commit (§4b(1) L4 rule).
@@ -2714,7 +2727,16 @@ async fn receive_commit(
         return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryMemberIneligible);
     }
     if info.state_hash != body.prior_head && info.state_revision < body.prior_revision {
-        return ReceiveOutcome::Retained;
+        // #1508 rc18 (Codex P1): a commit of a later revision is head
+        // evidence only when its mandate and actor verify on this node's
+        // latest head. A forged future commit is kept for a retry but
+        // holds nothing.
+        let revocations = verified_agent_revocations(state).await;
+        let verified = revocations
+            .get(sender.as_bytes())
+            .is_none_or(BTreeSet::is_empty)
+            && orc::check_ahead(&body, &info, &revocations, now_unix()).is_ok();
+        return ReceiveOutcome::Retained { verified };
     }
     // Load the held log before the tree lock (#1508 review F2, below).
     ensure_restored(state).await;
@@ -2764,7 +2786,9 @@ async fn receive_commit(
         }
         return if refusal == orc::OwnerRecoveryRefusal::RecoveryNotNeeded {
             // The named revocation records may still be on their way.
-            ReceiveOutcome::Retained
+            ReceiveOutcome::Retained {
+                verified: orc::check_ahead(&body, &info, &revocations, now_unix()).is_ok(),
+            }
         } else {
             ReceiveOutcome::Refused(refusal)
         };
@@ -2790,7 +2814,7 @@ async fn receive_commit(
     let stable = body.stable_group_id.clone();
     let at = (body.next_revision, body.commit.state_hash.as_str());
     if !replay_log::write_received(state, ext, held, &stable, at, &frame_bytes).await {
-        return ReceiveOutcome::Retained;
+        return ReceiveOutcome::Retained { verified: true };
     }
     // #1508 rc12 (Codex P1): a GSS recovery installs only with its new
     // secret, as a GSS crypto-only exclusion does. The installed head is
@@ -2841,7 +2865,7 @@ async fn receive_commit(
                     .await
                     {
                         tracing::warn!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery secret refused: {error}");
-                        return ReceiveOutcome::Retained;
+                        return ReceiveOutcome::Retained { verified: true };
                     }
                     Some(secret)
                 }
@@ -2875,7 +2899,7 @@ async fn receive_commit(
                         secret_epoch = next_secret_epoch,
                         "ADR 0110 S4: GSS owner recovery waits for its sealed share"
                     );
-                    return ReceiveOutcome::Retained;
+                    return ReceiveOutcome::Retained { verified: true };
                 }
             }
         }
@@ -2943,7 +2967,7 @@ async fn receive_commit(
             },
         ) => {
             let Ok(rollback_snapshot) = guard.to_snapshot_bytes() else {
-                return ReceiveOutcome::Retained;
+                return ReceiveOutcome::Retained { verified: true };
             };
             let processed = commits
                 .iter()
@@ -2987,7 +3011,7 @@ async fn receive_commit(
                         &hex::encode(agent.as_bytes()),
                     );
                 }
-                return ReceiveOutcome::Retained;
+                return ReceiveOutcome::Retained { verified: true };
             }
             if !installed || leaves.contains(&Some(true)) {
                 ng::rollback_treekem_group_after_failed_install(
@@ -3036,7 +3060,7 @@ async fn receive_commit(
     if !installed {
         // A local storage fault, not a sender defect: keep the frame, in
         // the stash and durable in the held log.
-        return ReceiveOutcome::Retained;
+        return ReceiveOutcome::Retained { verified: true };
     }
     if kind == orc::RecoveryCryptoKind::Gss {
         let mut mls_groups = state.mls_groups.write().await;
@@ -4506,7 +4530,7 @@ mod restart_tests {
         let blocked = block_install(&receiver).await?;
         assert_eq!(
             receive_bytes(&receiver, &bytes).await?,
-            ReceiveOutcome::Retained,
+            ReceiveOutcome::Retained { verified: true },
             "the install failed"
         );
         assert_eq!(
@@ -5202,7 +5226,7 @@ mod restart_tests {
 
         assert_eq!(
             receive_bytes(&survivor, &frame).await?,
-            ReceiveOutcome::Retained,
+            ReceiveOutcome::Retained { verified: true },
             "the frame waits for its share"
         );
         assert_eq!(
@@ -5458,7 +5482,7 @@ mod restart_tests {
             .await;
         assert_eq!(
             receive_bytes(&survivor, &frame).await?,
-            ReceiveOutcome::Retained,
+            ReceiveOutcome::Retained { verified: true },
             "the recovery still waits for its own share"
         );
         assert_eq!(

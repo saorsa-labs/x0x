@@ -88,6 +88,7 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
 use super::super::{LogHexId, SelfLeaveRekeyStep};
+use super::frame_stash::{FrameStash, StashedFrame};
 use super::rebind::replay_log;
 
 /// A delivery round runs no more often than this per row.
@@ -97,10 +98,9 @@ const CE_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 const CE_LOG_PER_GROUP: usize = x0x::groups::eviction::MAX_REPLAY_FRAMES_PER_GROUP;
 /// The per-exchange bound of one live delivery or catch-up frame write.
 const CE_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Frames that arrived ahead of this node's head, waiting for it.
+/// Frames that arrived ahead of this node's head, waiting for it
+/// ([`FrameStash`]).
 const CE_STASH_CAP: usize = 64;
-/// A stashed frame is dropped after this long.
-const CE_STASH_TTL: Duration = Duration::from_secs(600);
 
 /// The delivery state of one recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,14 +148,6 @@ pub(super) struct CeDelivery {
     next_at: Instant,
 }
 
-/// A verified-shape frame that arrived before this node reached its parent.
-#[derive(Debug, Clone)]
-struct StashedFrame {
-    sender: AgentId,
-    bytes: Vec<u8>,
-    at: Instant,
-}
-
 /// The crypto-only exclusion state held in the S4 runtime.
 #[derive(Debug, Default)]
 pub(super) struct CeState {
@@ -164,7 +156,7 @@ pub(super) struct CeState {
     /// in the `.celog` ([`replay_log`]); the authored frames are durable in
     /// their `.evs` rows.
     log: replay_log::HeldLog<CE_LOG_PER_GROUP>,
-    stash: Vec<StashedFrame>,
+    stash: FrameStash<CE_STASH_CAP>,
     /// Rows whose saved frame meets a competing branch (§3).
     pub(super) fork: BTreeSet<EvictionKey>,
     /// Rows held by the D76 rule, with the holding survivors.
@@ -243,17 +235,12 @@ impl CeState {
 
 impl CeState {
     /// #1508 rc17 (Codex P1): whether a retained crypto-only exclusion
-    /// frame of `stable_group_id` commits a revision above `revision`. A
-    /// frame is retained only after [`receive`] checked it, or after a
-    /// restart restored a frame that passed those checks.
-    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64, now: Instant) -> bool {
-        self.stash.iter().any(|frame| {
-            now.saturating_duration_since(frame.at) <= CE_STASH_TTL
-                && ce::decode_frame(&frame.bytes).is_ok_and(|decoded| {
-                    decoded.body.stable_group_id == stable_group_id
-                        && decoded.body.next_revision > revision
-                })
-        })
+    /// frame of `stable_group_id` commits a revision above `revision`.
+    /// #1508 rc18 (Codex P1): only a frame that passed [`ce::check_ahead`]
+    /// on this node's latest head, or every receiver check, counts, with no
+    /// time limit ([`FrameStash`]).
+    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64) -> bool {
+        self.stash.ahead(stable_group_id, revision)
     }
 }
 
@@ -273,18 +260,19 @@ async fn ensure_restored(state: &AppState) {
     }
     let mut inner = state.revocation_evictions.inner.lock().await;
     for bytes in restored.received {
-        // The frame is self-authenticating; its actor is the sender.
+        // The frame is self-authenticating; its actor is the sender. It
+        // passed every receiver check before it was written.
         let Ok(frame) = ce::decode_frame(&bytes) else {
             continue;
         };
-        if inner.ce.stash.len() >= CE_STASH_CAP {
-            inner.ce.stash.remove(0);
-        }
-        inner.ce.stash.push(StashedFrame {
-            sender: AgentId(frame.body.actor),
-            bytes: bytes.to_vec(),
-            at: Instant::now(),
-        });
+        let body = &frame.body;
+        let _kept = inner.ce.stash.push(StashedFrame::new(
+            AgentId(body.actor),
+            bytes.to_vec(),
+            &body.stable_group_id,
+            body.next_revision,
+            true,
+        ));
     }
 }
 
@@ -1661,7 +1649,10 @@ pub(in crate::server) enum ReceiveOutcome {
     /// This node already holds the result.
     Duplicate,
     /// This node is behind the frame's parent; the frame is stashed.
-    Behind,
+    /// `verified`: the frame passed [`ce::check_ahead`] on this node's
+    /// latest head, so it is known higher-head evidence (#1508 rc18,
+    /// [`FrameStash`]).
+    Behind { verified: bool },
     /// The frame was refused.
     Refused(ce::CryptoExclusionRefusal),
     /// The frame was valid but this node could not persist the result (a
@@ -1682,9 +1673,31 @@ impl ReceiveOutcome {
     pub(in crate::server) fn is_retained(self) -> bool {
         matches!(
             self,
-            Self::Behind | Self::LocalFailure | Self::WaitingForShare
+            Self::Behind { .. } | Self::LocalFailure | Self::WaitingForShare
         )
     }
+
+    /// A retained frame that is known higher-head evidence (§2): it passed
+    /// [`ce::check_ahead`], or every receiver check before it waited.
+    pub(in crate::server) fn head_evidence(self) -> bool {
+        matches!(
+            self,
+            Self::Behind { verified: true } | Self::LocalFailure | Self::WaitingForShare
+        )
+    }
+}
+
+/// The stash entry of an exclusion frame, or `None` when it does not
+/// decode.
+fn stashed(sender: AgentId, bytes: Vec<u8>, evidence: bool) -> Option<StashedFrame> {
+    let body = ce::decode_frame(&bytes).ok()?.body;
+    Some(StashedFrame::new(
+        sender,
+        bytes,
+        &body.stable_group_id,
+        body.next_revision,
+        evidence,
+    ))
 }
 
 /// The direct-message listener hands every `X0XCE1` payload here.
@@ -1701,44 +1714,45 @@ pub(in crate::server) fn spawn_receipt(
     let _spawned = state.spawn_detached(async move {
         let outcome = receive(&task_state, sender, &payload).await;
         if outcome.is_retained() {
-            let mut inner = task_state.revocation_evictions.inner.lock().await;
-            if inner.ce.stash.len() >= CE_STASH_CAP {
-                inner.ce.stash.remove(0);
+            if let Some(frame) = stashed(sender, payload, outcome.head_evidence()) {
+                let mut inner = task_state.revocation_evictions.inner.lock().await;
+                let _kept = inner.ce.stash.push(frame);
             }
-            inner.ce.stash.push(StashedFrame {
-                sender,
-                bytes: payload,
-                at: Instant::now(),
-            });
         }
     });
 }
 
 /// Retry every stashed frame; keep the ones still ahead of this node or
-/// stopped by a local fault.
+/// stopped by a local fault. #1508 rc18 (Codex P1): the frames stay in the
+/// stash while the retry runs, so head evidence holds throughout, and each
+/// retained frame's evidence state is checked again on the new head.
 pub(super) async fn retry_stash(state: &Arc<AppState>) {
     ensure_restored(state).await;
-    let stash = std::mem::take(&mut state.revocation_evictions.inner.lock().await.ce.stash);
-    let now = Instant::now();
-    let mut keep = Vec::new();
-    for frame in stash {
-        if now.saturating_duration_since(frame.at) > CE_STASH_TTL {
-            continue;
-        }
-        if receive(state, frame.sender, &frame.bytes)
-            .await
-            .is_retained()
-        {
-            keep.push(frame);
-        }
+    let frames = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .ce
+        .stash
+        .retry_set(Instant::now());
+    if frames.is_empty() {
+        return;
     }
-    if !keep.is_empty() {
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        keep.append(&mut inner.ce.stash);
-        let excess = keep.len().saturating_sub(CE_STASH_CAP);
-        keep.drain(..excess);
-        inner.ce.stash = keep;
+    let mut results = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let outcome = receive(state, frame.sender, &frame.bytes).await;
+        let kept = outcome.is_retained().then(|| outcome.head_evidence());
+        results.push((frame, kept));
     }
+    state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .ce
+        .stash
+        .settle(results);
 }
 
 /// Verify and install one frame.
@@ -1787,7 +1801,13 @@ pub(in crate::server) async fn receive(
         return ReceiveOutcome::Duplicate;
     }
     if info.state_hash != body.prior_head && info.state_revision < body.prior_revision {
-        return ReceiveOutcome::Behind;
+        // #1508 rc18 (Codex P1): a frame of a later revision is head
+        // evidence only when its actor has standing on this node's latest
+        // head. A forged future frame is kept for a retry but holds
+        // nothing. The revocation check above covered the actor and the
+        // sender.
+        let verified = ce::check_ahead(&body, &info).is_ok();
+        return ReceiveOutcome::Behind { verified };
     }
     // The load runs first, so the frame write below keeps the frames that
     // a restart restored.
@@ -2433,7 +2453,8 @@ mod tests {
     #[test]
     fn local_failure_is_retained_and_is_not_a_refusal() {
         assert!(ReceiveOutcome::LocalFailure.is_retained());
-        assert!(ReceiveOutcome::Behind.is_retained());
+        assert!(ReceiveOutcome::Behind { verified: false }.is_retained());
+        assert!(!ReceiveOutcome::Behind { verified: false }.head_evidence());
         assert!(!ReceiveOutcome::Applied.is_retained());
         assert!(!ReceiveOutcome::Duplicate.is_retained());
         assert!(!ReceiveOutcome::NotApplicable.is_retained());
@@ -4556,11 +4577,7 @@ mod daemon_tests {
             .await
             .ce
             .stash
-            .push(StashedFrame {
-                sender: b,
-                bytes: frame.clone(),
-                at: Instant::now(),
-            });
+            .push(stashed(b, frame.clone(), true).context("decode")?);
         let refused =
             ng::apply_named_group_metadata_event(&fx.replica, b_share.clone(), b, true, None).await;
         assert!(!refused.accepted, "B is a Member here: {refused:?}");
@@ -4671,11 +4688,7 @@ mod daemon_tests {
             .await
             .ce
             .stash
-            .push(StashedFrame {
-                sender: admin,
-                bytes: frame.clone(),
-                at: Instant::now(),
-            });
+            .push(stashed(admin, frame.clone(), true).context("decode")?);
         let refused =
             ng::apply_named_group_metadata_event(&fx.replica, rename, admin, true, None).await;
         assert!(!refused.accepted, "the rename does not chain yet");
