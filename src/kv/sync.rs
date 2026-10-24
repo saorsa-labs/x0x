@@ -1025,6 +1025,42 @@ impl BeaconWakeGate {
     }
 }
 
+/// Count one verified divergent beacon and, when the gate grants it, wake
+/// the parked requester (#1601).
+///
+/// A granted wake increments `digest_beacon_divergences` and bumps
+/// `divergence`, which is the only signal that re-arms the bounded
+/// `StateRequest` tail. A damped wake — pair suppression, the per-author
+/// cap, or the per-group budget — increments `digest_beacon_wakes_deferred`
+/// and leaves the requester parked. Both counters are what
+/// [`StateSyncCounters::snapshot`] reports on `/diagnostics/state-sync`.
+fn record_divergent_beacon(
+    gate: &mut BeaconWakeGate,
+    counters: &StateSyncCounters,
+    divergence: Option<&tokio::sync::watch::Sender<u64>>,
+    author: AgentId,
+    declared: [u8; 32],
+    local: [u8; 32],
+) -> bool {
+    if gate.should_wake(author, declared, local) {
+        counters
+            .digest_beacon_divergences
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(divergence) = divergence {
+            divergence.send_if_modified(|epoch| {
+                *epoch += 1;
+                true
+            });
+        }
+        true
+    } else {
+        counters
+            .digest_beacon_wakes_deferred
+            .fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
 /// Owns the request cadence shared by production and socket-free tests.
 /// Returning `true` grants one publication slot; `false` ends the task.
 struct RequestSlotScheduler {
@@ -4253,32 +4289,21 @@ impl KvStoreSync {
                         // itself verified, so a beacon can neither inject
                         // nor truncate state.
                         let local_digest = responder_store.read().await.served_digest();
-                        if local_digest != digest {
-                            if beacon_wakes.should_wake(author, digest, local_digest) {
-                                responder_counters
-                                    .digest_beacon_divergences
-                                    .fetch_add(1, Ordering::Relaxed);
-                                if let Some(divergence) = responder_digest_divergence.as_ref() {
-                                    divergence.send_if_modified(|epoch| {
-                                        *epoch += 1;
-                                        true
-                                    });
-                                }
-                                tracing::debug!(
-                                    store_id = %responder_store_id,
-                                    "peer digest beacon disagrees with local state; \
-                                     re-entering the bounded repair tail"
-                                );
-                            } else {
-                                // #1601: the gate damped this divergence
-                                // (pair suppression, the per-author cap, or
-                                // the per-group wake budget). Count it so
-                                // the store's aggregate wake pressure stays
-                                // answerable from local diagnostics.
-                                responder_counters
-                                    .digest_beacon_wakes_deferred
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
+                        if local_digest != digest
+                            && record_divergent_beacon(
+                                &mut beacon_wakes,
+                                responder_counters.as_ref(),
+                                responder_digest_divergence.as_ref(),
+                                author,
+                                digest,
+                                local_digest,
+                            )
+                        {
+                            tracing::debug!(
+                                store_id = %responder_store_id,
+                                "peer digest beacon disagrees with local state; \
+                                 re-entering the bounded repair tail"
+                            );
                         }
                     }
                     KvSyncMessage::OwnerAnnounce {
@@ -7751,70 +7776,250 @@ mod tests {
         );
     }
 
-    /// #1601: K sealed members can each churn their own digest — every
-    /// local write mints a fresh declared digest — so every beacon
-    /// presents a fresh (declared, local) pair, pair suppression never
-    /// applies, and only the per-group budget bounds the aggregate. One
-    /// gate is one open store's responder (one parked replica): on main
-    /// it granted one wake per churning author per rate-cap interval — K
-    /// wakes per window here, and about K × M tails across a group of M
-    /// parked replicas. The budget caps the granted wakes per window at a
-    /// per-store constant, deferring the excess exactly like the
-    /// per-author cap, and every divergent beacon is still accounted:
-    /// granted (divergences) or damped (wakes deferred).
+    /// Above the jittered 15 s discovery wait (at most 18 s) and below the
+    /// jittered 30 s tail start (at least 24 s). A slot still pending at
+    /// this ceiling has parked; a discovery-prefix slot has returned.
+    const DISCOVERY_SLOT_CEILING: Duration = Duration::from_secs(22);
+
+    /// One parked sealed replica and its real [`RequestSlotScheduler`].
+    /// Socket-free: the beacon hook does not publish, and the wake path is
+    /// [`record_divergent_beacon`] — the same function the responder uses
+    /// to move the diagnostic counters and the divergence watch.
+    struct ChurnReplica {
+        schedule: RequestSlotScheduler,
+        evidence: Arc<std::sync::Mutex<ServedEvidence>>,
+        store: Arc<RwLock<KvStore>>,
+        weak_store: std::sync::Weak<RwLock<KvStore>>,
+        active: std::sync::atomic::AtomicBool,
+        stopped: std::sync::atomic::AtomicBool,
+        cancel: tokio_util::sync::CancellationToken,
+        bootstrap_cancel: tokio_util::sync::CancellationToken,
+        digest: [u8; 32],
+        divergence: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl ChurnReplica {
+        fn new() -> Self {
+            let owner = agent(1);
+            let mut store = KvStore::new(
+                store_id(76),
+                "churn".to_string(),
+                owner,
+                AccessPolicy::Signed,
+            )
+            .expect("store");
+            store
+                .put(
+                    "held".to_string(),
+                    b"v".to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("seed");
+            let digest = store.served_digest();
+            let store = Arc::new(RwLock::new(store));
+            let weak_store = Arc::downgrade(&store);
+            let (divergence, divergence_rx) = tokio::sync::watch::channel(0u64);
+            let hook: DigestBeaconHook = Arc::new(|| Box::pin(std::future::ready(())));
+            let schedule = RequestSlotScheduler::new(None).with_digest_beacon(hook, divergence_rx);
+            Self {
+                schedule,
+                evidence: Arc::new(std::sync::Mutex::new(ServedEvidence::default())),
+                store,
+                weak_store,
+                active: std::sync::atomic::AtomicBool::new(true),
+                stopped: std::sync::atomic::AtomicBool::new(false),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                bootstrap_cancel: tokio_util::sync::CancellationToken::new(),
+                digest,
+                divergence,
+            }
+        }
+
+        fn restore_evidence(&self) {
+            self.evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .digests
+                .insert(
+                    peer(1),
+                    ServedState {
+                        digest: self.digest,
+                        entry_count: 1,
+                    },
+                );
+        }
+
+        async fn take_grant(&mut self) -> Option<bool> {
+            let ChurnReplica {
+                schedule,
+                evidence,
+                weak_store,
+                active,
+                stopped,
+                cancel,
+                bootstrap_cancel,
+                ..
+            } = self;
+            let context = RequestSlotContext {
+                cancel,
+                bootstrap_cancel,
+                stopped,
+                refresh: None,
+                evidence,
+                store: weak_store,
+                bootstrap_active: active,
+            };
+            let slot = schedule.next_slot(context);
+            tokio::pin!(slot);
+            tokio::time::timeout(DISCOVERY_SLOT_CEILING, &mut slot)
+                .await
+                .ok()
+        }
+
+        /// Grant slots until the scheduler parks. Each `Some(true)` is one
+        /// `StateRequest` publication.
+        async fn publications_until_park(&mut self) -> u64 {
+            let mut publications = 0u64;
+            loop {
+                match self.take_grant().await {
+                    Some(true) => {
+                        publications += 1;
+                        self.schedule.request_published();
+                        self.restore_evidence();
+                        assert!(
+                            publications <= STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+                            "{publications} StateRequests before parking; one wake re-arms \
+                             only the {STATE_REQUEST_DISCOVERY_MIN_SLOTS}-slot discovery prefix"
+                        );
+                    }
+                    Some(false) => panic!("repair scheduler ended"),
+                    None => return publications,
+                }
+            }
+        }
+    }
+
+    /// #1601: twelve sealed members each churn a fresh digest, so pair
+    /// suppression never applies. The per-group budget grants 4 wakes per
+    /// rate-cap window — that 4 is hard-coded below, so raising
+    /// `BEACON_WAKE_GROUP_BUDGET` fails this test — and the deferred
+    /// remainder is read from [`StateSyncSnapshot`], not from a test-local
+    /// tally. One burst wakes the real parked scheduler once; it publishes
+    /// the discovery prefix of the state-request tail
+    /// ([`STATE_REQUEST_DISCOVERY_MIN_SLOTS`] slots) and parks again.
+    /// Twelve authors do not publish twelve tails.
     #[tokio::test(start_paused = true)]
-    async fn beacon_wake_group_budget_bounds_aggregate_wakes_across_churning_authors() {
+    async fn beacon_wake_group_budget_bounds_scheduler_under_multi_author_churn() {
+        // The issue's per-store cap. Not `BEACON_WAKE_GROUP_BUDGET`: a
+        // looser constant must fail these asserts rather than move them.
+        const GROUP_WAKE_BUDGET: u64 = 4;
+        const CHURNING_AUTHORS: u8 = 12;
+        const ROUNDS: u8 = 3;
+
+        let mut replica = ChurnReplica::new();
+        replica.restore_evidence();
+        let discovery = replica.publications_until_park().await;
+        assert_eq!(
+            discovery, STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+            "the parked replica converges on the discovery prefix before churn"
+        );
+
+        let counters = StateSyncCounters::default();
         let mut gate = BeaconWakeGate::default();
-        let local = [9u8; 32];
-        let churning: u8 = 12;
-        let rounds: u8 = 3;
-        let mut wakes = 0u64;
-        let mut deferred = 0u64;
-        let mut last_deferred_pair = None;
-        for round in 1..=rounds {
-            let mut round_wakes = 0u64;
-            for member in 1..=churning {
-                // The churning author's beacon-interval digest: fresh
-                // every round, distinct per author, always divergent from
-                // the parked replica's fixed local digest.
+        let mut state_requests = 0u64;
+        let mut deferred_pair = None;
+        for round in 1..=ROUNDS {
+            let before = counters.snapshot();
+            for member in 2..=(CHURNING_AUTHORS + 1) {
                 let mut declared = [0u8; 32];
                 declared[0] = round;
                 declared[1] = member;
-                if gate.should_wake(agent(member), declared, local) {
-                    wakes += 1;
-                    round_wakes += 1;
-                } else {
-                    deferred += 1;
-                    last_deferred_pair = Some((member, declared));
+                declared[2] = 0xA5;
+                assert_ne!(declared, replica.digest, "a churn digest must diverge");
+                let granted = record_divergent_beacon(
+                    &mut gate,
+                    &counters,
+                    Some(&replica.divergence),
+                    agent(member),
+                    declared,
+                    replica.digest,
+                );
+                if !granted {
+                    deferred_pair = Some((member, declared));
                 }
             }
-            assert!(
-                round_wakes <= BEACON_WAKE_GROUP_BUDGET as u64,
-                "round {round}: {round_wakes} wakes for {churning} churning authors — \
-                 the per-group budget must bound the store's aggregate wakes"
+            let after = counters.snapshot();
+            let wakes = after.digest_beacon_divergences - before.digest_beacon_divergences;
+            let deferred = after.digest_beacon_wakes_deferred - before.digest_beacon_wakes_deferred;
+            assert_eq!(
+                wakes, GROUP_WAKE_BUDGET,
+                "round {round}: {wakes} granted wakes for {CHURNING_AUTHORS} churning authors"
             );
-            // The budget window IS the per-author rate-cap interval; slide
-            // it fully so the next round measures a fresh window.
-            tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER).await;
+            assert_eq!(
+                deferred,
+                u64::from(CHURNING_AUTHORS) - GROUP_WAKE_BUDGET,
+                "round {round}: the production deferred counter must record every damped beacon"
+            );
+            assert_eq!(wakes + deferred, u64::from(CHURNING_AUTHORS));
+
+            let published = replica.publications_until_park().await;
+            assert_eq!(
+                published, STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+                "round {round}: {CHURNING_AUTHORS} authors published {published} StateRequests; \
+                 one burst re-arms one discovery prefix of the tail, not one tail per author"
+            );
+            state_requests += published;
         }
-        assert!(
-            wakes <= rounds as u64 * BEACON_WAKE_GROUP_BUDGET as u64,
-            "the aggregate stays at the budget per window, never one wake per author"
+
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap.digest_beacon_divergences,
+            u64::from(ROUNDS) * GROUP_WAKE_BUDGET
         );
         assert_eq!(
-            wakes + deferred,
-            rounds as u64 * churning as u64,
-            "every divergent beacon either woke the tail or was deferred — the \
-             divergences and wakes-deferred counters account for the whole pressure"
+            snap.digest_beacon_wakes_deferred,
+            u64::from(ROUNDS) * (u64::from(CHURNING_AUTHORS) - GROUP_WAKE_BUDGET)
         );
-        // A budget-deferred divergence is not consumed (#238 patience at
-        // capped cadence): once the window has slid, the same author's
-        // still-divergent beacon earns its wake. Deferral never becomes
-        // suppression.
-        let (member, declared) = last_deferred_pair.expect("a full budget defers someone");
         assert!(
-            gate.should_wake(agent(member), declared, local),
+            state_requests < u64::from(ROUNDS) * u64::from(CHURNING_AUTHORS),
+            "StateRequest publications stayed inside the tail-schedule bound: {state_requests}"
+        );
+
+        // A budget-deferred beacon is not consumed (#238). The repair tail
+        // above already ran longer than the rate-cap window, so the same
+        // pair earns one wake and one tail.
+        let (member, declared) = deferred_pair.expect("a full budget defers someone");
+        let before = counters.snapshot();
+        assert!(
+            record_divergent_beacon(
+                &mut gate,
+                &counters,
+                Some(&replica.divergence),
+                agent(member),
+                declared,
+                replica.digest,
+            ),
             "a budget-deferred pair earns its wake once the window slides"
+        );
+        let after = counters.snapshot();
+        assert_eq!(
+            after.digest_beacon_wakes_deferred, before.digest_beacon_wakes_deferred,
+            "re-earning a deferred wake must not count as another deferral"
+        );
+        assert_eq!(
+            after.digest_beacon_divergences,
+            before.digest_beacon_divergences + 1
+        );
+        assert_eq!(
+            replica.publications_until_park().await,
+            STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+            "the re-earned wake re-arms one discovery prefix"
+        );
+        assert_eq!(
+            replica.store.read().await.served_digest(),
+            replica.digest,
+            "churn wakes the requester and does not rewrite local state"
         );
     }
 
