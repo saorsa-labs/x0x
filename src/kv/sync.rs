@@ -46,6 +46,7 @@ struct StateSyncCounters {
     incoming_record_merges: AtomicU64,
     digest_beacons_sent: AtomicU64,
     digest_beacon_divergences: AtomicU64,
+    digest_beacon_wakes_deferred: AtomicU64,
 }
 
 /// Cumulative state-sync activity for one currently open local store.
@@ -71,6 +72,11 @@ pub struct StateSyncSnapshot {
     /// Peer digest beacons that disagreed with local state (#1117) — each
     /// one re-arms the bounded state-request tail.
     pub digest_beacon_divergences: u64,
+    /// Divergent peer beacons whose wake the gate damped (#1601): pair
+    /// suppression, the per-author rate cap, or the per-group wake budget
+    /// deferred it. Added to `digest_beacon_divergences`, this is the
+    /// store's total beacon-divergence pressure.
+    pub digest_beacon_wakes_deferred: u64,
 }
 
 impl StateSyncCounters {
@@ -93,6 +99,7 @@ impl StateSyncCounters {
             incoming_record_merges: get(&self.incoming_record_merges),
             digest_beacons_sent: get(&self.digest_beacons_sent),
             digest_beacon_divergences: get(&self.digest_beacon_divergences),
+            digest_beacon_wakes_deferred: get(&self.digest_beacon_wakes_deferred),
         }
     }
 }
@@ -937,10 +944,27 @@ struct DigestBeaconPlan {
 /// write load; a wake it defers is not consumed. Both maps are capped;
 /// at the cap they are cleared and re-learned — memory stays bounded
 /// even under a beacon flood.
+///
+/// A per-GROUP budget (#1601) bounds the aggregate across authors. The
+/// gate lives inside one store's responder loop, so the budget caps that
+/// store's granted wakes per rate-cap window however many sealed members
+/// churn: per-author damping alone let K churning authors (every local
+/// write mints a fresh declared digest, so pair suppression never
+/// applied) wake a parked replica about K times per window — about
+/// K × M tails across M parked replicas. A granted wake only re-arms ONE
+/// bounded request tail whose next verified serve repairs every
+/// divergence, so distinct authors' wakes inside one window are largely
+/// redundant; budget excess defers exactly like the per-author cap (not
+/// consumed, re-earned next window) and the #238 patience rule still
+/// holds. The wake log below is bounded by the budget itself, so the map
+/// cap never needs to clear it.
 #[derive(Default)]
 struct BeaconWakeGate {
     woken_for: std::collections::HashMap<AgentId, ([u8; 32], [u8; 32], tokio::time::Instant)>,
     last_wake: std::collections::HashMap<AgentId, tokio::time::Instant>,
+    /// Granted-wake instants still inside the rate-cap window, oldest
+    /// first. Never longer than [`BEACON_WAKE_GROUP_BUDGET`].
+    group_wakes: std::collections::VecDeque<tokio::time::Instant>,
 }
 
 /// How long one (author, declared, local) divergence stays suppressed.
@@ -949,6 +973,13 @@ const BEACON_WAKE_REPEAT_AFTER: std::time::Duration =
 
 /// Map ceiling before the gate re-learns from scratch.
 const BEACON_WAKE_GATE_CAP: usize = 1024;
+
+/// Most wakes one gate (one open store, one parked replica) grants per
+/// rate-cap interval across ALL authors (#1601). One granted wake re-arms
+/// one bounded tail, so four re-arms per 16 s — regardless of group size
+/// or churn — keeps post-divergence repair latency small while capping
+/// the aggregate wake cost at a per-store constant.
+const BEACON_WAKE_GROUP_BUDGET: usize = 4;
 
 impl BeaconWakeGate {
     fn should_wake(&mut self, author: AgentId, declared: [u8; 32], local: [u8; 32]) -> bool {
@@ -967,6 +998,20 @@ impl BeaconWakeGate {
         {
             return false;
         }
+        // Per-group budget (#1601): a sliding rate-cap window across
+        // authors. Expired entries leave first; a full budget then defers
+        // the wake without consuming anything, exactly like the per-author
+        // cap above — the same beacon re-earns its wake next window.
+        while self
+            .group_wakes
+            .front()
+            .is_some_and(|at| now >= *at + KEY_GAP_REPAIR_RETRY_AFTER)
+        {
+            self.group_wakes.pop_front();
+        }
+        if self.group_wakes.len() >= BEACON_WAKE_GROUP_BUDGET {
+            return false;
+        }
         if self.woken_for.len() >= BEACON_WAKE_GATE_CAP
             || self.last_wake.len() >= BEACON_WAKE_GATE_CAP
         {
@@ -975,6 +1020,7 @@ impl BeaconWakeGate {
         }
         self.woken_for.insert(author, (declared, local, now));
         self.last_wake.insert(author, now);
+        self.group_wakes.push_back(now);
         true
     }
 }
@@ -4207,23 +4253,32 @@ impl KvStoreSync {
                         // itself verified, so a beacon can neither inject
                         // nor truncate state.
                         let local_digest = responder_store.read().await.served_digest();
-                        if local_digest != digest
-                            && beacon_wakes.should_wake(author, digest, local_digest)
-                        {
-                            responder_counters
-                                .digest_beacon_divergences
-                                .fetch_add(1, Ordering::Relaxed);
-                            if let Some(divergence) = responder_digest_divergence.as_ref() {
-                                divergence.send_if_modified(|epoch| {
-                                    *epoch += 1;
-                                    true
-                                });
+                        if local_digest != digest {
+                            if beacon_wakes.should_wake(author, digest, local_digest) {
+                                responder_counters
+                                    .digest_beacon_divergences
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if let Some(divergence) = responder_digest_divergence.as_ref() {
+                                    divergence.send_if_modified(|epoch| {
+                                        *epoch += 1;
+                                        true
+                                    });
+                                }
+                                tracing::debug!(
+                                    store_id = %responder_store_id,
+                                    "peer digest beacon disagrees with local state; \
+                                     re-entering the bounded repair tail"
+                                );
+                            } else {
+                                // #1601: the gate damped this divergence
+                                // (pair suppression, the per-author cap, or
+                                // the per-group wake budget). Count it so
+                                // the store's aggregate wake pressure stays
+                                // answerable from local diagnostics.
+                                responder_counters
+                                    .digest_beacon_wakes_deferred
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
-                            tracing::debug!(
-                                store_id = %responder_store_id,
-                                "peer digest beacon disagrees with local state; \
-                                 re-entering the bounded repair tail"
-                            );
                         }
                     }
                     KvSyncMessage::OwnerAnnounce {
@@ -7693,6 +7748,73 @@ mod tests {
         assert!(
             gate.should_wake(agent(4), declared, local),
             "another author's divergence is not damped by this author's history"
+        );
+    }
+
+    /// #1601: K sealed members can each churn their own digest — every
+    /// local write mints a fresh declared digest — so every beacon
+    /// presents a fresh (declared, local) pair, pair suppression never
+    /// applies, and only the per-group budget bounds the aggregate. One
+    /// gate is one open store's responder (one parked replica): on main
+    /// it granted one wake per churning author per rate-cap interval — K
+    /// wakes per window here, and about K × M tails across a group of M
+    /// parked replicas. The budget caps the granted wakes per window at a
+    /// per-store constant, deferring the excess exactly like the
+    /// per-author cap, and every divergent beacon is still accounted:
+    /// granted (divergences) or damped (wakes deferred).
+    #[tokio::test(start_paused = true)]
+    async fn beacon_wake_group_budget_bounds_aggregate_wakes_across_churning_authors() {
+        let mut gate = BeaconWakeGate::default();
+        let local = [9u8; 32];
+        let churning: u8 = 12;
+        let rounds: u8 = 3;
+        let mut wakes = 0u64;
+        let mut deferred = 0u64;
+        let mut last_deferred_pair = None;
+        for round in 1..=rounds {
+            let mut round_wakes = 0u64;
+            for member in 1..=churning {
+                // The churning author's beacon-interval digest: fresh
+                // every round, distinct per author, always divergent from
+                // the parked replica's fixed local digest.
+                let mut declared = [0u8; 32];
+                declared[0] = round;
+                declared[1] = member;
+                if gate.should_wake(agent(member), declared, local) {
+                    wakes += 1;
+                    round_wakes += 1;
+                } else {
+                    deferred += 1;
+                    last_deferred_pair = Some((member, declared));
+                }
+            }
+            assert!(
+                round_wakes <= BEACON_WAKE_GROUP_BUDGET as u64,
+                "round {round}: {round_wakes} wakes for {churning} churning authors — \
+                 the per-group budget must bound the store's aggregate wakes"
+            );
+            // The budget window IS the per-author rate-cap interval; slide
+            // it fully so the next round measures a fresh window.
+            tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER).await;
+        }
+        assert!(
+            wakes <= rounds as u64 * BEACON_WAKE_GROUP_BUDGET as u64,
+            "the aggregate stays at the budget per window, never one wake per author"
+        );
+        assert_eq!(
+            wakes + deferred,
+            rounds as u64 * churning as u64,
+            "every divergent beacon either woke the tail or was deferred — the \
+             divergences and wakes-deferred counters account for the whole pressure"
+        );
+        // A budget-deferred divergence is not consumed (#238 patience at
+        // capped cadence): once the window has slid, the same author's
+        // still-divergent beacon earns its wake. Deferral never becomes
+        // suppression.
+        let (member, declared) = last_deferred_pair.expect("a full budget defers someone");
+        assert!(
+            gate.should_wake(agent(member), declared, local),
+            "a budget-deferred pair earns its wake once the window slides"
         );
     }
 
