@@ -70,6 +70,7 @@ pub const SIG_ALGORITHM_ML_DSA65: u8 = 0;
 /// What the sealed payload carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum KvMutationKind {
     /// An incremental [`KvStoreDelta`](crate::kv::KvStoreDelta) (a regular
     /// put/remove/update).
@@ -652,9 +653,11 @@ pub fn open_mutation(
         &record.nonce,
         &record.ciphertext,
     )?;
-    let mutation: SignedKvMutation = bincode::deserialize(&plaintext).map_err(|e| {
-        KvError::SecureRecord(format!("decrypted payload is not a signed mutation: {e}"))
-    })?;
+    // #1604: an unknown `KvMutationKind` is a typed, counted error.
+    let mutation: SignedKvMutation =
+        crate::wire_compat::decode_bincode("SignedKvMutation", &plaintext).map_err(|e| {
+            KvError::SecureRecord(format!("decrypted payload is not a signed mutation: {e}"))
+        })?;
     if mutation.group_id != group_id
         || mutation.store_id != *expected_store_id.as_bytes()
         || mutation.epoch != record.epoch

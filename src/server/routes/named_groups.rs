@@ -1323,6 +1323,7 @@ pub(in crate::server) struct PublicGroupBootstrap {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub(in crate::server) enum JoinResultMessage {
     FetchRequest {
         group_id: String,
@@ -1414,6 +1415,7 @@ pub(in crate::server) enum JoinResultMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // the shared Invite prefix IS the taxonomy
+#[non_exhaustive]
 pub(in crate::server) enum JoinRefusalReason {
     InviteSecretUnknown,
     InviteSecretConsumed,
@@ -1427,6 +1429,11 @@ pub(in crate::server) enum JoinRefusalReason {
     InviteEventBeforeCreation,
     InviteExpired,
     InviteNotAddressed,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl JoinRefusalReason {
@@ -1453,6 +1460,8 @@ impl JoinRefusalReason {
             Self::InviteEventBeforeCreation => "invite_event_before_creation",
             Self::InviteExpired => "invite_expired",
             Self::InviteNotAddressed => "invite_not_addressed",
+            // #1604: never signed; decoders refuse an unknown reason first.
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -1657,6 +1666,7 @@ fn live_group_allows_metadata_withdrawal_commit(event: &NamedGroupMetadataEvent)
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub(in crate::server) enum WelcomeBlobMessage {
     FetchRequest {
         group_id: String,
@@ -1692,6 +1702,7 @@ pub(in crate::server) enum WelcomeBlobMessage {
 // to the gossip plumbing cost.
 #[allow(clippy::large_enum_variant)]
 #[derive(PartialEq)]
+#[non_exhaustive]
 pub(in crate::server) enum NamedGroupMetadataEvent {
     MemberAdded {
         group_id: String,
@@ -2690,7 +2701,11 @@ pub(in crate::server) fn unsigned_group_cards_refused() -> u64 {
 /// One payload from the global discovery topic. The listener task calls
 /// this; tests call it directly.
 pub(in crate::server) async fn apply_global_discovery_payload(state: &AppState, payload: &[u8]) {
-    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(payload) else {
+    let Ok(event) = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>(
+        "NamedGroupMetadataEvent",
+        "",
+        payload,
+    ) else {
         return;
     };
     let NamedGroupMetadataEvent::GroupCardPublished { card, .. } = event else {
@@ -3227,7 +3242,8 @@ pub(in crate::server) async fn apply_listed_to_contacts_frame(
         return;
     }
     let json = &payload[LTC_CARD_FRAME_PREFIX.len()..];
-    let card: x0x::groups::GroupCard = match serde_json::from_slice(json) {
+    let card: x0x::groups::GroupCard = match crate::wire_compat::decode_json("GroupCard", "", json)
+    {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!("C.2/LTC: malformed card JSON: {e}");
@@ -10328,8 +10344,12 @@ pub(in crate::server) fn decode_and_verify_v2(
     if !msg.verified {
         return Err("v2_signature_invalid");
     }
-    let decoded_event = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
-        .map_err(|_| "payload_deserialize_failed")?;
+    let decoded_event = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>(
+        "NamedGroupMetadataEvent",
+        "",
+        &msg.payload,
+    )
+    .map_err(|_| "payload_deserialize_failed")?;
     let signer = msg.sender.ok_or("no_v2_sender")?;
     let topic = msg.topic.clone();
     Ok((decoded_event, signer, topic))
@@ -11320,6 +11340,11 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
     let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(payload) else {
         return true;
     };
+    // #1604 G5: refuse held unknown variants before any apply.
+    let Ok(response) = crate::wire_compat::reject_unknown("TreeKemCatchupResponse", response)
+    else {
+        return true;
+    };
     if response.message_type != "treekem_catchup_response" {
         return true;
     }
@@ -12268,7 +12293,7 @@ async fn request_member_key_package_catchup(
         for (aid, m) in &info.members_v2 {
             if !aid.eq_ignore_ascii_case(&local_agent_hex)
                 && !candidate_hexes.iter().any(|c| c.eq_ignore_ascii_case(aid))
-                && m.state == x0x::groups::GroupMemberState::Active
+                && m.is_active()
             {
                 candidate_hexes.push(aid.clone());
             }
@@ -16854,7 +16879,7 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         }
                         continue;
                     }
-                    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
+                    let Ok(event) = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>("NamedGroupMetadataEvent", "", &msg.payload) else { continue; };
                     let Some(apply_result) = apply_listener_metadata_event(
                         &state_for_task,
                         event,
@@ -16988,6 +17013,10 @@ pub(in crate::server) async fn create_named_group(
         if req.preset.is_some() {
             return bad_request("pass either `preset` or `policy`, not both");
         }
+        // #1604: a policy value this daemon does not know is refused.
+        let Ok(explicit) = crate::wire_compat::reject_unknown("GroupPolicy", explicit) else {
+            return api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown policy value");
+        };
         // ADR-0038 review fix 2: an explicit OwnerCertified(owner) claim is
         // only honored when THIS daemon's agent certificate actually chains
         // to that owner — otherwise any token holder could mint and
@@ -18460,6 +18489,10 @@ pub(in crate::server) async fn send_group_public_message(
                     return forbidden("admin-only write policy");
                 }
             }
+            // #1604: an unknown write policy permits no send.
+            x0x::groups::GroupWriteAccess::Unknown => {
+                return forbidden("unknown write policy");
+            }
         }
         let direct_recipients = info
             .active_members()
@@ -19924,7 +19957,11 @@ pub(in crate::server) async fn spawn_global_public_message_listener(
                 maybe = sub.recv() => {
                     let Some(gossip_msg) = maybe else { break; };
                     let msg: x0x::groups::GroupPublicMessage =
-                        match serde_json::from_slice(&gossip_msg.payload) {
+                        match crate::wire_compat::decode_json(
+                            "GroupPublicMessage",
+                            "",
+                            &gossip_msg.payload,
+                        ) {
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::debug!("E: dropped malformed global public msg: {e}");
@@ -19994,7 +20031,11 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                 maybe = sub.recv() => {
                     let Some(gossip_msg) = maybe else { break; };
                     let msg: x0x::groups::GroupPublicMessage =
-                        match serde_json::from_slice(&gossip_msg.payload) {
+                        match crate::wire_compat::decode_json(
+                            "GroupPublicMessage",
+                            "",
+                            &gossip_msg.payload,
+                        ) {
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::debug!("E: dropped malformed public msg: {e}");
@@ -20205,7 +20246,7 @@ pub(in crate::server) async fn mint_invite_transaction(
     // joiner rides the record and is compared at consumption.
     let signed_link = match origin {
         x0x::groups::InviteOrigin::Card => Some(link.clone()),
-        x0x::groups::InviteOrigin::Explicit => None,
+        x0x::groups::InviteOrigin::Explicit | x0x::groups::InviteOrigin::Unknown => None,
     };
     next.record_issued_invite_v2(
         invite.invite_secret.clone(),
@@ -29982,6 +30023,10 @@ pub(in crate::server) async fn update_group_policy(
     if let Some(w) = req.write_access {
         new_policy.write_access = w;
     }
+    // #1604: a policy value this daemon does not know is refused.
+    let Ok(new_policy) = crate::wire_compat::reject_unknown("GroupPolicy", new_policy) else {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown policy value");
+    };
 
     // ADR-0038 review B2: the OwnerCertified axis is IMMUTABLE once set —
     // an admin (even a compromised one) must not be able to swap the group
@@ -31378,10 +31423,7 @@ pub(in crate::server) async fn approve_join_request(
                 .map(|info| {
                     info.members_v2
                         .iter()
-                        .filter(|(mid, m)| {
-                            m.state == x0x::groups::GroupMemberState::Active
-                                && **mid != local_agent_hex
-                        })
+                        .filter(|(mid, m)| m.is_active() && **mid != local_agent_hex)
                         .map(|(mid, _)| mid.clone())
                         .collect()
                 })
@@ -32339,6 +32381,9 @@ pub(in crate::server) async fn create_discovery_subscription(
                 x0x::groups::ShardKind::Tag => x0x::groups::normalize_tag(k),
                 x0x::groups::ShardKind::Name => k.trim().to_lowercase(),
                 x0x::groups::ShardKind::Id => k.to_string(),
+                x0x::groups::ShardKind::Unknown => {
+                    return bad_request("kind must be 'tag', 'name', or 'id'");
+                }
             };
             (x0x::groups::shard_of(kind, &normalised), Some(normalised))
         }
@@ -33219,6 +33264,8 @@ pub(in crate::server) async fn secure_group_encrypt(
                 .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
                 .unwrap_or(false),
             x0x::groups::GroupWriteAccess::ModeratedPublic => true,
+            // #1604: an unknown write policy permits nothing.
+            x0x::groups::GroupWriteAccess::Unknown => false,
         };
         if !role_ok {
             return forbidden("sub-agent lacks the required roster role in this group");
@@ -37432,6 +37479,161 @@ pub(in crate::server) fn merge_home_suite_groups(
 /// Startup load for the durable group store: `named_groups.json` (the
 /// legacy-safe view every binary can parse) merged with the Home-Suite
 /// sidecar (the authoritative owner-certified state; issue #451).
+/// #1604: a saved group that holds a variant this build does not know (a
+/// role, state, policy or plane written by a newer build, read after a
+/// downgrade) is replaced, with every alias that shares its stable group
+/// id, by the inert #451 [`legacy_safe_placeholder`] marked as a withdrawn
+/// tombstone: default (restrictive) policy, no roster, no secret, no join or
+/// invite state, Gss plane. The identity and the state-commit chain head
+/// stay, so the group remains PRESENT locally: an absent-group path (the
+/// public message fallback, a bootstrap or card install) can never treat it
+/// as unknown, and the withdrawn gates refuse any reinstall or refresh. Every live ingress already
+/// refuses `Unknown`, so no in-memory group holds one.
+///
+/// Before that, the exact saved file bytes (the group stores and the
+/// group's TreeKEM `.snap`, `.journal` and `.hsjournal`) are kept in a
+/// durable, content-addressed backup (`<file>.unsupported-1604-<blake3>.bak`) for
+/// a later upgrade. If the backup fails, or a placeholder still holds an
+/// `Unknown`, startup fails loudly rather than lose data or fail open.
+async fn quarantine_unsupported_saved_groups(
+    groups: &mut HashMap<String, x0x::groups::GroupInfo>,
+    named_groups_path: &FsPath,
+    sidecar_path: &FsPath,
+) -> Result<()> {
+    let holds_unknown = |info: &x0x::groups::GroupInfo| {
+        crate::wire_compat::reject_unknown("SavedGroupInfo", info).is_err()
+    };
+    let affected: std::collections::HashSet<String> = groups
+        .values()
+        .filter(|info| holds_unknown(info))
+        .map(|info| info.stable_group_id().to_string())
+        .collect();
+    if affected.is_empty() {
+        return Ok(());
+    }
+    for path in [named_groups_path, sidecar_path] {
+        preserve_unsupported_saved_bytes(path).await?;
+    }
+    // The withdrawn placeholder makes `restore_treekem_groups` drop the
+    // group's TreeKEM files, so they are preserved first (ADR 0085: a
+    // downgrade must not destroy state a later upgrade can use). The
+    // directory layout is the daemon's: `<data_dir>/treekem` beside
+    // `<data_dir>/named_groups.json`.
+    let treekem_dir = named_groups_path
+        .parent()
+        .map(|data_dir| data_dir.join("treekem"));
+    for (key, info) in groups.iter() {
+        if !affected.contains(info.stable_group_id()) {
+            continue;
+        }
+        if let Some(dir) = treekem_dir.as_deref() {
+            for path in [
+                treekem_snapshot_path_for_drop_in_dir(dir, key),
+                treekem_journal_path_for_drop_in_dir(dir, key),
+                Some(treekem_home_suite_journal_path(dir, key)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                preserve_unsupported_saved_bytes(&path).await?;
+            }
+        }
+    }
+    for (key, info) in groups.iter_mut() {
+        if !affected.contains(info.stable_group_id()) {
+            continue;
+        }
+        let mut placeholder = legacy_safe_placeholder(info);
+        // The existing withdrawn tombstone: every path that could reinstall
+        // or refresh the group by its id (card import, journal replay,
+        // bootstrap, re-create) already refuses a withdrawn record.
+        placeholder.withdrawn = true;
+        if holds_unknown(&placeholder) {
+            anyhow::bail!(
+                "saved named group {key} holds a value this x0xd build cannot represent; \
+                 upgrade x0xd (the saved bytes are kept in *.unsupported-1604-*.bak)"
+            );
+        }
+        *info = placeholder;
+        tracing::warn!(
+            group_id = %key,
+            "startup: replaced a saved named group that holds a variant this build does not know with an inert placeholder; its bytes are kept in *.unsupported-1604-*.bak"
+        );
+    }
+    Ok(())
+}
+
+/// `<file name>.unsupported-1604-<first 16 hex of BLAKE3(bytes)>.bak`
+/// beside `path`: one backup per distinct saved version.
+pub(in crate::server) fn unsupported_backup_path(path: &FsPath, bytes: &[u8]) -> PathBuf {
+    let digest = blake3::hash(bytes).to_hex();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.unsupported-1604-{}.bak", &digest[..16]))
+}
+
+/// Copy `path` to a backup named by the BLAKE3 of its bytes, durably. An
+/// existing backup with other bytes (partial or stale) is rewritten.
+async fn preserve_unsupported_saved_bytes(path: &FsPath) -> Result<()> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let backup = unsupported_backup_path(path, &bytes);
+    if tokio::fs::read(&backup)
+        .await
+        .is_ok_and(|held| held == bytes)
+    {
+        // Reused: make sure the earlier copy itself is on stable storage.
+        let file = tokio::fs::File::open(&backup)
+            .await
+            .with_context(|| format!("failed to open {}", backup.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to sync {}", backup.display()))?;
+        return sync_parent_dir(&backup).await;
+    }
+    write_durably(&backup, &bytes).await
+}
+
+/// Sync the directory that holds `path`, so a rename into it is durable.
+async fn sync_parent_dir(path: &FsPath) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = tokio::fs::File::open(parent)
+        .await
+        .with_context(|| format!("failed to open directory {}", parent.display()))?;
+    dir.sync_all()
+        .await
+        .with_context(|| format!("failed to sync directory {}", parent.display()))
+}
+
+/// Write `bytes` to `path` through a synced temporary file and a rename.
+async fn write_durably(path: &FsPath, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let tmp = path.with_extension("tmp-1604");
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    file.write_all(bytes)
+        .await
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to sync {}", tmp.display()))?;
+    drop(file);
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
+    sync_parent_dir(path).await
+}
+
 pub(in crate::server) async fn load_named_groups_merged(
     named_groups_path: &FsPath,
     sidecar_path: &FsPath,
@@ -37449,6 +37651,7 @@ pub(in crate::server) async fn load_named_groups_merged(
         // process stopped, or the corrective re-save failed) — it is
         // excluded here so a restart can never resurrect it. The marker
         // stays until the next durable roster save clears it.
+        quarantine_unsupported_saved_groups(&mut merged, named_groups_path, sidecar_path).await?;
         for group_id in read_join_install_pending_markers(named_groups_path).await? {
             if merged.remove(&group_id).is_some() {
                 tracing::warn!(
@@ -38365,8 +38568,7 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> R
                     // B7: bind stored sender (carrier) to an active admin role.
                     let sender_hex = hex::encode(entry.sender.as_bytes());
                     let is_admin = info.members_v2.get(&sender_hex).is_some_and(|m| {
-                        m.state == x0x::groups::GroupMemberState::Active
-                            && m.role.at_least(x0x::groups::GroupRole::Admin)
+                        m.is_active() && m.role.at_least(x0x::groups::GroupRole::Admin)
                     });
                     if !is_admin {
                         tracing::warn!(
@@ -38554,9 +38756,7 @@ fn validate_relay_obligation_for_restart(
     let relay_targets = info
         .members_v2
         .iter()
-        .filter(|(id, member)| {
-            member.state == x0x::groups::GroupMemberState::Active && **id != local_agent_hex
-        })
+        .filter(|(id, member)| member.is_active() && **id != local_agent_hex)
         .map(|(id, _)| id.clone())
         .collect();
     let mut validated = entry.clone();
@@ -39148,9 +39348,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             let active_witnesses: std::collections::HashSet<String> = info
                 .members_v2
                 .iter()
-                .filter(|(id, m)| {
-                    m.state == x0x::groups::GroupMemberState::Active && **id != local_agent_hex
-                })
+                .filter(|(id, m)| m.is_active() && **id != local_agent_hex)
                 .map(|(id, _)| id.clone())
                 .collect();
             // Union: every active witness is a valid target. The stored

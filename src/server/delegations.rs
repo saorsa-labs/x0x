@@ -700,7 +700,7 @@ async fn active_member_hex(state: &AppState, group_id: &str) -> std::collections
         .map(|info| {
             info.members_v2
                 .values()
-                .filter(|m| m.state == x0x::groups::GroupMemberState::Active)
+                .filter(|m| m.is_active())
                 .map(|m| m.agent_id.to_lowercase())
                 .collect()
         })
@@ -793,6 +793,7 @@ pub(in crate::server) async fn delegate_group_authority(
         x0x::delegation::AuthorityScope::SendAs => {
             vec![x0x::delegation::DelegationVerb::SendPublicMessage]
         }
+        x0x::delegation::AuthorityScope::Unknown => return bad_request("unknown scope"),
     };
     let verbs = match &req.verbs {
         None => all_verbs,
@@ -861,6 +862,8 @@ pub(in crate::server) async fn delegate_group_authority(
             x0x::groups::GroupWriteAccess::AdminOnly => {
                 role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
             }
+            // #1604: an unknown write policy permits nothing.
+            x0x::groups::GroupWriteAccess::Unknown => false,
         };
         if !write_ok {
             return forbidden("write policy denies issuing delegations");
@@ -1117,7 +1120,7 @@ pub(in crate::server) async fn list_group_delegations(
     let committed = committed_delegations(&state, &stable_id).await;
     let active_hex: std::collections::HashSet<String> = members
         .values()
-        .filter(|m| m.state == x0x::groups::GroupMemberState::Active)
+        .filter(|m| m.is_active())
         .map(|m| m.agent_id.to_lowercase())
         .collect();
     let mut out: Vec<serde_json::Value> = committed

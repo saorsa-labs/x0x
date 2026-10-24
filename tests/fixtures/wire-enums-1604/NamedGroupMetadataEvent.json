@@ -1,0 +1,232 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "actor": "a",
+        "agent_id": "m",
+        "display_name": "D",
+        "event": "member_added",
+        "group_id": "g",
+        "revision": 1
+      },
+      "variant": "MemberAdded",
+      "wire": {
+        "json": "{\"event\":\"member_added\",\"group_id\":\"g\",\"revision\":1,\"actor\":\"a\",\"agent_id\":\"m\",\"display_name\":\"D\",\"treekem_commit_b64\":null,\"treekem_welcome_b64\":null,\"welcome_ref\":null,\"treekem_epoch\":null,\"treekem_key_package_hash\":null,\"member_joined_recovery\":null,\"member_recovery_history\":[],\"certificate_b64\":null,\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "agent_id": "m",
+        "event": "member_removed",
+        "group_id": "g",
+        "revision": 2
+      },
+      "variant": "MemberRemoved",
+      "wire": {
+        "json": "{\"event\":\"member_removed\",\"group_id\":\"g\",\"revision\":2,\"actor\":\"a\",\"agent_id\":\"m\",\"treekem_commit_b64\":null,\"treekem_epoch\":null,\"secret_epoch\":null,\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "event": "group_deleted",
+        "group_id": "g",
+        "revision": 3
+      },
+      "variant": "GroupDeleted",
+      "wire": {
+        "json": "{\"event\":\"group_deleted\",\"group_id\":\"g\",\"revision\":3,\"actor\":\"a\",\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "event": "policy_updated",
+        "group_id": "g",
+        "policy": {
+          "admission": "invite_only",
+          "confidentiality": "mls_encrypted",
+          "discoverability": "hidden",
+          "read_access": "members_only",
+          "write_access": "members_only"
+        },
+        "revision": 4
+      },
+      "variant": "PolicyUpdated",
+      "wire": {
+        "json": "{\"event\":\"policy_updated\",\"group_id\":\"g\",\"revision\":4,\"actor\":\"a\",\"policy\":{\"discoverability\":\"hidden\",\"admission\":\"invite_only\",\"confidentiality\":\"mls_encrypted\",\"read_access\":\"members_only\",\"write_access\":\"members_only\"},\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "agent_id": "m",
+        "event": "member_role_updated",
+        "group_id": "g",
+        "revision": 5,
+        "role": "moderator"
+      },
+      "variant": "MemberRoleUpdated",
+      "wire": {
+        "json": "{\"event\":\"member_role_updated\",\"group_id\":\"g\",\"revision\":5,\"actor\":\"a\",\"agent_id\":\"m\",\"role\":\"moderator\",\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "agent_id": "m",
+        "event": "member_banned",
+        "group_id": "g",
+        "revision": 6
+      },
+      "variant": "MemberBanned",
+      "wire": {
+        "json": "{\"event\":\"member_banned\",\"group_id\":\"g\",\"revision\":6,\"actor\":\"a\",\"agent_id\":\"m\",\"secret_epoch\":null,\"treekem_commit_b64\":null,\"treekem_epoch\":null,\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "agent_id": "m",
+        "event": "member_unbanned",
+        "group_id": "g",
+        "revision": 7
+      },
+      "variant": "MemberUnbanned",
+      "wire": {
+        "json": "{\"event\":\"member_unbanned\",\"group_id\":\"g\",\"revision\":7,\"actor\":\"a\",\"agent_id\":\"m\",\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "event": "join_request_created",
+        "group_id": "g",
+        "message": "hi",
+        "request_id": "r",
+        "requester_agent_id": "q",
+        "ts": 8
+      },
+      "variant": "JoinRequestCreated",
+      "wire": {
+        "json": "{\"event\":\"join_request_created\",\"group_id\":\"g\",\"request_id\":\"r\",\"requester_agent_id\":\"q\",\"message\":\"hi\",\"ts\":8,\"requester_kem_public_key_b64\":null,\"treekem_key_package_b64\":null,\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "event": "join_request_approved",
+        "group_id": "g",
+        "request_id": "r",
+        "requester_agent_id": "q",
+        "revision": 9
+      },
+      "variant": "JoinRequestApproved",
+      "wire": {
+        "json": "{\"event\":\"join_request_approved\",\"group_id\":\"g\",\"request_id\":\"r\",\"revision\":9,\"actor\":\"a\",\"requester_agent_id\":\"q\",\"treekem_commit_b64\":null,\"treekem_welcome_b64\":null,\"welcome_ref\":null,\"treekem_key_package_hash\":null,\"treekem_epoch\":null,\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "event": "join_request_rejected",
+        "group_id": "g",
+        "request_id": "r",
+        "requester_agent_id": "q"
+      },
+      "variant": "JoinRequestRejected",
+      "wire": {
+        "json": "{\"event\":\"join_request_rejected\",\"group_id\":\"g\",\"request_id\":\"r\",\"actor\":\"a\",\"requester_agent_id\":\"q\",\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "event": "join_request_cancelled",
+        "group_id": "g",
+        "request_id": "r",
+        "requester_agent_id": "q"
+      },
+      "variant": "JoinRequestCancelled",
+      "wire": {
+        "json": "{\"event\":\"join_request_cancelled\",\"group_id\":\"g\",\"request_id\":\"r\",\"requester_agent_id\":\"q\",\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "card": {
+          "admin_count": 1,
+          "created_at": 3,
+          "description": "d",
+          "group_id": "g1",
+          "member_count": 2,
+          "name": "n",
+          "owner_agent_id": "o",
+          "policy_summary": {
+            "admission": "invite_only",
+            "confidentiality": "mls_encrypted",
+            "discoverability": "hidden",
+            "read_access": "members_only",
+            "write_access": "members_only"
+          },
+          "request_access_enabled": false,
+          "updated_at": 4
+        },
+        "event": "group_card_published",
+        "group_id": "g"
+      },
+      "variant": "GroupCardPublished",
+      "wire": {
+        "json": "{\"event\":\"group_card_published\",\"group_id\":\"g\",\"card\":{\"group_id\":\"g1\",\"name\":\"n\",\"description\":\"d\",\"avatar_url\":null,\"banner_url\":null,\"tags\":[],\"policy_summary\":{\"discoverability\":\"hidden\",\"admission\":\"invite_only\",\"confidentiality\":\"mls_encrypted\",\"read_access\":\"members_only\",\"write_access\":\"members_only\"},\"owner_agent_id\":\"o\",\"admin_count\":1,\"member_count\":2,\"created_at\":3,\"updated_at\":4,\"request_access_enabled\":false,\"metadata_topic\":null,\"revision\":0,\"state_hash\":\"\",\"prev_state_hash\":null,\"issued_at\":0,\"expires_at\":0,\"authority_agent_id\":\"\",\"authority_public_key\":\"\",\"withdrawn\":false,\"signature\":\"\"}}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "description": null,
+        "event": "group_metadata_updated",
+        "group_id": "g",
+        "name": "n",
+        "revision": 10
+      },
+      "variant": "GroupMetadataUpdated",
+      "wire": {
+        "json": "{\"event\":\"group_metadata_updated\",\"group_id\":\"g\",\"revision\":10,\"actor\":\"a\",\"name\":\"n\",\"description\":null,\"commit\":null}"
+      }
+    },
+    {
+      "input": {
+        "event": "member_joined",
+        "group_id": "g",
+        "invite_secret": "s",
+        "inviter_agent_id": "i",
+        "member_agent_id": "m",
+        "member_public_key_b64": "pk",
+        "role": "member",
+        "signature_b64": "sig",
+        "ts_ms": 11
+      },
+      "variant": "MemberJoined",
+      "wire": {
+        "json": "{\"event\":\"member_joined\",\"group_id\":\"g\",\"stable_group_id\":null,\"member_agent_id\":\"m\",\"member_public_key_b64\":\"pk\",\"role\":\"member\",\"display_name\":null,\"inviter_agent_id\":\"i\",\"invite_secret\":\"s\",\"ts_ms\":11,\"treekem_key_package_b64\":null,\"kem_public_key_b64\":null,\"kem_signature_b64\":null,\"certificate_b64\":null,\"recovery_authority_agent_id\":null,\"recovery_authority_public_key_b64\":null,\"recovery_authority_signature_b64\":null,\"recovery_authority_commit\":null,\"signature_b64\":\"sig\"}"
+      }
+    },
+    {
+      "input": {
+        "actor": "a",
+        "aead_ciphertext_b64": "c",
+        "aead_nonce_b64": "n",
+        "event": "secure_share_delivered",
+        "group_id": "g",
+        "kem_ciphertext_b64": "k",
+        "recipient": "r",
+        "secret_epoch": 12
+      },
+      "variant": "SecureShareDelivered",
+      "wire": {
+        "json": "{\"event\":\"secure_share_delivered\",\"group_id\":\"g\",\"recipient\":\"r\",\"secret_epoch\":12,\"kem_ciphertext_b64\":\"k\",\"aead_nonce_b64\":\"n\",\"aead_ciphertext_b64\":\"c\",\"actor\":\"a\"}"
+      }
+    }
+  ],
+  "type": "NamedGroupMetadataEvent"
+}

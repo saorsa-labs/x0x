@@ -1971,3 +1971,258 @@ async fn issue1103_all_clean_seal_does_not_publish_a_failed_clear() -> Result<()
 async fn issue1103_eviction_seal_does_not_publish_a_failed_clear() -> Result<()> {
     issue1103_seal_clear_failure(true).await
 }
+
+#[tokio::test]
+async fn unknown_policy_values_keep_http_422_on_both_policy_routes() -> Result<()> {
+    // WHY (#1604, Engineer ruling): an unknown policy string now decodes as
+    // `Unknown`, but the REST contract stays 422 and nothing changes.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "78".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let before = state.named_groups.read().await[&group_id].policy.clone();
+    let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
+        "read_access": "guests_with_cake"
+    }))?;
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        state.named_groups.read().await[&group_id].policy,
+        before,
+        "policy unchanged"
+    );
+
+    let req: CreateGroupRequest = serde_json::from_value(serde_json::json!({
+        "name": "g",
+        "policy": {
+            "discoverability": "hidden",
+            "admission": "invite_only",
+            "confidentiality": "quantum_sealed",
+            "read_access": "members_only",
+            "write_access": "members_only"
+        }
+    }))?;
+    let groups_before = state.named_groups.read().await.len();
+    let response = create_named_group(State(Arc::clone(&state)), Json(req))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(state.named_groups.read().await.len(), groups_before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Result<()> {
+    // WHY (#1604, Codex P1/P2): a saved group with an unknown read policy or
+    // secure plane (a newer build's state, read after a downgrade) must not
+    // run with that state: equality checks on those fields would fail open.
+    // It, and every alias sharing its stable id, becomes the inert #451
+    // placeholder, and the saved bytes are preserved for a later upgrade.
+    let dir = tempfile::tempdir()?;
+    let named = dir.path().join("named_groups.json");
+    let sidecar = dir.path().join("home_suite_groups.json");
+    let creator = AgentKeypair::generate()?.agent_id();
+    let info = |name: &str, mls: &str| {
+        x0x::groups::GroupInfo::new(name.into(), String::new(), creator, mls.repeat(16))
+    };
+    let good = info("ok", "aa");
+    let mut odd_policy = serde_json::to_value(info("p", "bb"))?;
+    odd_policy["policy"]["read_access"] = "guests_with_cake".into();
+    let plane_group = info("q", "cc");
+    let mut odd_plane = serde_json::to_value(&plane_group)?;
+    odd_plane["secure_plane"] = "quantum_plane".into();
+    // A compatible alias of the plane group: same stable id, known values.
+    let alias = serde_json::to_value(&plane_group)?;
+    let saved = serde_json::json!({
+        "good": serde_json::to_value(&good)?,
+        "odd_policy": odd_policy,
+        "odd_plane": odd_plane,
+        "odd_plane_alias": alias,
+    });
+    tokio::fs::write(&named, serde_json::to_vec(&saved)?).await?;
+    let first_bytes = tokio::fs::read(&named).await?;
+    let backup_for = |bytes: &[u8]| unsupported_backup_path(&named, bytes);
+    // A partial backup left by an interrupted earlier run is rewritten.
+    tokio::fs::write(backup_for(&first_bytes), b"{\"partial").await?;
+
+    let loaded = load_named_groups_merged(&named, &sidecar).await?;
+    assert_eq!(loaded["good"], good, "an unaffected group is untouched");
+    for key in ["odd_policy", "odd_plane", "odd_plane_alias"] {
+        let entry = &loaded[key];
+        assert_eq!(entry.policy, x0x::groups::GroupPolicy::default(), "{key}");
+        assert_eq!(entry.secure_plane, x0x::mls::SecureGroupPlane::Gss, "{key}");
+        assert!(entry.members_v2.is_empty(), "{key}: no roster");
+        assert!(entry.shared_secret.is_none(), "{key}: no secret");
+        assert!(entry.withdrawn, "{key}: withdrawn tombstone");
+        assert!(
+            crate::wire_compat::reject_unknown("test", entry).is_ok(),
+            "{key}: no Unknown in memory"
+        );
+        // The public message route refuses it; it is not an absent group.
+        assert!(
+            crate::server::group_access::admit_public_messages(entry, &"ee".repeat(32)).is_err(),
+            "{key}: no public read"
+        );
+    }
+    assert_eq!(
+        loaded["odd_plane_alias"].stable_group_id(),
+        plane_group.stable_group_id()
+    );
+    assert_eq!(
+        tokio::fs::read(backup_for(&first_bytes)).await?,
+        first_bytes,
+        "saved bytes preserved; partial backup rewritten"
+    );
+
+    // A second, different saved version (a second downgrade) gets its own
+    // backup; the first one is kept.
+    let mut newer = saved.clone();
+    newer["odd_plane"]["name"] = "renamed".into();
+    tokio::fs::write(&named, serde_json::to_vec(&newer)?).await?;
+    let second_bytes = tokio::fs::read(&named).await?;
+    let _ = load_named_groups_merged(&named, &sidecar).await?;
+    assert_eq!(
+        tokio::fs::read(backup_for(&second_bytes)).await?,
+        second_bytes
+    );
+    assert_eq!(
+        tokio::fs::read(backup_for(&first_bytes)).await?,
+        first_bytes
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn quarantined_group_is_not_reinstalled_by_bootstrap_or_card_import() -> Result<()> {
+    // WHY (#1604, Codex P1): the quarantined placeholder stays present, so an
+    // older valid bootstrap or signed card cannot reinstall the group's old
+    // roster or policy.
+    let (state, _dir, _owner_kp) = owner_authority_state().await?;
+    let authority = AgentKeypair::generate()?;
+    let creator = authority.agent_id();
+    let mut original =
+        x0x::groups::GroupInfo::new("g".into(), String::new(), creator, "ab".repeat(16));
+    original.policy = x0x::groups::GroupPolicy {
+        discoverability: x0x::groups::GroupDiscoverability::PublicDirectory,
+        confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+        read_access: x0x::groups::GroupReadAccess::Public,
+        ..x0x::groups::GroupPolicy::default()
+    };
+    let mut placeholder = legacy_safe_placeholder(&original);
+    placeholder.withdrawn = true;
+    let key = original.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(key.clone(), placeholder.clone());
+
+    let bootstrap = PublicGroupBootstrap {
+        message_type: "public_group_bootstrap".to_string(),
+        group: Box::new(original.clone()),
+    };
+    let _ = crate::server::routes::public_group_bootstrap_outbox::admit_public_group_bootstrap(
+        &state, creator, None, bootstrap,
+    )
+    .await;
+    assert_eq!(
+        state.named_groups.read().await[&key],
+        placeholder,
+        "bootstrap"
+    );
+
+    let mut card = original
+        .to_group_card()
+        .ok_or_else(|| anyhow::anyhow!("public group has a card"))?;
+    card.sign(&authority)?;
+    let response = import_group_card(State(Arc::clone(&state)), Json(card))
+        .await
+        .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "card import refused"
+    );
+    assert_eq!(
+        state.named_groups.read().await[&key],
+        placeholder,
+        "card import"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn quarantine_preserves_treekem_files_through_the_restart_path() -> Result<()> {
+    // WHY (#1604, Codex P1; ADR 0085): the withdrawn placeholder makes the
+    // startup TreeKEM restore drop the group's `.snap`, `.journal` and
+    // `.hsjournal`. Their bytes must survive in backups for a later upgrade.
+    let (state, dir, _owner_kp) = owner_authority_state().await?;
+    let data_dir = dir.path().join("restart");
+    let treekem_dir = data_dir.join("treekem");
+    tokio::fs::create_dir_all(&treekem_dir).await?;
+    let named = data_dir.join("named_groups.json");
+    let sidecar = data_dir.join("home_suite_groups.json");
+    let creator = AgentKeypair::generate()?.agent_id();
+    let group = x0x::groups::GroupInfo::new("g".into(), String::new(), creator, "dd".repeat(16));
+    let key = group.mls_group_id.clone();
+    let mut saved = serde_json::to_value(&group)?;
+    saved["secure_plane"] = "quantum_plane".into();
+    tokio::fs::write(
+        &named,
+        serde_json::to_vec(&serde_json::json!({ &key: saved }))?,
+    )
+    .await?;
+    let files = [
+        (
+            treekem_dir.join(format!("{key}.snap")),
+            b"snapshot-bytes".to_vec(),
+        ),
+        (
+            treekem_dir.join(format!("{key}.journal")),
+            b"journal-bytes".to_vec(),
+        ),
+        (
+            treekem_dir.join(format!("{key}.hsjournal")),
+            b"hsjournal-bytes".to_vec(),
+        ),
+    ];
+    for (path, bytes) in &files {
+        tokio::fs::write(path, bytes).await?;
+    }
+
+    let loaded = load_named_groups_merged(&named, &sidecar).await?;
+    assert!(
+        loaded[&key].withdrawn,
+        "quarantined as a withdrawn placeholder"
+    );
+    // The daemon's next startup step drops the live TreeKEM files.
+    let _ = restore_treekem_groups(&loaded, state.agent.as_ref(), &treekem_dir).await;
+    for (path, bytes) in &files {
+        assert!(
+            !tokio::fs::try_exists(path).await?,
+            "{} dropped",
+            path.display()
+        );
+        assert_eq!(
+            &tokio::fs::read(unsupported_backup_path(path, bytes)).await?,
+            bytes,
+            "{} preserved",
+            path.display()
+        );
+    }
+    Ok(())
+}

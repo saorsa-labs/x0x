@@ -696,6 +696,7 @@ fn state_request_wait(attempt: usize) -> std::time::Duration {
 /// (their receive loop tolerates undecodable payloads), so the addition is
 /// purely additive.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 enum KvSyncMessage {
     /// A peer with no local state for the store asks holders to republish
     /// their full state (as a regular delta) on the main topic.
@@ -806,6 +807,26 @@ enum KvSyncMessage {
         /// Number of entries in the declaring replica's set.
         entry_count: u32,
     },
+}
+
+/// #1604: main-era wire bytes of every `KvSyncMessage` variant still match.
+#[cfg(test)]
+#[test]
+fn kv_sync_message_wire_matches_main() {
+    crate::wire_golden_tests::check::<KvSyncMessage>(
+        "KvSyncMessage",
+        &[(
+            crate::wire_golden_tests::Codec::Bincode,
+            crate::wire_golden_tests::Mode::RoundTrip,
+        )],
+        &[
+            "StateRequest",
+            "OwnerAnnounce",
+            "StateServed",
+            "StateServedV2",
+            "StateDigestBeacon",
+        ],
+    );
 }
 
 /// One responder's latest v2 digest declaration.
@@ -2060,8 +2081,9 @@ impl KvStoreSync {
         if mutation.kind != KvMutationKind::Control {
             return Err(ControlOpenFailure::Verify);
         }
-        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload)
-            .map_err(|_| ControlOpenFailure::Verify)?;
+        let msg =
+            crate::wire_compat::decode_bincode::<KvSyncMessage>("KvSyncMessage", &mutation.payload)
+                .map_err(|_| ControlOpenFailure::Verify)?;
         let authorized = match msg {
             KvSyncMessage::StateRequest { .. } | KvSyncMessage::StateDigestBeacon { .. } => {
                 opened.reader_only && protector.is_authorized_reader(&mutation.author_id).await
@@ -2695,8 +2717,9 @@ impl KvStoreSync {
             );
             return Err(ControlOpenFailure::Verify);
         }
-        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload)
-            .map_err(|_| ControlOpenFailure::Verify)?;
+        let msg =
+            crate::wire_compat::decode_bincode::<KvSyncMessage>("KvSyncMessage", &mutation.payload)
+                .map_err(|_| ControlOpenFailure::Verify)?;
         let authorized = match &msg {
             KvSyncMessage::StateRequest { .. } => ctx.is_authorized_reader(&mutation.author_id),
             KvSyncMessage::StateDigestBeacon { .. } => {
@@ -2787,8 +2810,8 @@ impl KvStoreSync {
         }
         let payload = open_public_payload(ctx.as_ref(), &mutation.payload)
             .map_err(|_| ControlOpenFailure::Verify)?;
-        let msg: KvSyncMessage =
-            bincode::deserialize(payload).map_err(|_| ControlOpenFailure::Verify)?;
+        let msg: KvSyncMessage = crate::wire_compat::decode_bincode("KvSyncMessage", payload)
+            .map_err(|_| ControlOpenFailure::Verify)?;
         if matches!(msg, KvSyncMessage::OwnerAnnounce { .. }) {
             return Err(ControlOpenFailure::UnauthorizedControl);
         }
@@ -3585,6 +3608,9 @@ impl KvStoreSync {
                         }
                     }
                     Err(e) => {
+                        // #1604: an unknown variant (for example a newer
+                        // `AccessPolicy`) is counted as well as logged.
+                        let e = crate::wire_compat::classify_bincode("KvStoreDelta", &e);
                         tracing::warn!("Failed to deserialize KvStore delta: {e}");
                     }
                 }
@@ -3717,7 +3743,10 @@ impl KvStoreSync {
                         }
                     }
                 } else {
-                    match bincode::deserialize::<KvSyncMessage>(&msg.payload) {
+                    match crate::wire_compat::decode_bincode::<KvSyncMessage>(
+                        "KvSyncMessage",
+                        &msg.payload,
+                    ) {
                         Ok(m) => (m, msg.sender, None),
                         Err(_) => {
                             responder_counters

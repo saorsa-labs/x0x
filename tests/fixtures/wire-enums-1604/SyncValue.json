@@ -1,0 +1,70 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "OwnerProfile": {
+          "human_name": "Ann"
+        }
+      },
+      "variant": "OwnerProfile",
+      "wire": {
+        "bincode": "00000000010300000000000000416e6e"
+      }
+    },
+    {
+      "input": {
+        "MachineNames": {
+          "display_name": "d",
+          "machine_name": null
+        }
+      },
+      "variant": "MachineNames",
+      "wire": {
+        "bincode": "010000000101000000000000006400"
+      }
+    },
+    {
+      "input": {
+        "HomePointer": {
+          "group_id": "g",
+          "policy": {
+            "admission": "invite_only",
+            "confidentiality": "mls_encrypted",
+            "discoverability": "hidden",
+            "read_access": "members_only",
+            "write_access": "members_only"
+          },
+          "primary_agent": "p",
+          "provisioned_at_ms": 5,
+          "roster": [
+            {
+              "agent_id": "a",
+              "role": "admin",
+              "state": "active"
+            }
+          ]
+        }
+      },
+      "variant": "HomePointer",
+      "wire": {
+        "bincode": "020000000100000000000000670000000000000000000000000000000000000000010000000000000001000000000000006101000000000000000100000000000000700500000000000000"
+      }
+    },
+    {
+      "input": {
+        "IssuanceJournal": {
+          "agent_id": "a",
+          "cert_digest": "c",
+          "issued_at": 1,
+          "not_after": 2
+        }
+      },
+      "variant": "IssuanceJournal",
+      "wire": {
+        "bincode": "030000000100000000000000610100000000000000630100000000000000010200000000000000"
+      }
+    }
+  ],
+  "type": "SyncValue"
+}

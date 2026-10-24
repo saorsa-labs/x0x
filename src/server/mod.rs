@@ -2320,6 +2320,12 @@ pub async fn serve_with_options(
                 let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
                     continue;
                 };
+                // #1604 G5: refuse a held unknown variant before any check.
+                let Ok(join_msg) =
+                    crate::wire_compat::reject_unknown("JoinResultMessage", join_msg)
+                else {
+                    continue;
+                };
                 tracing::debug!(
                     target: "treekem.trace",
                     stage = "direct_classified_join_result",
@@ -2377,8 +2383,11 @@ pub async fn serve_with_options(
             let mut rx = control_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                let Ok(control_msg) = serde_json::from_slice::<ControlBlobMessage>(&msg.payload)
-                else {
+                let Ok(control_msg) = crate::wire_compat::decode_json::<ControlBlobMessage>(
+                    "ControlBlobMessage",
+                    "control_blob_",
+                    &msg.payload,
+                ) else {
                     continue;
                 };
                 handle_control_blob_message(&control_state, &msg.sender, msg.verified, control_msg)
@@ -2519,8 +2528,11 @@ pub async fn serve_with_options(
                     continue;
                 };
 
-                let Ok(msg) = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(payload)
-                else {
+                let Ok(msg) = crate::wire_compat::decode_json::<x0x::groups::GroupPublicMessage>(
+                    "GroupPublicMessage",
+                    "",
+                    payload,
+                ) else {
                     tracing::debug!(
                         sender = %hex::encode(typed.sender.as_bytes()),
                         "typed group-public DM payload was not a GroupPublicMessage"
@@ -4063,7 +4075,11 @@ async fn handle_predecessor_relay_typed_payload_inner(
     let Some(sender) = msg.sender else {
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
-    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
+    let Ok(event) = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>(
+        "NamedGroupMetadataEvent",
+        "",
+        &msg.payload,
+    ) else {
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
 
@@ -4721,10 +4737,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 .map(|info| {
                     info.members_v2
                         .iter()
-                        .filter(|(id, m)| {
-                            m.state == x0x::groups::GroupMemberState::Active
-                                && **id != local_agent_hex
-                        })
+                        .filter(|(id, m)| m.is_active() && **id != local_agent_hex)
                         .map(|(id, _)| id.clone())
                         .collect::<Vec<_>>()
                 })

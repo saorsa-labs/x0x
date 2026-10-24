@@ -1,0 +1,20 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "gss",
+      "variant": "Gss",
+      "wire": {
+        "json": "\"gss\""
+      }
+    },
+    {
+      "input": "tree_kem",
+      "variant": "TreeKem",
+      "wire": {
+        "json": "\"tree_kem\""
+      }
+    }
+  ],
+  "type": "SecureGroupPlane"
+}

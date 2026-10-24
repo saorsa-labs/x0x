@@ -205,6 +205,7 @@ fn default_chunk_size() -> usize {
 /// File transfer message types (sent over direct messaging).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum FileMessage {
     /// Offer to send a file.
     #[serde(rename = "file-offer")]

@@ -398,6 +398,7 @@ pub struct DmEnvelope {
 
 /// Envelope body — either a payload DM or an acknowledgement of a prior one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DmBody {
     /// Encrypted user payload.
     Payload(DmPayload),
@@ -449,6 +450,7 @@ pub struct DmAckBody {
 /// Per-design-doc ACK semantics — "recipient agent accepted" or policy
 /// rejection. Never implies durable storage or user read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DmAckOutcome {
     /// Envelope decrypted, signature verified, trust-policy passed, and
     /// enqueued to the recipient's DM handler / inbox.
@@ -1741,8 +1743,14 @@ impl DmEnvelope {
                 MAX_ENVELOPE_BYTES
             )));
         }
-        postcard::from_bytes(bytes)
-            .map_err(|e| IdentityError::Serialization(format!("DM envelope decode: {e}")))
+        postcard::from_bytes(bytes).map_err(|e| {
+            // #1604: an unknown body or ACK-outcome variant is counted and
+            // logged, not dropped silently.
+            match crate::wire_compat::dm_envelope_unknown_variant(bytes) {
+                Some(unknown) => IdentityError::Serialization(format!("DM envelope: {unknown}")),
+                None => IdentityError::Serialization(format!("DM envelope decode: {e}")),
+            }
+        })
     }
 
     /// Dedupe key for this envelope.

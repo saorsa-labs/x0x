@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Controls whether a group is visible to non-members.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupDiscoverability {
     /// Not listed anywhere; only members know the group exists.
     #[default]
@@ -19,11 +20,17 @@ pub enum GroupDiscoverability {
     ListedToContacts,
     /// Published to the public directory / gossip index.
     PublicDirectory,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Controls how new members are admitted.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupAdmission {
     /// Admin must issue an invite link.
     #[default]
@@ -50,6 +57,11 @@ pub enum GroupAdmission {
         #[serde(with = "crate::identity::user_id_hex")]
         UserId,
     ),
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl GroupAdmission {
@@ -67,28 +79,41 @@ impl GroupAdmission {
 /// Controls how group content is cryptographically protected.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupConfidentiality {
     /// MLS end-to-end encryption; only members decrypt.
     #[default]
     MlsEncrypted,
     /// Signed but readable plaintext; anyone can read.
     SignedPublic,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Controls who can read group content.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupReadAccess {
     /// Only active members can read.
     #[default]
     MembersOnly,
     /// Anyone can read.
     Public,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Controls who can write content to the group.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum GroupWriteAccess {
     /// Only active members can write.
     #[default]
@@ -97,6 +122,11 @@ pub enum GroupWriteAccess {
     ModeratedPublic,
     /// Only admins/owner can write (announcement channel).
     AdminOnly,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded (so never signed, re-gossiped or stored).
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Complete policy for a named group.

@@ -423,6 +423,7 @@ pub const PREFIX_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// prefix cannot be mistaken for a valid protocol.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamProtocol {
     /// Local port-forwarding — legacy header (`ForwardV1`, no attestation).
     /// The opener's identity is resolved from the discovery cache by machine
