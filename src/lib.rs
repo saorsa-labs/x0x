@@ -10075,6 +10075,65 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        // #1239: ONE absolute deadline across the entire send. The stages
+        // below keep their own budgets (the evidence budget, the transport
+        // ACK caps, the cold-repair bound); this deadline is their sum, so a
+        // send that fits its configured stages is never cut short, while a
+        // later wait no stage bounds — a held revocation, registry or
+        // contact lock, a stacked slow stage, a stuck fallback — ends the
+        // whole send here with the typed timeout instead of staying open.
+        let started = std::time::Instant::now();
+        let retries = config.max_retries;
+        let strict = config.require_durable_app_ack;
+        let deadline = tokio::time::Instant::now()
+            + dm_evidence::ordinary_send_budget(&config, cold_wait.map(|ColdWait(wait)| wait));
+        // The body records both failure counters before it awaits relay
+        // fallback. This flag is that record. A deadline during the fallback
+        // must not record the same send again.
+        let failure_accounted = std::sync::atomic::AtomicBool::new(false);
+        match tokio::time::timeout_at(
+            deadline,
+            self.send_direct_all_stages(to, payload, config, cold_wait, &failure_accounted),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_expired) => {
+                // A deadline before the body's own accounting is still one
+                // failed send. Once the body has recorded that pair, this
+                // handler must not record it again. A strict send keeps a
+                // stage row (the named stages are unknown past the wrap, so
+                // the whole budget folds into publish, as the strict-gate
+                // fold does). Strict sends do not attempt relay fallback.
+                if !failure_accounted.load(std::sync::atomic::Ordering::Acquire) {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    self.peer_relay.record_direct_failure(to);
+                }
+                if strict {
+                    let elapsed = dm::millis_since(started);
+                    self.direct_messaging
+                        .record_durable_send_stages(dm::DurableSendStages {
+                            elapsed_ms: elapsed,
+                            publish_ms: elapsed,
+                            ..dm::DurableSendStages::default()
+                        });
+                }
+                Err(dm::DmError::Timeout {
+                    retries,
+                    elapsed: started.elapsed(),
+                })
+            }
+        }
+    }
+
+    async fn send_direct_all_stages(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
+        failure_accounted: &std::sync::atomic::AtomicBool,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         let mut evidence = dm_evidence::SendEvidence::new(
             self,
             *to,
@@ -10507,6 +10566,9 @@ impl Agent {
                 // returns `false` and the fallback below is skipped. With
                 // an opted-in policy this drives the relay decision.
                 self.peer_relay.record_direct_failure(to);
+                // #1239: one sample for this send. The deadline handler
+                // records the same pair only when this store has not run.
+                failure_accounted.store(true, std::sync::atomic::Ordering::Release);
                 // X0X-0070b: relay fallback. We only attempt it when the
                 // engine says the peer has now crossed `needs_relay`, and
                 // only when we have both a saved payload and a recipient
@@ -41818,6 +41880,9 @@ mod issue1099_tests;
 
 #[cfg(test)]
 mod issue1239_tests;
+
+#[cfg(test)]
+mod issue1239_send_deadline_tests;
 
 #[cfg(test)]
 mod wire_golden_tests;
