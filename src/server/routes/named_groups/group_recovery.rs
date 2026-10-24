@@ -9292,6 +9292,7 @@ mod tests {
         super::super::handle_treekem_catchup_response(
             &state,
             &owner.agent_id(),
+            &clean_sender_machine(),
             true,
             super::super::TreeKemCatchupResponse {
                 message_type: "treekem_catchup_response".to_string(),
@@ -9428,6 +9429,12 @@ mod tests {
             .map(|info| info.state_hash.clone())
     }
 
+    /// A machine id no revocation set lists: recovery pages must stay on the
+    /// clean side of the #1616 machine gate.
+    fn clean_sender_machine() -> x0x::identity::MachineId {
+        x0x::identity::MachineId([0x16; 32])
+    }
+
     /// One catch-up page from `sender` carrying `events`.
     async fn deliver_page(
         state: &Arc<AppState>,
@@ -9438,6 +9445,7 @@ mod tests {
         super::super::handle_treekem_catchup_response(
             state,
             &sender,
+            &clean_sender_machine(),
             true,
             super::super::TreeKemCatchupResponse {
                 message_type: "treekem_catchup_response".to_string(),
