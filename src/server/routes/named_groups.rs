@@ -11417,6 +11417,13 @@ pub(in crate::server) const TREEKEM_CATCHUP_SERVE_SLOTS: usize = 16;
 /// not hold this listener: the responses behind it include the answers to
 /// this node's own head round, and an available holder's answer must
 /// reach the seal decision. Responses stay in order on the listener.
+/// W3-H diagnostics: this node's live certificate rebind deliveries and
+/// their egress gates (ADR 0110 §4a).
+#[cfg(test)]
+pub(in crate::server) async fn w3h_rebind_delivery_report(state: &Arc<AppState>) -> String {
+    revocation_eviction::rebind_delivery_report(state).await
+}
+
 pub(in crate::server) async fn dispatch_treekem_catchup_message(
     state: &Arc<AppState>,
     sender: &AgentId,

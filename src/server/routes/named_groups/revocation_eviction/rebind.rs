@@ -2159,6 +2159,61 @@ pub(super) fn status_json(rebind: &RebindState, info: &GroupInfo) -> serde_json:
     })
 }
 
+/// W3-H diagnostics: every live rebind delivery, and for each recipient
+/// its status and each egress gate as this node sees it now.
+#[cfg(test)]
+pub(super) async fn delivery_report(state: &Arc<AppState>) -> String {
+    use super::super as ng;
+    let deliveries: Vec<((String, String), Delivery)> = state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .rebind
+        .deliveries
+        .iter()
+        .map(|(key, delivery)| (key.clone(), delivery.clone()))
+        .collect();
+    let now = Instant::now();
+    let durable = ng::roster_durable_for_publication(state).await;
+    let mut out = format!("roster durable {durable}; {} deliveries", deliveries.len());
+    for ((stable, head), delivery) in deliveries {
+        let head_ok = {
+            let groups = state.named_groups.read().await;
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == stable)
+                .is_some_and(|info| head_rule_admits(info, &HeadRule::OnChain(head.clone())))
+        };
+        out.push_str(&format!(
+            "; [{} head {} on chain {head_ok} age {:?} next in {:?} resumed {}:",
+            LogHexId::group(&stable),
+            &head[..head.len().min(12)],
+            now.saturating_duration_since(delivery.started),
+            delivery.next_at.saturating_duration_since(now),
+            delivery.resumed
+        ));
+        for (recipient, status) in &delivery.recipients {
+            let agent = AgentId(*recipient);
+            let hex = hex::encode(recipient);
+            let support = state.agent.capability_store().verified_registry_supports(
+                &agent,
+                x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+            );
+            let write = write_allowed(state, &agent).await;
+            let member = ng::join_artifact_member_check(state, &stable, &hex)
+                .await
+                .map(|_| ());
+            out.push_str(&format!(
+                " {}={status:?} cap={support:?} write={write} member={member:?}",
+                &hex[..8]
+            ));
+        }
+        out.push(']');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
