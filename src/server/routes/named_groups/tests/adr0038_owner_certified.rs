@@ -2016,34 +2016,33 @@ async fn unknown_policy_values_keep_http_422_on_both_policy_routes() -> Result<(
 
 #[tokio::test]
 async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Result<()> {
-    // WHY (#1604, Codex P1): a saved group with an unknown read policy or
+    // WHY (#1604, Codex P1/P2): a saved group with an unknown read policy or
     // secure plane (a newer build's state, read after a downgrade) must not
-    // load; equality checks on those fields would fail open. The saved
-    // bytes are preserved for a later upgrade.
+    // run with that state: equality checks on those fields would fail open.
+    // It, and every alias sharing its stable id, becomes the inert #451
+    // placeholder, and the saved bytes are preserved for a later upgrade.
     let dir = tempfile::tempdir()?;
     let named = dir.path().join("named_groups.json");
     let sidecar = dir.path().join("home_suite_groups.json");
     let creator = AgentKeypair::generate()?.agent_id();
-    let good = x0x::groups::GroupInfo::new("ok".into(), String::new(), creator, "aa".repeat(16));
-    let other = |name: &str, mls: &str| {
-        serde_json::to_value(x0x::groups::GroupInfo::new(
-            name.into(),
-            String::new(),
-            creator,
-            mls.repeat(16),
-        ))
+    let info = |name: &str, mls: &str| {
+        x0x::groups::GroupInfo::new(name.into(), String::new(), creator, mls.repeat(16))
     };
-    let mut odd_policy = other("p", "bb")?;
+    let good = info("ok", "aa");
+    let mut odd_policy = serde_json::to_value(info("p", "bb"))?;
     odd_policy["policy"]["read_access"] = "guests_with_cake".into();
-    let mut odd_plane = other("q", "cc")?;
+    let plane_group = info("q", "cc");
+    let mut odd_plane = serde_json::to_value(&plane_group)?;
     odd_plane["secure_plane"] = "quantum_plane".into();
+    // A compatible alias of the plane group: same stable id, known values.
+    let alias = serde_json::to_value(&plane_group)?;
     let saved = serde_json::json!({
         "good": serde_json::to_value(&good)?,
         "odd_policy": odd_policy,
         "odd_plane": odd_plane,
+        "odd_plane_alias": alias,
     });
     tokio::fs::write(&named, serde_json::to_vec(&saved)?).await?;
-
     let first_bytes = tokio::fs::read(&named).await?;
     let backup_for = |bytes: &[u8]| {
         let digest = blake3::hash(bytes).to_hex();
@@ -2053,14 +2052,27 @@ async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Resul
     tokio::fs::write(backup_for(&first_bytes), b"{\"partial").await?;
 
     let loaded = load_named_groups_merged(&named, &sidecar).await?;
-    assert!(loaded.contains_key("good"));
-    assert!(
-        !loaded.contains_key("odd_policy"),
-        "unknown read access quarantined"
-    );
-    assert!(
-        !loaded.contains_key("odd_plane"),
-        "unknown plane quarantined"
+    assert_eq!(loaded["good"], good, "an unaffected group is untouched");
+    for key in ["odd_policy", "odd_plane", "odd_plane_alias"] {
+        let entry = &loaded[key];
+        assert_eq!(entry.policy, x0x::groups::GroupPolicy::default(), "{key}");
+        assert_eq!(entry.secure_plane, x0x::mls::SecureGroupPlane::Gss, "{key}");
+        assert!(entry.members_v2.is_empty(), "{key}: no roster");
+        assert!(entry.shared_secret.is_none(), "{key}: no secret");
+        assert!(entry.withdrawn, "{key}: withdrawn tombstone");
+        assert!(
+            crate::wire_compat::reject_unknown("test", entry).is_ok(),
+            "{key}: no Unknown in memory"
+        );
+        // The public message route refuses it; it is not an absent group.
+        assert!(
+            crate::server::group_access::admit_public_messages(entry, &"ee".repeat(32)).is_err(),
+            "{key}: no public read"
+        );
+    }
+    assert_eq!(
+        loaded["odd_plane_alias"].stable_group_id(),
+        plane_group.stable_group_id()
     );
     assert_eq!(
         tokio::fs::read(backup_for(&first_bytes)).await?,
@@ -2083,44 +2095,64 @@ async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Resul
         tokio::fs::read(backup_for(&first_bytes)).await?,
         first_bytes
     );
-
-    // The quarantine list is durable and blocks reinstall by any id.
-    assert!(!group_ids_quarantined(&named, &[good.stable_group_id(), "good"]).await);
-    assert!(group_ids_quarantined(&named, &[&"cc".repeat(16)]).await);
-    assert!(group_ids_quarantined(&named, &["odd_policy"]).await);
-    assert!(group_ids_quarantined(&named, &["odd_plane"]).await);
-    // An unreadable list fails closed.
-    tokio::fs::write(unsupported_group_quarantine_path(&named), b"not json").await?;
-    assert!(group_ids_quarantined(&named, &["good"]).await);
     Ok(())
 }
 
 #[tokio::test]
-async fn quarantined_group_bootstrap_replay_is_refused() -> Result<()> {
-    // WHY (#1604, Codex P1): after a quarantine, an older valid signed-public
-    // bootstrap for the same group must not reinstall it (that would roll
-    // back later bans or policy).
+async fn quarantined_group_is_not_reinstalled_by_bootstrap_or_card_import() -> Result<()> {
+    // WHY (#1604, Codex P1): the quarantined placeholder stays present, so an
+    // older valid bootstrap or signed card cannot reinstall the group's old
+    // roster or policy.
     let (state, _dir, _owner_kp) = owner_authority_state().await?;
-    let creator = AgentKeypair::generate()?.agent_id();
-    let group = x0x::groups::GroupInfo::new("g".into(), String::new(), creator, "ab".repeat(16));
-    let ids = serde_json::json!([group.stable_group_id().to_ascii_lowercase()]);
-    tokio::fs::write(
-        unsupported_group_quarantine_path(&state.named_groups_path),
-        serde_json::to_vec(&ids)?,
-    )
-    .await?;
+    let authority = AgentKeypair::generate()?;
+    let creator = authority.agent_id();
+    let mut original =
+        x0x::groups::GroupInfo::new("g".into(), String::new(), creator, "ab".repeat(16));
+    original.policy = x0x::groups::GroupPolicy {
+        discoverability: x0x::groups::GroupDiscoverability::PublicDirectory,
+        confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+        read_access: x0x::groups::GroupReadAccess::Public,
+        ..x0x::groups::GroupPolicy::default()
+    };
+    let mut placeholder = legacy_safe_placeholder(&original);
+    placeholder.withdrawn = true;
+    let key = original.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(key.clone(), placeholder.clone());
+
     let bootstrap = PublicGroupBootstrap {
         message_type: "public_group_bootstrap".to_string(),
-        group: Box::new(group),
+        group: Box::new(original.clone()),
     };
-    let result =
-        crate::server::routes::public_group_bootstrap_outbox::admit_public_group_bootstrap(
-            &state, creator, None, bootstrap,
-        )
-        .await;
-    assert!(
-        result.as_ref().is_err_and(|e| e.contains("quarantined")),
-        "{result:?}"
+    let _ = crate::server::routes::public_group_bootstrap_outbox::admit_public_group_bootstrap(
+        &state, creator, None, bootstrap,
+    )
+    .await;
+    assert_eq!(
+        state.named_groups.read().await[&key],
+        placeholder,
+        "bootstrap"
+    );
+
+    let mut card = original
+        .to_group_card()
+        .ok_or_else(|| anyhow::anyhow!("public group has a card"))?;
+    card.sign(&authority)?;
+    let response = import_group_card(State(Arc::clone(&state)), Json(card))
+        .await
+        .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "card import refused"
+    );
+    assert_eq!(
+        state.named_groups.read().await[&key],
+        placeholder,
+        "card import"
     );
     Ok(())
 }

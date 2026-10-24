@@ -1323,17 +1323,6 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
     };
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group = *bootstrap.group;
-    // #1604: a group quarantined at startup (it held a variant this build
-    // does not know) is never reinstalled from a bootstrap, so an older
-    // valid snapshot cannot roll back later bans or policy.
-    if super::named_groups::group_ids_quarantined(
-        &state.named_groups_path,
-        &[group.stable_group_id(), &group.mls_group_id],
-    )
-    .await
-    {
-        return Err("public-group bootstrap names a quarantined group".to_string());
-    }
     if sender_blocked {
         tracing::debug!(
             sender = %LogHexId::agent(&sender_hex),

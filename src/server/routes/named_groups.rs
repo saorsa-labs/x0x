@@ -20436,22 +20436,6 @@ pub(in crate::server) async fn join_group_via_invite(
             return bad_request(format!("invalid invite: {e}"));
         }
     };
-    // #1604: a group quarantined at startup (it held a variant this build
-    // does not know) is not reinstalled from an invite.
-    if group_ids_quarantined(
-        &state.named_groups_path,
-        &[
-            &invite.group_id,
-            invite.stable_group_id.as_deref().unwrap_or(""),
-        ],
-    )
-    .await
-    {
-        return api_error(
-            StatusCode::CONFLICT,
-            "group is quarantined: this build cannot read its saved state; upgrade x0xd",
-        );
-    }
     // #477: while a pending attempt exists for this group, the SAME invite
     // is an idempotent resend (the stored bytes keep flowing) and a
     // DIFFERENT invite is refused with 409 join_already_pending until the
@@ -36230,95 +36214,60 @@ pub(in crate::server) fn merge_home_suite_groups(
 /// sidecar (the authoritative owner-certified state; issue #451).
 /// #1604: a saved group that holds a variant this build does not know (a
 /// role, state, policy or plane written by a newer build, read after a
-/// downgrade) is never loaded. Every live ingress already refuses such
-/// values, so this keeps the invariant "no in-memory group holds an
-/// `Unknown`", and no equality check on a policy or plane can fail open.
+/// downgrade) is replaced, with every alias that shares its stable group
+/// id, by the inert #451 [`legacy_safe_placeholder`] marked as a withdrawn
+/// tombstone: default (restrictive) policy, no roster, no secret, no join or
+/// invite state, Gss plane. The identity and the state-commit chain head
+/// stay, so the group remains PRESENT locally: an absent-group path (the
+/// public message fallback, a bootstrap or card install) can never treat it
+/// as unknown, and the withdrawn gates refuse any reinstall or refresh. Every live ingress already
+/// refuses `Unknown`, so no in-memory group holds one.
 ///
-/// Before the group leaves memory, two things are made durable:
-/// - the exact saved file bytes, in a content-addressed backup
-///   (`*.unsupported-1604-<blake3>.bak`), so a later upgrade can restore
-///   them; every distinct version is kept, and a stale or partial backup is
-///   rewritten;
-/// - the group's ids, in the quarantine list next to `named_groups.json`
-///   ([`unsupported_group_quarantine_path`]). Admission paths that could
-///   reinstall the group (bootstrap, invite join) refuse a listed id, so an
-///   older, valid snapshot cannot roll back later bans or policy.
-///
-/// If either write fails, startup fails loudly rather than lose data.
+/// Before that, the exact saved file bytes are kept in a durable,
+/// content-addressed backup (`*.unsupported-1604-<blake3>.bak`) for a later
+/// upgrade. If the backup fails, or a placeholder still holds an
+/// `Unknown`, startup fails loudly rather than lose data or fail open.
 async fn quarantine_unsupported_saved_groups(
     groups: &mut HashMap<String, x0x::groups::GroupInfo>,
     named_groups_path: &FsPath,
     sidecar_path: &FsPath,
 ) -> Result<()> {
-    let unsupported: Vec<String> = groups
-        .iter()
-        .filter(|(_, info)| crate::wire_compat::reject_unknown("SavedGroupInfo", *info).is_err())
-        .map(|(id, _)| id.clone())
+    let holds_unknown = |info: &x0x::groups::GroupInfo| {
+        crate::wire_compat::reject_unknown("SavedGroupInfo", info).is_err()
+    };
+    let affected: std::collections::HashSet<String> = groups
+        .values()
+        .filter(|info| holds_unknown(info))
+        .map(|info| info.stable_group_id().to_string())
         .collect();
-    if unsupported.is_empty() {
+    if affected.is_empty() {
         return Ok(());
     }
     for path in [named_groups_path, sidecar_path] {
         preserve_unsupported_saved_bytes(path).await?;
     }
-    let mut ids: std::collections::BTreeSet<String> =
-        read_unsupported_group_quarantine(named_groups_path).await;
-    for key in &unsupported {
-        if let Some(info) = groups.get(key) {
-            ids.insert(key.to_ascii_lowercase());
-            ids.insert(info.stable_group_id().to_ascii_lowercase());
-            ids.insert(info.mls_group_id.to_ascii_lowercase());
+    for (key, info) in groups.iter_mut() {
+        if !affected.contains(info.stable_group_id()) {
+            continue;
         }
-    }
-    let bytes = serde_json::to_vec(&ids).context("encode quarantine list")?;
-    write_durably(
-        &unsupported_group_quarantine_path(named_groups_path),
-        &bytes,
-    )
-    .await?;
-    for group_id in unsupported {
-        groups.remove(&group_id);
+        let mut placeholder = legacy_safe_placeholder(info);
+        // The existing withdrawn tombstone: every path that could reinstall
+        // or refresh the group by its id (card import, journal replay,
+        // bootstrap, re-create) already refuses a withdrawn record.
+        placeholder.withdrawn = true;
+        if holds_unknown(&placeholder) {
+            anyhow::bail!(
+                "saved named group {key} holds a value this x0xd build cannot represent; \
+                 upgrade x0xd (the saved bytes are kept in *.unsupported-1604-*.bak)"
+            );
+        }
+        *info = placeholder;
         tracing::warn!(
-            group_id = %group_id,
-            "startup: quarantined a saved named group that holds a variant this build does not know; its bytes are kept in *.unsupported-1604-*.bak"
+            group_id = %key,
+            "startup: replaced a saved named group that holds a variant this build does not know with an inert placeholder; its bytes are kept in *.unsupported-1604-*.bak"
         );
     }
     Ok(())
-}
-
-/// The durable list of quarantined group ids (#1604).
-pub(in crate::server) fn unsupported_group_quarantine_path(named_groups_path: &FsPath) -> PathBuf {
-    named_groups_path.with_extension("quarantine-1604.json")
-}
-
-/// Read the quarantine list. A missing file is an empty list. An unreadable
-/// list is treated as empty for reads only by callers that cannot block on
-/// it; admission uses [`group_ids_quarantined`], which fails closed.
-async fn read_unsupported_group_quarantine(
-    named_groups_path: &FsPath,
-) -> std::collections::BTreeSet<String> {
-    match tokio::fs::read(unsupported_group_quarantine_path(named_groups_path)).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => std::collections::BTreeSet::new(),
-    }
-}
-
-/// True when any of `ids` is quarantined (#1604). Fails closed: a quarantine
-/// list that exists but cannot be read or parsed blocks admission.
-pub(in crate::server) async fn group_ids_quarantined(
-    named_groups_path: &FsPath,
-    ids: &[&str],
-) -> bool {
-    match tokio::fs::read(unsupported_group_quarantine_path(named_groups_path)).await {
-        Ok(bytes) => match serde_json::from_slice::<std::collections::BTreeSet<String>>(&bytes) {
-            Ok(list) => ids
-                .iter()
-                .any(|id| !id.is_empty() && list.contains(&id.to_ascii_lowercase())),
-            Err(_) => true,
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
-    }
 }
 
 /// Copy `path` to a backup named by the BLAKE3 of its bytes, durably. An
