@@ -460,7 +460,7 @@ async fn commit_locked(
         Err(error) => Err(error.to_string()),
     };
     if let Err(error) = persisted {
-        replay_log::rewrite_from_memory(state, ext, held, stable).await;
+        replay_log::rewrite_without(state, ext, held, stable, at).await;
         return Err(CommitError::Persist(error));
     }
     ng::refresh_group_card_cache_from_info(state, group_key, &next).await;
@@ -1707,6 +1707,8 @@ fn spawn_send(
 /// the frame never goes into a legacy-decoded catch-up page. A competing
 /// frame kept as fork evidence (#1579) is not on this node's verified
 /// chain, so it is skipped, not served, and it does not stop the round.
+/// A fork-quarantined group serves nothing on purpose: `head_rule_admits`
+/// refuses every frame of it, so the skip leaves the round empty.
 /// Each write uses [`guarded_admission_for`] with [`HeadRule::OnChain`]:
 /// ADR 0107's serving guard plus D60 under the membership lock,
 /// re-checked at the seam immediately before the physical write.
@@ -2026,7 +2028,7 @@ pub(in crate::server) async fn receive(
     {
         Ok(next) => next,
         Err(error) => {
-            replay_log::rewrite_from_memory(state, ext, held, stable).await;
+            replay_log::rewrite_without(state, ext, held, stable, at).await;
             tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0110 S4: certificate rebind commit refused: {error}");
             return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::StateMismatch);
         }

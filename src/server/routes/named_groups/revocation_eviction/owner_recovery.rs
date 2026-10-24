@@ -1248,7 +1248,7 @@ async fn finish_commit(
         ),
     };
     if !persisted {
-        replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+        replay_log::rewrite_without(state, ext, held, &stable, at).await;
         rollback(&mut tree, &next, "owner_recovery_persist_failed");
         tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: persist failed");
         set_wait(state, &stable, None).await;
@@ -1526,8 +1526,10 @@ fn spawn_commit_send(
 /// first, on the distinct gated carrier only, never inside a legacy
 /// catch-up page (§4b(1) "Mixed versions"). A competing frame kept as
 /// fork evidence (#1579) is not on this node's verified chain, so it is
-/// skipped, not served, and it does not stop the round. Each write uses
-/// the guarded admission with [`HeadRule::OnChain`] and the
+/// skipped, not served, and it does not stop the round. A
+/// fork-quarantined group serves nothing on purpose: `head_rule_admits`
+/// refuses every frame of it, so the skip leaves the round empty. Each
+/// write uses the guarded admission with [`HeadRule::OnChain`] and the
 /// `owner_recovery_v1` gate.
 ///
 /// The author's frames survive a restart ([`replay_log`]). A GSS frame
@@ -2888,7 +2890,7 @@ async fn receive_commit(
     {
         Ok(next) => next,
         Err(error) => {
-            replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+            replay_log::rewrite_without(state, ext, held, &stable, at).await;
             tracing::info!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery commit refused by the chained apply: {error}");
             return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
         }
@@ -2962,7 +2964,7 @@ async fn receive_commit(
                     guard,
                     "owner_recovery_proof_failed",
                 );
-                replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+                replay_log::rewrite_without(state, ext, held, &stable, at).await;
                 return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
             }
             match ng::persist_treekem_and_named_groups_atomic_with_info(

@@ -29,11 +29,15 @@
 //!   In the rebind and owner-recovery logs a frame at a revision the file
 //!   already holds, with a different result head, is a competing commit:
 //!   both are kept, and the held frame is never replaced — the pair is the
-//!   fork evidence that two commits claimed one revision (#1579). The
-//!   crypto-only exclusion log keeps the #1508 rule — a received frame
-//!   never replaces a held one, so one frame per revision — because its
-//!   catch-up round stops at the first frame the head rule refuses: a
-//!   competing pair would strand every frame after it.
+//!   fork evidence that two commits claimed one revision (#1579). A
+//!   refused commit or install removes its own frame and no other
+//!   ([`rewrite_without`]). The crypto-only exclusion log keeps the #1508
+//!   rule — a received frame never replaces a held one, so one frame per
+//!   revision, and a frame the file holds at a revision memory or the new
+//!   write claims is displaced by that claim, so the write always holds
+//!   the frame it reports durable — because its catch-up round stops at
+//!   the first frame the head rule refuses: a competing pair would strand
+//!   every frame after it.
 //! - **Load.** A damaged file is quarantined (ADR 0108 §5a: pending name,
 //!   then history name), and that group starts with an empty log: its
 //!   frames are lost, the load never panics and never uses the damaged
@@ -52,7 +56,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 
 use serde::{Deserialize, Serialize};
 
@@ -249,7 +253,12 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
     /// file holds, then memory's, then the new frame, each under the
     /// [`Self::remember`] rule. The file can hold frames memory does not
     /// (a crash between a write and its commit or install), so a new
-    /// write never displaces them (#1579).
+    /// write never displaces them (#1579). Without the keep-competing
+    /// rule (the crypto-only exclusion log) a frame the file holds at a
+    /// revision that memory or this write claims is displaced by that
+    /// claim (#1579 fix round 2): the write always holds the received
+    /// frame it reports durable, a stale crash-window frame never blocks
+    /// it, and that log still holds one frame per revision.
     fn planned(
         &self,
         file_frames: &[ReplayFrameV1],
@@ -257,6 +266,53 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
         (revision, head): (u64, &str),
         bytes: &Arc<Vec<u8>>,
         authored: bool,
+    ) -> ReplayLogV1 {
+        let mut scratch = Self::default();
+        let claimed_by_memory = |rev: u64| {
+            self.log
+                .get(stable)
+                .is_some_and(|log| log.iter().any(|e| e.next_revision == rev))
+        };
+        for frame in file_frames {
+            if !KEEP_COMPETING
+                && (frame.next_revision == revision || claimed_by_memory(frame.next_revision))
+            {
+                continue;
+            }
+            scratch.remember(
+                stable,
+                frame.next_revision,
+                &frame.result_head,
+                Arc::new(frame.frame.clone()),
+                frame.authored,
+            );
+        }
+        if let Some(log) = self.log.get(stable) {
+            for e in log {
+                scratch.remember(
+                    stable,
+                    e.next_revision,
+                    &e.result_head,
+                    Arc::clone(&e.bytes),
+                    e.authored,
+                );
+            }
+        }
+        scratch.remember(stable, revision, head, Arc::clone(bytes), authored);
+        scratch.file(stable)
+    }
+
+    /// The file of the group after the refused commit leaves it: the
+    /// frames the file holds and memory's, minus that one commit (#1579
+    /// fix round 2). A competing frame at the refused revision stays, and
+    /// so does every crash-window frame memory has not installed; memory
+    /// never holds the refused commit, because a frame is remembered only
+    /// after its commit or install succeeds.
+    fn planned_without(
+        &self,
+        file_frames: &[ReplayFrameV1],
+        stable: &str,
+        (refused_revision, refused_head): (u64, &str),
     ) -> ReplayLogV1 {
         let mut scratch = Self::default();
         for frame in file_frames {
@@ -279,7 +335,9 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
                 );
             }
         }
-        scratch.remember(stable, revision, head, Arc::clone(bytes), authored);
+        if let Some(log) = scratch.log.get_mut(stable) {
+            log.retain(|e| !(e.next_revision == refused_revision && e.result_head == refused_head));
+        }
         scratch.file(stable)
     }
 
@@ -392,18 +450,22 @@ fn log_path(state: &AppState, stable_group_id: &str, extension: &str) -> PathBuf
 /// One writer at a time per log file path (#1579 fix round): the writes of
 /// one group's log serialize, so each write plans from the bytes the last
 /// write left. Keyed by the full path, so distinct data directories never
-/// share a lock.
+/// share a lock. The map holds weak references: a lock no write holds is
+/// reclaimed with its entry, so the map is bounded by the logs being
+/// written, not by every group this process ever served (#1579 fix
+/// round 2).
 static FILE_WRITE_LOCKS: LazyLock<
-    tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    tokio::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 > = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 async fn lock_file_writes(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    FILE_WRITE_LOCKS
-        .lock()
-        .await
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+    let mut locks = FILE_WRITE_LOCKS.lock().await;
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
 }
 
 /// Write `log` durably at `path`. A file with a newer layout is never
@@ -541,8 +603,44 @@ async fn write_with<const CAP: usize, const KEEP: bool>(
     write_at(&path, &planned).await
 }
 
-/// After a failed local commit: write the group's log as memory holds it,
-/// so the file does not keep the frame. Best effort: a restart drops such
+/// After a refused commit or install (rebind and owner recovery): remove
+/// the refused commit — the revision and the result head — from the
+/// group's log, and keep every other frame the file holds (#1579 fix
+/// round 2): the competing pair at the head revision and the
+/// crash-window frames memory has not installed are the evidence and the
+/// restart links this log exists for. Best effort, as
+/// [`rewrite_from_memory`]. Memory never holds the refused commit, so
+/// the next write does not bring it back.
+pub(in super::super) async fn rewrite_without<const CAP: usize, const KEEP: bool>(
+    state: &AppState,
+    extension: &str,
+    held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP, KEEP>,
+    stable: &str,
+    refused: (u64, &str),
+) {
+    if !host_commit_gate_open(state) {
+        return;
+    }
+    let path = log_path(state, stable, extension);
+    let write_lock = lock_file_writes(&path).await;
+    let _serialized = write_lock.lock().await;
+    let file_frames = match tokio::fs::read(&path).await {
+        Ok(existing) => decode(&existing).map(|log| log.frames).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let log = held(&mut *state.revocation_evictions.inner.lock().await).planned_without(
+        &file_frames,
+        stable,
+        refused,
+    );
+    let _durable = write_at(&path, &log).await;
+}
+
+/// After a refused install (crypto-only exclusion): write the group's log
+/// as memory holds it, so the file does not keep the frame. That log
+/// keeps no competing evidence (#1508 rule), and dropping its stale
+/// file-only frames is what its catch-up round — which stops at the first
+/// frame the head rule refuses — needs. Best effort: a restart drops such
 /// a frame too.
 pub(in super::super) async fn rewrite_from_memory<const CAP: usize, const KEEP: bool>(
     state: &AppState,
@@ -816,9 +914,10 @@ pub(in super::super) mod tests {
     /// restore — because its catch-up round stops at the first frame the
     /// head rule refuses, so a competing pair would strand every frame
     /// after the pair. The rebind and owner-recovery logs, whose rounds
-    /// skip an off-chain frame, keep a competing pair instead. A received
-    /// frame at a held revision is dropped; an authored frame replaces
-    /// the held one.
+    /// skip an off-chain frame, keep a competing pair instead. In memory
+    /// a received frame at a held revision is dropped and an authored one
+    /// replaces it; in the file a claim at a revision displaces what only
+    /// the file held there.
     #[tokio::test]
     async fn the_celog_rule_holds_one_frame_per_revision() {
         // Memory: the second frame of a pair is dropped, not held beside.
@@ -839,8 +938,10 @@ pub(in super::super) mod tests {
             "an authored frame replaces the held one, as before"
         );
 
-        // The file: a competing received frame is not written beside the
-        // crash-window frame the file already holds.
+        // The file: a received frame displaces a stale frame that only the
+        // file holds at its revision (#1579 fix round 2), so the write
+        // holds the frame it reports durable and the file still holds one
+        // frame per revision.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("g.celog");
         let file = ReplayLogV1 {
@@ -863,15 +964,15 @@ pub(in super::super) mod tests {
         );
         assert!(write_at(&path, &planned).await);
         let on_disk = file_frames_of(&path).await;
-        assert_eq!(on_disk.len(), 1, "the competing frame is not kept");
+        assert_eq!(on_disk.len(), 1, "one frame per revision");
         assert_eq!(
             (
                 on_disk[0].next_revision,
                 on_disk[0].result_head.as_str(),
                 on_disk[0].frame.as_slice()
             ),
-            (5, "h5a", &[1][..]),
-            "the held frame is never replaced"
+            (5, "h5b", &[2][..]),
+            "the received frame is durable, the stale one displaced"
         );
 
         // The load: even a pair a foreign file holds below the head —
@@ -955,6 +1056,96 @@ pub(in super::super) mod tests {
             held,
             vec![(5, "h5"), (6, "h6")],
             "a concurrent write displaces nothing the other made durable"
+        );
+    }
+
+    /// #1579 fix round 2: a refused commit or install removes its own
+    /// frame and no other. After a restart with a competing pair on disk
+    /// (memory holds neither), a later refused frame leaves the pair in
+    /// the file — the evidence this log exists for.
+    #[tokio::test]
+    async fn a_refused_frame_leaves_the_log_and_the_file_evidence_stays() {
+        use crate::server::routes::named_groups as ng;
+        fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
+            &mut inner.rebind.log
+        }
+        let (state, _dir) = ng::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        let pair = (Arc::new(b"first".to_vec()), Arc::new(b"second".to_vec()));
+        assert!(
+            write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (5, "h5a"),
+                &pair.0
+            )
+            .await
+        );
+        assert!(
+            write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (5, "h5b"),
+                &pair.1
+            )
+            .await
+        );
+        // The crash window: the installs never happened, so memory holds
+        // neither frame of the pair.
+        let refused = Arc::new(b"refused".to_vec());
+        assert!(
+            write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (6, "h6"),
+                &refused
+            )
+            .await
+        );
+        rewrite_without(&state, REBIND_EXTENSION, rebind_held, "g", (6, "h6")).await;
+        let on_disk = frames_on_disk(&state, REBIND_EXTENSION, "g").await;
+        let held: Vec<(u64, &str, &[u8])> = on_disk
+            .iter()
+            .map(|frame| {
+                (
+                    frame.next_revision,
+                    frame.result_head.as_str(),
+                    frame.frame.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                (5, "h5a", b"first".as_slice()),
+                (5, "h5b", b"second".as_slice())
+            ],
+            "the refused frame leaves; the competing pair stays as evidence"
+        );
+    }
+
+    /// #1579 fix round 2: the per-file write locks are reclaimed. While a
+    /// write holds a path's lock it is the same lock for every writer;
+    /// once no write holds it, its map entry goes with it.
+    #[tokio::test]
+    async fn an_unused_write_lock_leaves_the_map() {
+        let path = std::path::PathBuf::from("/evidence/lock-reclaim/group.crblog");
+        let first = lock_file_writes(&path).await;
+        let second = lock_file_writes(&path).await;
+        assert!(Arc::ptr_eq(&first, &second), "one lock per path while held");
+        let reclaimed = Arc::downgrade(&first);
+        drop((first, second));
+        let _next = lock_file_writes(&path).await;
+        assert!(
+            reclaimed.upgrade().is_none(),
+            "a lock no write holds leaves the map"
         );
     }
 
