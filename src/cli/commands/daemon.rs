@@ -662,7 +662,10 @@ fn ps_single_quote_escape(s: &str) -> String {
 /// the tested wrapper version, the restart-on-exit-100 policy, and the
 /// executable/arguments binding the upgrade-time readback verifies. ASCII
 /// only — Windows PowerShell 5.1 reads a no-BOM file as ANSI, so a non-ASCII
-/// path or `--name` would corrupt the binding silently.
+/// path or `--name` would corrupt the binding silently. Empty arguments and
+/// arguments containing `"` are refused too: Windows PowerShell 5.1 drops
+/// the former and mangles the latter when it starts x0xd, so the wrapper
+/// would run different arguments than it declares (review round 3 of #1612).
 #[cfg(any(test, target_os = "windows"))]
 fn render_windows_wrapper(executable: &str, args: &[String]) -> Result<String> {
     validate_autostart_value(executable)?;
@@ -673,6 +676,13 @@ fn render_windows_wrapper(executable: &str, args: &[String]) -> Result<String> {
         anyhow::bail!(
             "autostart on Windows needs ASCII paths and arguments (Windows PowerShell 5.1 \
              reads a no-BOM script as ANSI)"
+        );
+    }
+    if args.iter().any(|arg| arg.is_empty() || arg.contains('"')) {
+        anyhow::bail!(
+            "autostart on Windows cannot wrap empty arguments or arguments containing a \
+             double quote: Windows PowerShell 5.1 drops or mangles them when starting \
+             x0xd, so the wrapper would run different arguments than it declares"
         );
     }
     let arguments = args
@@ -1245,7 +1255,6 @@ fn port_file_path(name: Option<&str>) -> Result<std::path::PathBuf> {
     Ok(data_dir.join(dir_name).join("api.port"))
 }
 
-/// Find the x0xd binary.
 /// Candidate file names for the daemon binary: `x0xd.exe` on Windows
 /// (releases ship `x0xd.exe`), bare `x0xd` everywhere else.
 fn x0xd_binary_names() -> &'static [&'static str] {
@@ -1256,6 +1265,7 @@ fn x0xd_binary_names() -> &'static [&'static str] {
     }
 }
 
+/// Find the x0xd binary.
 fn find_x0xd() -> Result<std::path::PathBuf> {
     // Same directory as x0x binary.
     if let Ok(exe) = std::env::current_exe() {
@@ -1861,6 +1871,17 @@ mod tests {
         assert!(render_windows_wrapper(
             "C:\\x0xd.exe",
             &["--name".to_string(), "\u{fc}".to_string()]
+        )
+        .is_err());
+        // Empty and quote-bearing arguments: Windows PowerShell 5.1 drops or
+        // mangles them when starting x0xd, so the wrapper would run different
+        // arguments than it declares — refuse at generation, not at upgrade.
+        assert!(
+            render_windows_wrapper("C:\\x0xd.exe", &["--name".to_string(), String::new()]).is_err()
+        );
+        assert!(render_windows_wrapper(
+            "C:\\x0xd.exe",
+            &["--name".to_string(), "say \"hi\"".to_string()]
         )
         .is_err());
     }
