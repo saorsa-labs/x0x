@@ -558,6 +558,19 @@ pub(crate) fn flush_captured(callback: &FlushCallback, deadline: Instant) -> io:
     failure.map_or(Ok(()), Err)
 }
 
+/// Best-effort flush of the acknowledged log sinks so the error lines that
+/// justify an immediate `EX_TEMPFAIL` exit reach their appenders before the
+/// process ends. The hook's own barrier ran before those lines were emitted;
+/// without this second flush `std::process::exit` can cut them. Failures and
+/// a missing flush bridge (for example in the CLI) are ignored: a logging
+/// fault must not delay or skip the exit.
+pub(crate) fn flush_before_tempfail_exit() {
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    if let Ok(callback) = capture(&dispatch) {
+        let _ = flush_captured(&callback, Instant::now() + Duration::from_secs(2));
+    }
+}
+
 #[cfg(test)]
 include!("../../tests/upgrade_log_flush.rs");
 #[cfg(test)]

@@ -579,8 +579,9 @@ example a receipt that fails authorization) also ends in `EX_TEMPFAIL`;
 nothing is restored because the new bytes are already durable.
 
 A refusal that happens before the daemon stops (a missing flush owner, an
-unresolved predecessor, a failed intent write, or the pre-hook deadline
-check) is not a failed start (engineer ruling, 24 Oct 2026). The daemon
+unresolved predecessor, a failed intent write, the pre-hook deadline
+check, or the deadline overrunning before the hook commits the stop) is
+not a failed start (engineer ruling, 24 Oct 2026). The daemon
 never stopped, so it keeps serving — but first it restores every binary
 this transaction swapped, with the same verified-backup rule as the started
 case, releases the flush admission so a later supervised apply can run,

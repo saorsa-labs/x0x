@@ -113,6 +113,68 @@ macro_rules! flush_receipt_regression_tests {
             }
 
             #[test]
+            fn deadline_overrun_before_the_stop_is_an_ordinary_refusal() {
+                // Engineer ruling, 24 Oct 2026: when the fixed deadline
+                // passes before the hook commits the daemon to stopping,
+                // the overrun is a refusal, not a started failure. The
+                // daemon never stopped: no rollback record, admission is
+                // released, the intent record is cleared, and a later
+                // supervised apply is admitted again.
+                let dir = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let (entered, entering) = mpsc::channel();
+                let (release, released) = mpsc::channel();
+                let released = Mutex::new(released);
+                let owner = register_with_limit(
+                    root.clone(),
+                    Arc::new(move |deadline, stopped| {
+                        let _ = entered.send(());
+                        // The hook holds past the deadline without ever
+                        // committing the daemon to stop, then concedes the
+                        // deadline like the production hook's entry check.
+                        released
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .map_err(io::Error::other)?;
+                        assert!(
+                            !stopped.load(Ordering::SeqCst),
+                            "the fixture hook must never commit the stop"
+                        );
+                        deadline.check()
+                    }),
+                    Duration::from_millis(300),
+                )
+                .unwrap();
+                let binding = Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+                let (returned, result) = mpsc::channel();
+                let caller_root = root.clone();
+                let caller = std::thread::spawn(move || {
+                    let _ = returned.send(acknowledge(&caller_root, binding, || Ok(())));
+                });
+                entering.recv_timeout(Duration::from_secs(5)).unwrap();
+                let outcome = result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
+                let _ = release.send(());
+                caller.join().unwrap();
+                owner.join_workers();
+                assert!(
+                    !outcome.started,
+                    "an overrun before the stop never stopped the daemon"
+                );
+                assert!(
+                    !owner.entry.started.load(Ordering::Acquire),
+                    "an overrun before the stop is not a failed start"
+                );
+                assert!(!root.join(ROLLBACK_RECORD).exists());
+                assert!(!root.join(RECORD).exists());
+                ensure_ready(&root).unwrap();
+                assert!(
+                    !owner.seal_admission(),
+                    "an ordinary shutdown after the overrun must not wait"
+                );
+            }
+
+            #[test]
             fn flush_receipt_write_failure_after_hook_preserves_logging() {
                 failed_receipt_keeps_logging(AfterHookFailure::ReceiptWrite);
             }

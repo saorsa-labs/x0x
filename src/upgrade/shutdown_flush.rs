@@ -705,14 +705,17 @@ fn acknowledge_inner(
     let rollback_deadline = record.deadline_ms;
     let (send, receive) = mpsc::channel();
     let hook = Arc::clone(&entry.hook);
+    // True only from the moment the daemon is committed to stopping behind
+    // the hook. The hook marks it via the `&AtomicBool`; a returned hook
+    // proves it retroactively. The waiter shares it so a deadline overrun
+    // can still tell a daemon that stopped from one that never did.
+    let stopped = Arc::new(AtomicBool::new(false));
+    let worker_stopped = Arc::clone(&stopped);
     let spawn = std::thread::Builder::new()
         .name("x0x-upgrade-flush".into())
         .spawn(move || {
             let mut record = record;
-            // True only from the moment the daemon is committed to stopping
-            // behind the hook. The hook marks it via the `&AtomicBool`; a
-            // returned hook proves it retroactively.
-            let stopped = AtomicBool::new(false);
+            let stopped = worker_stopped;
             let outcome = (|| {
                 check_deadline(&record, deadline)?;
                 let path = root.join(RECORD);
@@ -752,12 +755,18 @@ fn acknowledge_inner(
                 Ok((Ok(receipt), _)) => Ok(receipt),
                 Ok((Err(error), started)) => Err(FlushFailure { error, started }),
                 // A wait-level failure means the fixed deadline passed or the
-                // worker died mid-flush. The daemon may already be stopped
-                // behind the hook, so recovery must assume it is (engineer
-                // ruling, 23 Oct 2026): never a parked, stop-less daemon.
+                // worker died mid-flush. The stopped marker tells the two
+                // outcomes apart (engineer ruling, 24 Oct 2026). A daemon the
+                // hook already committed to stopping is a started failure:
+                // recovery and `EX_TEMPFAIL`, never a parked, stop-less
+                // daemon (ruling, 23 Oct 2026). A daemon the hook never
+                // stopped is an ordinary refusal — every compliant hook
+                // checks the deadline before stopping, so past the deadline
+                // it can only refuse — and gets the refusal recovery:
+                // restore, release admission, keep serving, exit 0 later.
                 Err(error) => Err(FlushFailure {
                     error,
-                    started: true,
+                    started: stopped.load(Ordering::Acquire),
                 }),
             }
         }

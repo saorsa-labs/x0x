@@ -212,6 +212,7 @@ impl FlushOwner {
                         "acknowledged shutdown flush failed; exiting EX_TEMPFAIL \
                          for a service-manager restart on the previous binary"
                     );
+                    log_flush::flush_before_tempfail_exit();
                     (self.exit)(crate::upgrade::restart::flush_failure_exit_code());
                 },
             }
@@ -699,7 +700,7 @@ mod arm_flush_regressions_unused_reservation {
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_finish_refuses_the_receipt_when_producers_are_unfinished() {
         let (_dir, root) = fixture();
-        let (owner, receive, _called, _exit_code) = owner(&root, false);
+        let (owner, receive, _called, _exit_code) = owner(&root, HookOutcome::Ok);
         let reservation = shutdown_flush::reserve(&root).unwrap();
         reservation.activate().unwrap();
         let cancel = CancellationToken::new();
@@ -800,6 +801,75 @@ mod arm_flush_regressions_unused_reservation {
             exit_code.load(Ordering::SeqCst),
             -1,
             "a refusal must not exit EX_TEMPFAIL"
+        );
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_ordinary_shutdown_after_a_pre_stop_deadline_overrun_exits_normally() {
+        // Engineer ruling, 24 Oct 2026: when the 30 s deadline passes before
+        // the hook calls stop(), the daemon never stopped, so the overrun is
+        // a refusal. No "flush failed" permit is stored and admission is
+        // released, so a later ordinary SIGTERM finishes normally (exit 0),
+        // never EX_TEMPFAIL — exit 75 belongs only to a flush that started
+        // (the daemon stopped) and then failed or overran.
+        let (_dir, root) = fixture();
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let registration = shutdown_flush::register_with_limit(
+            root.clone(),
+            Arc::new(move |deadline, _| {
+                let _ = entered.send(());
+                // Hold past the deadline without ever committing the stop,
+                // then concede the deadline like the production hook's
+                // entry check would.
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+                deadline.check()
+            }),
+            Duration::from_millis(300),
+        )
+        .unwrap();
+        let (complete, _receive) = mpsc::sync_channel(1);
+        let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let observed_exit = Arc::clone(&exit_code);
+        let owner = FlushOwner {
+            _registration: registration,
+            complete,
+            control: tokio::spawn(std::future::pending()),
+            // This fixture creates no socket and no Agent or network runtime.
+            socket: root.join("never-bound.sock"),
+            exit: Arc::new(move |code| {
+                observed_exit.store(code, Ordering::SeqCst);
+            }),
+            flush_failed: Arc::new(tokio::sync::Notify::new()),
+        };
+        let overrun_root = root.clone();
+        let overrun = tokio::task::spawn_blocking(move || {
+            let binding =
+                shutdown_flush::Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap();
+            shutdown_flush::acknowledge(&overrun_root, binding, || Ok(()))
+        });
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        let failure = overrun.await.unwrap().unwrap_err();
+        assert!(!failure.started, "the daemon never stopped behind the hook");
+        let _ = release.send(());
+        owner._registration.join_workers();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let finish = tokio::spawn(async move { owner.finish(&Ok(()), true, &worker_cancel).await });
+        tokio::time::timeout(Duration::from_secs(2), finish)
+            .await
+            .expect("an ordinary shutdown after the overrun must not wait")
+            .unwrap();
+        assert_eq!(
+            exit_code.load(Ordering::SeqCst),
+            -1,
+            "an overrun before the stop must not exit EX_TEMPFAIL"
         );
         assert!(!cancel.is_cancelled());
     }
