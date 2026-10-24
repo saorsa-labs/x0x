@@ -1200,6 +1200,23 @@ async fn post_cutoff(
         supports(sim, "A", "B", Reg::CERTIFICATE_REBIND_V1)?,
         supports(sim, "A", "C", Reg::CERTIFICATE_REBIND_V1)?
     ));
+    let (b_id, _) = sim.ids("B")?;
+    let b_seen = sim
+        .state("A")?
+        .agent
+        .discovered_agent(b_id)
+        .await
+        .ok()
+        .flatten();
+    receipt.note(format!(
+        "A's discovery entry for B: cert_not_after {:?}, announced cert digest {:?} (B's \
+         pinned binding carries this expiry; an expired live binding resolves nothing)",
+        b_seen.as_ref().and_then(|entry| entry.cert_not_after),
+        b_seen
+            .as_ref()
+            .and_then(|entry| entry.agent_certificate.as_ref())
+            .map(crate::groups::owner_cert::certificate_digest_hex)
+    ));
     if reached_ms.is_some() {
         pause(sim, "the rebind settles", SETTLE).await?;
     }

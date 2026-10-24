@@ -290,3 +290,229 @@ async fn an_unexpired_sole_admin_gets_no_every_admin_expired_exception() {
         .expect("group");
     assert_eq!(info.state_revision, 0, "the unknown member is not stranded");
 }
+
+/// #1357 rc21 fixture: the local daemon holds the owner key `U` (seed
+/// `owner_seed`) and starts on an `agent.cert` that `U` issued with
+/// `not_after`, as a W3-H Home device does. Returns the state, its data
+/// directory, `U`, and the agent keypair (a copy) for building renewals.
+async fn expiring_device_state(
+    owner_seed: [u8; 32],
+    not_after: u64,
+) -> (Arc<AppState>, tempfile::TempDir, UserKeypair, AgentKeypair) {
+    let dir = tempfile::tempdir().expect("dir");
+    let data_dir = dir.path();
+    let owner = UserKeypair::from_seed(&owner_seed).expect("owner");
+    let agent = AgentKeypair::generate().expect("agent");
+    let agent_bytes = x0x::storage::serialize_agent_keypair(&agent).expect("agent bytes");
+    let first =
+        AgentCertificate::issue_with_expiry(&owner, &agent, Some(not_after)).expect("first");
+    x0x::storage::save_agent_certificate_to(&first, data_dir.join("agent.cert"))
+        .await
+        .expect("save first cert");
+    let built = Arc::new(
+        Agent::builder()
+            .with_machine_key(data_dir.join("machine.key"))
+            .with_agent_key(agent)
+            .with_agent_cert_path(data_dir.join("agent.cert"))
+            .with_user_key(UserKeypair::from_seed(&owner_seed).expect("owner"))
+            .with_peer_cache_disabled()
+            .with_contact_store_path(data_dir.join("contacts.json"))
+            .build()
+            .await
+            .expect("agent"),
+    );
+    assert_eq!(
+        built
+            .agent_certificate()
+            .and_then(AgentCertificate::not_after),
+        Some(not_after),
+        "the daemon starts on its expiring certificate"
+    );
+    let state = secure_endpoint_test_state_at(data_dir, built)
+        .await
+        .expect("state");
+    let copy = x0x::storage::deserialize_agent_keypair(&agent_bytes).expect("agent copy");
+    (state, dir, owner, copy)
+}
+
+async fn cert_on_disk(dir: &tempfile::TempDir) -> AgentCertificate {
+    x0x::storage::load_agent_certificate_from(dir.path().join("agent.cert"))
+        .await
+        .expect("agent.cert")
+}
+
+/// #1357 rc21 (ADR 0110 §4a run (6); Engineer call 24 Oct 2026): after the
+/// cutoff the route hands B's renewal to the admin, and B itself now uses
+/// that renewal: `agent.cert` holds it (so a restart keeps it) and the
+/// identity announces it. Before rc21 B kept its first certificate until a
+/// restart, so after `not_after` no peer's pinned send reached B and the
+/// admin's rebind frame never arrived.
+#[tokio::test]
+async fn rc21_post_cutoff_self_rebind_adopts_the_daemons_own_renewal() {
+    let first_not_after = unix_now() + 60;
+    let (state, dir, owner, agent) = expiring_device_state([0x57u8; 32], first_not_after).await;
+    let admin = AgentKeypair::generate().expect("admin");
+    let group = seed_group(&state, &owner, first_not_after, Some(&admin)).await;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let renewed_not_after = unix_now() + 86_400;
+    let renewal = renewal_b64(&owner, &agent, renewed_not_after);
+    let (status, body) = call(&state, &group, &local_hex, Some(renewal)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], REBIND_WINDOW_CLOSED, "{body}");
+    assert_eq!(
+        state
+            .agent
+            .agent_certificate()
+            .and_then(AgentCertificate::not_after),
+        Some(renewed_not_after),
+        "the daemon uses its renewal at once"
+    );
+    assert_eq!(
+        cert_on_disk(&dir).await.not_after(),
+        Some(renewed_not_after)
+    );
+    // The committed seat is unchanged: only the admin commits after the
+    // cutoff.
+    let info = state
+        .named_groups
+        .read()
+        .await
+        .get(&group)
+        .cloned()
+        .expect("group");
+    assert_eq!(info.state_revision, 0);
+    assert_eq!(
+        cr::committed_certificate(&info.members_v2[&local_hex])
+            .and_then(AgentCertificate::not_after),
+        Some(first_not_after)
+    );
+    // A restart loads the renewal from `agent.cert`.
+    let agent_bytes = x0x::storage::serialize_agent_keypair(&agent).expect("agent bytes");
+    let restarted = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key(x0x::storage::deserialize_agent_keypair(&agent_bytes).expect("agent"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_user_key(UserKeypair::from_seed(&[0x57u8; 32]).expect("owner"))
+        .with_peer_cache_disabled()
+        .with_contact_store_path(dir.path().join("contacts-restarted.json"))
+        .build()
+        .await
+        .expect("restarted agent");
+    assert_eq!(
+        restarted
+            .agent_certificate()
+            .and_then(AgentCertificate::not_after),
+        Some(renewed_not_after)
+    );
+}
+
+/// #1357 rc21 guards: a renewal is adopted only for this daemon's own
+/// agent, from the same user, unexpired, verified, and strictly later than
+/// the certificate in use; it never downgrades. Every refusal leaves
+/// memory and `agent.cert` unchanged.
+#[tokio::test]
+async fn rc21_own_renewal_adoption_refuses_older_foreign_and_downgrade() {
+    use x0x::identity::CertificateRenewalRefusal as Refusal;
+    use x0x::CertificateRenewalAdoption as Adoption;
+    let first_not_after = unix_now() + 3_600;
+    let (state, dir, owner, agent) = expiring_device_state([0x58u8; 32], first_not_after).await;
+    let refused = |result: x0x::error::Result<Adoption>| match result.expect("no io error") {
+        Adoption::Refused(refusal) => refusal,
+        Adoption::Adopted => panic!("adopted a renewal that must be refused"),
+    };
+    let unchanged = async |state: &Arc<AppState>| {
+        assert_eq!(
+            state
+                .agent
+                .agent_certificate()
+                .and_then(AgentCertificate::not_after),
+            Some(first_not_after)
+        );
+        assert_eq!(cert_on_disk(&dir).await.not_after(), Some(first_not_after));
+    };
+    // Older and equal expiry.
+    let older =
+        AgentCertificate::issue_with_expiry(&owner, &agent, Some(first_not_after - 60)).unwrap();
+    assert_eq!(
+        refused(state.agent.adopt_own_certificate_renewal(&older).await),
+        Refusal::NotLater
+    );
+    let equal = AgentCertificate::issue_with_expiry(&owner, &agent, Some(first_not_after)).unwrap();
+    assert_eq!(
+        refused(state.agent.adopt_own_certificate_renewal(&equal).await),
+        Refusal::NotLater
+    );
+    unchanged(&state).await;
+    // Another agent's certificate, even from the same owner.
+    let stranger = AgentKeypair::generate().unwrap();
+    let foreign =
+        AgentCertificate::issue_with_expiry(&owner, &stranger, Some(first_not_after + 60)).unwrap();
+    assert_eq!(
+        refused(state.agent.adopt_own_certificate_renewal(&foreign).await),
+        Refusal::ForeignAgent
+    );
+    // This agent's certificate from another user.
+    let other_owner = UserKeypair::generate().unwrap();
+    let other_user =
+        AgentCertificate::issue_with_expiry(&other_owner, &agent, Some(first_not_after + 60))
+            .unwrap();
+    assert_eq!(
+        refused(state.agent.adopt_own_certificate_renewal(&other_user).await),
+        Refusal::ForeignUser
+    );
+    // A forged expiry: the signature covers `not_after`.
+    let mut storage =
+        AgentCertificate::issue_with_expiry(&owner, &agent, Some(first_not_after + 60))
+            .unwrap()
+            .to_storage_bytes()
+            .unwrap();
+    let forged_not_after = (first_not_after + 120).to_le_bytes();
+    let at = storage
+        .windows(8)
+        .rposition(|w| w == (first_not_after + 60).to_le_bytes())
+        .expect("not_after bytes");
+    storage[at..at + 8].copy_from_slice(&forged_not_after);
+    let forged = AgentCertificate::from_storage_bytes(&storage).expect("decodes");
+    assert_eq!(forged.not_after(), Some(first_not_after + 120));
+    assert_eq!(
+        refused(state.agent.adopt_own_certificate_renewal(&forged).await),
+        Refusal::InvalidSignature
+    );
+    unchanged(&state).await;
+    // A later renewal is adopted; a non-expiring one after it too; then no
+    // expiring certificate replaces the non-expiring one.
+    let later =
+        AgentCertificate::issue_with_expiry(&owner, &agent, Some(first_not_after + 60)).unwrap();
+    assert_eq!(
+        state
+            .agent
+            .adopt_own_certificate_renewal(&later)
+            .await
+            .unwrap(),
+        Adoption::Adopted
+    );
+    assert_eq!(cert_on_disk(&dir).await, later);
+    let forever = AgentCertificate::issue_with_expiry(&owner, &agent, None).unwrap();
+    assert_eq!(
+        state
+            .agent
+            .adopt_own_certificate_renewal(&forever)
+            .await
+            .unwrap(),
+        Adoption::Adopted
+    );
+    let after_forever =
+        AgentCertificate::issue_with_expiry(&owner, &agent, Some(unix_now() + 10 * 86_400))
+            .unwrap();
+    assert_eq!(
+        refused(
+            state
+                .agent
+                .adopt_own_certificate_renewal(&after_forever)
+                .await
+        ),
+        Refusal::NotLater
+    );
+    assert_eq!(state.agent.agent_certificate(), Some(&forever));
+    assert_eq!(cert_on_disk(&dir).await, forever);
+}
