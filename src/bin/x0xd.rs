@@ -928,6 +928,68 @@ fn init_logging(level: &str, format: &str) -> Result<Vec<log_flush::LogGuard>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_log_directory_skips_unrelated_existing_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/upgrade-log-dir-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = tempfile::tempdir_in(root).unwrap();
+        let ancestor = fixture.path().join("search-only");
+        let existing = ancestor.join("logs");
+        std::fs::create_dir_all(&existing).unwrap();
+        // Permission checks need a non-root process; the injected check below is unconditional.
+        // SAFETY: geteuid has no pointer or memory preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            let original = std::fs::metadata(&ancestor).unwrap().permissions();
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+            let denied = std::fs::File::open(&ancestor);
+            let write = std::fs::write(existing.join("accepted.log"), b"accepted");
+            let result = super::log_flush::prepare_log_dir(
+                &existing,
+                |path| std::fs::File::open(path)?.sync_all(),
+                |_, error| panic!("unexpected warning: {error}"),
+            );
+            std::fs::set_permissions(&ancestor, original).unwrap();
+            assert_eq!(
+                denied.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            write.unwrap();
+            result.unwrap();
+        }
+        super::log_flush::prepare_log_dir(
+            &existing,
+            |_| {
+                Err(std::io::Error::other(
+                    "existing directory needs no ancestor sync",
+                ))
+            },
+            |_, error| panic!("unexpected warning: {error}"),
+        )
+        .unwrap();
+        let nested = existing.join("new/deep");
+        let mut synced = Vec::new();
+        super::log_flush::prepare_log_dir(
+            &nested,
+            |path| {
+                if path == ancestor {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "unrelated ancestor",
+                    ));
+                }
+                synced.push(path.to_path_buf());
+                std::fs::File::open(path)?.sync_all()
+            },
+            |_, error| panic!("unexpected warning: {error}"),
+        )
+        .unwrap();
+        assert_eq!(synced, vec![nested.clone(), existing.join("new")]);
+        assert!(nested.is_dir());
+    }
+
     #[test]
     fn logs_are_uncoloured_unless_stdout_is_a_terminal() {
         // #1036: journald/syslog captured ANSI escapes from every WARN line.

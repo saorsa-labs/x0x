@@ -32,6 +32,8 @@ mod routes;
 mod sse;
 mod state;
 mod update_check;
+#[cfg(unix)]
+mod upgrade_flush;
 pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
@@ -158,6 +160,36 @@ async fn finish_startup_error(
         Err(shutdown) => primary.context(format!(
             "agent shutdown also failed after startup rejection: {shutdown}"
         )),
+    }
+}
+
+/// Drain the axum accept task with a 2 s bound. The returned result keeps
+/// the ordinary-shutdown exit-0 contract (#261/#363): a drain that misses
+/// the bound is aborted and joined, not turned into a process error. The
+/// companion flag reports whether every HTTP producer finished on its own;
+/// an abort does not join request-owned blocking writes (ADR 0094 §4), so
+/// only the acknowledged-flush receipt consumes the flag, never the exit.
+async fn drain_http_server(
+    mut server: tokio::task::JoinHandle<std::io::Result<()>>,
+) -> (anyhow::Result<()>, bool) {
+    match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+        Ok(Ok(Ok(()))) => (Ok(()), true),
+        Ok(Ok(Err(error))) => (
+            Err(anyhow::Error::new(error).context("API server error")),
+            true,
+        ),
+        Ok(Err(error)) => (
+            Err(anyhow::Error::new(error).context("API server task failed")),
+            true,
+        ),
+        Err(_) => {
+            tracing::warn!(
+                "API server did not shut down within 2s; aborting lingering connections"
+            );
+            server.abort();
+            let _ = server.await;
+            (Ok(()), false)
+        }
     }
 }
 
@@ -1415,6 +1447,41 @@ pub async fn serve_with_options(
         )
         .await);
     }
+
+    // Startup recovery (engineer ruling 23 Oct 2026): a receipt-less
+    // upgrade-flush.json or an upgrade-flush-rollback.json whose owning
+    // process is gone is debris from a failed or interrupted flush. The
+    // instance lock taken above proves that owner exited (it held the lock
+    // for its whole flush); clear the debris, log the cause and leave that
+    // upgrade failed so a later apply is not refused forever.
+    #[cfg(unix)]
+    crate::upgrade::shutdown_flush::clear_stale_records(&config.data_dir);
+
+    // The control listener survives the HTTP drain, so a peer can receive
+    // its durable receipt after every normal request and producer has stopped.
+    #[cfg(unix)]
+    let upgrade_flush = if self_update_enabled {
+        let setup = async {
+            let identity_root = match identity_dir.clone() {
+                Some(root) => root,
+                None => crate::storage::x0x_dir().await?,
+            };
+            let exit: std::sync::Arc<dyn Fn(i32) + Send + Sync> =
+                std::sync::Arc::new(|code| std::process::exit(code));
+            upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root, exit)
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        match setup {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                tracing::warn!(%error, "Acknowledged flush unavailable; supervised apply disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let port_file = config.data_dir.join("api.port");
 
@@ -3171,22 +3238,12 @@ pub async fn serve_with_options(
 
         // Drain the axum server result and propagate any failure. If the select
         // already observed it ending, `server` was consumed there and its result
-        // captured above; otherwise await it (with a bound) and propagate.
-        let server_result: anyhow::Result<()> = match server_result {
-            Some(res) => res,
-            None => match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
-                Ok(Ok(Ok(()))) => Ok(()),
-                Ok(Ok(Err(e))) => Err(anyhow::Error::new(e).context("API server error")),
-                Ok(Err(e)) => Err(anyhow::Error::new(e).context("API server task failed")),
-                Err(_) => {
-                    tracing::warn!(
-                        "API server did not shut down within 2s; aborting lingering connections"
-                    );
-                    server.abort();
-                    let _ = server.await;
-                    Ok(())
-                }
-            },
+        // captured above; otherwise await it (with a bound) and propagate. The
+        // drain flag records whether every HTTP producer finished on its own;
+        // it feeds only the flush receipt below, never the exit code.
+        let (server_result, _http_drained) = match server_result {
+            Some(res) => (res, true),
+            None => drain_http_server(server).await,
         };
 
         // Fix C (Issue #110 Phase 2 + 2b): tear down the server-owned tasks, the
@@ -3234,7 +3291,7 @@ pub async fn serve_with_options(
         //    returns a `JoinError`; that is expected, never unwrap it. Draining
         //    here (after begin_shutdown, before Agent shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
-        drain_server_tasks(&state, bg_tasks).await;
+        let _server_tasks_finished = drain_server_tasks(&state, bg_tasks).await;
         let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
         // 3. Now that join_network is stopped (and the token cancelled so any
         //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
@@ -3302,7 +3359,21 @@ pub async fn serve_with_options(
         } else {
             server_result
         };
-        combine_server_shutdown_results(server_result, agent_shutdown_result)
+        let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
+        #[cfg(unix)]
+        if let Some(owner) = &upgrade_flush {
+            // An HTTP producer aborted at the drain bound is as unfinished as
+            // an aborted background task (ADR 0094 §4): the receipt refuses,
+            // while the ordinary-shutdown exit above stays 0 (#261/#363).
+            owner
+                .finish(
+                    &result,
+                    _server_tasks_finished && _http_drained,
+                    &supervisor_cancel,
+                )
+                .await;
+        }
+        result
     });
 
     Ok(ServerHandle {
@@ -3334,7 +3405,11 @@ const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
 /// maps, the REST `/subscribe` forwarders, the detached registry, the
 /// join-attempt registry and, in place, the join-artifact egress registry),
 /// then await, never abort, the shielded group-state applies.
-async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
+async fn drain_server_tasks(
+    state: &AppState,
+    mut bg_tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> bool {
+    let mut complete = true;
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
@@ -3436,13 +3511,21 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     let grace_end = tokio::time::Instant::now() + SERVER_TASK_GRACE;
     let mut join = futures::future::join_all(bg_tasks);
     tokio::select! {
-        _results = &mut join => {}
+        results = &mut join => {
+            complete &= results.iter().all(|r| r.as_ref().err().is_none_or(|e| e.is_cancelled()));
+        }
         _ = tokio::time::sleep_until(grace_end) => {
             tracing::warn!("background tasks did not stop within grace; aborting stragglers");
             for handle in &abort_handles {
                 handle.abort();
             }
-            let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            let results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            // ADR 0094 §4: an abort cancels a task's next await; it does not
+            // stop blocking work the task already started. A straggler that
+            // missed the grace window is therefore never a finished producer,
+            // whatever its cancelled JoinError says. Only a task that returned
+            // on its own counts as finished here.
+            complete &= results.iter().all(Result::is_ok);
         }
     }
     // #1288: history backfills outlive the session that started them. The
@@ -3482,6 +3565,7 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         .await
         .is_err()
         {
+            complete = false;
             tracing::warn!(
                 bound_secs = JOIN_ARTIFACT_EGRESS_ABORT_BOUND.as_secs(),
                 "a join-artifact egress task did not end after its abort"
@@ -3499,14 +3583,15 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // aborted), and the AppState it holds then outlives this supervisor.
     if !shielded.is_empty() {
         let applies = futures::future::join_all(shielded);
-        if tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
-                "a group-state apply is still running at shutdown; it is left to finish, not aborted"
-            );
+        match tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies).await {
+            Ok(results) => complete &= results.iter().all(Result::is_ok),
+            Err(_) => {
+                complete = false;
+                tracing::warn!(
+                    bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
+                    "a group-state apply is still running at shutdown; it is left to finish, not aborted"
+                );
+            }
         }
     }
     // #1545: the owner-sync store runs each durable write in its own task,
@@ -3519,6 +3604,7 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         sync.store().release_write_custody().await;
     }
     crate::profile::IssuedCertRecord::wait_for_writes().await;
+    complete
 }
 
 /// Whether two directory paths refer to the same directory, tolerating
