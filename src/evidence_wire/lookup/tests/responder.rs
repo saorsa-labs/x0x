@@ -83,3 +83,49 @@ async fn held_responder_policy_keeps_the_stream_worker_running_and_fails_closed(
     .unwrap();
     assert!(runtime.readers_idle_for_testing());
 }
+
+/// #1239 review r1: the evaluation's ASYNC lock waits must also end at the
+/// budget INSIDE the worker — a held Tokio discovery writer must not pin the
+/// worker and its shared reader permit past the deadline. Real time, not a
+/// paused clock: the worker must actually be RUNNING inside its lock wait
+/// when the budget passes, so an abort-before-start cannot mask the pin.
+#[tokio::test(flavor = "current_thread")]
+async fn responder_evaluation_past_its_budget_returns_its_reader_permit() {
+    let responder = Arc::new(Node::new().await);
+    let requester = Node::new().await;
+    responder.know(&requester).await;
+    let runtime = Arc::clone(&responder.relations.runtime);
+    let target = AgentId([39; 32]);
+
+    // Hold the discovery cache's Tokio write side for the whole test: the
+    // evaluation's `machine_agents`/`peer` reads queue behind it.
+    let held = responder.relations.discovery.write().await;
+    let authorized = responder.relations.authorized(requester.m(), target);
+    tokio::pin!(authorized);
+    assert!(futures::poll!(&mut authorized).is_pending());
+    let outcome = tokio::time::timeout(
+        RESPONDER_AUTHORITY_BUDGET + Duration::from_secs(2),
+        &mut authorized,
+    )
+    .await
+    .expect("the evaluation must fail closed by its budget plus slack");
+    assert!(!outcome, "the evaluation must fail closed at its budget");
+    // The discovery writer is STILL held: only the worker's own inner
+    // deadline can end the evaluation. Its reader permit must come back
+    // without releasing the lock.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !runtime.readers_idle_for_testing() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the held async read kept its shared reader permit past the budget");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.shutdown_workers().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}

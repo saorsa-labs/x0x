@@ -10081,6 +10081,7 @@ impl Agent {
         // whole send here with the typed timeout instead of staying open.
         let started = std::time::Instant::now();
         let retries = config.max_retries;
+        let strict = config.require_durable_app_ack;
         let deadline = tokio::time::Instant::now()
             + dm_evidence::ordinary_send_budget(&config, cold_wait.map(|ColdWait(wait)| wait));
         match tokio::time::timeout_at(
@@ -10091,7 +10092,22 @@ impl Agent {
         {
             Ok(result) => result,
             Err(_expired) => {
+                // Keep the body's failure accounting: a deadline-expired
+                // send is also a relay-engine direct-failure sample, and a
+                // strict send keeps a stage row (the named stages are
+                // unknown past the wrap, so the whole budget folds into
+                // publish, as the strict-gate fold does).
                 self.direct_messaging.record_outgoing_failed(*to);
+                self.peer_relay.record_direct_failure(to);
+                if strict {
+                    let elapsed = dm::millis_since(started);
+                    self.direct_messaging
+                        .record_durable_send_stages(dm::DurableSendStages {
+                            elapsed_ms: elapsed,
+                            publish_ms: elapsed,
+                            ..dm::DurableSendStages::default()
+                        });
+                }
                 Err(dm::DmError::Timeout {
                     retries,
                     elapsed: started.elapsed(),

@@ -13,9 +13,11 @@ use std::time::Duration;
 /// The absolute budget of one ordinary send under the test config
 /// (`timeout_per_attempt` = 2 s, default retries/backoff/raw knobs), from
 /// `dm_evidence::ordinary_send_budget`:
-/// evidence 2 + refresh 3 + evidence dial 3 + preferred raw 2×2 + 0.25
-/// + gossip 2 + (2 + 2 backoff) + raw fallback 2×2 + 0.25 = 22.5 s.
-const TWO_SECOND_ATTEMPT_BUDGET: Duration = Duration::from_millis(22_500);
+///
+/// evidence 2, refresh 3, evidence dial 3, preferred raw 2×2 plus 0.25,
+/// gossip 2 plus (2, 2 backoff, 0.25 republish), raw fallback 2×2 plus
+/// 0.25 — 22.75 s in total.
+const TWO_SECOND_ATTEMPT_BUDGET: Duration = Duration::from_millis(22_750);
 
 async fn agent_in(dir: &std::path::Path) -> error::Result<Agent> {
     Agent::builder()

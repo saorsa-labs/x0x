@@ -450,11 +450,14 @@ impl EvidenceRuntime {
     /// synchronous std-lock policy reads (the Lookup responder's
     /// `Relations::shared` reads) so it cannot occupy a Tokio worker. The
     /// evaluation runs on a tracked blocking worker; admission, the
-    /// evaluation and its result share one absolute `deadline`. Readers
-    /// reserve from the same 16-permit cap as the send evidence reads, so
-    /// evaluations queued behind a held lock cannot grow the blocking pool
-    /// without bound. Dropping the caller aborts a queued worker; a running
-    /// synchronous read keeps its permit and join handle through the
+    /// evaluation and its result share one absolute `deadline`, and the
+    /// deadline plus shutdown cancellation also apply INSIDE the worker, so
+    /// an async lock wait cannot pin the worker and its reader permit past
+    /// the budget. Readers reserve from the same 16-permit cap as the send
+    /// evidence reads, so evaluations queued behind a held lock cannot grow
+    /// the blocking pool without bound. Dropping the caller aborts a queued
+    /// worker; only a synchronous read already inside a store lock can
+    /// outlive the deadline, keeping its permit and join handle through the
     /// shutdown grace, exactly as the evidence readers.
     pub(crate) async fn evaluate_before<T: Send + 'static>(
         self: &Arc<Self>,
@@ -467,12 +470,20 @@ impl EvidenceRuntime {
                 .await
                 .map_err(|_| ())?;
             let executor = tokio::runtime::Handle::current();
+            let stopping = self.stopping.clone();
             let (result, abort) = self.spawn_blocking_worker(move || {
                 let _permit = permit;
                 if tokio::time::Instant::now() >= deadline {
                     return Err(());
                 }
-                Ok(executor.block_on(work))
+                executor.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = stopping.cancelled() => Err(()),
+                        _ = tokio::time::sleep_until(deadline) => Err(()),
+                        value = work => Ok(value),
+                    }
+                })
             })?;
             let _abort = AbortWorkerOnDrop(abort);
             let value = result.await.map_err(|_| ())??;

@@ -8,18 +8,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
-/// #1239: the one absolute budget of an entire ordinary send. Every stage the
-/// config can already spend is summed, so a send that fits its configured
-/// stages is never cut short, while an unbounded later wait (a held lock, a
-/// stacked slow stage, a stuck fallback) ends at this deadline with the
-/// send's typed timeout instead of staying open.
+/// Ceiling of the absolute budget. A retry schedule whose summed budgets
+/// exceed it already saturates the backoff computation, so Tokio's own
+/// inter-attempt timers cannot represent it either; the deadline bounds such
+/// a pathological config at the ceiling instead of panicking on an
+/// unrepresentable `Instant`.
+const MAX_SEND_BUDGET: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// #1239: the one absolute budget of an entire ordinary send. Every stage
+/// with a budget of its own is summed, so a send that fits those stages is
+/// never cut short, while a wait none of them bounds (a held lock, a stacked
+/// slow stage, a stuck fallback) ends at this deadline with the send's typed
+/// timeout instead of staying open.
 ///
 /// Stage terms: the discovery/evidence budget ([`SendEvidence`]), one forced
 /// targeted capability refresh (ADR 0030 §2), the evidence dial cap
 /// ([`Agent::dial_evidence_view`]), the preferred raw-QUIC attempt and the
 /// raw-QUIC fallback redial — each counted with one X0X-0053 reissue and its
-/// prefer-newest grace — and every gossip attempt with its backoff. A
-/// cold-wait send adds its opt-in repair wait (#1217).
+/// prefer-newest grace — and every gossip attempt with its backoff plus the
+/// publish-only inter-attempt republish delay. A cold-wait send adds its
+/// opt-in repair wait (#1217).
+///
+/// Stages that had NO bound before #1239 — the known-recipient redial and
+/// last-resort `connect_to_agent`, a fire-and-forget raw write, the relay
+/// fallback — get no term: the deadline itself is their first bound, which is
+/// the fix. A redial or traversal slower than the send's whole budget fails
+/// retryably instead of hanging the caller.
 pub(crate) fn ordinary_send_budget(
     config: &dm::DmSendConfig,
     cold_wait: Option<Duration>,
@@ -35,11 +49,15 @@ pub(crate) fn ordinary_send_budget(
     for attempt in 0..=config.max_retries {
         budget = budget.saturating_add(per_attempt);
         if attempt > 0 {
-            budget = budget.saturating_add(config.backoff.delay(per_attempt, attempt - 1));
+            budget = budget
+                .saturating_add(config.backoff.delay(per_attempt, attempt - 1))
+                .saturating_add(crate::dm_send::PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY);
         }
     }
     budget = budget.saturating_add(raw_execution);
-    budget.saturating_add(cold_wait.unwrap_or(Duration::ZERO))
+    budget
+        .saturating_add(cold_wait.unwrap_or(Duration::ZERO))
+        .min(MAX_SEND_BUDGET)
 }
 
 pub(crate) type SendCapability = (
@@ -327,15 +345,15 @@ mod tests {
             ..Default::default()
         };
         // evidence 2 + refresh 3 + dial 3 + raw (2*2 + 0.25)
-        // + gossip 2 + (2 + 2 backoff) + raw (2*2 + 0.25)
+        // + gossip 2 + (2 + 2 backoff + 0.25 republish) + raw (2*2 + 0.25)
         assert_eq!(
             ordinary_send_budget(&config, None),
-            Duration::from_millis(22_500)
+            Duration::from_millis(22_750)
         );
         // A cold-wait send adds its opt-in repair wait (#1217).
         assert_eq!(
             ordinary_send_budget(&config, Some(Duration::from_secs(30))),
-            Duration::from_millis(52_500)
+            Duration::from_millis(52_750)
         );
         // Retries and backoff extend the budget they already control.
         let strict = dm::DmSendConfig {
@@ -351,5 +369,33 @@ mod tests {
             ordinary_send_budget(&strict, None),
             Duration::from_millis(54_500)
         );
+        // Publish-only retries add their inter-attempt republish delay even
+        // with zero backoff (review r1: 32 x 250 ms must fit the budget).
+        let publish_only = dm::DmSendConfig {
+            timeout_per_attempt: Duration::from_millis(10),
+            max_retries: 32,
+            backoff: dm::BackoffPolicy::Fixed(Duration::ZERO),
+            prefer_newest_grace_ms: 0,
+            ..Default::default()
+        };
+        assert!(
+            ordinary_send_budget(&publish_only, None) >= Duration::from_secs(8),
+            "publish-only republish delays must fit the absolute budget"
+        );
+    }
+
+    /// #1239 review r1: a pathological retry schedule saturates the backoff
+    /// arithmetic; the budget must stay clock-representable instead of
+    /// panicking on `Instant + Duration`.
+    #[test]
+    fn ordinary_send_budget_stays_representable_for_pathological_retries() {
+        let config = dm::DmSendConfig {
+            timeout_per_attempt: Duration::from_secs(4),
+            max_retries: 64,
+            ..Default::default()
+        };
+        let budget = ordinary_send_budget(&config, None);
+        assert_eq!(budget, MAX_SEND_BUDGET);
+        assert!(tokio::time::Instant::now().checked_add(budget).is_some());
     }
 }
