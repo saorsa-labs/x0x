@@ -373,6 +373,36 @@ macro_rules! shutdown_flush_regression_tests {
             }
 
             #[test]
+            fn supervised_duplicate_flush_preserves_installed_bytes_and_receipt() {
+                let (_dir, plan) = fixture();
+                let backup = plan.data_root.join("previous-daemon");
+                std::fs::write(&backup, b"previous daemon").unwrap();
+                let upgrader = AutoApplyUpgrader::new("x0xd")
+                    .with_swapped_artifacts(vec![(plan.executable.clone(), backup.clone())]);
+                let owner =
+                    flush::register(plan.data_root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+                upgrader
+                    .trigger_restart_with_exit(&plan, "2.0.0", |_| {})
+                    .unwrap();
+                owner.join_workers();
+                let receipt = std::fs::read(plan.data_root.join(flush::RECORD)).unwrap();
+                assert!(upgrader
+                    .trigger_restart_with_exit(&plan, "2.0.0", |_| panic!(
+                        "duplicate must not exit"
+                    ))
+                    .is_err());
+                assert_eq!(
+                    std::fs::read(&plan.executable).unwrap(),
+                    b"owned candidate fixture"
+                );
+                assert_eq!(std::fs::read(&backup).unwrap(), b"previous daemon");
+                assert_eq!(
+                    std::fs::read(plan.data_root.join(flush::RECORD)).unwrap(),
+                    receipt
+                );
+            }
+
+            #[test]
             fn supervised_exit_refuses_without_a_shutdown_owner_or_receipt() {
                 let (_dir, plan) = fixture();
                 let mut exited = false;

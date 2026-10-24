@@ -158,7 +158,7 @@ macro_rules! flush_receipt_regression_tests {
                 caller.join().unwrap();
                 owner.join_workers();
                 assert!(
-                    !outcome.started,
+                    !outcome.started(),
                     "an overrun before the stop never stopped the daemon"
                 );
                 assert!(

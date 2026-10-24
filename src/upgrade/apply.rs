@@ -1673,7 +1673,10 @@ impl AutoApplyUpgrader {
                 };
                 let receipt = match receipt {
                     Ok(receipt) => receipt,
-                    Err(failure) if failure.started => {
+                    Err(super::shutdown_flush::FlushFailure::NotOwned(error)) => {
+                        return Err(UpgradeError::Other(error.to_string()));
+                    }
+                    Err(failure) if failure.started() => {
                         // Engineer ruling 23 Oct 2026: a flush that started
                         // and failed or overran left this daemon stopped
                         // behind the hook (no API, no network). Record the

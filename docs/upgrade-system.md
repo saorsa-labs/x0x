@@ -361,9 +361,10 @@ A flush timeout, receipt-write failure or binding failure does not authorize
 the supervised exit. A flush that started — the daemon actually stopped
 behind the hook — and then failed or overran restores every binary the
 transaction swapped and exits
-`EX_TEMPFAIL` (75) for a service-manager restart on the old version; a
-refusal before the daemon stops is an ordinary error, nothing is restored,
-and the daemon keeps serving. Both cases are described under
+`EX_TEMPFAIL` (75) for a service-manager restart on the old version.
+A refusal before the stop keeps the daemon serving. It restores only when
+this call owned admission; a duplicate or competing request changes nothing.
+The ownership and recovery rules are described under
 [Acknowledged shutdown flush (supervised exit)](#acknowledged-shutdown-flush-supervised-exit)
 below, together with the startup cleanup that clears a receipt-less record or
 rollback marker whose owning process is gone. Do not apply the legacy
@@ -578,17 +579,30 @@ the daemon on the old version. An error after the flush completed (for
 example a receipt that fails authorization) also ends in `EX_TEMPFAIL`;
 nothing is restored because the new bytes are already durable.
 
-A refusal that happens before the daemon stops (a missing flush owner, an
-unresolved predecessor, a failed intent write, the pre-hook deadline
-check, or the deadline overrunning before the hook commits the stop) is
-not a failed start (engineer ruling, 24 Oct 2026). The daemon
-never stopped, so it keeps serving — but first it restores every binary
-this transaction swapped, with the same verified-backup rule as the started
-case, releases the flush admission so a later supervised apply can run,
-clears the receipt-less intent record of the refused attempt, and logs the
-refusal reason. No failed-release hold is written: the release may be
-retried on the next normal update cycle. An ordinary shutdown after a
-refusal exits with its normal code, never `EX_TEMPFAIL`.
+A request that does not own flush admission never restores binaries, clears
+intent, or disarms another request. This includes a missing flush owner,
+`already armed`, `already started`, and a reservation that does not own
+admission. A duplicate arm after a receipt leaves the installed bytes and
+receipt unchanged (engineer ruling, 24 Oct 2026).
+
+An owned refusal before the stop commit point (an unresolved predecessor,
+a failed intent or handoff write, or a deadline overrun before the hook
+commits the stop) is not a failed start. The daemon keeps serving. The arm
+handler holds admission while it marks its host journal `rolling_back`, restores the swapped files,
+and records `restored` with the swapped flags cleared. It removes only the
+handoff this attempt wrote, then retains the resolved journal under
+`upgrade-refused-<uuid>.json`. The active journal path is cleared so a later
+apply can run; replaying the old arm cannot acknowledge the restored bytes.
+An existing handoff is preserved and refuses preparation. A restore or
+cleanup error retains the active journal and blocks apply for manual
+recovery. A rename failure can still leave a mixed pair, as described above.
+
+After an owned refusal, the flush clears its own receipt-less intent and
+releases admission. No failed-release hold is written: a resolved refusal
+permits retry on the next normal update cycle. An ordinary shutdown after a
+refusal uses its normal exit code. The production hook marks the stop commit
+point before sending either shutdown signal, so a deadline inside that send
+cannot turn a started shutdown into a refusal.
 
 The flush walk refuses any symlink under the data root or the identity
 root (`~/.x0x` by default): a symlink is not a verified store root, and its
