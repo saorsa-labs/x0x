@@ -1728,6 +1728,11 @@ pub(in crate::server) fn spawn_receipt(
 /// retained frame's evidence state is checked again on the new head.
 pub(super) async fn retry_stash(state: &Arc<AppState>) {
     ensure_restored(state).await;
+    // #1580: converge the legacy MLS views with the durable rosters on
+    // the same pass. A received frame the restore kept at the head (the
+    // crash between the durable install and the MLS removal) never
+    // re-enters [`receive`], so the frames below cannot redo it.
+    converge_legacy_mls_views_with_rosters(state).await;
     let frames = state
         .revocation_evictions
         .inner
@@ -1798,6 +1803,14 @@ pub(in crate::server) async fn receive(
         return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::ActorIneligible);
     }
     if info.state_hash == body.commit.state_hash {
+        // #1580: the frame's result is this node's head, so it installed
+        // here before (or a peer resent the exact durable frame). The
+        // local legacy MLS removal is not durable, so this replay of the
+        // durable frame reruns it. Idempotent: a view without the target,
+        // including the empty view of a fresh process, changes nothing.
+        if matches!(body.crypto, ce::CryptoExclusionCryptoV1::Gss { .. }) {
+            remove_legacy_mls_member(state, &group_key, AgentId(body.target)).await;
+        }
         return ReceiveOutcome::Duplicate;
     }
     if info.state_hash != body.prior_head && info.state_revision < body.prior_revision {
@@ -2205,6 +2218,68 @@ async fn remove_legacy_mls_member(state: &AppState, group_key: &str, target: Age
     };
     if removed {
         ng::save_mls_groups(state).await;
+    }
+}
+
+/// #1580: the local legacy MLS view of a GSS group lists only seats the
+/// durable roster still holds Active. Every removal that keeps it (this
+/// module, the ban and removal arms) is an in-memory step after the
+/// durable roster write, so a crash between the two leaves a Removed or
+/// Banned seat listed, and the restart never re-receives the frame that
+/// carried the removal (a restored received frame at the head is kept for
+/// serving only). The worker's stash pass reruns the removal from the
+/// loaded roster instead: idempotent, and a no-op while the fresh process
+/// holds no view yet.
+pub(super) async fn converge_legacy_mls_views_with_rosters(state: &AppState) {
+    use super::super as ng;
+    use x0x::groups::GroupMemberState;
+    // The roster snapshot is taken and released before the MLS lock: the
+    // join paths hold the MLS writer across a named-groups write.
+    let rosters: Vec<(String, GroupInfo)> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| info.secure_plane == x0x::mls::SecureGroupPlane::Gss)
+            .map(|(key, info)| (key.clone(), info.clone()))
+            .collect()
+    };
+    for (key, info) in rosters {
+        let gone: Vec<AgentId> = {
+            let views = state.mls_groups.read().await;
+            let Some(view) = views.get(&key) else {
+                continue;
+            };
+            view.members()
+                .keys()
+                .filter(|agent| {
+                    matches!(
+                        info.members_v2
+                            .get(&hex::encode(agent.as_bytes()))
+                            .map(|seat| seat.state),
+                        Some(GroupMemberState::Removed) | Some(GroupMemberState::Banned)
+                    )
+                })
+                .copied()
+                .collect()
+        };
+        if gone.is_empty() {
+            continue;
+        }
+        let mut views = state.mls_groups.write().await;
+        let Some(view) = views.get_mut(&key) else {
+            continue;
+        };
+        for agent in gone {
+            if view.is_member(&agent) {
+                let _ = view.remove_member(agent).await;
+            }
+        }
+        drop(views);
+        ng::save_mls_groups(state).await;
+        tracing::info!(
+            group_id = %LogHexId::group(&key),
+            "ADR 0110 S4: a removed seat left the legacy MLS view again (#1580)"
+        );
     }
 }
 
@@ -4791,6 +4866,160 @@ mod daemon_tests {
         );
         let relay = restarted.agent.agent_id();
         lagging_peer_installs(&fx, &parent, relay, &frames[0], &result_head).await
+    }
+
+    /// Seed a live legacy MLS view for `fx`'s group on `state`: the local
+    /// agent and the leaver, the listing a process holds when its MLS
+    /// mirror saw both seats (#1580).
+    async fn seeded_legacy_mls_view(fx: &GssLeave, state: &Arc<AppState>) -> Result<()> {
+        let mut mls =
+            x0x::mls::MlsGroup::new(hex::decode(&fx.group_id)?, state.agent.agent_id()).await?;
+        mls.add_member(fx.leaver).await?;
+        state
+            .mls_groups
+            .write()
+            .await
+            .insert(fx.group_id.clone(), mls);
+        Ok(())
+    }
+
+    /// #1580: the GSS exclusion's local legacy MLS removal is an
+    /// in-memory step after the durable roster write. A crash between the
+    /// two leaves the received frame held in the `.celog` (its write ran
+    /// before the install; the tail that unholds it did not) with the
+    /// roster already at the result head — and the restart never
+    /// re-receives that frame (the restore keeps an at-head received frame
+    /// for serving only). The restarted receiver must still converge: the
+    /// worker's stash pass reruns the removal from the durable roster, so
+    /// the view no longer lists the removed member.
+    #[tokio::test]
+    async fn a_restart_reruns_the_gss_exclusions_legacy_mls_removal() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, _parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+
+        // The durable half of the flow ran on the receiver: the roster
+        // reached the frame's result head (the replica took its share, so
+        // the install is `Applied`). The replica holds no MLS view here,
+        // so the install's own removal had nothing to do.
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await.as_deref(),
+            Some(result_head.as_str())
+        );
+        assert!(
+            ng::save_named_groups(&fx.replica).await,
+            "the installed roster is durable"
+        );
+
+        // The crash residue: the frame is held in the `.celog` again, as
+        // the write-before-install left it when the tail never ran.
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let at = (
+            decoded.body.next_revision,
+            decoded.body.commit.state_hash.as_str(),
+        );
+        assert!(
+            replay_log::write_received(
+                &fx.replica,
+                replay_log::CE_EXTENSION,
+                held,
+                &fx.stable,
+                at,
+                &Arc::new(frame.clone()),
+            )
+            .await,
+            "the frame is held, as the crash left it"
+        );
+
+        // The receiver restarts from its data dir. Its session-scoped MLS
+        // view is rebuilt and lists the removed member — the state the
+        // crash left behind.
+        let restarted = ng::tests::secure_endpoint_test_state_at(
+            fx._replica_dir.path(),
+            Arc::clone(&fx.replica.agent),
+        )
+        .await?;
+        super::super::load_persisted_obligations(&restarted).await;
+        seeded_legacy_mls_view(&fx, &restarted).await?;
+        {
+            let views = restarted.mls_groups.read().await;
+            let view = views.get(&fx.group_id).context("the view")?;
+            assert!(view.is_member(&fx.leaver));
+            assert!(view.is_member(&restarted.agent.agent_id()));
+        }
+
+        // One worker stash pass converges the view with the durable
+        // roster; the roster itself is unchanged.
+        retry_stash(&restarted).await;
+        assert_eq!(
+            head_of(&restarted, &fx.group_id).await.as_deref(),
+            Some(result_head.as_str()),
+            "the convergence installs nothing new"
+        );
+        {
+            let views = restarted.mls_groups.read().await;
+            let view = views.get(&fx.group_id).context("the view")?;
+            assert!(
+                !view.is_member(&fx.leaver),
+                "#1580: the removed member left the legacy MLS view"
+            );
+            assert!(
+                view.is_member(&restarted.agent.agent_id()),
+                "the survivor keeps its seat"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1580, the in-process form: a peer resends the exact durable frame
+    /// after this node already installed it. The duplicate replay reruns
+    /// the local legacy MLS removal, so a view that still lists the
+    /// removed member (the crash between the durable write and the
+    /// removal) converges on the resend.
+    #[tokio::test]
+    async fn a_duplicate_gss_exclusion_frame_reruns_the_legacy_mls_removal() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        let (frame, result_head, _parent) = authored_frame_and_parent(&fx).await?;
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+
+        // The stale listing: the removal never ran on it.
+        seeded_legacy_mls_view(&fx, &fx.replica).await?;
+        {
+            let views = fx.replica.mls_groups.read().await;
+            let view = views.get(&fx.group_id).context("the view")?;
+            assert!(view.is_member(&fx.leaver));
+        }
+
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Duplicate
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await.as_deref(),
+            Some(result_head.as_str()),
+            "the duplicate installs nothing new"
+        );
+        let views = fx.replica.mls_groups.read().await;
+        let view = views.get(&fx.group_id).context("the view")?;
+        assert!(
+            !view.is_member(&fx.leaver),
+            "#1580: the duplicate reran the legacy MLS removal"
+        );
+        assert!(
+            view.is_member(&fx.replica.agent.agent_id()),
+            "the survivor keeps its seat"
+        );
+        Ok(())
     }
 
     /// #1508 review (Codex P1, boot race): a frame received before the S4
