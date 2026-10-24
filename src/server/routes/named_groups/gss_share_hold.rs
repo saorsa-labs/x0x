@@ -86,7 +86,7 @@ struct HeldRemoval {
 /// The hold file format version.
 const HOLD_FILE_VERSION: u32 = 1;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct HoldFile {
     version: u32,
     group_key: String,

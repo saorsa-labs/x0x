@@ -1897,10 +1897,9 @@ fn blocks_manual_request(cause: WaitingCause) -> bool {
     )
 }
 
-/// §2: list a queued manual request on its row. A repeat of a listed
-/// kind adds nothing, so a client that repeats a request does not grow the
-/// list: it holds at most one entry per kind, the earliest (ZCode MINOR at
-/// 7441b7a).
+/// §2: list a queued manual request on its row, at most one entry per
+/// kind (the earliest), so a repeated request does not grow the list
+/// (ZCode MINOR at 7441b7a).
 fn queue_manual(
     queued: &mut HashMap<EvictionKey, Vec<QueuedManual>>,
     key: EvictionKey,
@@ -1908,7 +1907,7 @@ fn queue_manual(
     now_ms: u64,
 ) {
     let requests = queued.entry(key).or_default();
-    if requests.iter().all(|request| request.kind != kind) {
+    if !requests.iter().any(|request| request.kind == kind) {
         requests.push(QueuedManual {
             kind,
             queued_at_unix_ms: now_ms,
