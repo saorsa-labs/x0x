@@ -1326,6 +1326,7 @@ pub async fn serve_with_options(
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
         home_provisioning_deferred: std::sync::atomic::AtomicBool::new(false),
         pending_join_refusals: StdMutex::new(HashMap::new()),
+        pending_join_notices: StdMutex::new(HashMap::new()),
         pending_join_attempts: StdMutex::new(HashMap::new()),
         last_join_outcomes: StdMutex::new(HashMap::new()),
         join_refusal_sign_limiter: StdMutex::new(Default::default()),
