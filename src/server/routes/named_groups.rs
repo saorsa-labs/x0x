@@ -12887,6 +12887,111 @@ pub(in crate::server) fn set_policy_update(
     next.updated_at = committed_at;
 }
 
+/// The fields a verified `JoinRequestCreated` sets. The ordinary apply
+/// and the GSS held-chain walk (#1533 rc19) share it, so both reach one
+/// result.
+pub(in crate::server) fn set_join_request_created(
+    next: &mut x0x::groups::GroupInfo,
+    req: x0x::groups::JoinRequest,
+    requester_kem_public_key_b64: Option<String>,
+) {
+    let requester_agent_id = req.requester_agent_id.clone();
+    let treekem_key_package_b64 = req.treekem_key_package_b64.clone();
+    let ts = req.created_at;
+    next.join_requests.insert(req.request_id.clone(), req);
+    if let Some(kem_b64) = requester_kem_public_key_b64 {
+        next.members_v2
+            .entry(requester_agent_id.clone())
+            .and_modify(|m| {
+                m.kem_public_key_b64 = Some(kem_b64.clone());
+            })
+            .or_insert_with(|| x0x::groups::GroupMember {
+                agent_id: requester_agent_id.clone(),
+                user_id: None,
+                role: x0x::groups::GroupRole::Member,
+                state: x0x::groups::GroupMemberState::Pending,
+                display_name: None,
+                joined_at: ts,
+                updated_at: ts,
+                added_by: None,
+                removed_by: None,
+                kem_public_key_b64: Some(kem_b64),
+                treekem_key_package_b64: treekem_key_package_b64.clone(),
+                treekem_key_package_hash: None,
+                certificate: None,
+                certificate_missing_since_ms: None,
+                certificate_digest: None,
+            });
+    }
+    if let Some(kp_b64) = treekem_key_package_b64 {
+        next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
+    }
+}
+
+/// The plane-independent fields a verified `JoinRequestApproved` sets
+/// (the TreeKEM fields are set after it). Shared as
+/// [`set_join_request_created`] is.
+pub(in crate::server) fn set_join_request_approved(
+    next: &mut x0x::groups::GroupInfo,
+    request_id: &str,
+    actor: &str,
+    requester_agent_id: &str,
+    revision: u64,
+    committed_at: u64,
+) {
+    if let Some(req) = next.join_requests.get_mut(request_id) {
+        req.status = x0x::groups::JoinRequestStatus::Approved;
+        req.reviewed_by = Some(actor.to_string());
+        req.reviewed_at = Some(committed_at);
+    }
+    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
+    next.add_member(
+        requester_agent_id.to_string(),
+        x0x::groups::GroupRole::Member,
+        Some(actor.to_string()),
+        None,
+    );
+}
+
+/// The fields a verified `JoinRequestRejected` sets. Shared as
+/// [`set_join_request_created`] is.
+pub(in crate::server) fn set_join_request_rejected(
+    next: &mut x0x::groups::GroupInfo,
+    request_id: &str,
+    actor: &str,
+    committed_at: u64,
+) {
+    let requester_hex = next
+        .join_requests
+        .get(request_id)
+        .map(|req| req.requester_agent_id.clone());
+    if let Some(req) = next.join_requests.get_mut(request_id) {
+        req.status = x0x::groups::JoinRequestStatus::Rejected;
+        req.reviewed_by = Some(actor.to_string());
+        req.reviewed_at = Some(committed_at);
+    }
+    // PR #370 r2 blocker 1: keep the roster mirror in step with the
+    // resolved request (gossip-apply side).
+    if let Some(requester_hex) = requester_hex {
+        next.clear_pending_joiner(&requester_hex, Some(actor.to_string()));
+    }
+}
+
+/// The fields a verified `JoinRequestCancelled` sets. Shared as
+/// [`set_join_request_created`] is.
+pub(in crate::server) fn set_join_request_cancelled(
+    next: &mut x0x::groups::GroupInfo,
+    request_id: &str,
+    requester_agent_id: &str,
+) {
+    if let Some(req) = next.join_requests.get_mut(request_id) {
+        req.status = x0x::groups::JoinRequestStatus::Cancelled;
+    }
+    // PR #370 r2 blocker 1: keep the roster mirror in step with the
+    // resolved request (gossip-apply side).
+    next.clear_pending_joiner(requester_agent_id, None);
+}
+
 /// A parked GSS removal of a placeholder member that chains from `info`'s
 /// head and rotates one epoch above it (test builds only): the state
 /// [`park_gss_removal_for_share`] leaves after a verified removal.
@@ -15332,34 +15437,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         predecessor_envelope_digest: envelope_bytes.map(|b| blake3::hash(b).into()),
                         predecessor_first_seen_ms: observed_predecessor_at_ms,
                     };
-                    next.join_requests.insert(request_id.clone(), req);
-                    if let Some(kem_b64) = requester_kem_public_key_b64.clone() {
-                        next.members_v2
-                            .entry(requester_agent_id.clone())
-                            .and_modify(|m| {
-                                m.kem_public_key_b64 = Some(kem_b64.clone());
-                            })
-                            .or_insert_with(|| x0x::groups::GroupMember {
-                                agent_id: requester_agent_id.clone(),
-                                user_id: None,
-                                role: x0x::groups::GroupRole::Member,
-                                state: x0x::groups::GroupMemberState::Pending,
-                                display_name: None,
-                                joined_at: ts,
-                                updated_at: ts,
-                                added_by: None,
-                                removed_by: None,
-                                kem_public_key_b64: Some(kem_b64),
-                                treekem_key_package_b64: treekem_key_package_b64.clone(),
-                                treekem_key_package_hash: None,
-                                certificate: None,
-                                certificate_missing_since_ms: None,
-                                certificate_digest: None,
-                            });
-                    }
-                    if let Some(kp_b64) = treekem_key_package_b64.clone() {
-                        next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
-                    }
+                    set_join_request_created(next, req, requester_kem_public_key_b64.clone());
                 },
             )
             .await
@@ -15490,18 +15568,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    let now_ms = commit.committed_at;
-                    if let Some(req) = next.join_requests.get_mut(&request_id) {
-                        req.status = x0x::groups::JoinRequestStatus::Approved;
-                        req.reviewed_by = Some(actor.clone());
-                        req.reviewed_at = Some(now_ms);
-                    }
-                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
-                    next.add_member(
-                        requester_agent_id.clone(),
-                        x0x::groups::GroupRole::Member,
-                        Some(actor.clone()),
-                        None,
+                    set_join_request_approved(
+                        next,
+                        &request_id,
+                        &actor,
+                        &requester_agent_id,
+                        revision,
+                        commit.committed_at,
                     );
                     if let Some((_, _, _, _, package_hash)) = treekem_payload.as_ref() {
                         next.set_member_treekem_key_package_hash(
@@ -15692,22 +15765,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    let requester_hex = next
-                        .join_requests
-                        .get(request_id.as_str())
-                        .map(|req| req.requester_agent_id.clone());
-                    if let Some(req) = next.join_requests.get_mut(&request_id) {
-                        req.status = x0x::groups::JoinRequestStatus::Rejected;
-                        req.reviewed_by = Some(actor.clone());
-                        req.reviewed_at = Some(commit.committed_at);
-                    }
-                    // PR #370 r2 blocker 1: keep the roster mirror in step
-                    // with the resolved request (gossip-apply side).
-                    if let Some(requester_hex) = requester_hex {
-                        next.clear_pending_joiner(&requester_hex, Some(actor.clone()));
-                    }
-                },
+                |next| set_join_request_rejected(next, &request_id, &actor, commit.committed_at),
             )
             .await
             else {
@@ -15750,14 +15808,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 held_gss_guard,
                 x0x::groups::ActionKind::NonMemberRequest,
-                |next| {
-                    if let Some(req) = next.join_requests.get_mut(&request_id) {
-                        req.status = x0x::groups::JoinRequestStatus::Cancelled;
-                    }
-                    // PR #370 r2 blocker 1: keep the roster mirror in step
-                    // with the resolved request (gossip-apply side).
-                    next.clear_pending_joiner(requester_agent_id.as_str(), None);
-                },
+                |next| set_join_request_cancelled(next, &request_id, &requester_agent_id),
             )
             .await
             else {
@@ -15887,7 +15938,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             }
             // Only accept from an active admin+.
             let actor_role = info.caller_role(&actor);
+            // #1533 rc19 (Codex P1): a verified removal or ban of the actor
+            // that waits for this epoch's share takes its authority, though
+            // the head (and so `info`) still lists it.
+            gss_share_hold::ensure_loaded(state).await;
+            let actor_removed = gss_share_hold::removes_share_actor(
+                state,
+                &resolved_group_key,
+                &actor,
+                secret_epoch,
+            );
             let actor_authorized = actor == sender_hex
+                && !actor_removed
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
                 // ADR 0110 §4b(1), #1508 r5: an owner-recovery share can
@@ -54359,6 +54421,8 @@ pub(in crate::server) mod tests {
         state: Arc<AppState>,
         _dir: tempfile::TempDir,
         admin_kp: crate::identity::AgentKeypair,
+        /// The member that the removal takes off the roster.
+        victim: AgentId,
         victim_hex: String,
         group_id: String,
         new_epoch: u64,
@@ -54397,14 +54461,23 @@ pub(in crate::server) mod tests {
         _dir: tempfile::TempDir,
         group_tag: &str,
     ) -> Result<F1GssRotationFixture> {
+        f1_gss_rotation_fixture_with(state, _dir, group_tag, |_, _| {}).await
+    }
+
+    // The same fixture with `tweak` applied to the parent before it is
+    // installed and the removal is sealed on it (the victim's hex id is
+    // passed, so a test can make the victim an admin).
+    async fn f1_gss_rotation_fixture_with(
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+        group_tag: &str,
+        tweak: impl FnOnce(&mut x0x::groups::GroupInfo, &str),
+    ) -> Result<F1GssRotationFixture> {
         let admin_kp = crate::identity::AgentKeypair::generate()?;
         let admin_id = admin_kp.agent_id();
         let admin_hex = hex::encode(admin_id.as_bytes());
-        let victim_hex = hex::encode(
-            crate::identity::AgentKeypair::generate()?
-                .agent_id()
-                .as_bytes(),
-        );
+        let victim = crate::identity::AgentKeypair::generate()?.agent_id();
+        let victim_hex = hex::encode(victim.as_bytes());
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let promotee_kp = crate::identity::AgentKeypair::generate()?;
         let promotee = promotee_kp.agent_id();
@@ -54456,6 +54529,7 @@ pub(in crate::server) mod tests {
             Some(admin_hex.clone()),
             None,
         );
+        tweak(&mut parent, &victim_hex);
         parent.recompute_state_hash();
 
         // Install the parent (the survivor daemon's pre-event view) in state.
@@ -54521,6 +54595,7 @@ pub(in crate::server) mod tests {
             state,
             _dir,
             admin_kp,
+            victim,
             victim_hex,
             group_id,
             new_epoch,
@@ -55409,6 +55484,195 @@ pub(in crate::server) mod tests {
                 .await
                 .is_some(),
             "sends stay held"
+        );
+        Ok(())
+    }
+
+    /// #1533 rc19 (Codex P1 at 8578a78): A removes admin V with a GSS
+    /// rotation. While the removal waits on a survivor, the head still
+    /// lists V as an admin. V seals a key that it chose for the removal's
+    /// epoch. That share must install nothing and the hold must stay; A's
+    /// share then installs. Before the fix V's key installed, released the
+    /// hold, and A's same-epoch share was refused, so the survivor sealed
+    /// new ciphertext under a key that V holds.
+    #[tokio::test]
+    async fn rc19_gss_share_from_the_removed_admin_installs_nothing() -> Result<()> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let f = f1_gss_rotation_fixture_with(state, dir, "removed-admin", |parent, victim| {
+            parent.set_member_role(victim, x0x::groups::GroupRole::Admin);
+        })
+        .await?;
+        let admin = f.admin_kp.agent_id();
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted, "the removal waits for its share");
+
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let stable_group_id = f.committed.stable_group_id().to_string();
+        let chosen = [0xbb_u8; 32];
+        let aad = secure_share_aad(&stable_group_id, &local_hex, f.new_epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &f.state.agent_kem_keypair.public_bytes,
+                &aad,
+                &chosen,
+            )?;
+        let victim_share = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: stable_group_id,
+            recipient: local_hex,
+            secret_epoch: f.new_epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: f.victim_hex.clone(),
+        };
+        let refused =
+            apply_named_group_metadata_event(&f.state, victim_share, f.victim, true, None).await;
+        assert!(!refused.accepted, "the removal takes V's authority");
+        assert_gss_removal_held(&f).await?;
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            Some(GroupCiphertextHold::PendingGssRemoval),
+            "sends stay held"
+        );
+
+        let _ =
+            apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), admin, true, None)
+                .await;
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// #1533 rc19 (Codex P1 at 8578a78): A removes a member with a GSS
+    /// rotation, J requests to join, A approves J, A promotes B and goes
+    /// offline. A lagging survivor must walk J's request and its approval,
+    /// install the removal with B's secret and reach A's last head. Before
+    /// the fix the walk stopped at the request, so the removal stayed
+    /// parked although B was an admin.
+    #[tokio::test]
+    async fn rc19_gss_removal_catchup_past_a_join_request_approval_reaches_its_head() -> Result<()>
+    {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let f = f1_gss_rotation_fixture_with(state, dir, "approval-then-promotion", |parent, _| {
+            parent.policy.admission = x0x::groups::GroupAdmission::RequestAccess;
+        })
+        .await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let joiner_kp = crate::identity::AgentKeypair::generate()?;
+        let joiner = joiner_kp.agent_id();
+        let joiner_hex = hex::encode(joiner.as_bytes());
+        let stable_group_id = f.committed.stable_group_id().to_string();
+        let request_id = "rc19-request".to_string();
+
+        let mut requested = f.committed.clone();
+        set_join_request_created(
+            &mut requested,
+            x0x::groups::JoinRequest {
+                request_id: request_id.clone(),
+                group_id: stable_group_id.clone(),
+                requester_agent_id: joiner_hex.clone(),
+                requester_user_id: None,
+                requested_role: x0x::groups::GroupRole::Member,
+                message: None,
+                treekem_key_package_b64: None,
+                created_at: 2_000,
+                reviewed_at: None,
+                reviewed_by: None,
+                status: x0x::groups::JoinRequestStatus::Pending,
+                predecessor_envelope_digest: None,
+                predecessor_first_seen_ms: None,
+            },
+            None,
+        );
+        let request_commit =
+            seal_commit_owner_certified(&f.state, &mut requested, &joiner_kp, 2_000).await?;
+        let request = NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: stable_group_id.clone(),
+            request_id: request_id.clone(),
+            requester_agent_id: joiner_hex.clone(),
+            message: None,
+            ts: 2_000,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(request_commit),
+        };
+        let mut approved = requested.clone();
+        let approval_revision = approved.roster_revision.saturating_add(1);
+        set_join_request_approved(
+            &mut approved,
+            &request_id,
+            &admin_hex,
+            &joiner_hex,
+            approval_revision,
+            3_000,
+        );
+        let approval_commit =
+            seal_commit_owner_certified(&f.state, &mut approved, &f.admin_kp, 3_000).await?;
+        let approval = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: stable_group_id.clone(),
+            request_id,
+            revision: approval_revision,
+            actor: admin_hex.clone(),
+            requester_agent_id: joiner_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_key_package_hash: None,
+            treekem_epoch: None,
+            commit: Some(approval_commit),
+        };
+        let mut promoted = approved.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 4_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: stable_group_id,
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: promotee_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(
+            &f.state,
+            rc14_promotee_share(&f),
+            f.promotee,
+            true,
+            None,
+        )
+        .await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, request, joiner, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, approval, admin, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert!(info.has_active_member(&joiner_hex), "J is seated");
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
         );
         Ok(())
     }
