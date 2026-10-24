@@ -241,6 +241,22 @@ impl CeState {
     }
 }
 
+impl CeState {
+    /// #1508 rc17 (Codex P1): whether a retained crypto-only exclusion
+    /// frame of `stable_group_id` commits a revision above `revision`. A
+    /// frame is retained only after [`receive`] checked it, or after a
+    /// restart restored a frame that passed those checks.
+    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64, now: Instant) -> bool {
+        self.stash.iter().any(|frame| {
+            now.saturating_duration_since(frame.at) <= CE_STASH_TTL
+                && ce::decode_frame(&frame.bytes).is_ok_and(|decoded| {
+                    decoded.body.stable_group_id == stable_group_id
+                        && decoded.body.next_revision > revision
+                })
+        })
+    }
+}
+
 fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CE_LOG_PER_GROUP> {
     &mut inner.ce.log
 }

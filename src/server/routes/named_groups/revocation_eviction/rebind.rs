@@ -173,6 +173,22 @@ impl RebindState {
     }
 }
 
+impl RebindState {
+    /// #1508 rc17 (Codex P1): whether a retained rebind frame of
+    /// `stable_group_id` commits a revision above `revision`. A frame is
+    /// retained only after its signatures and sender checks pass
+    /// ([`receive`]), or after a restart restored a frame that passed them.
+    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64, now: Instant) -> bool {
+        self.stash.iter().any(|frame| {
+            now.saturating_duration_since(frame.at) <= CRB_STASH_TTL
+                && cr::decode_frame(&frame.bytes).is_ok_and(|decoded| {
+                    decoded.body.stable_group_id == stable_group_id
+                        && decoded.body.next_revision > revision
+                })
+        })
+    }
+}
+
 fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP> {
     &mut inner.rebind.log
 }
@@ -3129,6 +3145,87 @@ pub(super) mod restart_tests {
             .await
             .attempt_wait
             .contains_key(&key));
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1508 rc17 (Codex P1): a valid admin-signed rebind at R+2 that
+    /// waits for R+1 is known higher-head evidence. A round that confirmed
+    /// the head at R must not let this node seal another S4 commit from it
+    /// (a competing branch, ADR 0110 §2). Before the fix the stashed frame
+    /// was not head evidence, so the head stayed synced.
+    #[tokio::test]
+    async fn a_stashed_future_rebind_unsyncs_a_confirmed_head() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        let me = state.agent.identity().agent_keypair();
+        let base = certified_group(&owner, &admin, &[&member, me])?;
+        hold_persisted(&state, &base).await?;
+        let stable = base.stable_group_id().to_string();
+        // R+1: the admin renews its own certificate; this node misses it.
+        let now_ms = now_unix_ms();
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, &admin, Some(now_ms / 1000 + 900))?;
+        let (parent, _) = cr::seal(
+            &base,
+            *admin.agent_id().as_bytes(),
+            &renewal,
+            &admin,
+            now_ms,
+        )
+        .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+        // R+2: the admin rebinds the member's seat on R+1.
+        let (frame, _) = sibling_frame(&parent, &owner, &member, &admin)?;
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: base.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: true,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        assert!(
+            super::super::group_head_synced(&state, &stable).await,
+            "no false hold"
+        );
+        assert_eq!(
+            receive(&state, admin.agent_id(), &frame).await,
+            ReceiveOutcome::Behind
+        );
+        // The worker keeps the frame, as `spawn_receipt` does.
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .stash
+            .push(StashedFrame {
+                sender: admin.agent_id(),
+                bytes: frame,
+                at: Instant::now(),
+            });
+        assert!(
+            !super::super::group_head_synced(&state, &stable).await,
+            "a stashed later-revision frame is unresolved head evidence"
+        );
         state.agent.shutdown().await;
         Ok(())
     }

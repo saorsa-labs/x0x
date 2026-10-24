@@ -564,6 +564,10 @@ fn head_holders(
 /// local head at its parent, so a round confirmed on that head would let
 /// this node seal another S4 commit from it: a sibling of the verified
 /// transition, and a quarantine.
+///
+/// #1508 rc17 (Codex P1): so is a retained S4 frame (a rebind, a
+/// crypto-only exclusion or an owner recovery) of a later revision, which
+/// waits for a missing predecessor. It is known higher-head evidence.
 async fn unresolved_head_evidence(
     state: &AppState,
     group_key: &str,
@@ -572,6 +576,16 @@ async fn unresolved_head_evidence(
 ) -> bool {
     super::gss_share_hold::ensure_loaded(state).await;
     if super::gss_share_hold::withholds(state, group_key, info) {
+        return true;
+    }
+    let stashed = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        let (stable, revision, now) = (info.stable_group_id(), info.state_revision, Instant::now());
+        inner.rebind.stash_ahead(stable, revision, now)
+            || inner.ce.stash_ahead(stable, revision, now)
+            || inner.orc.stash_ahead(stable, revision, now)
+    };
+    if stashed {
         return true;
     }
     let ids = [

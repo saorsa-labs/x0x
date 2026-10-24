@@ -449,6 +449,9 @@ pub(super) async fn hold_exclusion(
     secret_epoch: u64,
 ) {
     ensure_loaded(state).await;
+    // #1508 rc17 (#1533 rc16): added under the GSS publication gate held
+    // exclusively, as a parked removal is (`park_gss_removal_for_share`).
+    let gss_gate = state.gss_publication_gate.write().await;
     let added = push_exclusion(
         state,
         group_key,
@@ -457,6 +460,7 @@ pub(super) async fn hold_exclusion(
             secret_epoch,
         },
     );
+    drop(gss_gate);
     if added {
         persist_logged(state, group_key).await;
     } else {
