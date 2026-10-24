@@ -38,6 +38,21 @@ pub const UPGRADE_HANDOFF_FLAG: &str = "--upgrade-handoff";
 /// supervised-exit semantics explicitly (launchd plists, Windows services).
 pub const SUPERVISED_ENV_VAR: &str = "X0X_SUPERVISED";
 
+/// Environment variable the x0x-generated Windows wrapper sets to the path
+/// of its own script (ADR-0061 §3, #621): the marker
+/// (`X0X_SUPERVISED=1`) alone is an operator assertion, so the upgrade-time
+/// readback loads and verifies the script this variable names.
+pub(crate) const WINDOWS_WRAPPER_ENV_VAR: &str = "X0X_WRAPPER";
+
+/// Wrapper-script version this build has tested supervised upgrades against
+/// (ADR-0061 §3, #621). `x0x autostart` stamps it into the generated script
+/// (`$x0xWrapperVersion`), and the readback accepts only that version. When
+/// the wrapper's semantics change, bump this, regenerate the script, and a
+/// deployment still on the old version refuses self-update until
+/// `x0x autostart` regenerates it — drift becomes visible, not silent.
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) const WINDOWS_WRAPPER_TESTED_VERSION: u32 = 1;
+
 /// Bound on the old process's graceful cancel before it hard-exits. The macOS
 /// SIGTERM-hang incident is why this must be bounded, not generous.
 const GRACEFUL_CANCEL_BOUND: Duration = Duration::from_secs(5);
@@ -64,6 +79,7 @@ const HEALTH_TIMEOUT_ENV: &str = "X0X_UPGRADE_HANDOFF_HEALTH_TIMEOUT_SECS";
 const ENV_WHITELIST: &[&str] = &[
     "INVOCATION_ID",
     SUPERVISED_ENV_VAR,
+    WINDOWS_WRAPPER_ENV_VAR,
     "X0X_LOG_DIR",
     "RUST_LOG",
 ];
@@ -2256,6 +2272,230 @@ pub(crate) mod systemd_readback_seam {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows wrapper loaded-policy readback (ADR-0061 §3, #621)
+// ---------------------------------------------------------------------------
+
+/// Outcome of the Windows wrapper loaded-policy readback — the Windows twin
+/// of [`LaunchdPolicyReadback`] (#615) and [`SystemdPolicyReadback`]
+/// (#690). Windows has no `launchctl`/`systemctl` to query, so the loaded
+/// policy is the wrapper script itself, named by the
+/// [`WINDOWS_WRAPPER_ENV_VAR`] binding the running wrapper set: that is the
+/// script the wrapper was started from and will run from on its next start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// `Verified`/`NotGuaranteed` are constructed by the Windows sampler and the
+// any-platform test table; off-Windows non-test builds only see
+// `NotApplicable` from the stub below.
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(crate) enum WindowsWrapperReadback {
+    /// No Windows wrapper readback applies (not Windows, or the recognized
+    /// signal is not the marker) — nothing to gate.
+    NotApplicable,
+    /// The bound script names the tested wrapper version, restarts after
+    /// exit 100, and runs THIS executable with THIS argv.
+    Verified {
+        /// The tested wrapper version the script carries.
+        wrapper_version: u32,
+    },
+    /// Every path that cannot confirm the guarantee. Fail-closed: choosing
+    /// `SupervisedExit` on any of these is the silent-service-disappearance
+    /// failure §3 exists to prevent — the daemon would exit 100 for the
+    /// upgrade and nothing restarts it.
+    NotGuaranteed {
+        /// Why the loaded wrapper policy could not be confirmed.
+        detail: String,
+    },
+}
+
+/// Basename of a Windows path-like string: Windows accepts both separators.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_path_basename(s: &str) -> &str {
+    s.rsplit(['\\', '/']).next().unwrap_or(s)
+}
+
+/// Parse a PowerShell single-quoted string array literal (`@('a','b,c')`,
+/// `@()` for empty; `''` inside quotes is a literal apostrophe). `None` on
+/// anything that is not exactly that grammar — the readback fails closed.
+#[cfg(any(test, target_os = "windows"))]
+fn parse_ps_string_array(literal: &str) -> Option<Vec<String>> {
+    let inner = literal
+        .strip_prefix("@(")
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut items = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while chars.peek() == Some(&'\'') {
+        chars.next();
+        let mut item = String::new();
+        loop {
+            match chars.next() {
+                Some('\'') if chars.peek() == Some(&'\'') => {
+                    item.push('\'');
+                    chars.next();
+                }
+                Some('\'') => break,
+                Some(c) => item.push(c),
+                None => return None,
+            }
+        }
+        items.push(item);
+        match chars.next() {
+            Some(',') => continue,
+            None => break,
+            _ => return None,
+        }
+    }
+    if chars.peek().is_some() {
+        return None;
+    }
+    Some(items)
+}
+
+/// The decision core of the Windows wrapper readback: verify the script text
+/// the running wrapper bound this instance to. Free of platform APIs so the
+/// refuse-vs-proceed table is unit-testable on any platform; the production
+/// sampler only supplies the script bytes. Every path that cannot confirm a
+/// tested version, a restart-on-exit-100 policy, and a binding to THIS
+/// executable (by `argv[0]`, the instance's self-reported path) and argv
+/// fails closed — a marker in isolation is not support (ADR-0061 §3).
+#[cfg(any(test, target_os = "windows"))]
+pub(crate) fn readback_windows_wrapper_script(
+    script: &str,
+    argv: &[String],
+) -> WindowsWrapperReadback {
+    use WindowsWrapperReadback::NotGuaranteed;
+    let refused = |what: &str| NotGuaranteed {
+        detail: format!("the wrapper script does not {what}"),
+    };
+    // `str::lines` is CRLF-safe, so an operator's editor resaving the script
+    // cannot break the marker lines.
+    let mut version: Option<u32> = None;
+    let mut wrapper_executable: Option<String> = None;
+    let mut arguments: Option<Vec<String>> = None;
+    let mut restart_on_100 = false;
+    let mut loop_restarts_on_100 = false;
+    for line in script.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("$x0xWrapperVersion = ") {
+            version = rest.parse().ok();
+        } else if let Some(rest) = line.strip_prefix("$x0xExecutable = ") {
+            wrapper_executable = rest
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+                .map(|inner| inner.replace("''", "'"));
+        } else if let Some(rest) = line.strip_prefix("$x0xArguments = ") {
+            arguments = parse_ps_string_array(rest);
+        } else if line == "$x0xRestartOnExit100 = $true" {
+            restart_on_100 = true;
+        } else if line == "if ($x0xExit -ne 100) { exit $x0xExit }" {
+            loop_restarts_on_100 = true;
+        }
+    }
+    let Some(version) = version else {
+        return refused("name a wrapper version (`$x0xWrapperVersion`)");
+    };
+    if version != WINDOWS_WRAPPER_TESTED_VERSION {
+        return NotGuaranteed {
+            detail: format!(
+                "the wrapper script names version {version}, not the tested version \
+                 {WINDOWS_WRAPPER_TESTED_VERSION}; run `x0x autostart` to regenerate it"
+            ),
+        };
+    }
+    if !restart_on_100 {
+        return refused("declare `$x0xRestartOnExit100 = $true`");
+    }
+    if !loop_restarts_on_100 {
+        return refused(
+            "propagate every exit status except 100 (`if ($x0xExit -ne 100) { exit $x0xExit }`)",
+        );
+    }
+    let Some(wrapper_executable) = wrapper_executable else {
+        return refused("name the executable it runs (`$x0xExecutable`)");
+    };
+    let Some(argv0) = argv.first() else {
+        return NotGuaranteed {
+            detail: "this process reports no argv, so the wrapper binding cannot be \
+                     compared"
+                .to_string(),
+        };
+    };
+    // Windows paths are case-insensitive, and `& $x0xExecutable` may hand the
+    // child a forward- or backslash-separated path; basename comparison on
+    // both separators is the identity relation (the launchd readback's
+    // basename rule, Windows-adjusted).
+    if !windows_path_basename(&wrapper_executable)
+        .eq_ignore_ascii_case(windows_path_basename(argv0))
+    {
+        return NotGuaranteed {
+            detail: format!(
+                "the wrapper script runs `{wrapper_executable}`, not this instance \
+                 (`{argv0}`)"
+            ),
+        };
+    }
+    let Some(arguments) = arguments else {
+        return refused("name the arguments it runs (`$x0xArguments`)");
+    };
+    let argv_tail: &[String] = argv.get(1..).unwrap_or(&[]);
+    if arguments != argv_tail {
+        return NotGuaranteed {
+            detail: format!(
+                "the wrapper script runs different arguments (`{arguments:?}`) than this \
+                 instance (`{argv_tail:?}`)"
+            ),
+        };
+    }
+    WindowsWrapperReadback::Verified {
+        wrapper_version: version,
+    }
+}
+
+/// Sample the Windows wrapper readback for the marker signal: load the
+/// script named by [`WINDOWS_WRAPPER_ENV_VAR`] and verify it. A marker
+/// without the binding, or an unreadable script, fails closed.
+#[cfg(target_os = "windows")]
+fn sampled_windows_wrapper_readback(
+    signals: &SupervisionSignals,
+    argv: &[String],
+) -> WindowsWrapperReadback {
+    if signals.invocation_id || !signals.x0x_supervised {
+        return WindowsWrapperReadback::NotApplicable;
+    }
+    let Some(wrapper) = std::env::var_os(WINDOWS_WRAPPER_ENV_VAR).filter(|v| !v.is_empty()) else {
+        return WindowsWrapperReadback::NotGuaranteed {
+            detail: format!(
+                "{SUPERVISED_ENV_VAR}=1 is set but {WINDOWS_WRAPPER_ENV_VAR} is not, so the \
+                 marker did not come from an x0x-generated wrapper. Run `x0x autostart` to \
+                 install the supported wrapper, or remove {SUPERVISED_ENV_VAR} if this \
+                 instance is not supervised",
+            ),
+        };
+    };
+    match std::fs::read_to_string(&wrapper) {
+        Ok(script) => readback_windows_wrapper_script(&script, argv),
+        Err(e) => WindowsWrapperReadback::NotGuaranteed {
+            detail: format!(
+                "cannot read the wrapper script `{}` named by {WINDOWS_WRAPPER_ENV_VAR}: {e}",
+                wrapper.to_string_lossy()
+            ),
+        },
+    }
+}
+
+/// Windows does not exist here, so no wrapper readback applies. The macOS
+/// marker keeps its launchd gate; every other signal keeps today's
+/// behaviour.
+#[cfg(not(target_os = "windows"))]
+fn sampled_windows_wrapper_readback(
+    _signals: &SupervisionSignals,
+    _argv: &[String],
+) -> WindowsWrapperReadback {
+    WindowsWrapperReadback::NotApplicable
+}
+
 /// The instance's restart contract could not be resolved, so no bytes may be
 /// replaced (ADR-0061 §1: failure "leaves the current process and installed
 /// binaries unchanged and reports the unresolved contract").
@@ -2469,6 +2709,7 @@ pub(crate) async fn resolve_staging_identity(
     let argv = current_argv();
     let launchd =
         readback_launchd_policy_retaining(&signals, executable, &argv, lease.clone()).await;
+    let windows = sampled_windows_wrapper_readback(&signals, &argv);
     let observed_signals = signals.clone();
     let observed_executable = executable.to_path_buf();
     let systemd = spawn_readback_retaining(
@@ -2492,6 +2733,7 @@ pub(crate) async fn resolve_staging_identity(
         api_addr,
         &launchd,
         (&systemd.policy, systemd.verified_identity.as_ref()),
+        &windows,
     )?;
     Ok(StagingIdentity {
         executable: identity.executable,
@@ -2521,7 +2763,10 @@ pub fn resolve_restart_plan(
     systemd_readback: &SystemdPolicyReadback,
 ) -> Result<RestartPlan, RestartOwnershipError> {
     // Only the strict path can produce a public plan: it carries no
-    // staging-only unit identity past a pending start-rate window.
+    // staging-only unit identity past a pending start-rate window. The
+    // Windows wrapper readback is sampled inline (a single small file read,
+    // unlike the subprocess readbacks callers offload): on every other
+    // platform it is a constant `NotApplicable`.
     let identity = resolve_restart_identity(
         stop_on_upgrade,
         signals,
@@ -2530,6 +2775,7 @@ pub fn resolve_restart_plan(
         api_addr,
         launchd_readback,
         (systemd_readback, None),
+        &sampled_windows_wrapper_readback(signals, &current_argv()),
     )?;
     Ok(RestartPlan {
         mode: identity.mode,
@@ -2545,6 +2791,10 @@ pub fn resolve_restart_plan(
     })
 }
 
+// One resolved input per supervision family (launchd, systemd, Windows
+// wrapper) keeps each readback independently injectable for the decision
+// table instead of packing them into a struct tests would rebuild anyway.
+#[allow(clippy::too_many_arguments)]
 fn resolve_restart_identity(
     stop_on_upgrade: bool,
     signals: &SupervisionSignals,
@@ -2553,6 +2803,7 @@ fn resolve_restart_identity(
     api_addr: Option<SocketAddr>,
     launchd_readback: &LaunchdPolicyReadback,
     systemd: (&SystemdPolicyReadback, Option<&SystemdVerifiedUnit>),
+    windows_readback: &WindowsWrapperReadback,
 ) -> Result<ResolvedRestartIdentity, RestartOwnershipError> {
     let (systemd_readback, staging_unit) = systemd;
     let mode = plan_restart_mode(stop_on_upgrade, signals)?;
@@ -2618,6 +2869,26 @@ fn resolve_restart_identity(
                 signal: format!("{SUPERVISED_ENV_VAR}=1"),
                 exit_code: supervised_exit_code(),
                 detail: detail.clone(),
+            });
+        }
+        // #621 / ADR-0061 §3, the Windows half of the marker gate: on Windows
+        // the marker names an x0x-generated wrapper, and the script the
+        // wrapper bound this instance to (loaded at upgrade time) is the
+        // restart policy. A marker whose wrapper cannot be confirmed is a
+        // marker in isolation — precisely what §3 rules out — so the apply is
+        // refused while the current binary still serves. `Unresolved` rather
+        // than a new error variant: `RestartOwnershipError` is public API,
+        // and adding a variant would break downstream matches (#621 rules).
+        if let WindowsWrapperReadback::NotGuaranteed { detail } = windows_readback {
+            return Err(RestartOwnershipError::Unresolved {
+                what: "Windows wrapper restart policy",
+                detail: format!(
+                    "{detail}. The supported deployment is the wrapper generated by \
+                     `x0x autostart` (restart after exit {} only); run it to install or \
+                     regenerate the wrapper, or remove {SUPERVISED_ENV_VAR} if this instance \
+                     is not supervised",
+                    supervised_exit_code()
+                ),
             });
         }
     }
@@ -3904,6 +4175,206 @@ mod tests {
         )
         .expect("a verified launchd policy is a supported contract");
         assert_eq!(plan.mode, RestartMode::SupervisedExit);
+    }
+
+    // --------------------------------------------------------------------
+    // #621 / ADR-0061 §3, Windows: the wrapper-script loaded-policy readback
+    // and the marker gate behind it. The decision core is platform-free, so
+    // the fail-closed table runs on every platform (the Windows CI job runs
+    // it on the real target too).
+    // --------------------------------------------------------------------
+
+    /// A wrapper script in the exact shape `x0x autostart` generates, with
+    /// the version / policy / executable / argument lines the readback
+    /// verifies (the template lives in `src/cli/commands/windows-wrapper.ps1`;
+    /// a daemon.rs test cross-pins the rendered template against this
+    /// readback).
+    fn windows_wrapper_script(version: &str, executable: &str, arguments: &str) -> String {
+        format!(
+            "# x0xd supervision wrapper. Generated by `x0x autostart` -- do not edit.\n\
+             $x0xWrapperVersion = {version}\n\
+             $x0xExecutable = '{executable}'\n\
+             $x0xArguments = @({arguments})\n\
+             $x0xRestartOnExit100 = $true\n\
+             $env:X0X_SUPERVISED = '1'\n\
+             $env:X0X_WRAPPER = $PSCommandPath\n\
+             while ($true) {{\n\
+                 & $x0xExecutable @x0xArguments\n\
+                 $x0xExit = $LASTEXITCODE\n\
+                 if ($x0xExit -ne 100) {{ exit $x0xExit }}\n\
+                 Start-Sleep -Seconds 5\n\
+             }}\n"
+        )
+    }
+
+    #[test]
+    fn windows_wrapper_readback_verifies_the_generated_script() {
+        // The supported deployment: tested version, restart-on-exit-100
+        // policy, and a binding to this exact executable + argv (basename
+        // comparison is case-insensitive: Windows paths are).
+        let argv = vec![
+            "C:\\Program Files\\x0x\\X0XD.EXE".to_string(),
+            "--name".to_string(),
+            "alice".to_string(),
+        ];
+        let script = windows_wrapper_script(
+            &WINDOWS_WRAPPER_TESTED_VERSION.to_string(),
+            "c:\\program files\\x0x\\x0xd.exe",
+            "'--name','alice'",
+        );
+        assert_eq!(
+            readback_windows_wrapper_script(&script, &argv),
+            WindowsWrapperReadback::Verified {
+                wrapper_version: WINDOWS_WRAPPER_TESTED_VERSION
+            }
+        );
+        // CRLF-resaved scripts still parse (str::lines strips the CR).
+        assert!(matches!(
+            readback_windows_wrapper_script(&script.replace('\n', "\r\n"), &argv),
+            WindowsWrapperReadback::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn windows_wrapper_readback_fails_closed_on_every_drift() {
+        let argv = vec![
+            "C:\\Tools\\x0xd.exe".to_string(),
+            "--name".to_string(),
+            "alice".to_string(),
+        ];
+        let canonical = windows_wrapper_script(
+            &WINDOWS_WRAPPER_TESTED_VERSION.to_string(),
+            "C:\\Tools\\x0xd.exe",
+            "'--name','alice'",
+        );
+        // A version the build has not tested must refuse, naming both
+        // versions, so drift is visible.
+        let drifted = windows_wrapper_script("2", "C:\\Tools\\x0xd.exe", "'--name','alice'");
+        match readback_windows_wrapper_script(&drifted, &argv) {
+            WindowsWrapperReadback::NotGuaranteed { detail } => {
+                assert!(detail.contains("tested version"), "detail: {detail}")
+            }
+            other => panic!("untested wrapper version must refuse, got {other:?}"),
+        }
+        for (what, script) in [
+            (
+                "no version",
+                canonical.replacen("$x0xWrapperVersion = 1\n", "", 1),
+            ),
+            (
+                "policy flag off",
+                canonical.replace(
+                    "$x0xRestartOnExit100 = $true",
+                    "$x0xRestartOnExit100 = $false",
+                ),
+            ),
+            (
+                "restart-on-any-exit",
+                canonical.replace(
+                    "if ($x0xExit -ne 100) { exit $x0xExit }",
+                    "if ($x0xExit -eq 999) { exit $x0xExit }",
+                ),
+            ),
+            (
+                "different executable",
+                canonical.replace("'C:\\Tools\\x0xd.exe'", "'C:\\Tools\\otherd.exe'"),
+            ),
+            (
+                "different arguments",
+                canonical.replace("'--name','alice'", "'--name','bob'"),
+            ),
+            ("empty script", String::new()),
+        ] {
+            match readback_windows_wrapper_script(&script, &argv) {
+                WindowsWrapperReadback::NotGuaranteed { detail } => {
+                    assert!(!detail.is_empty(), "{what}: refusal must say why");
+                }
+                other => panic!("{what} must refuse, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn windows_marker_without_a_verified_wrapper_is_refused_by_the_resolver() {
+        // #621: on Windows the marker alone classified SupervisedExit and the
+        // daemon exited 100 into whatever the operator's wrapper did — the
+        // marker-in-isolation gap ADR-0061 §3 rules out. The resolver must
+        // refuse before any byte changes while the readback cannot confirm
+        // the wrapper's restart policy.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = installed_binary(dir.path());
+        let err = match resolve_restart_identity(
+            true,
+            &launchd_marker_signals(),
+            &binary,
+            Some(dir.path()),
+            None,
+            &readback_na(),
+            (&SystemdPolicyReadback::NotApplicable, None),
+            &WindowsWrapperReadback::NotGuaranteed {
+                detail: "the wrapper script does not name a wrapper version".to_string(),
+            },
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("an unverifiable Windows wrapper must refuse the apply"),
+        };
+        match &err {
+            RestartOwnershipError::Unresolved { what, detail } => {
+                assert_eq!(*what, "Windows wrapper restart policy");
+                assert!(detail.contains("x0x autostart"), "detail: {detail}");
+            }
+            other => panic!("expected the unresolved-contract refusal, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("No binaries were replaced"),
+            "the refusal must state that nothing was mutated: {message}"
+        );
+    }
+
+    #[test]
+    fn windows_marker_with_a_verified_wrapper_resolves_supervised_exit() {
+        // The positive half: the readback confirmed a tested wrapper bound to
+        // this instance, so the exit-100 restart request has a taker and the
+        // managed plan launches no helper (ADR-0061 §5).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = resolve_restart_identity(
+            true,
+            &launchd_marker_signals(),
+            &installed_binary(dir.path()),
+            Some(dir.path()),
+            None,
+            &readback_na(),
+            (&SystemdPolicyReadback::NotApplicable, None),
+            &WindowsWrapperReadback::Verified {
+                wrapper_version: WINDOWS_WRAPPER_TESTED_VERSION,
+            },
+        )
+        .expect("a verified Windows wrapper is a supported contract");
+        assert_eq!(identity.mode, RestartMode::SupervisedExit);
+        assert_eq!(identity.supervised_exit_code, Some(supervised_exit_code()));
+    }
+
+    #[test]
+    fn windows_wrapper_readback_gates_the_marker_signal_only() {
+        // The gate is scoped to the marker path: an unsupervised (or
+        // INVOCATION_ID) instance must not be refused over a Windows readback
+        // verdict, on any platform.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = resolve_restart_identity(
+            true,
+            &shell_parent_signals(),
+            &installed_binary(dir.path()),
+            Some(dir.path()),
+            None,
+            &readback_na(),
+            (&SystemdPolicyReadback::NotApplicable, None),
+            &WindowsWrapperReadback::NotGuaranteed {
+                detail: "unrelated".to_string(),
+            },
+        )
+        .expect("an unsupervised instance ignores the Windows wrapper readback");
+        assert_eq!(identity.mode, RestartMode::TransactionalHandoff);
     }
 
     #[test]
