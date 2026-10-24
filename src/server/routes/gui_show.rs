@@ -909,8 +909,9 @@ async fn send_show_and_wait(
         send_gui_dm(state, &agent, &machine, payload, bytes),
     )
     .await;
-    // The gossip ACK and the authenticated result are independent. A result
-    // that has already arrived is the outcome when the ACK times out.
+    // The gossip ACK and the authenticated result are independent. An ACK
+    // timeout keeps this waiter until `deadline`. A result that has already
+    // arrived is also the outcome.
     if let Some(result) = take_arrived(deadline, sent, wait).await {
         return remote_json(result.outcome, target_hex, request_id, None, None);
     }
@@ -923,7 +924,7 @@ async fn send_show_and_wait(
     )
 }
 
-/// One activity query. A reply that has already arrived survives an ACK timeout.
+/// One activity query. An ACK timeout keeps the waiter until `deadline`.
 async fn query_activity(
     state: &AppState,
     agent: AgentId,
@@ -938,21 +939,41 @@ async fn query_activity(
     take_arrived(deadline, sent, wait).await
 }
 
-/// Read a reply that has arrived, then the transport ACK.
+/// Read a reply that has arrived, then wait out the result deadline.
 ///
 /// `sent` is the finished send. A waiter that already holds a reply is
-/// returned even when that send timed out or failed. An empty waiter
-/// is read only after the send succeeds, and only until `deadline`.
+/// returned even when that send timed out or failed. A gossip ACK timeout
+/// ([`crate::dm::DmError::Timeout`]) still waits until `deadline`: the
+/// request may already be on the peer, and the authenticated result is a
+/// separate message. Any other send failure did not deliver the request,
+/// so the waiter stops. The outer `Elapsed` means `deadline` has already
+/// passed.
 async fn take_arrived<T>(
     deadline: tokio::time::Instant,
     sent: Result<Result<(), crate::dm::DmError>, tokio::time::error::Elapsed>,
+    wait: crate::gui::remote::PartyWait<'_, T>,
+) -> Option<T> {
+    take_arrived_with(deadline, sent, wait, || {}).await
+}
+
+/// `take_arrived` with a hook that runs once an ACK timeout starts the
+/// remaining wait. Production passes a no-op. The late-result test uses
+/// the hook to deliver only after that wait has begun.
+async fn take_arrived_with<T>(
+    deadline: tokio::time::Instant,
+    sent: Result<Result<(), crate::dm::DmError>, tokio::time::error::Elapsed>,
     mut wait: crate::gui::remote::PartyWait<'_, T>,
+    on_ack_timeout_wait: impl FnOnce(),
 ) -> Option<T> {
     if let Ok(value) = wait.try_recv() {
         return Some(value);
     }
-    if !matches!(sent, Ok(Ok(()))) {
+    let ack_timeout = matches!(sent, Ok(Err(crate::dm::DmError::Timeout { .. })));
+    if !matches!(sent, Ok(Ok(()))) && !ack_timeout {
         return None;
+    }
+    if ack_timeout {
+        on_ack_timeout_wait();
     }
     match tokio::time::timeout_at(deadline, wait.recv()).await {
         Ok(Ok(value)) => Some(value),
@@ -980,8 +1001,10 @@ fn show_dm_request(
 /// Visibility stamp for active selection and activity replies.
 ///
 /// A tab that is visible now counts as now, including when the stored
-/// stamp is older than [`crate::gui::ACTIVE_WINDOW_SECS`]. Hiding the tab
-/// leaves the stored stamp. The socket must hold a live session token.
+/// stamp is older than [`crate::gui::ACTIVE_WINDOW_SECS`]. Hiding a live
+/// tab, or disconnecting its socket, stores that instant via
+/// `record_visibility_end`. The stored stamp is then the last moment
+/// the tab was visible. The socket must hold a live session token.
 /// A session refresh does not write this stamp.
 pub(crate) async fn fresh_gui_visible_at(state: &AppState) -> Option<u64> {
     let now_instant = Instant::now();
@@ -994,6 +1017,20 @@ pub(crate) async fn fresh_gui_visible_at(state: &AppState) -> Option<u64> {
         return Some(now);
     }
     state.gui_show.last_gui_visible_at()
+}
+
+/// Store the last moment a live GUI tab was visible.
+///
+/// `ended_at` is the hide or disconnect instant. It replaces an earlier
+/// become-visible stamp when it is later. A tab visible at unix 0 and
+/// hidden at 7 minutes is still inside the 15-minute window at 16 minutes.
+/// The stamp from unix 0 is outside that window.
+pub(in crate::server) fn record_visibility_end(state: &AppState, ended_at: u64) {
+    let stamp = match state.gui_show.last_gui_visible_at() {
+        Some(stored) => stored.max(ended_at),
+        None => ended_at,
+    };
+    state.gui_show.note_gui_visible(stamp);
 }
 
 async fn send_gui_dm(
@@ -2800,6 +2837,124 @@ mod tests {
             }) => assert_eq!(request_id, qid),
             other => panic!("activity reply must survive the ACK timeout: {other:?}"),
         }
+        Ok(())
+    }
+
+    /// The gossip ACK returns at four seconds. The authenticated result
+    /// arrives after that, and still inside the ten-second result deadline.
+    #[tokio::test]
+    async fn show_result_arrives_after_the_ack_timeout() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x84; 32]);
+        let machine = MachineId([0x85; 32]);
+        let request_id = [0x86u8; 16];
+        let wait = state
+            .gui_show
+            .remote_hub()
+            .begin_show(request_id, agent, machine)
+            .expect("show waiter");
+        let deliver_state = Arc::clone(&state);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let delivered = tokio::spawn(async move {
+            ready_rx
+                .await
+                .expect("the ACK timeout must start the result wait");
+            tokio::task::yield_now().await;
+            deliver_state.gui_show.remote_hub().complete_show(
+                &agent,
+                &machine,
+                crate::gui::remote::GuiShowDmResult {
+                    request_id,
+                    outcome: GuiShowOutcome::Navigated,
+                },
+            );
+        });
+        let deadline = tokio::time::Instant::now() + crate::gui::remote::RESULT_WAIT;
+        let sent = Ok(Err(crate::dm::DmError::Timeout {
+            retries: 0,
+            elapsed: std::time::Duration::from_secs(4),
+        }));
+        let got = take_arrived_with(deadline, sent, wait, || {
+            let _ = ready_tx.send(());
+        })
+        .await;
+        delivered.await.expect("late result task");
+        match got {
+            Some(crate::gui::remote::GuiShowDmResult { outcome, .. }) => {
+                assert_eq!(outcome, GuiShowOutcome::Navigated);
+            }
+            None => panic!("a result after the ACK timeout must be kept"),
+        }
+        Ok(())
+    }
+
+    /// A send that never left this daemon does not sit on the result deadline.
+    #[tokio::test]
+    async fn send_failure_does_not_keep_the_result_wait() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x87; 32]);
+        let machine = MachineId([0x88; 32]);
+        let request_id = [0x89u8; 16];
+        let wait = state
+            .gui_show
+            .remote_hub()
+            .begin_show(request_id, agent, machine)
+            .expect("show waiter");
+        let deadline = tokio::time::Instant::now() + crate::gui::remote::RESULT_WAIT;
+        let started = std::time::Instant::now();
+        let got = take_arrived_with(
+            deadline,
+            Ok(Err(crate::dm::DmError::RecipientUndiscovered(
+                "not sent".to_string(),
+            ))),
+            wait,
+            || panic!("a failed send must not wait for a result"),
+        )
+        .await;
+        assert!(got.is_none());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a failed send must return before the result deadline"
+        );
+        Ok(())
+    }
+
+    /// A tab visible from minute 0 until minute 7 is still inside the
+    /// 15-minute window when the query runs at minute 16.
+    #[tokio::test]
+    async fn visible_from_zero_to_seven_is_active_at_sixteen() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        state.gui_show.note_gui_visible(0);
+        let hidden_at = 7 * 60;
+        let query_at = 16 * 60;
+        record_visibility_end(&state, hidden_at);
+        assert_eq!(state.gui_show.last_gui_visible_at(), Some(hidden_at));
+        let machine = [0x16_u8; 32];
+        let choice = crate::gui::remote::select_active(
+            query_at,
+            &[crate::gui::remote::ActivityCandidate {
+                machine_id: machine,
+                last_gui_visible_at: state.gui_show.last_gui_visible_at(),
+                remote_enabled: true,
+            }],
+        );
+        assert_eq!(
+            choice,
+            crate::gui::remote::ActiveChoice::Machine(machine),
+            "hide at minute 7 must still count at minute 16"
+        );
+        let stale = crate::gui::remote::select_active(
+            query_at,
+            &[crate::gui::remote::ActivityCandidate {
+                machine_id: machine,
+                last_gui_visible_at: Some(0),
+                remote_enabled: true,
+            }],
+        );
+        assert!(
+            matches!(stale, crate::gui::remote::ActiveChoice::None { .. }),
+            "the become-visible stamp at minute 0 is outside the window at minute 16"
+        );
         Ok(())
     }
 

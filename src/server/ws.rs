@@ -1128,7 +1128,10 @@ async fn abandon_ws_session(
     for child in children {
         child.abort();
     }
-    state.ws_sessions.write().await.remove(session_id);
+    let removed = state.ws_sessions.write().await.remove(session_id);
+    if let Some(session) = removed {
+        note_if_live_visible_ended(state, &session);
+    }
 }
 
 /// #1229: a topic backfill row is refused when its author is revoked or
@@ -1487,8 +1490,8 @@ async fn handle_ws_connection(
         return;
     };
     let call_forwarder = armed.forwarder;
-    // `gui=1` means the tab is visible at connect. A later hide does not
-    // clear `last_gui_visible_at`.
+    // `gui=1` means the tab is visible at connect. A later hide records
+    // that instant. It does not clear `last_gui_visible_at`.
     if visible_gui.load(Ordering::Acquire) {
         note_gui_tab_visible(&state);
     }
@@ -1703,18 +1706,20 @@ async fn handle_ws_connection(
         }
     }
 
-    // Cleanup: remove session, abort per-session forwarders
-    let subscribed_topics =
-        if let Some(session) = state.ws_sessions.write().await.remove(&session_id) {
-            let mut subscribed_topics = session.subscribed_topics;
-            for (topic, handle) in session.topic_forwarders {
-                subscribed_topics.insert(topic);
-                handle.abort();
-            }
-            subscribed_topics
-        } else {
-            HashSet::new()
-        };
+    // Cleanup: remove session, abort per-session forwarders.
+    // A live visible tab records this instant before the row is dropped.
+    let removed = state.ws_sessions.write().await.remove(&session_id);
+    let subscribed_topics = if let Some(session) = removed {
+        note_if_live_visible_ended(&state, &session);
+        let mut subscribed_topics = session.subscribed_topics;
+        for (topic, handle) in session.topic_forwarders {
+            subscribed_topics.insert(topic);
+            handle.abort();
+        }
+        subscribed_topics
+    } else {
+        HashSet::new()
+    };
 
     // Clean up shared subscriptions for topics where this was the last WS subscriber
     for topic in &subscribed_topics {
@@ -2303,7 +2308,7 @@ async fn handle_ws_command(
         }
 
         WsInbound::GuiVisible { visible } => {
-            let reveal = {
+            let (reveal, ended_visible) = {
                 let sessions = state.ws_sessions.read().await;
                 let Some(session) = sessions.get(session_id) else {
                     return;
@@ -2313,8 +2318,16 @@ async fn handle_ws_command(
                 // view this tab was opened for. Store every request. The
                 // reveal that is waiting for a slot applies the latest one
                 // when the frame fits, so a later show or hide wins.
-                begin_gui_visibility_request(session, visible)
+                let now = std::time::Instant::now();
+                let ended_visible = !visible
+                    && session
+                        .visible_with_live_session(|token| state.sessions.is_valid(token, now));
+                let reveal = begin_gui_visibility_request(session, visible);
+                (reveal, ended_visible)
             };
+            if ended_visible {
+                record_live_visibility_end(state);
+            }
             if let Some(token) = reveal {
                 if let Some(pending) = state
                     .gui_show
@@ -2446,13 +2459,34 @@ async fn finish_queued_reveal(state: &AppState, session_id: &str, sent: bool) {
     }
 }
 
-/// Record the last time a GUI tab became visible. Hiding the tab does not
-/// clear the timestamp.
+/// Record the last time a GUI tab became visible.
+///
+/// Hiding a live tab and disconnecting its socket store that later instant
+/// through `record_live_visibility_end`. Neither path clears the stamp.
 fn note_gui_tab_visible(state: &AppState) {
-    let unix_secs = std::time::SystemTime::now()
+    state.gui_show.note_gui_visible(unix_secs_now());
+}
+
+/// A live visible tab hid or its socket disconnected.
+///
+/// The stamp becomes this instant when it is later than the stored
+/// become-visible time. A hidden tab and an expired session do not move it.
+fn note_if_live_visible_ended(state: &AppState, session: &WsSession) {
+    let now = std::time::Instant::now();
+    if session.visible_with_live_session(|token| state.sessions.is_valid(token, now)) {
+        record_live_visibility_end(state);
+    }
+}
+
+/// Store the current unix time as the last moment a live tab was visible.
+fn record_live_visibility_end(state: &AppState) {
+    super::routes::gui_show::record_visibility_end(state, unix_secs_now());
+}
+
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    state.gui_show.note_gui_visible(unix_secs);
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// A full outbound queue with one pending origin banner. The receiver stays
@@ -3118,6 +3152,81 @@ mod tests {
             other => panic!("expected gui.show, got {other:?}"),
         }
         assert!(!state.gui_show.has_pending_session(token));
+    }
+
+    /// Hiding a live tab stores the hide instant. A second hide does not
+    /// move that stamp, and neither does disconnecting a hidden tab.
+    #[tokio::test]
+    async fn hiding_a_live_tab_records_the_hide_instant() {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        state.gui_show.note_gui_visible(0);
+        let token = state.sessions.issue(std::time::Instant::now());
+        state.ws_sessions.write().await.insert(
+            "live-tab".to_string(),
+            test_live_gui_ws_session("live-tab", &token),
+        );
+        let (tx, _rx) = mpsc::channel::<WsOutbound>(4);
+        let stats = WsOutboundStats::default();
+        let before = unix_secs_now();
+        handle_ws_command(
+            &state,
+            "live-tab",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        let stamp = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("hide records a stamp");
+        let after = unix_secs_now();
+        assert!(
+            (before..=after).contains(&stamp),
+            "hiding a live tab must store the hide instant, got {stamp} (window {before}..={after})"
+        );
+
+        state.gui_show.note_gui_visible(0);
+        handle_ws_command(
+            &state,
+            "live-tab",
+            r#"{"type":"gui.visible","visible":false}"#,
+            &tx,
+            &stats,
+            false,
+        )
+        .await;
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "a tab that is already hidden must not refresh the stamp"
+        );
+
+        let hidden = test_live_gui_ws_session("hidden-tab", &token);
+        hidden.set_visible_gui(false);
+        note_if_live_visible_ended(&state, &hidden);
+        assert_eq!(
+            state.gui_show.last_gui_visible_at(),
+            Some(0),
+            "disconnecting a hidden tab must not refresh the stamp"
+        );
+
+        let live = test_live_gui_ws_session("closing-tab", &token);
+        let disconnect_at = unix_secs_now();
+        note_if_live_visible_ended(&state, &live);
+        let closed = state
+            .gui_show
+            .last_gui_visible_at()
+            .expect("disconnect records a stamp");
+        let disconnect_end = unix_secs_now();
+        assert!(
+            (disconnect_at..=disconnect_end).contains(&closed),
+            "disconnecting a live tab must store that instant, got {closed}"
+        );
     }
 
     /// A hidden tab refreshes its session before the WebSocket reconnects.
