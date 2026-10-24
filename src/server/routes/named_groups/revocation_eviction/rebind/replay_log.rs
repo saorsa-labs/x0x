@@ -21,18 +21,27 @@
 //! - **Write.** Temp write, fsync, atomic rename and directory fsync, as
 //!   for the `.evjournal`. If the write fails, the commit does not occur.
 //!   A file with a newer layout is never rewritten, so the commit does not
-//!   occur either (fail closed).
+//!   occur either (fail closed). The write starts from the frames the file
+//!   already holds, then memory's, then the new frame: a restart may have
+//!   left frames in the file that memory has not installed, and a new
+//!   write never displaces them (#1579). A frame at a revision the file
+//!   already holds, with a different result head, is a competing commit:
+//!   both are kept, and the held frame is never replaced — the pair is the
+//!   fork evidence that two commits claimed one revision.
 //! - **Load.** A damaged file is quarantined (ADR 0108 §5a: pending name,
 //!   then history name), and that group starts with an empty log: its
 //!   frames are lost, the load never panics and never uses the damaged
 //!   bytes. A newer layout stays on disk, not loaded. A frame that is not
 //!   on this node's loaded chain is not held (a crash between the write and
-//!   the commit). An authored frame that is still the group's head gets
+//!   the commit). Of a competing pair at the head revision, the chain's
+//!   frame is held; the other stays in the file as evidence and is never
+//!   served (#1579). An authored frame that is still the group's head gets
 //!   its delivery again. A received frame above the loaded head (a crash
 //!   between the write and the install) is received again: the caller
 //!   puts it through the full receive checks.
-//! - **Retire.** The file holds the group's in-memory log, with the same
-//!   bound, so a frame leaves the file only when that bound drops it.
+//! - **Retire.** The file holds what the writes kept — memory's frames
+//!   and the frames only the file had — under the same bound, so a frame
+//!   leaves the file only when that bound drops it.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -119,9 +128,13 @@ struct HeldFrame {
 }
 
 impl<const CAP: usize> HeldLog<CAP> {
-    /// Keep a frame. A received frame never replaces a held frame of the
-    /// same revision; an authored frame does, because it is the one on
-    /// this node's chain.
+    /// Keep a frame. A frame of the same commit (the revision and the
+    /// result head) replaces the held copy, so one commit is held once; an
+    /// authored copy replaces a received one, because it is the one on
+    /// this node's chain. A frame at a held revision with a different
+    /// result head is a competing commit: both are kept and neither
+    /// replaces the other (#1579) — the bytes are the fork evidence that
+    /// two commits claimed one revision.
     pub(in super::super) fn remember(
         &mut self,
         stable_group_id: &str,
@@ -131,10 +144,10 @@ impl<const CAP: usize> HeldLog<CAP> {
         authored: bool,
     ) {
         let log = self.log.entry(stable_group_id.to_string()).or_default();
-        if let Some(at) = log.iter().position(|e| e.next_revision == next_revision) {
-            if !authored {
-                return;
-            }
+        if let Some(at) = log
+            .iter()
+            .position(|e| e.next_revision == next_revision && e.result_head == result_head)
+        {
             log.remove(at);
         }
         let at = log
@@ -211,18 +224,39 @@ impl<const CAP: usize> HeldLog<CAP> {
         }
     }
 
-    /// The file of the group after it also holds the frame, with the
-    /// [`Self::remember`] rule.
+    /// The file of the group after it also holds the frame: the frames the
+    /// file holds, then memory's, then the new frame, each under the
+    /// [`Self::remember`] rule. The file can hold frames memory does not
+    /// (a crash between a write and its commit or install), so a new
+    /// write never displaces them (#1579).
     fn planned(
         &self,
+        file_frames: &[ReplayFrameV1],
         stable: &str,
         (revision, head): (u64, &str),
         bytes: &Arc<Vec<u8>>,
         authored: bool,
     ) -> ReplayLogV1 {
         let mut scratch = Self::default();
+        for frame in file_frames {
+            scratch.remember(
+                stable,
+                frame.next_revision,
+                &frame.result_head,
+                Arc::new(frame.frame.clone()),
+                frame.authored,
+            );
+        }
         if let Some(log) = self.log.get(stable) {
-            scratch.log.insert(stable.to_string(), log.clone());
+            for e in log {
+                scratch.remember(
+                    stable,
+                    e.next_revision,
+                    &e.result_head,
+                    Arc::clone(&e.bytes),
+                    e.authored,
+                );
+            }
         }
         scratch.remember(stable, revision, head, Arc::clone(bytes), authored);
         scratch.file(stable)
@@ -442,9 +476,24 @@ async fn write_with<const CAP: usize>(
     if !host_commit_gate_open(state) {
         return false;
     }
-    let planned = held(&mut *state.revocation_evictions.inner.lock().await)
-        .planned(stable, at, bytes, authored);
-    write_at(&log_path(state, stable, extension), &planned).await
+    let path = log_path(state, stable, extension);
+    // #1579: the file may hold frames memory does not (a crash between a
+    // write and its commit or install). A frame that cannot be decoded is
+    // not merged; a newer layout still fails the write below (fail
+    // closed), and a damaged file is replaced by this write, as by the
+    // first write after the quarantine.
+    let file_frames = match tokio::fs::read(&path).await {
+        Ok(existing) => decode(&existing).map(|log| log.frames).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let planned = held(&mut *state.revocation_evictions.inner.lock().await).planned(
+        &file_frames,
+        stable,
+        at,
+        bytes,
+        authored,
+    );
+    write_at(&path, &planned).await
 }
 
 /// After a failed local commit: write the group's log as memory holds it,
@@ -514,6 +563,17 @@ pub(in super::super) mod tests {
         (stable.clone(), HashMap::from([(stable, info)]))
     }
 
+    /// The frames a held frame log file holds on disk now (empty when the
+    /// file is missing or cannot be used).
+    pub(in super::super::super) async fn file_frames_of(
+        path: &std::path::Path,
+    ) -> Vec<ReplayFrameV1> {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => decode(&bytes).map(|log| log.frames).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// The §4a/§4b(1) crash point on the storage path shared by both
     /// frame kinds: the frame is written before the commit, memory is
     /// lost after it, and the restart serves the exact bytes. Returns the
@@ -528,7 +588,14 @@ pub(in super::super) mod tests {
         let path = dir.path().join(format!("g.{extension}"));
         let mut before = HeldLog::<CAP>::default();
         before.remember(stable, 4, "h4", Arc::new(vec![4]), false);
-        assert!(write_at(&path, &before.planned(stable, (5, "h5"), frame, true)).await);
+        let existing = file_frames_of(&path).await;
+        assert!(
+            write_at(
+                &path,
+                &before.planned(&existing, stable, (5, "h5"), frame, true)
+            )
+            .await
+        );
         // The commit lands, then the process dies: `before` is lost.
         drop(before);
         let mut after = HeldLog::<CAP>::default();
@@ -543,7 +610,8 @@ pub(in super::super) mod tests {
 
         // A crash between the write and the commit: revision 6 never
         // landed, so a restart does not serve it.
-        let planned = after.planned(stable, (6, "h6"), &Arc::new(vec![6]), true);
+        let existing = file_frames_of(&path).await;
+        let planned = after.planned(&existing, stable, (6, "h6"), &Arc::new(vec![6]), true);
         assert!(write_at(&path, &planned).await);
         let mut again = HeldLog::<CAP>::default();
         let _ = again.restore(read_all_in(dir.path(), extension, true).await, groups);
@@ -562,6 +630,135 @@ pub(in super::super) mod tests {
             Ok(bytes) => decode(&bytes).map(|log| log.frames).unwrap_or_default(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// #1579: a frame at a held revision with a different result head is a
+    /// competing commit. Both are kept — an authored frame no more
+    /// replaces it than a received one — while a frame of the same commit
+    /// (the revision and the head) is held once.
+    #[test]
+    fn a_competing_frame_at_a_held_revision_is_kept_not_substituted() {
+        let mut log = HeldLog::<16>::default();
+        log.remember("g", 5, "h5a", Arc::new(vec![1]), false);
+        log.remember("g", 5, "h5b", Arc::new(vec![2]), false);
+        log.remember("g", 5, "h5c", Arc::new(vec![3]), true);
+        log.remember("g", 6, "h6", Arc::new(vec![6]), true);
+        // The same commit replaces its held copy, and a repeat adds none.
+        log.remember("g", 5, "h5a", Arc::new(vec![7]), true);
+        log.remember("g", 5, "h5a", Arc::new(vec![7]), true);
+        let served: Vec<(String, Vec<u8>)> = log
+            .catchup_frames(&["g".to_string()], 4)
+            .into_iter()
+            .map(|(_, head, bytes)| (head, bytes.to_vec()))
+            .collect();
+        assert_eq!(
+            served,
+            vec![
+                ("h5b".to_string(), vec![2]),
+                ("h5c".to_string(), vec![3]),
+                ("h5a".to_string(), vec![7]),
+                ("h6".to_string(), vec![6]),
+            ],
+            "the held frame is never replaced; the competing ones are kept"
+        );
+    }
+
+    /// #1579, the file side: the log file can hold a frame memory does not
+    /// (a crash between the write and the install). A received frame at
+    /// that revision — here a competing one, a different commit at the
+    /// same revision — is written beside the held frame, never in its
+    /// place, and the file still decodes in the v1 layout.
+    #[tokio::test]
+    async fn a_received_competing_frame_is_written_beside_the_held_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("g.crblog");
+        let held = ReplayLogV1 {
+            stable_group_id: "g".to_string(),
+            frames: vec![ReplayFrameV1 {
+                next_revision: 5,
+                result_head: "h5a".to_string(),
+                authored: false,
+                frame: vec![1],
+            }],
+        };
+        assert!(write_at(&path, &held).await);
+        // The crash window: memory lost the frame before its install.
+        let memory = HeldLog::<16>::default();
+        let existing = file_frames_of(&path).await;
+        let planned = memory.planned(&existing, "g", (5, "h5b"), &Arc::new(vec![2]), false);
+        assert!(write_at(&path, &planned).await);
+        let on_disk = file_frames_of(&path).await;
+        assert_eq!(on_disk.len(), 2, "both frames are on disk");
+        assert_eq!(
+            (
+                on_disk[0].next_revision,
+                on_disk[0].result_head.as_str(),
+                on_disk[0].frame.as_slice(),
+                on_disk[0].authored
+            ),
+            (5, "h5a", &[1][..], false),
+            "the held frame is never replaced"
+        );
+        assert_eq!(
+            (
+                on_disk[1].next_revision,
+                on_disk[1].result_head.as_str(),
+                on_disk[1].frame.as_slice()
+            ),
+            (5, "h5b", &[2][..]),
+            "the competing frame is kept as fork evidence"
+        );
+        // The same commit again adds no second copy.
+        let existing = file_frames_of(&path).await;
+        let planned = memory.planned(&existing, "g", (5, "h5a"), &Arc::new(vec![1]), false);
+        assert!(write_at(&path, &planned).await);
+        assert_eq!(file_frames_of(&path).await.len(), 2);
+    }
+
+    /// #1579, the load side: of a competing pair at the head revision only
+    /// the chain's frame is held (the other stays file evidence, never
+    /// served), and a pair above the head — the crash before either
+    /// install — is received again, both frames.
+    #[tokio::test]
+    async fn a_competing_pair_restores_as_one_held_frame_or_both_received() {
+        let (local, survivor) = (crate::identity::AgentId([1; 32]), [2u8; 32]);
+        let (stable, mut groups) = committed_group(local, survivor);
+        let log_of = |frames: Vec<ReplayFrameV1>| ReplayLogV1 {
+            stable_group_id: stable.clone(),
+            frames,
+        };
+        let winner = ReplayFrameV1 {
+            next_revision: 5,
+            result_head: "h5".to_string(),
+            authored: false,
+            frame: vec![1],
+        };
+        let loser = ReplayFrameV1 {
+            next_revision: 5,
+            result_head: "h5x".to_string(),
+            authored: false,
+            frame: vec![2],
+        };
+
+        let mut at_head = HeldLog::<16>::default();
+        let restored = at_head.restore(vec![log_of(vec![winner.clone(), loser.clone()])], &groups);
+        assert!(
+            restored.received.is_empty(),
+            "the head frame is not re-received"
+        );
+        assert_eq!(
+            at_head.catchup_frames(std::slice::from_ref(&stable), 4).len(),
+            1,
+            "only the chain's frame is held at the head revision"
+        );
+
+        let info = groups.get_mut(&stable).expect("group");
+        info.state_revision = 4;
+        info.state_hash = "h4".to_string();
+        let mut above = HeldLog::<16>::default();
+        let restored = above.restore(vec![log_of(vec![winner, loser])], &groups);
+        assert_eq!(restored.received.len(), 2, "both frames are received again");
+        assert!(above.catchup_frames(&[stable], 4).is_empty());
     }
 
     #[test]

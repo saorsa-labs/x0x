@@ -40,8 +40,8 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
 use super::crypto_exclusion::{
-    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, next_attempt,
-    note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
+    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 use super::rebind::replay_log;
@@ -1524,8 +1524,11 @@ fn spawn_commit_send(
 /// Serve the recovery commit frames this node holds for the group (any of
 /// `group_ids`) above `from_revision` to a catch-up requester, oldest
 /// first, on the distinct gated carrier only, never inside a legacy
-/// catch-up page (§4b(1) "Mixed versions"). Each write uses the guarded
-/// admission with [`HeadRule::OnChain`] and the `owner_recovery_v1` gate.
+/// catch-up page (§4b(1) "Mixed versions"). A competing frame kept as
+/// fork evidence (#1579) is not on this node's verified chain, so it is
+/// skipped, not served, and it does not stop the round. Each write uses
+/// the guarded admission with [`HeadRule::OnChain`] and the
+/// `owner_recovery_v1` gate.
 ///
 /// The author's frames survive a restart ([`replay_log`]). A GSS frame
 /// moves the requester's epoch without the secret, so an admin also seals
@@ -1546,8 +1549,22 @@ pub(in crate::server) async fn serve_catchup(
         .orc
         .log
         .catchup_frames(group_ids, from_revision);
+    if frames.is_empty() {
+        return;
+    }
+    // The frames all come from one group (`catchup_frames` serves the
+    // first of `group_ids` that has a log).
+    let Some((_, info)) = group_by_stable(state, &frames[0].0).await else {
+        return;
+    };
     let mut gss_groups = BTreeSet::new();
     for (group_id, result_head, bytes) in frames {
+        // #1579: a competing frame kept as fork evidence is not on this
+        // node's verified chain. It is never served, and it does not stop
+        // the round for the frames that are.
+        if !head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+            continue;
+        }
         if matches!(
             orc::decode_frame(&bytes),
             Ok(orc::OwnerRecoveryFrameV1::Commit(frame))
@@ -3450,6 +3467,9 @@ mod tests {
 
     /// #1357: recovery commit frames are held for catch-up serving, oldest
     /// first, above the requested revision, deduplicated and bounded.
+    /// #1579: a frame at a held revision with a different result head is a
+    /// competing commit: it is kept beside the held one, as fork evidence,
+    /// and it never replaces it.
     #[test]
     fn catchup_frames_are_bounded_ordered_and_above_the_revision() {
         let mut orc = OrcState::default();
@@ -3468,12 +3488,15 @@ mod tests {
         let all = orc.log.catchup_frames(&["x".into(), "g".into()], 0);
         assert_eq!(all.len(), ORC_LOG_PER_GROUP);
         let heads: Vec<&str> = all.iter().map(|(_, head, _)| head.as_str()).collect();
-        let expected: Vec<String> = (3..=total).map(|revision| format!("h{revision}")).collect();
+        let mut expected: Vec<String> =
+            (4..=total).map(|revision| format!("h{revision}")).collect();
+        expected.push("dup".to_string());
         assert_eq!(heads, expected);
         assert!(all.iter().all(|(id, _, _)| id == "g"));
         let tail = orc.log.catchup_frames(&["g".into()], total - 1);
-        assert_eq!(tail.len(), 1);
+        assert_eq!(tail.len(), 2, "the competing frame is held too");
         assert_eq!(tail[0].1, format!("h{total}"));
+        assert_eq!(tail[1].1, "dup");
         assert!(orc.log.catchup_frames(&["other".into()], 0).is_empty());
     }
 

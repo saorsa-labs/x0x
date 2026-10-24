@@ -1704,10 +1704,12 @@ fn spawn_send(
 /// `group_ids`) above `from_revision`, oldest first, to a catch-up
 /// requester, on the distinct gated carrier only. A requester without a
 /// current verified advert setting `certificate_rebind_v1` gets nothing:
-/// the frame never goes into a legacy-decoded catch-up page. Each write
-/// uses [`guarded_admission_for`] with [`HeadRule::OnChain`]: ADR 0107's
-/// serving guard plus D60 under the membership lock, re-checked at the
-/// seam immediately before the physical write.
+/// the frame never goes into a legacy-decoded catch-up page. A competing
+/// frame kept as fork evidence (#1579) is not on this node's verified
+/// chain, so it is skipped, not served, and it does not stop the round.
+/// Each write uses [`guarded_admission_for`] with [`HeadRule::OnChain`]:
+/// ADR 0107's serving guard plus D60 under the membership lock,
+/// re-checked at the seam immediately before the physical write.
 pub(in crate::server) async fn serve_catchup(
     state: &Arc<AppState>,
     requester: &AgentId,
@@ -1723,7 +1725,27 @@ pub(in crate::server) async fn serve_catchup(
         .rebind
         .log
         .catchup_frames(group_ids, from_revision);
+    // The frames all come from one group (`catchup_frames` serves the
+    // first of `group_ids` that has a log).
+    let info = {
+        let groups = state.named_groups.read().await;
+        frames.first().and_then(|(group, _, _)| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group)
+                .cloned()
+        })
+    };
+    let Some(info) = info else {
+        return;
+    };
     for (group_id, result_head, bytes) in frames {
+        // #1579: a competing frame kept as fork evidence is not on this
+        // node's verified chain. It is never served, and it does not stop
+        // the round for the frames that are.
+        if !head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+            continue;
+        }
         let admission = guarded_admission_for(
             state,
             &group_id,
@@ -2856,11 +2878,25 @@ pub(super) mod restart_tests {
                 );
             }
             info.recompute_state_hash();
+            // The held state is a sealed parent, so its head is a retained
+            // commit: a later frame that does not chain from this node's
+            // head can be checked against it (#1579, the sibling rule).
+            // The admin renews its own certificate once; every fixture
+            // frame seals on that state.
+            let renewal = AgentCertificate::issue_with_expiry(&owner, &admin, Some(now + 900))?;
+            let (parent, _) = cr::seal(
+                &info,
+                *admin.agent_id().as_bytes(),
+                &renewal,
+                &admin,
+                now_unix_ms(),
+            )
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
             Ok(Self {
                 owner,
                 admin,
                 seat,
-                info,
+                info: parent,
             })
         }
 
@@ -2871,6 +2907,23 @@ pub(super) mod restart_tests {
                 &self.owner,
                 &self.seat,
                 Some(now_ms / 1000 + 6000),
+            )?;
+            let seat = *self.seat.agent_id().as_bytes();
+            let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
+                .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+            let bytes = cr::encode_frame(&frame)?;
+            Ok((bytes, next.state_hash))
+        }
+
+        /// A second, different rebind of the seat on the same parent: a
+        /// competing commit at the same revision (#1579) — a different
+        /// renewal, so a different roster root and result head.
+        fn competing_frame(&self) -> Result<(Vec<u8>, String)> {
+            let now_ms = now_unix_ms();
+            let renewal = AgentCertificate::issue_with_expiry(
+                &self.owner,
+                &self.seat,
+                Some(now_ms / 1000 + 7000),
             )?;
             let seat = *self.seat.agent_id().as_bytes();
             let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
@@ -2988,6 +3041,74 @@ pub(super) mod restart_tests {
         );
         let frames = served(&restarted, &stable, fixture.info.state_revision).await;
         assert_eq!(frames, vec![(result_head, bytes)]);
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1579: a received frame at a revision the `.crblog` already holds
+    /// — the crash window left it there, memory has not installed it — is
+    /// written beside the held frame, never in its place, and both stay
+    /// durable. After the restart one installs and the other, a valid
+    /// sibling, contains the group as fork evidence.
+    #[tokio::test]
+    async fn a_competing_rebind_frame_is_kept_as_fork_evidence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes1, head1) = fixture.frame()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        assert_ne!(head1, head2, "the fixture frames compete at one revision");
+
+        // The installs fail after each frame write (a crash at that
+        // point): the first frame stays in the file, and the second is
+        // written beside it.
+        let blocked = block_install(&receiver).await?;
+        assert_eq!(
+            receive(&receiver, fixture.admin.agent_id(), &bytes1).await,
+            ReceiveOutcome::LocalFailure
+        );
+        assert_eq!(
+            receive(&receiver, fixture.admin.agent_id(), &bytes2).await,
+            ReceiveOutcome::LocalFailure
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 2, "the competing frame is written");
+        assert_eq!(
+            (on_disk[0].result_head.as_str(), on_disk[0].frame.as_slice()),
+            (head1.as_str(), bytes1.as_slice()),
+            "the held frame is never replaced"
+        );
+        assert_eq!(
+            (on_disk[1].result_head.as_str(), on_disk[1].frame.as_slice()),
+            (head2.as_str(), bytes2.as_slice()),
+            "the competing frame is kept"
+        );
+
+        // The process dies before either install. The restart re-receives
+        // both: one installs, the other contains the group.
+        receiver.agent.shutdown().await;
+        drop(receiver);
+        unblock_install(blocked).await?;
+        let restarted = offline_daemon(dir.path(), None).await?;
+        ensure_restored(&restarted).await;
+        retry_stash(&restarted).await;
+        let head = head_of(&restarted, &stable).await.context("the head")?;
+        assert!(
+            head == head1 || head == head2,
+            "one of the competing pair installed: {head}"
+        );
+        assert!(
+            quarantine_of(&restarted, &stable).await.is_some(),
+            "the other frame contains the group as fork evidence"
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&restarted, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 2, "both frames stay durable as evidence");
         restarted.agent.shutdown().await;
         Ok(())
     }
