@@ -3807,21 +3807,10 @@ mod tests {
             x0x::groups::GroupMemberState::Removed
         );
         assert_eq!(committed.state_revision, info.state_revision + 1);
-        let bytes = state
-            .revocation_evictions
-            .inner
-            .lock()
-            .await
-            .orc
-            .deliveries
-            .get(&stable)
-            .map(|delivery| delivery.bytes.to_vec())
-            .expect("the committed frame is held for delivery");
-        let Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) = orc::decode_frame(&bytes) else {
-            panic!("an X0XORC1 commit frame");
-        };
-        orc::verify_commit_signatures(&frame).unwrap();
-        // The committed frame is held for catch-up serving.
+        // The committed frame is held for catch-up serving. Read it there:
+        // this fixture has no other survivor, so the live delivery
+        // converges at once and the spawned delivery task may already
+        // have dropped it (a CI race at 2e73321).
         let served = state
             .revocation_evictions
             .inner
@@ -3832,7 +3821,11 @@ mod tests {
             .catchup_frames(std::slice::from_ref(&stable), info.state_revision);
         assert_eq!(served.len(), 1);
         assert_eq!(served[0].1, committed.state_hash);
-        assert_eq!(served[0].2.as_slice(), bytes.as_slice());
+        let bytes = served[0].2.to_vec();
+        let Ok(orc::OwnerRecoveryFrameV1::Commit(frame)) = orc::decode_frame(&bytes) else {
+            panic!("an X0XORC1 commit frame");
+        };
+        orc::verify_commit_signatures(&frame).unwrap();
         let revocations = verified_agent_revocations(&state).await;
         orc::validate_against_parent(&frame.body, &info, 0, &revocations, now_unix()).unwrap();
 

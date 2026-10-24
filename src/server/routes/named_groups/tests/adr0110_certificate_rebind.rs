@@ -290,3 +290,92 @@ async fn an_unexpired_sole_admin_gets_no_every_admin_expired_exception() {
         .expect("group");
     assert_eq!(info.state_revision, 0, "the unknown member is not stranded");
 }
+
+/// Seed `agent` in the discovery cache with `cert` as its announced
+/// certificate.
+async fn announce(state: &AppState, agent: &AgentKeypair, cert: AgentCertificate) {
+    let machine = x0x::identity::MachineKeypair::generate().expect("machine");
+    state
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            agent_id: agent.agent_id(),
+            machine_id: machine.machine_id(),
+            user_id: cert.user_id().ok(),
+            addresses: Vec::new(),
+            announced_at: unix_now(),
+            last_seen: unix_now(),
+            machine_public_key: machine.public_key().as_bytes().to_vec(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: AgentCertificate::not_after(&cert),
+            agent_certificate: Some(cert),
+            cert_digest: None,
+            agent_public_key: agent.public_key().as_bytes().to_vec(),
+            self_name: None,
+        })
+        .await;
+}
+
+/// #1508 rc20 (W3-H `s4_certificate_rebind` run (6), INFRA at 2e73321): after
+/// the designated admin's post-cutoff rebind, the seat's agent still
+/// announces its expired first certificate. The egress member check
+/// refused that seat (`CertificateVerdictFailed(Expired)`), so the rebind
+/// frame never reached it. The rebind admission also judges the seat by
+/// the roster's committed renewal, and still refuses a seat whose
+/// committed certificate is expired.
+#[tokio::test]
+async fn the_rebind_admission_judges_the_rebound_seat_by_its_committed_renewal() {
+    let (state, _dir) = secure_endpoint_test_state().await.expect("state");
+    let owner = UserKeypair::generate().expect("owner");
+    let group = seed_group(&state, &owner, unix_now() + 86_400, None).await;
+    let seat = AgentKeypair::generate().expect("seat");
+    let seat_hex = hex::encode(seat.agent_id().as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // Past `not_after + τ`, so the expiry tolerance does not admit it.
+    let expired = AgentCertificate::issue_with_expiry(&owner, &seat, Some(unix_now() - 1000))
+        .expect("expired");
+    let renewal = AgentCertificate::issue_with_expiry(&owner, &seat, Some(unix_now() + 86_400))
+        .expect("renewal");
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group).expect("group");
+        info.members_v2.insert(
+            seat_hex.clone(),
+            x0x::groups::GroupMember::new_member(seat_hex.clone(), None, Some(local_hex), 1),
+        );
+        cr::install_certificate(info, &seat_hex, renewal);
+        info.recompute_state_hash();
+    }
+    announce(&state, &seat, expired.clone()).await;
+
+    assert!(
+        join_artifact_member_check(&state, &group, &seat_hex)
+            .await
+            .is_err(),
+        "the ordinary check follows the stale, expired announce"
+    );
+    assert!(
+        join_artifact_member_check_with(&state, &group, &seat_hex, true)
+            .await
+            .is_ok(),
+        "the rebind admission admits the seat on its committed renewal"
+    );
+
+    // A committed certificate that is itself expired is still refused.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group).expect("group");
+        cr::install_certificate(info, &seat_hex, expired);
+        info.recompute_state_hash();
+    }
+    assert!(
+        join_artifact_member_check_with(&state, &group, &seat_hex, true)
+            .await
+            .is_err(),
+        "an expired committed certificate is refused"
+    );
+}

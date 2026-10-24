@@ -1555,7 +1555,34 @@ pub(super) fn guarded_admission_for(
     rule: HeadRule,
     capability: u64,
 ) -> x0x::dm::ArtifactAdmission {
-    guarded_admission_gated(state, group_id, recipient, rule, Some(capability))
+    guarded_admission_gated(state, group_id, recipient, rule, Some(capability), false)
+}
+
+/// As [`guarded_admission_for`] for a certificate rebind `frame` (ADR 0110
+/// §4a). When the recipient is the seat the frame rebinds, its
+/// certificate verdict also uses the roster's committed certificate
+/// ([`ng::join_artifact_member_check_with`]), in the pre-check and at the
+/// seam. Every other recipient is checked as before.
+///
+/// [`ng::join_artifact_member_check_with`]: super::super::join_artifact_member_check_with
+pub(super) fn guarded_rebind_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &AgentId,
+    rule: HeadRule,
+    frame: &[u8],
+) -> x0x::dm::ArtifactAdmission {
+    // A frame that does not decode names no seat: the ordinary check.
+    let rebound_seat = x0x::groups::cert_rebind::decode_frame(frame)
+        .is_ok_and(|frame| &frame.body.seat == recipient.as_bytes());
+    guarded_admission_gated(
+        state,
+        group_id,
+        recipient,
+        rule,
+        Some(x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1),
+        rebound_seat,
+    )
 }
 
 /// As [`guarded_admission`], with no capability gate: the admission of a
@@ -1568,17 +1595,19 @@ pub(super) fn guarded_removal_admission(
     recipient: &AgentId,
     rule: HeadRule,
 ) -> x0x::dm::ArtifactAdmission {
-    guarded_admission_gated(state, group_id, recipient, rule, None)
+    guarded_admission_gated(state, group_id, recipient, rule, None, false)
 }
 
 /// The shared body of the guarded admissions. `capability: None` skips
-/// only the capability gate.
+/// only the capability gate. `rebound_seat`: the recipient is the seat the
+/// frame rebinds ([`guarded_rebind_admission`]).
 fn guarded_admission_gated(
     state: &Arc<AppState>,
     group_id: &str,
     recipient: &AgentId,
     rule: HeadRule,
     capability: Option<u64>,
+    rebound_seat: bool,
 ) -> x0x::dm::ArtifactAdmission {
     use super::super as ng;
     let state = Arc::clone(state);
@@ -1596,9 +1625,14 @@ fn guarded_admission_gated(
             let lock = ng::group_membership_lock_for_known_group(&state, &group_id).await?;
             let evidence = {
                 let _membership_guard = lock.lock().await;
-                let evidence = ng::join_artifact_member_check(&state, &group_id, &recipient_hex)
-                    .await
-                    .ok()?;
+                let evidence = ng::join_artifact_member_check_with(
+                    &state,
+                    &group_id,
+                    &recipient_hex,
+                    rebound_seat,
+                )
+                .await
+                .ok()?;
                 let head_ok = {
                     let roster = state.named_groups.read().await;
                     crate::server::resolve_group_entry_locked(&roster, &group_id)
