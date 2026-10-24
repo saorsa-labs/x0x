@@ -575,19 +575,41 @@ pub(super) async fn hold_exclusion(
 
 /// Drop the group's exclusion holds that no longer hold `info` (a secret of
 /// their epoch or a later one is installed), such as an evicted removal's
-/// hold after its key installed. The caller writes the file.
-pub(super) fn prune_exclusions(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) {
+/// hold after its key installed, or #1578's keyless install hold after the
+/// share it awaits installed. Returns whether a hold was dropped. The
+/// caller writes the file.
+pub(super) fn prune_exclusions(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
     let mut lot = state
         .gss_share_holds
         .exclusions
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(list) = lot.get_mut(group_key) {
-        list.retain(|hold| holds(info, Some(hold.secret_epoch)));
-        if list.is_empty() {
-            lot.remove(group_key);
-        }
+    let Some(list) = lot.get_mut(group_key) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|hold| holds(info, Some(hold.secret_epoch)));
+    let dropped = list.len() != before;
+    if list.is_empty() {
+        lot.remove(group_key);
     }
+    dropped
+}
+
+/// Whether the group has an exclusion hold in memory. A share that installs
+/// with no removal parked still prunes the holds it ends (#1578). Call
+/// [`ensure_loaded`] first.
+pub(super) fn holds_exclusions(state: &AppState, group_key: &str) -> bool {
+    state
+        .gss_share_holds
+        .exclusions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(group_key)
 }
 
 /// The exclusion installed with its secret at `secret_epoch`: its hold,

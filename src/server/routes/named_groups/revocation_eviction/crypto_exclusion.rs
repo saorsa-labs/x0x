@@ -16,7 +16,11 @@
 //!   delivery and restart rules, and seals the new secret to each
 //!   remaining Active member in the existing `SecureShareDelivered`
 //!   envelope (D60 guarded egress). A receiver installs the frame, then
-//!   takes the secret from its share.
+//!   takes the secret from its share. A survivor whose roster seat carries
+//!   no KEM public key can never receive that share (#1578): it installs
+//!   the frame keyless — the head moves, the old secret is dropped, the
+//!   share hold stays — and a share that arrives once the seat publishes
+//!   a KEM key ends the hold.
 //! - **Hold (D76).** While an Active survivor's current verified advert
 //!   lacks `crypto_exclusion_v1`, the commit does not run. The obligation
 //!   shows `waiting_for_receiver_upgrade`, naming each holding survivor.
@@ -946,7 +950,8 @@ fn spawn_gss_shares(state: &Arc<AppState>, info: &GroupInfo, target: &[u8; 32]) 
 /// Seal `info`'s current secret to the Active member `recipient_hex`. The
 /// D60 verdict re-checks its eligibility and the epoch at each write. A
 /// member without a roster KEM key cannot get a share; it is logged and
-/// skipped, as in the ban path.
+/// skipped, as in the ban path (#1578: such a survivor installs a received
+/// frame keyless instead of waiting for the share).
 fn spawn_gss_share_to(state: &Arc<AppState>, info: &GroupInfo, recipient_hex: &str) {
     use super::super as ng;
     let Some(secret) = info
@@ -982,6 +987,18 @@ fn spawn_gss_share_to(state: &Arc<AppState>, info: &GroupInfo, recipient_hex: &s
             tracing::warn!(recipient = %LogHexId::agent(recipient_hex), "ADR 0110 S4: the GSS share could not be sealed");
         }
     }
+}
+
+/// #1578: whether a share of a rotated secret can never be sealed to this
+/// node. Its own roster seat is Active but carries no KEM public key, so
+/// every author skips the seal for it ([`spawn_gss_share_to`] reads the
+/// same seat field). The frame's roster is the parent's (a crypto-only
+/// commit keeps the roster root), so `info` — at the parent while the frame
+/// waits — names the same seat every author sees.
+fn own_seat_cannot_take_a_share(state: &AppState, info: &GroupInfo) -> bool {
+    let self_hex = hex::encode(state.agent.agent_id().as_bytes());
+    info.active_members()
+        .any(|member| member.agent_id == self_hex && member.kem_public_key_b64.is_none())
 }
 
 /// A new delivery for a just-committed frame.
@@ -2086,7 +2103,17 @@ async fn install_gss(
         None => None,
     };
     let superseded = promoted == Some(LaterAdminKey::Superseded);
-    if waiting && promoted.is_none() {
+    // #1578: a survivor whose roster seat carries no KEM public key can
+    // never receive the sealed share — every author skips the seal for that
+    // seat ([`spawn_gss_share_to`]), as for a ban. Waiting would keep the
+    // verified frame pending for ever, holding this group's head. Such a
+    // survivor installs the frame keyless instead: the head moves to the
+    // verified result, the old secret (which the excluded member holds) is
+    // dropped, and the share hold stays until a share of this epoch
+    // installs — through the existing share path once the seat publishes a
+    // KEM key (a re-join) or a later rotation seals to it.
+    let awaiting_share = waiting && promoted.is_none() && own_seat_cannot_take_a_share(state, info);
+    if waiting && promoted.is_none() && !awaiting_share {
         tracing::info!(
             group_id = %LogHexId::group(group_key),
             secret_epoch = next_secret_epoch,
@@ -2099,6 +2126,13 @@ async fn install_gss(
         ng::gss_share_hold::hold_exclusion(state, group_key, &info.state_hash, next_secret_epoch)
             .await;
         return ReceiveOutcome::WaitingForShare;
+    }
+    if awaiting_share {
+        // The keyless install holds through the same durable hold: it is
+        // written before the state change, so a crash between the two
+        // leaves the hold and a retry that installs again.
+        ng::gss_share_hold::hold_exclusion(state, group_key, &info.state_hash, next_secret_epoch)
+            .await;
     }
     let next = match ng::apply_stateful_event_with_evidence(
         state,
@@ -2121,6 +2155,13 @@ async fn install_gss(
                     LaterAdminKey::Exact(secret) => Some(secret.to_vec()),
                     LaterAdminKey::Superseded => None,
                 };
+                next.secret_epoch = next_secret_epoch;
+            } else if awaiting_share {
+                // #1578: no share can be sealed to this seat. Install the
+                // verified result keyless, as a superseded rotation does:
+                // the epoch advances without a secret, so the share hold
+                // keeps withholding new ciphertext until a share installs.
+                next.shared_secret = None;
                 next.secret_epoch = next_secret_epoch;
             }
             next.security_binding = Some(ce::gss_binding(next_secret_epoch));
@@ -2150,11 +2191,13 @@ async fn install_gss(
         secret_epoch = next_secret_epoch,
         from_later_admin = promoted.is_some(),
         superseded,
+        awaiting_share,
         "ADR 0110 S4: GSS crypto-only exclusion installed"
     );
     // An intermediate head holds no secret of this epoch: its hold stays
-    // until the later secret installs ([`ng::gss_share_hold::holds`]).
-    if !superseded {
+    // until the later secret installs ([`ng::gss_share_hold::holds`]). So
+    // does the #1578 keyless install, until a share of this epoch arrives.
+    if !superseded && !awaiting_share {
         ng::gss_share_hold::release_exclusions(state, group_key, next_secret_epoch).await;
     }
     state.agent.s4_revocation_intake().request_reconcile();
@@ -3360,6 +3403,16 @@ mod daemon_tests {
 
     /// [`gss_leave_fixture`], with `extra` seated as one more Member.
     async fn gss_leave_fixture_with(extra: Option<AgentId>) -> Result<GssLeave> {
+        gss_leave_fixture_build(extra, true).await
+    }
+
+    /// [`gss_leave_fixture`], choosing whether the survivor's seat carries
+    /// a KEM public key. Without one (#1578) no author can seal a share to
+    /// the survivor.
+    async fn gss_leave_fixture_build(
+        extra: Option<AgentId>,
+        survivor_seats_kem: bool,
+    ) -> Result<GssLeave> {
         let (mut state, dir) = ng::tests::secure_endpoint_test_state().await?;
         // Only the per-group head round holds a seal, not the boot wait.
         anyhow::Context::context(
@@ -3397,7 +3450,7 @@ mod daemon_tests {
             x0x::groups::GroupRole::Member,
             Some(admin_hex.clone()),
             None,
-            Some(survivor_kem),
+            survivor_seats_kem.then_some(survivor_kem),
         );
         if let Some(extra) = extra {
             info.add_member(
@@ -4473,6 +4526,320 @@ mod daemon_tests {
         assert_eq!(
             ng::gss_share_hold::test_seam::held_exclusions(&restarted, &fx.group_id),
             0
+        );
+        Ok(())
+    }
+
+    /// #1578: a GSS survivor whose roster seat carries no KEM public key
+    /// can never receive the re-sealed share — every author skips the seal
+    /// for that seat, as for a ban. Before the fix the verified frame
+    /// waited for its share for ever: the survivor's head stayed at the
+    /// parent, the frame stayed pending in the stash, and the author's
+    /// delivery never converged. Now such a survivor installs the frame
+    /// keyless: the head moves to the verified result, the old secret
+    /// (which the excluded member holds) is dropped, new ciphertext stays
+    /// withheld by the typed share hold, and the author's row completes.
+    /// A KEM-seated survivor keeps the wait-for-share flow (the fixture
+    /// test above).
+    #[tokio::test]
+    async fn a_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let result_head = decoded.body.commit.state_hash.clone();
+        let next_revision = decoded.body.next_revision;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = decoded.body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let new_secret = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .and_then(|info| info.shared_secret.clone())
+            .context("the rotated secret")?;
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        assert!(
+            shares_for(&fx.state, &survivor_hex).is_empty(),
+            "no share can be sealed to a seat with no KEM key: the stranding premise of #1578"
+        );
+
+        // The survivor takes the leave, then the frame. It holds no new
+        // secret and no share can ever arrive, so the frame installs
+        // keyless instead of pending for ever.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the keyless survivor installs the verified frame (#1578)"
+        );
+        {
+            let installed = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .cloned()
+                .context("group")?;
+            assert_eq!(installed.state_hash, result_head, "the head moves");
+            assert_eq!(installed.secret_epoch, next_secret_epoch);
+            assert!(
+                installed.shared_secret.is_none(),
+                "the old secret, which the excluded member holds, is dropped"
+            );
+            assert!(
+                installed.secure_message_key().is_none(),
+                "no message key exists at the new epoch"
+            );
+        }
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the typed share hold withholds new ciphertext while the share is awaited"
+        );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the hold stays until a share of this epoch installs"
+        );
+        // The frame is no longer pending: the stash holds no higher-head
+        // evidence for the group.
+        {
+            let inner = fx.replica.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner
+                    .ce
+                    .stash_ahead(&fx.stable, next_revision.saturating_sub(1)),
+                "the installed frame leaves no pending higher-head evidence"
+            );
+        }
+        assert_ne!(
+            head_of(&fx.replica, &fx.group_id).await.as_deref(),
+            parent.as_deref(),
+            "the survivor left the parent head"
+        );
+
+        // The survivor's head report is the author's convergence evidence:
+        // the delivery ends and the row completes, instead of resending
+        // for ever.
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            Some(result_head.as_str()),
+        )
+        .await;
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.ce.delivering().contains(&key),
+                "the keyless survivor's convergence ends the delivery"
+            );
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::Complete),
+                "the obligation completes once every survivor converged"
+            );
+        }
+
+        // The recovery path: the seat publishes a KEM key (a re-join) and a
+        // holder seals the current secret to it through the existing share
+        // primitive (`/secure/reseal` and the S4 delivery both use it).
+        let secret: [u8; 32] = new_secret.as_slice().try_into().context("secret bytes")?;
+        let share = ng::build_secure_share_event(
+            &fx.stable,
+            &survivor_hex,
+            &base64::engine::general_purpose::STANDARD
+                .encode(&fx.replica.agent_kem_keypair.public_bytes),
+            &hex::encode(admin.as_bytes()),
+            &secret,
+            next_secret_epoch,
+        )
+        .map_err(|error| anyhow::anyhow!("seal the share: {error:?}"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
+        assert!(took.accepted, "the awaited share installs: {took:?}");
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the installed share ends the hold"
+        );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            0
+        );
+        Ok(())
+    }
+
+    /// #1578, restart case: the keyless install persists (the group state
+    /// and the durable share hold file), a restarted survivor still holds
+    /// the result head with no secret and no pending frame, and a share
+    /// that arrives after the restart installs and ends the hold.
+    #[tokio::test]
+    async fn a_keyless_gss_install_survives_a_restart() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let result_head = decoded.body.commit.state_hash.clone();
+        let next_revision = decoded.body.next_revision;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = decoded.body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let new_secret = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .and_then(|info| info.shared_secret.clone())
+            .context("the rotated secret")?;
+        let admin = fx.state.agent.agent_id();
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the keyless survivor installs the verified frame (#1578)"
+        );
+
+        // The survivor restarts while the share is still awaited.
+        let mut restarted = ng::tests::secure_endpoint_test_state_at(
+            fx._replica_dir.path(),
+            Arc::clone(&fx.replica.agent),
+        )
+        .await?;
+        Arc::get_mut(&mut restarted)
+            .context("the restarted state is not shared yet")?
+            .agent_kem_keypair = Arc::clone(&fx.replica.agent_kem_keypair);
+        assert_eq!(
+            head_of(&restarted, &fx.group_id).await,
+            Some(result_head.clone())
+        );
+        {
+            let installed = restarted
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .cloned()
+                .context("group")?;
+            assert_eq!(
+                installed.secret_epoch, next_secret_epoch,
+                "the keyless install is durable"
+            );
+            assert!(installed.shared_secret.is_none(), "still keyless");
+        }
+        assert_eq!(
+            ng::group_ciphertext_withheld(&restarted, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the durable hold keeps withholding after the restart"
+        );
+        // The boot load and the stash retry leave the installed frame
+        // resolved: nothing is pending, and the head does not move back.
+        super::super::load_persisted_obligations(&restarted).await;
+        retry_stash(&restarted).await;
+        assert_eq!(
+            head_of(&restarted, &fx.group_id).await,
+            Some(result_head.clone()),
+            "no pending frame after the restart"
+        );
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            assert!(!inner
+                .ce
+                .stash_ahead(&fx.stable, next_revision.saturating_sub(1)));
+        }
+
+        // The share arrives after the restart and ends the hold.
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let secret: [u8; 32] = new_secret.as_slice().try_into().context("secret bytes")?;
+        let share = ng::build_secure_share_event(
+            &fx.stable,
+            &survivor_hex,
+            &base64::engine::general_purpose::STANDARD
+                .encode(&restarted.agent_kem_keypair.public_bytes),
+            &hex::encode(admin.as_bytes()),
+            &secret,
+            next_secret_epoch,
+        )
+        .map_err(|error| anyhow::anyhow!("seal the share: {error:?}"))?;
+        let took = ng::apply_named_group_metadata_event(&restarted, share, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the restarted survivor takes the share: {took:?}"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&restarted, &fx.group_id, None).await,
+            None,
+            "the installed share ends the hold"
+        );
+        let installed = restarted
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(installed.secret_epoch, next_secret_epoch);
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(new_secret.as_slice()),
+            "the restarted survivor holds the rotated secret"
         );
         Ok(())
     }

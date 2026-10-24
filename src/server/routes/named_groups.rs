@@ -13042,7 +13042,9 @@ async fn park_gss_removal_for_share(
 /// see it. After the replay, a removal leaves the list only when this node
 /// holds a secret of its epoch or a later one. One that still waits, or
 /// that the apply refuses (a sibling commit moved the head), stays held
-/// (#1533 rc13): the old secret is still in use.
+/// (#1533 rc13): the old secret is still in use. #1578: a share that
+/// installs with no removal parked still prunes the exclusion holds it
+/// ends (the keyless install of a crypto-only frame waits for no replay).
 async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
     gss_share_hold::ensure_loaded(state).await;
     let parked = state
@@ -13053,6 +13055,21 @@ async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
         .cloned()
         .unwrap_or_default();
     if parked.is_empty() {
+        // The parked replay is for removals; a share can still end an
+        // exclusion hold, so the file follows memory, as the tail below
+        // makes it.
+        if gss_share_hold::holds_exclusions(state, group_key) {
+            let pruned = state
+                .named_groups
+                .read()
+                .await
+                .get(group_key)
+                .cloned()
+                .is_some_and(|info| gss_share_hold::prune_exclusions(state, group_key, &info));
+            if pruned {
+                gss_share_hold::persist_logged(state, group_key).await;
+            }
+        }
         return;
     }
     for entry in parked {
