@@ -3246,7 +3246,7 @@
     {
       "category": "gui",
       "cli_name": "show",
-      "description": "Show a GUI view to the human (ADR 0083 local show)",
+      "description": "Show a GUI view on this machine or, with --on, on an owner machine",
       "method": "POST",
       "path": "/gui/show",
       "request": {

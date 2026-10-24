@@ -15,7 +15,7 @@ mod exec;
 mod files;
 mod grants;
 mod groups;
-mod gui_show;
+pub(super) mod gui_show;
 pub(in crate::server) mod history;
 pub mod home;
 mod identity;
