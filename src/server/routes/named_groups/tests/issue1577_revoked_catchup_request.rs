@@ -4,6 +4,8 @@
 //! requester, while `handle_treekem_catchup_response` already dropped a
 //! revoked sender. The serve now refuses a revoked requester on that same
 //! drop path: no membership page, no member-keyed reply, no gated carrier.
+//! A pending revocation resync refuses every requester, fail-closed, as
+//! the response handler does.
 
 use super::*;
 use x0x::identity::AgentKeypair;
@@ -100,6 +102,44 @@ async fn a_revoked_requester_gets_no_pages_and_an_active_member_still_does() -> 
         recorded_pages(&state),
         1,
         "a revoked requester must not be served a catch-up page"
+    );
+
+    // A pending revocation resync must refuse every requester (fail-closed,
+    // as the response handler does): even the active member gets no page,
+    // and serving resumes once the set is whole again.
+    let revocation_set = state.agent.revocation_set();
+    let whole_set = revocation_set.read().await.clone();
+    *revocation_set.write().await = crate::revocation::RevocationSet::quarantined_carrier(
+        crate::revocation::REVOCATION_CARRIER_V3,
+    );
+    assert!(
+        revocation_set.read().await.revocation_resync_required(),
+        "CONTROL: the quarantined carrier arms the resync hold"
+    );
+    handle_treekem_catchup_request(
+        &state,
+        &active.agent_id(),
+        true,
+        catchup_request(&group_id, &active.agent_id()),
+    )
+    .await;
+    assert_eq!(
+        recorded_pages(&state),
+        1,
+        "no page may leave while the revocation set needs a resync"
+    );
+    *revocation_set.write().await = whole_set;
+    handle_treekem_catchup_request(
+        &state,
+        &active.agent_id(),
+        true,
+        catchup_request(&group_id, &active.agent_id()),
+    )
+    .await;
+    assert_eq!(
+        recorded_pages(&state),
+        2,
+        "an active member is served again once the resync hold clears"
     );
     Ok(())
 }

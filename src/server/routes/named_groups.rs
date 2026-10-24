@@ -11382,14 +11382,24 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // keeps its Active seat until the S4 eviction commits, so the roster
     // check below alone cannot refuse it. Drop the request on the same
     // path the response handler uses for a revoked sender; no typed reply.
+    // A pending revocation resync also refuses (fail-closed, as the
+    // response handler does), under its own operator sentence.
     {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
-        if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
+        if revoked.is_agent_revoked(sender) {
             tracing::warn!(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request from a revoked requester"
+            );
+            return;
+        }
+        if revoked.revocation_resync_required() {
+            tracing::warn!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&sender_hex),
+                "rejecting TreeKEM catch-up request while the revocation set needs a resync"
             );
             return;
         }
