@@ -20,6 +20,8 @@ mod crdt_subscriptions;
 mod delegations;
 mod delivery_gate;
 mod group_access;
+#[cfg(test)]
+mod gui_show_pair;
 mod gui_show_remote;
 /// M1 structured `/health` verdict (#1380). `pub` because the `x0xd`
 /// binary installs [`health_verdict::ErrorCountLayer`] in its tracing
@@ -2749,8 +2751,8 @@ pub async fn serve_with_options(
     }
 
     // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
-    // the body is decoded. Reply sends are detached there, so one slow
-    // refusal does not hold the next result or activity message.
+    // the body is decoded. Displays and reply sends run on detached tasks,
+    // so one opener wait does not hold the next result or activity message.
     {
         let gui_show_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
