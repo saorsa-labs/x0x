@@ -2025,9 +2025,17 @@ async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Resul
     let sidecar = dir.path().join("home_suite_groups.json");
     let creator = AgentKeypair::generate()?.agent_id();
     let good = x0x::groups::GroupInfo::new("ok".into(), String::new(), creator, "aa".repeat(16));
-    let mut odd_policy = serde_json::to_value(&good)?;
+    let other = |name: &str, mls: &str| {
+        serde_json::to_value(x0x::groups::GroupInfo::new(
+            name.into(),
+            String::new(),
+            creator,
+            mls.repeat(16),
+        ))
+    };
+    let mut odd_policy = other("p", "bb")?;
     odd_policy["policy"]["read_access"] = "guests_with_cake".into();
-    let mut odd_plane = serde_json::to_value(&good)?;
+    let mut odd_plane = other("q", "cc")?;
     odd_plane["secure_plane"] = "quantum_plane".into();
     let saved = serde_json::json!({
         "good": serde_json::to_value(&good)?,
@@ -2035,6 +2043,14 @@ async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Resul
         "odd_plane": odd_plane,
     });
     tokio::fs::write(&named, serde_json::to_vec(&saved)?).await?;
+
+    let first_bytes = tokio::fs::read(&named).await?;
+    let backup_for = |bytes: &[u8]| {
+        let digest = blake3::hash(bytes).to_hex();
+        named.with_extension(format!("unsupported-1604-{}.bak", &digest[..16]))
+    };
+    // A partial backup left by an interrupted earlier run is rewritten.
+    tokio::fs::write(backup_for(&first_bytes), b"{\"partial").await?;
 
     let loaded = load_named_groups_merged(&named, &sidecar).await?;
     assert!(loaded.contains_key("good"));
@@ -2046,11 +2062,65 @@ async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Resul
         !loaded.contains_key("odd_plane"),
         "unknown plane quarantined"
     );
-    let backup = tokio::fs::read(named.with_extension("unsupported-1604.bak")).await?;
     assert_eq!(
-        backup,
-        tokio::fs::read(&named).await?,
-        "saved bytes preserved"
+        tokio::fs::read(backup_for(&first_bytes)).await?,
+        first_bytes,
+        "saved bytes preserved; partial backup rewritten"
+    );
+
+    // A second, different saved version (a second downgrade) gets its own
+    // backup; the first one is kept.
+    let mut newer = saved.clone();
+    newer["odd_plane"]["name"] = "renamed".into();
+    tokio::fs::write(&named, serde_json::to_vec(&newer)?).await?;
+    let second_bytes = tokio::fs::read(&named).await?;
+    let _ = load_named_groups_merged(&named, &sidecar).await?;
+    assert_eq!(
+        tokio::fs::read(backup_for(&second_bytes)).await?,
+        second_bytes
+    );
+    assert_eq!(
+        tokio::fs::read(backup_for(&first_bytes)).await?,
+        first_bytes
+    );
+
+    // The quarantine list is durable and blocks reinstall by any id.
+    assert!(!group_ids_quarantined(&named, &[good.stable_group_id(), "good"]).await);
+    assert!(group_ids_quarantined(&named, &[&"cc".repeat(16)]).await);
+    assert!(group_ids_quarantined(&named, &["odd_policy"]).await);
+    assert!(group_ids_quarantined(&named, &["odd_plane"]).await);
+    // An unreadable list fails closed.
+    tokio::fs::write(unsupported_group_quarantine_path(&named), b"not json").await?;
+    assert!(group_ids_quarantined(&named, &["good"]).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn quarantined_group_bootstrap_replay_is_refused() -> Result<()> {
+    // WHY (#1604, Codex P1): after a quarantine, an older valid signed-public
+    // bootstrap for the same group must not reinstall it (that would roll
+    // back later bans or policy).
+    let (state, _dir, _owner_kp) = owner_authority_state().await?;
+    let creator = AgentKeypair::generate()?.agent_id();
+    let group = x0x::groups::GroupInfo::new("g".into(), String::new(), creator, "ab".repeat(16));
+    let ids = serde_json::json!([group.stable_group_id().to_ascii_lowercase()]);
+    tokio::fs::write(
+        unsupported_group_quarantine_path(&state.named_groups_path),
+        serde_json::to_vec(&ids)?,
+    )
+    .await?;
+    let bootstrap = PublicGroupBootstrap {
+        message_type: "public_group_bootstrap".to_string(),
+        group: Box::new(group),
+    };
+    let result =
+        crate::server::routes::public_group_bootstrap_outbox::admit_public_group_bootstrap(
+            &state, creator, None, bootstrap,
+        )
+        .await;
+    assert!(
+        result.as_ref().is_err_and(|e| e.contains("quarantined")),
+        "{result:?}"
     );
     Ok(())
 }
