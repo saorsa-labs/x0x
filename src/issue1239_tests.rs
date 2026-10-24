@@ -551,6 +551,7 @@ mod address_hints;
 mod connector;
 mod fallback;
 mod pinned_lookup;
+mod share_grant_candidates;
 mod share_grant_lookup;
 mod shutdown;
 

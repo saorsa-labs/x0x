@@ -343,6 +343,9 @@ jobs:
     name: Signing path 100k acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Bound concurrent crates and LLVM workers on the standard 16 GiB runner.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v5
 
@@ -413,7 +416,8 @@ jobs:
           X0X_SLOW_CONSUMER_PROOF: ${{ runner.temp }}/issue703-signing-test/proof.json
         run: |
           set +e
-          bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
+          /usr/bin/time -v -o "${RUNNER_TEMP}/issue703-signing-test/build-and-test.time.txt" \
+            bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
             --run-ignored ignored-only --no-tests=fail \
             -E 'test(=gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages)'
           status=$?
@@ -436,6 +440,9 @@ jobs:
           fi
           if [[ -f "${artifact}/resources.log" ]]; then
             tail -n 120 "${artifact}/resources.log"
+          fi
+          if [[ -f "${artifact}/build-and-test.time.txt" ]]; then
+            cat "${artifact}/build-and-test.time.txt"
           fi
 
       - name: Upload signing-path acceptance custody
