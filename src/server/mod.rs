@@ -82,30 +82,31 @@ use routes::{
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, handle_treekem_catchup_request, handle_treekem_catchup_response, health,
-    history_diagnostics, history_list, history_message, history_policy, history_purge,
-    history_retain, history_scopes, history_search, history_stats, identity_revocations,
-    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
-    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
-    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
-    list_named_groups, list_revocations, list_task_lists, list_tasks, listener_restart_context,
-    load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
-    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    handle_file_message, health, history_diagnostics, history_list, history_message,
+    history_policy, history_purge, history_retain, history_scopes, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, listener_restart_context, load_causal_approval_queue, load_named_groups_merged,
+    load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
+    machine_for_agent_handler, machines_by_user_handler,
+    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_machines, owner_riders_issue, owner_riders_list,
-    owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust,
-    recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
-    reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
-    remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
-    restore_treekem_groups, revoke_contact, run_direct_metadata_listener, run_fallback_github_poll,
-    run_gossip_update_listener, run_startup_update_check, save_named_groups_checked,
-    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
-    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
-    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
-    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
+    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
+    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
+    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
+    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    rebind_member_certificate, recover_home_suite_sidecar_journals, recover_treekem_named_journals,
+    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
+    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
+    requester_offer_step, restore_treekem_groups, revoke_contact, run_direct_metadata_listener,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
+    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
+    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
+    send_group_public_message, set_group_display_name, shutdown_handler,
+    spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
@@ -113,13 +114,12 @@ use routes::{
     update_task, upgrade_diagnostics, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage,
     ControlBlobState, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
     PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
-    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, TreeKemCatchupRequest,
-    TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
-    KV_STORE_DELTA_DM_PREFIX,
+    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -1317,6 +1317,8 @@ pub async fn serve_with_options(
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
         parked_role_updates: StdMutex::new(HashMap::new()),
+        parked_gss_removals: StdMutex::new(HashMap::new()),
+        gss_share_holds: crate::server::routes::named_groups::GssShareHolds::default(),
         join_result_staging_guards: StdMutex::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
@@ -1341,10 +1343,14 @@ pub async fn serve_with_options(
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
+        treekem_catchup_serve_slots: Arc::new(tokio::sync::Semaphore::new(
+            routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
+        )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
+        revocation_evictions: routes::named_groups::S4Runtime::default(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -2399,48 +2405,15 @@ pub async fn serve_with_options(
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
-                    if request.message_type == "treekem_catchup_request" {
-                        handle_treekem_catchup_request(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            request,
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-                if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
+                if !routes::named_groups::dispatch_treekem_catchup_message(
+                    &catchup_state,
+                    &msg.sender,
+                    msg.verified,
+                    &msg.payload,
+                )
+                .await
                 {
-                    // #1604 G5: refuse held unknown variants before any apply.
-                    let Ok(response) =
-                        crate::wire_compat::reject_unknown("TreeKemCatchupResponse", response)
-                    else {
-                        continue;
-                    };
-                    if response.message_type == "treekem_catchup_response" {
-                        // #1275: the response's events are applied and
-                        // persisted, so the apply runs shielded; awaiting it
-                        // keeps the responses in arrival order.
-                        let apply_state = Arc::clone(&catchup_state);
-                        let sender = msg.sender;
-                        let verified = msg.verified;
-                        let applied = catchup_state
-                            .run_shielded(Box::pin(async move {
-                                handle_treekem_catchup_response(
-                                    &apply_state,
-                                    &sender,
-                                    verified,
-                                    response,
-                                )
-                                .await;
-                            }))
-                            .await;
-                        if applied.is_none() {
-                            break;
-                        }
-                    }
+                    break;
                 }
             }
         }));
@@ -2536,6 +2509,11 @@ pub async fn serve_with_options(
                 .await;
         }));
     }
+
+    // ADR 0110 S4: revocation eviction, designated first.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
+    ));
 
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
@@ -2866,6 +2844,10 @@ pub async fn serve_with_options(
             post(owner_riders_issue).get(owner_riders_list),
         )
         .route("/owner/riders/:id", delete(owner_riders_revoke))
+        .route(
+            "/owner/groups/:id/recovery-mandate",
+            post(owner_group_recovery_mandate),
+        )
         .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))
@@ -2961,6 +2943,10 @@ pub async fn serve_with_options(
         .route(
             "/groups/:id/members/:agent_id/role",
             patch(update_member_role),
+        )
+        .route(
+            "/groups/:id/members/:agent_id/certificate/rebind",
+            post(rebind_member_certificate),
         )
         .route("/groups/:id/ban/:agent_id", post(ban_group_member))
         .route("/groups/:id/ban/:agent_id", delete(unban_group_member))

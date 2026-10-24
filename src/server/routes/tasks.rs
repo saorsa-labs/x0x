@@ -412,6 +412,20 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
                     .map_err(|e| {
                         x0x::crdt::CrdtError::Gossip(format!("task author signing: {e}"))
                     })?;
+            // ADR 0110 §4 and §4b(3): a task delta is a member send on
+            // every plane, so the no-eligible-admin refusal applies before
+            // the plane decides how to publish it (#1508 r6: the
+            // `SignedPublic` plane published plaintext with no check). The
+            // TreeKEM arm checks again inside `seal_record`, with its group
+            // guard held.
+            if let Some(hold) =
+                super::named_groups::group_ciphertext_withheld(&state, &self.group_id, None).await
+            {
+                return Err(x0x::crdt::CrdtError::Gossip(format!(
+                    "task seal: {}",
+                    hold.reason()
+                )));
+            }
             match plane {
                 TaskListPlane::Public => Ok(None),
                 TaskListPlane::Gss(info) => x0x::crdt::sealed::seal_gss_task_payload(
@@ -504,7 +518,9 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
     /// - GSS: the daemon's GSS publication gate (#973). Every authoritative
     ///   roster commit holds it exclusively from installing the rotated
     ///   secret through durable save or rollback, so under a read permit the
-    ///   live `secret_epoch` cannot move.
+    ///   live `secret_epoch` cannot move. A GSS share hold (a verified
+    ///   removal that waits for its share) is added under it too, so the
+    ///   hold cannot start between the check and the publish (#1508 rc17).
     /// - TreeKEM: the group's membership lock, then its live ratchet mutex —
     ///   the same order `seal_record` takes them. Every ratchet epoch change
     ///   needs the ratchet mutex.
@@ -526,26 +542,37 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
             match body {
                 x0x::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
                     let permit = Arc::clone(&state.gss_publication_gate).read_owned().await;
+                    // #1508 rc17 (Codex P1; #1533 rc16): a verified removal
+                    // that parks after the seal leaves the epoch unchanged,
+                    // and the removed member holds that secret. The hold is
+                    // added under this gate held exclusively, so it is
+                    // checked here, under the permit. `seal` loaded the
+                    // durable holds.
                     let current = {
                         let groups = state.named_groups.read().await;
                         crate::server::resolve_group_entry_locked(&groups, &self.group_id).map(
-                            |(_, info)| {
+                            |(key, info)| {
                                 (
                                     info.secret_epoch,
                                     info.secure_plane == x0x::mls::SecureGroupPlane::Gss,
+                                    super::named_groups::pending_gss_removal_withholds(
+                                        &state, key, info,
+                                    ),
                                 )
                             },
                         )
                     };
-                    let (current_epoch, still_gss) =
+                    let (current_epoch, still_gss, removal_held) =
                         current.ok_or_else(|| unavailable("group is not known"))?;
-                    Ok(if still_gss && current_epoch == record.epoch {
-                        x0x::crdt::TaskPublication::Current(
-                            x0x::crdt::TaskPublicationPermit::holding(permit),
-                        )
-                    } else {
-                        x0x::crdt::TaskPublication::Stale
-                    })
+                    Ok(
+                        if still_gss && !removal_held && current_epoch == record.epoch {
+                            x0x::crdt::TaskPublication::Current(
+                                x0x::crdt::TaskPublicationPermit::holding(permit),
+                            )
+                        } else {
+                            x0x::crdt::TaskPublication::Stale
+                        },
+                    )
                 }
                 x0x::crdt::sealed::SealedTaskRecordBody::TreeKem(record) => {
                     let group_key = {
@@ -2534,6 +2561,301 @@ mod tests {
             assert!(
                 crate::gossip::wire::decode_delta::<x0x::crdt::TaskListDelta>(&msg.payload).is_ok(),
                 "and that payload is a task delta"
+            );
+        }
+    }
+
+    /// #1508 Codex P1 #1 (and #1533): ADR 0110 §4 (D75) and §4b(3)
+    /// (D126) at the task-list seal. While verified revocations cover every
+    /// Admin-or-higher Active seat, a member must not seal a task delta
+    /// under the epoch the revoked admin can still decrypt. Red on f634bed:
+    /// both planes sealed after the revocation.
+    mod no_eligible_admin_1508 {
+        use super::publication_epoch_975::test_state;
+        use super::*;
+        use x0x::crdt::sealed::SealedTaskRecordBody;
+        use x0x::identity::AgentKeypair;
+
+        async fn revoke_agent(state: &AppState, subject: &AgentKeypair) {
+            let record = x0x::revocation::RevocationRecord::sign(
+                x0x::revocation::RevokedSubject::Agent(subject.agent_id()),
+                subject.public_key(),
+                subject.secret_key(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_secs(),
+                Some("test".to_string()),
+            )
+            .expect("sign revocation");
+            let revocation_set = state.agent.revocation_set();
+            assert!(revocation_set
+                .write()
+                .await
+                .verify_and_insert(record, None)
+                .expect("self-revocation verifies"));
+        }
+
+        /// A group whose sole admin is `admin` (the creator, a foreign
+        /// key) and where this node holds an ordinary Member seat.
+        fn group_with_foreign_admin(
+            state: &AppState,
+            group_key: &str,
+            admin: &AgentKeypair,
+        ) -> x0x::groups::GroupInfo {
+            let mut info = x0x::groups::GroupInfo::new(
+                "board".to_string(),
+                String::new(),
+                admin.agent_id(),
+                group_key.to_string(),
+            );
+            info.migrate_from_v1();
+            info.add_member(
+                hex::encode(state.agent.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(admin.agent_id().as_bytes())),
+                None,
+            );
+            info
+        }
+
+        async fn seal_once(
+            state: &Arc<AppState>,
+            topic: &str,
+        ) -> x0x::crdt::Result<Option<SealedTaskRecordBody>> {
+            let protector = group_task_list_binding(state, topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                protector.seal(x0x::kv::KvMutationKind::Delta, b"delta"),
+            )
+            .await
+            .expect("the boundary check must not stall the seal")
+        }
+
+        fn assert_withheld(result: x0x::crdt::Result<Option<SealedTaskRecordBody>>) {
+            match result {
+                Err(x0x::crdt::CrdtError::Gossip(reason)) => assert!(
+                    reason.contains("no_eligible_admin"),
+                    "typed refusal, got {reason}"
+                ),
+                Err(other) => panic!("wrong refusal: {other}"),
+                Ok(_) => panic!("a task delta was sealed while no eligible admin remains"),
+            }
+        }
+
+        #[tokio::test]
+        async fn gss_task_seal_is_withheld_while_every_admin_seat_is_revoked() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b1".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+
+            // No false refusal while the admin seat is unrevoked.
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+            revoke_agent(&state, &admin).await;
+            assert_withheld(seal_once(&state, &topic).await);
+        }
+
+        /// #1508 rc17 (Codex P1, ported from #1533 rc16): a GSS task record
+        /// sealed before a verified removal parks is not published after
+        /// it. The park leaves the epoch unchanged and the removed member
+        /// holds that secret. Before the fix `confirm_publication` checked
+        /// the plane and epoch only and answered `Current`.
+        #[tokio::test]
+        async fn gss_task_record_sealed_before_a_removal_parks_is_not_published() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b5".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            let protector = group_task_list_binding(&state, &topic)
+                .await
+                .delta_protector
+                .expect("a group-scoped list gets a protector");
+            let Ok(Some(body)) = protector
+                .seal(x0x::kv::KvMutationKind::Delta, b"delta")
+                .await
+            else {
+                panic!("the delta seals before the removal");
+            };
+
+            super::super::super::named_groups::park_pending_gss_removal_for_test(
+                &state, &group_key, &info,
+            );
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Stale)
+            ));
+
+            // The installed share ends the hold; the old-epoch record is
+            // still stale, and a fresh seal publishes.
+            let mut keyed = info.clone();
+            let _ = keyed.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), keyed);
+            assert!(matches!(
+                protector.confirm_publication(&body).await,
+                Ok(x0x::crdt::TaskPublication::Stale)
+            ));
+            let Ok(Some(fresh)) = seal_once(&state, &topic).await else {
+                panic!("the delta seals after the share installs");
+            };
+            assert!(matches!(
+                protector.confirm_publication(&fresh).await,
+                Ok(x0x::crdt::TaskPublication::Current(_))
+            ));
+        }
+
+        /// #1573 (#1508 rc12): a GSS task delta is not sealed while a
+        /// verified removal waits for this survivor's share (the removed
+        /// member still holds the secret); the installed share ends the
+        /// hold. Before the fix the delta was sealed under the old secret.
+        #[tokio::test]
+        async fn gss_task_seal_is_withheld_while_a_removal_waits_for_its_share() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b4".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+
+            super::super::super::named_groups::park_pending_gss_removal_for_test(
+                &state, &group_key, &info,
+            );
+            let reason =
+                super::super::super::named_groups::GroupCiphertextHold::PendingGssRemoval.reason();
+            match seal_once(&state, &topic).await {
+                Err(x0x::crdt::CrdtError::Gossip(text)) => {
+                    assert!(text.contains(reason), "typed refusal, got {text}")
+                }
+                Err(other) => panic!("wrong refusal: {other}"),
+                Ok(_) => panic!("a task delta was sealed while a removal waits for its share"),
+            }
+
+            let mut keyed = info.clone();
+            let _ = keyed.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), keyed);
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+        }
+
+        /// Codex P2 (#1508 r6), ADR 0110 §4b(3): a `SignedPublic` group's
+        /// task delta is a member send too. It is refused while verified
+        /// revocations cover every admin seat, like the encrypted planes.
+        /// Before the fix the public plane returned `Ok(None)` (publish
+        /// plaintext) with no check.
+        #[tokio::test]
+        async fn public_task_write_is_refused_while_every_admin_seat_is_revoked() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b3".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+
+            // No false refusal while the admin seat is unrevoked.
+            assert!(matches!(seal_once(&state, &topic).await, Ok(None)));
+            revoke_agent(&state, &admin).await;
+            assert_withheld(seal_once(&state, &topic).await);
+        }
+
+        #[tokio::test]
+        async fn treekem_task_seal_is_withheld_while_every_admin_seat_is_revoked() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let writer = state.agent.agent_id();
+            let group_key = "b2".repeat(16);
+            let group_id = hex::decode(&group_key).expect("group id");
+            let writer_seed = crate::server::routes::named_groups::agent_treekem_seed(
+                state.agent.as_ref(),
+                &group_id,
+            );
+            let mut admin_group =
+                x0x::mls::TreeKemMlsGroup::create(group_id.clone(), admin.agent_id(), &[0xb2; 32])
+                    .expect("admin group");
+            let writer_prepared =
+                x0x::mls::TreeKemMlsGroup::prepare_member(writer, &writer_seed).expect("writer kp");
+            let writer_add = admin_group
+                .add_member(writer, writer_prepared.key_package_bytes())
+                .expect("add writer");
+            let writer_group =
+                x0x::mls::TreeKemMlsGroup::join_from_welcome(writer_prepared, &writer_add.welcome)
+                    .expect("writer join");
+            let epoch = writer_group.epoch();
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+            info.shared_secret = None;
+            info.secret_epoch = epoch;
+            info.security_binding = Some(format!("treekem:epoch={epoch}"));
+            info.recompute_state_hash();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info);
+            let live = Arc::new(tokio::sync::Mutex::new(writer_group));
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_key.clone(), Arc::clone(&live));
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+
+            // No false refusal while the admin seat is unrevoked.
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::TreeKem(_)))
+            ));
+            revoke_agent(&state, &admin).await;
+            let before = live.lock().await.to_snapshot_bytes().expect("snapshot");
+            assert_withheld(seal_once(&state, &topic).await);
+            assert_eq!(
+                before,
+                live.lock().await.to_snapshot_bytes().expect("snapshot"),
+                "a refused seal must not advance the send ratchet"
             );
         }
     }

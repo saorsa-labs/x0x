@@ -178,7 +178,18 @@ async fn revoked_cert_member_evicted_with_rekey_at_seal() -> Result<()> {
     // and is evicted WITH a rekey — losing both the roster seat AND the
     // group secret in one commit. The seal endpoint is the ADR's
     // explicit re-verification point.
-    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let (mut state, _dir, owner_kp) = owner_authority_state().await?;
+    // ADR 0110 §2 (#1508 review P1): the seal evicts an S4 target, so it
+    // waits for head sync like the worker. Start past the restart wait.
+    Arc::get_mut(&mut state)
+        .ok_or_else(|| anyhow::anyhow!("the fresh test state is not shared yet"))?
+        .revocation_evictions =
+        crate::server::routes::named_groups::revocation_eviction::S4Runtime::new(
+            x0x::groups::eviction::S4Timing {
+                restart_sync_wait: std::time::Duration::ZERO,
+                ..x0x::groups::eviction::S4Timing::default()
+            },
+        );
     let group_id = "72".repeat(32);
     insert_owner_group(
         state.as_ref(),

@@ -19,7 +19,8 @@ async fn two_member_treekem_group() -> Result<LeaveFixture> {
 }
 
 async fn two_member_treekem_group_with_id(group_id: String) -> Result<LeaveFixture> {
-    let (state, dir) = secure_endpoint_test_state().await?;
+    let (mut state, dir) = secure_endpoint_test_state().await?;
+    zero_s4_restart_wait(&mut state);
     let admin_id = state.agent.agent_id();
     let group_id_bytes = hex::decode(&group_id)?;
     let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
@@ -155,6 +156,58 @@ async fn encrypt(state: &AppState, group_id: &str, plaintext: &[u8]) -> Result<V
     Ok(guard.encrypt_message(plaintext)?)
 }
 
+/// ADR 0110 §4: this binary seals a self-leaver's retained leaf with
+/// `CryptoExclusionV1`. Tests of the retained legacy paths (the outbox
+/// replay of a repeated `MemberRemoved` an earlier binary saved, and the
+/// receive checks for a legacy admin's event) produce that event the way a
+/// released v0.48.1 binary does.
+fn legacy_sender() {
+    super::super::revocation_eviction::crypto_exclusion::author_legacy_rekeys_on_this_thread_for_test();
+}
+
+/// The newest `CryptoExclusionV1` frame `state` committed or installed.
+async fn crypto_exclusion_frame(
+    state: &AppState,
+    group_id: &str,
+) -> Option<(
+    Vec<u8>,
+    x0x::groups::crypto_exclusion::SignedCryptoExclusionV1,
+)> {
+    let stable = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id)?.stable_group_id().to_string()
+    };
+    let bytes =
+        super::super::revocation_eviction::crypto_exclusion::latest_frame_for_test(state, &stable)
+            .await?;
+    let frame = x0x::groups::crypto_exclusion::decode_frame(&bytes).ok()?;
+    Some((bytes, frame))
+}
+
+fn crypto_exclusion_treekem_commit(
+    frame: &x0x::groups::crypto_exclusion::SignedCryptoExclusionV1,
+) -> Option<Vec<u8>> {
+    match &frame.body.crypto {
+        x0x::groups::crypto_exclusion::CryptoExclusionCryptoV1::TreeKem { commit, .. } => {
+            Some(commit.clone())
+        }
+        x0x::groups::crypto_exclusion::CryptoExclusionCryptoV1::Gss { .. } => None,
+    }
+}
+
+/// Only the per-group head round holds an S4 seal here, not the boot
+/// wait (ADR 0110 §2).
+fn zero_s4_restart_wait(state: &mut Arc<AppState>) {
+    super::super::revocation_eviction::zero_restart_wait_for_test(state);
+}
+
+/// ADR 0110 §2 (#1508 review P1): the crypto-only exclusion seals only
+/// from the leaver's own S4 row, opened by the worker after the leave is
+/// durable. Run the worker steps that open the row and drive the rekey.
+async fn s4_worker(state: &std::sync::Arc<AppState>) {
+    super::super::revocation_eviction::run_worker_steps_for_test(state).await;
+}
+
 fn published_removal_commit(state: &AppState) -> Option<Vec<u8>> {
     let published = state
         .named_group_test_recorders
@@ -196,6 +249,7 @@ async fn lowest_admin_rekey_locks_self_leaver_out_of_the_next_epoch() -> Result<
         applied.accepted,
         "self-leave must apply before the responsive rekey: {applied:?}"
     );
+    s4_worker(&fixture.state).await;
 
     let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
     assert!(
@@ -203,8 +257,17 @@ async fn lowest_admin_rekey_locks_self_leaver_out_of_the_next_epoch() -> Result<
         "lowest admin must advance the TreeKEM epoch on self-leave; before {}, after {epoch_after}",
         fixture.epoch_before
     );
-    let commit = published_removal_commit(&fixture.state)
-        .expect("responsive rekey must publish a TreeKEM removal commit");
+    // ADR 0110 §4: the removal is a crypto-only exclusion, never a
+    // repeated `MemberRemoved` on the metadata topic.
+    assert!(
+        published_removal_commit(&fixture.state).is_none(),
+        "no repeated MemberRemoved may be published for an already-Removed seat"
+    );
+    let (_, frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("responsive rekey must commit a CryptoExclusionV1");
+    assert_eq!(frame.body.target, *fixture.member_id.as_bytes());
+    let commit = crypto_exclusion_treekem_commit(&frame).expect("TreeKEM exclusion");
     let process = fixture.leaver_group.process_commit(&commit);
     assert!(
         process.is_err(),
@@ -278,6 +341,7 @@ async fn online_pass_rekeys_after_the_designated_admin_is_gone() -> Result<()> {
         applied.accepted,
         "roster self-leave must apply: {applied:?}"
     );
+    s4_worker(&fixture.state).await;
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -289,6 +353,8 @@ async fn online_pass_rekeys_after_the_designated_admin_is_gone() -> Result<()> {
         let info = groups.get_mut(&fixture.group_id).expect("group");
         info.remove_member(&lower_hex, Some(hex::encode(admin_id.as_bytes())));
     }
+    // ADR 0110 §2: the S4 designation is evaluated again on the new roster.
+    s4_open(&fixture.state).await;
     rekey_outstanding_treekem_self_leaves(&fixture.state).await;
 
     let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
@@ -371,6 +437,7 @@ async fn missing_key_package_defers_until_the_bytes_return() -> Result<()> {
         applied.accepted,
         "the roster removal must apply: {applied:?}"
     );
+    s4_worker(&fixture.state).await;
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -410,6 +477,7 @@ async fn queued_treekem_event_blocks_the_rekey_until_the_queue_is_empty() -> Res
         apply_named_group_metadata_event(&fixture.state, event, fixture.member_id, true, None)
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -417,6 +485,8 @@ async fn queued_treekem_event_blocks_the_rekey_until_the_queue_is_empty() -> Res
     );
     fixture.state.treekem_pending_events.write().await.clear();
     let hash_before = stored_hash(&fixture.state, &fixture.group_id).await;
+    // The queued event was higher-head evidence; S4 evaluates again.
+    s4_open(&fixture.state).await;
     schedule_self_leave_rekey_if_idle(&fixture.state, &fixture.group_id).await;
     assert!(
         live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
@@ -446,6 +516,7 @@ async fn demotion_of_the_designated_admin_rekeys() -> Result<()> {
         apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before
@@ -477,6 +548,8 @@ async fn demotion_of_the_designated_admin_rekeys() -> Result<()> {
         role_applied.accepted,
         "demotion must apply: {role_applied:?}"
     );
+    // ADR 0110 §2: the S4 designation is evaluated again on the new roster.
+    s4_worker(&fixture.state).await;
     assert!(
         live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
         "demoting the designated admin must run the rekey"
@@ -484,11 +557,94 @@ async fn demotion_of_the_designated_admin_rekeys() -> Result<()> {
     Ok(())
 }
 
+/// #1508 review P1 (ADR 0110 §2): the fallback time of an older
+/// departure never authorizes a fresh one. This node is rank 1 for both
+/// leavers; the older row's fallback time has passed, the fresh leaver's
+/// has not, so the fresh leaver's leaf is not sealed.
+#[tokio::test]
+async fn an_older_departures_fallback_does_not_seal_a_fresh_leaver() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let admin_id = fixture.state.agent.agent_id();
+    let stable = {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        add_lower_admin(info, admin_id);
+        info.stable_group_id().to_string()
+    };
+    super::super::revocation_eviction::open_fallback_row_for_test(
+        &fixture.state,
+        &stable,
+        [0x42; 32],
+        &fixture.group_id,
+    )
+    .await;
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "another row's fallback time must not seal this leaver"
+    );
+    rekey_outstanding_treekem_self_leaves(&fixture.state).await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "the rekey pass waits for this leaver's own fallback time too"
+    );
+    Ok(())
+}
+
+/// #1508 review P1 (ADR 0110 §2): the designated admin's in-apply rekey
+/// seals only from the leaver's own S4 row and only after the head round.
+/// Here the restart sync wait has not passed: no seal in the apply and none
+/// after the worker opens the row.
+#[tokio::test]
+async fn the_in_apply_rekey_waits_for_the_row_and_the_head_round() -> Result<()> {
+    let mut fixture = two_member_treekem_group().await?;
+    if let Some(fresh) = Arc::get_mut(&mut fixture.state) {
+        fresh.revocation_evictions = super::super::revocation_eviction::S4Runtime::new(
+            x0x::groups::eviction::S4Timing::default(),
+        );
+    }
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "no seal before the leaver's S4 row exists"
+    );
+    s4_worker(&fixture.state).await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "no seal before the head round of the restart sync wait"
+    );
+    Ok(())
+}
+
 /// The lowest raw admin does not commit when the test marks that admin as
-/// an old binary. The next eligible admin does.
+/// an old binary. The next eligible admin does, at its ranked fallback
+/// time: ADR 0110 §2 and §4 (#1508 review P1) give the designated admin
+/// its window W first, even when its advert lacks the capability.
 #[tokio::test]
 async fn old_lowest_admin_yields_to_the_next_eligible_admin() -> Result<()> {
-    let fixture = two_member_treekem_group().await?;
+    let mut fixture = two_member_treekem_group().await?;
+    let window = std::time::Duration::from_millis(300);
+    if let Some(fresh) = Arc::get_mut(&mut fixture.state) {
+        fresh.revocation_evictions =
+            super::super::revocation_eviction::S4Runtime::new(x0x::groups::eviction::S4Timing {
+                designated_window: window,
+                completion_bound: window,
+                fallback_stagger: std::time::Duration::from_millis(100),
+                restart_sync_wait: std::time::Duration::ZERO,
+            });
+    }
     let admin_id = fixture.state.agent.agent_id();
     {
         let mut groups = fixture.state.named_groups.write().await;
@@ -501,6 +657,14 @@ async fn old_lowest_admin_yields_to_the_next_eligible_admin() -> Result<()> {
         apply_named_group_metadata_event(&fixture.state, event, fixture.member_id, true, None)
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "the fallback admin waits for the designated admin's window"
+    );
+    tokio::time::sleep(window + std::time::Duration::from_millis(200)).await;
+    s4_worker(&fixture.state).await;
     assert!(
         live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
         "an incapable lower admin must not block an eligible higher admin"
@@ -538,6 +702,7 @@ async fn incapable_lowest_admin_does_not_rekey() -> Result<()> {
 /// Restart loads it back into the catch-up log.
 #[tokio::test]
 async fn restart_reloads_the_removal_event_saved_before_publish() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     let event = signed_self_leave(&fixture).await?;
     let applied =
@@ -617,10 +782,13 @@ async fn remaining_member_converges_on_the_rekey() -> Result<()> {
     )
     .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
     let committer_hash = stored_hash(&fixture.state, &fixture.group_id).await;
     let committer_epoch = live_epoch(&fixture.state, &fixture.group_id).await;
-    let rekey = published_removal_event(&fixture.state).expect("rekey event");
-    let commit_bytes = published_removal_commit(&fixture.state).expect("rekey commit");
+    let (rekey, frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("crypto-only exclusion frame");
+    let commit_bytes = crypto_exclusion_treekem_commit(&frame).expect("rekey commit");
     survivor
         .process_commit(&commit_bytes)
         .expect("the remaining member processes the rekey");
@@ -643,17 +811,27 @@ async fn remaining_member_converges_on_the_rekey() -> Result<()> {
         replica_leave.accepted,
         "the replica must apply the self-leave: {replica_leave:?}"
     );
-    let replica_rekey = apply_named_group_metadata_event(
+    let replica_rekey = super::super::revocation_eviction::crypto_exclusion::receive(
         &replica,
-        rekey,
         fixture.state.agent.agent_id(),
-        true,
-        None,
+        &rekey,
     )
     .await;
-    assert!(
-        replica_rekey.accepted,
-        "the replica must apply the rekey: {replica_rekey:?}"
+    assert_eq!(
+        replica_rekey,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Applied,
+        "the replica must apply the crypto-only exclusion"
+    );
+    let again = super::super::revocation_eviction::crypto_exclusion::receive(
+        &replica,
+        fixture.state.agent.agent_id(),
+        &rekey,
+    )
+    .await;
+    assert_eq!(
+        again,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Duplicate,
+        "a second copy is a duplicate"
     );
     assert_eq!(
         stored_hash(&replica, &fixture.group_id).await,
@@ -750,6 +928,7 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
         fixture.epoch_before,
         "another peer's terminal page must not close the open page stream"
     );
+    s4_open(&fixture.state).await;
     handle_treekem_catchup_response(
         &fixture.state,
         &peer,
@@ -809,6 +988,7 @@ async fn second_live_leaf_is_sealed_after_the_in_apply_commit() -> Result<()> {
         apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
     assert!(
         live_epoch(&fixture.state, &fixture.group_id).await >= epoch_before.saturating_add(2),
         "both live removed leaves must be sealed, one in the apply and one after the guard drops"
@@ -831,6 +1011,7 @@ async fn demotion_route_rekeys_when_the_local_admin_becomes_designated() -> Resu
         apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -851,6 +1032,8 @@ async fn demotion_route_rekeys_when_the_local_admin_becomes_designated() -> Resu
         StatusCode::OK,
         "the role route must succeed"
     );
+    // ADR 0110 §2: the S4 designation is evaluated again on the new roster.
+    s4_worker(&fixture.state).await;
     assert!(
         live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
         "the role route must run the rekey after the guard drops"
@@ -863,6 +1046,7 @@ async fn demotion_route_rekeys_when_the_local_admin_becomes_designated() -> Resu
 /// and it does not send the rekey again.
 #[tokio::test]
 async fn disk_restart_serves_predecessor_without_republish() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fixture
         .state
@@ -917,6 +1101,7 @@ async fn disk_restart_serves_predecessor_without_republish() -> Result<()> {
 /// An outbox commit that is not in the stored chain is not published.
 #[tokio::test]
 async fn resume_drops_a_rekey_that_is_not_in_the_stored_chain() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fixture
         .state
@@ -971,7 +1156,8 @@ async fn two_concurrent_admins_only_the_lower_id_commits() -> Result<()> {
     let fixture = two_member_treekem_group().await?;
     let admin_b_kp = x0x::identity::AgentKeypair::generate()?;
     let id_b = admin_b_kp.agent_id();
-    let (state_b, _dir_b) = secure_endpoint_test_state_with_key(admin_b_kp).await?;
+    let (mut state_b, _dir_b) = secure_endpoint_test_state_with_key(admin_b_kp).await?;
+    zero_s4_restart_wait(&mut state_b);
     assert_eq!(state_b.agent.agent_id(), id_b);
     let id_a = fixture.state.agent.agent_id();
     let lower_is_a = id_a.as_bytes() < id_b.as_bytes();
@@ -1036,6 +1222,8 @@ async fn two_concurrent_admins_only_the_lower_id_commits() -> Result<()> {
         applied_b.accepted,
         "admin B must apply the shared leave: {applied_b:?}"
     );
+    s4_worker(&fixture.state).await;
+    s4_worker(&state_b).await;
     let epoch_a = live_epoch(&fixture.state, &fixture.group_id).await;
     let epoch_b = live_epoch(&state_b, &fixture.group_id).await;
     let (committer, holder, committer_epoch) = if lower_is_a {
@@ -1047,12 +1235,17 @@ async fn two_concurrent_admins_only_the_lower_id_commits() -> Result<()> {
         assert_eq!(epoch_a, epoch_before, "the higher admin must hold off");
         (&state_b, &fixture.state, epoch_b)
     };
-    let rekey = published_removal_event(committer).expect("the lower admin publishes one rekey");
+    let (rekey, _) = crypto_exclusion_frame(committer, &fixture.group_id)
+        .await
+        .expect("the lower admin commits one crypto-only exclusion");
     let committer_id = committer.agent.agent_id();
-    let applied = apply_named_group_metadata_event(holder, rekey, committer_id, true, None).await;
-    assert!(
-        applied.accepted,
-        "the higher admin must apply the shared rekey: {applied:?}"
+    let applied =
+        super::super::revocation_eviction::crypto_exclusion::receive(holder, committer_id, &rekey)
+            .await;
+    assert_eq!(
+        applied,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Applied,
+        "the higher admin must apply the shared exclusion"
     );
     assert_eq!(
         stored_hash(holder, &fixture.group_id).await,
@@ -1124,6 +1317,7 @@ async fn historical_hash_only_seat_does_not_block_the_live_leaver() -> Result<()
 /// retry installs that commit. It does not persist a second payload.
 #[tokio::test]
 async fn retry_after_outbox_sync_failure_reuses_the_saved_commit() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fail_self_leave_outbox_write_number(2);
     skip_self_leave_rekey_ack(true);
@@ -1187,6 +1381,7 @@ async fn retry_after_outbox_sync_failure_reuses_the_saved_commit() -> Result<()>
 }
 
 async fn publish_fault_leaves_rekey_pending(fault: &str) -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     fixture
         .state
@@ -1254,6 +1449,7 @@ async fn timed_out_publish_stays_pending() -> Result<()> {
 /// not yet installed. The hash check runs under the membership lock.
 #[tokio::test]
 async fn resume_keeps_a_rekey_until_the_membership_lock_shows_it_stored() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     let leave = signed_self_leave(&fixture).await?;
     let applied =
@@ -1315,6 +1511,7 @@ fn unix_mode(path: &std::path::Path) -> u32 {
 /// deletes that copy. A later wipe deletes the file.
 #[tokio::test]
 async fn outbox_private_tree_is_mode_0600_dropped_after_persist_and_wiped() -> Result<()> {
+    legacy_sender();
     let fixture = two_member_treekem_group().await?;
     skip_self_leave_rekey_ack(true);
     fixture
@@ -1423,6 +1620,9 @@ async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
         info.remove_member(&member_hex, Some(member_hex.clone()));
         info.recompute_state_hash();
     }
+    // The leave opens the leaver's S4 row (ADR 0110 §2), so a zero below
+    // means the corrupt outbox deferred the seal.
+    s4_open(&fixture.state).await;
     fixture
         .state
         .named_group_test_recorders
@@ -1496,6 +1696,7 @@ async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
         info.remove_member(&open_hex, Some(open_hex.clone()));
         info.recompute_state_hash();
     }
+    s4_open(&open.state).await;
     open.state
         .named_group_test_recorders
         .metadata_publish_force_ok
@@ -1520,6 +1721,7 @@ async fn corrupt_or_unreadable_outbox_is_not_replaced() -> Result<()> {
 /// rekey installs and the leaver cannot read it.
 #[tokio::test]
 async fn relayed_removal_rejects_another_members_treekem_commit() -> Result<()> {
+    legacy_sender();
     let mut fixture = two_member_treekem_group().await?;
     let member_b_kp = x0x::identity::AgentKeypair::generate()?;
     let member_b = member_b_kp.agent_id();
@@ -1923,6 +2125,7 @@ async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
 /// A digest-bound rekey can be relayed. Substituted bytes cannot.
 #[tokio::test]
 async fn catchup_third_party_relays_a_digest_bound_rekey() -> Result<()> {
+    legacy_sender();
     let mut cast = catchup_relay_fixture().await?;
     cast.fixture
         .state
@@ -2016,6 +2219,16 @@ async fn mark_leaver_removed(fixture: &LeaveFixture) {
     let mut groups = fixture.state.named_groups.write().await;
     let info = groups.get_mut(&fixture.group_id).expect("group");
     info.remove_member(&member_hex, Some(member_hex.clone()));
+    drop(groups);
+    // ADR 0110 §2 (#1508 review P1): the leave opens the leaver's S4 row,
+    // which every seal of its leaf needs.
+    s4_open(&fixture.state).await;
+}
+
+/// Open and write the S4 rows of the current rosters (one pass), as the
+/// worker does after a durable leave.
+async fn s4_open(state: &Arc<AppState>) {
+    super::super::revocation_eviction::open_rows_for_test(state).await;
 }
 
 fn catchup_page(
@@ -3530,6 +3743,7 @@ async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Resu
         applied.accepted,
         "roster self-leave must apply before the fork: {applied:?}"
     );
+    s4_worker(&fixture.state).await;
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -3549,6 +3763,7 @@ async fn receive_path_conflict_quarantines_again_after_the_local_clear() -> Resu
         let guard = group.lock().await;
         guard.to_snapshot_bytes()?
     };
+    s4_open(&fixture.state).await;
     startup_self_leave_rekey(&fixture.state).await;
     let sealed_epoch = live_epoch(&fixture.state, &fixture.group_id).await;
     assert!(
@@ -4353,5 +4568,113 @@ async fn single_epoch_ahead_observation_asks_every_candidate() -> Result<()> {
         assert!(asked(peer), "every candidate is asked");
     }
     cast.shutdown().await;
+    Ok(())
+}
+
+fn advertise_registry(state: &AppState, peer: x0x::identity::AgentId, bits: u64) {
+    let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+    capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+    assert!(
+        state.agent.capability_store().insert(
+            peer,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            x0x::dm_capability::now_unix_ms(),
+        ),
+        "verified capability advert"
+    );
+}
+
+/// ADR 0110 §4 (D76): an Active survivor whose current verified advert
+/// lacks `crypto_exclusion_v1` holds the crypto-only exclusion. The leaver
+/// keeps its leaf, nothing is published, and the commit runs once the
+/// survivor's advert sets the bit.
+#[tokio::test]
+async fn lacking_survivor_advert_holds_the_crypto_only_exclusion() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let survivor = x0x::identity::AgentId([0x77; 32]);
+    {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        add_active_peer(info, survivor);
+    }
+    let all = x0x::dm::CapabilityRegistry::current().bits;
+    advertise_registry(
+        &fixture.state,
+        survivor,
+        all & !x0x::dm::CapabilityRegistry::CRYPTO_EXCLUSION_V1,
+    );
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
+    assert_eq!(
+        live_epoch(&fixture.state, &fixture.group_id).await,
+        fixture.epoch_before,
+        "a lacking survivor holds the exclusion"
+    );
+    assert!(crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .is_none());
+    assert!(
+        published_removal_commit(&fixture.state).is_none(),
+        "the hold never falls back to a repeated MemberRemoved"
+    );
+
+    advertise_registry(&fixture.state, survivor, all);
+    rekey_outstanding_treekem_self_leaves(&fixture.state).await;
+    assert!(
+        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
+        "the exclusion runs once the survivor upgrades"
+    );
+    let (_, frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("crypto-only exclusion frame");
+    assert_eq!(frame.body.target, *fixture.member_id.as_bytes());
+    Ok(())
+}
+
+/// ADR 0110 §4: a frame whose outer signature does not verify is refused,
+/// and a second copy of an installed frame is a duplicate.
+#[tokio::test]
+async fn tampered_crypto_exclusion_is_refused() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let leave = signed_self_leave(&fixture).await?;
+    let applied =
+        apply_named_group_metadata_event(&fixture.state, leave, fixture.member_id, true, None)
+            .await;
+    assert!(applied.accepted, "the leave must apply: {applied:?}");
+    s4_worker(&fixture.state).await;
+    let (bytes, mut frame) = crypto_exclusion_frame(&fixture.state, &fixture.group_id)
+        .await
+        .expect("crypto-only exclusion frame");
+    let admin = fixture.state.agent.agent_id();
+    let ce = &super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Duplicate;
+    assert_eq!(
+        &super::super::revocation_eviction::crypto_exclusion::receive(
+            &fixture.state,
+            admin,
+            &bytes
+        )
+        .await,
+        ce
+    );
+    if let Some(byte) = frame.signature.first_mut() {
+        *byte ^= 0xff;
+    }
+    let tampered = x0x::groups::crypto_exclusion::encode_frame(&frame)?;
+    assert_eq!(
+        super::super::revocation_eviction::crypto_exclusion::receive(
+            &fixture.state,
+            admin,
+            &tampered
+        )
+        .await,
+        super::super::revocation_eviction::crypto_exclusion::ReceiveOutcome::Refused(
+            x0x::groups::crypto_exclusion::CryptoExclusionRefusal::BadSignature
+        )
+    );
     Ok(())
 }

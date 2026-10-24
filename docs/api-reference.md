@@ -719,7 +719,35 @@ A token minted with no `scopes` lists `"scopes": []`.
   `min(cert expiry, token expiry)` — a longer `not_after` answers
   `400` with the bound named.
 
+### Owner recovery of a group (ADR 0110 §4b(1))
 
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/owner/groups/:id/recovery-mandate` | `x0x owner groups recovery-mandate <GROUP_ID> --promoted <AGENT_ID>` | Owner-sign an `OwnerRecoveryMandateV1` for an `OwnerCertified` group whose admins are all revoked |
+
+Body: `{ "promoted_agent_id": <hex agent ID> }`. Requires the durable API
+token and a node that holds the owner's user key U (`~/.x0x/user.key` is
+never auto-generated; `409` without it). The group's admission must be
+`OwnerCertified(U)`.
+
+The mandate names the group ID, the current head, each revoked
+Admin-or-higher Active seat with the hashes of its verified Agent-subject
+revocation records, and the promoted member with its committed certificate
+digest. The daemon sends it to the promoted member over the direct-message
+carrier, only when that member's current verified advert sets
+`owner_recovery_v1`.
+
+- `202 Accepted` — `{"ok": true, "group_id", "state":
+  "waiting_for_recovery_member", "promoted_member", "mandate_id",
+  "parent_head", "parent_revision", "revoked_admins": [...]}`. The state
+  stays on the group's `admin_availability.owner_recovery.owner` until the
+  promoted member commits.
+- `409 Conflict` — `{"ok": false, "error": "recovery_not_needed" |
+  "recovery_member_ineligible" | "recovery_group_quarantined" |
+  "recovery_head_mismatch", "group_id"}`.
+- `403 Forbidden` — a session token, or `recovery_signer_not_owner` (the
+  group's owner is not this node's user key).
+- `404 Not Found` — the group is not known on this node.
 
 ## Owner profile and naming (ADR-0036)
 
@@ -1516,6 +1544,7 @@ token. A session token is refused before the body is read.
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
+| POST | `/groups/:id/members/:agent_id/certificate/rebind` | `x0x group rebind-certificate <group_id> <agent_id> [--certificate <b64>]` | Self-rebind this agent's renewed certificate into its own seat (ADR 0110 §4a). See [Certificate rebind](#certificate-rebind-adr-0110-4a) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
 | GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires a local admin seat. Token class: [join-request admin](#authentication-and-token-classes) (#1347). A session token is accepted, except on a Home or an `OwnerCertified` group, which needs the durable API token |
@@ -1647,6 +1676,243 @@ directly.
   (an alternate commit at a retained revision, signature-verified, committed
   by an active admin in the retained base roster); first evidence wins and
   replays do not overwrite it.
+
+### Revocation eviction (ADR 0110, S4)
+
+When a member's agent is revoked, its selected certificate expires
+(`OwnerCertified` groups), or it leaves while its TreeKEM leaf is still in
+the tree, the daemon opens one obligation for that (group, member). The
+lowest eligible admin on the roster does the exclusion first. The other
+admins wait for their ranked fallback time. These fields show the work and
+every wait. A wait always names its cause; it does not stop silently.
+
+`GET /groups/:id` adds four fields:
+
+```json
+"revocation_evictions": [
+  {
+    "target": "<64-hex agent id>",
+    "phase": "pending",
+    "triggers": ["agent_revocation", "self_leave", "certificate_expiry"],
+    "termination_cause": null,
+    "designated_admin": "<64-hex agent id>",
+    "fallback_ranks": ["<64-hex agent id>"],
+    "waiting": {
+      "cause": "waiting_for_designated_admin",
+      "named": ["<64-hex agent id>"],
+      "designated_admin": "<64-hex agent id>",
+      "detail": "rank",
+      "remaining_ms": 9000
+    },
+    "queued_requests": [{"request": "remove", "queued_at_unix_ms": 1788091312000}],
+    "observed_at_unix_ms": 1788091300000,
+    "result_head": null,
+    "result_epoch": null,
+    "receiver_upgrade_members": [
+      {
+        "cause": "waiting_for_receiver_upgrade",
+        "agent_id": "<64-hex agent id>",
+        "gap_revision": 12,
+        "advert": "lacking"
+      }
+    ]
+  }
+],
+"revocation_eviction_store": {
+  "state": "ok",
+  "file": "revocation-evictions.evs",
+  "detail": null,
+  "rebuilt_from": []
+},
+"admin_availability": null,
+"certificate_evidence_waits": [
+  {
+    "cause": "waiting_for_certificate_evidence",
+    "agent_id": "<64-hex agent id>",
+    "certificate_digest": "<hex digest>"
+  }
+]
+```
+
+- `phase` — `pending`, `prepared`, `committed_delivery_pending`, `complete`
+  or `terminated`. `termination_cause` is `group_deleted` or
+  `certificate_valid` for a `terminated` row.
+- `waiting.cause` — one of:
+  - `waiting_for_designated_admin` — another admin is designated. `detail`
+    is `rank` (this node waits for its fallback time, `remaining_ms`) or
+    `designated_admin_unsupported` (the designated admin's advert lacks
+    `eviction_handoff_v1`).
+  - `unresolved_designated_admin` — the hand-off has not reached the
+    designated admin yet.
+  - `local_committer_ineligible` — this admin may not seal (demoted,
+    removed, revoked, left, or its own certificate expired).
+  - `waiting_for_durable_intake` — the obligation is not on disk yet; the
+    daemon retries.
+  - `waiting_for_head_sync` — a catch-up round must finish first (for
+    example after a restart).
+  - `waiting_for_member_key_package` — the TreeKEM removal needs the
+    member's KeyPackage; the daemon asks for it.
+  - `waiting_for_fork_resolution` — a competing branch exists. A saved
+    exclusion is kept as evidence and is not published.
+  - `waiting_for_receiver_upgrade` — the crypto-only exclusion of a member
+    that already left is held. `named` lists each Active member whose
+    current verified advert lacks `crypto_exclusion_v1`. The hold ends when
+    each one upgrades, stops being Active, or its advert expires.
+  - `waiting_for_eligible_admin_revocation` — every Admin-or-higher seat is
+    revoked; `named` lists them.
+  - `waiting_for_active_admin` — the roster has no Active admin.
+  - `waiting_for_admin_certificate_renewal` — every other admin's
+    certificate is expired.
+  - `waiting_for_certificate_expiry` — the local clock is not past the
+    certificate's signed `not_after` yet.
+  - `waiting_for_host_commit` — an upgrade trial is running.
+  - `rebuilding_obligation_store` — the `.evs` file is being rebuilt.
+- `receiver_upgrade_members` — on the admin that committed a crypto-only
+  exclusion: each Active member that could not take it yet. `advert` is
+  `lacking` (its current verified advert lacks `crypto_exclusion_v1`; it
+  stays stranded until it upgrades) or `unknown` (no current verified
+  advert; the daemon asked for a refresh). `gap_revision` is the revision
+  it cannot cross.
+- `revocation_eviction_store.state` — `ok`, `rebuilt`,
+  `sidecar_unavailable`, `sidecar_newer_format` or
+  `sidecar_quarantine_failed` (ADR 0108 §5a).
+- `admin_availability` — `null` while an eligible admin exists. When
+  verified revocations cover every Admin-or-higher seat:
+  - `OwnerCertified` groups:
+    `{"state": "waiting_for_eligible_admin_revocation", "revoked_admins": [...], "exit": "owner_recovery"}`.
+  - Other groups, after a catch-up round:
+    `{"state": "group_admin_revoked", "revoked_admins": [...], "exit": "group_admin_revoked", "recreate_offer": {"members": [...], "name": "...", "policy": {...}}}`.
+    The group stays readable. To continue, a member makes a new group with
+    the existing create API and invites the listed members.
+  - In the `OwnerCertified` case the object also has `owner_recovery`:
+    `null`, or `{"owner", "promoted_member", "receiver_upgrade_members"}`.
+    On the owner's node, `owner` is
+    `{"state": "waiting_for_recovery_member" | "waiting_for_receiver_upgrade", "promoted_member", "mandate_id", "parent_head", "advert"}`
+    until the promoted member commits. On the promoted member,
+    `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
+    `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
+    lists each Active member whose current advert lacks bit 7),
+    `waiting_for_member_key_package` or `recovery_not_needed` (the named
+    revocation records have not arrived yet). After the commit,
+    `receiver_upgrade_members` lists the stranded members with
+    `gap_revision`.
+
+**New status codes.**
+
+| Route | Status | Body |
+|---|---|---|
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
+| Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
+| Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
+
+**Wire and capabilities.** The daemon advertises three more ADR 0093
+application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
+(bit 5) and `owner_recovery_v1` (bit 7). The new frames ride the
+direct-message carrier only. They are
+not on the metadata topic and not in a legacy-decoded container:
+
+- `X0XEVH1` — `EvictionHandoffV1`, signed evidence from one admin to the
+  others. It carries no key material.
+- `X0XCE1` — `CryptoExclusionV1`. It removes the retained TreeKEM leaf of
+  a member that is already `Removed`. The roster does not change; the
+  revision and the epoch advance together. The body is signed in domain
+  `x0x.crypto-exclusion.v1`. A daemon sends it only to a member whose
+  current verified advert sets bit 5, and it checks the recipient's agent,
+  machine and binding revocations just before each send. A capable member
+  that asks for TreeKEM catch-up gets held frames on this same carrier.
+
+- `X0XORC1` — owner recovery (ADR 0110 §4b(1), bit 7
+  `owner_recovery_v1`). One postcard frame type with two variants: the
+  owner's `OwnerRecoveryMandateV1` (signed by user key U in domain
+  `x0x.owner-recovery.v1`) and the promoted member's `OwnerRecoveryV1`
+  commit (agent signature in domain `x0x.owner-recovery.commit.v1` over the
+  body, which embeds the mandate). The commit removes each revoked admin's
+  seat (with its TreeKEM leaf, with one GSS rotation, or the roster seat
+  alone in a `SignedPublic` group) and makes the promoted member Admin.
+  Receivers accept it only under the §4b(1) rule. Typed refusals:
+  `recovery_not_needed`, `recovery_head_mismatch`,
+  `recovery_signer_not_owner`, `recovery_member_ineligible`,
+  `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
+  member holds the commit while a known Active member's current advert
+  lacks bit 7 (D76).
+
+DM history does not record these frames: they are protocol traffic. A user
+message that only starts with the same letters stays history.
+
+### Certificate rebind (ADR 0110 §4a)
+
+In an `OwnerCertified` group, a renewed certificate keeps a member's seat
+only through a `CertificateRebindV1` commit. The commit changes only that
+seat's committed certificate and digest. Role, membership, TreeKEM leaf and
+epoch do not change. An announced renewal alone does not keep a seat.
+
+`POST /groups/:id/members/:agent_id/certificate/rebind` is the agent's
+self-rebind. `:agent_id` must be this daemon's own agent. Body (optional):
+
+```json
+{"certificate": "<base64 storage encoding, the certificate.storage_b64 of POST /owner/agents/issue>"}
+```
+
+Without a body the daemon uses its loaded agent certificate. The
+**cutoff** is `not_after − τ` (τ = 300 s) of the seat's committed
+certificate, on this daemon's clock.
+
+| Case | Status | Body |
+|---|---|---|
+| Before the cutoff, every other Active member's current verified advert sets `certificate_rebind_v1` | `200 OK` | `{"ok": true, "group_id", "agent_id", "certificate_digest", "not_after", "state_revision", "state_hash"}` |
+| After the cutoff | `409 Conflict` | `{"ok": false, "error": "rebind_window_closed", "state": "waiting_for_admin_rebind", "designated_admin", "renewal_digest", "handed_to": [...]}`. The daemon sends the renewal to every eligible admin in an `EvictionHandoffV1`. At expiry the designated admin commits the rebind instead of the removal. |
+| Another Active member's advert does not set `certificate_rebind_v1` (lacking or unknown) | `409 Conflict` | `{"ok": false, "error": "waiting_for_receiver_upgrade", "named": [...]}`. Rebinding is off; at expiry the seat is evicted. |
+| This replica's head is not synced (§2): no completed catch-up round for the current head, or unresolved higher-head evidence | `409 Conflict` | `{"ok": false, "error": "waiting_for_head_sync", "state": "waiting_for_head_sync", "detail"}`. Nothing is sealed. The daemon holds the rebind and runs a head catch-up round; it checks the rules above again and commits the rebind when the head is synced. `GET /groups/:id` lists it in `held_self_rebinds` with cause `waiting_for_head_sync`. |
+| Every other admin's certificate is expired (§4b(2)) and this agent is an admin | as above | The self-rebind runs after the cutoff too. A known Active member whose current advert lacks the bit holds it: `409` with `waiting_for_receiver_upgrade` and `named`; the held rebind commits when the hold lifts. Unknown or offline members do not hold it. |
+| `:agent_id` is another agent, or this agent is revoked | `403 Forbidden` | `{"error": "rebind_signer_ineligible"}` |
+| The seat is not Active | `409 Conflict` | `{"error": "rebind_seat_not_active"}` |
+| The renewal does not verify against the group owner for this agent, is expired, or the group has no owner | `422` | `{"error": "rebind_certificate_invalid"}` |
+| The renewal's `not_after` is not later than the committed one | `422` | `{"error": "rebind_not_later"}` |
+| The `certificate` field is not a base64 storage-encoded `AgentCertificate`, or there is no body and no loaded agent certificate | `400 Bad Request` | `{"error": "rebind_certificate_invalid", "detail"}` |
+| The encoded rebind frame is larger than the frame limit | `413 Payload Too Large` | `{"error": "rebind_frame_oversized", "group_id"}`. Nothing is committed. |
+
+Receivers refuse a frame with the same typed reasons, plus
+`rebind_digest_mismatch` when the seat's committed digest is not the old
+digest in the frame. Receivers do not enforce the cutoff.
+
+`GET /groups/:id` adds:
+
+```json
+"certificate_rebind": {
+  "waiting_for_admin_rebind": [
+    {
+      "cause": "waiting_for_admin_rebind",
+      "agent_id": "<64-hex agent id>",
+      "designated_admin": "<64-hex agent id>",
+      "old_certificate_digest": "<hex digest>",
+      "renewal_digest": "<hex digest>",
+      "since_unix_ms": 1788091300000
+    }
+  ],
+  "held_self_rebinds": [
+    {"cause": "waiting_for_receiver_upgrade", "agent_id": "<64-hex>", "named": ["<64-hex>"]}
+  ],
+  "held_renewals": ["<64-hex agent id>"]
+}
+```
+
+`waiting_for_admin_rebind` ends when a rebind or a removal for the seat
+lands. A `held_self_rebinds` entry has cause `waiting_for_receiver_upgrade`
+while a §4b(2) hold names members, and `waiting_for_head_sync` with an
+empty `named` while it waits only for the §2 head sync. `held_renewals` lists the seats for which this admin holds a
+verified renewal from a hand-off. A verified rebind ends the seat's expiry
+row with `termination_cause` `certificate_valid`. While every admin other
+than the target is expired, the row shows `waiting_for_admin_certificate_renewal`
+naming those admins, or `waiting_for_receiver_upgrade` while a §4b(2)
+self-rebind is held.
+
+**Wire.** `X0XCRB1` — `CertificateRebindV1`, signed in domain
+`x0x.certificate-rebind.v1`, capability `certificate_rebind_v1` (bit 6). It
+rides the direct-message carrier only, to members whose current verified
+advert sets bit 6, with the same per-send revocation checks as
+`CryptoExclusionV1`. It carries no key material. A capable member that asks
+for TreeKEM catch-up gets held frames on this carrier.
 
 ### Roles
 

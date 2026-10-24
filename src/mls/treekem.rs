@@ -474,6 +474,26 @@ impl TreeKemMlsGroup {
         self.agent_to_leaf.contains_key(member)
     }
 
+    /// Whether `member` still occupies a ratchet leaf, read from the tree.
+    ///
+    /// `committed_key_package` is the roster's committed KeyPackage for
+    /// `member`. With it, the tree itself answers. Without it, only a
+    /// leaf-map entry is evidence: the map holds this instance's own leaf
+    /// and the members it added, so a missing entry proves nothing and the
+    /// answer is `None` (#1508 review P1).
+    #[must_use]
+    pub fn member_leaf_present(
+        &self,
+        member: &AgentId,
+        committed_key_package: Option<&[u8]>,
+    ) -> Option<bool> {
+        if self.agent_to_leaf.contains_key(member) {
+            return Some(true);
+        }
+        let kp = decode::<KeyPackage>(committed_key_package?, "key package").ok()?;
+        Some(self.inner.find_leaf_by_key_package(&kp).is_some())
+    }
+
     /// Serialize the full group state for persistence. **Contains private key
     /// material** — the caller MUST protect it at rest (Phase 4 persists it with
     /// the same `0600` model x0x uses for other key files; see ADR-0012).
@@ -866,5 +886,42 @@ mod tests {
         let mut g = TreeKemMlsGroup::create(b"room".to_vec(), agent(1), &seed(1)).expect("create");
         let err = g.remove_member(agent(9)).unwrap_err();
         assert!(matches!(err, MlsError::MemberNotInGroup(_)));
+    }
+
+    /// #1508 review P1: a Welcome joiner's leaf map holds only its own
+    /// leaf. The tree, read against the committed KeyPackage, still shows
+    /// another member's leaf and its removal; with no KeyPackage and no
+    /// map entry there is no evidence (`None`), never "no leaf".
+    #[test]
+    fn member_leaf_present_reads_the_tree_not_the_leaf_map() {
+        let mut creator =
+            TreeKemMlsGroup::create(b"room".to_vec(), agent(1), &seed(1)).expect("create");
+        let leaver = TreeKemMlsGroup::prepare_member(agent(2), &seed(2)).expect("prepare");
+        let leaver_kp = leaver.key_package_bytes().to_vec();
+        creator
+            .add_member(agent(2), &leaver_kp)
+            .expect("add leaver");
+        let joiner = TreeKemMlsGroup::prepare_member(agent(3), &seed(3)).expect("prepare");
+        let joiner_kp = joiner.key_package_bytes().to_vec();
+        let added = creator
+            .add_member(agent(3), &joiner_kp)
+            .expect("add joiner");
+        let mut joined =
+            TreeKemMlsGroup::join_from_welcome(joiner, &added.welcome).expect("welcome");
+
+        assert!(!joined.tracks_member(&agent(2)), "premise: not in the map");
+        assert_eq!(
+            joined.member_leaf_present(&agent(2), Some(&leaver_kp)),
+            Some(true)
+        );
+        assert_eq!(joined.member_leaf_present(&agent(2), None), None);
+        assert_eq!(joined.member_leaf_present(&agent(3), None), Some(true));
+
+        let commit = creator.remove_member(agent(2)).expect("remove");
+        joined.process_commit(&commit).expect("process");
+        assert_eq!(
+            joined.member_leaf_present(&agent(2), Some(&leaver_kp)),
+            Some(false)
+        );
     }
 }

@@ -633,11 +633,27 @@ pub(in crate::server) async fn list_kv_keys(
 }
 
 /// PUT /stores/:id/:key
+/// ADR 0110 §4 and §4b(3): a put or delete on a group's store (topic
+/// `x0x/group/<gid>/kv/<id>`) is a member send on every plane. While
+/// verified revocations cover every admin seat of that group, the route
+/// refuses it with the typed state, before the store's plane decides how
+/// to publish it (#1508 r6: a `SignedPublic` store took the write).
+async fn group_store_write_refusal(
+    state: &AppState,
+    topic: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let (group_id, _) = topic.strip_prefix("x0x/group/")?.split_once("/kv/")?;
+    super::named_groups::s4_no_eligible_admin_refusal(state, group_id).await
+}
+
 pub(in crate::server) async fn put_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
     Json(req): Json<PutValueRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = group_store_write_refusal(&state, &id).await {
+        return refusal;
+    }
     let handle = {
         let stores = state.kv_stores.read().await;
         let Some(handle) = stores.get(&id) else {
@@ -779,6 +795,9 @@ pub(in crate::server) async fn delete_kv_value(
     State(state): State<Arc<AppState>>,
     Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = group_store_write_refusal(&state, &id).await {
+        return refusal;
+    }
     let handle = {
         let stores = state.kv_stores.read().await;
         let Some(handle) = stores.get(&id) else {
@@ -1127,18 +1146,15 @@ impl x0x::kv::TreeKemKvProtector for TreeKemGroupStoreProtector {
                 reader_only,
             },
         )?;
-        // Same hold as REST encrypt. The ratchet has not moved. Do not
-        // edit persist_treekem_snapshot_bound; this return never reaches it.
-        if super::named_groups::self_leave_startup_withholds_ciphertext(
-            &state,
-            &self.group_key,
-            &group,
-        )
-        .await
+        // The same ciphertext boundary as REST encrypt: the self-leave hold
+        // and ADR 0110 §4 (no eligible admin). TreeKEM task-list seals come
+        // through here too. The ratchet has not moved. Do not edit
+        // persist_treekem_snapshot_bound; this return never reaches it.
+        if let Some(hold) =
+            super::named_groups::group_ciphertext_withheld(&state, &self.group_key, Some(&*group))
+                .await
         {
-            return Err(x0x::kv::KvError::SecureRecord(
-                "self-leave exclusion is not complete; ciphertext is withheld".to_string(),
-            ));
+            return Err(x0x::kv::KvError::SecureRecord(hold.reason().to_string()));
         }
         let ciphertext = match group.encrypt_message(&inner) {
             Ok(ciphertext) => ciphertext,
@@ -1785,6 +1801,17 @@ pub(in crate::server) fn gss_kv_refresh(
                 };
                 (outcome, start_repair)
             };
+            // The group ciphertext boundary (ADR 0110 §4). The GSS seal is
+            // synchronous, so this async hook, which the sync loops run
+            // before every seal, sets the context's hold. It runs after the
+            // named-groups guard above is released.
+            if outcome != GssBindingRefresh::Ineligible {
+                let withheld =
+                    super::named_groups::group_ciphertext_withheld(&state, &group_key, None)
+                        .await
+                        .map(super::named_groups::GroupCiphertextHold::reason);
+                ctx.set_seal_withheld(withheld);
+            }
             if start_repair {
                 spawn_gss_key_gap_repair(&state, topic);
             } else if outcome == GssBindingRefresh::Ineligible {
@@ -7114,6 +7141,128 @@ mod tests {
         let _ = GroupPolicy::default();
     }
 
+    /// Codex P2 (#1508 r6), same class as the task-list write: ADR 0110
+    /// §4b(3) refuses every member operation while verified revocations
+    /// cover every admin seat. A put or delete on a `SignedPublic` group's
+    /// store is a member send, so the route refuses it with the typed
+    /// state and the store does not change. Before the fix the public
+    /// store took the write and published it.
+    #[tokio::test]
+    async fn public_group_store_write_is_refused_while_every_admin_seat_is_revoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let admin = crate::identity::AgentKeypair::generate().expect("admin key");
+        let group_key = "4b".repeat(16);
+        let mut info = GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            crate::groups::GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+        info.policy.read_access = crate::groups::GroupReadAccess::Public;
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+        let binding = {
+            let groups = state.named_groups.read().await;
+            resolve_public_group_store(&groups, &group_key, "Wiki", &state.agent.agent_id())
+                .expect("binding")
+        };
+        let snapshot_lease = claim_bound_store_open(&state, &binding).await;
+        let (handle, _context, _) = open_bound_public_store(&state, &binding, snapshot_lease)
+            .await
+            .expect("public store open");
+        state
+            .kv_stores
+            .write()
+            .await
+            .insert(binding.topic.clone(), handle.clone());
+        let put = |key: &str| {
+            let state = Arc::clone(&state);
+            let topic = binding.topic.clone();
+            let key = key.to_string();
+            async move {
+                let response = put_kv_value(
+                    State(state),
+                    Path((topic, key)),
+                    Json(PutValueRequest {
+                        value: BASE64.encode(b"v"),
+                        content_type: None,
+                    }),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).expect("json"),
+                )
+            }
+        };
+        let (status, body) = put("before").await;
+        assert!(status.is_success(), "no false refusal: {status} {body}");
+
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(admin.agent_id()),
+            admin.public_key(),
+            admin.secret_key(),
+            1,
+            None,
+        )
+        .expect("sign revocation");
+        assert!(state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("self-revocation verifies"));
+        let (status, body) = put("after").await;
+        assert!(
+            status == StatusCode::GONE || status == StatusCode::CONFLICT,
+            "typed refusal, got {status} {body}"
+        );
+        assert!(
+            body["error"] == "group_admin_revoked"
+                || body["error"] == "waiting_for_eligible_admin_revocation",
+            "{body}"
+        );
+        let response = delete_kv_value(
+            State(Arc::clone(&state)),
+            Path((binding.topic.clone(), "before".to_string())),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        assert!(
+            status == StatusCode::GONE || status == StatusCode::CONFLICT,
+            "a delete is refused too, got {status}"
+        );
+        assert!(
+            handle.get("after").await.ok().flatten().is_none(),
+            "no write"
+        );
+        assert!(
+            handle.get("before").await.ok().flatten().is_some(),
+            "no delete"
+        );
+        state.kv_stores.write().await.remove(&binding.topic);
+        handle.retire_and_drain().await;
+    }
+
     #[tokio::test]
     async fn public_store_open_drops_its_authorization_context() {
         let (state, _dir) = encrypted_store_test_state().await;
@@ -7768,5 +7917,266 @@ mod tests {
         // fallback ran for exactly that recipient.
         assert_eq!(body["direct_attempted"], serde_json::json!(1), "{body}");
         assert_eq!(body["published"], serde_json::json!(false), "{body}");
+    }
+
+    // ─── #1508 Codex P1 #1: ADR 0110 §4 at the KV seal boundary ────────
+
+    /// Seed a TreeKEM group with this node as an ordinary Member and a
+    /// foreign Admin seat, and return the Admin's key. The Admin seat is
+    /// roster-only: the §4 cover reads the roster, not the tree.
+    async fn seed_treekem_group_with_foreign_admin(
+        state: &AppState,
+        group_key: &str,
+    ) -> x0x::identity::AgentKeypair {
+        seed_treekem_group(state, group_key).await;
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin key");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(group_key).expect("seeded group");
+        info.members_v2
+            .get_mut(&local_hex)
+            .expect("local seat")
+            .role = x0x::groups::GroupRole::Member;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        info.members_v2.insert(
+            admin_hex.clone(),
+            x0x::groups::GroupMember::new_admin(admin_hex, None, 0),
+        );
+        info.recompute_state_hash();
+        admin
+    }
+
+    /// Insert a verified self-revocation of `subject`.
+    async fn revoke_agent(state: &AppState, subject: &x0x::identity::AgentKeypair) {
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(subject.agent_id()),
+            subject.public_key(),
+            subject.secret_key(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_secs(),
+            Some("test".to_string()),
+        )
+        .expect("sign revocation");
+        let revocation_set = state.agent.revocation_set();
+        assert!(revocation_set
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("self-revocation verifies"));
+    }
+
+    async fn seal_once(
+        state: &Arc<AppState>,
+        group_key: &str,
+    ) -> x0x::kv::Result<x0x::kv::TreeKemKvStoreRecordV1> {
+        use x0x::kv::TreeKemKvProtector;
+        let info = state.named_groups.read().await[group_key].clone();
+        let protector = treekem_store_protector(state, group_key, &info);
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        protector
+            .seal_record(
+                &signing,
+                x0x::kv::KvMutationKind::Delta,
+                &x0x::kv::KvStoreId::new([7; 32]),
+                b"value",
+                false,
+            )
+            .await
+    }
+
+    async fn ratchet_snapshot(state: &AppState, group_key: &str) -> Vec<u8> {
+        let live = state.treekem_groups.read().await[group_key].clone();
+        let guard = live.lock().await;
+        guard.to_snapshot_bytes().expect("snapshot")
+    }
+
+    /// ADR 0110 §4 (D75): the only admin seat is revoked. An active member
+    /// must not publish a KV record under the epoch the revoked admin can
+    /// still decrypt. Red on f634bed: `seal_record` sealed and the ratchet
+    /// moved.
+    #[tokio::test]
+    async fn treekem_kv_seal_is_withheld_while_every_admin_seat_is_revoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e7".repeat(16);
+        let admin = seed_treekem_group_with_foreign_admin(&state, &group_key).await;
+        revoke_agent(&state, &admin).await;
+        let before = ratchet_snapshot(&state, &group_key).await;
+
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            seal_once(&state, &group_key),
+        )
+        .await
+        .expect("the boundary check must not stall the seal");
+        let error = refused.expect_err("no ciphertext while no eligible admin remains");
+        assert!(
+            matches!(&error, x0x::kv::KvError::SecureRecord(reason) if reason.starts_with("no_eligible_admin")),
+            "typed refusal, got {error}"
+        );
+        assert_eq!(
+            before,
+            ratchet_snapshot(&state, &group_key).await,
+            "a refused seal must not advance the send ratchet"
+        );
+    }
+
+    /// No false refusal: the same group, with the admin NOT revoked,
+    /// seals; and a revoked non-admin seat does not refuse either.
+    #[tokio::test]
+    async fn treekem_kv_seal_proceeds_while_an_admin_seat_is_unrevoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "e8".repeat(16);
+        let _admin = seed_treekem_group_with_foreign_admin(&state, &group_key).await;
+        let other = x0x::identity::AgentKeypair::generate().expect("member key");
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_key).expect("seeded group");
+            let other_hex = hex::encode(other.agent_id().as_bytes());
+            info.members_v2.insert(
+                other_hex.clone(),
+                x0x::groups::GroupMember::new_member(other_hex, None, None, 0),
+            );
+            info.recompute_state_hash();
+        }
+        revoke_agent(&state, &other).await;
+        let record = seal_once(&state, &group_key)
+            .await
+            .expect("a group with an eligible admin seals");
+        assert_eq!(record.version, 1);
+
+        // A normal group (the local owner, no revocation) seals too.
+        let (plain_state, _plain_dir) = encrypted_store_test_state().await;
+        let plain_key = "e9".repeat(16);
+        seed_treekem_group(&plain_state, &plain_key).await;
+        seal_once(&plain_state, &plain_key)
+            .await
+            .expect("an ordinary group seals");
+    }
+
+    /// #1508 round 2: ADR 0110 §4 on the GSS KV plane. The GSS seal is
+    /// synchronous, so the daemon's refresh hook, which runs before every
+    /// seal, sets the context's hold from the async boundary check. Red on
+    /// b4adc95: the seal after the revocation succeeded.
+    #[tokio::test]
+    async fn gss_kv_seal_is_withheld_while_every_admin_seat_is_revoked() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin key");
+        let group_key = "ea".repeat(16);
+        let mut info = GroupInfo::new(
+            "gss".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        let ctx = Arc::new(x0x::groups::GssKvSecureContext::from_group(&info).expect("ctx"));
+        let hook = gss_kv_refresh(
+            &state,
+            Arc::clone(&ctx),
+            group_key.clone(),
+            format!("group/{group_key}/gss"),
+            admin.agent_id(),
+        );
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let store_id = x0x::kv::KvStoreId::new([9; 32]);
+
+        hook().await;
+        ctx.seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect("no false refusal while the admin seat is unrevoked");
+
+        revoke_agent(&state, &admin).await;
+        hook().await;
+        let error = ctx
+            .seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect_err("no GSS ciphertext while no eligible admin remains");
+        assert!(
+            matches!(&error, x0x::kv::KvError::SecureRecord(reason) if reason.starts_with("no_eligible_admin")),
+            "typed refusal, got {error}"
+        );
+        assert!(
+            ctx.is_active_member(&state.agent.agent_id()),
+            "the hold does not invalidate the context: opens keep working"
+        );
+    }
+
+    /// #1573 (#1508 rc12): a verified GSS removal waits for this
+    /// survivor's share, so the removed member still holds the secret. The
+    /// refresh hook holds every KV seal with the pending-removal reason;
+    /// once the share installs (the epoch moves up) the seal works again.
+    /// Before the fix the seal succeeded under the old secret.
+    #[tokio::test]
+    async fn gss_kv_seal_is_withheld_while_a_removal_waits_for_its_share() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin key");
+        let group_key = "eb".repeat(16);
+        let mut info = GroupInfo::new(
+            "gss".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info.clone());
+        let ctx = Arc::new(x0x::groups::GssKvSecureContext::from_group(&info).expect("ctx"));
+        let hook = gss_kv_refresh(
+            &state,
+            Arc::clone(&ctx),
+            group_key.clone(),
+            format!("group/{group_key}/gss"),
+            admin.agent_id(),
+        );
+        let signing = x0x::kv::AuthorSigning::from_keypair(state.agent.identity().agent_keypair())
+            .expect("signing");
+        let store_id = x0x::kv::KvStoreId::new([9; 32]);
+
+        super::super::named_groups::park_pending_gss_removal_for_test(&state, &group_key, &info);
+        hook().await;
+        let error = ctx
+            .seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect_err("no GSS ciphertext while a removal waits for its share");
+        assert!(
+            matches!(&error, x0x::kv::KvError::SecureRecord(reason)
+                if reason == super::super::named_groups::GroupCiphertextHold::PendingGssRemoval.reason()),
+            "typed refusal, got {error}"
+        );
+
+        // The share installs: the local epoch reaches the removal's.
+        let mut keyed = info.clone();
+        let _ = keyed.rotate_shared_secret();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), keyed);
+        hook().await;
+        ctx.seal_authorized(&signing, x0x::kv::KvMutationKind::Delta, &store_id, b"v")
+            .expect("the installed share ends the hold");
     }
 }

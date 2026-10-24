@@ -10,6 +10,11 @@
 //! and unregister the handle, because nothing re-opens it when the share
 //! installs.
 //!
+//! Since #1573 a current survivor holds the removal head until its share
+//! installs, so it never enters this window. A released receiver still
+//! does, and so does a node that upgrades inside the window, so these tests
+//! keep the window with the `legacy_gss_removal_receiver` test switch.
+//!
 //! The survivor here holds a real store handle, so its agent needs a gossip
 //! runtime: loopback bind, no seeds, no discovery or port mapping, peer cache
 //! off and a private network id. Run it only inside the loopback sandbox or
@@ -36,6 +41,14 @@ async fn loopback_survivor_state() -> Result<(Arc<AppState>, tempfile::TempDir)>
     );
     let state = secure_endpoint_test_state_at(data_dir, agent).await?;
     Ok((state, dir))
+}
+
+/// Keep the metadata-first keyless window (see the module note).
+fn legacy_receiver(state: &AppState) {
+    state
+        .named_group_test_recorders
+        .legacy_gss_removal_receiver
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 async fn open_group_store(
@@ -78,6 +91,7 @@ async fn get_value(
 async fn issue1266_removal_first_rekey_gap_keeps_survivor_store() -> Result<()> {
     let (state, dir) = loopback_survivor_state().await?;
     let f = f1_gss_rotation_fixture_on(state, dir, "issue1266").await?;
+    legacy_receiver(&f.state);
     let admin = f.admin_kp.agent_id();
     let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
 
@@ -221,6 +235,7 @@ async fn issue1266_record_dropped_in_rekey_gap_is_repaired_once() -> Result<()> 
     use x0x::kv::encrypted::KvSecureContext as _;
     let (state, dir) = loopback_survivor_state().await?;
     let f = f1_gss_rotation_fixture_on(state, dir, "issue1266repair").await?;
+    legacy_receiver(&f.state);
     let admin = f.admin_kp.agent_id();
     let (status, created) = open_group_store(&f.state, &f.group_id).await?;
     assert_eq!(
@@ -489,6 +504,7 @@ async fn wait_for_count(mut read: impl FnMut() -> u64, at_least: u64, deadline: 
 async fn issue1266_repair_retries_once_after_responder_cooldown() -> Result<()> {
     let (state, dir) = loopback_survivor_state().await?;
     let f = f1_gss_rotation_fixture_on(state, dir, "issue1266cooldown").await?;
+    legacy_receiver(&f.state);
     let admin = f.admin_kp.agent_id();
     let (status, created) = open_group_store(&f.state, &f.group_id).await?;
     assert_eq!(
@@ -609,6 +625,7 @@ async fn issue1266_concurrent_refreshes_start_one_repair_per_gap() -> Result<()>
     use crate::server::routes::stores::key_gap_test_seam as seam;
     let (state, dir) = loopback_survivor_state().await?;
     let f = f1_gss_rotation_fixture_on(state, dir, "issue1266latch").await?;
+    legacy_receiver(&f.state);
     let admin = f.admin_kp.agent_id();
     let (status, created) = open_group_store(&f.state, &f.group_id).await?;
     assert_eq!(
@@ -758,6 +775,7 @@ async fn daemon_shutdown_releases_gss_store(repair_in_flight: bool) -> Result<()
         envelope_event,
         ..
     } = f1_gss_rotation_fixture_on(state, tempfile::tempdir()?, "issue1266shutdown").await?;
+    legacy_receiver(&state);
     let admin = admin_kp.agent_id();
     let (status, created) = open_group_store(&state, &group_id).await?;
     assert_eq!(
@@ -885,6 +903,7 @@ async fn issue1266_daemon_shutdown_with_repair_in_flight_releases_state() -> Res
 async fn issue1266_delayed_marker_does_not_cancel_the_repair_retry() -> Result<()> {
     let (state, dir) = loopback_survivor_state().await?;
     let f = f1_gss_rotation_fixture_on(state, dir, "issue1266marker").await?;
+    legacy_receiver(&f.state);
     let admin = f.admin_kp.agent_id();
     let (status, created) = open_group_store(&f.state, &f.group_id).await?;
     assert_eq!(

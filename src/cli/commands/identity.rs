@@ -444,6 +444,22 @@ pub async fn owner_agents_revoke(
     Ok(())
 }
 
+/// `x0x owner groups recovery-mandate` — POST
+/// /owner/groups/:id/recovery-mandate (ADR 0110 §4b(1)).
+pub async fn owner_group_recovery_mandate(
+    client: &DaemonClient,
+    group_id: &str,
+    promoted_agent_id: &str,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({ "promoted_agent_id": promoted_agent_id });
+    let resp = client
+        .post(&format!("/owner/groups/{group_id}/recovery-mandate"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x owner riders` — GET /owner/riders (ADR-0039).
 pub async fn owner_riders_list(client: &DaemonClient) -> Result<()> {
     client.run_get("/owner/riders").await
