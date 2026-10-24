@@ -9655,6 +9655,23 @@ impl Agent {
             .map(|(receipt, _ingress)| receipt)
     }
 
+    /// Send to `to` only while the capability binding still names `machine`.
+    ///
+    /// GUI show admits one machine. This send awaits, then reads the
+    /// binding again. A binding that names a different machine is not a
+    /// destination. The gossip address stays the admitted machine.
+    pub(crate) async fn send_direct_bound_to_machine(
+        &self,
+        to: &identity::AgentId,
+        machine: identity::MachineId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_history(to, payload, config, None, Some(machine))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
     /// #461: provenance variant for the direct-send HTTP route — identical
     /// behavior to the public method INCLUDING the ADR-0023 §4 outbound
     /// history wiring (this is the single common path; the public method
@@ -9667,7 +9684,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
-        self.send_direct_with_history(to, payload, config, None)
+        self.send_direct_with_history(to, payload, config, None, None)
             .await
     }
 
@@ -9682,7 +9699,7 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)))
+        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)), None)
             .await
             .map(|(receipt, _ingress)| receipt)
     }
@@ -9696,6 +9713,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
@@ -9711,7 +9729,13 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config, cold_wait)
+            .send_direct_with_config_inner_with_provenance(
+                to,
+                payload,
+                config,
+                cold_wait,
+                bound_machine,
+            )
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -9765,6 +9789,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         let mut evidence = dm_evidence::SendEvidence::new(
             self,
@@ -10035,6 +10060,23 @@ impl Agent {
                     .as_ref()
                     .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
             }
+        }
+
+        // A caller that admitted one machine (GUI show) must not follow a
+        // binding that moved during the awaits above. The gossip address is
+        // that admitted machine. Any other machine fails closed.
+        if let Some(bound) = bound_machine {
+            let resolved = self
+                .capability_store
+                .lookup_binding(to)
+                .map(|binding| binding.machine_id);
+            if resolved != Some(bound) || cap_machine.is_some_and(|current| current != bound) {
+                self.direct_messaging.record_outgoing_failed(*to);
+                return Err(dm::DmError::RecipientUndiscovered(
+                    "selected machine changed before the show send".to_string(),
+                ));
+            }
+            cap_machine = Some(bound);
         }
 
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM

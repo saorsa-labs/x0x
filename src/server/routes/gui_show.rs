@@ -647,19 +647,7 @@ async fn show_active(
     let replies = futures::future::join_all(prepared.into_iter().map(
         |(machine, agent, payload, qid, wait)| async move {
             let selected = MachineId(machine);
-            let sent = tokio::time::timeout_at(
-                deadline,
-                send_gui_dm(state, &agent, &selected, payload, qid),
-            )
-            .await;
-            let body = if matches!(sent, Ok(Ok(()))) {
-                match tokio::time::timeout_at(deadline, wait.recv()).await {
-                    Ok(Ok(body)) => Some(body),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let body = query_activity(state, agent, selected, payload, qid, wait, deadline).await;
             (machine, body)
         },
     ))
@@ -829,8 +817,9 @@ async fn candidate_owner_trusted(state: &AppState, agent: &AgentId, machine: &Ma
 
 /// The retained binding and the capability advert both name `machine`.
 ///
-/// `send_direct` addresses the machine on the capability advert. Dispatch
-/// sends only when that machine is the one this call selected.
+/// Dispatch sends only when both name the machine this call selected.
+/// The send then carries that same machine. A later binding change does
+/// not redirect it.
 async fn dispatch_names_machine(state: &AppState, agent: &AgentId, machine: &MachineId) -> bool {
     let advert_machine = state
         .agent
@@ -920,24 +909,54 @@ async fn send_show_and_wait(
         send_gui_dm(state, &agent, &machine, payload, bytes),
     )
     .await;
+    // The gossip ACK and the authenticated result are independent. A result
+    // that has already arrived is the outcome when the ACK times out.
+    if let Some(result) = take_arrived(deadline, sent, wait).await {
+        return remote_json(result.outcome, target_hex, request_id, None, None);
+    }
+    remote_json(
+        GuiShowOutcome::Unconfirmed,
+        target_hex,
+        request_id,
+        None,
+        None,
+    )
+}
+
+/// One activity query. A reply that has already arrived survives an ACK timeout.
+async fn query_activity(
+    state: &AppState,
+    agent: AgentId,
+    machine: MachineId,
+    payload: Vec<u8>,
+    qid: [u8; 16],
+    wait: crate::gui::remote::PartyWait<'_, crate::gui::remote::GuiActivityBody>,
+    deadline: tokio::time::Instant,
+) -> Option<crate::gui::remote::GuiActivityBody> {
+    let sent =
+        tokio::time::timeout_at(deadline, send_gui_dm(state, &agent, &machine, payload, qid)).await;
+    take_arrived(deadline, sent, wait).await
+}
+
+/// Read a reply that has arrived, then the transport ACK.
+///
+/// `sent` is the finished send. A waiter that already holds a reply is
+/// returned even when that send timed out or failed. An empty waiter
+/// is read only after the send succeeds, and only until `deadline`.
+async fn take_arrived<T>(
+    deadline: tokio::time::Instant,
+    sent: Result<Result<(), crate::dm::DmError>, tokio::time::error::Elapsed>,
+    mut wait: crate::gui::remote::PartyWait<'_, T>,
+) -> Option<T> {
+    if let Ok(value) = wait.try_recv() {
+        return Some(value);
+    }
     if !matches!(sent, Ok(Ok(()))) {
-        return remote_json(
-            GuiShowOutcome::Unconfirmed,
-            target_hex,
-            request_id,
-            None,
-            None,
-        );
+        return None;
     }
     match tokio::time::timeout_at(deadline, wait.recv()).await {
-        Ok(Ok(result)) => remote_json(result.outcome, target_hex, request_id, None, None),
-        _ => remote_json(
-            GuiShowOutcome::Unconfirmed,
-            target_hex,
-            request_id,
-            None,
-            None,
-        ),
+        Ok(Ok(value)) => Some(value),
+        _ => None,
     }
 }
 
@@ -990,6 +1009,9 @@ async fn send_gui_dm(
             "gui show dispatch is bound to the selected machine".to_string(),
         ));
     }
+    // Admission has named `machine`. The prelude may move the binding.
+    // The send below still addresses this machine, or it fails closed.
+    state.gui_show.invoke_send_prelude();
     if let Some(result) = state.gui_show.invoke_send_hook().await {
         return result;
     }
@@ -1001,7 +1023,7 @@ async fn send_gui_dm(
     };
     state
         .agent
-        .send_direct_with_config(to, payload, config)
+        .send_direct_bound_to_machine(to, *machine, payload, config)
         .await
         .map(|_| ())
 }
@@ -2623,6 +2645,164 @@ mod tests {
         Ok(())
     }
 
+    /// Admission names one machine. The binding then moves. The send must
+    /// not follow that new machine.
+    #[tokio::test]
+    async fn binding_change_after_admission_does_not_redirect_the_send() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x71; 32]);
+        let selected = MachineId([0x72; 32]);
+        let moved = MachineId([0x73; 32]);
+        let stamp = unix_secs().saturating_mul(1000);
+        let caps = show_caps();
+        assert!(state
+            .agent
+            .capability_store()
+            .insert(agent, selected, caps.clone(), stamp));
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, selected, unix_secs())
+            .await;
+        assert!(
+            dispatch_names_machine(&state, &agent, &selected).await,
+            "admission must accept the selected machine"
+        );
+        let inserted = Arc::new(AtomicBool::new(false));
+        let inserted_flag = Arc::clone(&inserted);
+        let mover = Arc::clone(&state);
+        state.gui_show.arm_send_prelude_for_test(move || {
+            let ok = mover.agent.capability_store().insert(
+                agent,
+                moved,
+                caps.clone(),
+                stamp.saturating_add(1),
+            );
+            inserted_flag.store(ok, Ordering::Relaxed);
+        });
+        let err = send_gui_dm(&state, &agent, &selected, b"show-pin".to_vec(), [0x74; 16])
+            .await
+            .expect_err("a moved binding must not be a destination");
+        assert!(
+            inserted.load(Ordering::Relaxed),
+            "the moved advert must replace the admitted one before the send resolves it"
+        );
+        match err {
+            crate::dm::DmError::RecipientUndiscovered(message) => {
+                assert!(
+                    message.contains("selected machine changed before the show send"),
+                    "{message}"
+                );
+            }
+            other => panic!("binding move must fail closed, got {other}"),
+        }
+        assert_eq!(
+            state
+                .agent
+                .capability_store()
+                .lookup_binding(&agent)
+                .map(|binding| binding.machine_id),
+            Some(moved),
+            "the test must observe the binding that the send refused"
+        );
+        Ok(())
+    }
+
+    /// A result that is already waiting is kept when the gossip ACK times out.
+    #[tokio::test]
+    async fn show_result_arrives_when_the_ack_times_out() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x81; 32]);
+        let machine = MachineId([0x82; 32]);
+        install_show_advert(&state, agent, machine);
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, machine, unix_secs())
+            .await;
+        let request_id = [0x83u8; 16];
+        let deliver = Arc::clone(&state);
+        state.gui_show.arm_send_ack_timeout_for_test(move || {
+            deliver.gui_show.remote_hub().complete_show(
+                &agent,
+                &machine,
+                crate::gui::remote::GuiShowDmResult {
+                    request_id,
+                    outcome: GuiShowOutcome::Navigated,
+                },
+            );
+        });
+        let response = send_show_and_wait(
+            &state,
+            agent,
+            machine,
+            "people".to_string(),
+            false,
+            agent,
+            hex::encode(request_id),
+        )
+        .await;
+        let bytes = to_bytes(response.into_body(), 1 << 20).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(body["outcome"], "navigated", "{body}");
+        assert_eq!(
+            body["machine_id"],
+            hex::encode(machine.as_bytes()),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    /// An activity reply that is already waiting is kept when its ACK times out.
+    #[tokio::test]
+    async fn activity_reply_arrives_when_the_ack_times_out() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let agent = AgentId([0x91; 32]);
+        let machine = MachineId([0x92; 32]);
+        install_show_advert(&state, agent, machine);
+        state
+            .agent
+            .record_authenticated_binding_for_testing(agent, machine, unix_secs())
+            .await;
+        let qid = [0x93u8; 16];
+        let deliver = Arc::clone(&state);
+        state.gui_show.arm_send_ack_timeout_for_test(move || {
+            deliver.gui_show.remote_hub().complete_activity(
+                &agent,
+                &machine,
+                crate::gui::remote::GuiActivityBody::Reply {
+                    request_id: qid,
+                    last_gui_visible_at: Some(42),
+                    remote_enabled: true,
+                },
+            );
+        });
+        let wait = state
+            .gui_show
+            .remote_hub()
+            .begin_activity(qid, agent, machine)
+            .expect("activity waiter");
+        let body = query_activity(
+            &state,
+            agent,
+            machine,
+            b"activity".to_vec(),
+            qid,
+            wait,
+            tokio::time::Instant::now() + crate::gui::remote::RESULT_WAIT,
+        )
+        .await;
+        match body {
+            Some(crate::gui::remote::GuiActivityBody::Reply {
+                last_gui_visible_at: Some(42),
+                remote_enabled: true,
+                request_id,
+            }) => assert_eq!(request_id, qid),
+            other => panic!("activity reply must survive the ACK timeout: {other:?}"),
+        }
+        Ok(())
+    }
+
     /// `/direct/send` refuses every gui-show prefix for a session bearer
     /// and for the durable owner token.
     #[tokio::test]
@@ -2677,16 +2857,20 @@ mod tests {
         Ok(())
     }
 
-    fn install_show_advert(state: &AppState, agent: AgentId, machine: MachineId) {
+    fn show_caps() -> crate::dm::DmCapabilities {
         let mut caps = crate::dm::DmCapabilities::pending();
         caps.application_registry = crate::dm::CapabilityRegistry {
             version: 1,
             bits: crate::dm::CapabilityRegistry::GUI_SHOW_V1,
         };
+        caps
+    }
+
+    fn install_show_advert(state: &AppState, agent: AgentId, machine: MachineId) {
         assert!(state.agent.capability_store().insert(
             agent,
             machine,
-            caps,
+            show_caps(),
             unix_secs().saturating_mul(1000),
         ));
     }

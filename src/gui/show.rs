@@ -27,6 +27,9 @@ type ShowSendHook = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>> + Send + Sync,
 >;
 
+/// Runs after admission and before the real send. Production leaves it empty.
+type ShowSendPrelude = Arc<dyn Fn() + Send + Sync>;
+
 /// Reply sends that may be in flight together.
 const REPLY_SEND_SLOTS: usize = 4;
 
@@ -440,6 +443,11 @@ pub struct GuiShowRuntime {
     /// Production leaves this empty. The send function calls it and does
     /// not branch on `cfg(test)`.
     send_hook: Mutex<Option<ShowSendHook>>,
+    /// Runs after the selected machine is admitted and before the send.
+    ///
+    /// Production leaves this empty. A test uses it to move the capability
+    /// binding in that gap.
+    send_prelude: Mutex<Option<ShowSendPrelude>>,
     /// Test seam: milliseconds `send_show_result` waits before it returns.
     ///
     /// Zero uses the real send. The receive tests arm this so one slow
@@ -494,6 +502,7 @@ impl GuiShowRuntime {
             rider_pairs: Mutex::new(HashSet::new()),
             trusted_senders: Mutex::new(HashSet::new()),
             send_hook: Mutex::new(None),
+            send_prelude: Mutex::new(None),
             #[cfg(test)]
             reply_delay_ms: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -570,6 +579,34 @@ impl GuiShowRuntime {
                 Err(crate::dm::DmError::RecipientUndiscovered(
                     "gui show test stall".to_string(),
                 ))
+            }) as Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>>
+        });
+        if let Ok(mut guard) = self.send_hook.lock() {
+            *guard = Some(hook);
+        }
+    }
+
+    /// Move state after admission, then let the real send run.
+    #[cfg(test)]
+    pub fn arm_send_prelude_for_test(&self, prelude: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut guard) = self.send_prelude.lock() {
+            *guard = Some(Arc::new(prelude));
+        }
+    }
+
+    /// Deliver a reply, then fail the gossip ACK.
+    ///
+    /// The waiter is already registered when this hook runs.
+    #[cfg(test)]
+    pub fn arm_send_ack_timeout_for_test(&self, deliver: impl Fn() + Send + Sync + 'static) {
+        let deliver = Arc::new(deliver);
+        let hook: ShowSendHook = Arc::new(move || {
+            deliver();
+            Box::pin(async {
+                Err(crate::dm::DmError::Timeout {
+                    retries: 0,
+                    elapsed: std::time::Duration::from_secs(10),
+                })
             }) as Pin<Box<dyn Future<Output = Result<(), crate::dm::DmError>> + Send>>
         });
         if let Ok(mut guard) = self.send_hook.lock() {
@@ -943,6 +980,19 @@ impl GuiShowRuntime {
     pub(crate) async fn invoke_send_hook(&self) -> Option<Result<(), crate::dm::DmError>> {
         let hook = self.send_hook.lock().ok().and_then(|guard| guard.clone())?;
         Some(hook().await)
+    }
+
+    /// Run the post-admission test step. Production does nothing.
+    pub(crate) fn invoke_send_prelude(&self) {
+        let Some(hook) = self
+            .send_prelude
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+        else {
+            return;
+        };
+        hook();
     }
 
     /// Opener for one launch.
