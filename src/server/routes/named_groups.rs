@@ -54360,6 +54360,7 @@ pub(in crate::server) mod tests {
         promotee_kp: crate::identity::AgentKeypair,
         /// A Member that a later admin can remove after the removal.
         bystander_hex: String,
+        bystander_kp: crate::identity::AgentKeypair,
         /// The committed post-removal state.
         committed: x0x::groups::GroupInfo,
     }
@@ -54396,11 +54397,8 @@ pub(in crate::server) mod tests {
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let promotee_kp = crate::identity::AgentKeypair::generate()?;
         let promotee = promotee_kp.agent_id();
-        let bystander_hex = hex::encode(
-            crate::identity::AgentKeypair::generate()?
-                .agent_id()
-                .as_bytes(),
-        );
+        let bystander_kp = crate::identity::AgentKeypair::generate()?;
+        let bystander_hex = hex::encode(bystander_kp.agent_id().as_bytes());
 
         let group_id = format!("f1-gss-{group_tag}-local");
         let stable_group_id = format!("f1-gss-{group_tag}-stable");
@@ -54522,6 +54520,7 @@ pub(in crate::server) mod tests {
             promotee,
             promotee_kp,
             bystander_hex,
+            bystander_kp,
             committed,
         })
     }
@@ -55276,6 +55275,79 @@ pub(in crate::server) mod tests {
             assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
             assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
             assert!(info.has_active_member(&joiner_hex), "J is seated");
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
+    /// #1533 rc17 (Codex P1 at 8459714): A removes a member with a GSS
+    /// rotation, then C leaves by itself, then A promotes B and goes
+    /// offline. A lagging survivor must walk past C's self-leave, install
+    /// the removal with B's secret and reach A's last head. Before the fix
+    /// the walk stopped at the self-leave, so the removal stayed parked
+    /// although B was an admin.
+    #[tokio::test]
+    async fn rc17_gss_removal_catchup_past_a_self_leave_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("self-leave-then-promotion").await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let leaver = f.bystander_kp.agent_id();
+        let mut left = f.committed.clone();
+        left.remove_member(&f.bystander_hex, Some(f.bystander_hex.clone()));
+        left.roster_revision = left.roster_revision.saturating_add(1);
+        let leave_revision = left.roster_revision;
+        let leave_commit =
+            seal_commit_owner_certified(&f.state, &mut left, &f.bystander_kp, 2_000).await?;
+        let self_leave = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: leave_revision,
+            actor: f.bystander_hex.clone(),
+            agent_id: f.bystander_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(leave_commit),
+        };
+        let mut promoted = left.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 3_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: promotee_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(
+            &f.state,
+            rc14_promotee_share(&f),
+            f.promotee,
+            true,
+            None,
+        )
+        .await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, self_leave, leaver, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert!(!info.has_active_member(&f.bystander_hex), "C has left");
         }
         assert_eq!(
             group_ciphertext_withheld(&f.state, &f.group_id, None).await,

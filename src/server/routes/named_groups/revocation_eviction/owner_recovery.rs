@@ -1908,7 +1908,8 @@ pub(in crate::server) async fn promoted_admin_secret(
 
 /// The state after the held commit `held` on `cursor`, checked as the
 /// ordinary apply checks it, or `None`. Only same-epoch roster and
-/// metadata steps (a role update, a rename or a GSS add, #1508 rc16) and
+/// metadata steps (a role update, a rename, a GSS add, #1508 rc16, or a
+/// member's own GSS leave, #1533 rc17) and
 /// an admin's GSS removal or ban to a later epoch (#1508 rc15) are walked;
 /// any other event, or one that fails a check, ends the walk, and the
 /// transition keeps waiting for its share.
@@ -2043,6 +2044,35 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                     if let Some(name) = display_name.clone() {
                         next.set_display_name(agent_id, name);
                     }
+                },
+            )
+        }
+        // #1533 rc17 (Codex P1): an active member's own GSS leave between
+        // the removal and a promotion, checked as the ordinary self-leave
+        // apply checks it: the leaver signs, names itself, and neither
+        // rotates nor carries a TreeKEM commit. It keeps the epoch.
+        Event::MemberRemoved {
+            revision,
+            actor,
+            agent_id,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            ..
+        } if *actor == author && *agent_id == author => {
+            if cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                || !cursor.has_active_member(agent_id)
+            {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::MemberSelf,
+                |next| {
+                    next.roster_revision =
+                        super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    next.remove_member(agent_id, Some(actor.clone()));
                 },
             )
         }

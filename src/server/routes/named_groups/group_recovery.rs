@@ -254,6 +254,12 @@ struct Placeheld {
     legacy_pending: bool,
 }
 
+/// One subject's §3 re-seat bases and the time of its last request.
+struct ReseatBases {
+    refs: Vec<RecoveryRef>,
+    at: Instant,
+}
+
 #[derive(Default)]
 struct S3Inner {
     /// Per group (stable ID): this node's own recovery as a subject.
@@ -266,7 +272,9 @@ struct S3Inner {
     recovery_lists: HashMap<String, Vec<RecoveryListEntry>>,
     /// Per `(group, subject)`: the refs this admin answered `not_on_chain`
     /// for, or the subject reported as `attestation_conflict` (§3 basis).
-    reseat_bases: HashMap<(String, String), Vec<RecoveryRef>>,
+    /// Bounded per §11: at most `RECOVERY_LIST_CAP` subjects per group,
+    /// each kept for `RECOVERY_LIST_TTL` from its last request.
+    reseat_bases: HashMap<(String, String), ReseatBases>,
     /// The join carry: one ATA per `(attempt_id, from_revision)` (§2).
     join_carry: HashMap<(String, u64), AdminTerminalAttestation>,
     /// The §11 responder limits.
@@ -2092,7 +2100,7 @@ async fn build_answer(
                 },
                 ChainPosition::OnChain => (AttestAnswer::OnChain(head), Guard::Member),
                 ChainPosition::NotOnChain => {
-                    remember_reseat_bases(state, &stable, &requester_hex, request, true).await;
+                    remember_reseat_bases(state, &info, &requester_hex, request, true).await;
                     (AttestAnswer::NotOnChain(head), Guard::Member)
                 }
                 ChainPosition::AttesterBehind => (
@@ -2105,7 +2113,14 @@ async fn build_answer(
                 ),
             }
         };
-    remember_reseat_bases(state, &stable, &requester_hex, request, false).await;
+    // The re-seat route refuses a banned or revoked subject, so its refs
+    // are never a basis.
+    if !matches!(
+        answer,
+        AttestAnswer::Refused(AttestRefusalReason::BannedOrRevoked)
+    ) {
+        remember_reseat_bases(state, &info, &requester_hex, request, false).await;
+    }
     record_recovery_list(state, &stable, &requester_hex, request, answer.name()).await;
     (answer, guard)
 }
@@ -2193,9 +2208,14 @@ async fn current_issued_reseat(
 /// Keep the refs a re-seat may name as its basis (§3): every ref of a
 /// request this admin answers `not_on_chain`, and every ref the subject
 /// reports as `attestation_conflict`.
+///
+/// §11 (D83) bounds this per group: each subject keeps at most
+/// `RECOVERY_LIST_CAP` refs and the group at most `RECOVERY_LIST_CAP`
+/// subjects. Over the cap, the least recent subject that has no roster
+/// entry goes first, so fresh keys cannot push out a removed member.
 async fn remember_reseat_bases(
     state: &AppState,
-    stable_group_id: &str,
+    info: &GroupInfo,
     subject_hex: &str,
     request: &GroupAttestRequestV1,
     not_on_chain: bool,
@@ -2209,18 +2229,47 @@ async fn remember_reseat_bases(
     if refs.is_empty() {
         return;
     }
+    let stable = info.stable_group_id().to_string();
+    let now = Instant::now();
     let mut inner = state.group_recovery.inner.lock().await;
     let entry = inner
         .reseat_bases
-        .entry((stable_group_id.to_string(), subject_hex.to_string()))
-        .or_default();
+        .entry((stable.clone(), subject_hex.to_string()))
+        .or_insert_with(|| ReseatBases {
+            refs: Vec::new(),
+            at: now,
+        });
+    entry.at = now;
     for recovery_ref in refs {
-        if !entry.contains(&recovery_ref) {
-            entry.push(recovery_ref);
+        if !entry.refs.contains(&recovery_ref) {
+            entry.refs.push(recovery_ref);
         }
     }
-    let excess = entry.len().saturating_sub(s3::RECOVERY_LIST_CAP);
-    entry.drain(..excess);
+    let excess = entry.refs.len().saturating_sub(s3::RECOVERY_LIST_CAP);
+    entry.refs.drain(..excess);
+    loop {
+        let mut subjects: Vec<(bool, Instant, String)> = inner
+            .reseat_bases
+            .iter()
+            .filter(|((group, _), _)| *group == stable)
+            .map(|((_, subject), bases)| {
+                (
+                    info.members_v2.contains_key(subject),
+                    bases.at,
+                    subject.clone(),
+                )
+            })
+            .collect();
+        if subjects.len() <= s3::RECOVERY_LIST_CAP {
+            break;
+        }
+        // Strangers before roster subjects, then the least recent first.
+        subjects.sort();
+        let Some((_, _, evict)) = subjects.into_iter().next() else {
+            break;
+        };
+        inner.reseat_bases.remove(&(stable.clone(), evict));
+    }
 }
 
 async fn record_recovery_list(
@@ -3062,6 +3111,9 @@ async fn prune_admin_state(state: &AppState) {
         list.retain(|entry| now.saturating_duration_since(entry.at) < s3::RECOVERY_LIST_TTL);
     }
     inner.recovery_lists.retain(|_, list| !list.is_empty());
+    inner
+        .reseat_bases
+        .retain(|_, bases| now.saturating_duration_since(bases.at) < s3::RECOVERY_LIST_TTL);
     let issued: Vec<(String, Vec<String>)> = inner
         .sidecars
         .iter()
@@ -3244,6 +3296,19 @@ pub(in crate::server) fn cached_recovery_json(
 /// verified ATA. A sibling marker can never meet this, and the gap record
 /// is untouched. Returns whether it retired one.
 async fn retire_marker_attested(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) -> bool {
+    if info.fork_quarantine.is_none() {
+        return false;
+    }
+    // #1533 rc17 (Codex P2): [`record_conflict`] writes under the group's
+    // membership lock. Hold it from the conflict check below until the
+    // marker is durably cleared, so no conflict is recorded between the
+    // check and the clear. The record and the sidecar are read again under
+    // the lock; the caller's copies are only a fast path.
+    let lock = super::group_membership_lock(state, group_key).await;
+    let membership_guard = lock.lock().await;
+    let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
+        return false;
+    };
     let Some(marker) = info.fork_quarantine.as_ref() else {
         return false;
     };
@@ -3258,7 +3323,7 @@ async fn retire_marker_attested(state: &Arc<AppState>, group_key: &str, info: &G
     let Some(ata) = body.active_ata else {
         return false;
     };
-    if !marker_retires_under(info, &ata) {
+    if !marker_retires_under(&info, &ata) {
         return false;
     }
     let identity = RecoveryRef::from_marker(marker);
@@ -3285,6 +3350,9 @@ async fn retire_marker_attested(state: &Arc<AppState>, group_key: &str, info: &G
         same
     })
     .await;
+    // The ingest resume takes the task-list locks before `named_groups`,
+    // so it runs without the membership lock.
+    drop(membership_guard);
     if !matches!(outcome, Ok(super::AtomicWriteOutcome::Durable)) {
         return false;
     }
@@ -4295,7 +4363,7 @@ pub(in crate::server) async fn reseat_group_member(
             .await
             .reseat_bases
             .get(&(stable.clone(), subject_hex.clone()))
-            .is_some_and(|refs| refs.contains(recovery_ref)),
+            .is_some_and(|bases| bases.refs.contains(recovery_ref)),
     };
     if !basis_known {
         return reseat_refusal(StatusCode::CONFLICT, "basis_unknown", basis.to_json());
@@ -8653,6 +8721,53 @@ mod tests {
         Ok(())
     }
 
+    /// #1533 rc17 (Codex P2 at 8459714): the marker retirement checks for a
+    /// conflict and then clears the marker. A conflict recorded between
+    /// the two (here while the clear waits for the roster write) must keep
+    /// the marker. The retirement now holds the membership lock that
+    /// [`record_conflict`] takes, so the record waits until the clear is
+    /// done. Before the fix the record landed in the window and the marker
+    /// was cleared under it. Inert.
+    #[tokio::test]
+    async fn a_conflict_cannot_land_between_the_retirement_check_and_clear() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = marker_fixture(&state).await?;
+        let persistence = state.named_groups_persistence_lock.lock().await;
+        let task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            let info = info.clone();
+            async move { retire_marker_attested(&state, &key, &info).await }
+        });
+        // Let the retirement pass its checks and wait on the roster write.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let lock = super::super::group_membership_lock(&state, &key).await;
+        let recorded_in_window =
+            match tokio::time::timeout(Duration::from_millis(300), lock.lock()).await {
+                Ok(guard) => {
+                    assert!(live_marker(&state, &key).await, "the clear has not run");
+                    record_conflict_locked(&state, &key, &info, diverging(&ata)).await;
+                    drop(guard);
+                    true
+                }
+                Err(_) => false,
+            };
+        drop(persistence);
+        let retired = task.await?;
+        if recorded_in_window {
+            assert!(
+                live_marker(&state, &key).await,
+                "a conflict recorded before the clear keeps the marker"
+            );
+        }
+        assert!(
+            !recorded_in_window,
+            "the record waits for the retirement to finish"
+        );
+        assert!(retired, "with no conflict the marker retires");
+        Ok(())
+    }
+
     /// #1533 r11: a conflict without its active ATA has no common prefix,
     /// so it admits nothing past the head (it admitted everything before).
     /// A conflict whose ATA was retired before it could be recorded is not
@@ -9481,6 +9596,114 @@ mod tests {
             "the live record is unchanged"
         );
         assert_eq!(files().await, before, "the Home files are unchanged");
+        Ok(())
+    }
+
+    /// #1533 rc17 (ZCode MAJOR 2, ADR 0109 §11 D83): the §3 re-seat bases
+    /// are bounded. Every answered request wrote an entry keyed by its
+    /// requester, a banned one too, and nothing pruned the map, so fresh
+    /// keys grew an admin's memory without limit. Now a banned or revoked
+    /// requester stores none (the re-seat route refuses that subject), a
+    /// group keeps at most `RECOVERY_LIST_CAP` subjects, and a roster
+    /// subject outlives a flood of unknown requesters.
+    #[tokio::test]
+    async fn reseat_bases_stay_bounded_and_keep_a_roster_subject() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let keypair = state.agent.identity().agent_keypair();
+        let local = local_hex(&state);
+        let removed = "ab".repeat(32);
+        let banned = "cd".repeat(32);
+        let mut info = GroupInfo::new(
+            "rc17-reseat-bases".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "1717".repeat(16),
+        );
+        for member in [&removed, &banned] {
+            info.add_member(
+                member.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(local.clone()),
+                None,
+            );
+        }
+        info.seal_commit(keypair, 1_000)?;
+        info.remove_member(&removed, Some(local.clone()));
+        info.ban_member(&banned, Some(local.clone()));
+        info.seal_commit(keypair, 2_000)?;
+        let stable = info.stable_group_id().to_string();
+        let key = info.mls_group_id.clone();
+        state.named_groups.write().await.insert(key.clone(), info);
+
+        let request = |requester: [u8; 32], n: u64| GroupAttestRequestV1 {
+            group: stable.clone(),
+            requester,
+            head_revision: 1,
+            head_state_hash: "00".to_string(),
+            refs: vec![(
+                RecoveryRef::Gap {
+                    reason: "r".to_string(),
+                    head_state_hash: format!("{n:064x}"),
+                    terminal_revision: n,
+                    terminal_state_hash: "00".to_string(),
+                },
+                "attestation_conflict".to_string(),
+            )],
+        };
+        let raw = |hex_id: &str| -> anyhow::Result<[u8; 32]> {
+            let bytes = hex::decode(hex_id)?;
+            bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("an agent ID is 32 bytes"))
+        };
+        let has = |subject: &str| {
+            let subject = subject.to_string();
+            let stable = stable.clone();
+            let state = Arc::clone(&state);
+            async move {
+                state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .reseat_bases
+                    .contains_key(&(stable, subject))
+            }
+        };
+
+        let _ = build_answer(&state, &key, &request(raw(&removed)?, 1)).await;
+        assert!(has(&removed).await, "a removed subject's basis is kept");
+        let _ = build_answer(&state, &key, &request(raw(&banned)?, 2)).await;
+        assert!(
+            !has(&banned).await,
+            "a banned requester stores no basis: the re-seat route refuses it"
+        );
+
+        let flood = 4 * s3::RECOVERY_LIST_CAP;
+        for n in 0..flood {
+            let mut stranger = [0u8; 32];
+            stranger[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            stranger[31] = 0x17;
+            let _ = build_answer(&state, &key, &request(stranger, 100 + n as u64)).await;
+        }
+        let kept = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .reseat_bases
+            .keys()
+            .filter(|(group, _)| *group == stable)
+            .count();
+        assert!(
+            kept <= s3::RECOVERY_LIST_CAP,
+            "{kept} subjects kept after {flood} fresh requesters; the cap is {}",
+            s3::RECOVERY_LIST_CAP
+        );
+        assert!(
+            has(&removed).await,
+            "a flood of unknown requesters does not evict a roster subject"
+        );
         Ok(())
     }
 }
