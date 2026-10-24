@@ -1192,6 +1192,14 @@ async fn post_cutoff(
         }
     }
     seen.verify("the designated admin rebinds B")?;
+    receipt.note(format!(
+        "after the rebind wait (wall {} ms): A's rebind deliveries: {}; A sees B, C \
+         certificate_rebind_v1 {:?}, {:?}",
+        wall_ms(),
+        crate::server::routes::named_groups::w3h_rebind_delivery_report(&sim.state("A")?).await,
+        supports(sim, "A", "B", Reg::CERTIFICATE_REBIND_V1)?,
+        supports(sim, "A", "C", Reg::CERTIFICATE_REBIND_V1)?
+    ));
     if reached_ms.is_some() {
         pause(sim, "the rebind settles", SETTLE).await?;
     }

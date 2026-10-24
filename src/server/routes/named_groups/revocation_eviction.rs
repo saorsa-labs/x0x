@@ -1897,6 +1897,12 @@ fn blocks_manual_request(cause: WaitingCause) -> bool {
     )
 }
 
+/// W3-H diagnostics: [`rebind::delivery_report`].
+#[cfg(test)]
+pub(super) async fn rebind_delivery_report(state: &Arc<AppState>) -> String {
+    rebind::delivery_report(state).await
+}
+
 /// §2: list a queued manual request on its row, at most one entry per
 /// kind (the earliest), so a repeated request does not grow the list
 /// (ZCode MINOR at 7441b7a).
