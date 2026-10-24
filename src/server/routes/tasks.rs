@@ -513,7 +513,7 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
     ///   secret through durable save or rollback, so under a read permit the
     ///   live `secret_epoch` cannot move. A GSS share hold (a verified
     ///   removal that waits for its share) is added under it too, so the
-    ///   hold cannot start between the check and the publish (#1533 rc16).
+    ///   hold cannot start between the check and the publish (#1508 rc17).
     /// - TreeKEM: the group's membership lock, then its live ratchet mutex —
     ///   the same order `seal_record` takes them. Every ratchet epoch change
     ///   needs the ratchet mutex.
@@ -535,12 +535,12 @@ impl x0x::crdt::TaskDeltaProtector for GroupTaskDeltaProtector {
             match body {
                 x0x::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
                     let permit = Arc::clone(&state.gss_publication_gate).read_owned().await;
-                    // #1533 rc16 (Codex P1): a verified removal that parks
-                    // after the seal leaves the epoch unchanged, and the
-                    // removed member holds that secret. The hold is added
-                    // under this gate held exclusively, so it is checked
-                    // here, under the permit. `seal` loaded the durable
-                    // holds.
+                    // #1508 rc17 (Codex P1; #1533 rc16): a verified removal
+                    // that parks after the seal leaves the epoch unchanged,
+                    // and the removed member holds that secret. The hold is
+                    // added under this gate held exclusively, so it is
+                    // checked here, under the permit. `seal` loaded the
+                    // durable holds.
                     let current = {
                         let groups = state.named_groups.read().await;
                         crate::server::resolve_group_entry_locked(&groups, &self.group_id).map(

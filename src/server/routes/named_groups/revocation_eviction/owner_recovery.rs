@@ -277,6 +277,24 @@ pub(super) fn note_survivor_head(
     }
 }
 
+impl OrcState {
+    /// #1508 rc17 (Codex P1): whether a retained owner-recovery frame of
+    /// `stable_group_id` commits a revision above `revision`. A frame is
+    /// retained only after [`receive`] checked it, or after a restart
+    /// restored a frame that passed those checks.
+    pub(super) fn stash_ahead(&self, stable_group_id: &str, revision: u64, now: Instant) -> bool {
+        self.stash.iter().any(|frame| {
+            now.saturating_duration_since(frame.at) <= ORC_RETAIN_TTL
+                && matches!(
+                    orc::decode_frame(&frame.bytes),
+                    Ok(orc::OwnerRecoveryFrameV1::Commit(decoded))
+                        if decoded.body.stable_group_id == stable_group_id
+                            && decoded.body.next_revision > revision
+                )
+        })
+    }
+}
+
 fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP> {
     &mut inner.orc.log
 }
@@ -1908,8 +1926,9 @@ pub(in crate::server) async fn promoted_admin_secret(
 
 /// The state after the held commit `held` on `cursor`, checked as the
 /// ordinary apply checks it, or `None`. Only same-epoch roster and
-/// metadata steps (a role update, a rename, a GSS add, #1508 rc16, or a
-/// member's own GSS leave, #1533 rc17) and
+/// metadata steps (a role update, a rename, a GSS add (#1508 rc16), a
+/// policy update or an unban (#1508 rc17), or a member's own GSS leave
+/// (#1533 rc17)) and
 /// an admin's GSS removal or ban to a later epoch (#1508 rc15) are walked;
 /// any other event, or one that fails a check, ends the walk, and the
 /// transition keeps waiting for its share.
@@ -2073,6 +2092,54 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                     next.roster_revision =
                         super::super::adopt_roster_revision(next.roster_revision, *revision);
                     next.remove_member(agent_id, Some(actor.clone()));
+                },
+            )
+        }
+        // #1508 rc17 (Codex P1): an admin's policy update, or an unban,
+        // between the removal and a promotion. Neither changes the epoch.
+        // A policy update keeps an OwnerCertified owner axis, as in the
+        // ordinary apply.
+        Event::PolicyUpdated {
+            revision,
+            actor,
+            policy,
+            ..
+        } => {
+            if !admin(actor)
+                || cursor
+                    .policy
+                    .admission
+                    .owner_certified_user_id()
+                    .is_some_and(|owner| policy.admission.owner_certified_user_id() != Some(owner))
+            {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    super::super::set_policy_update(next, *revision, policy, commit.committed_at)
+                },
+            )
+        }
+        Event::MemberUnbanned {
+            revision,
+            actor,
+            agent_id,
+            ..
+        } => {
+            if !admin(actor) || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                return None;
+            }
+            super::super::apply_stateful_event_to_group(
+                cursor,
+                commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision =
+                        super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    next.unban_member(agent_id);
                 },
             )
         }

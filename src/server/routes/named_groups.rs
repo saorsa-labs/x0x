@@ -12866,6 +12866,27 @@ pub(in crate::server) fn pending_gss_removal_withholds(
     gss_share_hold::withholds(state, group_key, info)
 }
 
+/// The fields a verified `PolicyUpdated` sets. The ordinary apply and the
+/// GSS held-chain walk (#1508 rc17) share it, so both reach one result.
+pub(in crate::server) fn set_policy_update(
+    next: &mut x0x::groups::GroupInfo,
+    revision: u64,
+    policy: &x0x::groups::GroupPolicy,
+    committed_at: u64,
+) {
+    next.policy_revision = revision.max(next.policy_revision);
+    next.policy = policy.clone();
+    if next.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+        && next.discovery_card_topic.is_none()
+    {
+        next.discovery_card_topic = Some(format!(
+            "x0x.group.{}.card",
+            &next.mls_group_id[..16.min(next.mls_group_id.len())]
+        ));
+    }
+    next.updated_at = committed_at;
+}
+
 /// A parked GSS removal of a placeholder member that chains from `info`'s
 /// head and rotates one epoch above it (test builds only): the state
 /// [`park_gss_removal_for_share`] leaves after a verified removal.
@@ -12929,11 +12950,13 @@ async fn later_admin_removal_secret(
 /// ([`gss_removal_waits_for_share`]). A resend of the same commit is not
 /// parked twice. Suppressed in replay contexts (`allow_queue` false).
 ///
-/// #1533 rc16 (Codex P1): the hold is added under the GSS publication gate
-/// held exclusively. A sealed GSS task record rechecks the hold under a read
-/// permit on that gate and publishes under the same permit, so a record
-/// sealed before the park is not published after it. `gss_gate_held` is
-/// `true` when the caller already holds the gate exclusively.
+/// #1508 rc17 (Codex P1; #1533 rc16): the hold is added under the GSS
+/// publication gate held exclusively. An encrypted KV publisher holds a
+/// read permit from its hold check through its publish, and a sealed GSS
+/// task record rechecks the hold under a read permit and publishes under
+/// it, so a hold cannot start between a check and its publish.
+/// `gss_gate_held` is `true` when the caller already holds the gate
+/// exclusively.
 async fn park_gss_removal_for_share(
     state: &AppState,
     group_key: &str,
@@ -14916,19 +14939,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.policy_revision = revision.max(next.policy_revision);
-                    next.policy = policy.clone();
-                    if next.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
-                        && next.discovery_card_topic.is_none()
-                    {
-                        next.discovery_card_topic = Some(format!(
-                            "x0x.group.{}.card",
-                            &next.mls_group_id[..16.min(next.mls_group_id.len())]
-                        ));
-                    }
-                    next.updated_at = commit.committed_at;
-                },
+                |next| set_policy_update(next, revision, &policy, commit.committed_at),
             )
             .await
             else {
@@ -55356,6 +55367,80 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// #1508 rc17 (Codex P1): A removes a member with a GSS rotation,
+    /// changes the policy, promotes B and goes offline. A lagging survivor
+    /// must walk past the policy update, install the removal with B's
+    /// secret and reach A's last head. Before the fix the walk stopped at
+    /// the policy update, so the removal stayed parked although B was an
+    /// admin.
+    #[tokio::test]
+    async fn rc17_gss_removal_catchup_past_a_policy_update_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("policy-then-promotion").await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let mut updated = f.committed.clone();
+        updated.policy.write_access = x0x::groups::GroupWriteAccess::AdminOnly;
+        updated.policy_revision = updated.policy_revision.saturating_add(1);
+        updated.updated_at = 2_000;
+        let policy_revision = updated.policy_revision;
+        let policy_commit =
+            seal_commit_owner_certified(&f.state, &mut updated, &f.admin_kp, 2_000).await?;
+        let policy_update = NamedGroupMetadataEvent::PolicyUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: policy_revision,
+            actor: admin_hex.clone(),
+            policy: updated.policy.clone(),
+            commit: Some(policy_commit),
+        };
+        let mut promoted = updated.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 3_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: promotee_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(
+            &f.state,
+            rc14_promotee_share(&f),
+            f.promotee,
+            true,
+            None,
+        )
+        .await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, policy_update, admin, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert_eq!(
+                info.policy.write_access,
+                x0x::groups::GroupWriteAccess::AdminOnly,
+                "the policy update is applied"
+            );
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
     /// #1508 rc15 (Codex P1): A removes a member with a GSS rotation,
     /// promotes B and goes offline; B then removes another member and
     /// rotates again. A lagging survivor gets A's removal, B's share of
@@ -55572,6 +55657,86 @@ pub(in crate::server) mod tests {
             group_ciphertext_withheld(&f.state, &f.group_id, None).await,
             Some(GroupCiphertextHold::PendingGssRemoval),
             "the restarted survivor still holds"
+        );
+        Ok(())
+    }
+
+    /// #1508 rc17 (Codex P1): a verified removal parks only under the GSS
+    /// publication gate held exclusively. An encrypted KV publisher holds a
+    /// read permit from its hold check (the refresh hook) through its
+    /// publish, so the hold cannot start between that check and the
+    /// publish with the removed member's key. Before the fix the park did
+    /// not wait for the permit.
+    #[tokio::test]
+    async fn rc17_gss_park_waits_for_an_in_flight_publication() -> Result<()> {
+        let f = f1_gss_rotation_fixture("park-gate").await?;
+        let info = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("group")?;
+        let removal = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: info.stable_group_id().to_string(),
+            revision: info.roster_revision.saturating_add(1),
+            actor: String::new(),
+            agent_id: "ee".repeat(32),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(info.secret_epoch.saturating_add(1)),
+            commit: Some(x0x::groups::state_commit::GroupStateCommit {
+                group_id: info.stable_group_id().to_string(),
+                revision: info.state_revision.saturating_add(1),
+                prev_state_hash: Some(info.state_hash.clone()),
+                roster_root: String::new(),
+                policy_hash: String::new(),
+                public_meta_hash: String::new(),
+                security_binding: None,
+                state_hash: "park-gate".to_string(),
+                withdrawn: false,
+                committed_by: String::new(),
+                committed_at: 0,
+                signer_public_key: String::new(),
+                signature: String::new(),
+            }),
+        };
+        // A KV publisher passed its hold check and holds its permit.
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        let publication = f.state.gss_publication_gate.read().await;
+        let parking = {
+            let state = Arc::clone(&f.state);
+            let group_key = f.group_id.clone();
+            tokio::spawn(async move {
+                park_gss_removal_for_share(
+                    &state,
+                    &group_key,
+                    &removal,
+                    AgentId([0xee; 32]),
+                    true,
+                    false,
+                )
+                .await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None,
+            "the hold does not start inside an in-flight publication"
+        );
+        drop(publication);
+        tokio::time::timeout(std::time::Duration::from_secs(10), parking)
+            .await
+            .context("park after the publication")??;
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            Some(GroupCiphertextHold::PendingGssRemoval),
+            "the hold starts after the publication"
         );
         Ok(())
     }
