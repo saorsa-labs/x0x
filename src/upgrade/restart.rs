@@ -191,6 +191,15 @@ pub const fn supervised_exit_code() -> i32 {
     }
 }
 
+/// Exit status after a failed or overrunning acknowledged shutdown flush
+/// (engineer ruling 23 Oct 2026): `EX_TEMPFAIL`. The previous binary has
+/// been restored, the upgrade is marked failed, and the service manager
+/// restarts the daemon on the old version instead of finding a live process
+/// with no API and no network.
+pub(crate) const fn flush_failure_exit_code() -> i32 {
+    75
+}
+
 // ---------------------------------------------------------------------------
 // I0b — loaded launchd policy readback (ADR-0061 §3, #615)
 // ---------------------------------------------------------------------------

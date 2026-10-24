@@ -1746,7 +1746,103 @@ mod s5_bit2_tests {
         assert!(registry.supports(CapabilityRegistry::SHARE_GRANT_V1));
         assert!(registry.supports(CapabilityRegistry::PREDECESSOR_OFFER_V1));
         assert!(registry.supports(CapabilityRegistry::FILE_CONTROL_ACK_V1));
+        assert!(registry.supports(CapabilityRegistry::GUI_SHOW_V1));
         assert_eq!(CapabilityRegistry::FILE_CONTROL_ACK_V1, 1 << 3);
+        let rows = canonical_registry_rows();
+        let mut seen = std::collections::BTreeMap::new();
+        for (bit, name) in &rows {
+            assert!(
+                seen.insert(*bit, *name).is_none(),
+                "bit {bit} is allocated twice"
+            );
+        }
+        let gui_bit = registry_bit(&rows, "gui_show_v1");
+        assert_eq!(gui_bit, 10, "gui_show_v1 must take the lowest free bit");
+        for (bit, name) in &rows {
+            if *name == "gui_show_v1" {
+                continue;
+            }
+            assert_ne!(
+                CapabilityRegistry::GUI_SHOW_V1,
+                1_u64 << bit,
+                "gui_show_v1 collides with {name} on bit {bit}"
+            );
+        }
+        assert_eq!(CapabilityRegistry::GUI_SHOW_V1, 1_u64 << gui_bit);
+        let paired = [
+            ("share_grant_v1", CapabilityRegistry::SHARE_GRANT_V1),
+            (
+                "predecessor_offer_v1",
+                CapabilityRegistry::PREDECESSOR_OFFER_V1,
+            ),
+            ("peer_evidence_v1", CapabilityRegistry::PEER_EVIDENCE_V1),
+            (
+                "file_control_ack_v1",
+                CapabilityRegistry::FILE_CONTROL_ACK_V1,
+            ),
+            ("gui_show_v1", CapabilityRegistry::GUI_SHOW_V1),
+        ];
+        for (name, mask) in paired {
+            let bit = registry_bit(&rows, name);
+            assert_eq!(mask, 1_u64 << bit, "{name}");
+        }
+        assert_eq!(registry_bit(&rows, "eviction_handoff_v1"), 4);
+    }
+
+    fn registry_bit(rows: &[(u32, &str)], name: &str) -> u32 {
+        rows.iter()
+            .find(|(_, row)| *row == name)
+            .unwrap_or_else(|| panic!("registry has no {name}"))
+            .0
+    }
+
+    /// Rows of the canonical ADR 0093 table in `docs/adr/README.md`.
+    fn canonical_registry_rows() -> Vec<(u32, &'static str)> {
+        let readme = include_str!("../docs/adr/README.md");
+        let start = readme
+            .find("**ADR 0093 capability registry**")
+            .expect("registry heading");
+        let body = &readme[start..];
+        let end = body.find("\n## ").expect("registry section end");
+        let mut rows = Vec::new();
+        let mut unallocated_from = None;
+        for line in body[..end].lines() {
+            let line = line.trim();
+            if !line.starts_with('|') {
+                continue;
+            }
+            let mut cols = line.split('|').map(str::trim).filter(|col| !col.is_empty());
+            let Some(bit_col) = cols.next() else {
+                continue;
+            };
+            let Some(name_col) = cols.next() else {
+                continue;
+            };
+            if bit_col == "Bit" || bit_col.starts_with('-') {
+                continue;
+            }
+            let name = name_col.trim_matches('`');
+            if bit_col.contains('–') || bit_col.contains('-') {
+                assert_eq!(name, "unallocated", "{line}");
+                let start_bit: u32 = bit_col
+                    .split(['–', '-'])
+                    .next()
+                    .expect("range")
+                    .parse()
+                    .expect("range start");
+                unallocated_from = Some(start_bit);
+                continue;
+            }
+            let bit: u32 = bit_col.parse().expect("bit number");
+            rows.push((bit, name));
+        }
+        let next = rows.iter().map(|(bit, _)| *bit).max().expect("rows") + 1;
+        assert_eq!(
+            unallocated_from,
+            Some(next),
+            "the unallocated range must start at the next free bit"
+        );
+        rows
     }
 
     #[test]

@@ -363,6 +363,62 @@ macro_rules! log_flush_regression_tests {
                 assert_eq!(*fixture.bytes.lock().unwrap(), b"firstsecond");
             }
 
+            fn assert_overflow_fails_one_transaction(
+                capacity: usize,
+                chunks: usize,
+                chunk_size: usize,
+                rejected_size: usize,
+            ) {
+                let mut fixture = Fixture::new(None, true, capacity);
+                fixture.block();
+                for _ in 0..chunks {
+                    fixture.writer.write_all(&vec![0; chunk_size]).unwrap();
+                }
+                assert_eq!(
+                    fixture
+                        .writer
+                        .write(&vec![0; rejected_size])
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                fixture.release.send(()).unwrap();
+                assert_eq!(
+                    fixture.writer.flush().unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                let mut expected = b"first".to_vec();
+                expected.extend(vec![0; chunks * chunk_size]);
+                // The rejected write is one unterminated line. Main's bounded
+                // stdout sink reports that loss before the failed barrier.
+                expected.extend_from_slice(b"1 log lines dropped\n");
+                assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+                fixture.writer.write_all(b"healthy tail").unwrap();
+                fixture.writer.flush().unwrap();
+                expected.extend_from_slice(b"healthy tail");
+                assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+            }
+
+            #[test]
+            fn shutdown_log_flush_message_overflow_fails_one_transaction() {
+                assert_overflow_fails_one_transaction(1, 1, 1, 1);
+            }
+
+            #[test]
+            fn shutdown_log_flush_byte_overflow_fails_one_transaction() {
+                assert_overflow_fails_one_transaction(
+                    MAX_MESSAGES,
+                    MAX_BYTES / MAX_MESSAGE_BYTES,
+                    MAX_MESSAGE_BYTES,
+                    1,
+                );
+            }
+
+            #[test]
+            fn shutdown_log_flush_oversized_message_fails_one_transaction() {
+                assert_overflow_fails_one_transaction(MAX_MESSAGES, 0, 0, MAX_MESSAGE_BYTES + 1);
+            }
+
             #[test]
             fn shutdown_log_flush_hang_cannot_extend_its_deadline() {
                 let mut fixture = Fixture::new(None, true, 8);

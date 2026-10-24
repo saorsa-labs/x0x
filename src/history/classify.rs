@@ -73,6 +73,15 @@ struct Probe {
 /// communication until a protocol family claims it explicitly.
 #[must_use]
 pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
+    // ADR 0083 §6: gui-show typed DMs are daemon plumbing. They are not
+    // inbox messages and they are not history.
+    if payload.starts_with(crate::gui::remote::SHOW_REQUEST_PREFIX)
+        || payload.starts_with(crate::gui::remote::SHOW_RESULT_PREFIX)
+        || payload.starts_with(crate::gui::remote::ACTIVITY_PREFIX)
+    {
+        return DmPayloadClass::Ephemeral;
+    }
+
     // Typed byte-prefix frames: plumbing families with their own durable
     // surfaces (group ingest, KV store, exec audit log, card import).
     if payload
@@ -261,6 +270,19 @@ mod tests {
             classify_dm_payload(b"X0XGRC1 hello"),
             DmPayloadClass::Durable("text/plain")
         );
+    }
+
+    #[test]
+    fn gui_show_typed_dms_are_not_history() {
+        for prefix in [
+            crate::gui::remote::SHOW_REQUEST_PREFIX,
+            crate::gui::remote::SHOW_RESULT_PREFIX,
+            crate::gui::remote::ACTIVITY_PREFIX,
+        ] {
+            let mut payload = prefix.to_vec();
+            payload.extend_from_slice(&[1, 2, 3, 4]);
+            assert_eq!(classify_dm_payload(&payload), DmPayloadClass::Ephemeral);
+        }
     }
 
     #[test]

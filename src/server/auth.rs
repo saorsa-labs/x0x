@@ -303,6 +303,8 @@ pub(super) async fn refresh_session(
             // follow the new token, or the view opens with no origin banner.
             state.gui_show.rebind_pending_session(&bearer, &token);
             super::ws::rebind_gui_ws_tokens(&state, &bearer, &token).await;
+            // A hidden tab refreshes during bootstrap. Visibility comes from
+            // a live GUI socket, not from this refresh.
             (
                 StatusCode::OK,
                 Json(serde_json::json!({

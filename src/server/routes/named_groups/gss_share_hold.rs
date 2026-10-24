@@ -19,7 +19,9 @@
 //!
 //! Only transitions whose signed commit the apply verified are written, so
 //! a forged removal holds nothing. The file is local state only: it is not
-//! a wire format and not an API.
+//! a wire format and not an API. It carries `version`
+//! ([`HOLD_FILE_VERSION`]); a file of another version is not decoded, so it
+//! holds its group and is never replaced, as a damaged file is.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -81,8 +83,12 @@ struct HeldRemoval {
     sender: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// The hold file format version.
+const HOLD_FILE_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
 struct HoldFile {
+    version: u32,
     group_key: String,
     #[serde(default)]
     removals: Vec<HeldRemoval>,
@@ -265,7 +271,7 @@ pub(super) async fn ensure_loaded(state: &AppState) {
         }
         let file = match tokio::fs::read(&path)
             .await
-            .map(|bytes| serde_json::from_slice::<HoldFile>(&bytes))
+            .map(|bytes| decode_hold_file(&bytes))
         {
             Ok(Ok(file)) => file,
             Ok(Err(error)) => {
@@ -298,6 +304,17 @@ pub(super) async fn ensure_loaded(state: &AppState) {
         .unreadable
         .store(false, std::sync::atomic::Ordering::SeqCst);
     *loaded = true;
+}
+
+fn decode_hold_file(bytes: &[u8]) -> Result<HoldFile, String> {
+    let file: HoldFile = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if file.version != HOLD_FILE_VERSION {
+        return Err(format!(
+            "unsupported hold file version {} (expected {HOLD_FILE_VERSION})",
+            file.version
+        ));
+    }
+    Ok(file)
 }
 
 fn absorb(state: &AppState, file: HoldFile) {
@@ -396,6 +413,7 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
         };
     }
     let file = HoldFile {
+        version: HOLD_FILE_VERSION,
         group_key: group_key.to_string(),
         removals,
         exclusions,

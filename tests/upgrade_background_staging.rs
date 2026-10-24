@@ -287,8 +287,8 @@ macro_rules! background_permit_regression_tests {
                     semver::Version::new(2, 0, 0),
                     Some((Upgrader::new(cli.clone(), semver::Version::new(1, 0, 0)), incoming_cli)),
                     TempDirGuard { path: scratch.clone() },
-                    Some(Box::new(move || std::fs::write(continued, b"restart owned").unwrap())),
-                    None, Some(&permit),
+                    Some(Box::new(move |_| std::fs::write(continued, b"restart owned").unwrap())),
+                    None, Some(&permit), None,
                 );
                 tokio::pin!(operation);
                 tokio::time::timeout(Duration::from_secs(5), async {

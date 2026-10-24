@@ -44,7 +44,7 @@ use crate::groups::eviction::SidecarDecodeError;
 use crate::groups::GroupInfo;
 use crate::server::state::AppState;
 
-use super::super::S4Inner;
+use super::super::{host_commit_gate_open, S4Inner};
 
 /// Extension of the certificate-rebind log.
 pub(in super::super) const REBIND_EXTENSION: &str = "crblog";
@@ -356,8 +356,12 @@ async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
 }
 
 /// Read every file with `extension` in `dir`. A damaged file is
-/// quarantined and skipped; a newer layout is skipped and kept.
-async fn read_all_in(dir: &Path, extension: &str) -> Vec<ReplayLogV1> {
+/// quarantined and skipped; a newer layout is skipped and kept. Inside an
+/// ADR 0094 trial (`gate_open` false) a damaged file is skipped and left
+/// in place (§5). The load runs once per process, so that file is not
+/// quarantined later: the first write of its group's log after host
+/// commit replaces it, and its frames are lost as in the quarantine case.
+async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<ReplayLogV1> {
     let mut logs = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return logs;
@@ -374,6 +378,10 @@ async fn read_all_in(dir: &Path, extension: &str) -> Vec<ReplayLogV1> {
             Ok(log) => logs.push(log),
             Err(SidecarDecodeError::NewerFormat(version)) => {
                 tracing::warn!(version, path = %path.display(), "ADR 0110 S4: held frame log has a newer layout; not loaded");
+            }
+            // An ADR 0094 trial starts no quarantine (§5).
+            Err(SidecarDecodeError::Damaged(reason)) if !gate_open => {
+                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged held frame log inside an ADR 0094 trial; not loaded and not quarantined");
             }
             Err(SidecarDecodeError::Damaged(reason)) => {
                 tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged held frame log; quarantining (ADR 0108 §5a); its frames are lost");
@@ -429,6 +437,11 @@ async fn write_with<const CAP: usize>(
     bytes: &Arc<Vec<u8>>,
     authored: bool,
 ) -> bool {
+    // §5: no S4 file write inside an ADR 0094 trial, so no commit or
+    // install of this kind occurs before host commit.
+    if !host_commit_gate_open(state) {
+        return false;
+    }
     let planned = held(&mut *state.revocation_evictions.inner.lock().await)
         .planned(stable, at, bytes, authored);
     write_at(&log_path(state, stable, extension), &planned).await
@@ -443,6 +456,9 @@ pub(in super::super) async fn rewrite_from_memory<const CAP: usize>(
     held: impl Fn(&mut S4Inner) -> &mut HeldLog<CAP>,
     stable: &str,
 ) {
+    if !host_commit_gate_open(state) {
+        return;
+    }
     let log = held(&mut *state.revocation_evictions.inner.lock().await).file(stable);
     let _durable = write_at(&log_path(state, stable, extension), &log).await;
 }
@@ -458,7 +474,8 @@ pub(in super::super) async fn ensure_restored<const CAP: usize>(
     if held(&mut *state.revocation_evictions.inner.lock().await).restored {
         return Restored::default();
     }
-    let logs = read_all_in(&state.treekem_dir, extension).await;
+    let gate_open = host_commit_gate_open(state);
+    let logs = read_all_in(&state.treekem_dir, extension, gate_open).await;
     let groups: HashMap<String, GroupInfo> = state
         .named_groups
         .read()
@@ -516,7 +533,7 @@ pub(in super::super) mod tests {
         drop(before);
         let mut after = HeldLog::<CAP>::default();
         let resumes = after
-            .restore(read_all_in(dir.path(), extension).await, groups)
+            .restore(read_all_in(dir.path(), extension, true).await, groups)
             .resumes;
         let served = after.catchup_frames(&[stable.to_string()], 4);
         assert_eq!(served.len(), 1, "the frame is missing after the restart");
@@ -529,7 +546,7 @@ pub(in super::super) mod tests {
         let planned = after.planned(stable, (6, "h6"), &Arc::new(vec![6]), true);
         assert!(write_at(&path, &planned).await);
         let mut again = HeldLog::<CAP>::default();
-        let _ = again.restore(read_all_in(dir.path(), extension).await, groups);
+        let _ = again.restore(read_all_in(dir.path(), extension, true).await, groups);
         assert!(again.catchup_frames(&[stable.to_string()], 5).is_empty());
         resumes
     }
@@ -582,7 +599,9 @@ pub(in super::super) mod tests {
         tokio::fs::write(&damaged, b"X0XRPL1\0not a log")
             .await
             .expect("write");
-        assert!(read_all_in(dir.path(), REBIND_EXTENSION).await.is_empty());
+        assert!(read_all_in(dir.path(), REBIND_EXTENSION, true)
+            .await
+            .is_empty());
         assert!(!damaged.exists(), "the damaged file is moved aside");
         let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read_dir");
         let entry = entries.next_entry().await.expect("entry").expect("one");
@@ -600,7 +619,9 @@ pub(in super::super) mod tests {
         let mut bytes = encode(&log).expect("encode");
         bytes[PREFIX.len()] = b'2';
         tokio::fs::write(&newer, &bytes).await.expect("write");
-        assert!(read_all_in(dir.path(), REBIND_EXTENSION).await.is_empty());
+        assert!(read_all_in(dir.path(), REBIND_EXTENSION, true)
+            .await
+            .is_empty());
         assert!(
             !write_at(&newer, &log).await,
             "a newer layout blocks the commit"

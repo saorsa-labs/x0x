@@ -54,7 +54,7 @@ macro_rules! http_custody_regression_tests {
                 }));
                 // The actual production owner parks before any mutation, then
                 // waits its real750ms after the worker signals successful apply.
-                let on_success=arm_http_deferred_restart_owner("x0xd".into(),false,RestartContext::default(),plan,"2.0.0".into()).unwrap();
+                let on_success=arm_http_deferred_restart_owner("x0xd".into(),false,RestartContext::default(),plan,"2.0.0".into(),None).unwrap();
                 REPLACE_HOOK_INIT.call_once(|| { tracing::subscriber::set_global_default(PauseAtReplacingBinary).unwrap(); });
                 let (entered_tx,entered_rx)=tokio::sync::oneshot::channel();
                 let (release_tx,release_rx)=std::sync::mpsc::channel();
@@ -71,7 +71,7 @@ macro_rules! http_custody_regression_tests {
                 let mut operation=Box::pin(apply_replacements_with_permit(
                     Upgrader::new(daemon.clone(),semver::Version::new(1,0,0)),incoming,semver::Version::new(2,0,0),
                     Some((Upgrader::new(cli.clone(),semver::Version::new(1,0,0)),incoming_cli)),
-                    TempDirGuard {path:scratch.clone()},Some(on_success),None,Some(&permit),
+                    TempDirGuard {path:scratch.clone()},Some(on_success),None,Some(&permit),None,
                 ));
                 tokio::time::timeout(Duration::from_secs(5),async {
                     tokio::select! { result=operation.as_mut()=>panic!("replacement ended before pause: {result:?}"), entered=entered_rx=>entered.unwrap() }

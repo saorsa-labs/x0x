@@ -38,6 +38,7 @@ use tokio::time::Instant;
 
 use crate as x0x;
 use crate::server::state::AppState;
+use crate::upgrade::journal::{read_boot_records, Phase as UpgradePhase, RecordRead};
 use x0x::groups::crypto_exclusion as ce;
 use x0x::groups::eviction::{
     self as s4, CommitPermission, EvJournalV1, EvictionKey, EvictionTrigger, EvsBodyV1,
@@ -154,6 +155,9 @@ struct S4Inner {
     rebuilt_from: Vec<[u8; 16]>,
     /// A rebuild is running: rows show `rebuilding_obligation_store`.
     rebuilding: bool,
+    /// The last load ran inside an ADR 0094 trial, read-only (§5). The
+    /// worker repeats it after host commit.
+    trial_load: bool,
     /// The `.evs` file exists on disk.
     file_exists: bool,
     /// The store changed since the last snapshot a writer took. A writer
@@ -823,13 +827,28 @@ pub(in crate::server) async fn note_catchup_head(
 }
 
 /// ADR 0094 host-commit gate (§5). S4 creates or materially writes its
-/// files only after host commit. This tree has no ADR 0094 upgrade-trial
-/// state machine yet, so every boot runs outside a trial and the gate is
-/// open; the ADR's follow-up "clarify the host-commit gate when M2 is
-/// absent" covers this. `waiting_for_host_commit` is shown when the gate
-/// is closed.
-fn host_commit_gate_open(_state: &AppState) -> bool {
-    true
+/// files only after host commit, never after instance health alone.
+/// Read on every use, so the gate opens on the first pass after the
+/// commit; with no record each read is one failed `lstat` per record name.
+/// Closed rows show `waiting_for_host_commit`.
+pub(super) fn host_commit_gate_open(state: &AppState) -> bool {
+    host_commit_gate_open_at(&state.data_dir)
+}
+
+/// The gate reads the ADR 0094 upgrade journal (`upgrade-journal.json`)
+/// read-only. With no journal record, this boot runs outside a trial and
+/// the gate is open. A record in `host_committed` opens it. A record in
+/// any other phase is an uncommitted trial, and an unreadable, corrupt or
+/// unknown record fails closed.
+fn host_commit_gate_open_at(data_dir: &FsPath) -> bool {
+    match read_boot_records(data_dir).journal {
+        RecordRead::Missing => true,
+        RecordRead::Journal(record) => record.phase == UpgradePhase::HostCommitted,
+        RecordRead::Refused(_)
+        | RecordRead::Handoff(_)
+        | RecordRead::Boot(_)
+        | RecordRead::LegacyHandoff(_) => false,
+    }
 }
 
 // ─── Worker ────────────────────────────────────────────────────────────────
@@ -847,6 +866,12 @@ pub(in crate::server) async fn run_revocation_eviction_worker(state: Arc<AppStat
     load_persisted_obligations(&state).await;
     let notify = state.agent.s4_revocation_intake().notified();
     loop {
+        // §5: re-scan on host commit; the load then does what the trial
+        // load deferred.
+        if state.revocation_evictions.inner.lock().await.trial_load && host_commit_gate_open(&state)
+        {
+            load_persisted_obligations(&state).await;
+        }
         revocation_eviction_pass(&state).await;
         // The `.evh` drops a kept hand-off only after the `.evs` holds the
         // row it opened.
@@ -1872,6 +1897,24 @@ fn blocks_manual_request(cause: WaitingCause) -> bool {
     )
 }
 
+/// §2: list a queued manual request on its row, at most one entry per
+/// kind (the earliest), so a repeated request does not grow the list
+/// (ZCode MINOR at 7441b7a).
+fn queue_manual(
+    queued: &mut HashMap<EvictionKey, Vec<QueuedManual>>,
+    key: EvictionKey,
+    kind: ManualRequestKind,
+    now_ms: u64,
+) {
+    let requests = queued.entry(key).or_default();
+    if !requests.iter().any(|request| request.kind == kind) {
+        requests.push(QueuedManual {
+            kind,
+            queued_at_unix_ms: now_ms,
+        });
+    }
+}
+
 async fn manual_request_gate(
     state: &Arc<AppState>,
     group_key: &str,
@@ -1909,14 +1952,7 @@ async fn manual_request_gate(
             inner.queued_bans.entry(key.clone()).or_insert(now_ms);
             inner.dirty = true;
         }
-        inner
-            .queued_manual
-            .entry(key)
-            .or_default()
-            .push(QueuedManual {
-                kind,
-                queued_at_unix_ms: now_ms,
-            });
+        queue_manual(&mut inner.queued_manual, key, kind, now_ms);
     }
     if kind == ManualRequestKind::Ban && !persist_obligations(state).await {
         tracing::warn!(
@@ -3338,6 +3374,10 @@ async fn run_member_route(
 /// renew and rejoin. A ban that this node cannot apply yet (not an admin,
 /// head not synced, route refused) stays queued and durable.
 async fn drive_queued_bans(state: &Arc<AppState>) {
+    // §5: a queued ban is S4 work; it waits for host commit.
+    if !host_commit_gate_open(state) {
+        return;
+    }
     let now = Instant::now();
     let due: Vec<EvictionKey> = {
         let inner = state.revocation_evictions.inner.lock().await;
@@ -4003,6 +4043,11 @@ async fn load_persisted_obligations(state: &AppState) {
     let runtime = &state.revocation_evictions;
     let _writer = runtime.evs_writer.lock().await;
     let path = evs_path(state);
+    // §5 and "ADR 0094 trial": inside an uncommitted trial the load only
+    // reads. It starts no quarantine transaction, writes no replacement
+    // and retires no copy or journal; a damaged file runs memory-only. The
+    // worker repeats the load after host commit.
+    let gate_open = host_commit_gate_open(state);
     let (pending, verify_failed) = match sync_dir_of(&path).await {
         Ok(()) => verified_pending_copies(&path).await,
         Err(_) => (Vec::new(), true),
@@ -4036,6 +4081,11 @@ async fn load_persisted_obligations(state: &AppState) {
                 sidecar.state = SidecarState::SidecarNewerFormat;
                 sidecar.detail = Some(format!("version {version}"));
             }
+            Err(SidecarDecodeError::Damaged(reason)) if !gate_open => {
+                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged obligation sidecar inside an ADR 0094 trial; memory-only until host commit");
+                sidecar.state = SidecarState::SidecarUnavailable;
+                sidecar.detail = Some("cause waiting_for_host_commit".to_string());
+            }
             Err(SidecarDecodeError::Damaged(reason)) => {
                 tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged obligation sidecar; quarantining (ADR 0108 §5a)");
                 covered = pending;
@@ -4049,7 +4099,11 @@ async fn load_persisted_obligations(state: &AppState) {
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            covered = pending;
+            // Inside a trial `covered` stays empty, so no replacement is
+            // written.
+            if gate_open {
+                covered = pending;
+            }
         }
         Err(_) => {
             sidecar.state = SidecarState::SidecarUnavailable;
@@ -4086,13 +4140,15 @@ async fn load_persisted_obligations(state: &AppState) {
             sidecar.detail = Some("step replace".to_string());
         }
     }
-    for copy in finalize {
-        if !finalize_quarantine(&copy).await {
-            tracing::warn!(path = %copy.display(), "ADR 0110 S4: cannot finalize a quarantined copy");
+    if gate_open {
+        for copy in finalize {
+            if !finalize_quarantine(&copy).await {
+                tracing::warn!(path = %copy.display(), "ADR 0110 S4: cannot finalize a quarantined copy");
+            }
         }
     }
     // Speculative preparation never survives a restart on its own (§5).
-    let (journals, journal_paths) = reconcile_evjournals(state).await;
+    let (journals, journal_paths) = reconcile_evjournals(state, gate_open).await;
     for row in store.to_rows() {
         if row.phase == Phase::Prepared && !journals.contains_key(&row.key()) {
             if let Some(stored) = store.get_mut(&row.key()) {
@@ -4138,6 +4194,7 @@ async fn load_persisted_obligations(state: &AppState) {
     inner.removals = removals;
     inner.queued_bans = queued_bans;
     inner.dirty = !journals.is_empty();
+    inner.trial_load = !gate_open;
     drop(inner);
     // §5 (#1508 review P1): a journal is the only durable copy of its
     // prepared or committed transition until the `.evs` holds the row this
@@ -4147,10 +4204,7 @@ async fn load_persisted_obligations(state: &AppState) {
         let (snapshot, writable) = {
             let mut inner = runtime.inner.lock().await;
             let writable = inner.sidecar.state.writable();
-            (
-                begin_persist(&mut inner, host_commit_gate_open(state)),
-                writable,
-            )
+            (begin_persist(&mut inner, gate_open), writable)
         };
         let held = match snapshot {
             Ok(snapshot) => {
@@ -4171,7 +4225,7 @@ async fn load_persisted_obligations(state: &AppState) {
             }
         }
     }
-    handoff_log::load(state).await;
+    handoff_log::load(state, gate_open).await;
 }
 
 /// Read every `.evjournal` in the TreeKEM directory and classify it (§5).
@@ -4181,6 +4235,7 @@ async fn load_persisted_obligations(state: &AppState) {
 /// retires those after the `.evs` holds what it adopted from them.
 async fn reconcile_evjournals(
     state: &AppState,
+    gate_open: bool,
 ) -> (HashMap<EvictionKey, EvJournalV1>, Vec<std::path::PathBuf>) {
     let mut keys = HashMap::new();
     let mut decoded = Vec::new();
@@ -4205,6 +4260,10 @@ async fn reconcile_evjournals(
                 decoded.push(path);
             }
             Err(SidecarDecodeError::NewerFormat(_)) => {}
+            // An ADR 0094 trial starts no quarantine (§5).
+            Err(SidecarDecodeError::Damaged(reason)) if !gate_open => {
+                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged prepare journal inside an ADR 0094 trial; quarantine waits for host commit");
+            }
             Err(SidecarDecodeError::Damaged(reason)) => {
                 tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged prepare journal; quarantining (ADR 0108 §5a)");
                 match quarantine_file(&path, &bytes).await {
@@ -5595,6 +5654,205 @@ mod tests {
         assert!(
             !tokio::fs::try_exists(&path).await?,
             "retired after the write"
+        );
+        Ok(())
+    }
+
+    /// An ADR 0094 upgrade journal record in `phase`, in the fixed record
+    /// name of `data_dir`. Raw JSON on purpose, so a test can also write a
+    /// phase the reader does not know.
+    fn write_upgrade_journal(data_dir: &FsPath, phase: &str) -> anyhow::Result<()> {
+        let artifact = |name: &str| {
+            serde_json::json!({
+                "target_path": data_dir.join(name),
+                "staged_path": data_dir.join(format!("{name}.staged")),
+                "backup_path": data_dir.join(format!("{name}.backup")),
+                "previous_sha256": vec![1_u8; 32],
+                "candidate_sha256": vec![2_u8; 32],
+            })
+        };
+        let record = serde_json::json!({
+            "schema_version": 1,
+            "record_kind": "journal",
+            "transaction_id": "transaction-a",
+            "sequence": 1,
+            "generation": 1,
+            "plan": {
+                "previous_version": "0.48.1",
+                "candidate_version": "0.48.2",
+                "manifest_sha256": vec![3_u8; 32],
+                "daemon": artifact("x0xd"),
+                "cli": artifact("x0x"),
+                "participants": [{
+                    "instance_id": "alice",
+                    "executable": data_dir.join("x0xd"),
+                    "data_root": data_dir,
+                    "identity_root": data_dir,
+                    "argv": ["x0xd"],
+                    "cwd": data_dir,
+                    "env": {},
+                    "restart": {
+                        "mode": "TransactionalHandoff",
+                        "supervised_exit_code": null,
+                        "supervision_signal": null,
+                        "launchd_verified": null,
+                        "systemd_verified": null,
+                        "launcher": null
+                    },
+                    "old_pid": 1234,
+                    "process_start": 100,
+                    "boot_id": "boot-a",
+                    "was_running": true
+                }]
+            },
+            "phase": phase,
+            "cause": null,
+            "daemon_progress": {"swapped": true, "restored": false, "observed_sha256": null},
+            "cli_progress": {"swapped": true, "restored": false, "observed_sha256": null}
+        });
+        std::fs::write(
+            data_dir.join(crate::upgrade::journal::JOURNAL_FILE_NAME),
+            serde_json::to_vec(&record)?,
+        )?;
+        Ok(())
+    }
+
+    /// ZCode MINOR at 7441b7a: a client that repeats a manual request
+    /// while the row waits does not grow the queued list; each kind is
+    /// listed once, with its earliest time.
+    #[test]
+    fn a_repeated_manual_request_is_listed_once() {
+        let key = EvictionKey::new("g", [9; 32]);
+        let mut queued = HashMap::new();
+        for at in 0..1000 {
+            queue_manual(&mut queued, key.clone(), ManualRequestKind::Remove, at);
+            queue_manual(&mut queued, key.clone(), ManualRequestKind::Ban, 5000 + at);
+        }
+        let listed: Vec<(ManualRequestKind, u64)> = queued[&key]
+            .iter()
+            .map(|request| (request.kind, request.queued_at_unix_ms))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (ManualRequestKind::Remove, 0),
+                (ManualRequestKind::Ban, 5000)
+            ]
+        );
+    }
+
+    /// ZCode MAJOR-1 at 7441b7a (ADR 0110 §5): the host-commit gate reads
+    /// the ADR 0094 upgrade journal. No record or `host_committed` opens
+    /// it; any other phase is an uncommitted trial; a corrupt record fails
+    /// closed.
+    #[test]
+    fn the_host_commit_gate_follows_the_upgrade_journal() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert!(host_commit_gate_open_at(dir.path()), "no record: open");
+        for phase in ["staged", "swapped_daemon", "booting", "health_committed"] {
+            write_upgrade_journal(dir.path(), phase)?;
+            assert!(
+                !host_commit_gate_open_at(dir.path()),
+                "an uncommitted trial in {phase} closes the gate"
+            );
+        }
+        write_upgrade_journal(dir.path(), "host_committed")?;
+        assert!(host_commit_gate_open_at(dir.path()), "host committed: open");
+        let path = dir.path().join(crate::upgrade::journal::JOURNAL_FILE_NAME);
+        std::fs::write(&path, b"{\"schema_version\": 1, \"record_kind\": \"jour")?;
+        assert!(!host_commit_gate_open_at(dir.path()), "corrupt: closed");
+        write_upgrade_journal(dir.path(), "a_future_phase")?;
+        assert!(!host_commit_gate_open_at(dir.path()), "unknown: closed");
+        Ok(())
+    }
+
+    /// ZCode MAJOR-1 at 7441b7a (ADR 0110 §5): inside an uncommitted
+    /// ADR 0094 trial a revoked member's row waits as
+    /// `waiting_for_host_commit` and no `.evs` is written. After host
+    /// commit the next pass releases the row and the `.evs` is written.
+    #[tokio::test]
+    async fn an_upgrade_trial_holds_s4_work_until_host_commit() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "c3".repeat(16);
+        let info = hold_remote_admin_group(&state, &group_id, &target.agent_id(), true).await?;
+        let key = EvictionKey::new(
+            info.stable_group_id().to_string(),
+            *target.agent_id().as_bytes(),
+        );
+        write_upgrade_journal(&state.data_dir, "health_committed")?;
+        revoke_agent(&state, &target).await?;
+        revocation_eviction_pass(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).context("row")?;
+            assert_eq!(
+                row.waiting.as_ref().map(|waiting| waiting.cause),
+                Some(WaitingCause::WaitingForHostCommit),
+                "the trial holds the row"
+            );
+            let evaluation = inner.evaluations.get(&key).context("evaluated")?;
+            assert_eq!(evaluation.action, RowAction::None);
+        }
+        assert!(
+            !persist_obligations(&state).await,
+            "the row is not durable inside the trial"
+        );
+        assert!(
+            !tokio::fs::try_exists(evs_path(&state)).await?,
+            "no S4 file is created before host commit"
+        );
+        write_upgrade_journal(&state.data_dir, "host_committed")?;
+        revocation_eviction_pass(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).context("row")?;
+            assert_ne!(
+                row.waiting.as_ref().map(|waiting| waiting.cause),
+                Some(WaitingCause::WaitingForHostCommit),
+                "host commit releases the row"
+            );
+        }
+        assert!(persist_obligations(&state).await, "durable after commit");
+        assert!(tokio::fs::try_exists(evs_path(&state)).await?);
+        Ok(())
+    }
+
+    /// ZCode MAJOR-1 at 7441b7a (ADR 0110 §5, "ADR 0094 trial"): a damaged
+    /// `.evs` found inside a trial is not quarantined. It stays on disk
+    /// unchanged and the store runs memory-only; the load after host
+    /// commit quarantines it.
+    #[tokio::test]
+    async fn a_trial_load_starts_no_quarantine_until_host_commit() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let path = evs_path(&state);
+        let mut damaged = s4::EVS_HEADER_V1.to_vec();
+        damaged.extend_from_slice(b"not a body");
+        tokio::fs::write(&path, &damaged).await?;
+        write_upgrade_journal(&state.data_dir, "booting")?;
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(inner.trial_load, "the worker repeats the load");
+            assert!(!inner.sidecar.state.writable(), "memory-only");
+        }
+        assert_eq!(
+            tokio::fs::read(&path).await?,
+            damaged,
+            "the damaged file is not rewritten inside the trial"
+        );
+        write_upgrade_journal(&state.data_dir, "host_committed")?;
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        assert!(!state.revocation_evictions.inner.lock().await.trial_load);
+        assert_ne!(
+            tokio::fs::read(&path).await.ok(),
+            Some(damaged),
+            "after host commit the damaged file is quarantined and replaced"
         );
         Ok(())
     }

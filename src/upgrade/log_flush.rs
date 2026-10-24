@@ -558,6 +558,28 @@ pub(crate) fn flush_captured(callback: &FlushCallback, deadline: Instant) -> io:
     failure.map_or(Ok(()), Err)
 }
 
+/// Drain failure diagnostics before process::exit skips the worker guard.
+/// This has a fresh, short budget because the upgrade deadline may have passed.
+pub(crate) fn flush_before_exit(captured: Option<&FlushCallback>) {
+    let current;
+    let callback = match captured {
+        Some(callback) => callback,
+        None => {
+            current = capture(&tracing::dispatcher::get_default(Clone::clone));
+            match &current {
+                Ok(callback) => callback,
+                Err(error) => {
+                    eprintln!("cannot flush upgrade failure logs before exit: {error}");
+                    return;
+                }
+            }
+        }
+    };
+    if let Err(error) = flush_captured(callback, Instant::now() + Duration::from_secs(1)) {
+        eprintln!("cannot flush upgrade failure logs before exit: {error}");
+    }
+}
+
 #[cfg(test)]
 include!("../../tests/upgrade_log_flush.rs");
 #[cfg(test)]
