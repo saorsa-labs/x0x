@@ -2044,10 +2044,7 @@ async fn restart_quarantines_saved_group_with_unknown_policy_or_plane() -> Resul
     });
     tokio::fs::write(&named, serde_json::to_vec(&saved)?).await?;
     let first_bytes = tokio::fs::read(&named).await?;
-    let backup_for = |bytes: &[u8]| {
-        let digest = blake3::hash(bytes).to_hex();
-        named.with_extension(format!("unsupported-1604-{}.bak", &digest[..16]))
-    };
+    let backup_for = |bytes: &[u8]| unsupported_backup_path(&named, bytes);
     // A partial backup left by an interrupted earlier run is rewritten.
     tokio::fs::write(backup_for(&first_bytes), b"{\"partial").await?;
 
@@ -2154,5 +2151,67 @@ async fn quarantined_group_is_not_reinstalled_by_bootstrap_or_card_import() -> R
         placeholder,
         "card import"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn quarantine_preserves_treekem_files_through_the_restart_path() -> Result<()> {
+    // WHY (#1604, Codex P1; ADR 0085): the withdrawn placeholder makes the
+    // startup TreeKEM restore drop the group's `.snap`, `.journal` and
+    // `.hsjournal`. Their bytes must survive in backups for a later upgrade.
+    let (state, dir, _owner_kp) = owner_authority_state().await?;
+    let data_dir = dir.path().join("restart");
+    let treekem_dir = data_dir.join("treekem");
+    tokio::fs::create_dir_all(&treekem_dir).await?;
+    let named = data_dir.join("named_groups.json");
+    let sidecar = data_dir.join("home_suite_groups.json");
+    let creator = AgentKeypair::generate()?.agent_id();
+    let group = x0x::groups::GroupInfo::new("g".into(), String::new(), creator, "dd".repeat(16));
+    let key = group.mls_group_id.clone();
+    let mut saved = serde_json::to_value(&group)?;
+    saved["secure_plane"] = "quantum_plane".into();
+    tokio::fs::write(
+        &named,
+        serde_json::to_vec(&serde_json::json!({ &key: saved }))?,
+    )
+    .await?;
+    let files = [
+        (
+            treekem_dir.join(format!("{key}.snap")),
+            b"snapshot-bytes".to_vec(),
+        ),
+        (
+            treekem_dir.join(format!("{key}.journal")),
+            b"journal-bytes".to_vec(),
+        ),
+        (
+            treekem_dir.join(format!("{key}.hsjournal")),
+            b"hsjournal-bytes".to_vec(),
+        ),
+    ];
+    for (path, bytes) in &files {
+        tokio::fs::write(path, bytes).await?;
+    }
+
+    let loaded = load_named_groups_merged(&named, &sidecar).await?;
+    assert!(
+        loaded[&key].withdrawn,
+        "quarantined as a withdrawn placeholder"
+    );
+    // The daemon's next startup step drops the live TreeKEM files.
+    let _ = restore_treekem_groups(&loaded, state.agent.as_ref(), &treekem_dir).await;
+    for (path, bytes) in &files {
+        assert!(
+            !tokio::fs::try_exists(path).await?,
+            "{} dropped",
+            path.display()
+        );
+        assert_eq!(
+            &tokio::fs::read(unsupported_backup_path(path, bytes)).await?,
+            bytes,
+            "{} preserved",
+            path.display()
+        );
+    }
     Ok(())
 }

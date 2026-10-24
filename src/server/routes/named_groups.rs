@@ -36223,9 +36223,10 @@ pub(in crate::server) fn merge_home_suite_groups(
 /// as unknown, and the withdrawn gates refuse any reinstall or refresh. Every live ingress already
 /// refuses `Unknown`, so no in-memory group holds one.
 ///
-/// Before that, the exact saved file bytes are kept in a durable,
-/// content-addressed backup (`*.unsupported-1604-<blake3>.bak`) for a later
-/// upgrade. If the backup fails, or a placeholder still holds an
+/// Before that, the exact saved file bytes (the group stores and the
+/// group's TreeKEM `.snap`, `.journal` and `.hsjournal`) are kept in a
+/// durable, content-addressed backup (`<file>.unsupported-1604-<blake3>.bak`) for
+/// a later upgrade. If the backup fails, or a placeholder still holds an
 /// `Unknown`, startup fails loudly rather than lose data or fail open.
 async fn quarantine_unsupported_saved_groups(
     groups: &mut HashMap<String, x0x::groups::GroupInfo>,
@@ -36245,6 +36246,31 @@ async fn quarantine_unsupported_saved_groups(
     }
     for path in [named_groups_path, sidecar_path] {
         preserve_unsupported_saved_bytes(path).await?;
+    }
+    // The withdrawn placeholder makes `restore_treekem_groups` drop the
+    // group's TreeKEM files, so they are preserved first (ADR 0085: a
+    // downgrade must not destroy state a later upgrade can use). The
+    // directory layout is the daemon's: `<data_dir>/treekem` beside
+    // `<data_dir>/named_groups.json`.
+    let treekem_dir = named_groups_path
+        .parent()
+        .map(|data_dir| data_dir.join("treekem"));
+    for (key, info) in groups.iter() {
+        if !affected.contains(info.stable_group_id()) {
+            continue;
+        }
+        if let Some(dir) = treekem_dir.as_deref() {
+            for path in [
+                treekem_snapshot_path_for_drop_in_dir(dir, key),
+                treekem_journal_path_for_drop_in_dir(dir, key),
+                Some(treekem_home_suite_journal_path(dir, key)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                preserve_unsupported_saved_bytes(&path).await?;
+            }
+        }
     }
     for (key, info) in groups.iter_mut() {
         if !affected.contains(info.stable_group_id()) {
@@ -36270,6 +36296,17 @@ async fn quarantine_unsupported_saved_groups(
     Ok(())
 }
 
+/// `<file name>.unsupported-1604-<first 16 hex of BLAKE3(bytes)>.bak`
+/// beside `path`: one backup per distinct saved version.
+pub(in crate::server) fn unsupported_backup_path(path: &FsPath, bytes: &[u8]) -> PathBuf {
+    let digest = blake3::hash(bytes).to_hex();
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.unsupported-1604-{}.bak", &digest[..16]))
+}
+
 /// Copy `path` to a backup named by the BLAKE3 of its bytes, durably. An
 /// existing backup with other bytes (partial or stale) is rewritten.
 async fn preserve_unsupported_saved_bytes(path: &FsPath) -> Result<()> {
@@ -36280,8 +36317,7 @@ async fn preserve_unsupported_saved_bytes(path: &FsPath) -> Result<()> {
             return Err(e).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    let digest = blake3::hash(&bytes).to_hex();
-    let backup = path.with_extension(format!("unsupported-1604-{}.bak", &digest[..16]));
+    let backup = unsupported_backup_path(path, &bytes);
     if tokio::fs::read(&backup)
         .await
         .is_ok_and(|held| held == bytes)
