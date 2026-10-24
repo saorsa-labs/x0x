@@ -1,0 +1,27 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "tag",
+      "variant": "Tag",
+      "wire": {
+        "json": "\"tag\""
+      }
+    },
+    {
+      "input": "name",
+      "variant": "Name",
+      "wire": {
+        "json": "\"name\""
+      }
+    },
+    {
+      "input": "id",
+      "variant": "Id",
+      "wire": {
+        "json": "\"id\""
+      }
+    }
+  ],
+  "type": "ShardKind"
+}

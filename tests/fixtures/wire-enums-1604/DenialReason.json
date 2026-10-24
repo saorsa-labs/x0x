@@ -1,0 +1,90 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "ExecDisabled",
+      "variant": "ExecDisabled",
+      "wire": {
+        "bincode": "00000000"
+      }
+    },
+    {
+      "input": "UnverifiedSender",
+      "variant": "UnverifiedSender",
+      "wire": {
+        "bincode": "01000000"
+      }
+    },
+    {
+      "input": "TrustRejected",
+      "variant": "TrustRejected",
+      "wire": {
+        "bincode": "02000000"
+      }
+    },
+    {
+      "input": "AgentMachineNotInAcl",
+      "variant": "AgentMachineNotInAcl",
+      "wire": {
+        "bincode": "03000000"
+      }
+    },
+    {
+      "input": "ArgvNotAllowed",
+      "variant": "ArgvNotAllowed",
+      "wire": {
+        "bincode": "04000000"
+      }
+    },
+    {
+      "input": "StdinTooLarge",
+      "variant": "StdinTooLarge",
+      "wire": {
+        "bincode": "05000000"
+      }
+    },
+    {
+      "input": "TimeoutTooLarge",
+      "variant": "TimeoutTooLarge",
+      "wire": {
+        "bincode": "06000000"
+      }
+    },
+    {
+      "input": "CwdNotAllowed",
+      "variant": "CwdNotAllowed",
+      "wire": {
+        "bincode": "07000000"
+      }
+    },
+    {
+      "input": "ConcurrencyLimitReached",
+      "variant": "ConcurrencyLimitReached",
+      "wire": {
+        "bincode": "08000000"
+      }
+    },
+    {
+      "input": "ShellMetacharInArgv",
+      "variant": "ShellMetacharInArgv",
+      "wire": {
+        "bincode": "09000000"
+      }
+    },
+    {
+      "input": "SpawnFailed",
+      "variant": "SpawnFailed",
+      "wire": {
+        "bincode": "0a000000"
+      }
+    },
+    {
+      "input": "MalformedFrame",
+      "variant": "MalformedFrame",
+      "wire": {
+        "bincode": "0b000000"
+      }
+    }
+  ],
+  "type": "DenialReason"
+}

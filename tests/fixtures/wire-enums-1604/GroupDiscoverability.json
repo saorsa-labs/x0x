@@ -1,0 +1,30 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "hidden",
+      "variant": "Hidden",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"hidden\""
+      }
+    },
+    {
+      "input": "listed_to_contacts",
+      "variant": "ListedToContacts",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"listed_to_contacts\""
+      }
+    },
+    {
+      "input": "public_directory",
+      "variant": "PublicDirectory",
+      "wire": {
+        "bincode": "02000000",
+        "json": "\"public_directory\""
+      }
+    }
+  ],
+  "type": "GroupDiscoverability"
+}

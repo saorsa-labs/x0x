@@ -137,6 +137,21 @@ enum TaskListSyncMessage {
     },
 }
 
+/// #1604: main-era wire bytes of every `TaskListSyncMessage` variant still
+/// match.
+#[cfg(test)]
+#[test]
+fn task_list_sync_message_wire_matches_main() {
+    crate::wire_golden_tests::check::<TaskListSyncMessage>(
+        "TaskListSyncMessage",
+        &[(
+            crate::wire_golden_tests::Codec::Bincode,
+            crate::wire_golden_tests::Mode::RoundTrip,
+        )],
+        &["StateRequest", "StateServed", "StateServedV2"],
+    );
+}
+
 /// One responder's latest v2 digest declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServedState {

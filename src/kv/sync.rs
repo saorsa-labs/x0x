@@ -801,6 +801,26 @@ enum KvSyncMessage {
     },
 }
 
+/// #1604: main-era wire bytes of every `KvSyncMessage` variant still match.
+#[cfg(test)]
+#[test]
+fn kv_sync_message_wire_matches_main() {
+    crate::wire_golden_tests::check::<KvSyncMessage>(
+        "KvSyncMessage",
+        &[(
+            crate::wire_golden_tests::Codec::Bincode,
+            crate::wire_golden_tests::Mode::RoundTrip,
+        )],
+        &[
+            "StateRequest",
+            "OwnerAnnounce",
+            "StateServed",
+            "StateServedV2",
+            "StateDigestBeacon",
+        ],
+    );
+}
+
 /// One responder's latest v2 digest declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServedState {

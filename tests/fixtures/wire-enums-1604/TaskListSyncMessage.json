@@ -1,0 +1,41 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "StateRequest": {
+          "requester": "@b32:1"
+        }
+      },
+      "variant": "StateRequest",
+      "wire": {
+        "bincode": "000000000101010101010101010101010101010101010101010101010101010101010101"
+      }
+    },
+    {
+      "input": {
+        "StateServed": {
+          "responder": "@b32:2"
+        }
+      },
+      "variant": "StateServed",
+      "wire": {
+        "bincode": "010000000202020202020202020202020202020202020202020202020202020202020202"
+      }
+    },
+    {
+      "input": {
+        "StateServedV2": {
+          "digest": "@b32:4",
+          "entry_count": 5,
+          "responder": "@b32:3"
+        }
+      },
+      "variant": "StateServedV2",
+      "wire": {
+        "bincode": "020000000303030303030303030303030303030303030303030303030303030303030303040404040404040404040404040404040404040404040404040404040404040405000000"
+      }
+    }
+  ],
+  "type": "TaskListSyncMessage"
+}

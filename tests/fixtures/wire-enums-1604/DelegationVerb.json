@@ -1,0 +1,27 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "claim",
+      "variant": "Claim",
+      "wire": {
+        "json": "\"claim\""
+      }
+    },
+    {
+      "input": "complete",
+      "variant": "Complete",
+      "wire": {
+        "json": "\"complete\""
+      }
+    },
+    {
+      "input": "send_public_message",
+      "variant": "SendPublicMessage",
+      "wire": {
+        "json": "\"send_public_message\""
+      }
+    }
+  ],
+  "type": "DelegationVerb"
+}

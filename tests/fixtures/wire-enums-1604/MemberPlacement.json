@@ -1,0 +1,20 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "pinned",
+      "variant": "Pinned",
+      "wire": {
+        "json": "\"pinned\""
+      }
+    },
+    {
+      "input": "roaming",
+      "variant": "Roaming",
+      "wire": {
+        "json": "\"roaming\""
+      }
+    }
+  ],
+  "type": "MemberPlacement"
+}

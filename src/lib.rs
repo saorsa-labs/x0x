@@ -41820,6 +41820,9 @@ mod issue1099_tests;
 mod issue1239_tests;
 
 #[cfg(test)]
+mod wire_golden_tests;
+
+#[cfg(test)]
 include!("../tests/upgrade_cache_flush.rs");
 #[cfg(test)]
 upgrade_cache_flush_tests!();

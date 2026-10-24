@@ -1,0 +1,87 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "chunk_size": 2,
+        "filename": "f",
+        "sha256": "h",
+        "size": 1,
+        "total_chunks": 3,
+        "transfer_id": "t",
+        "type": "file-offer"
+      },
+      "variant": "Offer",
+      "wire": {
+        "json": "{\"type\":\"file-offer\",\"transfer_id\":\"t\",\"filename\":\"f\",\"size\":1,\"sha256\":\"h\",\"chunk_size\":2,\"total_chunks\":3}"
+      }
+    },
+    {
+      "input": {
+        "data": "ZGF0YQ==",
+        "sequence": 1,
+        "transfer_id": "t",
+        "type": "file-chunk"
+      },
+      "variant": "Chunk",
+      "wire": {
+        "json": "{\"type\":\"file-chunk\",\"transfer_id\":\"t\",\"sequence\":1,\"data\":\"ZGF0YQ==\"}"
+      }
+    },
+    {
+      "input": {
+        "sha256": "h",
+        "transfer_id": "t",
+        "type": "file-complete"
+      },
+      "variant": "Complete",
+      "wire": {
+        "json": "{\"type\":\"file-complete\",\"transfer_id\":\"t\",\"sha256\":\"h\"}"
+      }
+    },
+    {
+      "input": {
+        "transfer_id": "t",
+        "type": "file-accept"
+      },
+      "variant": "Accept",
+      "wire": {
+        "json": "{\"type\":\"file-accept\",\"transfer_id\":\"t\"}"
+      }
+    },
+    {
+      "input": {
+        "reason": "no",
+        "transfer_id": "t",
+        "type": "file-reject"
+      },
+      "variant": "Reject",
+      "wire": {
+        "json": "{\"type\":\"file-reject\",\"transfer_id\":\"t\",\"reason\":\"no\"}"
+      }
+    },
+    {
+      "input": {
+        "sequence": 4,
+        "transfer_id": "t",
+        "type": "file-chunk-ack"
+      },
+      "variant": "ChunkAck",
+      "wire": {
+        "json": "{\"type\":\"file-chunk-ack\",\"transfer_id\":\"t\",\"sequence\":4}"
+      }
+    },
+    {
+      "input": {
+        "op": "accept",
+        "transfer_id": "t",
+        "type": "file-control-ack"
+      },
+      "variant": "ControlAck",
+      "wire": {
+        "json": "{\"type\":\"file-control-ack\",\"transfer_id\":\"t\",\"op\":\"accept\"}"
+      }
+    }
+  ],
+  "type": "FileMessage"
+}

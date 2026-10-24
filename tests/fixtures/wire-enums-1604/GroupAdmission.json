@@ -1,0 +1,40 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "invite_only",
+      "variant": "InviteOnly",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"invite_only\""
+      }
+    },
+    {
+      "input": "request_access",
+      "variant": "RequestAccess",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"request_access\""
+      }
+    },
+    {
+      "input": "open_join",
+      "variant": "OpenJoin",
+      "wire": {
+        "bincode": "02000000",
+        "json": "\"open_join\""
+      }
+    },
+    {
+      "input": {
+        "owner_certified": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+      },
+      "variant": "OwnerCertified",
+      "wire": {
+        "bincode": "03000000400000000000000030613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061306130613061",
+        "json": "{\"owner_certified\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}"
+      }
+    }
+  ],
+  "type": "GroupAdmission"
+}
