@@ -191,6 +191,18 @@
 //!   the 10-minute `certificate_evidence_unavailable`). ADR 0088 L4 keeps
 //!   the wait fail-closed. GREEN on `main` and GREEN under a correct S5
 //!   (pending throughout). The receipt names the first terminal refusal.
+//!
+//! All four tests are declared `#[ignore]` (#1559, ADR 0025 §3–4): their
+//! observation is a verdict under seeded entropy and the virtual wall
+//! clock, which only the W3-H harness tier provides (`nextest --profile
+//! w3h / w3h-gate --run-ignored all`, shim preloaded). In a plain suite
+//! the shim is absent, so OS entropy is live: the shared restart stage
+//! `a_verifies_creator_certificate_after_its_restart` sometimes misses
+//! its 60 s bound (three CI INFRA runs, #1545/#1546/#1557) — an
+//! unseeded-entropy artefact, never a verdict about the system under
+//! test. The W3-H gate still runs every arm 20 times and requires the
+//! same verdict in each rerun with complete receipts (D196), so the
+//! plain suites lose no proof.
 
 #![cfg(test)]
 
@@ -3059,6 +3071,12 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
+)]
 async fn w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes() -> Result<()> {
     expect(
         "w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes",
@@ -3073,6 +3091,12 @@ async fn w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes() 
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
 )]
 async fn w3h_1023_restart_one_holder_online_admits() -> Result<()> {
     expect(
@@ -3089,6 +3113,12 @@ async fn w3h_1023_restart_one_holder_online_admits() -> Result<()> {
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
+)]
 async fn w3h_1023_control_holders_never_return_fail_closed() -> Result<()> {
     expect(
         "w3h_1023_control_holders_never_return_fail_closed",
@@ -3103,6 +3133,12 @@ async fn w3h_1023_control_holders_never_return_fail_closed() -> Result<()> {
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
 )]
 async fn w3h_1023_control_holder_returns_recovers() -> Result<()> {
     expect(

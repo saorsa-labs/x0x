@@ -119,7 +119,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             "    --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)"
         );
         println!(
-            "    --relay                         Be a relay node: Full participation + capability advertisement (ADR-0034)"
+            "    --relay                         Be a relay node: Full participation + capability advertisement (ADR-0034); the advert is informational only and grants no hint eligibility (#1112)"
         );
         println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");

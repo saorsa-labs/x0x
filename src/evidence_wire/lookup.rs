@@ -9,6 +9,11 @@ const FANOUT: usize = 3;
 // Bound each indexed source as well as fan-out; excess candidates fail closed.
 const MACHINE_BINDING_LIMIT: usize = 16;
 const HINT_CAP: usize = 128;
+/// #1239: one budget for a responder authorization's synchronous policy
+/// reads (`Relations::shared`). The stream's lease deadline still bounds the
+/// whole exchange; expiry fails closed (unauthorized). Five seconds matches
+/// the other #1239 read budgets.
+const RESPONDER_AUTHORITY_BUDGET: Duration = Duration::from_secs(5);
 
 /// Untrusted, process-only raw-frame routing claims. Never read by authority paths.
 #[derive(Default)]
@@ -151,6 +156,7 @@ fn select(
         .collect()
 }
 
+#[derive(Clone)]
 struct Relations {
     runtime: Arc<EvidenceRuntime>,
     local: Peer,
@@ -158,7 +164,7 @@ struct Relations {
     discovery: Arc<tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
     machines: Arc<tokio::sync::RwLock<HashMap<MachineId, crate::DiscoveredMachine>>>,
     #[cfg(test)]
-    peer_checks: std::sync::atomic::AtomicUsize,
+    peer_checks: Arc<std::sync::atomic::AtomicUsize>,
     owner: crate::owner_trust::OwnerTrust,
     revoked: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
 }
@@ -333,7 +339,24 @@ impl Relations {
         select(target, eligible)
     }
 
+    /// #1239: the awaited responder path (`Context::accept`) runs on a Tokio
+    /// worker, and `shared`'s policy reads are synchronous std-lock reads a
+    /// stream lease deadline cannot interrupt. Evaluate the whole
+    /// authorization on the runtime's bounded blocking workers under one
+    /// budget; a held policy lock fails closed (unauthorized, so the stream
+    /// answers NOT_FOUND) and the next request retries.
     pub(super) async fn authorized(&self, machine: MachineId, target: AgentId) -> bool {
+        let relations = self.clone();
+        let deadline = tokio::time::Instant::now() + RESPONDER_AUTHORITY_BUDGET;
+        self.runtime
+            .evaluate_before(deadline, async move {
+                relations.evaluate_authorized(machine, target).await
+            })
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn evaluate_authorized(&self, machine: MachineId, target: AgentId) -> bool {
         let Some(local) = self.peer(self.local.agent).await else {
             return false;
         };
@@ -806,6 +829,7 @@ mod tests {
     };
 
     mod background;
+    mod responder;
 
     #[tokio::test]
     async fn s4_relay_ingress_cannot_seed_host_hints_or_spawn_lookup() {

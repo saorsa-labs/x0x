@@ -304,6 +304,10 @@ impl EvidenceRuntime {
     }
     /// Pull missing relationship evidence over bounded connected-peer streams.
     /// Callers must re-read their authoritative sources after this await.
+    /// #1239: this inline variant blocks its caller's Tokio worker on the
+    /// synchronous store and policy reads; every production caller now uses
+    /// [`Self::lookup_before`]. Test-only, as a stand-in for an awaited sender.
+    #[cfg(test)]
     pub(crate) async fn lookup(&self, agent: AgentId, machine: Option<MachineId>) {
         let Some(permit) = self.lookup_permit() else {
             return;
@@ -318,9 +322,12 @@ impl EvidenceRuntime {
     /// current-thread runtime. The caller's absolute deadline also applies.
     /// Reserve the existing Lookup permit before spawning: even workers that
     /// cannot leave a synchronous read yet stay within the 16-Lookup cap.
+    /// `machine` is only the transport-observed routing hint recorded by
+    /// [`Self::lookup`]; it is never evidence authority.
     pub(crate) async fn lookup_before(
         self: &Arc<Self>,
         agent: AgentId,
+        machine: Option<MachineId>,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<(), ()> {
         if self.stopping.is_cancelled() || tokio::time::Instant::now() >= deadline {
@@ -346,7 +353,7 @@ impl EvidenceRuntime {
                         }
                         tokio::time::timeout_at(
                             deadline,
-                            runtime.lookup_with_permit(agent, None, permit, Some(deadline)),
+                            runtime.lookup_with_permit(agent, machine, permit, Some(deadline)),
                         )
                         .await
                         .map_err(|_| ())?;
@@ -437,6 +444,63 @@ impl EvidenceRuntime {
         tokio::time::timeout_at(deadline, work)
             .await
             .map_err(|_| ())?
+    }
+
+    /// #1239: run one async authority evaluation whose body takes
+    /// synchronous std-lock policy reads (the Lookup responder's
+    /// `Relations::shared` reads) so it cannot occupy a Tokio worker. The
+    /// evaluation runs on a tracked blocking worker; admission, the
+    /// evaluation and its result share one absolute `deadline`, and the
+    /// deadline plus shutdown cancellation also apply INSIDE the worker, so
+    /// an async lock wait cannot pin the worker and its reader permit past
+    /// the budget. Readers reserve from the same 16-permit cap as the send
+    /// evidence reads, so evaluations queued behind a held lock cannot grow
+    /// the blocking pool without bound. Dropping the caller aborts a queued
+    /// worker; only a synchronous read already inside a store lock can
+    /// outlive the deadline, keeping its permit and join handle through the
+    /// shutdown grace, exactly as the evidence readers.
+    pub(crate) async fn evaluate_before<T: Send + 'static>(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+        work: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> std::result::Result<T, ()> {
+        let evaluation = async {
+            let permit = Arc::clone(&self.reads)
+                .acquire_owned()
+                .await
+                .map_err(|_| ())?;
+            let executor = tokio::runtime::Handle::current();
+            let stopping = self.stopping.clone();
+            let (result, abort) = self.spawn_blocking_worker(move || {
+                let _permit = permit;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                executor.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = stopping.cancelled() => Err(()),
+                        _ = tokio::time::sleep_until(deadline) => Err(()),
+                        value = work => Ok(value),
+                    }
+                })
+            })?;
+            let _abort = AbortWorkerOnDrop(abort);
+            let value = result.await.map_err(|_| ())??;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            Ok(value)
+        };
+        tokio::time::timeout_at(deadline, evaluation)
+            .await
+            .map_err(|_| ())?
+    }
+
+    /// #1239 test seam: whether every bounded reader permit has returned.
+    #[cfg(test)]
+    pub(crate) fn readers_idle_for_testing(&self) -> bool {
+        self.reads.available_permits() == 16
     }
 
     /// x0x #1207: start a Lookup for `agent` in the background (the permit
