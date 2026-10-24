@@ -42523,24 +42523,6 @@ async fn join_artifact_member_check(
     group_id: &str,
     member_hex: &str,
 ) -> std::result::Result<Option<x0x::groups::owner_cert::OwnerCertEvidence>, JoinArtifactRefusal> {
-    join_artifact_member_check_with(state, group_id, member_hex, false).await
-}
-
-/// As [`join_artifact_member_check`]. With `committed_seat_evidence`, the
-/// recipient's seat is also judged by the certificate the roster commits
-/// for it (ADR 0110 §4a): a certificate rebind frame for that seat carries
-/// its owner-signed renewal, and after the designated admin's post-cutoff
-/// rebind the seat's agent still announces its expired certificate until
-/// it loads the renewal. Without this the guard refuses the one frame that
-/// ends the wait (#1508 rc20, W3-H `s4_certificate_rebind` run (6)). The
-/// committed certificate passes the same owner, binding and expiry checks;
-/// an expired committed certificate is still refused.
-async fn join_artifact_member_check_with(
-    state: &AppState,
-    group_id: &str,
-    member_hex: &str,
-    committed_seat_evidence: bool,
-) -> std::result::Result<Option<x0x::groups::owner_cert::OwnerCertEvidence>, JoinArtifactRefusal> {
     let revoked = match parse_agent_id_hex(member_hex) {
         Ok(member) => {
             let revocation_set = state.agent.revocation_set();
@@ -42556,31 +42538,17 @@ async fn join_artifact_member_check_with(
     let now_unix = x0x::groups::owner_cert::restore_clock_now();
     // The recipient's seat alone, for the verdict below (the per-member
     // ladder does not depend on other seats).
-    let (probe, seat_certificate) = {
+    let probe = {
         let roster = state.named_groups.read().await;
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) else {
             return Err(JoinArtifactRefusal::UnknownGroup);
         };
-        let seat_certificate = if committed_seat_evidence {
-            info.members_v2
-                .get(member_hex)
-                .and_then(x0x::groups::cert_rebind::committed_certificate)
-                .cloned()
-        } else {
-            None
-        };
-        (
-            join_artifact_record_probe(info, member_hex, revoked, now_unix)?,
-            seat_certificate,
-        )
+        join_artifact_record_probe(info, member_hex, revoked, now_unix)?
     };
     let evidence = match probe {
         None => None,
         Some(probe) => {
-            let mut evidence = owner_cert_evidence_for(state, &[member_hex]).await;
-            if let Some(certificate) = seat_certificate {
-                evidence.insert_cert(member_hex, certificate);
-            }
+            let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
             if let Some(refusal) = join_artifact_verdict_refusal(probe, &evidence, member_hex) {
                 return Err(refusal);
             }

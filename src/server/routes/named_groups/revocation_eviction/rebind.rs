@@ -58,9 +58,8 @@ use x0x::identity::{AgentCertificate, AgentId};
 use x0x::logging::LogHexId;
 
 use super::crypto_exclusion::{
-    all_converged, apply_round, ask_heads, finish_attempt, guarded_rebind_admission,
-    head_rule_admits, next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery,
-    RoundUpdate,
+    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
+    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 
@@ -1613,7 +1612,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
 }
 
 /// One live send. `key` is (stable group ID, result head). The write goes
-/// through [`guarded_rebind_admission`] (ADR 0107 serving guard plus D60,
+/// through [`guarded_admission_for`] (ADR 0107 serving guard plus D60,
 /// capability bit `certificate_rebind_v1`, [`HeadRule::OnChain`]), which
 /// re-checks under the membership lock and again at the seam.
 fn spawn_send(
@@ -1625,12 +1624,12 @@ fn spawn_send(
 ) {
     let task_state = Arc::clone(state);
     let _spawned = state.spawn_detached(async move {
-        let admission = guarded_rebind_admission(
+        let admission = guarded_admission_for(
             &task_state,
             &key.0,
             &agent,
             HeadRule::OnChain(key.1.clone()),
-            bytes.as_slice(),
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
         );
         let resolve_within =
             std::cmp::min(x0x::dm::PINNED_RESOLUTION_WAIT, CRB_EXCHANGE_TIMEOUT / 2);
@@ -1670,7 +1669,7 @@ fn spawn_send(
 /// requester, on the distinct gated carrier only. A requester without a
 /// current verified advert setting `certificate_rebind_v1` gets nothing:
 /// the frame never goes into a legacy-decoded catch-up page. Each write
-/// uses [`guarded_rebind_admission`] with [`HeadRule::OnChain`]: ADR 0107's
+/// uses [`guarded_admission_for`] with [`HeadRule::OnChain`]: ADR 0107's
 /// serving guard plus D60 under the membership lock, re-checked at the
 /// seam immediately before the physical write.
 pub(in crate::server) async fn serve_catchup(
@@ -1689,12 +1688,12 @@ pub(in crate::server) async fn serve_catchup(
         .log
         .catchup_frames(group_ids, from_revision);
     for (group_id, result_head, bytes) in frames {
-        let admission = guarded_rebind_admission(
+        let admission = guarded_admission_for(
             state,
             &group_id,
             requester,
             HeadRule::OnChain(result_head),
-            bytes.as_slice(),
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
         );
         let resolve_within =
             std::cmp::min(x0x::dm::PINNED_RESOLUTION_WAIT, CRB_EXCHANGE_TIMEOUT / 2);
@@ -2467,7 +2466,6 @@ mod tests {
 #[cfg(test)]
 mod daemon_tests {
     use super::super::super as ng;
-    use super::super::crypto_exclusion::guarded_admission_for;
     use super::*;
     use anyhow::Result;
 
