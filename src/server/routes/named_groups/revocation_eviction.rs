@@ -1897,6 +1897,25 @@ fn blocks_manual_request(cause: WaitingCause) -> bool {
     )
 }
 
+/// §2: list a queued manual request on its row. A repeat of a listed
+/// kind adds nothing, so a client that repeats a request does not grow the
+/// list: it holds at most one entry per kind, the earliest (ZCode MINOR at
+/// 7441b7a).
+fn queue_manual(
+    queued: &mut HashMap<EvictionKey, Vec<QueuedManual>>,
+    key: EvictionKey,
+    kind: ManualRequestKind,
+    now_ms: u64,
+) {
+    let requests = queued.entry(key).or_default();
+    if requests.iter().all(|request| request.kind != kind) {
+        requests.push(QueuedManual {
+            kind,
+            queued_at_unix_ms: now_ms,
+        });
+    }
+}
+
 async fn manual_request_gate(
     state: &Arc<AppState>,
     group_key: &str,
@@ -1934,14 +1953,7 @@ async fn manual_request_gate(
             inner.queued_bans.entry(key.clone()).or_insert(now_ms);
             inner.dirty = true;
         }
-        inner
-            .queued_manual
-            .entry(key)
-            .or_default()
-            .push(QueuedManual {
-                kind,
-                queued_at_unix_ms: now_ms,
-            });
+        queue_manual(&mut inner.queued_manual, key, kind, now_ms);
     }
     if kind == ManualRequestKind::Ban && !persist_obligations(state).await {
         tracing::warn!(
@@ -5701,6 +5713,30 @@ mod tests {
             serde_json::to_vec(&record)?,
         )?;
         Ok(())
+    }
+
+    /// ZCode MINOR at 7441b7a: a client that repeats a manual request
+    /// while the row waits does not grow the queued list; each kind is
+    /// listed once, with its earliest time.
+    #[test]
+    fn a_repeated_manual_request_is_listed_once() {
+        let key = EvictionKey::new("g", [9; 32]);
+        let mut queued = HashMap::new();
+        for at in 0..1000 {
+            queue_manual(&mut queued, key.clone(), ManualRequestKind::Remove, at);
+            queue_manual(&mut queued, key.clone(), ManualRequestKind::Ban, 5000 + at);
+        }
+        let listed: Vec<(ManualRequestKind, u64)> = queued[&key]
+            .iter()
+            .map(|request| (request.kind, request.queued_at_unix_ms))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (ManualRequestKind::Remove, 0),
+                (ManualRequestKind::Ban, 5000)
+            ]
+        );
     }
 
     /// ZCode MAJOR-1 at 7441b7a (ADR 0110 §5): the host-commit gate reads

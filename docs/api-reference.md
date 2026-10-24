@@ -1866,6 +1866,8 @@ certificate, on this daemon's clock.
 | The seat is not Active | `409 Conflict` | `{"error": "rebind_seat_not_active"}` |
 | The renewal does not verify against the group owner for this agent, is expired, or the group has no owner | `422` | `{"error": "rebind_certificate_invalid"}` |
 | The renewal's `not_after` is not later than the committed one | `422` | `{"error": "rebind_not_later"}` |
+| The `certificate` field is not a base64 storage-encoded `AgentCertificate`, or there is no body and no loaded agent certificate | `400 Bad Request` | `{"error": "rebind_certificate_invalid", "detail"}` |
+| The encoded rebind frame is larger than the frame limit | `413 Payload Too Large` | `{"error": "rebind_frame_oversized", "group_id"}`. Nothing is committed. |
 
 Receivers refuse a frame with the same typed reasons, plus
 `rebind_digest_mismatch` when the seat's committed digest is not the old

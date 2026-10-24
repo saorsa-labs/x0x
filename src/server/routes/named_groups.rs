@@ -54776,6 +54776,46 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// #1508 rc20 (ZCode MINOR at 7441b7a): the hold file carries a format
+    /// version. A file of another version is not decoded: it holds its
+    /// group after a restart, even when the content it shows holds
+    /// nothing, and it is kept, not replaced.
+    #[tokio::test]
+    async fn rc20_gss_hold_file_of_another_version_withholds_after_restart() -> Result<()> {
+        let f = f1_gss_rotation_fixture("hold-version").await?;
+        let held = apply_named_group_metadata_event(
+            &f.state,
+            f.remove_event.clone(),
+            f.admin_kp.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!held.accepted);
+        let path = gss_share_hold::test_seam::hold_path_for(&f.state, &f.group_id);
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(written["version"], 1, "the written file carries version 1");
+        let newer = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "group_key": f.group_id,
+            "removals": [],
+            "exclusions": [],
+        }))?;
+        std::fs::write(&path, &newer)?;
+        gss_share_hold::test_seam::simulate_restart(&f.state).await;
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            Some(GroupCiphertextHold::PendingGssRemoval),
+            "a file of another version holds its group"
+        );
+        assert_eq!(
+            std::fs::read(&path)?,
+            newer,
+            "the file is kept, not replaced"
+        );
+        Ok(())
+    }
+
     /// The rename and the promotion of `f.promotee` that `f`'s admin signs
     /// after the removal, each on the head before: the rename on the
     /// removal's result, the promotion on the rename's result.
