@@ -2714,6 +2714,13 @@ The CLI bounds connection setup to 30 seconds but sets no total timeout for
 these apply requests. A staging wait can exceed an hour. Other CLI requests
 retain their normal timeout.
 
+The GUI **Apply update** control sends ordinary `POST /upgrade/apply` with
+no `now` query. While that request is pending, the page says the request can
+wait for the rollout window before it installs and that this may take over
+an hour. That text gives no phase, progress percentage, or ETA. The control
+stays disabled until the response, including when the home view redraws the
+banner from its cached upgrade status.
+
 Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
 installation. `x0x upgrade --check` is a standalone GitHub release check and
 needs **no running daemon**. `--check` takes precedence over `--apply`;
