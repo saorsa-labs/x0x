@@ -4445,7 +4445,7 @@ fn now_unix_ms() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     // ─── Codex round 1, item 2: persistence generation ─────────────────
@@ -5667,7 +5667,10 @@ mod tests {
     /// An ADR 0094 upgrade journal record in `phase`, in the fixed record
     /// name of `data_dir`. Raw JSON on purpose, so a test can also write a
     /// phase the reader does not know.
-    fn write_upgrade_journal(data_dir: &FsPath, phase: &str) -> anyhow::Result<()> {
+    pub(in crate::server) fn write_upgrade_journal(
+        data_dir: &FsPath,
+        phase: &str,
+    ) -> anyhow::Result<()> {
         let artifact = |name: &str| {
             serde_json::json!({
                 "target_path": data_dir.join(name),

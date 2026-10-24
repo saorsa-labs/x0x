@@ -1860,7 +1860,7 @@ the fields shown:
 | `manual_clear_required` | `ref` | The head is on the admin's chain, but the marker names a sibling. Use `POST /groups/:id/quarantine/clear`. |
 | `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. |
 | `reseat_in_progress` | `authorised_by`, `phase`, `expires_at_ms` | A valid authorisation arrived. The staged join runs. |
-| `recovery_deferred` | `cause` | `home_gate_closed` (Home activation is off) or `host_commit_pending`. |
+| `recovery_deferred` | `cause`, and `file` for a damaged sidecar | `home_gate_closed` (Home activation is off) or `host_commit_pending`. Inside an uncommitted ADR 0094 upgrade trial S3 creates no sidecar and writes no placeholder, and a damaged sidecar stays in place; after host commit S3 continues (a damaged file is then quarantined and rebuilt). |
 | `recovery_refused` | `reason` | `banned_or_revoked`. Final. |
 | `sidecar_unavailable`, `sidecar_newer_format`, `sidecar_quarantine_failed` | `file` and `cause`, `version` or `step` | ADR 0108 §5a. S3 makes no transition for the group. |
 
@@ -1885,6 +1885,7 @@ route checks in this order and refuses with the first failure:
 |---|---|---|
 | 400 | `reason_required` | `reason` is empty. |
 | 400 | `basis_unknown` | `basis` does not parse. |
+| 503 | `recovery_deferred` | `detail.cause` is `host_commit_pending`: an ADR 0094 upgrade trial is not yet host-committed and the group has no sidecar. The route signs, stores and mints nothing. |
 | 409 | `admin_contained` | This admin's own record has a marker or an armed gap. |
 | 409 | `subject_active` | The subject is Active. Remove it first with `DELETE /groups/:id/members/:agent_id`. |
 | 409 | `subject_banned_or_revoked` | The subject is banned or its agent is revoked. |
@@ -1906,7 +1907,10 @@ one with `reseat_mandate_invalid` and one cause of `signature`,
 `binding_mismatch`, and keeps its state unchanged. The
 answer is `{"ok": true, "group_id", "subject", "basis", "authorisation": {"signer", "expires_at_ms", "digest"}}`.
 The admin keeps the authorisation in its sidecar and sends it to the
-subject. The subject needs no operator step (D79). It journals, joins
+subject. A second call for the same subject replaces the authorisation and
+first revokes the replaced one's unconsumed invite. At seal, a re-seat
+invite whose authorisation has expired seals nothing
+(`reseat_invite_unpaired`). The subject needs no operator step (D79). It journals, joins
 with the invite, and swaps the new record in when it is Active with
 keys. On failure it restores its contained record and shows
 `reseat_required` with `cause: reseat_failed`.

@@ -192,7 +192,7 @@ mod tests {
     }
 
     async fn loaded_rebuild(dir: &Path) -> Vec<[u8; 16]> {
-        let (loaded, faults) = super::super::scan_sidecar_dir(dir).await;
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir, true).await;
         assert!(faults.is_empty(), "{faults:?}");
         loaded
             .get("abc")
@@ -277,7 +277,7 @@ mod tests {
             .path()
             .join(format!("{F}.q-{}-{}", "07".repeat(16), "a".repeat(32)));
         tokio::fs::write(&history, b"old").await.expect("write");
-        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path()).await;
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
         assert!(faults.is_empty());
         assert_eq!(loaded.get("abc").map(|b| b.generation), Some(4));
         assert_eq!(names(dir.path()).await.len(), 2);
@@ -295,7 +295,7 @@ mod tests {
             .path()
             .join(s4::quarantine_pending_name(F, &txid, b"original"));
         tokio::fs::write(&bad, b"bit rot").await.expect("write");
-        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path()).await;
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
         assert!(loaded.is_empty());
         assert!(matches!(
             faults.get("abc"),

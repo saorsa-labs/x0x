@@ -294,9 +294,23 @@ struct S3Inner {
 /// group while one holds.
 #[derive(Debug, Clone)]
 enum SidecarFault {
-    Unavailable { file: String, cause: String },
-    NewerFormat { file: String, version: u8 },
-    QuarantineFailed { file: String, step: String },
+    Unavailable {
+        file: String,
+        cause: String,
+    },
+    NewerFormat {
+        file: String,
+        version: u8,
+    },
+    QuarantineFailed {
+        file: String,
+        step: String,
+    },
+    /// A damaged file found inside an uncommitted ADR 0094 trial: it stays
+    /// in place until host commit (§4 "Before host commit").
+    QuarantineDeferred {
+        file: String,
+    },
 }
 
 /// One entry of an admin's recovery list (§8).
@@ -571,12 +585,59 @@ fn sidecar_dir(state: &AppState) -> PathBuf {
     state.data_dir.join(s3::GROUP_RECOVERY_DIR)
 }
 
+/// The file stem of a group's sidecar (its name without the extension).
+fn sidecar_stem(stable_group_id: &str) -> String {
+    let file = s3::sidecar_file_name(stable_group_id);
+    file.strip_suffix(&format!(".{}", s3::GROUP_RECOVERY_EXTENSION))
+        .unwrap_or(&file)
+        .to_string()
+}
+
 fn sidecar_path(state: &AppState, stable_group_id: &str) -> PathBuf {
     sidecar_dir(state).join(s3::sidecar_file_name(stable_group_id))
 }
 
+/// The `recovery_deferred` cause while ADR 0094's host commit is pending.
+const HOST_COMMIT_PENDING: &str = "host_commit_pending";
+
+/// §4 "Timing" (ADR 0094: no format-upgrade writes before host commit):
+/// inside an uncommitted upgrade trial, a group with no sidecar on disk
+/// gets none. The node keeps today's state, so it writes no placeholder
+/// either, and shows `recovery_deferred {cause: host_commit_pending}`. A
+/// sidecar that is already on disk was created after an earlier host
+/// commit by a binary that reads it, so it is kept current. The gate is
+/// S4's ([`super::revocation_eviction::host_commit_gate_open`]): no
+/// journal record or `host_committed` opens it; any other record, or an
+/// unreadable one, keeps it closed.
+async fn sidecar_creation_deferred(state: &AppState, stable_group_id: &str) -> bool {
+    !super::revocation_eviction::host_commit_gate_open(state)
+        && !matches!(
+            tokio::fs::try_exists(sidecar_path(state, stable_group_id)).await,
+            Ok(true)
+        )
+}
+
+/// Show `recovery_deferred {cause: host_commit_pending}` and return `true`
+/// when [`sidecar_creation_deferred`] holds for this group.
+async fn defer_for_host_commit(state: &AppState, stable_group_id: &str, revision: u64) -> bool {
+    if !sidecar_creation_deferred(state, stable_group_id).await {
+        return false;
+    }
+    set_view(
+        state,
+        stable_group_id,
+        revision,
+        SubjectView::Deferred {
+            cause: HOST_COMMIT_PENDING,
+        },
+    )
+    .await;
+    true
+}
+
 /// Write one group's sidecar durably, or remove it when empty. Returns
-/// whether the bytes are durable.
+/// whether the bytes are durable. Inside an uncommitted ADR 0094 trial it
+/// creates no new sidecar ([`sidecar_creation_deferred`]).
 async fn write_sidecar(state: &AppState, stable_group_id: &str, body: &GroupRecoveryV1) -> bool {
     let path = sidecar_path(state, stable_group_id);
     if body.is_empty() {
@@ -588,6 +649,13 @@ async fn write_sidecar(state: &AppState, stable_group_id: &str, body: &GroupReco
                 false
             }
         };
+    }
+    if sidecar_creation_deferred(state, stable_group_id).await {
+        tracing::info!(
+            group_id = %LogHexId::group(stable_group_id),
+            "ADR 0109 S3: no new sidecar before ADR 0094 host commit (recovery_deferred host_commit_pending)"
+        );
+        return false;
     }
     if let Err(error) = tokio::fs::create_dir_all(sidecar_dir(state)).await {
         tracing::warn!(%error, "ADR 0109 S3: cannot create the group-recovery directory");
@@ -759,10 +827,14 @@ async fn sidecar_snapshot(state: &AppState, stable_group_id: &str) -> Option<Gro
 /// Read every `.grecov` file in `dir` (§4). Open ADR 0108 §5a quarantine
 /// transactions are resumed first ([`sidecar_resume`]). A damaged file is
 /// moved aside by the quarantine and replaced by an empty rebuild; a
-/// newer-format file stays in place and its group is memory-only. Returns
-/// the loaded bodies and the faults, keyed by file stem.
+/// newer-format file stays in place and its group is memory-only. When
+/// `quarantine_open` is false (inside an uncommitted ADR 0094 trial), a
+/// damaged file also stays in place, as `QuarantineDeferred` (§4 "Before
+/// host commit"). Returns the loaded bodies and the faults, keyed by file
+/// stem.
 async fn scan_sidecar_dir(
     dir: &FsPath,
+    quarantine_open: bool,
 ) -> (
     HashMap<String, GroupRecoveryV1>,
     HashMap<String, SidecarFault>,
@@ -824,6 +896,13 @@ async fn scan_sidecar_dir(
                     },
                 );
             }
+            Err(GroupRecoveryDecodeError::Damaged(cause)) if !quarantine_open => {
+                tracing::warn!(file = %name, cause, "ADR 0109 S3: damaged sidecar kept in place until ADR 0094 host commit");
+                faults.insert(
+                    stem.to_string(),
+                    SidecarFault::QuarantineDeferred { file: name.clone() },
+                );
+            }
             Err(GroupRecoveryDecodeError::Damaged(cause)) => {
                 tracing::warn!(file = %name, cause, "ADR 0109 S3: damaged sidecar; quarantining (D120)");
                 match super::revocation_eviction::quarantine_file(&path, &bytes).await {
@@ -866,9 +945,10 @@ async fn scan_sidecar_dir(
 /// writer lock (ADR 0108 §5a writer exclusion). See [`scan_sidecar_dir`].
 async fn load_sidecars(state: &AppState) {
     let dir = sidecar_dir(state);
+    let quarantine_open = super::revocation_eviction::host_commit_gate_open(state);
     let (mut loaded, mut faults) = {
         let _writer = state.group_recovery.writer.lock().await;
-        scan_sidecar_dir(&dir).await
+        scan_sidecar_dir(&dir, quarantine_open).await
     };
     // Files are named by the sanitised stable ID; map them back through
     // the live groups so the in-memory key is the stable ID itself. The
@@ -884,11 +964,7 @@ async fn load_sidecars(state: &AppState) {
     let mut inner = state.group_recovery.inner.lock().await;
     for stable in &stables {
         let stable = stable.as_str();
-        let file = s3::sidecar_file_name(stable);
-        let stem = file
-            .strip_suffix(&format!(".{}", s3::GROUP_RECOVERY_EXTENSION))
-            .unwrap_or(&file)
-            .to_string();
+        let stem = sidecar_stem(stable);
         if let Some(body) = loaded.remove(&stem) {
             inner.sidecars.insert(stable.to_string(), body);
         }
@@ -906,6 +982,43 @@ async fn load_sidecars(state: &AppState) {
     }
     for (stable, body) in &inner.sidecars {
         state.group_recovery.refresh_staging(stable, Some(body));
+    }
+}
+
+/// §4 "Before host commit": a damaged sidecar found inside an ADR 0094
+/// trial stayed in place. Once host commit is written, the next tick
+/// quarantines and rebuilds it as the load would have (D120).
+async fn resume_deferred_quarantine(state: &AppState) {
+    if !super::revocation_eviction::host_commit_gate_open(state) {
+        return;
+    }
+    let deferred: Vec<String> = {
+        let inner = state.group_recovery.inner.lock().await;
+        inner
+            .sidecar_status
+            .iter()
+            .filter(|(_, fault)| matches!(fault, SidecarFault::QuarantineDeferred { .. }))
+            .map(|(stable, _)| stable.clone())
+            .collect()
+    };
+    if deferred.is_empty() {
+        return;
+    }
+    let (mut loaded, mut faults) = {
+        let _writer = state.group_recovery.writer.lock().await;
+        scan_sidecar_dir(&sidecar_dir(state), true).await
+    };
+    let mut inner = state.group_recovery.inner.lock().await;
+    for stable in deferred {
+        let stem = sidecar_stem(&stable);
+        inner.sidecar_status.remove(&stable);
+        if let Some(body) = loaded.remove(&stem) {
+            state.group_recovery.refresh_staging(&stable, Some(&body));
+            inner.sidecars.insert(stable.clone(), body);
+        }
+        if let Some(fault) = faults.remove(&stem) {
+            inner.sidecar_status.insert(stable, fault);
+        }
     }
 }
 
@@ -1475,6 +1588,12 @@ async fn arm_in_place(
             .get(group_key)
             .is_none_or(is_home_policy_group);
     if home {
+        return false;
+    }
+    // §4 "Timing": every arming path ends here, so the ADR 0094 host-commit
+    // gate is checked here too. Nothing is written: no sidecar and no
+    // placeholder.
+    if defer_for_host_commit(state, &stable, captured.state_revision).await {
         return false;
     }
     let mut slot = ArmSlot::Installed;
@@ -2454,6 +2573,9 @@ pub(super) async fn apply_join_carry(
         .await;
         return false;
     }
+    if defer_for_host_commit(state, &stable, current.state_revision).await {
+        return false;
+    }
     let signer_revoked = match parse_raw(&ata.fields.attested_by) {
         Some(raw) => agent_revoked(state, &AgentId(raw)).await,
         None => true,
@@ -3091,6 +3213,7 @@ pub(in crate::server) async fn run_group_recovery_worker(state: Arc<AppState>) {
             () = state.shutdown_started.cancelled() => break,
             _ = interval.tick() => {}
         }
+        resume_deferred_quarantine(&state).await;
         reseat_progress(&state).await;
         subject_tick(&state).await;
         ensure_placeholders(&state).await;
@@ -3141,21 +3264,28 @@ async fn prune_admin_state(state: &AppState) {
                 })
                 .unwrap_or_default()
         };
+        // An expired entry stays for `RESEAT_SEAL_RETENTION_MS` more, so
+        // a seal of its invite still finds it and refuses (§3a); every
+        // other reader treats it as expired.
+        let gone = |issued: &IssuedReseatV1| {
+            issued
+                .authorisation
+                .fields
+                .expires_at_ms
+                .saturating_add(RESEAT_SEAL_RETENTION_MS)
+                <= now_wall
+                || seated.contains(&issued.authorisation.fields.subject)
+        };
         let due = {
             let inner = state.group_recovery.inner.lock().await;
-            inner.sidecars.get(&group).is_some_and(|body| {
-                body.issued_reseats.iter().any(|issued| {
-                    issued.authorisation.fields.expires_at_ms <= now_wall
-                        || seated.contains(&issued.authorisation.fields.subject)
-                })
-            })
+            inner
+                .sidecars
+                .get(&group)
+                .is_some_and(|body| body.issued_reseats.iter().any(gone))
         };
         if due {
             let _ = update_sidecar(state, &group, |body| {
-                body.issued_reseats.retain(|issued| {
-                    issued.authorisation.fields.expires_at_ms > now_wall
-                        && !seated.contains(&issued.authorisation.fields.subject)
-                });
+                body.issued_reseats.retain(|issued| !gone(issued));
             })
             .await;
         }
@@ -3243,6 +3373,11 @@ async fn subject_tick(state: &Arc<AppState>) {
                 },
             )
             .await;
+            continue;
+        }
+        // §4 "Timing", H-S3-t (4): no request before host commit, since
+        // its answer would create the sidecar.
+        if defer_for_host_commit(state, &stable, info.state_revision).await {
             continue;
         }
         if local_state_lost(state, &key, &info, now).await {
@@ -4325,6 +4460,15 @@ pub(in crate::server) async fn reseat_group_member(
         .into_response();
     }
     let stable = info.stable_group_id().to_string();
+    // §4 "Timing": the issued authorisation is a sidecar write, so the
+    // route signs, stores and mints nothing before ADR 0094's host commit.
+    if sidecar_creation_deferred(&state, &stable).await {
+        return reseat_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "recovery_deferred",
+            serde_json::json!({ "cause": HOST_COMMIT_PENDING }),
+        );
+    }
     if contained(&state, &info).await {
         return reseat_refusal(
             StatusCode::CONFLICT,
@@ -4376,6 +4520,16 @@ pub(in crate::server) async fn reseat_group_member(
                 return response;
             }
         }
+    }
+    // One authorisation per `(group, subject)` (§3): the one this call
+    // replaces loses its invite first, durably, so the replaced pairing can
+    // never reach a seal (§3a).
+    if !revoke_replaced_reseat_invite(&state, &group_key, &stable, &subject_hex).await {
+        return reseat_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_durable",
+            serde_json::Value::Null,
+        );
     }
     let expiry_secs = s3::RESEAT_AUTHORISATION_LIFETIME.as_secs();
     let minted = if promoted {
@@ -4547,8 +4701,10 @@ pub(in crate::server) async fn get_group_recovery(
         .get(&stable)
         .filter(|_| admin)
         .map(|body| {
+            let now = now_ms();
             body.issued_reseats
                 .iter()
+                .filter(|issued| issued.authorisation.fields.expires_at_ms > now)
                 .map(|issued| {
                     serde_json::json!({
                         "subject": issued.authorisation.fields.subject,
@@ -4662,19 +4818,36 @@ fn seating_commit_hash(info: &GroupInfo, subject_hex: &str, before: u64) -> Opti
     found
 }
 
+/// How long an expired issued re-seat stays in the sidecar. An invite is
+/// consumable to the end of its expiry second, up to 999 ms after its
+/// authorisation expires; the entry must outlive that, so the seal can
+/// tell a re-seat invite that lost its pairing from an ordinary invite.
+const RESEAT_SEAL_RETENTION_MS: u64 = 60_000;
+
 /// The issued re-seat whose invite secret this `MemberJoined` redeems, for
-/// this subject (§3a: the issuing admin applies checks 1 and 2 again when
-/// the join request arrives).
-pub(super) async fn issued_reseat_for_secret(
+/// this subject, expired or not (§3a: the issuing admin applies checks 1
+/// and 2 again when the join request arrives). The caller checks expiry.
+async fn recorded_reseat_for_secret(
     state: &AppState,
     stable_group_id: &str,
     subject_hex: &str,
     invite_secret: &str,
 ) -> Option<IssuedReseatV1> {
     let hash = s3::invite_secret_hash(invite_secret);
-    current_issued_reseat(state, stable_group_id, subject_hex)
+    state
+        .group_recovery
+        .inner
+        .lock()
         .await
-        .filter(|issued| issued.authorisation.fields.invite_secret_hash == hash)
+        .sidecars
+        .get(stable_group_id)?
+        .issued_reseats
+        .iter()
+        .find(|issued| {
+            let fields = &issued.authorisation.fields;
+            fields.subject.eq_ignore_ascii_case(subject_hex) && fields.invite_secret_hash == hash
+        })
+        .cloned()
 }
 
 /// The outcome of the §3a seal step for one `MemberJoined`.
@@ -4715,11 +4888,20 @@ pub(super) async fn reseat_mandate_for_seat(
     if owner_key_here {
         return ReseatSeal::NotReseat;
     }
+    // #1533 rc22 (ZCode MAJOR-2): a re-seat invite whose authorisation
+    // expired before the seal is still a re-seat invite. It seals nothing;
+    // it never falls through to an ordinary add with no mandate. A
+    // replaced authorisation's invite is revoked by the route
+    // ([`revoke_replaced_reseat_invite`]), so it never reaches the seal.
     let Some(issued) =
-        issued_reseat_for_secret(state, parent.stable_group_id(), subject_hex, invite_secret).await
+        recorded_reseat_for_secret(state, parent.stable_group_id(), subject_hex, invite_secret)
+            .await
     else {
         return ReseatSeal::NotReseat;
     };
+    if issued.authorisation.fields.expires_at_ms <= now_ms() {
+        return ReseatSeal::Refused("reseat_invite_unpaired");
+    }
     let ReseatBasis::Removal {
         revision: removal_revision,
         state_hash: removal_hash,
@@ -4921,6 +5103,60 @@ async fn promoted_admin_checks(
     Ok(())
 }
 
+/// §3 "one per `(group, subject)`": before the route replaces the issued
+/// re-seat for `subject_hex`, revoke the unconsumed invite that the old
+/// authorisation pairs with, so a join with it fails invite consumption
+/// before any seal. Returns whether the roster is durable (or nothing was
+/// to revoke). The caller holds the group's membership lock.
+async fn revoke_replaced_reseat_invite(
+    state: &AppState,
+    group_key: &str,
+    stable_group_id: &str,
+    subject_hex: &str,
+) -> bool {
+    let hashes: Vec<String> = sidecar_snapshot(state, stable_group_id)
+        .await
+        .map(|body| {
+            body.issued_reseats
+                .iter()
+                .filter(|issued| {
+                    issued
+                        .authorisation
+                        .fields
+                        .subject
+                        .eq_ignore_ascii_case(subject_hex)
+                })
+                .map(|issued| issued.authorisation.fields.invite_secret_hash.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if hashes.is_empty() {
+        return true;
+    }
+    let Some(mut next) = state.named_groups.read().await.get(group_key).cloned() else {
+        return true;
+    };
+    let secrets: Vec<String> = next
+        .issued_invites
+        .iter()
+        .filter(|(secret, record)| {
+            record.consumed_by.is_none() && hashes.contains(&s3::invite_secret_hash(secret))
+        })
+        .map(|(secret, _)| secret.clone())
+        .collect();
+    if secrets.is_empty() {
+        return true;
+    }
+    for secret in &secrets {
+        next.issued_invites.remove(secret);
+        next.issued_invite_secrets.remove(secret);
+    }
+    matches!(
+        super::persist_named_group_info(state, group_key, next).await,
+        Ok(super::AtomicWriteOutcome::Durable)
+    )
+}
+
 /// Mint a re-seat invite for the promoted-admin path (§3a): an InviteV4
 /// signed by this admin's agent key alone, with no owner countersignature,
 /// addressed to the subject and recorded as an ordinary issued invite. Its
@@ -5045,7 +5281,7 @@ fn check_reseat_invite(
         return Err("signer_not_inviter");
     }
     if s3::invite_secret_hash(&invite.invite_secret) != fields.invite_secret_hash {
-        return Err("invite_unpaired");
+        return Err("reseat_invite_unpaired");
     }
     if invite.base_state_revision != Some(fields.invite_base_revision)
         || invite.base_state_hash.as_deref() != Some(fields.invite_base_state_hash.as_str())
@@ -5138,6 +5374,11 @@ async fn consume_reseat(
     if let Err(cause) = check_reseat_invite(&invite, &authorisation, &stable, &local) {
         drop(membership_guard);
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
+        return;
+    }
+    // §4 "Timing": the journal is the first sidecar write; it waits for
+    // ADR 0094's host commit. The authorisation is offered again.
+    if defer_for_host_commit(state, &stable, info.state_revision).await {
         return;
     }
     let Ok(live_record) = serde_json::to_vec(&info) else {
@@ -5724,6 +5965,9 @@ pub(in crate::server) async fn recovery_json(
             }),
             SidecarFault::QuarantineFailed { file, step } => serde_json::json!({
                 "state": "sidecar_quarantine_failed", "file": file, "step": step,
+            }),
+            SidecarFault::QuarantineDeferred { file } => serde_json::json!({
+                "state": "recovery_deferred", "cause": HOST_COMMIT_PENDING, "file": file,
             }),
         });
     }
@@ -6529,7 +6773,7 @@ mod tests {
         unpaired.invite_secret = "00".repeat(32);
         assert_eq!(
             check_reseat_invite(&unpaired, &authorisation, "stable", &subject_hex),
-            Err("invite_unpaired")
+            Err("reseat_invite_unpaired")
         );
         let mut seated = invite.clone();
         if let Some(roster) = seated.base_roster.as_mut() {
@@ -6780,6 +7024,407 @@ mod tests {
         // The durable token passes the fence and meets the §3a checks.
         let response = reseat(true).await.into_response();
         assert_ne!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    /// A SignedPublic group that this node created, with `subject` seated
+    /// and then removed by this node. Returns the key, the record and the
+    /// `Removal` basis of the subject's removal.
+    async fn removed_subject_group(
+        state: &Arc<AppState>,
+        subject: &str,
+        owner: Option<x0x::identity::UserId>,
+    ) -> anyhow::Result<(String, GroupInfo, serde_json::Value)> {
+        let keypair = state.agent.identity().agent_keypair();
+        let local = local_hex(state);
+        let mut info = GroupInfo::with_policy(
+            "adr0109-reseat-rc22".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "2222".repeat(16),
+            x0x::groups::GroupPolicy {
+                discoverability: x0x::groups::GroupDiscoverability::Hidden,
+                admission: x0x::groups::GroupAdmission::InviteOnly,
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..x0x::groups::GroupPolicy::default()
+            },
+        );
+        info.add_member(
+            subject.to_string(),
+            x0x::groups::GroupRole::Member,
+            Some(local.clone()),
+            None,
+        );
+        info.seal_commit(keypair, 1_000)?;
+        info.remove_member(subject, Some(local));
+        info.seal_commit(keypair, 2_000)?;
+        let basis = serde_json::json!({
+            "kind": "removal", "revision": info.state_revision, "state_hash": info.state_hash,
+        });
+        // The owner axis is set after the seals, which would otherwise
+        // need certificate evidence.
+        if let Some(owner) = owner {
+            info.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner);
+        }
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        Ok((key, info, basis))
+    }
+
+    /// #1533 rc22 (ZCode MAJOR-2), ADR 0109 §3 and §3a: a second route
+    /// call for the same subject replaces its authorisation, and the
+    /// replaced authorisation's invite is revoked first, durably. A join
+    /// with the old invite then fails invite consumption, so the replaced
+    /// pairing never reaches a seal. Before the fix the old invite stayed
+    /// consumable, and its seal found no paired authorisation and sealed
+    /// an ordinary add. Inert.
+    #[tokio::test]
+    async fn a_replaced_reseat_authorisation_loses_its_invite() -> anyhow::Result<()> {
+        use crate::server::rider_auth::ActorContext;
+
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let subject = "ab".repeat(32);
+        let (key, info, basis) = removed_subject_group(&state, &subject, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let reseat = || {
+            let request: ReseatRequest = serde_json::from_value(serde_json::json!({
+                "reason": "forked while partitioned", "basis": basis,
+            }))
+            .expect("request decodes");
+            reseat_group_member(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(ActorContext::Owner { durable: true }),
+                Path((key.clone(), subject.clone())),
+                Json(request),
+            )
+        };
+        let paired = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            let stable = stable.clone();
+            async move {
+                sidecar_snapshot(&state, &stable)
+                    .await
+                    .map(|body| {
+                        body.issued_reseats
+                            .iter()
+                            .map(|issued| issued.authorisation.fields.invite_secret_hash.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+        let live_secrets = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            let key = key.clone();
+            async move {
+                state
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&key)
+                    .map(|info| {
+                        info.issued_invites
+                            .iter()
+                            .filter(|(_, record)| record.consumed_by.is_none())
+                            .map(|(secret, _)| secret.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+
+        assert_eq!(reseat().await.into_response().status(), StatusCode::OK);
+        let first = live_secrets(&state).await;
+        assert_eq!(first.len(), 1, "one re-seat invite");
+        assert_eq!(
+            paired(&state).await,
+            vec![s3::invite_secret_hash(&first[0])]
+        );
+
+        assert_eq!(reseat().await.into_response().status(), StatusCode::OK);
+        let second = live_secrets(&state).await;
+        assert_eq!(second.len(), 1, "the replaced invite is revoked");
+        assert_ne!(second[0], first[0]);
+        assert_eq!(
+            paired(&state).await,
+            vec![s3::invite_secret_hash(&second[0])],
+            "one authorisation per (group, subject)"
+        );
+        // A join with the replaced invite fails before any seal.
+        let mut probe = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("group"))?;
+        assert_eq!(
+            probe.consume_issued_invite(
+                &first[0],
+                &subject,
+                x0x::groups::GroupRole::Member,
+                now_ms(),
+                now_ms()
+            ),
+            Err("invite_secret_unknown")
+        );
+        // The revocation is durable.
+        let on_disk = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(!on_disk.issued_invites.contains_key(&first[0]));
+        assert!(on_disk.issued_invites.contains_key(&second[0]));
+        Ok(())
+    }
+
+    /// #1533 rc22 (ZCode MAJOR-2), ADR 0109 §3a "never omits the mandate":
+    /// at seal on a promoted admin (owner axis, no owner key here), a
+    /// re-seat invite whose authorisation expired before the seal is
+    /// refused with `reseat_invite_unpaired`; it is not sealed as an
+    /// ordinary add with no mandate. An invite that no authorisation ever
+    /// paired is not a re-seat. Inert.
+    #[tokio::test]
+    async fn a_reseat_invite_unpaired_at_seal_seals_nothing() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let keypair = state.agent.identity().agent_keypair();
+        let local = local_hex(&state);
+        let subject = "ab".repeat(32);
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?;
+        let (_key, info, _basis) =
+            removed_subject_group(&state, &subject, Some(owner.user_id())).await?;
+        let stable = info.stable_group_id().to_string();
+        let issue = |secret: &str, expires_at_ms: u64| -> anyhow::Result<IssuedReseatV1> {
+            Ok(IssuedReseatV1 {
+                authorisation: ReseatAuthorisation::sign(
+                    ReseatAuthorisationFields {
+                        group: stable.clone(),
+                        subject: subject.clone(),
+                        basis: ReseatBasis::Removal {
+                            revision: info.state_revision,
+                            state_hash: info.state_hash.clone(),
+                        },
+                        invite_secret_hash: s3::invite_secret_hash(secret),
+                        invite_base_revision: info.state_revision,
+                        invite_base_state_hash: info.state_hash.clone(),
+                        signer: local.clone(),
+                        signer_public_key: hex::encode(keypair.public_key().as_bytes()),
+                        reason_hash: s3::reason_hash("r"),
+                        expires_at_ms,
+                    },
+                    keypair,
+                )?,
+                invite: String::new(),
+                issued_at_ms: now_ms(),
+            })
+        };
+        let seal = |secret: &'static str| {
+            let state = Arc::clone(&state);
+            let info = info.clone();
+            let subject = subject.clone();
+            async move {
+                reseat_mandate_for_seat(
+                    &state,
+                    &info,
+                    &info,
+                    &subject,
+                    secret,
+                    1,
+                    None,
+                    x0x::groups::GroupRole::Member,
+                )
+                .await
+            }
+        };
+
+        let expired = issue("expired-secret", now_ms().saturating_sub(1))?;
+        assert!(
+            update_sidecar(&state, &stable, move |body| body
+                .issued_reseats
+                .push(expired))
+            .await
+        );
+        assert!(matches!(
+            seal("expired-secret").await,
+            ReseatSeal::Refused("reseat_invite_unpaired")
+        ));
+        // The prune keeps the expired entry long enough for that check.
+        prune_admin_state(&state).await;
+        assert!(matches!(
+            seal("expired-secret").await,
+            ReseatSeal::Refused("reseat_invite_unpaired")
+        ));
+        // Control: an invite no authorisation names is not a re-seat.
+        assert!(matches!(
+            seal("ordinary-secret").await,
+            ReseatSeal::NotReseat
+        ));
+        // Control: a current pairing goes on to the §3a floor and bindings.
+        let current = issue("current-secret", u64::MAX / 2)?;
+        assert!(
+            update_sidecar(&state, &stable, move |body| body
+                .issued_reseats
+                .push(current))
+            .await
+        );
+        assert!(!matches!(
+            seal("current-secret").await,
+            ReseatSeal::NotReseat | ReseatSeal::Refused("reseat_invite_unpaired")
+        ));
+        Ok(())
+    }
+
+    /// #1533 rc22 (ZCode MAJOR-1), ADR 0109 §4 "Timing", H-S3-t (4):
+    /// inside an uncommitted ADR 0094 trial S3 creates no sidecar and
+    /// writes no placeholder. The node keeps today's state and shows
+    /// `recovery_deferred {cause: host_commit_pending}`. After host commit
+    /// the same arming writes the sidecar and the placeholder. Inert.
+    #[tokio::test]
+    async fn an_upgrade_trial_defers_s3_writes_until_host_commit() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "health_committed",
+        )?;
+
+        assert!(!arm_in_place(&state, &key, &info, ata.clone()).await);
+        assert!(!tokio::fs::try_exists(sidecar_path(&state, &stable)).await?);
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&legacy), "no placeholder in a trial");
+        let recovery = recovery_json(&state, &info)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("recovery object"))?;
+        assert_eq!(recovery["state"], "recovery_deferred");
+        assert_eq!(recovery["cause"], HOST_COMMIT_PENDING);
+        assert!(sidecar_creation_deferred(&state, &stable).await);
+
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "host_committed",
+        )?;
+        assert!(!sidecar_creation_deferred(&state, &stable).await);
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        assert!(tokio::fs::try_exists(sidecar_path(&state, &stable)).await?);
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&legacy), "armed after host commit");
+        Ok(())
+    }
+
+    /// #1533 rc22 (ZCode MAJOR-1), ADR 0109 §4: a sidecar already on disk
+    /// was created after an earlier host commit, so a trial keeps it
+    /// current; and the re-seat route signs, stores and mints nothing for
+    /// a group with no sidecar before host commit. Inert.
+    #[tokio::test]
+    async fn an_upgrade_trial_keeps_existing_sidecars_and_refuses_new_reseats() -> anyhow::Result<()>
+    {
+        use crate::server::rider_auth::ActorContext;
+        use axum::body::to_bytes;
+
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, held, ata) = armed_fixture(&state).await?;
+        let held_stable = held.stable_group_id().to_string();
+        assert!(
+            update_sidecar(&state, &held_stable, move |body| body.active_ata =
+                Some(ata))
+            .await
+        );
+        let subject = "ab".repeat(32);
+        let (key, info, basis) = removed_subject_group(&state, &subject, None).await?;
+        let stable = info.stable_group_id().to_string();
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "health_committed",
+        )?;
+
+        assert!(!sidecar_creation_deferred(&state, &held_stable).await);
+        let before = sidecar_on_disk(&state, &held_stable).await?.generation;
+        assert!(
+            update_sidecar(&state, &held_stable, |_| {}).await,
+            "an existing sidecar is kept current"
+        );
+        assert!(sidecar_on_disk(&state, &held_stable).await?.generation > before);
+        assert!(sidecar_creation_deferred(&state, &stable).await);
+
+        let request: ReseatRequest = serde_json::from_value(serde_json::json!({
+            "reason": "forked while partitioned", "basis": basis,
+        }))?;
+        let response = reseat_group_member(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(ActorContext::Owner { durable: true }),
+            Path((key.clone(), subject.clone())),
+            Json(request),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert_eq!(body["reason"], "recovery_deferred");
+        assert_eq!(body["detail"]["cause"], HOST_COMMIT_PENDING);
+        assert!(!tokio::fs::try_exists(sidecar_path(&state, &stable)).await?);
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("group"))?;
+        assert!(live.issued_invites.is_empty(), "no invite minted");
+        Ok(())
+    }
+
+    /// #1533 rc22 (ZCode MAJOR-1), ADR 0109 §4 "Before host commit every
+    /// file stays in place": a damaged sidecar found inside a trial is not
+    /// quarantined. Its bytes stay, and the group shows
+    /// `recovery_deferred {cause: host_commit_pending}`. After host commit
+    /// the next tick quarantines and rebuilds it (D120). Inert.
+    #[tokio::test]
+    async fn a_damaged_sidecar_waits_for_host_commit_before_quarantine() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, _ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        let junk = [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat();
+        tokio::fs::write(&path, &junk).await?;
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "health_committed",
+        )?;
+
+        load_sidecars(&state).await;
+        assert_eq!(tokio::fs::read(&path).await?, junk, "kept in place");
+        let recovery = recovery_json(&state, &info)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("recovery object"))?;
+        assert_eq!(recovery["state"], "recovery_deferred");
+        assert_eq!(recovery["cause"], HOST_COMMIT_PENDING);
+        resume_deferred_quarantine(&state).await;
+        assert_eq!(tokio::fs::read(&path).await?, junk, "still in place");
+
+        super::super::revocation_eviction::tests::write_upgrade_journal(
+            &state.data_dir,
+            "host_committed",
+        )?;
+        resume_deferred_quarantine(&state).await;
+        let rebuilt = sidecar_on_disk(&state, &stable).await?;
+        assert_eq!(rebuilt.rebuilt_from.len(), 1, "quarantined and rebuilt");
+        assert!(!state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .sidecar_status
+            .contains_key(&stable));
         Ok(())
     }
 
