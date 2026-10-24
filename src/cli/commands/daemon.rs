@@ -829,7 +829,9 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
         // would survive into the stored task and break PowerShell's -File
         // parsing (review round 1 of #1612). -WindowStyle Hidden keeps the
         // logon task from leaving a console window open (a brief flash can
-        // still appear; verified behaviour is VM-acceptance work).
+        // still appear; verified behaviour is VM-acceptance work). schtasks
+        // caps /TR at 261 characters — a very long %APPDATA% path fails
+        // registration and falls through to the printed fallback.
         let task_run = format!(
             "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \
              \"{}\"",
@@ -848,13 +850,24 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
             println!("  Verify: schtasks /Query /TN {WINDOWS_AUTOSTART_TASK} /V /FO LIST");
         } else {
             println!("Autostart wrapper written, but the logon task could not be registered.");
-            println!("  Register it manually, or run the wrapper from your own service manager:");
+            println!("  Register it manually (PowerShell):");
             println!(
-                "    schtasks /Create /TN {WINDOWS_AUTOSTART_TASK} /SC ONLOGON /TR \"{task_run}\""
+                "    Register-ScheduledTask -TaskName {WINDOWS_AUTOSTART_TASK} -Trigger \
+                 (New-ScheduledTaskTrigger -AtLogOn) -Action (New-ScheduledTaskAction \
+                 -Execute 'powershell.exe' -Argument '-NoProfile -WindowStyle Hidden \
+                 -ExecutionPolicy Bypass -File ''{}''')",
+                wrapper_path.display()
             );
+            println!("  Or run the wrapper from your own service manager (WinSW/NSSM/SCM).");
         }
         println!("  Wrapper: {}", wrapper_path.display());
-        println!("  Policy:  restart after exit 100 (upgrade); every other exit stops.");
+        println!(
+            "  Policy:  the wrapper restarts x0xd after exit 100 (the upgrade request) and \
+             propagates every other exit. A supervised apply additionally needs the \
+             acknowledged-shutdown flush owner, which is Unix-only today: until it is \
+             ported, a supervised Windows apply is refused (no bytes change) and the \
+             unsupervised transactional path keeps working."
+        );
         println!("  Remove:  x0x autostart --remove");
     }
 
@@ -1158,9 +1171,38 @@ pub async fn autostart_remove() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("schtasks")
-            .args(["/Delete", "/TN", WINDOWS_AUTOSTART_TASK, "/F"])
-            .status();
+        // Delete the task FIRST and require the delete to have run and
+        // succeeded (when the task exists) before removing the script: a
+        // leftover logon task pointing at a deleted script fails silently at
+        // every sign-in (review round 2 of #1612). On a failed delete the
+        // wrapper stays so the task keeps working, and the operator gets the
+        // manual command.
+        let task_exists = std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", WINDOWS_AUTOSTART_TASK])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if task_exists {
+            let deleted = std::process::Command::new("schtasks")
+                .args(["/Delete", "/TN", WINDOWS_AUTOSTART_TASK, "/F"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !deleted {
+                let wrapper_path = dirs::config_dir()
+                    .context("cannot determine config directory")?
+                    .join("x0x")
+                    .join(WINDOWS_WRAPPER_FILE_NAME);
+                anyhow::bail!(
+                    "could not delete the logon task {WINDOWS_AUTOSTART_TASK} \
+                     (schtasks /Delete failed); the wrapper {} was left in place so the \
+                     task keeps working. Delete the task manually \
+                     (schtasks /Delete /TN {WINDOWS_AUTOSTART_TASK} /F), then re-run \
+                     `x0x autostart --remove`",
+                    wrapper_path.display()
+                );
+            }
+        }
         let wrapper_path = dirs::config_dir()
             .context("cannot determine config directory")?
             .join("x0x")
