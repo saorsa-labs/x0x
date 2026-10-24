@@ -1409,6 +1409,15 @@ fn parse_roster_row(row: &serde_json::Value) -> Result<RosterRow> {
         .with_context(|| format!("unsupported role: {row:?}"))?;
     let state = serde_json::from_value(closed("state")?)
         .with_context(|| format!("unsupported member state: {row:?}"))?;
+    // #1604: an unknown string now decodes as `Unknown`; it stays an error.
+    ensure!(
+        role != crate::groups::GroupRole::Unknown,
+        "unsupported role: {row:?}"
+    );
+    ensure!(
+        state != crate::groups::GroupMemberState::Unknown,
+        "unsupported member state: {row:?}"
+    );
     Ok(RosterRow {
         agent_id: agent_id.to_ascii_lowercase(),
         role,
