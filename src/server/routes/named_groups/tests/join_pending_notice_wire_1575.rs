@@ -412,9 +412,14 @@ async fn joiner_holds_only_verified_current_notices() -> Result<()> {
         "a notice bound to another attempt is refused"
     );
 
-    // D154: a member-signed `no_eligible_admin` notice from an Active
-    // stub-roster seat is held (newer replaces the held authority notice).
+    // D154 (review finding 1): a member-signed `no_eligible_admin` notice
+    // is DROPPED in this slice. The joiner polls only its authority, so one
+    // can arrive only unsolicited; §8's "Current notice" rule keeps the
+    // authority's notice current while it polls, and the D154 notice-only
+    // rotation slice owns member-signed acceptance. The held authority
+    // notice survives.
     let signer_hex = hex::encode(member_signer.agent_id().as_bytes());
+    use base64::Engine as _;
     let mut member_signed = signed_notice(
         notice_body(
             &group_key,
@@ -427,62 +432,45 @@ async fn joiner_holds_only_verified_current_notices() -> Result<()> {
         ),
         &member_signer,
     );
-    use base64::Engine as _;
     member_signed.signer_public_key_b64 =
         Some(BASE64.encode(member_signer.public_key().as_bytes()));
     assert!(
-        verify_and_hold_join_pending_notice(&state, true, &member_signed).await,
-        "a member-signed D154 notice from an Active seat is held"
+        !verify_and_hold_join_pending_notice(&state, true, &member_signed).await,
+        "an unsolicited member-signed D154 notice is dropped in this slice"
     );
+    {
+        let attempts = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let held = attempts
+            .values()
+            .find_map(|attempt| attempt.held_pending_notice.clone())
+            .expect("held");
+        assert_eq!(
+            held.signer_agent_id, inviter_hex,
+            "the held notice is still the authority's"
+        );
+    }
 
-    // The same signer with a non-D154 cause is refused (only the pinned
-    // authority may sign any other cause).
-    let mut other_cause = signed_notice(
+    // §8 newest-first: a NEWER authority notice replaces the held one, and
+    // an OLDER one is then ignored.
+    let newer = signed_notice(
         notice_body(
             &group_key,
             &joiner_hex,
-            &signer_hex,
+            &inviter_hex,
             &attempt_id,
             "owner_certificate_pending",
             detail.clone(),
             now + 5_000,
         ),
-        &member_signer,
+        &inviter,
     );
-    other_cause.signer_public_key_b64 = Some(BASE64.encode(member_signer.public_key().as_bytes()));
     assert!(
-        !verify_and_hold_join_pending_notice(&state, true, &other_cause).await,
-        "a non-D154 cause from a signer other than the pinned authority is refused"
+        verify_and_hold_join_pending_notice(&state, true, &newer).await,
+        "a newer authority notice replaces the held one"
     );
-
-    // A member-signed notice whose signer lost the Active stub-roster seat
-    // is refused.
-    {
-        let mut groups = state.named_groups.write().await;
-        let info = groups.get_mut(&group_key).expect("group kept");
-        info.remove_member(&signer_hex, None);
-        info.recompute_state_hash();
-    }
-    let mut gone_seat = signed_notice(
-        notice_body(
-            &group_key,
-            &joiner_hex,
-            &signer_hex,
-            &attempt_id,
-            "no_eligible_admin",
-            JoinPendingNoticeDetail::default(),
-            now + 6_000,
-        ),
-        &member_signer,
-    );
-    gone_seat.signer_public_key_b64 = Some(BASE64.encode(member_signer.public_key().as_bytes()));
-    assert!(
-        !verify_and_hold_join_pending_notice(&state, true, &gone_seat).await,
-        "a member-signed notice with no Active stub-roster seat is refused"
-    );
-
-    // §8 newest-first: an OLDER authority notice never displaces the held
-    // newer one.
     let older = signed_notice(
         notice_body(
             &group_key,

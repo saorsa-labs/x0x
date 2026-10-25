@@ -41502,12 +41502,14 @@ fn verify_join_refusal_receipt(
 ///   failure — §8);
 /// - freshness: inside the 10-minute staging lifetime and not dated more
 ///   than 300 s ahead (the refusal receipt's clock-skew rule);
-/// - the signer resolves: either the key pinned from the VERIFIED invite
-///   (which must derive `signer_agent_id`, so only the expected authority
-///   signs any cause), or — for `no_eligible_admin` only (D154) — the
-///   carried `signer_public_key_b64`, which must derive `signer_agent_id`
-///   AND name an Active seat in the joiner's local stub roster. Any other
-///   cause from a signer other than the pinned authority is dropped;
+/// - the signer resolves to the key pinned from the VERIFIED invite (which
+///   must derive `signer_agent_id`, so only the expected authority signs
+///   any cause). A member-signed `no_eligible_admin` notice (D154) is
+///   dropped in this slice: the joiner polls only its authority, so one
+///   can arrive only unsolicited, and §8's "Current notice" rule keeps the
+///   authority's notice current while it polls — the D154 notice-only
+///   rotation slice owns member-signed acceptance (with the Active
+///   stub-roster seat check D154 names);
 /// - the ML-DSA-65 signature verifies over the canonical notice bytes.
 ///
 /// Newest-first: a notice older than (or equal to) the held one by
@@ -41551,7 +41553,7 @@ async fn verify_and_hold_join_pending_notice(
     let key = join_result_key(&notice.group_id, &notice.member_agent_id);
     // Read the attempt, resolve the signer key, then re-check and hold
     // under the registry lock (the attempt id pins the entry).
-    let (attempt_id, local_group_key, inviter_public_key_b64) = {
+    let (attempt_id, inviter_public_key_b64) = {
         let attempts = state
             .pending_join_attempts
             .lock()
@@ -41562,7 +41564,6 @@ async fn verify_and_hold_join_pending_notice(
         };
         (
             attempt.attempt_id.clone(),
-            attempt.local_group_key.clone(),
             attempt.inviter_public_key_b64.clone(),
         )
     };
@@ -41570,9 +41571,14 @@ async fn verify_and_hold_join_pending_notice(
         tracing::warn!(group_id = %LogHexId::group(&notice.group_id), local_attempt = %attempt_id, notice_attempt = %notice.attempt_id, "#1575: pending notice attempt mismatch — dropped");
         return false;
     }
-    // Signer resolution (§8): the pinned inviter key, or — for the single
-    // D154 cause — the carried member key naming an Active stub-roster seat.
-    let pinned_signer = BASE64
+    // Signer resolution (§8): the pinned inviter key. This slice answers
+    // only its own authority-directed polls (the D154 notice-only rotation
+    // is a follow-up), so a member-signed `no_eligible_admin` notice can
+    // only arrive UNSOLICITED — §8's "Current notice" rule keeps the
+    // authority's notice current while the joiner polls it, so member-signed
+    // notices are dropped until the rotation slice owns their acceptance
+    // (including the Active stub-roster seat check D154 names).
+    let signer_key = BASE64
         .decode(&inviter_public_key_b64)
         .ok()
         .and_then(|bytes| ant_quic::MlDsaPublicKey::from_bytes(&bytes).ok())
@@ -41580,43 +41586,8 @@ async fn verify_and_hold_join_pending_notice(
             hex::encode(crate::identity::AgentId::from_public_key(pubkey).as_bytes())
                 == notice.signer_agent_id.to_ascii_lowercase()
         });
-    let signer_key = match pinned_signer {
-        Some(pinned) => Some(pinned),
-        None if notice.cause == JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN => {
-            let member_key = notice
-                .signer_public_key_b64
-                .as_deref()
-                .and_then(|key_b64| BASE64.decode(key_b64).ok())
-                .and_then(|bytes| ant_quic::MlDsaPublicKey::from_bytes(&bytes).ok());
-            let resolved = member_key.filter(|pubkey| {
-                hex::encode(crate::identity::AgentId::from_public_key(pubkey).as_bytes())
-                    == notice.signer_agent_id.to_ascii_lowercase()
-            });
-            if resolved.is_some() {
-                // D154: the signer must hold an Active seat in the local
-                // stub roster — the invite-committed base state this joiner
-                // already verifies receipts against.
-                let signer_hex = notice.signer_agent_id.to_ascii_lowercase();
-                let signer_active = {
-                    let groups = state.named_groups.read().await;
-                    groups
-                        .get(&local_group_key)
-                        .is_some_and(|info| info.has_active_member(&signer_hex))
-                };
-                if !signer_active {
-                    tracing::warn!(group_id = %LogHexId::group(&notice.group_id), signer = %LogHexId::agent(&notice.signer_agent_id), "#1575: member-signed notice signer holds no Active stub-roster seat — dropped");
-                    return false;
-                }
-            }
-            resolved
-        }
-        None => {
-            tracing::warn!(group_id = %LogHexId::group(&notice.group_id), signer = %LogHexId::agent(&notice.signer_agent_id), cause = %notice.cause, "#1575: notice from a signer that is not the pinned authority — dropped");
-            return false;
-        }
-    };
     let Some(signer_key) = signer_key else {
-        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), "#1575: notice signer key does not derive signer_agent_id — dropped");
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), signer = %LogHexId::agent(&notice.signer_agent_id), cause = %notice.cause, "#1575: notice from a signer that is not the pinned authority — dropped (member-signed acceptance lands with the D154 notice-only rotation)");
         return false;
     };
     let canonical = canonical_join_pending_notice_bytes(notice);
