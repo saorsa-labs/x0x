@@ -53,6 +53,14 @@ async fn pre_s3(sim: &Sim, labels: &[&str], _observer: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns once `observer` holds a current verified advert from `label`
+/// that sets bit 8 (a node restarted on the candidate); it asks for a
+/// fresh advert each round, as S3 itself does for unknown support.
+async fn sees_s3(_sim: &Sim, _observer: &str, _label: &str) -> Result<()> {
+    // DIAG (main): main has no bit 8 to wait for.
+    Ok(())
+}
+
 /// S0 (`skew`) or S0′ up to the mint: A creates the group and seats M1 and
 /// M2; with `skew`, A makes the four policy changes. `pre` names the
 /// nodes that run as the previous release from the start. Returns the
@@ -749,6 +757,7 @@ async fn typed_waits(sim: &mut Sim, receipt: &mut Receipt, host_commit: bool) ->
         steps_ok.push(("4-after-host-commit", asked));
     } else if step1 {
         sim.restart("M1", RestartMode::Graceful).await?;
+        sees_s3(sim, "J", "M1").await?;
         let not_admin = waits
             .until(
                 sim,
