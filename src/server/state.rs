@@ -1117,12 +1117,17 @@ pub(super) struct AppState {
     pub(super) pending_join_refusals: StdMutex<HashMap<String, PendingJoinRefusal>>,
     /// ADR 0108 §8 (#1575): member-side staged join pending notices, keyed
     /// `(group_id, member_agent_id, attempt_id)` like the staged refusals.
-    /// Unsigned typed local state for held join attempts: the signed wire
-    /// `JoinPendingNotice` and its `Pending` serving arm wait on David's
-    /// ruling (#1575), so nothing here is served to a joiner. Memory-only,
-    /// TTL-swept at the join staging lifetime.
+    /// Typed local state for held join attempts; the signed wire body
+    /// materializes lazily at the first capable serve (§8) under
+    /// `join_pending_notice_sign_limiter`. Memory-only, TTL-swept at the
+    /// join staging lifetime.
     pub(super) pending_join_notices:
         StdMutex<HashMap<String, crate::server::routes::named_groups::PendingJoinNotice>>,
+    /// ADR 0108 §8: the notice lazy-signing limiter — the #477 limiter
+    /// shape (per-(group, member) tokens + a global bucket) with the same
+    /// values as the refusals while §8 Q3 stays open with David.
+    pub(super) join_pending_notice_sign_limiter:
+        StdMutex<crate::server::routes::named_groups::JoinRefusalSignLimiter>,
     /// #477: joiner-side pending-join attempt registry, keyed
     /// `join_result_key` — the attempt id, the pinned inviter, and the
     /// poll task handle, so a typed refusal / timeout / seat can

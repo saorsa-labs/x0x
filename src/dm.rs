@@ -101,6 +101,10 @@ impl CapabilityRegistry {
     /// gives bits 4–9 to ADR 0110 and ADR 0109. Bit 4 is
     /// `eviction_handoff_v1`.
     pub const GUI_SHOW_V1: u64 = 1 << 10;
+    /// ADR 0108 §8: serves and understands `JoinPendingNotice` on the
+    /// join-result poll (David's 25 Oct 2026 05:14 GMT ruling). Bit 11,
+    /// the next free bit at acceptance order.
+    pub const JOIN_PENDING_NOTICE_V1: u64 = 1 << 11;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
@@ -114,7 +118,8 @@ impl CapabilityRegistry {
                 | Self::CRYPTO_EXCLUSION_V1
                 | Self::CERTIFICATE_REBIND_V1
                 | Self::OWNER_RECOVERY_V1
-                | Self::GUI_SHOW_V1,
+                | Self::GUI_SHOW_V1
+                | Self::JOIN_PENDING_NOTICE_V1,
         }
     }
 

@@ -211,6 +211,10 @@ pub(super) async fn serve_result(
             accepts_refusal: true,
             accepts_control_blob_ref: true,
             attempt_id: Some(attempt.to_string()),
+            accepts_pending_notice: false,
+            held_notice_hash: None,
+            notice_only: false,
+            attempt_evidence: None,
         },
     )
     .await;
@@ -3650,6 +3654,10 @@ async fn s8a_r5_g7_join_result_listener_never_waits_on_a_group_lock() -> anyhow:
         accepts_refusal: true,
         accepts_control_blob_ref: true,
         attempt_id: Some(s.j2_attempt.clone()),
+        accepts_pending_notice: false,
+        held_notice_hash: None,
+        notice_only: false,
+        attempt_evidence: None,
     };
     s.authority
         .named_group_test_recorders
@@ -4506,6 +4514,10 @@ async fn s8a_r6_duplicate_fetches_never_overlap_inline_egress() -> anyhow::Resul
                 accepts_refusal: true,
                 accepts_control_blob_ref: true,
                 attempt_id: Some(g.attempt.clone()),
+                accepts_pending_notice: false,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
             },
         )
         .await;
@@ -4661,6 +4673,10 @@ async fn s8a_r6_a_fetch_after_a_cancelled_egress_is_admitted() -> anyhow::Result
         accepts_refusal: true,
         accepts_control_blob_ref: true,
         attempt_id: Some(g.attempt.clone()),
+        accepts_pending_notice: false,
+        held_notice_hash: None,
+        notice_only: false,
+        attempt_evidence: None,
     };
     let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
     super::super::dispatch_join_result_message(
