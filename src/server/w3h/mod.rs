@@ -16,7 +16,10 @@
 //! wall clock is a fixed base plus virtual time: each `clock_gettime`
 //! pulls the current virtual offset (no 1 ms ticker race; #1245), and
 //! OS entropy is seeded per spawned task so one task's draws do not move
-//! another's stream.
+//! another's stream. With `--cfg tokio_unstable` the seed is the spawn
+//! lineage (parent, spawn site, and child index), not the process-wide
+//! task id, so an earlier spawn at another site cannot move a signature
+//! (#1245). Release binaries are not built with that cfg.
 //!
 //! Determinism (plan §3a): [`Sim::finish`] renders the fabric's canonical
 //! trace up to the `teardown begins` mark and prints
@@ -134,15 +137,166 @@ unsafe extern "C" fn virt_offset_ns() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-/// C ABI: the current spawned task's id, or 0 when this draw is on the
+/// C ABI: the current task's entropy key, or 0 when this draw is on the
 /// test body (`block_on`) or a thread with no task. 0 selects the shim's
 /// OS-thread stream. Must not draw entropy itself.
 unsafe extern "C" fn entropy_task_key() -> u64 {
+    current_task_entropy_key()
+}
+
+/// Stream key for the current task. A runtime built by [`block_on_paused`]
+/// under `tokio_unstable` returns the lineage key recorded at spawn. Any
+/// other runtime returns the task id, which still isolates siblings and
+/// still moves when an earlier spawn shifts the process-wide counter.
+fn current_task_entropy_key() -> u64 {
     let Some(id) = tokio::task::try_id() else {
         return 0;
     };
-    // `Id` prints as its integer. A parse failure selects the thread stream.
+    let bits = task_id_bits(id);
+    if bits == 0 {
+        return 0;
+    }
+    lineage::lookup(bits).unwrap_or(bits)
+}
+
+/// `Id` prints as its integer. A parse failure selects the thread stream.
+fn task_id_bits(id: tokio::task::Id) -> u64 {
     id.to_string().parse().unwrap_or(0)
+}
+
+/// Paused current-thread runtime for one W3-H test. Under `tokio_unstable`
+/// every spawn records a lineage key before the task runs.
+pub(crate) fn block_on_paused<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    lineage::reset();
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder.enable_all().start_paused(true);
+    lineage::install(&mut builder);
+    builder.build().expect("w3h runtime").block_on(future)
+}
+
+#[cfg(tokio_unstable)]
+mod lineage {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    struct Table {
+        /// Next child index for one parent key and one spawn site.
+        next_child: BTreeMap<(u64, u64), u32>,
+        /// Tokio task id → lineage stream key. Removed when the task ends
+        /// so a reused id does not keep the previous key. The child counter
+        /// is not reused: a later spawn at the same site takes the next index.
+        by_task: BTreeMap<u64, u64>,
+    }
+
+    impl Table {
+        const fn empty() -> Self {
+            Self {
+                next_child: BTreeMap::new(),
+                by_task: BTreeMap::new(),
+            }
+        }
+    }
+
+    static TABLE: Mutex<Table> = Mutex::new(Table::empty());
+
+    fn lock() -> std::sync::MutexGuard<'static, Table> {
+        TABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn reset() {
+        *lock() = Table::empty();
+    }
+
+    pub(super) fn lookup(task_id: u64) -> Option<u64> {
+        lock().by_task.get(&task_id).copied()
+    }
+
+    pub(super) fn install(builder: &mut tokio::runtime::Builder) {
+        builder.on_task_spawn(note_spawn);
+        builder.on_task_terminate(note_terminate);
+    }
+
+    /// The hook runs on the spawner, before the child is scheduled, so
+    /// `try_id` is the parent. `block_on` has no task id; those children
+    /// hang off parent key 0. A child index counts spawns of one parent at
+    /// one source location, so a spawn at another location does not move it.
+    fn note_spawn(meta: &tokio::runtime::TaskMeta<'_>) {
+        let child = super::task_id_bits(meta.id());
+        if child == 0 {
+            return;
+        }
+        let site = site_key(meta.spawned_at());
+        let seen = super::task_id_bits_of_current();
+        let mut table = lock();
+        let parent_key = if seen != 0 && seen != child {
+            table.by_task.get(&seen).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let counter = table.next_child.entry((parent_key, site)).or_insert(0);
+        *counter = counter.saturating_add(1);
+        let key = stream_key(parent_key, site, *counter);
+        table.by_task.insert(child, key);
+    }
+
+    fn note_terminate(meta: &tokio::runtime::TaskMeta<'_>) {
+        let child = super::task_id_bits(meta.id());
+        if child == 0 {
+            return;
+        }
+        lock().by_task.remove(&child);
+    }
+
+    fn site_key(loc: &'static std::panic::Location<'static>) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in loc.file().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash ^= u64::from(loc.line());
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+        hash ^= u64::from(loc.column());
+        hash.wrapping_mul(0x100_0000_01b3)
+    }
+
+    fn stream_key(parent: u64, site: u64, index: u32) -> u64 {
+        let mut mixed = parent
+            ^ site.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(index).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        // The shim reserves the high bit for OS-thread streams, and 0 means
+        // "use the thread stream".
+        let key = mixed & !(1_u64 << 63);
+        if key == 0 {
+            1
+        } else {
+            key
+        }
+    }
+}
+
+#[cfg(not(tokio_unstable))]
+mod lineage {
+    pub(super) fn reset() {}
+
+    pub(super) fn lookup(_task_id: u64) -> Option<u64> {
+        None
+    }
+
+    pub(super) fn install(_builder: &mut tokio::runtime::Builder) {}
+}
+
+/// Task id of the spawner, or 0 when this thread is inside `block_on`.
+#[cfg(tokio_unstable)]
+fn task_id_bits_of_current() -> u64 {
+    tokio::task::try_id().map(task_id_bits).unwrap_or(0)
 }
 
 /// Test helper: install the pull origin on the current runtime.
@@ -289,11 +443,12 @@ impl Shim {
         self.install_entropy_key();
     }
 
-    /// Per-task entropy. A spawned task's `getrandom` uses its task id as
-    /// the stream key, so another task's draws do not move it (#1245).
+    /// Per-task entropy. A spawned task's `getrandom` uses the lineage key
+    /// recorded for that task, so another task's draws do not move it and
+    /// an earlier spawn at another site does not move the key (#1245).
     fn install_entropy_key(self) {
         // SAFETY: `entropy_task_key` matches the shim's C ABI. It reads the
-        // current task id and does not draw entropy.
+        // current task id and the lineage table. It does not draw entropy.
         unsafe { (self.set_entropy_key_fn)(Some(entropy_task_key)) }
     }
 
