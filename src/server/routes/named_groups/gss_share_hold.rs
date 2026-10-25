@@ -175,6 +175,50 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
     })
 }
 
+/// #1578 (Engineer ruling, 25 Oct 00:26): the head this node reports for
+/// `group_key` in a catch-up answer. While this node holds no secret of a
+/// held exclusion's epoch — it installed that exclusion's result keyless —
+/// the report is the live hold's parent, the newest head of the chain this
+/// node's secrets vouch for, never the installed result: a keyless install
+/// is local fact only, it does not prove delivery of the share, and the
+/// author's delivery row must stay open until the share installs (then the
+/// report is the current head again, and it is share-proof). The parent of
+/// the lowest live hold is reported, so a chain of keyless installs names
+/// no keyless result. A superseded install releases its hold, so its head
+/// is reported as before: it proves a later key exists. A node that holds
+/// a secret, or is held by no exclusion, reports its current head.
+pub(super) async fn reported_head(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> String {
+    ensure_loaded(state).await;
+    let lot = state
+        .gss_share_holds
+        .exclusions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(held) = lot.get(group_key) else {
+        return info.state_hash.clone();
+    };
+    // The #1578 keyless install: the head is a held exclusion's result and
+    // no secret of its epoch is held. A node with a secret, or held only
+    // for a later epoch (its head is not that exclusion's result), reports
+    // its current head.
+    let keyless = info.shared_secret.is_none()
+        && held
+            .iter()
+            .any(|hold| hold.secret_epoch == info.secret_epoch);
+    if !keyless {
+        return info.state_hash.clone();
+    }
+    held.iter()
+        .filter(|hold| holds(info, Some(hold.secret_epoch)))
+        .min_by_key(|hold| hold.secret_epoch)
+        .map(|hold| hold.parent_state_hash.clone())
+        .unwrap_or_else(|| info.state_hash.clone())
+}
+
 /// Whether a parked removal or ban, or a held crypto-only exclusion, still
 /// holds new ciphertext for `group_key`. There is no time limit: only a
 /// secret of the held epoch, or a later one, ends a hold. Call

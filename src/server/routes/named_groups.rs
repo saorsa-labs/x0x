@@ -11380,7 +11380,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if sender_hex != request.requester_agent_id {
         return;
     }
-    let (authorized, log_keys, saved_head) = {
+    let (authorized, log_keys, held_group) = {
         let groups = state.named_groups.read().await;
         if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
             groups
@@ -11400,11 +11400,20 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             (
                 info.has_active_member(&sender_hex),
                 keys,
-                info.state_hash.clone(),
+                Some((key.clone(), info.clone())),
             )
         } else {
-            (false, vec![request.group_id.clone()], String::new())
+            (false, vec![request.group_id.clone()], None)
         }
+    };
+    // #1578 (Engineer ruling, 25 Oct 00:26): the responder's saved head is
+    // its survivor-convergence evidence for the S4 deliveries of this
+    // group. A node that installed a GSS exclusion keyless reports the
+    // held exclusion's parent, not the installed result, so that local
+    // keyless fact never converges an author's delivery row.
+    let saved_head = match &held_group {
+        Some((key, info)) => gss_share_hold::reported_head(state, key, info).await,
+        None => String::new(),
     };
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
