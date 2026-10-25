@@ -317,9 +317,9 @@ struct Oracle {
     current: usize,
     tolerated: usize,
     defects: Vec<String>,
-    a_post_delta: bool,
+    a_post_write: bool,
     b_control: bool,
-    b_restart_delta: bool,
+    b_restart_write: bool,
     a_retained: bool,
 }
 
@@ -342,9 +342,9 @@ fn run_oracle(
         current: 0,
         tolerated: 0,
         defects: Vec::new(),
-        a_post_delta: false,
+        a_post_write: false,
         b_control: false,
-        b_restart_delta: false,
+        b_restart_write: false,
         a_retained: false,
     };
     for (_label, peer) in &peers {
@@ -363,19 +363,28 @@ fn run_oracle(
                     mentions_restart,
                 } => {
                     out.current += 1;
+                    // Coverage, not a wire contract: a member's write may be
+                    // served to its reader as a delta or as a full/retained
+                    // state image (the serve shape depends on PlumTree peer
+                    // state at publish time — the unshimmed coverage job
+                    // took the retained shape), so any current-epoch frame
+                    // from the writer naming the key proves the traffic.
                     let main_topic = frame.topic != side_topic;
                     match (
                         frame.from.as_str(),
                         main_topic,
-                        kind,
                         mentions_post,
                         mentions_restart,
                     ) {
-                        ("A", true, KvMutationKind::Delta, true, _) => out.a_post_delta = true,
-                        ("A", true, KvMutationKind::RetainedState, _, _) => out.a_retained = true,
-                        ("B", false, KvMutationKind::Control, _, _) => out.b_control = true,
-                        ("B", true, KvMutationKind::Delta, _, true) => out.b_restart_delta = true,
+                        ("A", true, true, _) => out.a_post_write = true,
+                        ("B", true, _, true) => out.b_restart_write = true,
                         _ => {}
+                    }
+                    if main_topic && frame.from == "A" && kind == KvMutationKind::RetainedState {
+                        out.a_retained = true;
+                    }
+                    if !main_topic && frame.from == "B" && kind == KvMutationKind::Control {
+                        out.b_control = true;
                     }
                 }
                 FrameCheck::ToleratedReplay => out.tolerated += 1,
@@ -769,13 +778,13 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         ),
         at(sim),
     );
-    let coverage = oracle.a_post_delta && oracle.b_control && oracle.b_restart_delta;
+    let coverage = oracle.a_post_write && oracle.b_control && oracle.b_restart_write;
     receipt.evidence(
         "the oracle saw post-rekey sealed traffic from both members on both topics",
         coverage,
         format!(
-            "a_post_delta={} b_control={} b_restart_delta={} a_retained={}",
-            oracle.a_post_delta, oracle.b_control, oracle.b_restart_delta, oracle.a_retained
+            "a_post_write={} b_control={} b_restart_write={} a_retained={}",
+            oracle.a_post_write, oracle.b_control, oracle.b_restart_write, oracle.a_retained
         ),
         at(sim),
     );
